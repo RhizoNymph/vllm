@@ -289,7 +289,37 @@ def get_num_decode_tokens(default: int) -> int:
         return default
 
     layer_attn_metadata = next(iter(attn_metadata.values()))
-    return getattr(layer_attn_metadata, "num_decode_tokens", default)
+
+    # Direct attribute — works for FlashInfer, Mamba, TreeAttn, etc.
+    ndt = getattr(layer_attn_metadata, "num_decode_tokens", None)
+    if ndt is not None:
+        return ndt
+
+    # Fallback: derive from fields present on FlashAttentionMetadata.
+    max_query_len = getattr(layer_attn_metadata, "max_query_len", None)
+    num_actual_tokens = getattr(layer_attn_metadata, "num_actual_tokens", None)
+    if max_query_len is None or num_actual_tokens is None:
+        return default
+
+    # Fast path: all queries have length <= 1 → pure decode batch.
+    if max_query_len <= 1:
+        return num_actual_tokens
+
+    # Slow path: walk query_start_loc to find the decode/prefill boundary.
+    # Decodes are sorted to the front of the batch with query_len == 1.
+    query_start_loc = getattr(layer_attn_metadata, "query_start_loc", None)
+    if query_start_loc is None:
+        return default
+
+    if query_start_loc.is_cuda:
+        query_start_loc = query_start_loc.cpu()
+
+    for i in range(query_start_loc.shape[0] - 1):
+        qlen = (query_start_loc[i + 1] - query_start_loc[i]).item()
+        if qlen > 1:
+            return query_start_loc[i].item()
+
+    return num_actual_tokens
 
 
 def create_forward_context(

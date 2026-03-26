@@ -5,6 +5,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 import vllm.forward_context as fc_module
 from vllm.forward_context import get_num_decode_tokens
 
@@ -76,3 +78,48 @@ class TestGetNumDecodeTokens:
         with patch.object(fc_module, "_forward_context", ctx):
             # All layers in a batch have the same num_decode_tokens
             assert get_num_decode_tokens(100) == 5
+
+    # -- FlashAttention fallback path tests --
+
+    def test_flash_attn_pure_decode_batch(self):
+        """max_query_len=1 means all tokens are decode -> num_actual_tokens."""
+        layer_meta = SimpleNamespace(
+            max_query_len=1,
+            num_actual_tokens=10,
+        )
+        ctx = SimpleNamespace(attn_metadata={"layer0": layer_meta})
+        with patch.object(fc_module, "_forward_context", ctx):
+            assert get_num_decode_tokens(0) == 10
+
+    def test_flash_attn_mixed_batch(self):
+        """Mixed batch: first 2 requests are decodes (qlen=1), third is prefill."""
+        # query_start_loc = [0, 1, 2, 7] means:
+        #   request 0: tokens [0,1) -> qlen=1  (decode)
+        #   request 1: tokens [1,2) -> qlen=1  (decode)
+        #   request 2: tokens [2,7) -> qlen=5  (prefill)
+        layer_meta = SimpleNamespace(
+            max_query_len=5,
+            num_actual_tokens=7,
+            query_start_loc=torch.tensor([0, 1, 2, 7]),
+        )
+        ctx = SimpleNamespace(attn_metadata={"layer0": layer_meta})
+        with patch.object(fc_module, "_forward_context", ctx):
+            assert get_num_decode_tokens(0) == 2
+
+    def test_flash_attn_all_prefill(self):
+        """All-prefill batch: first request has qlen>1 -> returns 0."""
+        layer_meta = SimpleNamespace(
+            max_query_len=5,
+            num_actual_tokens=5,
+            query_start_loc=torch.tensor([0, 5]),
+        )
+        ctx = SimpleNamespace(attn_metadata={"layer0": layer_meta})
+        with patch.object(fc_module, "_forward_context", ctx):
+            assert get_num_decode_tokens(0) == 0
+
+    def test_flash_attn_no_fallback_fields(self):
+        """Metadata without num_decode_tokens or fallback fields -> default."""
+        layer_meta = SimpleNamespace()
+        ctx = SimpleNamespace(attn_metadata={"layer0": layer_meta})
+        with patch.object(fc_module, "_forward_context", ctx):
+            assert get_num_decode_tokens(77) == 77
