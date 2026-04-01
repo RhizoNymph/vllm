@@ -1033,3 +1033,168 @@ class TestPhaseTrackingRelease:
         # The prefill config for request B must still be intact.
         assert (10, "prefill") in mgr.config_to_row
         assert mgr.config_refcounts[(10, "prefill")] == 1
+
+
+# ---------------------------------------------------------------------------
+# TestPendingDecodeRowLeak
+# ---------------------------------------------------------------------------
+
+
+class TestPendingDecodeRowLeak:
+    """Verify that deferred decode registrations are dropped when
+    their owning request finishes before the retry loop runs.
+
+    Without request-ID tracking, the retry loop would register a
+    row that no request will ever release -- a permanent row leak.
+    These tests simulate the model runner's retry loop logic with
+    the request-ID filtering fix.
+    """
+
+    @staticmethod
+    def _run_retry_loop(
+        manager: SteeringManager,
+        pending: list[tuple[str, int, dict[str, dict[int, list[float]]]]],
+        active_requests: set[str],
+    ) -> list[tuple[str, int, dict[str, dict[int, list[float]]]]]:
+        """Simulate the model runner's retry loop for deferred decode
+        registrations, including the request-ID filtering fix.
+
+        Args:
+            manager: The SteeringManager instance.
+            pending: The pending decode registration entries
+                     as (req_id, config_hash, vectors) tuples.
+            active_requests: Set of request IDs still in self.requests.
+
+        Returns:
+            The updated pending list after processing.
+        """
+        still_pending: list[tuple[str, int, dict[str, dict[int, list[float]]]]] = []
+        for d_req_id, d_hash, d_vecs in pending:
+            if d_req_id not in active_requests:
+                continue  # Request already finished, drop the entry
+            try:
+                manager.register_config(d_hash, d_vecs, phase="decode")
+            except RuntimeError:
+                still_pending.append((d_req_id, d_hash, d_vecs))
+        return still_pending
+
+    def test_finished_request_entry_dropped_before_retry(self):
+        """A deferred decode entry whose request has already finished
+        must be dropped without registering, preventing a row leak."""
+        mgr = _make_manager(max_configs=2)
+        vectors_a = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        vectors_b = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+        deferred_vecs = {_HP: {0: [3.0] * HIDDEN_SIZE}}
+
+        # Fill the table to capacity.
+        mgr.register_config(config_hash=1, vectors=vectors_a, phase="prefill")
+        mgr.register_config(config_hash=2, vectors=vectors_b, phase="decode")
+        assert mgr.num_active_configs == 2
+
+        # Simulate: request "req-X" tried to register decode config but
+        # capacity was full, so the entry was deferred.
+        pending: list[tuple[str, int, dict[str, dict[int, list[float]]]]] = [
+            ("req-X", 99, deferred_vecs),
+        ]
+
+        # Now free a slot (some other request finished).
+        mgr.release_config(config_hash=1, phase="prefill")
+        assert mgr.num_active_configs == 1
+
+        # Simulate: req-X also finished before retry loop runs.
+        active_requests: set[str] = {"req-Y"}  # req-X not present
+
+        # Run the retry loop -- req-X entry should be dropped.
+        remaining = self._run_retry_loop(mgr, pending, active_requests)
+        assert remaining == []
+
+        # The config should NOT have been registered -- no row leaked.
+        assert (99, "decode") not in mgr.config_to_row
+        assert mgr.num_active_configs == 1  # only config_hash=2 remains
+
+    def test_active_request_entry_registered_on_retry(self):
+        """A deferred decode entry whose request is still active must
+        be registered when capacity becomes available."""
+        mgr = _make_manager(max_configs=2)
+        vectors_a = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        vectors_b = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+        deferred_vecs = {_HP: {0: [3.0] * HIDDEN_SIZE}}
+
+        # Fill to capacity.
+        mgr.register_config(config_hash=1, vectors=vectors_a, phase="prefill")
+        mgr.register_config(config_hash=2, vectors=vectors_b, phase="decode")
+
+        # Simulate: request "req-A" tried to register but was deferred.
+        pending: list[tuple[str, int, dict[str, dict[int, list[float]]]]] = [
+            ("req-A", 50, deferred_vecs),
+        ]
+
+        # Free a slot.
+        mgr.release_config(config_hash=1, phase="prefill")
+
+        # req-A is still active.
+        active_requests: set[str] = {"req-A", "req-B"}
+
+        remaining = self._run_retry_loop(mgr, pending, active_requests)
+        assert remaining == []
+
+        # The config should have been registered.
+        assert (50, "decode") in mgr.config_to_row
+        assert mgr.num_active_configs == 2  # 2 (existing) + 50 (new) - 1 (freed)
+
+    def test_mixed_active_and_finished_in_pending(self):
+        """When the pending list has entries for both active and finished
+        requests, only active entries are processed."""
+        mgr = _make_manager(max_configs=4)
+        vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+
+        # Register one config to occupy a slot.
+        mgr.register_config(config_hash=1, vectors=vectors, phase="prefill")
+
+        # Three deferred entries: two for finished requests, one for active.
+        pending: list[tuple[str, int, dict[str, dict[int, list[float]]]]] = [
+            ("req-finished-1", 10, {_HP: {0: [2.0] * HIDDEN_SIZE}}),
+            ("req-active", 20, {_HP: {0: [3.0] * HIDDEN_SIZE}}),
+            ("req-finished-2", 30, {_HP: {0: [4.0] * HIDDEN_SIZE}}),
+        ]
+
+        active_requests: set[str] = {"req-active", "req-other"}
+
+        remaining = self._run_retry_loop(mgr, pending, active_requests)
+        assert remaining == []
+
+        # Only config 20 should have been registered.
+        assert (10, "decode") not in mgr.config_to_row
+        assert (20, "decode") in mgr.config_to_row
+        assert (30, "decode") not in mgr.config_to_row
+        assert mgr.num_active_configs == 2  # config 1 + config 20
+
+    def test_still_at_capacity_keeps_active_entries(self):
+        """When capacity is still full, active request entries remain
+        in the pending list but finished request entries are dropped."""
+        mgr = _make_manager(max_configs=2)
+        vectors_a = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        vectors_b = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+
+        # Fill to capacity -- no slots freed.
+        mgr.register_config(config_hash=1, vectors=vectors_a, phase="prefill")
+        mgr.register_config(config_hash=2, vectors=vectors_b, phase="decode")
+
+        pending: list[tuple[str, int, dict[str, dict[int, list[float]]]]] = [
+            ("req-finished", 40, {_HP: {0: [5.0] * HIDDEN_SIZE}}),
+            ("req-active", 50, {_HP: {0: [6.0] * HIDDEN_SIZE}}),
+        ]
+
+        active_requests: set[str] = {"req-active"}
+
+        remaining = self._run_retry_loop(mgr, pending, active_requests)
+
+        # req-finished entry dropped, req-active stays pending.
+        assert len(remaining) == 1
+        assert remaining[0][0] == "req-active"
+        assert remaining[0][1] == 50
+
+        # Neither config should have been registered.
+        assert (40, "decode") not in mgr.config_to_row
+        assert (50, "decode") not in mgr.config_to_row
+        assert mgr.num_active_configs == 2
