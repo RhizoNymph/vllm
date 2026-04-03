@@ -95,18 +95,6 @@ class Request:
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
 
-        # Per-request activation steering vectors keyed by hook point.
-        self.steering_vectors = None
-        self.prefill_steering_vectors = None
-        self.decode_steering_vectors = None
-        if sampling_params is not None:
-            if sampling_params.steering_vectors:
-                self.steering_vectors = sampling_params.steering_vectors
-            if sampling_params.prefill_steering_vectors:
-                self.prefill_steering_vectors = sampling_params.prefill_steering_vectors
-            if sampling_params.decode_steering_vectors:
-                self.decode_steering_vectors = sampling_params.decode_steering_vectors
-
         if pooling_params is not None:
             # Pooling models.
             self.max_tokens = 1
