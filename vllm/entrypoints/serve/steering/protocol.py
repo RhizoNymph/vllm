@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from vllm.config.steering_types import SteeringVectorSpec
 
 
 class SetSteeringRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     vectors: SteeringVectorSpec | None = Field(
         default=None,
         description="Base steering vectors applied to both prefill and "
