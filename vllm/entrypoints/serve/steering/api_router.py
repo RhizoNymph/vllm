@@ -205,29 +205,48 @@ async def set_steering(
                 ),
             )
 
-            # Invalidate prefix cache if prefill-affecting vectors
-            # were changed.  Base vectors affect prefill (they are
-            # added to prefill-specific vectors), and explicit
-            # prefill_vectors do as well.  This preempts all running
-            # requests and clears the prefix cache so that subsequent
-            # prefills use the new steering state.
-            affects_prefill = (
+            # Invalidate prefix cache when any steering vectors change.
+            # Base and prefill vectors affect prefill-phase KV blocks
+            # directly.  Decode vectors affect decode-phase KV blocks
+            # which can also be cached and reused via automatic prefix
+            # caching (APC) — stale decode-phase blocks would produce
+            # outputs inconsistent with the new steering state.
+            affects_cache = (
                 normalized_base is not None
                 or normalized_prefill is not None
-                or request.replace  # replace clears all tiers including prefill
+                or normalized_decode is not None
+                or request.replace  # replace clears all tiers
             )
-            if affects_prefill:
-                success = await engine.reset_prefix_cache(reset_running_requests=True)
+            if affects_cache:
+                success = await engine.reset_prefix_cache(
+                    reset_running_requests=True)
                 if success:
                     logger.info(
                         "Prefix cache invalidated after "
-                        "prefill-affecting steering change."
+                        "steering change."
                     )
                 else:
-                    logger.warning(
-                        "Prefix cache reset requested after "
-                        "prefill-affecting steering change but "
-                        "some blocks were still in use."
+                    # Steering vectors are already applied on the
+                    # workers but stale KV blocks remain in the prefix
+                    # cache.  Returning success here would let future
+                    # requests silently reuse blocks computed under the
+                    # old steering state.
+                    logger.error(
+                        "Prefix cache reset failed after steering "
+                        "change — some blocks were still in use. "
+                        "Steering vectors have been applied but "
+                        "cached KV blocks may be stale."
+                    )
+                    return JSONResponse(
+                        content={
+                            "error": (
+                                "Steering vectors were applied but "
+                                "prefix cache could not be fully "
+                                "invalidated. Retry the request or "
+                                "call /v1/steering/clear and re-apply."
+                            )
+                        },
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
                     )
 
         # Build response with all hook points across tiers.
@@ -270,9 +289,26 @@ async def clear_steering(raw_request: Request) -> JSONResponse:
     try:
         async with _steering_lock:
             await engine.collective_rpc("clear_steering_vectors")
-            # Clearing may remove prefill-affecting vectors, so
-            # invalidate prefix cache to stay consistent.
-            await engine.reset_prefix_cache(reset_running_requests=True)
+            # Clearing removes all steering vectors, so invalidate
+            # prefix cache to prevent reuse of stale KV blocks.
+            success = await engine.reset_prefix_cache(
+                reset_running_requests=True)
+            if not success:
+                logger.error(
+                    "Prefix cache reset failed after clearing "
+                    "steering vectors — some blocks still in use. "
+                    "Cached KV blocks may be stale."
+                )
+                return JSONResponse(
+                    content={
+                        "error": (
+                            "Steering vectors were cleared but "
+                            "prefix cache could not be fully "
+                            "invalidated. Retry the request."
+                        )
+                    },
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                )
         return JSONResponse(content={"status": "ok"})
     except Exception as err:
         logger.exception("Failed to clear steering vectors")

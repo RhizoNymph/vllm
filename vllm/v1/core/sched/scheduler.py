@@ -637,21 +637,23 @@ class Scheduler(SchedulerInterface):
                 # occupies one steering row at a time — the prefill
                 # row is released before the decode row is registered
                 # in _handle_steering_transition.  So we only count
-                # the starting phase (prefill for WAITING requests).
+                # the prefill hash for WAITING requests.
+                #
+                # Decode-only requests (prefill_hash == 0, decode_hash
+                # != 0) do not occupy any steering row during prefill,
+                # so they are admitted without a capacity check here.
+                # Their decode row is reserved later by the transition
+                # prediction in the running-request tracking (above).
+                # For full prefix-cache hits that skip prefill, there
+                # is a one-step window where the decode row is not yet
+                # counted; the model runner handles this gracefully by
+                # deferring registration when capacity is exhausted.
                 if self.steering_config:
                     new_hashes: set[tuple[int, str]] = set()
                     if request.prefill_steering_config_hash != 0:
                         new_hashes.add(
                             (request.prefill_steering_config_hash, "prefill")
                         )
-                    elif request.decode_steering_config_hash != 0:
-                        # Decode-only steering: if the request has no
-                        # prefill hash but does have a decode hash, we
-                        # must still capacity-check it.  The elif is
-                        # correct: when both hashes are present, only
-                        # the prefill hash is counted because the
-                        # request occupies one row at a time.
-                        new_hashes.add((request.decode_steering_config_hash, "decode"))
                     if new_hashes:
                         new_unique = new_hashes - scheduled_steering_configs
                         if (

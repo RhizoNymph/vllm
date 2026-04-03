@@ -361,6 +361,53 @@ class TestClearSteering:
         assert resp.status_code == 500
         assert "fail" in resp.json()["error"]
 
+    def test_clear_cache_reset_failure_returns_503(self, client, engine):
+        """When prefix cache reset fails after clear, return 503."""
+        engine.collective_rpc.return_value = None
+        engine.reset_prefix_cache.return_value = False
+        resp = client.post("/v1/steering/clear")
+        assert resp.status_code == 503
+        assert "prefix cache" in resp.json()["error"].lower()
+
+
+# --- Cache invalidation on set ---
+
+
+class TestSetSteeringCacheInvalidation:
+    """Cache invalidation must succeed for set to return 200."""
+
+    def test_base_vectors_cache_failure_returns_503(self, client, engine):
+        """Base vectors affect cache; failure returns 503."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.reset_prefix_cache.return_value = False
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [1.0]}),
+        )
+        assert resp.status_code == 503
+        assert "prefix cache" in resp.json()["error"].lower()
+
+    def test_decode_only_cache_failure_returns_503(self, client, engine):
+        """Decode-only vectors also require cache invalidation."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.reset_prefix_cache.return_value = False
+        resp = client.post(
+            "/v1/steering/set",
+            json={"decode_vectors": {_HP: {"0": [1.0]}}},
+        )
+        assert resp.status_code == 503
+        assert "prefix cache" in resp.json()["error"].lower()
+
+    def test_cache_success_returns_200(self, client, engine):
+        """When cache reset succeeds, set returns 200."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.reset_prefix_cache.return_value = True
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [1.0]}),
+        )
+        assert resp.status_code == 200
+
 
 # --- GET /v1/steering ---
 

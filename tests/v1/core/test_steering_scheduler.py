@@ -516,60 +516,56 @@ class TestTransitionAwareCapacity:
 
 class TestDecodeOnlyCapacityCheck:
     """Test that decode-only steering (prefill_hash=0, decode_hash!=0)
-    is capacity-checked at the WAITING admission gate.
+    is NOT capacity-checked at the WAITING admission gate.
 
-    Bug: The original admission gate only checked prefill_hash.  If a
-    request had prefill_hash==0 but decode_hash!=0, new_hashes stayed
-    empty and the capacity check was completely skipped, allowing the
-    request to exceed max_steering_configs.
-
-    Fix: Add an elif for decode-only steering so that requests with
-    only a decode hash are also gated.
+    Decode-only requests do not occupy any steering row during prefill,
+    so they should be admitted freely.  Their decode row is reserved
+    later by the transition prediction in the running-request tracking
+    loop.  For full prefix-cache hits, there is a one-step window where
+    the decode row is not yet counted; the model runner handles this
+    gracefully by deferring registration when capacity is exhausted.
     """
 
     @staticmethod
     def _should_skip(
         scheduled_configs: set[tuple[int, str]],
         prefill_hash: int,
-        decode_hash: int,
+        decode_hash: int,  # noqa: ARG004 — kept for test clarity
         max_configs: int,
     ) -> bool:
-        """Reproduce the fixed scheduler admission check that also
-        considers decode-only steering.
+        """Reproduce the scheduler WAITING admission check.
 
-        The elif is correct: if a request has both hashes, only
-        prefill needs counting (the decode row replaces the prefill
-        row after transition -- one row at a time).
+        Only the prefill hash is checked at admission time.
+        Decode-only requests (prefill_hash == 0) are always admitted.
         """
         new_hashes: set[tuple[int, str]] = set()
         if prefill_hash != 0:
             new_hashes.add((prefill_hash, "prefill"))
-        elif decode_hash != 0:
-            new_hashes.add((decode_hash, "decode"))
         if not new_hashes:
             return False
         new_unique = new_hashes - scheduled_configs
         return len(scheduled_configs) + len(new_unique) > max_configs
 
-    def test_decode_only_is_capacity_checked(self):
-        """A request with prefill_hash=0, decode_hash!=0 should be
-        capacity-checked and skipped when at capacity."""
+    def test_decode_only_always_admitted(self):
+        """A decode-only request (prefill_hash=0) is never blocked at
+        WAITING admission, even when steering capacity is full."""
         scheduled = {(111, "prefill"), (222, "decode")}
-        assert self._should_skip(scheduled, 0, 333, max_configs=2)
+        assert not self._should_skip(scheduled, 0, 333, max_configs=2)
 
     def test_decode_only_admitted_when_capacity(self):
         """A decode-only request is admitted when there is capacity."""
         scheduled = {(111, "prefill")}
         assert not self._should_skip(scheduled, 0, 333, max_configs=2)
 
-    def test_decode_only_existing_hash_fits(self):
-        """A decode-only request whose hash is already scheduled fits."""
+    def test_decode_only_existing_hash_also_admitted(self):
+        """A decode-only request whose decode hash is already scheduled
+        is still admitted (no prefill check needed)."""
         scheduled = {(111, "prefill"), (222, "decode")}
         assert not self._should_skip(scheduled, 0, 222, max_configs=2)
 
     def test_both_hashes_only_counts_prefill(self):
         """When both hashes are nonzero, only the prefill hash is
-        counted (elif branch: decode is not reached)."""
+        counted at admission."""
         # Only 1 slot, occupied by a different prefill hash => skip
         # because prefill hash 333 is new.
         scheduled = {(111, "prefill")}
@@ -587,9 +583,10 @@ class TestDecodeOnlyCapacityCheck:
         assert not self._should_skip(scheduled, 0, 0, max_configs=2)
 
     def test_decode_only_single_slot(self):
-        """Decode-only with max_configs=1."""
+        """Decode-only with max_configs=1: always admitted regardless
+        of current capacity, since no prefill row is needed."""
         assert not self._should_skip(set(), 0, 111, max_configs=1)
-        assert self._should_skip({(222, "decode")}, 0, 111, max_configs=1)
+        assert not self._should_skip({(222, "decode")}, 0, 111, max_configs=1)
         assert not self._should_skip({(111, "decode")}, 0, 111, max_configs=1)
 
 

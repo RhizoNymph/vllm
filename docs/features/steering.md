@@ -380,26 +380,24 @@ its peak.
 
 **New request admission:** A request only occupies one steering row at
 a time.  The prefill row is released before the decode row is registered
-(in `_handle_steering_transition`).  Therefore the scheduler only counts
-the **starting phase** at admission time -- the prefill hash for
-WAITING requests (which always start in prefill before prefix cache
-resolution).
+(in `_handle_steering_transition`).  Therefore the scheduler only checks
+the **prefill hash** at WAITING admission time.
 
 1. Compute `new_hashes = {(prefill_hash, "prefill")}` (excluding zeros)
 2. Compute `new_unique = new_hashes - scheduled_steering_configs`
 3. If `len(scheduled) + len(new_unique) > max_configs`, skip
-4. When admitted, add only the **starting phase** `(hash, phase)` pair to
-   the scheduled set (prefill when `num_computed_tokens < num_prompt_tokens`,
-   decode when starting directly in decode due to a full prefix-cache hit)
-5. Requests without steering (`prefill hash == 0`) are never blocked
-6. Requests whose starting `(hash, phase)` pair is already in the batch pass through (dedup)
+4. Requests without prefill steering (`prefill_hash == 0`) — including
+   decode-only steering requests — are never blocked at admission
+5. Requests whose `(hash, phase)` pair is already in the batch pass through (dedup)
 
-**Decode-start capacity check:** After prefix-cache resolution, a request
-that initially passed the prefill admission check may turn out to have a
-full prefix-cache hit, meaning it starts directly in the decode phase.  In
-this case, the scheduler performs a second capacity check for the decode
-`(hash, phase)` pair.  If the decode row cannot fit, the request is moved
-back to the waiting queue and retried on the next step.
+**Decode-only requests** (prefill_hash == 0, decode_hash != 0) do not
+occupy a steering row during prefill, so they are admitted freely.
+Their decode row is reserved later by the transition prediction in
+the running-request tracking loop.  For full prefix-cache hits that
+skip prefill entirely, there is a one-step window where the decode row
+is not yet counted; the model runner handles this gracefully by deferring
+registration when capacity is exhausted (falling back to global-only
+decode steering for that step).
 
 ## Capacity Behavior During Transitions
 
@@ -510,11 +508,15 @@ Key design decisions:
   to the phases it spans: prefill-only, decode-only, or both for boundary blocks.
 - **Zero impact when unused.** When steering config hashes are 0 or absent, the
   helper returns an empty list, adding nothing to the extra keys.
-- **Global prefill steering is NOT in per-request hashes.** Instead, global
-  steering changes trigger `reset_prefix_cache()` to clear all cached blocks.
-  This avoids encoding mutable global state into every block hash. The
-  invariant is: within a "global steering epoch" (between cache resets), all
-  cached blocks were computed with the same global state.
+- **Global steering is NOT in per-request hashes.** Instead, any global
+  steering change (base, prefill, or decode) triggers `reset_prefix_cache()`
+  to clear all cached blocks.  Decode-phase changes must also invalidate the
+  cache because automatic prefix caching (APC) can cache and reuse
+  decode-phase KV blocks; stale blocks would produce outputs inconsistent
+  with the new steering state.  This avoids encoding mutable global state
+  into every block hash.  The invariant is: within a "global steering epoch"
+  (between cache resets), all cached blocks were computed with the same
+  global state.
 - **Forward-compatible.** Uses `getattr(request, 'prefill_steering_config_hash', 0)`
   so this code works even before the Request attribute is added.
 
@@ -532,6 +534,6 @@ Key design decisions:
 10. **Additive composition is pre-scaled.** `resolve_effective_vectors()` applies co-located scales before summing base and phase-specific vectors.
 11. **Phase detection is token-count based.** `num_computed_tokens < num_prompt_tokens` determines prefill vs decode, not the `n_tokens == 1` heuristic.
 12. **Reference counting is exact.** Every `register_config` is balanced by a `release_config` when the request finishes. Rows are only freed at refcount 0.
-13. **Prefix cache correctness.** Blocks computed under different per-request prefill steering configs produce different block hashes. Global steering changes invalidate the entire prefix cache rather than being encoded per-block.
+13. **Prefix cache correctness.** Blocks computed under different per-request steering configs produce different block hashes. Any global steering change (base, prefill, or decode) invalidates the entire prefix cache rather than being encoded per-block, because APC can cache decode-phase KV blocks that depend on decode steering. If the cache reset fails (blocks still in use), the API returns 503 rather than silently succeeding with stale cache entries.
 14. **Phase-specific global vectors survive lazy init.** When `set_steering_vectors()` is called with `prefill_vectors` or `decode_vectors` before the first forward pass (before `SteeringManager` is lazily created), the phase-specific vectors are captured with their phase labels into `_pending_steering_globals` on the model runner. During lazy init, these pending entries are replayed in order so that base, prefill, and decode globals are registered with the correct phase. Without this, all vectors would collapse into the last-written buffer contents and be misidentified as base-phase.
 15. **`clear_steering_vectors()` clears pending globals.** When clearing steering state, both the live `SteeringManager` globals and the `_pending_steering_globals` list are cleared. This prevents stale vectors from being replayed during lazy init if a clear happens before the first forward pass. The `replace=True` flag in `set_steering_vectors` handles clear-then-apply atomically within a single worker call, avoiding the non-atomic two-RPC pattern of clearing first and then setting.
