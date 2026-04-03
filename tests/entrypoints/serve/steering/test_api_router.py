@@ -165,16 +165,17 @@ class TestSetSteeringBase:
         assert "GPU exploded" in resp.json()["error"]
 
     def test_set_with_replace(self, client, engine):
-        """replace=True triggers a clear before apply."""
-        engine.collective_rpc.side_effect = [[[0]], None, [[0]]]
+        """replace=True passes replace flag to set_steering_vectors."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
         resp = client.post(
             "/v1/steering/set",
             json={**_vecs({"0": [1.0]}), "replace": True},
         )
         assert resp.status_code == 200
-        assert engine.collective_rpc.call_count == 3
-        clear_call = engine.collective_rpc.call_args_list[1]
-        assert clear_call[0][0] == "clear_steering_vectors"
+        assert engine.collective_rpc.call_count == 2
+        apply_call = engine.collective_rpc.call_args_list[1]
+        kwargs = apply_call.kwargs.get("kwargs", apply_call[1].get("kwargs", {}))
+        assert kwargs["replace"] is True
 
     def test_set_without_replace_no_clear(self, client, engine):
         engine.collective_rpc.side_effect = [[[0]], [[0]]]
@@ -184,6 +185,18 @@ class TestSetSteeringBase:
         )
         assert resp.status_code == 200
         assert engine.collective_rpc.call_count == 2
+
+    def test_set_without_replace_passes_false(self, client, engine):
+        """Default replace=False is passed through to workers."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [1.0]}),
+        )
+        assert resp.status_code == 200
+        apply_call = engine.collective_rpc.call_args_list[1]
+        kwargs = apply_call.kwargs.get("kwargs", apply_call[1].get("kwargs", {}))
+        assert kwargs["replace"] is False
 
     def test_set_empty_all_tiers(self, client, engine):
         """No tiers provided -> immediate 400."""
@@ -283,8 +296,8 @@ class TestSetSteeringThreeTier:
         assert decode_vecs[_HP][0] == [1.5, 3.0]
 
     def test_replace_clears_all_tiers(self, client, engine):
-        """replace=True clears all tiers before setting decode-only."""
-        engine.collective_rpc.side_effect = [[[0]], None, [[0]]]
+        """replace=True passes replace flag to set_steering_vectors."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
         resp = client.post(
             "/v1/steering/set",
             json={
@@ -293,9 +306,10 @@ class TestSetSteeringThreeTier:
             },
         )
         assert resp.status_code == 200
-        assert engine.collective_rpc.call_count == 3
-        clear_call = engine.collective_rpc.call_args_list[1]
-        assert clear_call[0][0] == "clear_steering_vectors"
+        assert engine.collective_rpc.call_count == 2
+        apply_call = engine.collective_rpc.call_args_list[1]
+        kwargs = apply_call.kwargs.get("kwargs", apply_call[1].get("kwargs", {}))
+        assert kwargs["replace"] is True
 
     def test_invalid_hook_in_prefill_tier(self, client, engine):
         """Invalid hook in any tier returns 400."""

@@ -192,9 +192,6 @@ async def set_steering(
                     status_code=HTTPStatus.BAD_REQUEST.value,
                 )
 
-            if request.replace:
-                await engine.collective_rpc("clear_steering_vectors")
-
             # Phase 2 -- apply.
             await engine.collective_rpc(
                 "set_steering_vectors",
@@ -203,7 +200,7 @@ async def set_steering(
                     vectors=normalized_base,
                     prefill_vectors=normalized_prefill,
                     decode_vectors=normalized_decode,
-                    replace=False,
+                    replace=request.replace,
                     validate_only=False,
                 ),
             )
