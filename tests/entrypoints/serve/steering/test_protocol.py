@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the steering request protocol."""
 
+import pytest
+
 from vllm.entrypoints.serve.steering.protocol import SetSteeringRequest
 
 
@@ -100,3 +102,25 @@ class TestSetSteeringRequest:
         assert req.vectors is None
         assert req.prefill_vectors is not None
         assert req.decode_vectors is not None
+
+    def test_unknown_field_rejected(self):
+        """Legacy 'scales' field (or any unknown field) must be rejected."""
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            SetSteeringRequest(
+                vectors={"post_mlp_pre_ln": {0: [1.0, 2.0]}},
+                scales={0: 2.5},
+            )
+
+    def test_unknown_field_via_model_validate(self):
+        """Ensure unknown fields are also rejected via model_validate (JSON path)."""
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            SetSteeringRequest.model_validate(
+                {
+                    "vectors": {"post_mlp_pre_ln": {"0": [1.0]}},
+                    "scales": {"0": 2.5},
+                }
+            )
