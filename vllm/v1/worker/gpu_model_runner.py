@@ -1598,6 +1598,77 @@ class GPUModelRunner(
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
 
+        # Refresh steering config hashes for the re-added request.
+        # Streaming re-adds go back through prefill, so we must:
+        # 1. Release the old config (whatever phase we were tracking)
+        # 2. Update the hashes on CachedRequestState
+        # 3. Register the new prefill config
+        # 4. Update phase tracking
+        old_prefill_hash = req_state.prefill_steering_config_hash
+        old_decode_hash = req_state.decode_steering_config_hash
+        new_prefill_hash = new_req_data.prefill_steering_config_hash
+        new_decode_hash = new_req_data.decode_steering_config_hash
+
+        req_state.prefill_steering_config_hash = new_prefill_hash
+        req_state.decode_steering_config_hash = new_decode_hash
+
+        if getattr(self, "_steering_manager", None) is not None:
+            # Release the old phase config.
+            old_phase = self._req_steering_phase.get(req_id)
+            if old_phase is not None:
+                if old_phase == "prefill" and old_prefill_hash != 0:
+                    self._steering_manager.release_config(old_prefill_hash, "prefill")
+                elif old_phase == "decode" and old_decode_hash != 0:
+                    self._steering_manager.release_config(old_decode_hash, "decode")
+
+            # Purge stale deferred registrations for this request.
+            if self._pending_steering_registrations:
+                self._pending_steering_registrations = [
+                    entry
+                    for entry in self._pending_steering_registrations
+                    if entry[0] != req_id
+                ]
+
+            # Register new prefill config (streaming re-adds start
+            # in prefill).
+            sp = new_req_data.sampling_params
+            if (
+                new_prefill_hash != 0
+                and sp is not None
+                and sp.effective_prefill_steering
+            ):
+                try:
+                    self._steering_manager.register_config(
+                        new_prefill_hash,
+                        sp.effective_prefill_steering,
+                        phase="prefill",
+                    )
+                except RuntimeError:
+                    self._pending_steering_registrations.append(
+                        (
+                            req_id,
+                            new_prefill_hash,
+                            sp.effective_prefill_steering,
+                            "prefill",
+                        )
+                    )
+                    logger.warning(
+                        "Deferred prefill steering config "
+                        "(hash=%d) for streaming re-add -- "
+                        "capacity full, will retry next step",
+                        new_prefill_hash,
+                    )
+                self._req_steering_phase[req_id] = "prefill"
+            elif new_prefill_hash == 0 and new_decode_hash == 0:
+                # No steering for this request anymore.
+                self._req_steering_phase.pop(req_id, None)
+            else:
+                # Has hashes but no effective prefill vectors (e.g.,
+                # decode-only steering).  Mark as prefill since the
+                # request re-enters prefill; transition to decode
+                # will handle decode registration.
+                self._req_steering_phase[req_id] = "prefill"
+
         if self.uses_mrope:
             self._init_mrope_positions(req_state)
 
