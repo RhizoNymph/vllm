@@ -321,3 +321,71 @@ class TestDimensionCrossValidation:
         )
         assert params.steering_vectors is not None
         assert params.prefill_steering_vectors is not None
+
+    def test_mismatched_prefill_decode_without_base_raises(self):
+        """prefill dim=2 vs decode dim=1 on same (hook, layer) without base
+        -> ValueError."""
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(
+            ValueError, match="Overlapping entries must have matching dimensions"
+        ):
+            SamplingParams(
+                prefill_steering_vectors={
+                    "post_mlp_pre_ln": {0: [1.0, 2.0]},
+                },
+                decode_steering_vectors={
+                    "post_mlp_pre_ln": {0: [1.0]},
+                },
+            )
+
+    def test_non_overlapping_prefill_decode_pass(self):
+        """Non-overlapping (hook, layer) between prefill and decode with no
+        base should construct without error even with different dims."""
+        from vllm.sampling_params import SamplingParams
+
+        params = SamplingParams(
+            prefill_steering_vectors={
+                "post_mlp_pre_ln": {0: [1.0, 2.0]},
+            },
+            decode_steering_vectors={
+                "post_mlp_pre_ln": {1: [1.0]},
+            },
+        )
+        assert params.prefill_steering_vectors is not None
+        assert params.decode_steering_vectors is not None
+
+    def test_matching_prefill_decode_without_base_pass(self):
+        """Matching (hook, layer) and dimensions between prefill and decode
+        with no base should construct without error."""
+        from vllm.sampling_params import SamplingParams
+
+        params = SamplingParams(
+            prefill_steering_vectors={
+                "post_mlp_pre_ln": {0: [1.0, 2.0]},
+            },
+            decode_steering_vectors={
+                "post_mlp_pre_ln": {0: [3.0, 4.0]},
+            },
+        )
+        assert params.prefill_steering_vectors is not None
+        assert params.decode_steering_vectors is not None
+
+    def test_mismatched_prefill_decode_scaled_entry_raises(self):
+        """Scaled {vector, scale} entry on one side should still be caught
+        for dimension mismatches between prefill and decode."""
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(
+            ValueError, match="Overlapping entries must have matching dimensions"
+        ):
+            SamplingParams(
+                prefill_steering_vectors={
+                    "post_mlp_pre_ln": {
+                        0: {"vector": [1.0, 2.0], "scale": 0.5},
+                    },
+                },
+                decode_steering_vectors={
+                    "post_mlp_pre_ln": {0: [1.0]},
+                },
+            )
