@@ -41,6 +41,11 @@ def _normalize_spec(
     Each layer entry may be a bare ``list[float]`` (scale=1.0) or
     ``{"vector": [...], "scale": float}``.  This function applies the
     scale and returns plain ``list[float]`` values.
+
+    Hook entries whose inner layer dict is empty are dropped from the
+    result: a hook with no layers is functionally equivalent to
+    omitting the hook entirely, and keeping an empty entry would
+    produce a truthy-but-empty spec that confuses downstream checks.
     """
     result: dict[str, dict[int, list[float]]] = {}
     for hook_name, layer_vecs in spec.items():
@@ -51,7 +56,8 @@ def _normalize_spec(
                 normalized_layers[layer_idx] = [v * scale for v in vec]
             else:
                 normalized_layers[layer_idx] = vec
-        result[hook_name] = normalized_layers
+        if normalized_layers:
+            result[hook_name] = normalized_layers
     return result
 
 
@@ -218,13 +224,9 @@ async def set_steering(
                 or request.replace  # replace clears all tiers
             )
             if affects_cache:
-                success = await engine.reset_prefix_cache(
-                    reset_running_requests=True)
+                success = await engine.reset_prefix_cache(reset_running_requests=True)
                 if success:
-                    logger.info(
-                        "Prefix cache invalidated after "
-                        "steering change."
-                    )
+                    logger.info("Prefix cache invalidated after steering change.")
                 else:
                     # Steering vectors are already applied on the
                     # workers but stale KV blocks remain in the prefix
@@ -291,8 +293,7 @@ async def clear_steering(raw_request: Request) -> JSONResponse:
             await engine.collective_rpc("clear_steering_vectors")
             # Clearing removes all steering vectors, so invalidate
             # prefix cache to prevent reuse of stale KV blocks.
-            success = await engine.reset_prefix_cache(
-                reset_running_requests=True)
+            success = await engine.reset_prefix_cache(reset_running_requests=True)
             if not success:
                 logger.error(
                     "Prefix cache reset failed after clearing "
