@@ -321,3 +321,39 @@ class TestDimensionCrossValidation:
         )
         assert params.steering_vectors is not None
         assert params.prefill_steering_vectors is not None
+
+    def test_mismatched_prefill_decode_without_base_raises(self):
+        """Prefill and decode specs with mismatched dims for same (hook,layer)
+        must be rejected even when no base vectors are provided."""
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(ValueError, match="dimension"):
+            SamplingParams(
+                prefill_steering_vectors={"post_mlp_pre_ln": {0: [1.0, 2.0]}},
+                decode_steering_vectors={"post_mlp_pre_ln": {0: [1.0]}},
+            )
+
+    def test_non_overlapping_prefill_decode_pass(self):
+        """Prefill and decode specs with disjoint (hook,layer) keys
+        should not be cross-validated for dimensions."""
+        from vllm.sampling_params import SamplingParams
+
+        # Different layers
+        SamplingParams(
+            prefill_steering_vectors={"post_mlp_pre_ln": {0: [1.0, 2.0]}},
+            decode_steering_vectors={"post_mlp_pre_ln": {1: [1.0]}},
+        )
+        # Different hook points
+        SamplingParams(
+            prefill_steering_vectors={"pre_attn": {0: [1.0, 2.0]}},
+            decode_steering_vectors={"post_attn": {0: [1.0]}},
+        )
+
+    def test_matching_prefill_decode_without_base_passes(self):
+        """Prefill and decode specs with matching dims should pass."""
+        from vllm.sampling_params import SamplingParams
+
+        SamplingParams(
+            prefill_steering_vectors={"post_mlp_pre_ln": {0: [1.0, 2.0, 3.0]}},
+            decode_steering_vectors={"post_mlp_pre_ln": {0: [0.1, 0.2, 0.3]}},
+        )
