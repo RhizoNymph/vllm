@@ -504,6 +504,28 @@ class TestPopulateTables:
         # Decode row: (base + decode_global) + per_req = 1+3+5 = 9
         assert torch.allclose(table[row_d], base_vec + decode_global + per_req)
 
+    def test_invalid_phase_in_populate_raises(self):
+        """Invalid phase string in config_to_row raises ValueError."""
+        mgr = _make_manager()
+        per_req = torch.ones(HIDDEN_SIZE) * 5.0
+        vectors = {_HP: {0: per_req.tolist()}}
+        # Register normally so state is otherwise valid.
+        row = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
+        # Corrupt the phase tracking state by injecting an invalid phase
+        # into the dict populate_steering_tables iterates over. Mirror the
+        # per-request vectors under the same invalid key so the iteration
+        # reaches the phase branch.
+        mgr.config_to_row.pop((42, "prefill"))
+        mgr.config_to_row[(42, "invalid")] = row
+        mgr.config_vectors[(42, "invalid")] = mgr.config_vectors.pop((42, "prefill"))
+
+        layers = _make_layers(mgr, layer_indices=[0])
+        try:
+            mgr.populate_steering_tables(layers)
+            raise AssertionError("Expected ValueError for invalid phase")
+        except ValueError:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # TestPhaseTracking
