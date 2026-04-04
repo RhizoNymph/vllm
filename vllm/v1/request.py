@@ -261,6 +261,13 @@ class Request:
             return 0
         return hash_steering_config(self.sampling_params.effective_decode_steering)
 
+    def invalidate_steering_hashes(self) -> None:
+        """Clear cached steering hashes so they recompute from current
+        sampling_params.  Must be called whenever sampling_params is
+        replaced (e.g. streaming session updates)."""
+        self.__dict__.pop("prefill_steering_config_hash", None)
+        self.__dict__.pop("decode_steering_config_hash", None)
+
     def get_skip_reading_prefix_cache(self) -> bool:
         if (
             self.sampling_params is not None

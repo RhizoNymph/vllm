@@ -1147,11 +1147,15 @@ class Scheduler(SchedulerInterface):
 
         session._all_token_ids.extend(update.prompt_token_ids or ())
         session.prompt_token_ids.extend(update.prompt_token_ids or ())
+        # Swap sampling_params *before* recomputing block hashes so that
+        # steering-config hashes embedded in block keys reflect the new
+        # steering configuration, not the stale cached values.
+        session.sampling_params = update.sampling_params
+        session.invalidate_steering_hashes()
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
-        session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
