@@ -593,6 +593,34 @@ class SamplingParams(
                                 f"matching dimensions."
                             )
 
+        # Cross-validate overlapping dimensions between prefill and decode
+        # phase specs (caught even when no base ``steering_vectors`` is set).
+        if self.prefill_steering_vectors and self.decode_steering_vectors:
+            from vllm.config.steering_types import normalize_layer_entry
+
+            for hook, prefill_layers in self.prefill_steering_vectors.items():
+                if hook not in self.decode_steering_vectors:
+                    continue
+                decode_layers = self.decode_steering_vectors[hook]
+                for layer_idx, prefill_entry in prefill_layers.items():
+                    if layer_idx not in decode_layers:
+                        continue
+                    prefill_vec, _ = normalize_layer_entry(prefill_entry)
+                    decode_vec, _ = normalize_layer_entry(
+                        decode_layers[layer_idx]
+                    )
+                    if len(prefill_vec) != len(decode_vec):
+                        raise ValueError(
+                            f"prefill_steering_vectors[{hook!r}]"
+                            f"[{layer_idx}] has "
+                            f"dimension {len(prefill_vec)} but "
+                            f"decode_steering_vectors[{hook!r}]"
+                            f"[{layer_idx}] has "
+                            f"dimension {len(decode_vec)}. "
+                            f"Overlapping entries must have "
+                            f"matching dimensions."
+                        )
+
     def _validate_single_steering_spec(
         self, field_name: str, spec: SteeringVectorSpec
     ) -> None:
