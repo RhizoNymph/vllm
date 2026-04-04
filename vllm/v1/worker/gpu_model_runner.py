@@ -1361,6 +1361,10 @@ class GPUModelRunner(
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
+            if resumed_from_preemption:
+                self._reset_steering_for_resumption(
+                    req_id, req_state, num_computed_tokens
+                )
 
             if not is_last_rank:
                 if not req_data.new_token_ids:
@@ -1592,6 +1596,9 @@ class GPUModelRunner(
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
+        )
+        self._reset_steering_for_resumption(
+            req_id, req_state, new_req_data.num_computed_tokens
         )
 
         # Clear `output_token_ids` as previous output tokens are now part of
@@ -3382,6 +3389,60 @@ class GPUModelRunner(
         # Update phase tracking regardless of whether decode
         # registration succeeded or was deferred.
         self._req_steering_phase[req_id] = "decode"
+
+    def _reset_steering_for_resumption(
+        self,
+        req_id: str,
+        req_state: "CachedRequestState",
+        new_num_computed_tokens: int,
+    ) -> None:
+        """Reset steering config registration when a request re-enters prefill.
+
+        Called when a preempted request is resumed with num_computed_tokens
+        reset. If the request had transitioned to decode before preemption,
+        its decode config is still registered and its phase is stale.
+        This helper releases the stale decode config and re-registers the
+        prefill config (or defers it on capacity exhaustion).
+        """
+        if getattr(self, "_steering_manager", None) is None:
+            return
+        prev_phase = self._req_steering_phase.get(req_id)
+        if prev_phase != "decode":
+            return
+        if new_num_computed_tokens >= req_state.num_prompt_tokens:
+            return  # still in decode, nothing to reset
+
+        # Release the stale decode config.
+        if req_state.decode_steering_config_hash != 0:
+            self._steering_manager.release_config(
+                req_state.decode_steering_config_hash, "decode"
+            )
+
+        # Drop any stale deferred entries for this request.
+        if self._pending_steering_registrations:
+            self._pending_steering_registrations = [
+                e for e in self._pending_steering_registrations if e[0] != req_id
+            ]
+
+        self._req_steering_phase[req_id] = "prefill"
+
+        sp = req_state.sampling_params
+        prefill_hash = req_state.prefill_steering_config_hash
+        if prefill_hash == 0 or sp is None or not sp.effective_prefill_steering:
+            return
+        try:
+            self._steering_manager.register_config(
+                prefill_hash, sp.effective_prefill_steering, phase="prefill"
+            )
+        except RuntimeError:
+            self._pending_steering_registrations.append(
+                (req_id, prefill_hash, sp.effective_prefill_steering, "prefill")
+            )
+            logger.warning(
+                "Deferred prefill steering config (hash=%d) on resumption "
+                "-- capacity full, will retry next step",
+                prefill_hash,
+            )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()

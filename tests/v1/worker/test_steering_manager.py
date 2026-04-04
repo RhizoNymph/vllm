@@ -1435,3 +1435,170 @@ class TestDeviceMismatch:
             f"Combined row {row} mismatch: "
             f"expected {expected_combined}, got {table[row].cpu()}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestPreemptionResumption
+# ---------------------------------------------------------------------------
+
+
+class TestPreemptionResumption:
+    """Regression tests for the preempt/resume steering config leak (C1).
+
+    When the scheduler preempts a request that already transitioned to decode
+    and later resumes it, the request re-enters prefill with num_computed=0.
+    The model runner must:
+      1) Release the stale decode config (refcount -> 0, row freed).
+      2) Re-register the prefill config.
+      3) Reset ``_req_steering_phase[req_id]`` to ``"prefill"``.
+
+    Without this reset, the final release after the request finishes only
+    drops refcount from 2 -> 1 (because the prefill->decode transition
+    re-registers the decode config on top of an already-registered one),
+    leaking the row permanently.
+
+    These tests exercise the SteeringManager primitives the fix relies on
+    plus a small simulation of the model-runner bookkeeping path.
+    """
+
+    def test_manager_primitives_contract(self):
+        """SteeringManager contract the fix builds on: register/release is
+        refcount-correct across phase transitions."""
+        mgr = _make_manager(max_configs=2)
+        initial_free_len = len(mgr.free_rows)
+        prefill_vecs = {_HP: {0: [1.0, 2.0] + [0.0] * (HIDDEN_SIZE - 2)}}
+        decode_vecs = {_HP: {0: [0.5, 0.5] + [0.0] * (HIDDEN_SIZE - 2)}}
+        hash_p = 1001
+        hash_d = 2002
+
+        # Step 1: register prefill config
+        row_p = mgr.register_config(hash_p, prefill_vecs, phase="prefill")
+        assert mgr.config_refcounts[(hash_p, "prefill")] == 1
+        assert row_p >= 3
+        assert (hash_p, "prefill") in mgr.config_to_row
+
+        # Step 2: normal prefill->decode transition — release prefill,
+        # register decode.  Row is reclaimed for decode.
+        mgr.release_config(hash_p, "prefill")
+        row_d = mgr.register_config(hash_d, decode_vecs, phase="decode")
+        assert mgr.config_refcounts[(hash_d, "decode")] == 1
+        assert (hash_p, "prefill") not in mgr.config_to_row
+        assert (hash_d, "decode") in mgr.config_to_row
+        # Only one active config entry: the decode one.
+        assert len(mgr.config_to_row) == 1
+
+        # Step 3: BASELINE no-fix behavior — a buggy re-transition after
+        # resumption would register the decode config AGAIN on top of the
+        # existing one, bumping refcount to 2.
+        mgr.register_config(hash_d, decode_vecs, phase="decode")
+        assert mgr.config_refcounts[(hash_d, "decode")] == 2, (
+            "Baseline bug check: a double-register must bump refcount to 2, "
+            "proving that without the fix the refcount leaks."
+        )
+
+        # Step 4: the corrected flow — fresh manager, then release decode
+        # and register prefill (what the helper will do on resumption).
+        mgr = _make_manager(max_configs=2)
+        mgr.register_config(hash_p, prefill_vecs, phase="prefill")
+        mgr.release_config(hash_p, "prefill")
+        mgr.register_config(hash_d, decode_vecs, phase="decode")
+        # Now simulate the helper's behaviour on resumption: release the
+        # stale decode config, re-register the prefill config.
+        mgr.release_config(hash_d, "decode")
+        row_p_again = mgr.register_config(hash_p, prefill_vecs, phase="prefill")
+        assert (hash_d, "decode") not in mgr.config_to_row
+        assert mgr.config_refcounts[(hash_p, "prefill")] == 1
+        assert row_p_again >= 3
+
+        # Step 5: on finish the request releases its live prefill config.
+        mgr.release_config(hash_p, "prefill")
+        assert mgr.config_to_row == {}
+        assert len(mgr.free_rows) == initial_free_len, (
+            "Row should be returned to free_rows after the final release."
+        )
+
+    def test_stale_phase_on_resumption_simulated(self):
+        """Simulate the model-runner ``_req_steering_phase`` + manager
+        interaction.  Confirms the bug exists without the reset helper and
+        is eliminated once the helper runs."""
+        prefill_vecs = {_HP: {0: [1.0, 2.0] + [0.0] * (HIDDEN_SIZE - 2)}}
+        decode_vecs = {_HP: {0: [0.5, 0.5] + [0.0] * (HIDDEN_SIZE - 2)}}
+        hash_p = 333
+        hash_d = 444
+
+        def simulate_lifecycle(apply_reset: bool) -> "SteeringManager":
+            """Simulate: register prefill -> transition to decode -> preempt
+            -> resume (optionally running the reset helper) -> transition
+            to decode again -> finish.  Returns the manager for inspection.
+            """
+            mgr = _make_manager(max_configs=2)
+            # Model-runner bookkeeping we care about
+            req_phase: dict[str, str] = {}
+            req_id = "req-X"
+
+            # Initial admission in prefill
+            mgr.register_config(hash_p, prefill_vecs, phase="prefill")
+            req_phase[req_id] = "prefill"
+
+            # Prefill->decode transition: release prefill, register decode
+            mgr.release_config(hash_p, "prefill")
+            mgr.register_config(hash_d, decode_vecs, phase="decode")
+            req_phase[req_id] = "decode"
+
+            # --- PREEMPTION ---
+            # Scheduler resets num_computed_tokens=0, request re-enters
+            # WAITING and is later RESUMED.  The model runner sees it come
+            # back with num_computed < num_prompt (i.e. prefill phase).
+            # Without the reset helper, the bookkeeping is STALE:
+            # req_phase[req_id] == "decode" and (hash_d, "decode") is still
+            # registered.
+            if apply_reset:
+                # The fix: release the stale decode config, re-register
+                # prefill, clear phase to "prefill".
+                if req_phase.get(req_id) == "decode":
+                    mgr.release_config(hash_d, "decode")
+                    req_phase[req_id] = "prefill"
+                    mgr.register_config(hash_p, prefill_vecs, phase="prefill")
+
+            # Re-prefill finishes -> transition runs again (release prefill,
+            # register decode).  In the buggy path this release is a no-op
+            # (not registered) and the register bumps the existing decode
+            # refcount to 2.
+            if req_phase.get(req_id) == "prefill":
+                mgr.release_config(hash_p, "prefill")
+            else:
+                # The stale path — the runner thinks it's already in
+                # decode, so release_config for prefill is a no-op.
+                mgr.release_config(hash_p, "prefill")
+            mgr.register_config(hash_d, decode_vecs, phase="decode")
+            req_phase[req_id] = "decode"
+
+            # Request finishes — the runner's cleanup pops the phase and
+            # releases whichever config corresponds to the tracked phase.
+            final_phase = req_phase.pop(req_id, None)
+            if final_phase == "decode":
+                mgr.release_config(hash_d, "decode")
+            elif final_phase == "prefill":
+                mgr.release_config(hash_p, "prefill")
+            return mgr
+
+        # Without the reset helper, the decode config leaks (refcount
+        # should be 1 after finish, but is 2 before release and 1 after).
+        mgr_buggy = simulate_lifecycle(apply_reset=False)
+        assert mgr_buggy.config_refcounts.get((hash_d, "decode"), 0) == 1, (
+            "Without the reset helper the decode config leaks: refcount "
+            "stays at 1 after finish instead of dropping to 0."
+        )
+        assert (hash_d, "decode") in mgr_buggy.config_to_row, (
+            "Without the reset helper the decode row is NOT reclaimed."
+        )
+
+        # With the reset helper, the decode config is fully released on
+        # finish and the row is reclaimed.
+        mgr_fixed = simulate_lifecycle(apply_reset=True)
+        assert (hash_d, "decode") not in mgr_fixed.config_to_row, (
+            "With the reset helper the decode row must be reclaimed after "
+            "finish."
+        )
+        assert (hash_d, "decode") not in mgr_fixed.config_refcounts
+        assert mgr_fixed.num_active_configs == 0
