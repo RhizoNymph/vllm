@@ -264,8 +264,12 @@ class SteeringManager:
                     )
                     if phase == "prefill":
                         phase_global = global_prefill
-                    else:
+                    elif phase == "decode":
                         phase_global = global_decode
+                    else:
+                        raise ValueError(
+                            f"Invalid phase: {phase!r}. Must be 'prefill' or 'decode'."
+                        )
 
                     if phase_global is not None and per_req is not None:
                         combined = phase_global + per_req.squeeze(0).to(
