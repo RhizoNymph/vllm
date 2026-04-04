@@ -14,7 +14,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import vllm.envs as envs
-from vllm.entrypoints.serve.steering.api_router import attach_router, router
+from vllm.entrypoints.serve.steering.api_router import (
+    _normalize_spec,
+    attach_router,
+    router,
+)
 from vllm.exceptions import SteeringVectorError
 from vllm.model_executor.layers.steering import DEFAULT_HOOK_POINT
 
@@ -447,6 +451,41 @@ class TestGetSteering:
         resp = client.get("/v1/steering")
         assert resp.status_code == 500
         assert "fail" in resp.json()["error"]
+
+
+# --- _normalize_spec ---
+
+
+class TestNormalizeSpec:
+    """Tests for the ``_normalize_spec`` helper."""
+
+    def test_normalize_spec_drops_empty_hook(self):
+        """Hooks whose layer dict is empty are dropped from the result.
+
+        An input like ``{"post_mlp_pre_ln": {}}`` is functionally
+        equivalent to omitting the hook entirely: no layers and no
+        vectors would be applied. Keeping the empty hook in the
+        normalized spec would produce a truthy-but-empty entry that
+        confuses downstream checks (affects_cache, response payload).
+        """
+        spec: dict = {_HP: {}}
+        result = _normalize_spec(spec)
+        assert _HP not in result
+        assert result == {}
+
+    def test_normalize_spec_drops_only_empty_hook(self):
+        """Empty hooks are dropped while populated hooks are preserved."""
+        spec: dict = {_HP: {0: [1.0, 2.0]}, "pre_attn": {}}
+        result = _normalize_spec(spec)
+        assert "pre_attn" not in result
+        assert _HP in result
+        assert result[_HP] == {0: [1.0, 2.0]}
+
+    def test_normalize_spec_keeps_populated_hook(self):
+        """Hooks with at least one layer entry survive normalization."""
+        spec: dict = {_HP: {0: [1.0, 2.0]}}
+        result = _normalize_spec(spec)
+        assert result == {_HP: {0: [1.0, 2.0]}}
 
 
 # --- attach_router ---
