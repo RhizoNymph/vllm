@@ -1502,7 +1502,7 @@ class TestPreemptionResumption:
         # Step 2: normal prefill->decode transition — release prefill,
         # register decode.  Row is reclaimed for decode.
         mgr.release_config(hash_p, "prefill")
-        row_d = mgr.register_config(hash_d, decode_vecs, phase="decode")
+        mgr.register_config(hash_d, decode_vecs, phase="decode")
         assert mgr.config_refcounts[(hash_d, "decode")] == 1
         assert (hash_p, "prefill") not in mgr.config_to_row
         assert (hash_d, "decode") in mgr.config_to_row
@@ -1574,13 +1574,12 @@ class TestPreemptionResumption:
             # Without the reset helper, the bookkeeping is STALE:
             # req_phase[req_id] == "decode" and (hash_d, "decode") is still
             # registered.
-            if apply_reset:
-                # The fix: release the stale decode config, re-register
-                # prefill, clear phase to "prefill".
-                if req_phase.get(req_id) == "decode":
-                    mgr.release_config(hash_d, "decode")
-                    req_phase[req_id] = "prefill"
-                    mgr.register_config(hash_p, prefill_vecs, phase="prefill")
+            # The fix: release the stale decode config, re-register
+            # prefill, clear phase to "prefill".
+            if apply_reset and req_phase.get(req_id) == "decode":
+                mgr.release_config(hash_d, "decode")
+                req_phase[req_id] = "prefill"
+                mgr.register_config(hash_p, prefill_vecs, phase="prefill")
 
             # Re-prefill finishes -> transition runs again (release prefill,
             # register decode).  In the buggy path this release is a no-op
@@ -1619,8 +1618,282 @@ class TestPreemptionResumption:
         # finish and the row is reclaimed.
         mgr_fixed = simulate_lifecycle(apply_reset=True)
         assert (hash_d, "decode") not in mgr_fixed.config_to_row, (
-            "With the reset helper the decode row must be reclaimed after "
-            "finish."
+            "With the reset helper the decode row must be reclaimed after finish."
         )
         assert (hash_d, "decode") not in mgr_fixed.config_refcounts
         assert mgr_fixed.num_active_configs == 0
+
+
+# ---------------------------------------------------------------------------
+# TestTransitionUnderCapacity
+# ---------------------------------------------------------------------------
+
+
+class TestTransitionUnderCapacity:
+    """Exercise the bookkeeping contract of ``_handle_steering_transition``
+    when the decode config cannot be registered due to capacity.
+
+    The runner method is mirrored below as a pure function so the
+    behaviour can be verified without a live GPUModelRunner.  The three
+    invariants being guarded:
+
+    1) The prefill config is released before the decode register attempt.
+    2) When ``register_config`` raises ``RuntimeError`` (capacity full),
+       the tuple ``(req_id, decode_hash, vectors, "decode")`` is appended
+       to ``_pending_steering_registrations``.
+    3) ``_req_steering_phase[req_id]`` is set to ``"decode"`` even when
+       the decode registration was deferred, so the deferred-retry loop
+       can match the phase on the next step.
+    """
+
+    @staticmethod
+    def _transition(
+        mgr: "SteeringManager",
+        pending: list,
+        req_phase: dict,
+        req_id: str,
+        prefill_hash: int,
+        decode_hash: int,
+        decode_vectors: dict,
+    ) -> None:
+        """Transcription of ``GPUModelRunner._handle_steering_transition``.
+
+        Kept in lockstep with ``vllm/v1/worker/gpu_model_runner.py`` lines
+        3412-3458 (update when that code changes).
+        """
+        if prefill_hash != 0:
+            mgr.release_config(prefill_hash, "prefill")
+        if decode_hash != 0 and decode_vectors:
+            try:
+                mgr.register_config(decode_hash, decode_vectors, phase="decode")
+            except RuntimeError:
+                pending.append((req_id, decode_hash, decode_vectors, "decode"))
+        req_phase[req_id] = "decode"
+
+    def test_decode_registration_succeeds_with_headroom(self):
+        """With capacity available, decode is registered and nothing is
+        deferred."""
+        mgr = _make_manager(max_configs=2)
+        pending: list = []
+        req_phase: dict = {}
+        prefill_vecs = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        decode_vecs = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+
+        mgr.register_config(config_hash=1, vectors=prefill_vecs, phase="prefill")
+        req_phase["req-A"] = "prefill"
+
+        self._transition(
+            mgr,
+            pending,
+            req_phase,
+            req_id="req-A",
+            prefill_hash=1,
+            decode_hash=2,
+            decode_vectors=decode_vecs,
+        )
+        assert pending == []
+        assert (2, "decode") in mgr.config_to_row
+        assert (1, "prefill") not in mgr.config_to_row
+        assert req_phase["req-A"] == "decode"
+
+    def test_decode_registration_deferred_on_capacity_exhaustion(self):
+        """When capacity is full, decode is deferred with phase='decode'
+        and ``_req_steering_phase[req_id]`` is still set to 'decode'.
+
+        ``get_row_for_config`` falls back to row 2 so the request keeps
+        running with global-only decode steering until the deferred
+        entry is retried next step.
+        """
+        mgr = _make_manager(max_configs=1)
+        pending: list = []
+        req_phase: dict = {}
+        blocker_vecs = {_HP: {0: [9.0] * HIDDEN_SIZE}}
+        # Fill the single per-request row with an unrelated running
+        # request's prefill config.
+        mgr.register_config(config_hash=99, vectors=blocker_vecs, phase="prefill")
+        req_phase["req-blocker"] = "prefill"
+
+        # A different request reaches the prefill->decode boundary.  Its
+        # prefill_hash=0 (no per-request prefill steering), decode_hash=5.
+        decode_vecs = {_HP: {0: [5.0] * HIDDEN_SIZE}}
+        req_phase["req-A"] = "prefill"
+        self._transition(
+            mgr,
+            pending,
+            req_phase,
+            req_id="req-A",
+            prefill_hash=0,
+            decode_hash=5,
+            decode_vectors=decode_vecs,
+        )
+        # Deferred
+        assert len(pending) == 1
+        assert pending[0] == ("req-A", 5, decode_vecs, "decode")
+        # Phase tracking must be updated so the retry loop can match.
+        assert req_phase["req-A"] == "decode"
+        # Row 2 is the decode fallback — unregistered decode hash yields 2.
+        assert mgr.get_row_for_config(5, is_prefill=False) == 2
+        # The blocker slot is still owned by req-blocker.
+        assert (99, "prefill") in mgr.config_to_row
+        assert (5, "decode") not in mgr.config_to_row
+
+    def test_deferred_entry_registers_after_capacity_frees(self):
+        """Round-trip: a deferred entry registers on the next retry once
+        another request releases its slot."""
+        mgr = _make_manager(max_configs=1)
+        pending: list = []
+        req_phase: dict = {}
+        blocker_vecs = {_HP: {0: [9.0] * HIDDEN_SIZE}}
+        mgr.register_config(99, blocker_vecs, phase="prefill")
+        req_phase["req-blocker"] = "prefill"
+
+        decode_vecs = {_HP: {0: [5.0] * HIDDEN_SIZE}}
+        req_phase["req-A"] = "prefill"
+        self._transition(
+            mgr,
+            pending,
+            req_phase,
+            req_id="req-A",
+            prefill_hash=0,
+            decode_hash=5,
+            decode_vectors=decode_vecs,
+        )
+        assert len(pending) == 1
+
+        # Blocker request finishes, its row is freed.
+        mgr.release_config(99, "prefill")
+        req_phase.pop("req-blocker", None)
+
+        # Drive the retry loop (same body as the runner's retry at
+        # gpu_model_runner.py:3322-3345).
+        still_pending: list = []
+        for d_req_id, d_hash, d_vecs, d_phase in pending:
+            if d_req_id not in req_phase:
+                continue
+            if req_phase.get(d_req_id) != d_phase:
+                continue
+            try:
+                mgr.register_config(d_hash, d_vecs, phase=d_phase)
+            except RuntimeError:
+                still_pending.append((d_req_id, d_hash, d_vecs, d_phase))
+        pending = still_pending
+
+        assert pending == []
+        assert (5, "decode") in mgr.config_to_row
+        assert mgr.get_row_for_config(5, is_prefill=False) >= 3
+
+
+# ---------------------------------------------------------------------------
+# TestPendingGlobalsReplay
+# ---------------------------------------------------------------------------
+
+
+class TestPendingGlobalsReplay:
+    """Verify that ``_pending_steering_globals`` entries captured before
+    lazy init are replayed into the SteeringManager with the correct
+    phase labels.
+
+    Reference code: ``vllm/v1/worker/gpu_model_runner.py:3228-3239``.
+    """
+
+    @staticmethod
+    def _replay(
+        mgr: "SteeringManager",
+        pending: list[tuple[dict[str, dict[int, torch.Tensor]], str]],
+    ) -> None:
+        """Transcription of the replay loop in ``_update_steering_buffers``
+        lazy-init.  Keep in lockstep with
+        ``gpu_model_runner.py:3229-3238``.
+        """
+        for captured_vectors, phase in pending:
+            for hook_point_str, layer_vecs in captured_vectors.items():
+                for layer_idx, vec in layer_vecs.items():
+                    mgr.update_global_vectors(
+                        hook_point_str, layer_idx, vec, phase=phase
+                    )
+
+    def test_mixed_phase_labels_land_in_correct_dicts(self):
+        """Entries with phase=base/prefill/decode must land in the
+        matching ``global_*_vectors`` dict, not collapse into one tier.
+        """
+        mgr = _make_manager()
+        base_vec = torch.ones(HIDDEN_SIZE) * 2.0
+        prefill_vec = torch.ones(HIDDEN_SIZE) * 3.0
+        decode_vec = torch.ones(HIDDEN_SIZE) * 4.0
+
+        pending: list[tuple[dict[str, dict[int, torch.Tensor]], str]] = [
+            ({_HP: {0: base_vec}}, "base"),
+            ({_HP: {0: prefill_vec}}, "prefill"),
+            ({_HP: {0: decode_vec}}, "decode"),
+        ]
+        self._replay(mgr, pending)
+
+        # Each tier must be populated from its own entry.
+        assert _HP in mgr.global_base_vectors
+        assert 0 in mgr.global_base_vectors[_HP]
+        assert torch.allclose(mgr.global_base_vectors[_HP][0], base_vec)
+
+        assert _HP in mgr.global_prefill_vectors
+        assert torch.allclose(mgr.global_prefill_vectors[_HP][0], prefill_vec)
+
+        assert _HP in mgr.global_decode_vectors
+        assert torch.allclose(mgr.global_decode_vectors[_HP][0], decode_vec)
+
+    def test_multi_layer_multi_hook_replay(self):
+        """Replay must iterate across all hook points and layers in each
+        captured entry, not just the first."""
+        mgr = _make_manager()
+
+        # Two hook points, two layers each.
+        hp_a = _HP
+        # Use the enum to get a second valid hook point name at runtime.
+        from vllm.model_executor.layers.steering import SteeringHookPoint
+
+        hook_names = [hp.value for hp in SteeringHookPoint]
+        hp_b = next(name for name in hook_names if name != hp_a)
+
+        vec_a0 = torch.ones(HIDDEN_SIZE) * 1.0
+        vec_a1 = torch.ones(HIDDEN_SIZE) * 2.0
+        vec_b0 = torch.ones(HIDDEN_SIZE) * 3.0
+
+        pending = [
+            ({hp_a: {0: vec_a0, 1: vec_a1}, hp_b: {0: vec_b0}}, "prefill"),
+        ]
+        self._replay(mgr, pending)
+
+        assert mgr.global_prefill_vectors[hp_a][0] is not None
+        assert mgr.global_prefill_vectors[hp_a][1] is not None
+        assert mgr.global_prefill_vectors[hp_b][0] is not None
+        assert torch.allclose(mgr.global_prefill_vectors[hp_a][0], vec_a0)
+        assert torch.allclose(mgr.global_prefill_vectors[hp_a][1], vec_a1)
+        assert torch.allclose(mgr.global_prefill_vectors[hp_b][0], vec_b0)
+        # Other phases must remain empty.
+        assert mgr.global_base_vectors == {}
+        assert mgr.global_decode_vectors == {}
+
+    def test_replay_then_populate_uses_phase_specific_globals(self):
+        """End-to-end: after replay, ``populate_steering_tables`` must
+        render row 1 as base+prefill and row 2 as base+decode.
+        """
+        mgr = _make_manager()
+        base_vec = torch.ones(HIDDEN_SIZE) * 2.0
+        prefill_vec = torch.ones(HIDDEN_SIZE) * 3.0
+        decode_vec = torch.ones(HIDDEN_SIZE) * 5.0
+
+        pending = [
+            ({_HP: {0: base_vec}}, "base"),
+            ({_HP: {0: prefill_vec}}, "prefill"),
+            ({_HP: {0: decode_vec}}, "decode"),
+        ]
+        self._replay(mgr, pending)
+
+        layers = _make_layers(mgr, layer_indices=[0])
+        mgr.populate_steering_tables(layers)
+        table = getattr(layers[0], _TABLE_ATTR)
+
+        # Row 0 is the zeros sentinel.
+        assert torch.allclose(table[0], torch.zeros(HIDDEN_SIZE))
+        # Row 1 = base + prefill.
+        assert torch.allclose(table[1], base_vec + prefill_vec)
+        # Row 2 = base + decode.
+        assert torch.allclose(table[2], base_vec + decode_vec)
