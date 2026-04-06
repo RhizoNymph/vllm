@@ -57,15 +57,30 @@ class TestNormalizeLayerEntry:
             normalize_layer_entry(entry)
 
     def test_dict_missing_both_keys_raises(self):
-        """Dict with neither 'vector' nor 'scale' should raise ValueError."""
+        """Dict with neither 'vector' nor 'scale' should raise ValueError.
+
+        With extra-key validation, the unexpected key is caught first.
+        """
         entry = {"foo": "bar"}
-        with pytest.raises(ValueError, match="missing required key"):
+        with pytest.raises(ValueError, match="unexpected keys"):
             normalize_layer_entry(entry)
 
     def test_dict_missing_key_error_lists_missing(self):
         """Error message should list the specific missing key(s)."""
         entry = {"vector": [1.0]}
         with pytest.raises(ValueError, match=r"\['scale'\]"):
+            normalize_layer_entry(entry)
+
+    def test_dict_with_extra_keys_raises(self):
+        """Dict with extra keys beyond 'vector' and 'scale' should raise."""
+        entry = {"vector": [1.0, 2.0], "scale": 1.0, "extra": "bad"}
+        with pytest.raises(ValueError, match="unexpected keys"):
+            normalize_layer_entry(entry)
+
+    def test_dict_with_multiple_extra_keys_raises(self):
+        """All extra keys should be listed in error."""
+        entry = {"vector": [1.0], "scale": 1.0, "foo": 1, "bar": 2}
+        with pytest.raises(ValueError, match="unexpected keys"):
             normalize_layer_entry(entry)
 
     def test_invalid_type_raises(self):
@@ -387,5 +402,54 @@ class TestDimensionCrossValidation:
                 },
                 decode_steering_vectors={
                     "post_mlp_pre_ln": {0: [1.0]},
+                },
+            )
+
+
+# -----------------------------------------------------------------------
+# SamplingParams extra-key rejection
+# -----------------------------------------------------------------------
+
+
+class TestSamplingParamsExtraKeyRejection:
+    """SamplingParams._validate_layer_entry should reject extra keys
+    in scaled steering dict entries."""
+
+    def test_extra_key_in_steering_vectors_raises(self):
+        """Extra key in a steering_vectors scaled entry should raise."""
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(ValueError, match="unexpected keys"):
+            SamplingParams(
+                steering_vectors={
+                    "post_mlp_pre_ln": {
+                        0: {"vector": [1.0, 2.0], "scale": 1.0, "typo": "bad"},
+                    },
+                },
+            )
+
+    def test_extra_key_in_prefill_steering_vectors_raises(self):
+        """Extra key in a prefill_steering_vectors scaled entry should raise."""
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(ValueError, match="unexpected keys"):
+            SamplingParams(
+                prefill_steering_vectors={
+                    "post_mlp_pre_ln": {
+                        0: {"vector": [1.0], "scale": 1.0, "extra": 42},
+                    },
+                },
+            )
+
+    def test_extra_key_in_decode_steering_vectors_raises(self):
+        """Extra key in a decode_steering_vectors scaled entry should raise."""
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(ValueError, match="unexpected keys"):
+            SamplingParams(
+                decode_steering_vectors={
+                    "post_mlp_pre_ln": {
+                        0: {"vector": [1.0], "scale": 1.0, "foo": 1, "bar": 2},
+                    },
                 },
             )

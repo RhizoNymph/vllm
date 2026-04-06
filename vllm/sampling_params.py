@@ -662,6 +662,13 @@ class SamplingParams(
         """Validate a single layer entry (bare list or dict with scale)."""
         prefix = f"{field_name}[{hook_name!r}][{layer_idx}]"
         if isinstance(entry, dict):
+            allowed = {"vector", "scale"}
+            extra = set(entry.keys()) - allowed
+            if extra:
+                raise ValueError(
+                    f"{prefix} dict entry has unexpected keys: {sorted(extra)}; "
+                    f"allowed keys: ['scale', 'vector']"
+                )
             if "vector" not in entry or "scale" not in entry:
                 raise ValueError(
                     f"{prefix} dict entries must have 'vector' "
