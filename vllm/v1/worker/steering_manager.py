@@ -40,8 +40,13 @@ class SteeringManager:
             + per_request combined
     """
 
-    def __init__(self, max_steering_configs: int):
+    def __init__(
+        self,
+        max_steering_configs: int,
+        device: torch.device | None = None,
+    ):
         self.max_steering_configs = max_steering_configs
+        self.device = device
         # (config_hash, phase) -> assigned table row index (3-based)
         self.config_to_row: dict[tuple[int, str], int] = {}
         # (config_hash, phase) -> {hook_point_str: {layer_idx: tensor}}
@@ -102,7 +107,9 @@ class SteeringManager:
         stored: dict[str, dict[int, torch.Tensor]] = {}
         for hook_point, layer_vecs in vectors.items():
             stored[hook_point] = {
-                layer_idx: torch.tensor(vec, dtype=torch.float32).unsqueeze(0)
+                layer_idx: torch.tensor(
+                    vec, dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
                 for layer_idx, vec in layer_vecs.items()
             }
         self.config_vectors[key] = stored
@@ -279,7 +286,11 @@ class SteeringManager:
                     elif phase_global is not None:
                         table[row].copy_(phase_global.to(table.dtype))
                     elif per_req is not None:
-                        table[row].copy_(per_req.squeeze(0).to(table.dtype))
+                        table[row].copy_(
+                            per_req.squeeze(0).to(
+                                dtype=table.dtype, device=table.device
+                            )
+                        )
                     else:
                         table[row].zero_()
 

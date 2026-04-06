@@ -3210,7 +3210,21 @@ class GPUModelRunner(
                 )
                 from vllm.v1.worker.steering_manager import SteeringManager
 
-                self._steering_manager = SteeringManager(max_configs)
+                # Resolve device from the first steerable layer's table
+                # buffer so per-request vectors are allocated on the same
+                # device, avoiding CPU->GPU copies each step.
+                table_device: torch.device | None = None
+                for mod in steerable.values():
+                    for attr in HOOK_POINT_TABLE_ATTR.values():
+                        if hasattr(mod, attr):
+                            table_device = getattr(mod, attr).device
+                            break
+                    if table_device is not None:
+                        break
+
+                self._steering_manager = SteeringManager(
+                    max_configs, device=table_device
+                )
                 # Each entry: (req_id, config_hash, vectors, phase).
                 # Retried with priority before new admissions.
                 self._pending_steering_registrations: list[
