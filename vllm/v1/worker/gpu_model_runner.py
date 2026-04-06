@@ -1597,10 +1597,6 @@ class GPUModelRunner(
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
-        self._reset_steering_for_resumption(
-            req_id, req_state, new_req_data.num_computed_tokens
-        )
-
         # Clear `output_token_ids` as previous output tokens are now part of
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
