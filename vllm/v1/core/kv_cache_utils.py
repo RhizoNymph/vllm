@@ -525,20 +525,36 @@ def _gen_steering_extra_hash_keys(
         # Always include both hashes in fixed positions [prefill, decode]
         # so that (prefill=X, decode=0) is distinguishable from
         # (prefill=0, decode=X).
-        prefill_hash = getattr(request, "prefill_steering_config_hash", 0)
-        decode_hash = getattr(request, "decode_steering_config_hash", 0)
+        prefill_hash = getattr(
+            request,
+            "block_hash_prefill_steering_config_hash",
+            getattr(request, "prefill_steering_config_hash", 0),
+        )
+        decode_hash = getattr(
+            request,
+            "block_hash_decode_steering_config_hash",
+            getattr(request, "decode_steering_config_hash", 0),
+        )
         if prefill_hash == 0 and decode_hash == 0:
             return []
         return [prefill_hash, decode_hash]
     elif start_token_idx < num_prompt_tokens:
         # Pure prompt block — only prefill steering affects KV
-        prefill_hash = getattr(request, "prefill_steering_config_hash", 0)
+        prefill_hash = getattr(
+            request,
+            "block_hash_prefill_steering_config_hash",
+            getattr(request, "prefill_steering_config_hash", 0),
+        )
         if prefill_hash == 0:
             return []
         return [prefill_hash]
     else:
         # Pure decode block — decode steering affects KV
-        decode_hash = getattr(request, "decode_steering_config_hash", 0)
+        decode_hash = getattr(
+            request,
+            "block_hash_decode_steering_config_hash",
+            getattr(request, "decode_steering_config_hash", 0),
+        )
         if decode_hash == 0:
             return []
         return [decode_hash]

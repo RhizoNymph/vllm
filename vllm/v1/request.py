@@ -164,6 +164,12 @@ class Request:
         self.num_external_computed_tokens = 0
 
         self.block_hashes: list[BlockHash] = []
+        self.block_hash_prefill_steering_config_hash = (
+            self.prefill_steering_config_hash
+        )
+        self.block_hash_decode_steering_config_hash = (
+            self.decode_steering_config_hash
+        )
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
@@ -218,6 +224,38 @@ class Request:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
+
+    def set_block_hash_steering_overrides(
+        self,
+        prefill_hash: int | None = None,
+        decode_hash: int | None = None,
+    ) -> None:
+        """Update the steering hashes used for block-hash generation.
+
+        Prefix-cache keys must track the effective steering applied when KV
+        blocks are produced. Scheduler-side capacity checks may temporarily
+        force a request onto the global fallback rows before the per-request
+        steering config can be registered, in which case APC should hash with
+        0 for that phase rather than the deferred per-request hash.
+        """
+        new_prefill_hash = (
+            self.prefill_steering_config_hash
+            if prefill_hash is None
+            else prefill_hash
+        )
+        new_decode_hash = (
+            self.decode_steering_config_hash if decode_hash is None else decode_hash
+        )
+        if (
+            self.block_hash_prefill_steering_config_hash == new_prefill_hash
+            and self.block_hash_decode_steering_config_hash == new_decode_hash
+        ):
+            return
+
+        self.block_hash_prefill_steering_config_hash = new_prefill_hash
+        self.block_hash_decode_steering_config_hash = new_decode_hash
+        self.block_hashes.clear()
+        self.update_block_hashes()
 
     @property
     def use_structured_output(self) -> bool:

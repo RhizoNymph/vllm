@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for steering-aware prefix cache key generation."""
 
-from unittest.mock import Mock
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,21 +25,26 @@ def _init_hash():
 def make_mock_request(
     prefill_hash: int = 0,
     decode_hash: int = 0,
+    block_hash_prefill: int | None = None,
+    block_hash_decode: int | None = None,
     num_prompt_tokens: int = 10,
     has_prefill_attr: bool = True,
     has_decode_attr: bool = True,
-) -> Mock:
+) -> SimpleNamespace:
     """Create a mock request with optional steering config hashes."""
-    req = Mock()
-    req.num_prompt_tokens = num_prompt_tokens
+    req = SimpleNamespace(num_prompt_tokens=num_prompt_tokens)
     if has_prefill_attr:
         req.prefill_steering_config_hash = prefill_hash
-    else:
-        del req.prefill_steering_config_hash
     if has_decode_attr:
         req.decode_steering_config_hash = decode_hash
-    else:
-        del req.decode_steering_config_hash
+    if block_hash_prefill is None and has_prefill_attr:
+        block_hash_prefill = prefill_hash
+    if block_hash_decode is None and has_decode_attr:
+        block_hash_decode = decode_hash
+    if block_hash_prefill is not None:
+        req.block_hash_prefill_steering_config_hash = block_hash_prefill
+    if block_hash_decode is not None:
+        req.block_hash_decode_steering_config_hash = block_hash_decode
     return req
 
 
@@ -58,6 +63,15 @@ class TestGenSteeringExtraHashKeys:
         req = make_mock_request(prefill_hash=12345, num_prompt_tokens=10)
         result = _gen_steering_extra_hash_keys(req, start_token_idx=0, end_token_idx=8)
         assert result == [12345]
+
+    def test_prompt_block_prefers_effective_prefill_override(self):
+        req = make_mock_request(
+            prefill_hash=12345,
+            block_hash_prefill=0,
+            num_prompt_tokens=10,
+        )
+        result = _gen_steering_extra_hash_keys(req, start_token_idx=0, end_token_idx=8)
+        assert result == []
 
     def test_prompt_block_getattr_fallback_when_attribute_missing(self):
         req = make_mock_request(has_prefill_attr=False, num_prompt_tokens=10)
@@ -78,6 +92,17 @@ class TestGenSteeringExtraHashKeys:
             req, start_token_idx=10, end_token_idx=18
         )
         assert result == [67890]
+
+    def test_generated_block_prefers_effective_decode_override(self):
+        req = make_mock_request(
+            decode_hash=67890,
+            block_hash_decode=0,
+            num_prompt_tokens=10,
+        )
+        result = _gen_steering_extra_hash_keys(
+            req, start_token_idx=10, end_token_idx=18
+        )
+        assert result == []
 
     def test_generated_block_returns_empty_when_decode_hash_is_zero(self):
         req = make_mock_request(decode_hash=0, num_prompt_tokens=10)

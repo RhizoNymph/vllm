@@ -13,8 +13,10 @@ from unittest.mock import MagicMock
 
 import torch
 
+from vllm.utils.hashing import sha256_cbor
 from vllm.config import DeviceConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -30,6 +32,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 STEERING_A = {"post_mlp": {0: [1.0, 2.0]}}
 STEERING_B = {"post_mlp": {0: [99.0, 100.0]}}
+
+init_none_hash(sha256_cbor)
 
 
 def _make_request(
@@ -176,6 +180,30 @@ class TestInvalidateSteeringHashes(unittest.TestCase):
         # The hashes should have swapped roles
         assert new_prefill == old_decode
         assert new_decode == old_prefill
+
+    def test_block_hash_steering_override_recomputes_hashes(self):
+        """Switching block-hash steering overrides must recompute APC keys."""
+        req = Request(
+            request_id="req-block-hash",
+            prompt_token_ids=[1, 2, 3, 4],
+            sampling_params=SamplingParams(
+                max_tokens=4,
+                prefill_steering_vectors=STEERING_A,
+            ),
+            pooling_params=None,
+            resumable=False,
+            block_hasher=get_request_block_hasher(2, sha256_cbor),
+        )
+
+        original_hashes = list(req.block_hashes)
+        assert original_hashes
+
+        req.set_block_hash_steering_overrides(prefill_hash=0)
+        fallback_hashes = list(req.block_hashes)
+        assert fallback_hashes != original_hashes
+
+        req.set_block_hash_steering_overrides()
+        assert req.block_hashes == original_hashes
 
 
 # ---------------------------------------------------------------------------

@@ -339,6 +339,40 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _set_request_block_hash_steering_overrides(
+        self,
+        request: Request,
+        scheduled_steering_configs: set[tuple[int, str]],
+    ) -> None:
+        """Keep APC steering keys aligned with the effective steering rows."""
+        prefill_hash = request.prefill_steering_config_hash
+        decode_hash = request.decode_steering_config_hash
+
+        if self.steering_config:
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                prefill_pair = (prefill_hash, "prefill")
+                if (
+                    prefill_hash != 0
+                    and prefill_pair not in scheduled_steering_configs
+                    and len(scheduled_steering_configs)
+                    >= self.steering_config.max_steering_configs
+                ):
+                    prefill_hash = 0
+            else:
+                decode_pair = (decode_hash, "decode")
+                if (
+                    decode_hash != 0
+                    and decode_pair not in scheduled_steering_configs
+                    and len(scheduled_steering_configs)
+                    >= self.steering_config.max_steering_configs
+                ):
+                    decode_hash = 0
+
+        request.set_block_hash_steering_overrides(
+            prefill_hash=prefill_hash,
+            decode_hash=decode_hash,
+        )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -633,6 +667,10 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                self._set_request_block_hash_steering_overrides(
+                    request, scheduled_steering_configs
+                )
+
                 # Check steering config capacity.  A new request only
                 # occupies one steering row at a time — the prefill
                 # row is released before the decode row is registered
@@ -660,6 +698,9 @@ class Scheduler(SchedulerInterface):
                             len(scheduled_steering_configs) + len(new_unique)
                             > self.steering_config.max_steering_configs
                         ):
+                            request.set_block_hash_steering_overrides(
+                                prefill_hash=0
+                            )
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
@@ -728,6 +769,7 @@ class Scheduler(SchedulerInterface):
                         and len(scheduled_steering_configs)
                         >= self.steering_config.max_steering_configs
                     ):
+                        request.set_block_hash_steering_overrides(decode_hash=0)
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
                         continue
