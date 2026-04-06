@@ -38,7 +38,14 @@ def normalize_layer_entry(entry: SteeringLayerEntry) -> tuple[list[float], float
     if isinstance(entry, list):
         return entry, 1.0
     if isinstance(entry, dict):
-        missing = {"vector", "scale"} - set(entry.keys())
+        allowed = {"vector", "scale"}
+        extra = set(entry.keys()) - allowed
+        if extra:
+            raise ValueError(
+                f"Scaled steering entry has unexpected keys: {sorted(extra)}; "
+                f"allowed keys: ['scale', 'vector']"
+            )
+        missing = allowed - set(entry.keys())
         if missing:
             raise ValueError(
                 f"Scaled steering entry missing required key(s): "
