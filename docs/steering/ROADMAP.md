@@ -71,12 +71,11 @@ The request-indexed gather approach is dramatically cheaper than the per-token b
 
 ### What was built
 
-Four hook points on the residual stream, all unconditionally allocated:
+Three hook points on the residual stream, all unconditionally allocated:
 
-- `pre_attn` — after `input_layernorm`, before `self_attn`
-- `post_attn` — after `post_attention_layernorm`, before `pre_feedforward_layernorm`
-- `post_mlp_pre_ln` — after `mlp`, before `post_feedforward_layernorm`
-- `post_mlp_post_ln` — after `post_feedforward_layernorm`
+- `pre_attn` — steer the residual skip tensor in the pre-attention region
+- `post_attn` — steer the residual skip tensor in the post-attention region
+- `post_mlp` — steer the residual skip tensor in the post-MLP region
 
 Key design decisions:
 
@@ -100,11 +99,7 @@ post_attention_layernorm(hidden_states)       # hidden_states only
 pre_feedforward_layernorm(hidden_states, residual)  # fused add + norm → updates residual
 mlp(hidden_states)
   ↓
-[post_mlp_pre_ln]                            ← default (backward compat)
-  ↓
-post_feedforward_layernorm(hidden_states)     # hidden_states only
-  ↓
-[post_mlp_post_ln]                           ← steer residual after post_ff_ln
+[post_mlp]                                   ← default
 ```
 
 ### Memory

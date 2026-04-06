@@ -27,7 +27,7 @@ Each vector entry supports co-located scales: either a bare `list[float]` (scale
 
 The implementation uses a **request-indexed gather** pattern with five components.
 Each decoder layer can have multiple **hook points** (e.g. `pre_attn`, `post_attn`,
-`post_mlp_pre_ln`, `post_mlp_post_ln`), each with its own steering table and global
+`post_mlp`), each with its own steering table and global
 vector buffer.
 
 ```
@@ -62,7 +62,7 @@ vector buffer.
 ### 1. Steering Table (Per-Layer, Per-Hook-Point Buffer)
 
 Each steerable decoder layer has a per-hook-point `steering_table_<hp>` buffer
-(e.g. `steering_table_post_mlp_pre_ln`) of shape `(max_steering_configs + 3, hidden_size)`.
+(e.g. `steering_table_post_mlp`) of shape `(max_steering_configs + 3, hidden_size)`.
 
 | Row | Contents | When used |
 |-----|----------|-----------|
@@ -123,7 +123,9 @@ Three endpoints under `/v1/steering/`, gated behind `VLLM_SERVER_DEV_MODE`. See 
 ## Intervention Points (Hook Points)
 
 Steering can be applied at multiple positions within `Gemma3DecoderLayer.forward()`.
-Each position is identified by a `SteeringHookPoint` enum value:
+Each position is identified by a `SteeringHookPoint` enum value.
+These hook names refer to where the carried residual skip tensor is
+steered, not to the post-norm tensor consumed by the next sublayer:
 
 ```
 input_layernorm(hidden_states, residual)
@@ -140,17 +142,13 @@ pre_feedforward_layernorm(hidden_states, residual)
     ↓
 mlp(hidden_states)
     ↓
-apply_steering(residual, table_post_mlp_pre_ln, index)  ← POST_MLP_PRE_LN (default)
-    ↓
-post_feedforward_layernorm(hidden_states)
-    ↓
-apply_steering(residual, table_post_mlp_post_ln, index) ← POST_MLP_POST_LN
+apply_steering(residual, table_post_mlp, index)  ← POST_MLP (default)
     ↓
 return hidden_states, residual
 ```
 
 Only hook points that are enabled (have buffers registered) are active.
-The default hook point is `post_mlp_pre_ln`, which matches where Gemma 3
+The default hook point is `post_mlp`, which matches where Gemma 3
 SAEs are trained.
 
 ## Key Files
@@ -176,7 +174,7 @@ SAEs are trained.
 ## Current Limitations
 
 - **Gemma 3 only** — no other model has the steering buffers wired in.
-- **Hook point support** — supports `pre_attn`, `post_attn`, `post_mlp_pre_ln`, `post_mlp_post_ln`; which are active depends on model configuration.
+- **Hook point support** — supports `pre_attn`, `post_attn`, `post_mlp`; which are active depends on model configuration.
 - **Dev mode only** — global HTTP API endpoints require `VLLM_SERVER_DEV_MODE=1`.
 
 ## Adding Steering to a New Model
@@ -210,7 +208,7 @@ To add steering to another model family (e.g., Llama, Qwen):
    ```python
    # At POST_MLP_PRE_LN position:
    residual = torch.ops.vllm.apply_steering(
-       residual, self.steering_table_post_mlp_pre_ln, self.steering_index
+       residual, self.steering_table_post_mlp, self.steering_index
    )
    ```
 

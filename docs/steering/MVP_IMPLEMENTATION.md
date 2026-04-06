@@ -201,7 +201,7 @@ With `load_format="dummy"`, certain tokens become strong attractors regardless o
 
 ## Phase 3: Multiple Hook Points
 
-Phase 3 extended steering from a single post-MLP position to four hook points on the residual stream (`pre_attn`, `post_attn`, `post_mlp_pre_ln`, `post_mlp_post_ln`). This section documents what we learned about torch.compile, graph partitions, and buffer allocation strategy.
+Phase 3 extended steering from a single post-MLP position to multiple hook points on the residual stream (`pre_attn`, `post_attn`, `post_mlp`). This section documents what we learned about torch.compile, graph partitions, and buffer allocation strategy.
 
 ### Splitting Ops Are Not Required for Buffer Correctness
 
@@ -260,7 +260,7 @@ Benefits:
 
 In Gemma 3's architecture, some hook points see identical residual state:
 - `pre_attn` and `post_attn` — attention only modifies `hidden_states`, not `residual`
-- `post_mlp_pre_ln` and `post_mlp_post_ln` — `post_feedforward_layernorm` only modifies `hidden_states`
+- `post_mlp` — post-MLP residual steering is the remaining public MLP hook
 
 The steering effect is therefore identical whether applied at `pre_attn` or `post_attn` (and likewise for the post-MLP pair). Both hook points exist for semantic matching with SAE training positions, not because they produce different results.
 
@@ -268,7 +268,7 @@ The steering effect is therefore identical whether applied at `pre_attn` or `pos
 
 ### Unified API: Hook Points Required
 
-Phase 3 initially maintained backward compatibility with Phase 2's flat `steering_vectors: dict[int, list[float]]` format (mapped to `post_mlp_pre_ln` by default) alongside a new `steering_hook_vectors` field. This created:
+Phase 3 initially maintained backward compatibility with Phase 2's flat `steering_vectors: dict[int, list[float]]` format (mapped to `post_mlp` by default) alongside a new `steering_hook_vectors` field. This created:
 - Two fields for the same concept
 - Merging logic when both were specified
 - Ambiguity about which format to use

@@ -17,7 +17,7 @@ Setting `vectors` or `prefill_vectors` triggers prefix cache invalidation (all c
 ```json
 {
   "vectors": {
-    "post_mlp_pre_ln": {
+    "post_mlp": {
       "14": [0.1, -0.2, 0.3, "...hidden_size floats"],
       "20": {"vector": [0.5, 0.1, -0.4, "..."], "scale": 2.0}
     }
@@ -52,7 +52,7 @@ At least one of `vectors`, `prefill_vectors`, or `decode_vectors` must be provid
 ```json
 {
   "status": "ok",
-  "hook_points": ["post_mlp_pre_ln", "pre_attn", "post_attn"],
+  "hook_points": ["post_mlp", "pre_attn", "post_attn"],
   "layers_updated": [14, 20]
 }
 ```
@@ -61,7 +61,7 @@ At least one of `vectors`, `prefill_vectors`, or `decode_vectors` must be provid
 
 ```json
 {"error": "No vectors provided. Include at least one of vectors, prefill_vectors, or decode_vectors with hook point/layer data."}
-{"error": "Invalid hook point name(s): ['invalid']. Valid values: ['post_attn', 'post_mlp_post_ln', 'post_mlp_pre_ln', 'pre_attn']"}
+{"error": "Invalid hook point name(s): ['invalid']. Valid values: ['post_attn', 'post_mlp', 'pre_attn']"}
 {"error": "Layer(s) [99] not found in model. Steerable layers that matched: [0, 1, ..., 25]"}
 {"error": "Layer 14: expected vector of size 3584, got 100"}
 ```
@@ -89,14 +89,14 @@ phase-specific global vector norms when set.
 {
   "active_layers": {
     "14": {
-      "post_mlp_pre_ln": {
+      "post_mlp": {
         "norm": 1.234567,
         "prefill_norm": 0.891234,
         "decode_norm": 0.456789
       }
     },
     "20": {
-      "post_mlp_pre_ln": {
+      "post_mlp": {
         "norm": 0.567890
       }
     }
@@ -125,14 +125,14 @@ from vllm import SamplingParams
 params = SamplingParams(
     max_tokens=100,
     temperature=0.7,
-    steering_vectors={"post_mlp_pre_ln": {15: [0.1, 0.2, ...]}},
+    steering_vectors={"post_mlp": {15: [0.1, 0.2, ...]}},
 )
 
 # Phase-specific
 params = SamplingParams(
     max_tokens=100,
     temperature=0.7,
-    steering_vectors={"post_mlp_pre_ln": {15: [0.1, 0.2, ...]}},
+    steering_vectors={"post_mlp": {15: [0.1, 0.2, ...]}},
     prefill_steering_vectors={"pre_attn": {15: [0.5, 0.6, ...]}},
     decode_steering_vectors={"pre_attn": {15: [0.3, 0.4, ...]}},
 )
@@ -141,7 +141,7 @@ params = SamplingParams(
 params = SamplingParams(
     max_tokens=100,
     temperature=0.7,
-    steering_vectors={"post_mlp_pre_ln": {15: {"vector": [0.1, 0.2, ...], "scale": 1.5}}},
+    steering_vectors={"post_mlp": {15: {"vector": [0.1, 0.2, ...], "scale": 1.5}}},
 )
 ```
 
@@ -164,7 +164,7 @@ response = client.chat.completions.create(
     extra_body={
         "steering_vectors": {
             "pre_attn": {15: [0.1, 0.2, ...]},
-            "post_mlp_pre_ln": {15: [0.3, 0.4, ...]},
+            "post_mlp": {15: [0.3, 0.4, ...]},
         },
         "prefill_steering_vectors": {
             "pre_attn": {15: [0.5, 0.6, ...]},
@@ -202,7 +202,7 @@ vector = [0.01] * hidden_size
 # Base steering (both phases) with co-located scale
 resp = requests.post(f"{base}/v1/steering/set", json={
     "vectors": {
-        "post_mlp_pre_ln": {
+        "post_mlp": {
             "14": {"vector": vector, "scale": 1.5},
         },
     },
@@ -235,7 +235,7 @@ llm = LLM(model="google/gemma-3-4b-it")
 vec = [10.0] * 3584
 llm.collective_rpc(
     "set_steering_vectors",
-    kwargs={"vectors": {"post_mlp_pre_ln": {14: vec}}},
+    kwargs={"vectors": {"post_mlp": {14: vec}}},
 )
 
 # Set prefill-specific global
@@ -265,7 +265,7 @@ llm = LLM(
 # Base + phase-specific
 steered = SamplingParams(
     max_tokens=100,
-    steering_vectors={"post_mlp_pre_ln": {15: [1.0] * 3072}},
+    steering_vectors={"post_mlp": {15: [1.0] * 3072}},
     prefill_steering_vectors={"pre_attn": {15: [0.5] * 3072}},
     decode_steering_vectors={"pre_attn": {15: [-0.5] * 3072}},
 )
@@ -274,7 +274,7 @@ steered = SamplingParams(
 scaled = SamplingParams(
     max_tokens=100,
     steering_vectors={
-        "post_mlp_pre_ln": {
+        "post_mlp": {
             15: {"vector": [0.5] * 3072, "scale": 2.0},
         },
     },

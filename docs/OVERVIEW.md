@@ -32,8 +32,8 @@ Features Index:
             stream to steer model behaviour.  Supports global (server-wide)
             and per-request steering with a three-tier additive composition
             model: base vectors (both phases) + prefill-specific +
-            decode-specific.  Co-located scale factors and four hook points
-            (pre_attn, post_attn, post_mlp_pre_ln, post_mlp_post_ln).
+            decode-specific.  Co-located scale factors and three hook points
+            (pre_attn, post_attn, post_mlp).
             Scheduler predicts mid-step prefill-to-decode transitions and
             reserves capacity for both phases; model runner gracefully defers
             decode registration when capacity is temporarily exhausted.
