@@ -13,7 +13,7 @@ class SetSteeringRequest(BaseModel):
         default=None,
         description="Base steering vectors applied to both prefill and "
         "decode phases. Keyed by hook point name (pre_attn, post_attn, "
-        "post_mlp_pre_ln, post_mlp_post_ln), then layer index. Values "
+        "post_mlp), then layer index. Values "
         "are either bare lists (scale=1.0) or "
         '{"vector": [...], "scale": float}.',
     )

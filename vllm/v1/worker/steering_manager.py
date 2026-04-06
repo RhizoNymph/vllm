@@ -163,7 +163,7 @@ class SteeringManager:
         """Update cached global vector for a hook point and layer.
 
         Args:
-            hook_point: Hook point string (e.g. ``"post_mlp_pre_ln"``).
+            hook_point: Hook point string (e.g. ``"post_mlp"``).
             layer_idx: Layer index.
             vector: The global vector tensor.
             phase: ``"base"``, ``"prefill"``, or ``"decode"``.

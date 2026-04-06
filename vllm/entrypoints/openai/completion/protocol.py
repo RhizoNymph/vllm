@@ -181,8 +181,8 @@ class CompletionRequest(OpenAIBaseModel):
     steering_vectors: SteeringVectorSpec | None = Field(
         default=None,
         description="Per-request activation steering vectors keyed by hook "
-        "point name (pre_attn, post_attn, post_mlp_pre_ln, "
-        "post_mlp_post_ln), then layer index. Values are either bare "
+        "point name (pre_attn, post_attn, post_mlp), then layer index. "
+        "Values are either bare "
         'list[float] (scale=1.0) or {"vector": [...], "scale": float}.',
     )
 

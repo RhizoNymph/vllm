@@ -23,7 +23,7 @@ Where each entry is either a bare `list[float]` (scale=1.0) or
 - Per-request steering via `SamplingParams.steering_vectors`
 - Phase-specific steering via `prefill_steering_vectors` and `decode_steering_vectors`
 - Co-located scale factors on each vector entry
-- Four hook points: `pre_attn`, `post_attn`, `post_mlp_pre_ln`, `post_mlp_post_ln`
+- Three hook points: `pre_attn`, `post_attn`, `post_mlp`
 - Additive composition: base + phase-specific vectors are pre-scaled and summed
 - Separate config hashes for prefill and decode phases
 - Scheduler admission control for per-request configs
@@ -60,14 +60,19 @@ the scheduler since there is no `SteeringConfig` to enable admission control.
 ## Hook Points
 
 Steering vectors can be applied at four positions within each decoder layer,
-all operating on the residual stream:
+all operating on the residual skip tensor. These hook names refer to
+regions of the layer where the carried residual skip tensor is steered;
+they do not mean the post-norm tensor that is fed into the next sublayer.
 
 | Hook Point         | Position                                                             |
 |--------------------|----------------------------------------------------------------------|
-| `pre_attn`         | After `input_layernorm`, before `self_attn`                          |
-| `post_attn`        | After `post_attention_layernorm`, before `pre_feedforward_layernorm` |
-| `post_mlp_pre_ln`  | After `mlp`, before `post_feedforward_layernorm`                     |
-| `post_mlp_post_ln` | After `post_feedforward_layernorm`                                   |
+| `pre_attn`         | Steers the residual skip tensor in the pre-attention region          |
+| `post_attn`        | Steers the residual skip tensor in the post-attention region         |
+| `post_mlp`         | Steers the residual skip tensor in the post-MLP region               |
+
+For Gemma 3 specifically, steering is applied to the carried `residual`
+tensor in `Gemma3DecoderLayer.forward()`, which matches the residual-skip
+tensor convention commonly used in mech interp and activation steering.
 
 All four are always active. The `apply_steering` custom op is **not** a
 graph-splitting op — it is opaque to the torch.compile tracer (preventing
@@ -86,7 +91,7 @@ curl -X POST http://localhost:8000/v1/steering/set \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
-      "post_mlp_pre_ln": {"15": [0.1, 0.2, ...]}
+      "post_mlp": {"15": [0.1, 0.2, ...]}
     }
   }'
 
@@ -95,7 +100,7 @@ curl -X POST http://localhost:8000/v1/steering/set \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
-      "post_mlp_pre_ln": {
+      "post_mlp": {
         "15": {"vector": [0.1, 0.2, ...], "scale": 1.5}
       }
     }
@@ -106,7 +111,7 @@ curl -X POST http://localhost:8000/v1/steering/set \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
-      "post_mlp_pre_ln": {"15": [0.1, 0.2, ...]}
+      "post_mlp": {"15": [0.1, 0.2, ...]}
     },
     "prefill_vectors": {
       "pre_attn": {"15": [0.5, 0.6, ...]}
@@ -120,7 +125,7 @@ curl -X POST http://localhost:8000/v1/steering/set \
 curl -X POST http://localhost:8000/v1/steering/set \
   -H "Content-Type: application/json" \
   -d '{
-    "vectors": {"post_mlp_pre_ln": {"15": [0.1, 0.2, ...]}},
+    "vectors": {"post_mlp": {"15": [0.1, 0.2, ...]}},
     "replace": true
   }'
 
@@ -150,7 +155,7 @@ llm = LLM(
 steered = SamplingParams(
     max_tokens=100,
     temperature=0.7,
-    steering_vectors={"post_mlp_pre_ln": {15: [0.1, 0.2, ...]}},
+    steering_vectors={"post_mlp": {15: [0.1, 0.2, ...]}},
 )
 
 # Co-located scale factor
@@ -158,7 +163,7 @@ scaled = SamplingParams(
     max_tokens=100,
     temperature=0.7,
     steering_vectors={
-        "post_mlp_pre_ln": {
+        "post_mlp": {
             15: {"vector": [0.1, 0.2, ...], "scale": 2.0}
         }
     },
@@ -168,7 +173,7 @@ scaled = SamplingParams(
 phase_specific = SamplingParams(
     max_tokens=100,
     temperature=0.7,
-    steering_vectors={"post_mlp_pre_ln": {15: [0.1, 0.2, ...]}},
+    steering_vectors={"post_mlp": {15: [0.1, 0.2, ...]}},
     prefill_steering_vectors={"pre_attn": {15: [0.5, 0.6, ...]}},
     decode_steering_vectors={"pre_attn": {15: [0.3, 0.4, ...]}},
 )
@@ -200,7 +205,7 @@ response = client.chat.completions.create(
     extra_body={
         "steering_vectors": {
             "pre_attn": {15: [0.1, 0.2, ...]},
-            "post_mlp_pre_ln": {15: [0.3, 0.4, ...]},
+            "post_mlp": {15: [0.3, 0.4, ...]},
         },
     },
 )
@@ -211,7 +216,7 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello"}],
     extra_body={
         "steering_vectors": {
-            "post_mlp_pre_ln": {
+            "post_mlp": {
                 15: {"vector": [0.1, 0.2, ...], "scale": 2.0}
             }
         },
@@ -224,7 +229,7 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello"}],
     extra_body={
         "steering_vectors": {
-            "post_mlp_pre_ln": {15: [0.1, 0.2, ...]}
+            "post_mlp": {15: [0.1, 0.2, ...]}
         },
         "prefill_steering_vectors": {
             "pre_attn": {15: [0.5, 0.6, ...]}
@@ -314,7 +319,7 @@ of buffer values) but does not partition the compiled graph.  This means:
 ## Steering Table Layout
 
 Each decoder layer has a `steering_table_<hook>` buffer per hook point
-(e.g., `steering_table_post_mlp_pre_ln`):
+(e.g., `steering_table_post_mlp`):
 
 ```text
 Row 0:  [0, 0, 0, ..., 0]              ← no steering (zeros sentinel)
