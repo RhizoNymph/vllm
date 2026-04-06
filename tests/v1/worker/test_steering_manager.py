@@ -14,6 +14,7 @@ lifecycle, the row-lookup semantics, the table-population logic,
 and the phase-aware config tracking.
 """
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -42,8 +43,11 @@ class FakeSteerableLayer(nn.Module):
         )
 
 
-def _make_manager(max_configs: int = MAX_CONFIGS) -> SteeringManager:
-    return SteeringManager(max_steering_configs=max_configs)
+def _make_manager(
+    max_configs: int = MAX_CONFIGS,
+    device: "torch.device | None" = None,
+) -> SteeringManager:
+    return SteeringManager(max_steering_configs=max_configs, device=device)
 
 
 def _make_layers(
@@ -1897,3 +1901,55 @@ class TestPendingGlobalsReplay:
         assert torch.allclose(table[1], base_vec + prefill_vec)
         # Row 2 = base + decode.
         assert torch.allclose(table[2], base_vec + decode_vec)
+
+
+# ---------------------------------------------------------------------------
+# TestDevicePlacement
+# ---------------------------------------------------------------------------
+
+
+class TestDevicePlacement:
+    """Verify that per-request vectors are stored on the specified device."""
+
+    def test_default_device_is_cpu(self):
+        """Without an explicit device, vectors should land on CPU."""
+        mgr = _make_manager()
+        vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
+        stored = mgr.config_vectors[(42, "prefill")][_HP][0]
+        assert stored.device == torch.device("cpu")
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA not available"
+    )
+    def test_vectors_stored_on_specified_cuda_device(self):
+        """When device=cuda, registered vectors must reside on that device."""
+        cuda_device = torch.device("cuda:0")
+        mgr = _make_manager(device=cuda_device)
+        vectors = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+        mgr.register_config(config_hash=99, vectors=vectors, phase="prefill")
+        stored = mgr.config_vectors[(99, "prefill")][_HP][0]
+        assert stored.device == cuda_device
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA not available"
+    )
+    def test_populate_per_request_only_on_gpu(self):
+        """Per-request-only path (no globals) should work with GPU vectors."""
+        cuda_device = torch.device("cuda:0")
+        mgr = _make_manager(device=cuda_device)
+        per_req_vec = torch.ones(HIDDEN_SIZE) * 7.0
+        vectors = {_HP: {0: per_req_vec.tolist()}}
+        row = mgr.register_config(
+            config_hash=42, vectors=vectors, phase="prefill"
+        )
+
+        # Create layer tables on GPU to match
+        layers = _make_layers(mgr, layer_indices=[0])
+        for mod in layers.values():
+            mod.to(cuda_device)
+
+        mgr.populate_steering_tables(layers)
+        table = getattr(layers[0], _TABLE_ATTR)
+        expected = per_req_vec.to(cuda_device)
+        assert torch.allclose(table[row], expected)
