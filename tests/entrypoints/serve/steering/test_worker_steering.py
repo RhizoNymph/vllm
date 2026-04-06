@@ -3,7 +3,7 @@
 """Unit tests for WorkerBase steering methods using a mock model.
 
 All hook-point-aware tests use the default hook point
-(``post_mlp_pre_ln``) unless testing multi-hook-point behaviour.
+(``post_mlp``) unless testing multi-hook-point behaviour.
 
 Tests cover three-tier steering (base, prefill, decode) and co-located
 scale format (bare list vs dict with scale).
@@ -21,7 +21,7 @@ from vllm.v1.worker.steering_manager import SteeringManager
 from vllm.v1.worker.worker_base import WorkerBase
 
 # Shorthand for test readability
-_HP = DEFAULT_HOOK_POINT.value  # "post_mlp_pre_ln"
+_HP = DEFAULT_HOOK_POINT.value  # "post_mlp"
 
 
 class FakeDecoderLayer(nn.Module):
@@ -30,14 +30,14 @@ class FakeDecoderLayer(nn.Module):
     def __init__(self, layer_idx: int, hidden_size: int, max_steering_configs: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
-        # Default hook point buffers (post_mlp_pre_ln)
+        # Default hook point buffers (post_mlp)
         self.register_buffer(
-            "steering_vector_post_mlp_pre_ln",
+            "steering_vector_post_mlp",
             torch.zeros(1, hidden_size),
             persistent=False,
         )
         self.register_buffer(
-            "steering_table_post_mlp_pre_ln",
+            "steering_table_post_mlp",
             torch.zeros(max_steering_configs + 2, hidden_size),
             persistent=False,
         )
@@ -150,7 +150,7 @@ class TestSetSteeringVectorsBase:
         result = worker.set_steering_vectors(vectors={_HP: {2: vec}})
         assert result == [2]
         assert torch.allclose(
-            model.layers[2].steering_vector_post_mlp_pre_ln,
+            model.layers[2].steering_vector_post_mlp,
             torch.tensor([vec]),
         )
 
@@ -159,13 +159,13 @@ class TestSetSteeringVectorsBase:
         vec_b = [2.0] * 8
         result = worker.set_steering_vectors(vectors={_HP: {0: vec_a, 3: vec_b}})
         assert result == [0, 3]
-        assert model.layers[0].steering_vector_post_mlp_pre_ln.sum().item() == 8.0
-        assert model.layers[3].steering_vector_post_mlp_pre_ln.sum().item() == 16.0
+        assert model.layers[0].steering_vector_post_mlp.sum().item() == 8.0
+        assert model.layers[3].steering_vector_post_mlp.sum().item() == 16.0
 
     def test_unspecified_layers_unchanged(self, worker, model):
-        model.layers[1].steering_vector_post_mlp_pre_ln.fill_(5.0)
+        model.layers[1].steering_vector_post_mlp.fill_(5.0)
         worker.set_steering_vectors(vectors={_HP: {0: [1.0] * 8}})
-        assert model.layers[1].steering_vector_post_mlp_pre_ln.sum().item() == 40.0
+        assert model.layers[1].steering_vector_post_mlp.sum().item() == 40.0
 
     def test_nonexistent_layer_ignored(self, worker):
         result = worker.set_steering_vectors(vectors={_HP: {999: [1.0] * 8}})
@@ -175,7 +175,7 @@ class TestSetSteeringVectorsBase:
         vec = [3.0] * 8
         result = worker.set_steering_vectors(vectors={_HP: {1: vec, 999: [1.0] * 8}})
         assert result == [1]
-        assert model.layers[1].steering_vector_post_mlp_pre_ln.sum().item() == 24.0
+        assert model.layers[1].steering_vector_post_mlp.sum().item() == 24.0
 
     def test_wrong_vector_size_raises(self, worker):
         with pytest.raises(SteeringVectorError, match="expected vector of size 8"):
@@ -202,7 +202,7 @@ class TestSetSteeringVectorsBase:
             vectors={_HP: {0: vec}}, validate_only=True
         )
         assert result == [0]
-        assert model.layers[0].steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+        assert model.layers[0].steering_vector_post_mlp.sum().item() == 0.0
 
     def test_validate_only_still_checks_size(self, worker):
         with pytest.raises(SteeringVectorError, match="expected vector of size"):
@@ -218,7 +218,7 @@ class TestSetSteeringVectorsBase:
             worker.set_steering_vectors(
                 vectors={_HP: {0: [1.0] * 8, 1: [1.0] * 3}},
             )
-        assert model.layers[0].steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+        assert model.layers[0].steering_vector_post_mlp.sum().item() == 0.0
 
     def test_empty_vectors_is_noop(self, worker):
         result = worker.set_steering_vectors(vectors={})
@@ -249,7 +249,7 @@ class TestSetSteeringVectorsThreeTier:
         result = worker.set_steering_vectors(prefill_vectors={_HP: {0: vec}})
         assert result == [0]
         # Phase-specific vectors are NOT written to the shared buffer
-        assert model.layers[0].steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+        assert model.layers[0].steering_vector_post_mlp.sum().item() == 0.0
 
     def test_set_decode_only(self, worker, model):
         """Decode-only vectors do NOT write to shared buffers."""
@@ -257,7 +257,7 @@ class TestSetSteeringVectorsThreeTier:
         result = worker.set_steering_vectors(decode_vectors={_HP: {1: vec}})
         assert result == [1]
         # Phase-specific vectors are NOT written to the shared buffer
-        assert model.layers[1].steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+        assert model.layers[1].steering_vector_post_mlp.sum().item() == 0.0
 
     def test_set_all_three_tiers(self, worker, model):
         """Setting all three tiers in one call."""
@@ -277,8 +277,8 @@ class TestSetSteeringVectorsThreeTier:
         )
         assert result == [0, 1]
         # Nothing mutated
-        assert model.layers[0].steering_vector_post_mlp_pre_ln.sum().item() == 0.0
-        assert model.layers[1].steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+        assert model.layers[0].steering_vector_post_mlp.sum().item() == 0.0
+        assert model.layers[1].steering_vector_post_mlp.sum().item() == 0.0
 
     def test_validation_error_in_prefill_tier(self, worker):
         """Validation error in prefill tier prevents all mutation."""
@@ -306,10 +306,10 @@ class TestSetSteeringVectorsThreeTier:
             replace=True,
         )
         # Layers 0, 1 should be zeroed (from clear)
-        assert model.layers[0].steering_vector_post_mlp_pre_ln.sum().item() == 0.0
-        assert model.layers[1].steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+        assert model.layers[0].steering_vector_post_mlp.sum().item() == 0.0
+        assert model.layers[1].steering_vector_post_mlp.sum().item() == 0.0
         # Layer 2 should have the new values
-        assert model.layers[2].steering_vector_post_mlp_pre_ln.sum().item() == 8.0
+        assert model.layers[2].steering_vector_post_mlp.sum().item() == 8.0
 
     def test_replace_with_no_new_vectors_clears_all(self, worker, model):
         """replace=True with no vector arguments clears all existing vectors.
@@ -321,8 +321,8 @@ class TestSetSteeringVectorsThreeTier:
         # Set some initial values on layers 0 and 1
         worker.set_steering_vectors(vectors={_HP: {0: [5.0] * 8, 1: [5.0] * 8}})
         # Verify they are set
-        assert model.layers[0].steering_vector_post_mlp_pre_ln.sum().item() == 40.0
-        assert model.layers[1].steering_vector_post_mlp_pre_ln.sum().item() == 40.0
+        assert model.layers[0].steering_vector_post_mlp.sum().item() == 40.0
+        assert model.layers[1].steering_vector_post_mlp.sum().item() == 40.0
 
         # Call replace=True with NO vector arguments
         result = worker.set_steering_vectors(replace=True)
@@ -331,7 +331,7 @@ class TestSetSteeringVectorsThreeTier:
         assert result == []
         # But all existing vectors should be cleared
         for layer in model.layers:
-            assert layer.steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+            assert layer.steering_vector_post_mlp.sum().item() == 0.0
 
     def test_replace_with_no_new_vectors_clears_pending_globals(self, worker, model):
         """replace=True with no vector arguments also clears pending globals."""
@@ -339,7 +339,7 @@ class TestSetSteeringVectorsThreeTier:
         import torch
 
         worker.model_runner._pending_steering_globals = [
-            ({"post_mlp_pre_ln": {0: torch.ones(1, 8)}}, "prefill"),
+            ({"post_mlp": {0: torch.ones(1, 8)}}, "prefill"),
         ]
         # Call replace=True with NO vector arguments
         result = worker.set_steering_vectors(replace=True)
@@ -360,7 +360,7 @@ class TestSetSteeringVectorsThreeTier:
             decode_vectors={_HP: {0: decode_vec}},
         )
         # Buffer should reflect base (sum = 8.0), not prefill (80) or decode (800)
-        buf_sum = model.layers[0].steering_vector_post_mlp_pre_ln.sum().item()
+        buf_sum = model.layers[0].steering_vector_post_mlp.sum().item()
         assert buf_sum == pytest.approx(8.0)
 
 
@@ -372,12 +372,12 @@ class TestClearSteeringVectors:
         worker.set_steering_vectors(vectors={_HP: {0: [1.0] * 8, 2: [2.0] * 8}})
         worker.clear_steering_vectors()
         for layer in model.layers:
-            assert layer.steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+            assert layer.steering_vector_post_mlp.sum().item() == 0.0
 
     def test_clear_on_already_zero(self, worker, model):
         worker.clear_steering_vectors()
         for layer in model.layers:
-            assert layer.steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+            assert layer.steering_vector_post_mlp.sum().item() == 0.0
 
     def test_clear_after_three_tier_set(self, worker, model):
         """Clearing after setting all three tiers zeros everything."""
@@ -388,14 +388,14 @@ class TestClearSteeringVectors:
         )
         worker.clear_steering_vectors()
         for layer in model.layers:
-            assert layer.steering_vector_post_mlp_pre_ln.sum().item() == 0.0
+            assert layer.steering_vector_post_mlp.sum().item() == 0.0
 
     def test_clear_removes_pending_steering_globals(self, worker):
         """Clearing should also discard any pending globals queued
         before the SteeringManager was lazily initialized."""
         # Simulate pending globals queued before manager init
         worker.model_runner._pending_steering_globals = [
-            ({"post_mlp_pre_ln": {0: torch.ones(1, 8)}}, "base"),
+            ({"post_mlp": {0: torch.ones(1, 8)}}, "base"),
         ]
         worker.clear_steering_vectors()
         assert worker.model_runner._pending_steering_globals is None
@@ -407,8 +407,8 @@ class TestClearSteeringVectors:
         assert worker.model_runner is not None
         assert worker.model_runner._steering_manager is None
         worker.model_runner._pending_steering_globals = [
-            ({"post_mlp_pre_ln": {1: torch.ones(1, 8)}}, "prefill"),
-            ({"post_mlp_pre_ln": {2: torch.ones(1, 8)}}, "decode"),
+            ({"post_mlp": {1: torch.ones(1, 8)}}, "prefill"),
+            ({"post_mlp": {2: torch.ones(1, 8)}}, "decode"),
         ]
         worker.clear_steering_vectors()
         assert worker.model_runner._pending_steering_globals is None
@@ -492,38 +492,38 @@ class TestGetSteeringStatus:
         # Queue pending globals directly (simulates set_steering_vectors before manager init)
         t = torch.tensor(vec, dtype=torch.float32)
         worker.model_runner._pending_steering_globals = [
-            ({"post_mlp_pre_ln": {0: t}}, "prefill"),
+            ({"post_mlp": {0: t}}, "prefill"),
         ]
         status = worker.get_steering_status()
         assert 0 in status
-        assert "post_mlp_pre_ln" in status[0]
+        assert "post_mlp" in status[0]
         expected_norm = round(t.norm().item(), 6)
-        assert status[0]["post_mlp_pre_ln"]["prefill_norm"] == expected_norm
+        assert status[0]["post_mlp"]["prefill_norm"] == expected_norm
 
     def test_status_reports_pending_decode_norm_before_manager_init(self, worker):
         """Decode vectors queued before manager init should appear in status."""
         vec = [3.0] * 8
         t = torch.tensor(vec, dtype=torch.float32)
         worker.model_runner._pending_steering_globals = [
-            ({"post_mlp_pre_ln": {1: t}}, "decode"),
+            ({"post_mlp": {1: t}}, "decode"),
         ]
         status = worker.get_steering_status()
         assert 1 in status
-        assert "post_mlp_pre_ln" in status[1]
+        assert "post_mlp" in status[1]
         expected_norm = round(t.norm().item(), 6)
-        assert status[1]["post_mlp_pre_ln"]["decode_norm"] == expected_norm
+        assert status[1]["post_mlp"]["decode_norm"] == expected_norm
 
     def test_status_skips_base_pending_globals(self, worker):
         """Base-phase pending globals should not add extra norm keys
         (base norms already come from layer buffers)."""
         t = torch.tensor([1.0] * 8, dtype=torch.float32)
         worker.model_runner._pending_steering_globals = [
-            ({"post_mlp_pre_ln": {0: t}}, "base"),
+            ({"post_mlp": {0: t}}, "base"),
         ]
         status = worker.get_steering_status()
         # Should not have prefill_norm or decode_norm from pending
         if 0 in status:
-            hp_info = status[0].get("post_mlp_pre_ln", {})
+            hp_info = status[0].get("post_mlp", {})
             assert "prefill_norm" not in hp_info
             assert "decode_norm" not in hp_info
 

@@ -462,7 +462,7 @@ class TestNormalizeSpec:
     def test_normalize_spec_drops_empty_hook(self):
         """Hooks whose layer dict is empty are dropped from the result.
 
-        An input like ``{"post_mlp_pre_ln": {}}`` is functionally
+        An input like ``{"post_mlp": {}}`` is functionally
         equivalent to omitting the hook entirely: no layers and no
         vectors would be applied. Keeping the empty hook in the
         normalized spec would produce a truthy-but-empty entry that

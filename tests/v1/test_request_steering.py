@@ -28,8 +28,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 # Helpers
 # ---------------------------------------------------------------------------
 
-STEERING_A = {"post_mlp_pre_ln": {0: [1.0, 2.0]}}
-STEERING_B = {"post_mlp_pre_ln": {0: [99.0, 100.0]}}
+STEERING_A = {"post_mlp": {0: [1.0, 2.0]}}
+STEERING_B = {"post_mlp": {0: [99.0, 100.0]}}
 
 
 def _make_request(
@@ -283,3 +283,41 @@ class TestSchedulerSteeringHashOrdering(unittest.TestCase):
 
         assert session.prefill_steering_config_hash == 0
         assert session.decode_steering_config_hash == 0
+
+    def test_session_updates_num_prompt_tokens_before_rehash(self):
+        """Streaming updates must bump num_prompt_tokens before
+        update_block_hashes runs so appended prompt tokens are hashed in
+        prompt phase, not decode phase."""
+        scheduler = _create_scheduler()
+
+        session = _make_request(
+            request_id="session",
+            steering_vectors=STEERING_A,
+            prompt_token_ids=[1, 2, 3],
+        )
+        session.num_computed_tokens = len(session.prompt_token_ids)
+
+        observed_prompt_lens: list[int] = []
+        original_update_block_hashes = session.update_block_hashes
+
+        def wrapped_update_block_hashes():
+            observed_prompt_lens.append(session.num_prompt_tokens)
+            return original_update_block_hashes()
+
+        session.update_block_hashes = wrapped_update_block_hashes  # type: ignore[method-assign]
+
+        update = StreamingUpdate(
+            mm_features=None,
+            prompt_token_ids=[4, 5],
+            max_tokens=16,
+            arrival_time=1.0,
+            sampling_params=SamplingParams(
+                max_tokens=16,
+                steering_vectors=STEERING_B,
+            ),
+        )
+
+        scheduler._update_request_as_session(session, update)
+
+        assert observed_prompt_lens == [5]
+        assert session.num_prompt_tokens == 5

@@ -23,7 +23,7 @@ _BARE_VECTORS = {
 }
 
 _SCALED_VECTORS = {
-    "post_mlp_pre_ln": {
+    "post_mlp": {
         10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0},
     },
 }
@@ -125,7 +125,7 @@ class TestChatCompletionSteering:
             max_tokens=100,
             default_sampling_params={},
         )
-        entry = sp.steering_vectors["post_mlp_pre_ln"][10]
+        entry = sp.steering_vectors["post_mlp"][10]
         assert isinstance(entry, dict)
         assert entry["vector"] == [0.4, 0.5, 0.6]
         assert entry["scale"] == 2.0
@@ -192,7 +192,7 @@ class TestCompletionSteering:
     def test_scaled_format_passes_through(self):
         req = _make_completion(steering_vectors=_SCALED_VECTORS)
         sp = req.to_sampling_params(max_tokens=100)
-        entry = sp.steering_vectors["post_mlp_pre_ln"][10]
+        entry = sp.steering_vectors["post_mlp"][10]
         assert isinstance(entry, dict)
         assert entry["vector"] == [0.4, 0.5, 0.6]
         assert entry["scale"] == 2.0
