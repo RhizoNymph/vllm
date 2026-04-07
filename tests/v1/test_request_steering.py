@@ -349,3 +349,113 @@ class TestSchedulerSteeringHashOrdering(unittest.TestCase):
 
         assert observed_prompt_lens == [5]
         assert session.num_prompt_tokens == 5
+
+    def test_session_update_refreshes_block_hash_steering_overrides(self):
+        """Streaming updates must refresh the APC-facing steering override
+        hashes, not just the cached_property values."""
+        scheduler = _create_scheduler()
+
+        session = _make_request(
+            request_id="session",
+            steering_vectors=STEERING_A,
+            prompt_token_ids=[1, 2, 3],
+        )
+        session.num_computed_tokens = len(session.prompt_token_ids)
+
+        old_block_prefill = session.block_hash_prefill_steering_config_hash
+        old_block_decode = session.block_hash_decode_steering_config_hash
+
+        update = StreamingUpdate(
+            mm_features=None,
+            prompt_token_ids=[4, 5],
+            max_tokens=16,
+            arrival_time=1.0,
+            sampling_params=SamplingParams(
+                max_tokens=16,
+                steering_vectors=STEERING_B,
+            ),
+        )
+
+        scheduler._update_request_as_session(session, update)
+
+        assert (
+            session.block_hash_prefill_steering_config_hash
+            == session.prefill_steering_config_hash
+        )
+        assert (
+            session.block_hash_decode_steering_config_hash
+            == session.decode_steering_config_hash
+        )
+        assert session.block_hash_prefill_steering_config_hash != old_block_prefill
+        assert session.block_hash_decode_steering_config_hash != old_block_decode
+
+    def test_session_update_rebuilds_existing_block_hash_chain(self):
+        """Streaming continuation must rebuild existing APC hashes because
+        previously generated tokens become prompt tokens in the next turn."""
+        scheduler = _create_scheduler()
+        block_hasher = get_request_block_hasher(2, sha256_cbor)
+
+        session = _make_request(
+            request_id="session",
+            steering_vectors=STEERING_A,
+            prompt_token_ids=[1, 2],
+        )
+        session._block_hasher = block_hasher
+        session.block_hashes.clear()
+        session.update_block_hashes()
+        session.append_output_token_ids([3, 4])
+        session.num_computed_tokens = len(session.all_token_ids)
+
+        old_block_hashes = list(session.block_hashes)
+
+        update = StreamingUpdate(
+            mm_features=None,
+            prompt_token_ids=[5, 6],
+            max_tokens=16,
+            arrival_time=1.0,
+            sampling_params=SamplingParams(
+                max_tokens=16,
+                steering_vectors=STEERING_B,
+            ),
+        )
+
+        scheduler._update_request_as_session(session, update)
+
+        ref = _make_request(
+            request_id="ref",
+            steering_vectors=STEERING_B,
+            prompt_token_ids=[1, 2, 3, 4, 5, 6],
+        )
+        ref._block_hasher = block_hasher
+        ref.block_hashes.clear()
+        ref.update_block_hashes()
+
+        assert session.block_hashes == ref.block_hashes
+        assert session.block_hashes != old_block_hashes
+
+    def test_session_update_refreshes_skip_reading_prefix_cache(self):
+        """Streaming updates must refresh the request-level APC read policy
+        after swapping sampling params."""
+        scheduler = _create_scheduler()
+
+        session = _make_request(
+            request_id="session",
+            prompt_token_ids=[1, 2, 3],
+        )
+        session.num_computed_tokens = len(session.prompt_token_ids)
+        assert session.skip_reading_prefix_cache is False
+
+        update = StreamingUpdate(
+            mm_features=None,
+            prompt_token_ids=[4, 5],
+            max_tokens=16,
+            arrival_time=1.0,
+            sampling_params=SamplingParams(
+                max_tokens=16,
+                skip_reading_prefix_cache=True,
+            ),
+        )
+
+        scheduler._update_request_as_session(session, update)
+
+        assert session.skip_reading_prefix_cache is True

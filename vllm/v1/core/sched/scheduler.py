@@ -1198,8 +1198,17 @@ class Scheduler(SchedulerInterface):
         # appended prompt tokens are still classified as prompt-phase
         # tokens by steering-aware cache-key generation.
         session.num_prompt_tokens = len(session.prompt_token_ids)
-        # Update block hashes for the new tokens.
+        # Streaming continuation changes both the steering config and the
+        # prompt/decode boundary, so the entire APC hash chain must be rebuilt.
+        session.block_hash_prefill_steering_config_hash = (
+            session.prefill_steering_config_hash
+        )
+        session.block_hash_decode_steering_config_hash = (
+            session.decode_steering_config_hash
+        )
+        session.block_hashes.clear()
         session.update_block_hashes()
+        session.skip_reading_prefix_cache = session.get_skip_reading_prefix_cache()
         session.arrival_time = update.arrival_time
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
