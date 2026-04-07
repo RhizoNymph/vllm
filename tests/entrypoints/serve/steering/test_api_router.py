@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the steering API router using a mock engine."""
+"""Unit tests for the steering API router using a mock engine.
+
+Tests cover three-tier steering (base, prefill, decode) with co-located
+scale format support.
+"""
 
 import asyncio
 from unittest.mock import AsyncMock, patch
@@ -10,7 +14,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import vllm.envs as envs
-from vllm.entrypoints.serve.steering.api_router import attach_router, router
+from vllm.entrypoints.serve.steering.api_router import (
+    _normalize_spec,
+    attach_router,
+    router,
+)
 from vllm.exceptions import SteeringVectorError
 from vllm.model_executor.layers.steering import DEFAULT_HOOK_POINT
 
@@ -45,14 +53,16 @@ def client(engine):
 
 
 def _vecs(layer_vecs: dict, hook: str = _HP) -> dict:
-    """Shorthand: wrap layer vectors in hook-point format."""
+    """Shorthand: wrap layer vectors in base-tier format."""
     return {"vectors": {hook: layer_vecs}}
 
 
-# --- POST /v1/steering/set ---
+# --- POST /v1/steering/set: base vectors ---
 
 
-class TestSetSteering:
+class TestSetSteeringBase:
+    """Tests for setting base-tier vectors."""
+
     def test_set_basic(self, client, engine):
         """Set vectors on one layer."""
         engine.collective_rpc.side_effect = [[[0]], [[0]]]
@@ -74,22 +84,33 @@ class TestSetSteering:
         assert resp.status_code == 200
         assert resp.json()["layers_updated"] == [0, 3]
 
-    def test_set_with_scales(self, client, engine):
-        """Scale factors are pre-multiplied before sending to workers."""
+    def test_set_with_co_located_scale(self, client, engine):
+        """Co-located scale factors are pre-multiplied before sending."""
         engine.collective_rpc.side_effect = [[[0]], [[0]]]
         resp = client.post(
             "/v1/steering/set",
-            json={**_vecs({"0": [1.0, 2.0]}), "scales": {"0": 3.0}},
+            json={"vectors": {_HP: {"0": {"vector": [1.0, 2.0], "scale": 3.0}}}},
         )
         assert resp.status_code == 200
         validate_call = engine.collective_rpc.call_args_list[0]
-        hook_vectors = validate_call.kwargs.get(
-            "args", validate_call[1].get("args", (None,))
-        )[0]
-        assert hook_vectors[_HP][0] == [3.0, 6.0]
+        kwargs = validate_call.kwargs.get("kwargs", validate_call[1].get("kwargs", {}))
+        vectors = kwargs.get("vectors", {})
+        assert vectors[_HP][0] == [3.0, 6.0]
+
+    def test_set_bare_list_scale_one(self, client, engine):
+        """Bare list vectors pass through with scale=1.0."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [5.0, 10.0]}),
+        )
+        assert resp.status_code == 200
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", validate_call[1].get("kwargs", {}))
+        vectors = kwargs.get("vectors", {})
+        assert vectors[_HP][0] == [5.0, 10.0]
 
     def test_set_missing_layer_returns_400(self, client, engine):
-        """Layer not found on any worker -> 400."""
         engine.collective_rpc.side_effect = [[[]]]
         resp = client.post(
             "/v1/steering/set",
@@ -99,7 +120,6 @@ class TestSetSteering:
         assert "999" in resp.json()["error"]
 
     def test_set_partial_missing_layers(self, client, engine):
-        """Some layers valid, some missing -> 400 for the missing ones."""
         engine.collective_rpc.side_effect = [[[0]]]
         resp = client.post(
             "/v1/steering/set",
@@ -109,7 +129,6 @@ class TestSetSteering:
         assert "999" in resp.json()["error"]
 
     def test_set_no_steerable_layers(self, client, engine):
-        """Model has no steerable layers at all -> 400."""
         engine.collective_rpc.side_effect = [[[]]]
         resp = client.post(
             "/v1/steering/set",
@@ -150,16 +169,17 @@ class TestSetSteering:
         assert "GPU exploded" in resp.json()["error"]
 
     def test_set_with_replace(self, client, engine):
-        """replace=True triggers a clear before apply."""
-        engine.collective_rpc.side_effect = [[[0]], None, [[0]]]
+        """replace=True passes replace flag to set_steering_vectors."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
         resp = client.post(
             "/v1/steering/set",
             json={**_vecs({"0": [1.0]}), "replace": True},
         )
         assert resp.status_code == 200
-        assert engine.collective_rpc.call_count == 3
-        clear_call = engine.collective_rpc.call_args_list[1]
-        assert clear_call[0][0] == "clear_steering_vectors"
+        assert engine.collective_rpc.call_count == 2
+        apply_call = engine.collective_rpc.call_args_list[1]
+        kwargs = apply_call.kwargs.get("kwargs", apply_call[1].get("kwargs", {}))
+        assert kwargs["replace"] is True
 
     def test_set_without_replace_no_clear(self, client, engine):
         engine.collective_rpc.side_effect = [[[0]], [[0]]]
@@ -170,22 +190,27 @@ class TestSetSteering:
         assert resp.status_code == 200
         assert engine.collective_rpc.call_count == 2
 
-    def test_set_scale_default_1(self, client, engine):
-        """Unscaled vectors are passed through as-is."""
+    def test_set_without_replace_passes_false(self, client, engine):
+        """Default replace=False is passed through to workers."""
         engine.collective_rpc.side_effect = [[[0]], [[0]]]
         resp = client.post(
             "/v1/steering/set",
-            json=_vecs({"0": [5.0, 10.0]}),
+            json=_vecs({"0": [1.0]}),
         )
         assert resp.status_code == 200
-        validate_call = engine.collective_rpc.call_args_list[0]
-        hook_vectors = validate_call.kwargs.get(
-            "args", validate_call[1].get("args", (None,))
-        )[0]
-        assert hook_vectors[_HP][0] == [5.0, 10.0]
+        apply_call = engine.collective_rpc.call_args_list[1]
+        kwargs = apply_call.kwargs.get("kwargs", apply_call[1].get("kwargs", {}))
+        assert kwargs["replace"] is False
+
+    def test_set_empty_all_tiers(self, client, engine):
+        """No tiers provided -> immediate 400."""
+        resp = client.post("/v1/steering/set", json={})
+        assert resp.status_code == 400
+        assert "No vectors provided" in resp.json()["error"]
+        engine.collective_rpc.assert_not_called()
 
     def test_set_empty_vectors(self, client, engine):
-        """Empty vectors dict -> immediate 400."""
+        """Empty vectors dict -> immediate 400 (no data in any tier)."""
         resp = client.post(
             "/v1/steering/set",
             json={"vectors": {}},
@@ -195,13 +220,132 @@ class TestSetSteering:
         engine.collective_rpc.assert_not_called()
 
     def test_set_invalid_hook_point(self, client, engine):
-        """Invalid hook point name -> 400."""
         resp = client.post(
             "/v1/steering/set",
             json={"vectors": {"invalid_hook": {"0": [1.0]}}},
         )
         assert resp.status_code == 400
         assert "Invalid hook point" in resp.json()["error"]
+
+
+# --- POST /v1/steering/set: three-tier vectors ---
+
+
+class TestSetSteeringThreeTier:
+    """Tests for three-tier steering (base, prefill, decode)."""
+
+    def test_set_prefill_only(self, client, engine):
+        """Set prefill-specific vectors without base."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={"prefill_vectors": {_HP: {"0": [1.0, 2.0]}}},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["layers_updated"] == [0]
+
+    def test_set_decode_only(self, client, engine):
+        """Set decode-specific vectors without base."""
+        engine.collective_rpc.side_effect = [[[1]], [[1]]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={"decode_vectors": {_HP: {"1": [3.0, 4.0]}}},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["layers_updated"] == [1]
+
+    def test_set_all_three_tiers(self, client, engine):
+        """Set all three tiers simultaneously."""
+        engine.collective_rpc.side_effect = [[[0, 1, 2]], [[0, 1, 2]]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "vectors": {_HP: {"0": [1.0]}},
+                "prefill_vectors": {_HP: {"1": [2.0]}},
+                "decode_vectors": {_HP: {"2": [3.0]}},
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert sorted(body["layers_updated"]) == [0, 1, 2]
+
+    def test_prefill_with_co_located_scale(self, client, engine):
+        """Prefill vectors support co-located scale format."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "prefill_vectors": {_HP: {"0": {"vector": [1.0, 2.0], "scale": 2.0}}}
+            },
+        )
+        assert resp.status_code == 200
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", validate_call[1].get("kwargs", {}))
+        prefill_vecs = kwargs.get("prefill_vectors", {})
+        assert prefill_vecs[_HP][0] == [2.0, 4.0]
+
+    def test_decode_with_co_located_scale(self, client, engine):
+        """Decode vectors support co-located scale format."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={"decode_vectors": {_HP: {"0": {"vector": [3.0, 6.0], "scale": 0.5}}}},
+        )
+        assert resp.status_code == 200
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", validate_call[1].get("kwargs", {}))
+        decode_vecs = kwargs.get("decode_vectors", {})
+        assert decode_vecs[_HP][0] == [1.5, 3.0]
+
+    def test_replace_clears_all_tiers(self, client, engine):
+        """replace=True passes replace flag to set_steering_vectors."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "decode_vectors": {_HP: {"0": [1.0]}},
+                "replace": True,
+            },
+        )
+        assert resp.status_code == 200
+        assert engine.collective_rpc.call_count == 2
+        apply_call = engine.collective_rpc.call_args_list[1]
+        kwargs = apply_call.kwargs.get("kwargs", apply_call[1].get("kwargs", {}))
+        assert kwargs["replace"] is True
+
+    def test_invalid_hook_in_prefill_tier(self, client, engine):
+        """Invalid hook in any tier returns 400."""
+        resp = client.post(
+            "/v1/steering/set",
+            json={"prefill_vectors": {"bad_hook": {"0": [1.0]}}},
+        )
+        assert resp.status_code == 400
+        assert "Invalid hook point" in resp.json()["error"]
+
+    def test_invalid_hook_in_decode_tier(self, client, engine):
+        resp = client.post(
+            "/v1/steering/set",
+            json={"decode_vectors": {"bad_hook": {"0": [1.0]}}},
+        )
+        assert resp.status_code == 400
+        assert "Invalid hook point" in resp.json()["error"]
+
+    def test_hook_points_response_includes_all_tiers(self, client, engine):
+        """Response includes hook points from all tiers."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "vectors": {"pre_attn": {"0": [1.0]}},
+                "decode_vectors": {_HP: {"0": [1.0]}},
+            },
+        )
+        assert resp.status_code == 200
+        hooks = resp.json()["hook_points"]
+        assert "pre_attn" in hooks
+        assert _HP in hooks
 
 
 # --- POST /v1/steering/clear ---
@@ -220,6 +364,53 @@ class TestClearSteering:
         resp = client.post("/v1/steering/clear")
         assert resp.status_code == 500
         assert "fail" in resp.json()["error"]
+
+    def test_clear_cache_reset_failure_returns_503(self, client, engine):
+        """When prefix cache reset fails after clear, return 503."""
+        engine.collective_rpc.return_value = None
+        engine.reset_prefix_cache.return_value = False
+        resp = client.post("/v1/steering/clear")
+        assert resp.status_code == 503
+        assert "prefix cache" in resp.json()["error"].lower()
+
+
+# --- Cache invalidation on set ---
+
+
+class TestSetSteeringCacheInvalidation:
+    """Cache invalidation must succeed for set to return 200."""
+
+    def test_base_vectors_cache_failure_returns_503(self, client, engine):
+        """Base vectors affect cache; failure returns 503."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.reset_prefix_cache.return_value = False
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [1.0]}),
+        )
+        assert resp.status_code == 503
+        assert "prefix cache" in resp.json()["error"].lower()
+
+    def test_decode_only_cache_failure_returns_503(self, client, engine):
+        """Decode-only vectors also require cache invalidation."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.reset_prefix_cache.return_value = False
+        resp = client.post(
+            "/v1/steering/set",
+            json={"decode_vectors": {_HP: {"0": [1.0]}}},
+        )
+        assert resp.status_code == 503
+        assert "prefix cache" in resp.json()["error"].lower()
+
+    def test_cache_success_returns_200(self, client, engine):
+        """When cache reset succeeds, set returns 200."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.reset_prefix_cache.return_value = True
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [1.0]}),
+        )
+        assert resp.status_code == 200
 
 
 # --- GET /v1/steering ---
@@ -260,6 +451,41 @@ class TestGetSteering:
         resp = client.get("/v1/steering")
         assert resp.status_code == 500
         assert "fail" in resp.json()["error"]
+
+
+# --- _normalize_spec ---
+
+
+class TestNormalizeSpec:
+    """Tests for the ``_normalize_spec`` helper."""
+
+    def test_normalize_spec_drops_empty_hook(self):
+        """Hooks whose layer dict is empty are dropped from the result.
+
+        An input like ``{"post_mlp": {}}`` is functionally
+        equivalent to omitting the hook entirely: no layers and no
+        vectors would be applied. Keeping the empty hook in the
+        normalized spec would produce a truthy-but-empty entry that
+        confuses downstream checks (affects_cache, response payload).
+        """
+        spec: dict = {_HP: {}}
+        result = _normalize_spec(spec)
+        assert _HP not in result
+        assert result == {}
+
+    def test_normalize_spec_drops_only_empty_hook(self):
+        """Empty hooks are dropped while populated hooks are preserved."""
+        spec: dict = {_HP: {0: [1.0, 2.0]}, "pre_attn": {}}
+        result = _normalize_spec(spec)
+        assert "pre_attn" not in result
+        assert _HP in result
+        assert result[_HP] == {0: [1.0, 2.0]}
+
+    def test_normalize_spec_keeps_populated_hook(self):
+        """Hooks with at least one layer entry survive normalization."""
+        spec: dict = {_HP: {0: [1.0, 2.0]}}
+        result = _normalize_spec(spec)
+        assert result == {_HP: {0: [1.0, 2.0]}}
 
 
 # --- attach_router ---

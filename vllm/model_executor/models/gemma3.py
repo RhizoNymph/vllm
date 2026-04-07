@@ -265,7 +265,7 @@ class Gemma3DecoderLayer(nn.Module):
             )
             self.register_buffer(
                 HOOK_POINT_TABLE_ATTR[hp],
-                torch.zeros(max_steering_configs + 2, config.hidden_size),
+                torch.zeros(max_steering_configs + 3, config.hidden_size),
                 persistent=False,
             )
         # Shared steering index mapping token positions to table rows.
@@ -346,14 +346,10 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         residual = torch.ops.vllm.apply_steering(
-            residual, self.steering_table_post_mlp_pre_ln, self.steering_index
+            residual, self.steering_table_post_mlp, self.steering_index
         )
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-
-        residual = torch.ops.vllm.apply_steering(
-            residual, self.steering_table_post_mlp_post_ln, self.steering_index
-        )
 
         return hidden_states, residual
 

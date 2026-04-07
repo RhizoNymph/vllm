@@ -29,13 +29,21 @@ Features Index:
     steering:
         description: >
             Activation steering — inject additive vectors into the residual
-            stream during decode to steer model behaviour.  Supports both
-            global (server-wide) and per-request steering vectors at four
-            hook points (pre_attn, post_attn, post_mlp_pre_ln, post_mlp_post_ln).
+            stream to steer model behaviour.  Supports global (server-wide)
+            and per-request steering with a three-tier additive composition
+            model: base vectors (both phases) + prefill-specific +
+            decode-specific.  Co-located scale factors and three hook points
+            (pre_attn, post_attn, post_mlp).
+            Scheduler predicts mid-step prefill-to-decode transitions and
+            reserves capacity for both phases; model runner gracefully defers
+            decode registration when capacity is temporarily exhausted.
+            Status endpoint reports base, prefill, and decode vector norms.
         entry_points:
             - POST /v1/steering/set (global)
             - POST /v1/steering/clear (global)
-            - GET /v1/steering (status)
-            - SamplingParams.steering_vectors (per-request)
+            - GET /v1/steering (status with phase-specific norms)
+            - SamplingParams.steering_vectors (per-request base)
+            - SamplingParams.prefill_steering_vectors (per-request prefill)
+            - SamplingParams.decode_steering_vectors (per-request decode)
         depends_on: []
         doc: docs/features/steering.md

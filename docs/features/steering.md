@@ -4,8 +4,16 @@ Activation steering injects additive vectors into the residual stream of
 decoder layers during generation.  This allows shifting model behaviour
 (tone, topic, safety) without fine-tuning.
 
-Steering is applied **only during decode steps** — prefill tokens are
-never modified.
+Steering supports a three-tier additive composition model with separate
+prefill and decode phases:
+
+```text
+effective_prefill[hook][layer] = scale(steering_vectors) + scale(prefill_steering_vectors)
+effective_decode[hook][layer]  = scale(steering_vectors) + scale(decode_steering_vectors)
+```
+
+Where each entry is either a bare `list[float]` (scale=1.0) or
+`{"vector": [...], "scale": float}` with a co-located scale factor.
 
 ## Scope
 
@@ -13,8 +21,11 @@ never modified.
 
 - Global (server-wide) steering via HTTP API
 - Per-request steering via `SamplingParams.steering_vectors`
-- Four hook points: `pre_attn`, `post_attn`, `post_mlp_pre_ln`, `post_mlp_post_ln`
-- Additive combination: global + per-request vectors are summed
+- Phase-specific steering via `prefill_steering_vectors` and `decode_steering_vectors`
+- Co-located scale factors on each vector entry
+- Three hook points: `pre_attn`, `post_attn`, `post_mlp`
+- Additive composition: base + phase-specific vectors are pre-scaled and summed
+- Separate config hashes for prefill and decode phases
 - Scheduler admission control for per-request configs
 - CUDA graph and torch.compile compatibility (zero graph partitions)
 - Gemma 3 model family
@@ -23,8 +34,6 @@ never modified.
 
 - Named / pre-registered steering configs (LoRA-style)
 - Models other than Gemma 3 (requires wiring buffers into each model)
-- Speculative decoding interaction (decode detection heuristic assumes 1 token)
-- Per-request steering during prefill
 
 ## Enabling Steering
 
@@ -36,29 +45,34 @@ vllm serve google/gemma-3-4b-it
 vllm serve google/gemma-3-4b-it --enable-steering --max-steering-configs 4
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--enable-steering` | `False` | Allocate per-request steering table rows |
-| `--max-steering-configs` | `4` | Max distinct per-request configs in one batch |
+| Flag                      | Default | Description                                  |
+|---------------------------|---------|----------------------------------------------|
+| `--enable-steering`       | `False` | Allocate per-request steering table rows     |
+| `--max-steering-configs`  | `4`     | Max distinct per-request configs in one batch|
 
 All four hook point buffers are always allocated on every decoder layer.
 The memory cost is trivial (~3.6 MB for 26 layers at `max_steering_configs=4`).
 
-Without `--enable-steering`, each layer gets a 2-row table (zeros + global).
+Without `--enable-steering`, each layer gets a 3-row table (zeros + global prefill + global decode).
 Per-request `steering_vectors` in `SamplingParams` are silently ignored by
 the scheduler since there is no `SteeringConfig` to enable admission control.
 
 ## Hook Points
 
 Steering vectors can be applied at four positions within each decoder layer,
-all operating on the residual stream:
+all operating on the residual skip tensor. These hook names refer to
+regions of the layer where the carried residual skip tensor is steered;
+they do not mean the post-norm tensor that is fed into the next sublayer.
 
-| Hook Point | Position |
-|-----------|----------|
-| `pre_attn` | After `input_layernorm`, before `self_attn` |
-| `post_attn` | After `post_attention_layernorm`, before `pre_feedforward_layernorm` |
-| `post_mlp_pre_ln` | After `mlp`, before `post_feedforward_layernorm` |
-| `post_mlp_post_ln` | After `post_feedforward_layernorm` |
+| Hook Point         | Position                                                             |
+|--------------------|----------------------------------------------------------------------|
+| `pre_attn`         | Steers the residual skip tensor in the pre-attention region          |
+| `post_attn`        | Steers the residual skip tensor in the post-attention region         |
+| `post_mlp`         | Steers the residual skip tensor in the post-MLP region               |
+
+For Gemma 3 specifically, steering is applied to the carried `residual`
+tensor in `Gemma3DecoderLayer.forward()`, which matches the residual-skip
+tensor convention commonly used in mech interp and activation steering.
 
 All four are always active. The `apply_steering` custom op is **not** a
 graph-splitting op — it is opaque to the torch.compile tracer (preventing
@@ -72,35 +86,59 @@ act as a no-op, so unused hook points add no computational overhead.
 Requires `VLLM_SERVER_DEV_MODE=1`.
 
 ```bash
-# Set steering on layer 15 at the post_mlp_pre_ln hook point
+# Set base steering (applies to both prefill and decode)
 curl -X POST http://localhost:8000/v1/steering/set \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
-      "post_mlp_pre_ln": {"15": [0.1, 0.2, ...]}
-    },
-    "scales": {"15": 1.5}
+      "post_mlp": {"15": [0.1, 0.2, ...]}
+    }
   }'
 
-# Set steering at multiple hook points
+# Co-located scale factor (scale embedded in the vector entry)
 curl -X POST http://localhost:8000/v1/steering/set \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
-      "pre_attn": {"15": [0.1, 0.2, ...]},
-      "post_mlp_pre_ln": {"15": [0.3, 0.4, ...]}
+      "post_mlp": {
+        "15": {"vector": [0.1, 0.2, ...], "scale": 1.5}
+      }
+    }
+  }'
+
+# Three-tier: base + prefill-specific + decode-specific
+curl -X POST http://localhost:8000/v1/steering/set \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": {
+      "post_mlp": {"15": [0.1, 0.2, ...]}
     },
-    "scales": {"15": 1.5}
+    "prefill_vectors": {
+      "pre_attn": {"15": [0.5, 0.6, ...]}
+    },
+    "decode_vectors": {
+      "pre_attn": {"15": [0.3, 0.4, ...]}
+    }
+  }'
+
+# Replace all existing vectors atomically
+curl -X POST http://localhost:8000/v1/steering/set \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": {"post_mlp": {"15": [0.1, 0.2, ...]}},
+    "replace": true
   }'
 
 # Check active steering
 curl http://localhost:8000/v1/steering
 
-# Clear all steering
+# Clear all steering (all tiers)
 curl -X POST http://localhost:8000/v1/steering/clear
 ```
 
-Global vectors affect **all** decode tokens in **all** requests until cleared.
+Global vectors affect **all** requests until cleared.  Base vectors
+affect both prefill and decode phases.  Phase-specific vectors
+(`prefill_vectors`, `decode_vectors`) are additive on top of base.
 
 ### Per-Request Steering (SamplingParams)
 
@@ -113,21 +151,31 @@ llm = LLM(
     max_steering_configs=4,
 )
 
-# Request with steering at one hook point
+# Base steering (applies to both prefill and decode)
 steered = SamplingParams(
     max_tokens=100,
     temperature=0.7,
-    steering_vectors={"post_mlp_pre_ln": {15: [0.1, 0.2, ...]}},
+    steering_vectors={"post_mlp": {15: [0.1, 0.2, ...]}},
 )
 
-# Request with steering at multiple hook points
-multi_hook = SamplingParams(
+# Co-located scale factor
+scaled = SamplingParams(
     max_tokens=100,
     temperature=0.7,
     steering_vectors={
-        "pre_attn": {15: [0.1, 0.2, ...]},
-        "post_mlp_pre_ln": {15: [0.3, 0.4, ...]},
+        "post_mlp": {
+            15: {"vector": [0.1, 0.2, ...], "scale": 2.0}
+        }
     },
+)
+
+# Phase-specific: different steering for prefill vs decode
+phase_specific = SamplingParams(
+    max_tokens=100,
+    temperature=0.7,
+    steering_vectors={"post_mlp": {15: [0.1, 0.2, ...]}},
+    prefill_steering_vectors={"pre_attn": {15: [0.5, 0.6, ...]}},
+    decode_steering_vectors={"pre_attn": {15: [0.3, 0.4, ...]}},
 )
 
 # Request without steering (unaffected)
@@ -135,25 +183,59 @@ normal = SamplingParams(max_tokens=100, temperature=0.7)
 
 # All can run in the same batch
 outputs = llm.generate(
-    ["Be creative:", "Summarize this:", "Explain:"],
-    [steered, multi_hook, normal],
+    ["Be creative:", "Summarize:", "Explain:", "Hello:"],
+    [steered, scaled, phase_specific, normal],
 )
 ```
 
 ### Per-Request Steering (OpenAI Client)
+
+All three steering tiers and the scaled vector format are available via
+`extra_body`:
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
+# Base steering (applies to both prefill and decode)
 response = client.chat.completions.create(
     model="google/gemma-3-4b-it",
     messages=[{"role": "user", "content": "Hello"}],
     extra_body={
         "steering_vectors": {
             "pre_attn": {15: [0.1, 0.2, ...]},
-            "post_mlp_pre_ln": {15: [0.3, 0.4, ...]},
+            "post_mlp": {15: [0.3, 0.4, ...]},
+        },
+    },
+)
+
+# Co-located scale factor
+response = client.chat.completions.create(
+    model="google/gemma-3-4b-it",
+    messages=[{"role": "user", "content": "Hello"}],
+    extra_body={
+        "steering_vectors": {
+            "post_mlp": {
+                15: {"vector": [0.1, 0.2, ...], "scale": 2.0}
+            }
+        },
+    },
+)
+
+# Phase-specific: different steering for prefill vs decode
+response = client.chat.completions.create(
+    model="google/gemma-3-4b-it",
+    messages=[{"role": "user", "content": "Hello"}],
+    extra_body={
+        "steering_vectors": {
+            "post_mlp": {15: [0.1, 0.2, ...]}
+        },
+        "prefill_steering_vectors": {
+            "pre_attn": {15: [0.5, 0.6, ...]}
+        },
+        "decode_steering_vectors": {
+            "pre_attn": {15: [0.3, 0.4, ...]}
         },
     },
 )
@@ -161,36 +243,56 @@ response = client.chat.completions.create(
 
 ## Data Flow
 
-```
-SamplingParams.steering_vectors
-    │  {hook_point: {layer_idx: [floats]}}
-    ▼
-Request.steering_config_hash  ◄── deterministic SHA-256 hash
+```text
+SamplingParams
+    ├── steering_vectors        (base, both phases)
+    ├── prefill_steering_vectors  (prefill-specific)
+    └── decode_steering_vectors   (decode-specific)
+    │
+    ▼  resolve_effective_vectors() via cached_property
+SamplingParams.effective_prefill_steering  → pre-scaled flat vectors
+SamplingParams.effective_decode_steering   → pre-scaled flat vectors
+    │
+    ▼  hash_steering_config()
+Request.prefill_steering_config_hash  ◄── deterministic SHA-256 hash
+Request.decode_steering_config_hash   ◄── deterministic SHA-256 hash
     │
     ▼
 Scheduler ── checks capacity against max_steering_configs
-    │         (same pattern as LoRA admission control)
+    │         (tracks union of active hashes: prefill for prefill,
+    │          decode for decode; new requests need only starting phase)
     │         excess requests queued in skipped_waiting
     ▼
-NewRequestData.steering_config_hash
+NewRequestData.prefill_steering_config_hash
+NewRequestData.decode_steering_config_hash
     │
     ▼
 Model Runner._update_states()
-    ├── CachedRequestState.steering_config_hash
-    ├── InputBatch.request_steering_config_hash[req_idx]
-    └── SteeringManager.register_config(hash, vectors) → row assignment
+    ├── CachedRequestState.{prefill,decode}_steering_config_hash
+    ├── InputBatch.request_{prefill,decode}_steering_hash[req_idx]
+    └── SteeringManager.register_config(hash, vectors, phase=...)
+    │     Phase detected at registration time:
+    │       num_computed >= num_prompt → register decode config directly
+    │       otherwise → register prefill config; decode registered on
+    │       phase transition in _update_steering_buffers
+    │     This handles full prefix-cache hits where a request starts
+    │     directly in the decode phase.
     │
     ▼
 Model Runner._update_steering_buffers()  (called before each forward pass)
     ├── SteeringManager.populate_steering_tables(layers)
     │     For EACH hook point's table:
-    │       Row 0 = zeros (prefill sentinel)
-    │       Row 1 = global vector for that hook point
-    │       Rows 2+ = global + per_request (additive)
-    └── Build steering_index: token → table row (shared across hook points)
-          prefill tokens → 0
-          decode, no per-request → 1
-          decode, per-request → assigned row
+    │       Row 0 = zeros (no-steering sentinel)
+    │       Row 1 = global_base + global_prefill (prefill effective)
+    │       Row 2 = global_base + global_decode (decode effective)
+    │       Rows 3+ = phase-appropriate global + per_request (additive)
+    ├── Build steering_index: token → table row (shared across hook points)
+    │     prefill tokens, no per-request → 1 (global prefill)
+    │     prefill tokens, per-request → prefill hash row (3+)
+    │     decode tokens, no per-request → 2 (global decode)
+    │     decode tokens, per-request → decode hash row (3+)
+    └── Detect prefill→decode transitions and swap configs
+          _handle_steering_transition() releases prefill, registers decode
     │
     ▼
 Gemma3DecoderLayer.forward()
@@ -217,70 +319,229 @@ of buffer values) but does not partition the compiled graph.  This means:
 ## Steering Table Layout
 
 Each decoder layer has a `steering_table_<hook>` buffer per hook point
-(e.g., `steering_table_post_mlp_pre_ln`):
+(e.g., `steering_table_post_mlp`):
 
-```
-Row 0:  [0, 0, 0, ..., 0]          ← prefill / no steering
-Row 1:  [g₁, g₂, g₃, ..., gₕ]     ← global vector for this hook point
-Row 2:  [g₁+a₁, g₂+a₂, ..., gₕ+aₕ] ← global + per-request config A
-Row 3:  [g₁+b₁, g₂+b₂, ..., gₕ+bₕ] ← global + per-request config B
+```text
+Row 0:  [0, 0, 0, ..., 0]              ← no steering (zeros sentinel)
+Row 1:  [gB+gP₁, gB+gP₂, ..., gB+gPₕ] ← global prefill effective (base + prefill)
+Row 2:  [gB+gD₁, gB+gD₂, ..., gB+gDₕ] ← global decode effective (base + decode)
+Row 3:  [(gB+gP)+a₁, ..., (gB+gP)+aₕ]  ← prefill global + per-request config A
+Row 4:  [(gB+gD)+b₁, ..., (gB+gD)+bₕ]  ← decode global + per-request config B
 ...
 ```
 
 Each hook point has its own table with independent global/per-request vectors.
+The global effective vectors are composed from three tiers:
+
+- **base**: applies to both phases (from `steering_vectors` global API)
+- **prefill**: prefill-specific globals
+- **decode**: decode-specific globals
+
+Per-request rows (3+) combine the phase-appropriate global effective vector
+with the per-request vector based on the config's registered phase.
 
 The shared `steering_index` buffer maps each token position to a row:
 
-```
+```text
 Token:  [decode₁, decode₂, prefill₁, prefill₂, prefill₃, decode₃]
-Index:  [   2,       1,        0,        0,        0,       3    ]
+Index:  [   4,       2,        1,        1,        3,       4    ]
 ```
+
+Phase detection uses `num_computed_tokens < num_prompt_tokens` (not the
+`n_tokens == 1` heuristic), making it correct for chunked prefill and
+speculative decoding.
 
 ## Deduplication
 
-Requests with identical `steering_vectors` dicts produce the same
-`steering_config_hash`.  The `SteeringManager` deduplicates by hash:
-multiple requests sharing a config consume **one** table row with
-reference counting.  When the last request using a config finishes,
-the row is freed.
+Requests with identical effective steering vectors (after resolution and
+pre-scaling) produce the same config hash.  The `SteeringManager`
+deduplicates by hash: multiple requests sharing a config consume **one**
+table row with reference counting.  When the last request using a config
+finishes, the row is freed.  Prefill and decode hashes are tracked
+independently.
 
 ## Scheduler Admission Control
 
 When `--enable-steering` is set, the scheduler tracks distinct steering
-config hashes in the current batch (same pattern as `scheduled_loras`).
-If `max_steering_configs` slots are occupied by distinct configs:
+config `(hash, phase)` pairs in the current batch — matching the worker's
+`SteeringManager` which allocates separate table rows per `(hash, phase)`
+key.  This ensures the scheduler's capacity counting is consistent with
+the actual row allocation.
 
-1. New requests with a **new** config hash are moved to `skipped_waiting`
-2. They retry on the next scheduling step (FCFS priority)
-3. Requests with a hash already in the batch pass through (dedup)
-4. Requests without steering (`hash == 0`) are never blocked
+**Running request hash collection:** For each running request, the
+scheduler adds its currently-active `(hash, phase)` pair:
+`(prefill_steering_config_hash, "prefill")` for requests still in
+prefill (`num_computed_tokens < num_tokens`),
+`(decode_steering_config_hash, "decode")` for those in decode.
+
+**Transition-aware capacity counting:** When a running request will
+complete prefill during the current step
+(`num_computed_tokens + num_scheduled_tokens >= num_prompt_tokens`), the
+scheduler predicts the mid-step prefill-to-decode transition and reserves
+both the prefill row (still active at step start) and the decode row
+(registered mid-step by `_handle_steering_transition`).  This prevents
+over-admitting new WAITING requests when transition-time row usage is at
+its peak.
+
+**New request admission:** A request only occupies one steering row at
+a time.  The prefill row is released before the decode row is registered
+(in `_handle_steering_transition`).  Therefore the scheduler only checks
+the **prefill hash** at WAITING admission time.
+
+1. Compute `new_hashes = {(prefill_hash, "prefill")}` (excluding zeros)
+2. Compute `new_unique = new_hashes - scheduled_steering_configs`
+3. If `len(scheduled) + len(new_unique) > max_configs`, skip
+4. Requests without prefill steering (`prefill_hash == 0`) — including
+   decode-only steering requests — are never blocked at admission
+5. Requests whose `(hash, phase)` pair is already in the batch pass through (dedup)
+
+**Decode-only requests** (prefill_hash == 0, decode_hash != 0) do not
+occupy a steering row during prefill, so they are admitted freely.
+Their decode row is reserved later by the transition prediction in
+the running-request tracking loop.  For full prefix-cache hits that
+skip prefill entirely, there is a one-step window where the decode row
+is not yet counted; the model runner handles this gracefully by deferring
+registration when capacity is exhausted (falling back to global-only
+decode steering for that step).
+
+## Capacity Behavior During Transitions
+
+During the prefill-to-decode transition, both the prefill and decode
+steering configs may briefly coexist.  The system handles this in two
+layers:
+
+**Scheduler (prediction):** The scheduler predicts which running requests
+will complete prefill during the current step and reserves capacity for
+both their prefill and decode configs in `scheduled_steering_configs`.
+This ensures that new WAITING requests are not admitted when the
+transition would temporarily exhaust capacity.
+
+**Model runner (graceful deferral):** In `_handle_steering_transition`,
+the model runner releases the prefill config and attempts to register the
+decode config.  If the `SteeringManager` is at capacity (all per-request
+rows are occupied), the decode registration is deferred to
+`_pending_decode_registrations` and retried on the next scheduler step.
+Each deferred entry is a `(req_id, decode_hash, vectors)` tuple so that
+entries can be cleaned up when the owning request finishes.  During the
+deferral period, `get_row_for_config` returns row 2 (global decode
+effective) for the unregistered decode hash, so the request falls back to
+global-only decode steering instead of crashing.
+
+**Deferred entry cleanup:** When a request finishes, the finish path in
+`_update_states` filters `_pending_decode_registrations` to remove entries
+whose `req_id` matches the finished request.  This prevents a leak where
+a deferred registration for a dead request would eventually succeed on
+retry, allocating a steering row that is never released.
+
+The `_req_steering_phase` dict tracks which single phase config is active
+per request.  This ensures that on request completion, only the correct
+phase config is released — preventing double-release bugs where a shared
+prefill config's refcount would be incorrectly decremented after the
+request had already transitioned to decode.
+
+## Status Endpoint
+
+`GET /v1/steering` returns per-layer, per-hook-point status via
+`get_steering_status()`.  Each layer/hook-point entry may contain:
+
+- `"norm"`: L2 norm of the base steering vector (from layer buffers).
+  Always present for layers with non-zero base steering.
+- `"prefill_norm"`: L2 norm of the prefill-specific global vector (from
+  `SteeringManager.global_prefill_vectors`).  Only present when set and
+  non-zero.
+- `"decode_norm"`: L2 norm of the decode-specific global vector (from
+  `SteeringManager.global_decode_vectors`).  Only present when set and
+  non-zero.
+
+Base norms reflect the shared layer buffers (written by
+`set_steering_vectors` for base vectors).  Phase-specific norms come from
+the `SteeringManager`'s internal dictionaries when the manager is
+initialized, or from `_pending_steering_globals` on the model runner
+before the first forward pass triggers lazy init.  This ensures that
+calling `GET /v1/steering` immediately after `POST /v1/steering/set`
+reports the pending phase-specific vectors even before any request has
+been served.  Base-phase pending entries are skipped (those norms already
+come from layer buffers).  Phase-specific norms are only present when
+those vectors have been set via the `prefill_vectors` or
+`decode_vectors` parameters of the `/v1/steering/set` endpoint.
 
 ## File Reference
 
-| Component | File |
-|-----------|------|
-| Config | `vllm/config/steering.py` |
-| Custom op + hook point enum | `vllm/model_executor/layers/steering.py` |
-| Gemma 3 buffers | `vllm/model_executor/models/gemma3.py` |
-| SteeringManager | `vllm/v1/worker/steering_manager.py` |
-| InputBatch tracking | `vllm/v1/worker/gpu_input_batch.py` |
-| Scheduler admission | `vllm/v1/core/sched/scheduler.py` |
-| Model runner integration | `vllm/v1/worker/gpu_model_runner.py` |
-| Worker global API | `vllm/v1/worker/worker_base.py` |
-| HTTP endpoints | `vllm/entrypoints/serve/steering/api_router.py` |
-| Protocol types | `vllm/entrypoints/serve/steering/protocol.py` |
-| SamplingParams field | `vllm/sampling_params.py` |
-| Request hash | `vllm/v1/request.py` |
-| CLI args | `vllm/engine/arg_utils.py` |
+| Component                      | File                                                                |
+|--------------------------------|---------------------------------------------------------------------|
+| Config                         | `vllm/config/steering.py`                                           |
+| Type definitions + helpers     | `vllm/config/steering_types.py`                                     |
+| Custom op + hook point enum    | `vllm/model_executor/layers/steering.py`                            |
+| Gemma 3 buffers                | `vllm/model_executor/models/gemma3.py`                              |
+| SteeringManager                | `vllm/v1/worker/steering_manager.py`                                |
+| InputBatch tracking            | `vllm/v1/worker/gpu_input_batch.py`                                 |
+| Scheduler admission            | `vllm/v1/core/sched/scheduler.py`                                   |
+| Model runner integration       | `vllm/v1/worker/gpu_model_runner.py`                                |
+| Worker global API              | `vllm/v1/worker/worker_base.py`                                     |
+| HTTP endpoints                 | `vllm/entrypoints/serve/steering/api_router.py`                     |
+| Protocol types                 | `vllm/entrypoints/serve/steering/protocol.py`                       |
+| SamplingParams field           | `vllm/sampling_params.py`                                           |
+| Request hash                   | `vllm/v1/request.py`                                                |
+| CLI args                       | `vllm/engine/arg_utils.py`                                          |
+| Streaming steering tests       | `tests/v1/streaming_input/test_gpu_model_runner_streaming.py`       |
+| OpenAI chat protocol           | `vllm/entrypoints/openai/chat_completion/protocol.py`               |
+| OpenAI completion protocol     | `vllm/entrypoints/openai/completion/protocol.py`                    |
+| Prefix cache key integration   | `vllm/v1/core/kv_cache_utils.py` (`_gen_steering_extra_hash_keys`)  |
+
+## Prefix Cache Key Integration
+
+Per-request steering config hashes are included in block hash extra keys via
+`_gen_steering_extra_hash_keys()` in `kv_cache_utils.py`. This ensures that
+blocks computed under different steering configurations produce different
+cache entries.
+
+The helper classifies each block into one of three categories based on
+`start_token_idx`, `end_token_idx`, and `num_prompt_tokens`:
+
+- **Pure prompt block** (`start < num_prompt_tokens` and `end <= num_prompt_tokens`):
+  only the prefill steering hash is included.
+- **Boundary block** (`start < num_prompt_tokens` and `end > num_prompt_tokens`):
+  both the prefill and decode steering hashes are included. This prevents two
+  requests with identical prefill steering but different decode steering from
+  sharing a block that contains KV data computed under both phases.
+- **Pure decode block** (`start >= num_prompt_tokens`): only the decode steering
+  hash is included. The prefill hash is already embedded in the parent hash
+  chain through earlier prompt blocks.
+
+Key design decisions:
+
+- **Phase-aware hashing.** Each block includes only the steering hashes relevant
+  to the phases it spans: prefill-only, decode-only, or both for boundary blocks.
+- **Zero impact when unused.** When steering config hashes are 0 or absent, the
+  helper returns an empty list, adding nothing to the extra keys.
+- **Global steering is NOT in per-request hashes.** Instead, any global
+  steering change (base, prefill, or decode) triggers `reset_prefix_cache()`
+  to clear all cached blocks.  Decode-phase changes must also invalidate the
+  cache because automatic prefix caching (APC) can cache and reuse
+  decode-phase KV blocks; stale blocks would produce outputs inconsistent
+  with the new steering state.  This avoids encoding mutable global state
+  into every block hash.  The invariant is: within a "global steering epoch"
+  (between cache resets), all cached blocks were computed with the same
+  global state.
+- **Forward-compatible.** Uses `getattr(request, 'prefill_steering_config_hash', 0)`
+  so this code works even before the Request attribute is added.
 
 ## Invariants
 
-1. **Row 0 is always zeros.** No token should ever receive steering from row 0.
-2. **Prefill tokens always index row 0.** Steering is decode-only.
+1. **Row 0 is always zeros.** No token should ever receive steering from row 0 (unless no steering is configured at all).
+2. **Prefill and decode phases use independent config hashes.** Each phase resolves its own effective vectors and hashes them separately.
 3. **Combined rows are recomputed every step.** `populate_steering_tables()` runs before each forward pass, so changes to global vectors are immediately reflected.
-4. **Buffer shapes are fixed at init.** The table has `max_steering_configs + 2` rows regardless of how many are active. This is required for CUDA graph compatibility.
+4. **Buffer shapes are fixed at init.** The table has `max_steering_configs + 3` rows (0=zeros, 1=global prefill, 2=global decode, 3+=per-request). This is required for CUDA graph compatibility.
 5. **The steering_index tensor is shared across all layers and all hook points.** One in-place update is visible to all decoder layers. Token-to-row mapping is independent of hook point.
 6. **All four hook point buffers are always allocated.** The memory cost is trivial. Zero rows make unused hook points a no-op.
 7. **The custom op is not a splitting op.** It prevents constant-folding but does not partition the compiled graph.
-8. **Reference counting is exact.** Every `register_config` is balanced by a `release_config` when the request finishes. Rows are only freed at refcount 0.
-9. **Validation is all-or-nothing.** `SamplingParams._validate_steering_vectors()` checks all keys and values before any request processing begins.
+8. **One-active-at-a-time registration.** Only one phase's config is registered per request at any time. The initial phase is detected at registration time: if `num_computed_tokens >= num_prompt_tokens` (full prefix-cache hit), the decode config is registered directly; otherwise, the prefill config is registered and the decode config is registered on the prefill-to-decode transition. The `_req_steering_phase` dict tracks which phase is active per request so that on completion only the correct config is released. If decode registration is deferred due to capacity exhaustion, the phase is still tracked as "decode" and the request falls back to global-only decode steering until the next step retries the registration. Deferred entries include the `req_id` and are cleaned up when the request finishes to prevent leaking rows for dead requests.
+9. **Validation is all-or-nothing.** `SamplingParams._validate_steering_vectors()` checks all three vector fields before any request processing begins.
+10. **Additive composition is pre-scaled.** `resolve_effective_vectors()` applies co-located scales before summing base and phase-specific vectors.
+11. **Phase detection is token-count based.** `num_computed_tokens < num_prompt_tokens` determines prefill vs decode, not the `n_tokens == 1` heuristic.
+12. **Reference counting is exact.** Every `register_config` is balanced by a `release_config` when the request finishes. Rows are only freed at refcount 0.
+13. **Prefix cache correctness.** Blocks computed under different per-request steering configs produce different block hashes. Any global steering change (base, prefill, or decode) invalidates the entire prefix cache rather than being encoded per-block, because APC can cache decode-phase KV blocks that depend on decode steering. If the cache reset fails (blocks still in use), the API returns 503 rather than silently succeeding with stale cache entries.
+14. **Phase-specific global vectors survive lazy init.** When `set_steering_vectors()` is called with `prefill_vectors` or `decode_vectors` before the first forward pass (before `SteeringManager` is lazily created), the phase-specific vectors are captured with their phase labels into `_pending_steering_globals` on the model runner. During lazy init, these pending entries are replayed in order so that base, prefill, and decode globals are registered with the correct phase. Without this, all vectors would collapse into the last-written buffer contents and be misidentified as base-phase.
+15. **`clear_steering_vectors()` clears pending globals.** When clearing steering state, both the live `SteeringManager` globals and the `_pending_steering_globals` list are cleared. This prevents stale vectors from being replayed during lazy init if a clear happens before the first forward pass. The `replace=True` flag in `set_steering_vectors` handles clear-then-apply atomically within a single worker call, avoiding the non-atomic two-RPC pattern of clearing first and then setting.
+16. **Streaming re-adds handle steering independently from preemption resumption.** `_update_streaming_request` uses an explicit block that saves old hashes before mutating `req_state`, releases the old phase config using those saved hashes, then registers the new prefill config using data from `new_req_data`. This avoids the hash/vector mismatch that would occur if `_reset_steering_for_resumption` were called, since by that point `req_state.sampling_params` has already been updated to NEW values while the config hashes are still OLD.
+17. **Per-request vectors are GPU-resident.** The `SteeringManager` is initialized with the device of the first steerable layer's table buffer (typically CUDA). All per-request steering vectors created in `register_config` are allocated directly on this device, avoiding implicit CPU-to-GPU transfers during `populate_steering_tables`. The per-request-only path in `populate_steering_tables` also includes an explicit `device=table.device` transfer as a safety net.

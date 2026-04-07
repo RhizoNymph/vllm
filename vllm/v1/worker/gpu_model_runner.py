@@ -1061,15 +1061,36 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        # Release steering configs for finished requests (before popping
-        # state so we still have access to the steering_config_hash).
+        # Release the currently-active steering config for finished requests
+        # (before popping state so we still have access to the hashes).
+        # Use _req_steering_phase to determine which single phase config
+        # is active, avoiding the bug where both prefill AND decode would
+        # be released (potentially decrementing another request's refcount
+        # on a shared prefill config that was already transitioned away).
         if getattr(self, "_steering_manager", None) is not None:
             for req_id in scheduler_output.finished_req_ids:
-                req_state = self.requests.get(req_id)
-                if req_state is not None and req_state.steering_config_hash != 0:
-                    self._steering_manager.release_config(
-                        req_state.steering_config_hash
-                    )
+                phase = self._req_steering_phase.pop(req_id, None)
+                if phase is not None:
+                    req_state = self.requests.get(req_id)
+                    if req_state is not None:
+                        if phase == "prefill":
+                            h = req_state.prefill_steering_config_hash
+                        else:
+                            h = req_state.decode_steering_config_hash
+                        if h != 0:
+                            self._steering_manager.release_config(h, phase)
+
+            # Also remove any deferred steering registrations for
+            # finished requests to prevent registering rows for dead
+            # requests.  (The retry loop also checks, but this eagerly
+            # drops entries before self.requests is pruned below.)
+            if self._pending_steering_registrations:
+                finished = set(scheduler_output.finished_req_ids)
+                self._pending_steering_registrations = [
+                    entry
+                    for entry in self._pending_steering_registrations
+                    if entry[0] not in finished
+                ]
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -1170,23 +1191,80 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
-                steering_config_hash=new_req_data.steering_config_hash,
+                prefill_steering_config_hash=(
+                    new_req_data.prefill_steering_config_hash
+                ),
+                decode_steering_config_hash=(new_req_data.decode_steering_config_hash),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
-            # Register per-request steering config if present.
+            # Register the initial-phase steering config.
+            # Normally requests start in prefill, but a full
+            # prefix-cache hit (num_computed >= num_prompt) puts
+            # a request directly into decode.
             if (
                 getattr(self, "_steering_manager", None) is not None
-                and new_req_data.steering_config_hash != 0
                 and new_req_data.sampling_params is not None
             ):
                 sp = new_req_data.sampling_params
-                if sp.steering_vectors:
-                    self._steering_manager.register_config(
-                        new_req_data.steering_config_hash,
-                        sp.steering_vectors,
-                    )
+                if new_req_data.num_computed_tokens >= req_state.num_prompt_tokens:
+                    # Already past prefill — register decode config.
+                    if (
+                        new_req_data.decode_steering_config_hash != 0
+                        and sp.effective_decode_steering
+                    ):
+                        try:
+                            self._steering_manager.register_config(
+                                new_req_data.decode_steering_config_hash,
+                                sp.effective_decode_steering,
+                                phase="decode",
+                            )
+                        except RuntimeError:
+                            self._pending_steering_registrations.append(
+                                (
+                                    req_id,
+                                    new_req_data.decode_steering_config_hash,
+                                    sp.effective_decode_steering,
+                                    "decode",
+                                )
+                            )
+                            logger.warning(
+                                "Deferred decode steering config "
+                                "(hash=%d) -- capacity full, "
+                                "will retry next step",
+                                new_req_data.decode_steering_config_hash,
+                            )
+                    self._req_steering_phase[req_id] = "decode"
+                else:
+                    # Normal: start in prefill; decode registered
+                    # on transition in _update_steering_buffers.
+                    if (
+                        new_req_data.prefill_steering_config_hash != 0
+                        and sp.effective_prefill_steering
+                    ):
+                        try:
+                            self._steering_manager.register_config(
+                                new_req_data.prefill_steering_config_hash,
+                                sp.effective_prefill_steering,
+                                phase="prefill",
+                            )
+                        except RuntimeError:
+                            self._pending_steering_registrations.append(
+                                (
+                                    req_id,
+                                    new_req_data.prefill_steering_config_hash,
+                                    sp.effective_prefill_steering,
+                                    "prefill",
+                                )
+                            )
+                            logger.warning(
+                                "Deferred prefill steering config "
+                                "(hash=%d) -- capacity full, "
+                                "will retry next step",
+                                new_req_data.prefill_steering_config_hash,
+                            )
+                    self._req_steering_phase[req_id] = "prefill"
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1283,6 +1361,10 @@ class GPUModelRunner(
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
+            if resumed_from_preemption:
+                self._reset_steering_for_resumption(
+                    req_id, req_state, num_computed_tokens
+                )
 
             if not is_last_rank:
                 if not req_data.new_token_ids:
@@ -1515,10 +1597,80 @@ class GPUModelRunner(
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
-
         # Clear `output_token_ids` as previous output tokens are now part of
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
+
+        # Refresh steering config hashes for the re-added request.
+        # Streaming re-adds go back through prefill, so we must:
+        # 1. Release the old config (whatever phase we were tracking)
+        # 2. Update the hashes on CachedRequestState
+        # 3. Register the new prefill config
+        # 4. Update phase tracking
+        old_prefill_hash = req_state.prefill_steering_config_hash
+        old_decode_hash = req_state.decode_steering_config_hash
+        new_prefill_hash = new_req_data.prefill_steering_config_hash
+        new_decode_hash = new_req_data.decode_steering_config_hash
+
+        req_state.prefill_steering_config_hash = new_prefill_hash
+        req_state.decode_steering_config_hash = new_decode_hash
+
+        if getattr(self, "_steering_manager", None) is not None:
+            # Release the old phase config.
+            old_phase = self._req_steering_phase.get(req_id)
+            if old_phase is not None:
+                if old_phase == "prefill" and old_prefill_hash != 0:
+                    self._steering_manager.release_config(old_prefill_hash, "prefill")
+                elif old_phase == "decode" and old_decode_hash != 0:
+                    self._steering_manager.release_config(old_decode_hash, "decode")
+
+            # Purge stale deferred registrations for this request.
+            if self._pending_steering_registrations:
+                self._pending_steering_registrations = [
+                    entry
+                    for entry in self._pending_steering_registrations
+                    if entry[0] != req_id
+                ]
+
+            # Register new prefill config (streaming re-adds start
+            # in prefill).
+            sp = new_req_data.sampling_params
+            if (
+                new_prefill_hash != 0
+                and sp is not None
+                and sp.effective_prefill_steering
+            ):
+                try:
+                    self._steering_manager.register_config(
+                        new_prefill_hash,
+                        sp.effective_prefill_steering,
+                        phase="prefill",
+                    )
+                except RuntimeError:
+                    self._pending_steering_registrations.append(
+                        (
+                            req_id,
+                            new_prefill_hash,
+                            sp.effective_prefill_steering,
+                            "prefill",
+                        )
+                    )
+                    logger.warning(
+                        "Deferred prefill steering config "
+                        "(hash=%d) for streaming re-add -- "
+                        "capacity full, will retry next step",
+                        new_prefill_hash,
+                    )
+                self._req_steering_phase[req_id] = "prefill"
+            elif new_prefill_hash == 0 and new_decode_hash == 0:
+                # No steering for this request anymore.
+                self._req_steering_phase.pop(req_id, None)
+            else:
+                # Has hashes but no effective prefill vectors (e.g.,
+                # decode-only steering).  Mark as prefill since the
+                # request re-enters prefill; transition to decode
+                # will handle decode registration.
+                self._req_steering_phase[req_id] = "prefill"
 
         if self.uses_mrope:
             self._init_mrope_positions(req_state)
@@ -3030,6 +3182,7 @@ class GPUModelRunner(
         Lazily initializes the SteeringManager on first call.  Each step:
         1. Populate each layer's per-hook steering_table from the manager
         2. Build the steering_index mapping tokens to table rows
+        3. Detect prefill->decode phase transitions and swap configs
         """
         from vllm.model_executor.layers.steering import (
             HOOK_POINT_TABLE_ATTR,
@@ -3057,26 +3210,152 @@ class GPUModelRunner(
                 )
                 from vllm.v1.worker.steering_manager import SteeringManager
 
-                self._steering_manager = SteeringManager(max_configs)
+                # Resolve device from the first steerable layer's table
+                # buffer so per-request vectors are allocated on the same
+                # device, avoiding CPU->GPU copies each step.
+                table_device: torch.device | None = None
+                for mod in steerable.values():
+                    for attr in HOOK_POINT_TABLE_ATTR.values():
+                        if hasattr(mod, attr):
+                            table_device = getattr(mod, attr).device
+                            break
+                    if table_device is not None:
+                        break
 
-                # Pick up any existing global vectors from the
-                # steering_vector_* buffers (set via the global API
-                # before this method was called).
-                for hp, vec_attr in HOOK_POINT_VECTOR_ATTR.items():
-                    for layer_idx, mod in steerable.items():
-                        if not hasattr(mod, vec_attr):
-                            continue
-                        vec = getattr(mod, vec_attr)
-                        if vec.any():
-                            self._steering_manager.update_global_vectors(
-                                hp.value, layer_idx, vec
-                            )
+                self._steering_manager = SteeringManager(
+                    max_configs, device=table_device
+                )
+                # Each entry: (req_id, config_hash, vectors, phase).
+                # Retried with priority before new admissions.
+                self._pending_steering_registrations: list[
+                    tuple[str, int, dict[str, dict[int, list[float]]], str]
+                ] = []
+                self._req_steering_phase: dict[str, str] = {}
+
+                # Replay any pending phase-specific global vectors that
+                # were set via set_steering_vectors() before the manager
+                # existed.
+                pending = getattr(self, "_pending_steering_globals", None)
+                if pending:
+                    for captured_vectors, phase in pending:
+                        for hook_point_str, layer_vecs in captured_vectors.items():
+                            for layer_idx, vec in layer_vecs.items():
+                                self._steering_manager.update_global_vectors(
+                                    hook_point_str,
+                                    layer_idx,
+                                    vec,
+                                    phase=phase,
+                                )
+                    self._pending_steering_globals = None
+                else:
+                    # No pending phase-specific globals -- fall back to
+                    # reading the steering_vector_* buffers as base-phase
+                    # globals.  This handles the case where vectors were
+                    # set via a path that doesn't use phase-aware
+                    # notifications.
+                    for hp, vec_attr in HOOK_POINT_VECTOR_ATTR.items():
+                        for layer_idx, mod in steerable.items():
+                            if not hasattr(mod, vec_attr):
+                                continue
+                            vec = getattr(mod, vec_attr)
+                            if vec.any():
+                                self._steering_manager.update_global_vectors(
+                                    hp.value,
+                                    layer_idx,
+                                    vec,
+                                    phase="base",
+                                )
+                # Register any configs that were added to the batch
+                # before the manager existed (first-step race).
+                for i in range(self.input_batch.num_reqs):
+                    rid = self.input_batch.req_ids[i]
+                    rs = self.requests.get(rid)
+                    if rs is None or rs.sampling_params is None:
+                        continue
+                    ri = self.input_batch.req_id_to_index.get(rid)
+                    if ri is None:
+                        continue
+
+                    num_computed = int(self.input_batch.num_computed_tokens_cpu[ri])
+                    num_prompt = int(self.input_batch.num_prompt_tokens[ri])
+
+                    if num_computed < num_prompt:
+                        # In prefill — register prefill config
+                        ph = int(self.input_batch.request_prefill_steering_hash[ri])
+                        if ph != 0:
+                            eff = rs.sampling_params.effective_prefill_steering
+                            if eff:
+                                try:
+                                    self._steering_manager.register_config(
+                                        ph, eff, phase="prefill"
+                                    )
+                                except RuntimeError:
+                                    self._pending_steering_registrations.append(
+                                        (rid, ph, eff, "prefill")
+                                    )
+                                    logger.warning(
+                                        "Deferred prefill steering config "
+                                        "(hash=%d) during init -- capacity "
+                                        "full, will retry next step",
+                                        ph,
+                                    )
+                        self._req_steering_phase[rid] = "prefill"
+                    else:
+                        # In decode (full prefix-cache hit) — register
+                        # decode config
+                        dh = int(self.input_batch.request_decode_steering_hash[ri])
+                        if dh != 0:
+                            eff = rs.sampling_params.effective_decode_steering
+                            if eff:
+                                try:
+                                    self._steering_manager.register_config(
+                                        dh, eff, phase="decode"
+                                    )
+                                except RuntimeError:
+                                    self._pending_steering_registrations.append(
+                                        (rid, dh, eff, "decode")
+                                    )
+                                    logger.warning(
+                                        "Deferred decode steering config "
+                                        "(hash=%d) during init -- capacity "
+                                        "full, will retry next step",
+                                        dh,
+                                    )
+                        self._req_steering_phase[rid] = "decode"
             else:
                 self._steering_manager = None
                 self._steerable_layers = {}
 
         if self._steering_manager is None or not self._steerable_layers:
             return
+
+        # Process deferred steering registrations (priority over new
+        # admissions).  Entries are dropped when the originating request
+        # has finished or changed phase, preventing row leaks.
+        if self._pending_steering_registrations:
+            still_pending: list[
+                tuple[str, int, dict[str, dict[int, list[float]]], str]
+            ] = []
+            for (
+                d_req_id,
+                d_hash,
+                d_vecs,
+                d_phase,
+            ) in self._pending_steering_registrations:
+                # Drop entries for finished requests.
+                if d_req_id not in self.requests:
+                    continue
+                # Drop entries whose request changed phase (e.g. prefill
+                # deferred but request already transitioned to decode).
+                if self._req_steering_phase.get(d_req_id) != d_phase:
+                    continue
+                try:
+                    self._steering_manager.register_config(
+                        d_hash, d_vecs, phase=d_phase
+                    )
+                except RuntimeError:
+                    still_pending.append((d_req_id, d_hash, d_vecs, d_phase))
+            self._pending_steering_registrations = still_pending
 
         # 1. Populate steering tables
         self._steering_manager.populate_steering_tables(self._steerable_layers)
@@ -3104,29 +3383,147 @@ class GPUModelRunner(
                 token_offset += n_tokens
                 continue
 
-            steering_hash = int(
-                self.input_batch.request_steering_config_hash[req_index]
-            )
+            # Determine phase from num_computed vs num_prompt
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+            is_prefilling = num_computed < num_prompt
 
-            # Decode heuristic: decode requests schedule exactly 1 token.
-            # TODO: spec decode may schedule >1 tokens for decode requests.
-            is_decode = n_tokens == 1
+            if is_prefilling:
+                # Prefill: use prefill steering hash
+                prefill_hash = int(
+                    self.input_batch.request_prefill_steering_hash[req_index]
+                )
+                row = self._steering_manager.get_row_for_config(
+                    prefill_hash, is_prefill=True
+                )
+                steering_index[token_offset : token_offset + n_tokens] = row
 
-            if is_decode:
-                if steering_hash != 0:
-                    row = self._steering_manager.get_row_for_config(steering_hash)
-                else:
-                    row = 1  # global-only
-                steering_index[token_offset] = row
+                # Check if this request will transition to decode after
+                # this step's tokens are processed.
+                num_computed_after = num_computed + n_tokens
+                if num_computed_after >= num_prompt:
+                    self._handle_steering_transition(req_id, req_index, prefill_hash)
             else:
-                # Prefill tokens: no steering
-                steering_index[token_offset : token_offset + n_tokens] = 0
+                # Decode: use decode steering hash
+                decode_hash = int(
+                    self.input_batch.request_decode_steering_hash[req_index]
+                )
+                row = self._steering_manager.get_row_for_config(
+                    decode_hash, is_prefill=False
+                )
+                steering_index[token_offset : token_offset + n_tokens] = row
 
             token_offset += n_tokens
 
         # Zero out remaining positions
         if token_offset < steering_index.shape[0]:
             steering_index[token_offset:].zero_()
+
+    def _handle_steering_transition(
+        self,
+        req_id: str,
+        req_index: int,
+        prefill_hash: int,
+    ) -> None:
+        """Handle prefill->decode steering config transition.
+
+        Called when a request will complete prefill after this step.
+        Releases the prefill config and registers the decode config
+        so it is ready for the next step's table population.
+
+        If the steering table is at capacity, the decode registration
+        is deferred to ``_pending_steering_registrations`` and retried
+        on the next scheduler step.  The existing ``get_row_for_config``
+        fallback (returns row 2 for unregistered decode hashes) provides
+        graceful degradation during the deferral period.
+        """
+        if prefill_hash != 0:
+            self._steering_manager.release_config(prefill_hash, "prefill")
+
+        decode_hash = int(self.input_batch.request_decode_steering_hash[req_index])
+        if decode_hash != 0:
+            req_state = self.requests.get(req_id)
+            if req_state is not None and req_state.sampling_params is not None:
+                sp = req_state.sampling_params
+                if sp.effective_decode_steering:
+                    try:
+                        self._steering_manager.register_config(
+                            decode_hash,
+                            sp.effective_decode_steering,
+                            phase="decode",
+                        )
+                    except RuntimeError:
+                        self._pending_steering_registrations.append(
+                            (
+                                req_id,
+                                decode_hash,
+                                sp.effective_decode_steering,
+                                "decode",
+                            )
+                        )
+                        logger.warning(
+                            "Deferred decode steering config (hash=%d) "
+                            "-- capacity full, will retry next step",
+                            decode_hash,
+                        )
+
+        # Update phase tracking regardless of whether decode
+        # registration succeeded or was deferred.
+        self._req_steering_phase[req_id] = "decode"
+
+    def _reset_steering_for_resumption(
+        self,
+        req_id: str,
+        req_state: "CachedRequestState",
+        new_num_computed_tokens: int,
+    ) -> None:
+        """Reset steering config registration when a request re-enters prefill.
+
+        Called when a preempted request is resumed with num_computed_tokens
+        reset. If the request had transitioned to decode before preemption,
+        its decode config is still registered and its phase is stale.
+        This helper releases the stale decode config and re-registers the
+        prefill config (or defers it on capacity exhaustion).
+        """
+        if getattr(self, "_steering_manager", None) is None:
+            return
+        prev_phase = self._req_steering_phase.get(req_id)
+        if prev_phase != "decode":
+            return
+        if new_num_computed_tokens >= req_state.num_prompt_tokens:
+            return  # still in decode, nothing to reset
+
+        # Release the stale decode config.
+        if req_state.decode_steering_config_hash != 0:
+            self._steering_manager.release_config(
+                req_state.decode_steering_config_hash, "decode"
+            )
+
+        # Drop any stale deferred entries for this request.
+        if self._pending_steering_registrations:
+            self._pending_steering_registrations = [
+                e for e in self._pending_steering_registrations if e[0] != req_id
+            ]
+
+        self._req_steering_phase[req_id] = "prefill"
+
+        sp = req_state.sampling_params
+        prefill_hash = req_state.prefill_steering_config_hash
+        if prefill_hash == 0 or sp is None or not sp.effective_prefill_steering:
+            return
+        try:
+            self._steering_manager.register_config(
+                prefill_hash, sp.effective_prefill_steering, phase="prefill"
+            )
+        except RuntimeError:
+            self._pending_steering_registrations.append(
+                (req_id, prefill_hash, sp.effective_prefill_steering, "prefill")
+            )
+            logger.warning(
+                "Deferred prefill steering config (hash=%d) on resumption "
+                "-- capacity full, will retry next step",
+                prefill_hash,
+            )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()

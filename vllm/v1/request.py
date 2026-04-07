@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
-import hashlib
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -96,11 +95,6 @@ class Request:
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
 
-        # Per-request activation steering vectors keyed by hook point.
-        self.steering_vectors: dict[str, dict[int, list[float]]] | None = None
-        if sampling_params is not None and sampling_params.steering_vectors:
-            self.steering_vectors = sampling_params.steering_vectors
-
         if pooling_params is not None:
             # Pooling models.
             self.max_tokens = 1
@@ -170,6 +164,12 @@ class Request:
         self.num_external_computed_tokens = 0
 
         self.block_hashes: list[BlockHash] = []
+        self.block_hash_prefill_steering_config_hash = (
+            self.prefill_steering_config_hash
+        )
+        self.block_hash_decode_steering_config_hash = (
+            self.decode_steering_config_hash
+        )
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
@@ -225,6 +225,38 @@ class Request:
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
 
+    def set_block_hash_steering_overrides(
+        self,
+        prefill_hash: int | None = None,
+        decode_hash: int | None = None,
+    ) -> None:
+        """Update the steering hashes used for block-hash generation.
+
+        Prefix-cache keys must track the effective steering applied when KV
+        blocks are produced. Scheduler-side capacity checks may temporarily
+        force a request onto the global fallback rows before the per-request
+        steering config can be registered, in which case APC should hash with
+        0 for that phase rather than the deferred per-request hash.
+        """
+        new_prefill_hash = (
+            self.prefill_steering_config_hash
+            if prefill_hash is None
+            else prefill_hash
+        )
+        new_decode_hash = (
+            self.decode_steering_config_hash if decode_hash is None else decode_hash
+        )
+        if (
+            self.block_hash_prefill_steering_config_hash == new_prefill_hash
+            and self.block_hash_decode_steering_config_hash == new_decode_hash
+        ):
+            return
+
+        self.block_hash_prefill_steering_config_hash = new_prefill_hash
+        self.block_hash_decode_steering_config_hash = new_decode_hash
+        self.block_hashes.clear()
+        self.update_block_hashes()
+
     @property
     def use_structured_output(self) -> bool:
         return self.structured_output_request is not None
@@ -250,17 +282,29 @@ class Request:
         return self.num_encoder_inputs > 0
 
     @cached_property
-    def steering_config_hash(self) -> int:
-        """0 if no per-request steering, else deterministic hash of vectors."""
-        if not self.steering_vectors:
+    def prefill_steering_config_hash(self) -> int:
+        """0 if no prefill steering, else deterministic hash of vectors."""
+        from vllm.config.steering_types import hash_steering_config
+
+        if self.sampling_params is None:
             return 0
-        canonical = {
-            hp: sorted(vecs.items())
-            for hp, vecs in sorted(self.steering_vectors.items())
-        }
-        data = str(sorted(canonical.items())).encode()
-        # Mask to fit in np.int64 (used by InputBatch tracking arrays)
-        return int(hashlib.sha256(data).hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+        return hash_steering_config(self.sampling_params.effective_prefill_steering)
+
+    @cached_property
+    def decode_steering_config_hash(self) -> int:
+        """0 if no decode steering, else deterministic hash of vectors."""
+        from vllm.config.steering_types import hash_steering_config
+
+        if self.sampling_params is None:
+            return 0
+        return hash_steering_config(self.sampling_params.effective_decode_steering)
+
+    def invalidate_steering_hashes(self) -> None:
+        """Clear cached steering hashes so they recompute from current
+        sampling_params.  Must be called whenever sampling_params is
+        replaced (e.g. streaming session updates)."""
+        self.__dict__.pop("prefill_steering_config_hash", None)
+        self.__dict__.pop("decode_steering_config_hash", None)
 
     def get_skip_reading_prefix_cache(self) -> bool:
         if (
