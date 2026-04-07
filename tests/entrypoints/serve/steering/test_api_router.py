@@ -6,12 +6,11 @@ Tests cover three-tier steering (base, prefill, decode) with co-located
 scale format support.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 import vllm.envs as envs
 from vllm.entrypoints.serve.steering.api_router import (
@@ -33,12 +32,26 @@ def _make_app(engine_mock) -> FastAPI:
     return app
 
 
-@pytest.fixture(autouse=True)
-def _reset_steering_lock():
-    """Prevent cross-test lock state leakage."""
-    import vllm.entrypoints.serve.steering.api_router as mod
+class _SyncASGIClient:
+    def __init__(self, app: FastAPI):
+        self._app = app
 
-    mod._steering_lock = asyncio.Lock()
+    def post(self, *args, **kwargs):
+        return self._request("post", *args, **kwargs)
+
+    def get(self, *args, **kwargs):
+        return self._request("get", *args, **kwargs)
+
+    def _request(self, method: str, *args, **kwargs):
+        async def _run():
+            transport = httpx.ASGITransport(app=self._app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                return await getattr(client, method)(*args, **kwargs)
+
+        return pytest.importorskip("anyio").run(_run)
 
 
 @pytest.fixture
@@ -48,8 +61,7 @@ def engine():
 
 @pytest.fixture
 def client(engine):
-    app = _make_app(engine)
-    return TestClient(app)
+    return _SyncASGIClient(_make_app(engine))
 
 
 def _vecs(layer_vecs: dict, hook: str = _HP) -> dict:

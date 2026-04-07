@@ -1416,6 +1416,9 @@ class TestDeviceMismatch:
         """When global vectors are on CUDA and per-request vectors are on
         CPU, ``populate_steering_tables`` must not raise a RuntimeError
         and must produce the correct combined values."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
         mgr = _make_manager()
 
         # Global vectors on CUDA (simulates real model behaviour)
