@@ -27,8 +27,6 @@ Steering currently supports:
 
 Not currently supported:
 
-- Models other than Gemma 3
-- Named or pre-registered steering configs
 - v2 model runner integration
 
 ## Steering Model
@@ -196,6 +194,104 @@ response = client.chat.completions.create(
     },
 )
 ```
+
+## Named Steering Modules
+
+Named steering modules let you pre-register steering vector configurations
+and reference them by name in requests, avoiding the need to send large
+inline vector arrays with every request.
+
+### Registering at Startup (CLI)
+
+```bash
+vllm serve google/gemma-3-4b-it \
+  --enable-steering \
+  --max-steering-configs 4 \
+  --steering-modules creativity=/path/to/creativity.json \
+                      safety=/path/to/safety.json
+```
+
+The JSON file uses the same three-tier format as the global steering API:
+
+```json
+{
+  "vectors": {
+    "post_mlp": {
+      "15": [0.1, 0.2, 0.3],
+      "20": {"vector": [0.4, 0.5, 0.6], "scale": 2.0}
+    }
+  },
+  "prefill_vectors": {
+    "pre_attn": {
+      "15": [0.3, 0.4, 0.5]
+    }
+  },
+  "decode_vectors": null
+}
+```
+
+### Registering at Runtime (API)
+
+Runtime management endpoints require `VLLM_SERVER_DEV_MODE=1`.
+
+```bash
+# Register a module
+curl -X POST http://localhost:8000/v1/steering/modules/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "creativity",
+    "vectors": {
+      "post_mlp": {"15": [0.1, 0.2, 0.3]}
+    }
+  }'
+
+# List modules
+curl http://localhost:8000/v1/steering/modules
+
+# Unregister a module
+curl -X POST http://localhost:8000/v1/steering/modules/unregister \
+  -H "Content-Type: application/json" \
+  -d '{"name": "creativity"}'
+```
+
+### Using Named Modules in Requests
+
+Reference a named module via `steering_name` in the OpenAI-compatible API:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+response = client.chat.completions.create(
+    model="google/gemma-3-4b-it",
+    messages=[{"role": "user", "content": "Write a poem"}],
+    extra_body={
+        "steering_name": "creativity",
+    },
+)
+```
+
+### Composing Named and Inline Vectors
+
+Named modules and inline vectors compose additively. When both are
+provided, the named module's vectors are merged with inline vectors
+per-tier before being processed:
+
+```python
+response = client.chat.completions.create(
+    model="google/gemma-3-4b-it",
+    messages=[{"role": "user", "content": "Write a poem"}],
+    extra_body={
+        "steering_name": "creativity",
+        "steering_vectors": {
+            "post_mlp": {15: [0.05, 0.1, 0.15]},
+        },
+    },
+)
+```
+
+In this example, the effective base vectors are `creativity.vectors + inline steering_vectors` (additive per hook/layer).
 
 ## Runtime Semantics
 

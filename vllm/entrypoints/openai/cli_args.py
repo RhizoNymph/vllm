@@ -10,7 +10,7 @@ import argparse
 import json
 import ssl
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import field
 from typing import Any, Literal
 
 import vllm.envs as envs
@@ -24,20 +24,15 @@ from vllm.entrypoints.constants import (
     H11_MAX_HEADER_COUNT_DEFAULT,
     H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
 )
-from vllm.entrypoints.openai.models.protocol import LoRAModulePath
+from vllm.entrypoints.openai.models.protocol import (
+    LoRAModulePath,
+    SteeringModulePath,
+)
 from vllm.logger import init_logger
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class SteeringModulePath:
-    """Path to a named steering module configuration file."""
-
-    name: str
-    path: str
 
 
 class LoRAParserAction(argparse.Action):
