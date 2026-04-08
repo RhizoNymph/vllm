@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from transformers.models.gemma3n.configuration_gemma3n import Gemma3nTextConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -43,6 +44,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -434,9 +442,18 @@ class Gemma3nDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
         assert isinstance(config, Gemma3nTextConfig)
+        self.layer_idx = extract_layer_index(prefix)
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         self.altup_active_idx = config.altup_active_idx
         assert config.altup_correct_scale
 
@@ -533,6 +550,9 @@ class Gemma3nDecoderLayer(nn.Module):
         # ActUp (predict).
         predictions = self.altup.predict(hidden_states)
         active_prediction = predictions[self.altup_active_idx]
+        active_prediction = apply_layer_steering(
+            self, active_prediction, SteeringHookPoint.PRE_ATTN
+        )
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
 
@@ -545,12 +565,18 @@ class Gemma3nDecoderLayer(nn.Module):
         attn = self.post_attention_layernorm(attn)
         attn_gated = attn + active_prediction
         attn_laurel = (attn_gated + laurel_output) / torch.sqrt(torch.tensor(2.0))
+        attn_laurel = apply_layer_steering(
+            self, attn_laurel, SteeringHookPoint.POST_ATTN
+        )
 
         # MLP.
         attn_norm = self.pre_feedforward_layernorm(attn_laurel)
         attn_ffw = self.mlp(attn_norm)
         attn_ffw_norm = self.post_feedforward_layernorm(attn_ffw)
         attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
+        attn_ffw_laurel_gated = apply_layer_steering(
+            self, attn_ffw_laurel_gated, SteeringHookPoint.POST_MLP
+        )
 
         # ActUp (connect).
         corrected_predictions = self.altup.correct(predictions, attn_ffw_laurel_gated)
@@ -594,6 +620,9 @@ class Gemma3nSelfDecoder(nn.Module):
         config = vllm_config.model_config.hf_config
         self.config = config
         quant_config = vllm_config.quant_config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -815,10 +844,16 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Gemma3nDecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         first_kv_shared_layer_idx = (
             config.num_hidden_layers - config.num_kv_shared_layers

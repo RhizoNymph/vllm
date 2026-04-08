@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
@@ -38,6 +39,13 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -132,8 +140,17 @@ class DeciLMDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         block_config = config.block_configs[layer_idx]
         self._is_no_op_attention = block_config.attention.no_op
         self._is_no_op_ffn = block_config.ffn.no_op
@@ -210,6 +227,7 @@ class DeciLMDecoderLayer(nn.Module):
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -220,7 +238,11 @@ class DeciLMDecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
+            residual = apply_layer_steering(
+                self, residual, SteeringHookPoint.POST_ATTN
+            )
             hidden_states = self.mlp(hidden_states)
+            residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 
 
@@ -238,6 +260,9 @@ class DeciModel(nn.Module):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.config = config
         self.quant_config = quant_config
@@ -263,6 +288,8 @@ class DeciModel(nn.Module):
                 cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -270,6 +297,7 @@ class DeciModel(nn.Module):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:

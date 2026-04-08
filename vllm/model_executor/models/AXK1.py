@@ -30,6 +30,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
@@ -54,6 +55,13 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -75,6 +83,7 @@ from vllm.transformers_utils.configs.AXK1 import AXK1Config
 from .interfaces import MixtureOfExperts, SupportsEagle, SupportsLoRA, SupportsPP
 from .utils import (
     PPMissingLayer,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -592,13 +601,22 @@ class AXK1DecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
         self.config = config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.hidden_size = config.hidden_size
         max_position_embeddings = config.max_position_embeddings
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
-        layer_idx = int(prefix.split(sep=".")[-1])
+        layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            self.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         # verify MLA attention specific fields
         qk_nope_head_dim = config.qk_nope_head_dim
@@ -674,6 +692,7 @@ class AXK1DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         attn_kwargs = {
             "positions": positions,
@@ -698,6 +717,7 @@ class AXK1DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
 
         if self.is_layer_sparse:
@@ -710,6 +730,7 @@ class AXK1DecoderLayer(nn.Module):
             # The scaling of AXK1MOE output would be done in the forward
             # of AXK1MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
 
         return hidden_states, residual
 
@@ -741,6 +762,7 @@ class AXK1Model(nn.Module):
             lambda prefix: AXK1DecoderLayer(vllm_config, prefix),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
