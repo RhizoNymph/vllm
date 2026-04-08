@@ -243,6 +243,32 @@ class OpenAIServingChat(OpenAIServing):
 
         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
 
+        # Resolve named steering module if specified
+        if request.steering_name is not None:
+            steering_registry = getattr(
+                raw_request.app.state, "steering_module_registry", None
+            )
+            if steering_registry is None:
+                return self.create_error_response(
+                    "Named steering modules are not available. "
+                    "Ensure the server was started with steering enabled.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            vectors, prefill, decode, error = steering_registry.resolve_for_request(
+                request.steering_name,
+                request.steering_vectors,
+                request.prefill_steering_vectors,
+                request.decode_steering_vectors,
+            )
+            if error is not None:
+                return self.create_error_response(
+                    error,
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            request.steering_vectors = vectors
+            request.prefill_steering_vectors = prefill
+            request.decode_steering_vectors = decode
+
         model_name = self.models.model_name(lora_request)
 
         # Extract data_parallel_rank from header (router can inject it)

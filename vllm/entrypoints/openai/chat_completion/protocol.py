@@ -376,6 +376,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "decode only. Same format as steering_vectors.",
     )
 
+    steering_name: str | None = Field(
+        default=None,
+        description="Name of a pre-registered steering module. "
+        "When set, the named vectors are resolved and additively "
+        "composed with any inline steering vector fields.",
+    )
+
     # --8<-- [end:chat-completion-extra-params]
 
     def build_chat_params(

@@ -196,3 +196,37 @@ class TestCompletionSteering:
         assert isinstance(entry, dict)
         assert entry["vector"] == [0.4, 0.5, 0.6]
         assert entry["scale"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# steering_name field tests
+# ---------------------------------------------------------------------------
+
+
+class TestSteeringNameField:
+    """Tests for the steering_name protocol field."""
+
+    def test_chat_completion_steering_name_field(self):
+        """steering_name field is accepted and defaults to None."""
+        chat = _make_chat()
+        assert chat.steering_name is None
+
+        chat_with_name = _make_chat(steering_name="creativity")
+        assert chat_with_name.steering_name == "creativity"
+
+    def test_completion_steering_name_field(self):
+        """steering_name field is accepted and defaults to None."""
+        comp = _make_completion()
+        assert comp.steering_name is None
+
+        comp_with_name = _make_completion(steering_name="safety")
+        assert comp_with_name.steering_name == "safety"
+
+    def test_steering_name_coexists_with_inline_vectors(self):
+        """Both steering_name and inline vectors can be set simultaneously."""
+        chat = _make_chat(
+            steering_name="base_personality",
+            steering_vectors=_BARE_VECTORS,
+        )
+        assert chat.steering_name == "base_personality"
+        assert chat.steering_vectors is not None
