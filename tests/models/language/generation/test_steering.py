@@ -17,6 +17,120 @@ from vllm.model_executor.layers.steering import (
 
 MODEL = "google/gemma-3-4b-it"
 
+_SMALL_DECODER_OVERRIDES = {
+    "num_hidden_layers": 1,
+    "hidden_size": 512,
+    "intermediate_size": 1024,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 8,
+}
+
+_QWEN_MOE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_experts": 2,
+    "num_experts_per_tok": 2,
+    "decoder_sparse_step": 1,
+    "moe_intermediate_size": 1024,
+    "shared_expert_intermediate_size": 0,
+}
+
+_QWEN3_NEXT_OVERRIDES = {
+    **_QWEN_MOE_OVERRIDES,
+    "num_hidden_layers": 2,
+    "head_dim": 64,
+    "linear_key_head_dim": 64,
+    "linear_value_head_dim": 64,
+    "linear_num_key_heads": 4,
+    "linear_num_value_heads": 8,
+    "layer_types": ["full_attention", "linear_attention"],
+}
+
+_LOOPCODER_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "loop_num": 2,
+    "loop_window_size": 32,
+}
+
+PHASE1_DISCOVERY_CASES = [
+    pytest.param("Qwen/Qwen3-0.6B", None, None, id="qwen3"),
+    pytest.param(
+        "Qwen/Qwen3-Next-80B-A3B-Instruct",
+        _QWEN3_NEXT_OVERRIDES,
+        {"enforce_eager": True, "enable_chunked_prefill": True},
+        id="qwen3-next",
+    ),
+    pytest.param(
+        "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+        _QWEN_MOE_OVERRIDES,
+        {"enforce_eager": True},
+        id="qwen2-moe",
+    ),
+    pytest.param(
+        "Qwen/Qwen3-30B-A3B",
+        _QWEN_MOE_OVERRIDES,
+        {"enforce_eager": True},
+        id="qwen3-moe",
+    ),
+    pytest.param(
+        "ByteDance/Ouro-1.4B",
+        _SMALL_DECODER_OVERRIDES,
+        {"enforce_eager": True},
+        id="ouro",
+    ),
+    pytest.param(
+        "ByteDance-Seed/Seed-OSS-36B-Instruct",
+        _SMALL_DECODER_OVERRIDES,
+        {"enforce_eager": True},
+        id="seed-oss",
+    ),
+    pytest.param(
+        "IQuestLab/IQuest-Coder-V1-40B-Loop-Instruct",
+        _LOOPCODER_OVERRIDES,
+        {"enforce_eager": True},
+        id="loopcoder",
+    ),
+]
+
+PHASE1_GENERATION_CASES = [
+    pytest.param("Qwen/Qwen3-0.6B", None, None, id="qwen3"),
+    pytest.param(
+        "Qwen/Qwen3-Next-80B-A3B-Instruct",
+        _QWEN3_NEXT_OVERRIDES,
+        {"enforce_eager": True, "enable_chunked_prefill": True},
+        id="qwen3-next",
+    ),
+    pytest.param(
+        "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+        _QWEN_MOE_OVERRIDES,
+        {"enforce_eager": True},
+        id="qwen2-moe",
+    ),
+    pytest.param(
+        "Qwen/Qwen3-30B-A3B",
+        _QWEN_MOE_OVERRIDES,
+        {"enforce_eager": True},
+        id="qwen3-moe",
+    ),
+    pytest.param(
+        "ByteDance-Seed/Seed-OSS-36B-Instruct",
+        _SMALL_DECODER_OVERRIDES,
+        {"enforce_eager": True},
+        id="seed-oss",
+    ),
+    pytest.param(
+        "ByteDance/Ouro-1.4B",
+        _SMALL_DECODER_OVERRIDES,
+        {"enforce_eager": True},
+        id="ouro",
+    ),
+    pytest.param(
+        "IQuestLab/IQuest-Coder-V1-40B-Loop-Instruct",
+        _LOOPCODER_OVERRIDES,
+        {"enforce_eager": True},
+        id="loopcoder",
+    ),
+]
+
 # Shorthand
 _HP = DEFAULT_HOOK_POINT.value
 _VEC_ATTR = HOOK_POINT_VECTOR_ATTR[DEFAULT_HOOK_POINT]
@@ -48,6 +162,91 @@ def _gen_tokens(llm, prompt, sampling):
     """Generate and return token ids list."""
     result = llm.llm.generate([prompt], sampling)
     return list(result[0].outputs[0].token_ids)
+
+
+def _runner_kwargs(hf_overrides: dict | None,
+                   extra_runner_kwargs: dict | None = None) -> dict:
+    kwargs = {
+        "load_format": "dummy",
+        "max_model_len": 256,
+        "enable_steering": True,
+        "max_steering_configs": 4,
+    }
+    if hf_overrides is not None:
+        kwargs["hf_overrides"] = hf_overrides
+    if extra_runner_kwargs is not None:
+        kwargs.update(extra_runner_kwargs)
+    return kwargs
+
+
+@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
+                         PHASE1_DISCOVERY_CASES)
+def test_steering_layers_discovered_for_supported_families(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+) -> None:
+    """Steering buffers should be discoverable beyond Gemma3."""
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        with vllm_runner(model,
+                         **_runner_kwargs(hf_overrides,
+                                          extra_runner_kwargs)) as llm:
+            target_layer, hidden_size = _discover_layers(llm)
+
+            assert target_layer >= 0
+            assert hidden_size > 0
+
+
+@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
+                         PHASE1_GENERATION_CASES)
+def test_phase1_steering_changes_output(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+) -> None:
+    """Representative phase-1 families should respond to steering."""
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        prompt = "What does the fox say? " * 32
+        sampling = SamplingParams(max_tokens=10, temperature=0.0)
+
+        runner_kwargs = _runner_kwargs(hf_overrides, extra_runner_kwargs)
+        runner_kwargs["enable_prefix_caching"] = True
+
+        with vllm_runner(model, **runner_kwargs) as llm:
+            baseline_tokens = _gen_tokens(llm, prompt, sampling)
+
+            assert llm.llm.reset_prefix_cache()
+
+            target_layer, hidden_size = _discover_layers(llm)
+
+            vec = [500.0] * hidden_size
+            llm.llm.collective_rpc(
+                "set_steering_vectors",
+                kwargs={"vectors": {_HP: {target_layer: vec}}},
+            )
+
+            steered_tokens = _gen_tokens(llm, prompt, sampling)
+
+            assert steered_tokens != baseline_tokens, (
+                f"Steering should change output for {model}"
+            )
+
+            llm.llm.collective_rpc("clear_steering_vectors")
+            assert llm.llm.reset_prefix_cache()
+
+            restored_tokens = _gen_tokens(llm, prompt, sampling)
+
+            assert restored_tokens == baseline_tokens, (
+                f"Clearing steering should restore baseline for {model}"
+            )
 
 
 # ---------------------------------------------------------------------------
