@@ -11,6 +11,7 @@ reading the live buffer values rather than baked-in constants.
 from enum import Enum
 
 import torch
+from torch import nn
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -51,6 +52,66 @@ HOOK_POINT_VECTOR_ATTR: dict[SteeringHookPoint, str] = {
 VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHookPoint)
 
 DEFAULT_HOOK_POINT = SteeringHookPoint.POST_MLP
+
+
+def register_steering_buffers(
+    module: nn.Module,
+    hidden_size: int,
+    *,
+    max_steering_tokens: int,
+    max_steering_configs: int,
+) -> None:
+    """Attach per-hook steering buffers to a decoder layer."""
+    for hp in SteeringHookPoint:
+        module.register_buffer(
+            HOOK_POINT_VECTOR_ATTR[hp],
+            torch.zeros(1, hidden_size),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_TABLE_ATTR[hp],
+            torch.zeros(max_steering_configs + 3, hidden_size),
+            persistent=False,
+        )
+
+    module.register_buffer(
+        "steering_index",
+        torch.zeros(max_steering_tokens, dtype=torch.long),
+        persistent=False,
+    )
+
+
+def get_steering_buffer_config(vllm_config: "VllmConfig") -> tuple[int, int]:
+    """Return ``(max_tokens, max_configs)`` for steering buffers."""
+    max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    steering_config = getattr(vllm_config, "steering_config", None)
+    max_configs = steering_config.max_steering_configs if steering_config else 0
+    return max_tokens, max_configs
+
+
+def share_steering_index_across_layers(layers: list[nn.Module]) -> None:
+    """Reuse one ``steering_index`` tensor across all steerable layers."""
+    shared_index: torch.Tensor | None = None
+    for layer in layers:
+        if not hasattr(layer, "steering_index"):
+            continue
+        if shared_index is None:
+            shared_index = layer.steering_index
+            continue
+        layer.steering_index = shared_index
+
+
+def apply_layer_steering(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    hook_point: SteeringHookPoint,
+) -> torch.Tensor:
+    """Apply the steering table for ``hook_point`` to ``hidden_states``."""
+    return torch.ops.vllm.apply_steering(
+        hidden_states,
+        getattr(module, HOOK_POINT_TABLE_ATTR[hook_point]),
+        module.steering_index,
+    )
 
 
 def apply_steering(
