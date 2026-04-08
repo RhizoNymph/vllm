@@ -10,7 +10,7 @@ import pytest
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
-from vllm.entrypoints.openai.engine.protocol import GenerationError
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse, GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -230,6 +230,30 @@ async def test_completion_error_stream():
         f"Expected error message in chunks: {chunks}"
     )
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_completion_named_steering_without_raw_request_returns_error():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_completion = _build_serving_completion(mock_engine)
+
+    request = CompletionRequest(
+        model=MODEL_NAME,
+        prompt="Test prompt",
+        max_tokens=10,
+        steering_name="named-module",
+    )
+
+    response = await serving_completion.create_completion(request)
+
+    assert isinstance(response, ErrorResponse)
+    assert "Named steering modules are not available" in response.error.message
 
 
 def test_json_schema_response_format_missing_schema():

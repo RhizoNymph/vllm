@@ -141,8 +141,10 @@ class OpenAIServingCompletion(OpenAIServing):
 
         # Resolve named steering module if specified
         if request.steering_name is not None:
-            steering_registry = getattr(
-                raw_request.app.state, "steering_module_registry", None
+            steering_registry = (
+                None
+                if raw_request is None
+                else getattr(raw_request.app.state, "steering_module_registry", None)
             )
             if steering_registry is None:
                 return self.create_error_response(

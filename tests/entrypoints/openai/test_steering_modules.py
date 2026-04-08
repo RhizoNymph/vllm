@@ -7,13 +7,18 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from argparse import Namespace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from starlette.datastructures import State
 
 from vllm.config.steering_types import (
     SteeringVectorSpec,
     merge_steering_specs,
 )
+from vllm.entrypoints.openai.api_server import init_app_state
 from vllm.entrypoints.openai.steering.registry import (
     SteeringModuleRegistry,
     _convert_layer_keys,
@@ -304,6 +309,93 @@ class TestSteeringModuleRegistry:
                 await registry.load_from_file("bad_fmt", tmp_path)
         finally:
             os.unlink(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_init_app_state_only_sets_registry_when_steering_enabled():
+    engine_client = MagicMock()
+    engine_client.vllm_config = SimpleNamespace(lora_config=None)
+    engine_client.model_config = MagicMock()
+    engine_client.renderer = MagicMock()
+    engine_client.io_processor = MagicMock()
+
+    args = Namespace(
+        served_model_name=None,
+        model="test-model",
+        enable_log_requests=False,
+        max_log_len=None,
+        disable_log_stats=False,
+        chat_template=None,
+        lora_modules=None,
+        enable_steering=False,
+        steering_modules=None,
+        chat_template_content_format="auto",
+        trust_request_chat_template=False,
+        enable_auto_tool_choice=False,
+        exclude_tools_when_tool_choice_none=False,
+        tool_call_parser=None,
+        default_chat_template_kwargs=None,
+        log_error_stack=False,
+        enable_server_load_tracking=False,
+    )
+
+    models = MagicMock()
+    models.registry = MagicMock()
+    models.init_static_loras = AsyncMock()
+
+    state = State()
+
+    with (
+        patch(
+            "vllm.entrypoints.openai.api_server.load_chat_template",
+            return_value=None,
+        ),
+        patch(
+            "vllm.entrypoints.openai.api_server.process_lora_modules",
+            return_value=[],
+        ),
+        patch(
+            "vllm.entrypoints.openai.api_server.OpenAIServingModels",
+            return_value=models,
+        ),
+        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
+        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+    ):
+        await init_app_state(
+            engine_client,
+            state,
+            args,
+            supported_tasks=(),
+        )
+
+    assert not hasattr(state, "steering_module_registry")
+
+    args.enable_steering = True
+
+    with (
+        patch(
+            "vllm.entrypoints.openai.api_server.load_chat_template",
+            return_value=None,
+        ),
+        patch(
+            "vllm.entrypoints.openai.api_server.process_lora_modules",
+            return_value=[],
+        ),
+        patch(
+            "vllm.entrypoints.openai.api_server.OpenAIServingModels",
+            return_value=models,
+        ),
+        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
+        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+    ):
+        await init_app_state(
+            engine_client,
+            state,
+            args,
+            supported_tasks=(),
+        )
+
+    assert hasattr(state, "steering_module_registry")
 
 
 # ---------------------------------------------------------------------------
