@@ -366,7 +366,16 @@ async def init_app_state(
             SteeringModuleRegistry,
         )
 
-        steering_registry = SteeringModuleRegistry()
+        steerable_layer_sets = await engine_client.collective_rpc(
+            "list_steerable_layers"
+        )
+        valid_layer_indices: set[int] = set()
+        for layer_set in steerable_layer_sets:
+            valid_layer_indices.update(layer_set)
+
+        steering_registry = SteeringModuleRegistry(
+            valid_layer_indices=valid_layer_indices
+        )
         if getattr(args, "steering_modules", None):
             for module in args.steering_modules:
                 await steering_registry.load_from_file(module.name, module.path)

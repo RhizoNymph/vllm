@@ -132,23 +132,27 @@ class TestConvertLayerKeys:
     """Tests for the helper that converts JSON string keys to int."""
 
     def test_none_returns_none(self):
-        assert _convert_layer_keys(None) is None
+        assert _convert_layer_keys(None, field_name="vectors") is None
 
     def test_empty_dict_returns_none(self):
-        assert _convert_layer_keys({}) is None
+        assert _convert_layer_keys({}, field_name="vectors") is None
 
     def test_converts_string_keys_to_int(self):
         spec = {"post_mlp": {"14": [1.0, 2.0], "15": [3.0, 4.0]}}
-        result = _convert_layer_keys(spec)
+        result = _convert_layer_keys(spec, field_name="vectors")
         assert result is not None
         assert 14 in result["post_mlp"]
         assert 15 in result["post_mlp"]
         assert result["post_mlp"][14] == [1.0, 2.0]
 
-    def test_skips_non_dict_layers(self):
+    def test_rejects_non_dict_layers(self):
         spec = {"post_mlp": "not_a_dict"}
-        result = _convert_layer_keys(spec)
-        assert result is None
+        with pytest.raises(ValueError, match="must be a JSON object mapping"):
+            _convert_layer_keys(spec, field_name="vectors")
+
+    def test_rejects_non_dict_spec(self):
+        with pytest.raises(ValueError, match="field 'vectors' must be a JSON object"):
+            _convert_layer_keys(["not", "a", "dict"], field_name="vectors")
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +236,15 @@ class TestSteeringModuleRegistry:
             await registry.register(
                 name="bad_hook",
                 vectors={"totally_invalid": {0: [1.0]}},
+            )
+
+    @pytest.mark.asyncio
+    async def test_register_unknown_layer_index_raises(self):
+        registry = SteeringModuleRegistry(valid_layer_indices={0, 1})
+        with pytest.raises(ValueError, match="unknown layer index 99"):
+            await registry.register(
+                name="bad_layer",
+                vectors={"post_mlp": {99: [1.0]}},
             )
 
     @pytest.mark.asyncio
@@ -364,6 +377,24 @@ class TestSteeringModuleRegistry:
         finally:
             os.unlink(tmp_path)
 
+    @pytest.mark.asyncio
+    async def test_load_from_file_rejects_non_dict_hook_payload(self):
+        registry = SteeringModuleRegistry()
+        data = {
+            "vectors": {
+                "post_mlp": [1.0, 2.0],
+            },
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            tmp_path = f.name
+
+        try:
+            with pytest.raises(ValueError, match="must be a JSON object mapping"):
+                await registry.load_from_file("bad_hook_payload", tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
 
 @pytest.mark.asyncio
 async def test_init_app_state_only_sets_registry_when_steering_enabled():
@@ -372,6 +403,7 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
     engine_client.model_config = MagicMock()
     engine_client.renderer = MagicMock()
     engine_client.io_processor = MagicMock()
+    engine_client.collective_rpc = AsyncMock(return_value=[{0, 1}])
 
     args = Namespace(
         served_model_name=None,
@@ -450,6 +482,7 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
         )
 
     assert hasattr(state, "steering_module_registry")
+    engine_client.collective_rpc.assert_awaited_once_with("list_steerable_layers")
 
 
 # ---------------------------------------------------------------------------
