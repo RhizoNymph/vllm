@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,9 +67,14 @@ class SteeringModuleRegistry:
                         f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}"
                     )
                 # Validate entries are well-formed
-                for _hook_name, layers in spec.items():
-                    for _layer_idx, entry in layers.items():
-                        normalize_layer_entry(entry)  # raises on bad format
+                for hook_name, layers in spec.items():
+                    for layer_idx, entry in layers.items():
+                        self._validate_layer_entry(
+                            name=name,
+                            hook_name=hook_name,
+                            layer_idx=layer_idx,
+                            entry=entry,
+                        )
 
         module = SteeringModule(
             name=name,
@@ -164,11 +170,58 @@ class SteeringModuleRegistry:
                 ),
             )
 
-        merged_vectors = merge_steering_specs(module.vectors, inline_vectors)
-        merged_prefill = merge_steering_specs(module.prefill_vectors, inline_prefill)
-        merged_decode = merge_steering_specs(module.decode_vectors, inline_decode)
+        try:
+            merged_vectors = merge_steering_specs(module.vectors, inline_vectors)
+            merged_prefill = merge_steering_specs(
+                module.prefill_vectors, inline_prefill
+            )
+            merged_decode = merge_steering_specs(module.decode_vectors, inline_decode)
+        except ValueError as exc:
+            return None, None, None, (
+                f"Invalid steering composition for module '{steering_name}': {exc}"
+            )
 
         return merged_vectors, merged_prefill, merged_decode, None
+
+    @staticmethod
+    def _validate_layer_entry(
+        name: str,
+        hook_name: str,
+        layer_idx: int,
+        entry: Any,
+    ) -> None:
+        """Validate a stored layer entry matches request-time constraints."""
+        prefix = f"module {name!r}[{hook_name!r}][{layer_idx}]"
+        vector: Any
+        if isinstance(entry, dict):
+            vector, scale = normalize_layer_entry(entry)
+            if not isinstance(entry["scale"], (int, float)):
+                raise ValueError(
+                    f"{prefix}['scale'] must be a finite float, "
+                    f"got {type(entry['scale']).__name__}."
+                )
+            if not math.isfinite(scale):
+                raise ValueError(f"{prefix}['scale'] must be finite, got {scale}.")
+        else:
+            vector, _ = normalize_layer_entry(entry)
+
+        if not isinstance(vector, list):
+            target = prefix if isinstance(entry, list) else f"{prefix}['vector']"
+            raise ValueError(
+                f"{target} must be a list of floats, got {type(vector).__name__}."
+            )
+
+        value_prefix = prefix if isinstance(entry, list) else f"{prefix}['vector']"
+        for i, value in enumerate(vector):
+            if not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"{value_prefix}[{i}] must be a finite float, "
+                    f"got {type(value).__name__}."
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"{value_prefix}[{i}] must be finite, got {value}."
+                )
 
 
 def _convert_layer_keys(

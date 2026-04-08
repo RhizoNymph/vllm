@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from argparse import Namespace
@@ -242,6 +243,36 @@ class TestSteeringModuleRegistry:
                 vectors={"post_mlp": {0: "not_a_list_or_dict"}},
             )
 
+    @pytest.mark.asyncio
+    async def test_register_invalid_vector_contents_raise(self):
+        registry = SteeringModuleRegistry()
+
+        with pytest.raises(ValueError, match="must be a finite float"):
+            await registry.register(
+                name="bad_values",
+                vectors={
+                    "post_mlp": {
+                        0: {
+                            "vector": ["bad", 1.0],
+                            "scale": 1.0,
+                        }
+                    }
+                },
+            )
+
+        with pytest.raises(ValueError, match="must be finite"):
+            await registry.register(
+                name="bad_scale",
+                vectors={
+                    "post_mlp": {
+                        0: {
+                            "vector": [1.0, 2.0],
+                            "scale": math.nan,
+                        }
+                    }
+                },
+            )
+
     # --- load_from_file tests ---
 
     @pytest.mark.asyncio
@@ -307,6 +338,29 @@ class TestSteeringModuleRegistry:
         try:
             with pytest.raises(ValueError, match="JSON object"):
                 await registry.load_from_file("bad_fmt", tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_load_from_file_invalid_vector_contents_raise(self):
+        registry = SteeringModuleRegistry()
+        data = {
+            "vectors": {
+                "post_mlp": {
+                    "14": {
+                        "vector": [1.0, "bad"],
+                        "scale": 1.0,
+                    }
+                }
+            },
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            tmp_path = f.name
+
+        try:
+            with pytest.raises(ValueError, match="must be a finite float"):
+                await registry.load_from_file("bad_values", tmp_path)
         finally:
             os.unlink(tmp_path)
 
@@ -473,3 +527,21 @@ class TestResolveForRequest:
         _, _, _, err = registry.resolve_for_request("missing", None, None, None)
         assert err is not None
         assert "['a', 'b']" in err
+
+    @pytest.mark.asyncio
+    async def test_dimension_mismatch_returns_error(self):
+        registry = SteeringModuleRegistry()
+        await registry.register(
+            "named",
+            vectors={"post_mlp": {14: [1.0, 2.0]}},
+        )
+
+        inline: SteeringVectorSpec = {"post_mlp": {14: [0.5]}}
+        v, p, d, err = registry.resolve_for_request("named", inline, None, None)
+
+        assert v is None
+        assert p is None
+        assert d is None
+        assert err is not None
+        assert "Invalid steering composition for module 'named'" in err
+        assert "different lengths: 2 vs 1" in err
