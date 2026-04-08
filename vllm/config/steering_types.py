@@ -136,6 +136,70 @@ def resolve_effective_vectors(
     return result if result else None
 
 
+def merge_steering_specs(
+    a: SteeringVectorSpec | None,
+    b: SteeringVectorSpec | None,
+) -> SteeringVectorSpec | None:
+    """Additively merge two :class:`SteeringVectorSpec` dicts.
+
+    For overlapping ``(hook, layer)`` entries both sides are pre-scaled
+    (via :func:`normalize_layer_entry` + :func:`_scale_vector`) then
+    summed (via :func:`_add_vectors`).  Non-overlapping entries pass
+    through pre-scaled.
+
+    Returns ``None`` if both inputs are ``None`` or empty.
+    """
+    a_empty = not a
+    b_empty = not b
+    if a_empty and b_empty:
+        return None
+
+    result: SteeringVectorSpec = {}
+
+    all_hooks: set[str] = set()
+    if not a_empty:
+        assert a is not None
+        all_hooks.update(a.keys())
+    if not b_empty:
+        assert b is not None
+        all_hooks.update(b.keys())
+
+    for hook in all_hooks:
+        a_layers = a.get(hook, {}) if a else {}
+        b_layers = b.get(hook, {}) if b else {}
+
+        all_layer_idxs: set[int] = set()
+        all_layer_idxs.update(a_layers.keys())
+        all_layer_idxs.update(b_layers.keys())
+
+        if not all_layer_idxs:
+            continue
+
+        hook_result: dict[int, SteeringLayerEntry] = {}
+        for layer_idx in all_layer_idxs:
+            a_entry = a_layers.get(layer_idx)
+            b_entry = b_layers.get(layer_idx)
+
+            if a_entry is not None and b_entry is not None:
+                a_vec, a_scale = normalize_layer_entry(a_entry)
+                b_vec, b_scale = normalize_layer_entry(b_entry)
+                scaled_a = _scale_vector(a_vec, a_scale)
+                scaled_b = _scale_vector(b_vec, b_scale)
+                hook_result[layer_idx] = _add_vectors(scaled_a, scaled_b)
+            elif a_entry is not None:
+                vec, scale = normalize_layer_entry(a_entry)
+                hook_result[layer_idx] = _scale_vector(vec, scale)
+            else:
+                assert b_entry is not None
+                vec, scale = normalize_layer_entry(b_entry)
+                hook_result[layer_idx] = _scale_vector(vec, scale)
+
+        if hook_result:
+            result[hook] = hook_result
+
+    return result if result else None
+
+
 def hash_steering_config(
     effective_vectors: dict[str, dict[int, list[float]]] | None,
 ) -> int:
