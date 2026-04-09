@@ -180,7 +180,7 @@ The runtime has to preserve these invariants:
 - transitions are retried before new-request registrations
 - new-request registrations are only attempted when no transitions are pending
 - stale pending entries are dropped if the request finishes or changes phase
-- fallback behavior must remain correct if a request temporarily uses a global row
+- unregistered per-request configs map to row 0 (no steering) via UNREGISTERED_SENTINEL rather than silently applying global steering
 
 This is one of the places where scheduler capacity logic and worker state must
 match exactly.

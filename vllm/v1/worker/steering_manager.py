@@ -23,6 +23,8 @@ from vllm.model_executor.layers.steering import HOOK_POINT_TABLE_ATTR
 
 logger = init_logger(__name__)
 
+UNREGISTERED_SENTINEL = -1
+
 
 class SteeringManager:
     """Per-request steering config manager.
@@ -142,7 +144,9 @@ class SteeringManager:
             ``(config_hash, "prefill"/"decode")``.
 
         For unregistered nonzero hashes:
-            Falls back to row 1 (prefill) or row 2 (decode).
+            Returns UNREGISTERED_SENTINEL (-1).  The caller is responsible
+            for mapping this to an appropriate row (typically 0 for no-op
+            steering) and logging a warning.
         """
         if config_hash == 0:
             return 1 if is_prefill else 2
@@ -150,8 +154,7 @@ class SteeringManager:
         row = self.config_to_row.get((config_hash, phase))
         if row is not None:
             return row
-        # Fallback for unregistered nonzero hash
-        return 1 if is_prefill else 2
+        return UNREGISTERED_SENTINEL
 
     def update_global_vectors(
         self,

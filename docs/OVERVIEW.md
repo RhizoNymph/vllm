@@ -35,8 +35,9 @@ Features Index:
             decode-specific.  Co-located scale factors and three hook points
             (pre_attn, post_attn, post_mlp).
             Scheduler predicts mid-step prefill-to-decode transitions and
-            reserves capacity for both phases; model runner gracefully defers
-            decode registration when capacity is temporarily exhausted.
+            reserves capacity for both phases; model runner defers decode
+            registration when capacity is temporarily exhausted and applies
+            no steering (row 0) instead of silently falling back to global.
             Deferred entries use a two-queue priority model: prefill→decode
             transitions are retried before new-request deferrals.
             Status endpoint reports base, prefill, and decode vector norms.

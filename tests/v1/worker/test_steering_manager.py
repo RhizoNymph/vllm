@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.layers.steering import DEFAULT_HOOK_POINT
-from vllm.v1.worker.steering_manager import SteeringManager
+from vllm.v1.worker.steering_manager import SteeringManager, UNREGISTERED_SENTINEL
 
 HIDDEN_SIZE = 8
 MAX_CONFIGS = 4
@@ -215,15 +215,15 @@ class TestGetRow:
         row = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
         assert mgr.get_row_for_config(config_hash=42, is_prefill=True) == row
 
-    def test_unregistered_nonzero_prefill_returns_row_1(self):
-        """An unknown nonzero hash with is_prefill=True falls back to row 1."""
+    def test_unregistered_nonzero_prefill_returns_sentinel(self):
+        """An unknown nonzero hash with is_prefill=True returns UNREGISTERED_SENTINEL."""
         mgr = _make_manager()
-        assert mgr.get_row_for_config(config_hash=12345, is_prefill=True) == 1
+        assert mgr.get_row_for_config(config_hash=12345, is_prefill=True) == UNREGISTERED_SENTINEL
 
-    def test_unregistered_nonzero_decode_returns_row_2(self):
-        """An unknown nonzero hash with is_prefill=False falls back to row 2."""
+    def test_unregistered_nonzero_decode_returns_sentinel(self):
+        """An unknown nonzero hash with is_prefill=False returns UNREGISTERED_SENTINEL."""
         mgr = _make_manager()
-        assert mgr.get_row_for_config(config_hash=12345, is_prefill=False) == 2
+        assert mgr.get_row_for_config(config_hash=12345, is_prefill=False) == UNREGISTERED_SENTINEL
 
     def test_registered_hash_uses_phase_for_lookup(self):
         """A prefill-registered hash is only found with is_prefill=True."""
@@ -231,8 +231,8 @@ class TestGetRow:
         vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
         row = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
         assert mgr.get_row_for_config(config_hash=42, is_prefill=True) == row
-        # With is_prefill=False the (42, "decode") key is absent, falls back
-        assert mgr.get_row_for_config(config_hash=42, is_prefill=False) == 2
+        # With is_prefill=False the (42, "decode") key is absent — sentinel
+        assert mgr.get_row_for_config(config_hash=42, is_prefill=False) == UNREGISTERED_SENTINEL
 
 
 # ---------------------------------------------------------------------------
@@ -1230,10 +1230,10 @@ class TestLazyInitCapacityExhaustion:
         assert row >= 3
         assert mgr.num_active_configs == max_cfgs
 
-    def test_overflow_falls_back_to_global_row(self):
+    def test_overflow_returns_sentinel(self):
         """When a config cannot be registered due to capacity, the
-        ``get_row_for_config`` call should return the global row
-        (1 for prefill, 2 for decode) rather than crash.
+        ``get_row_for_config`` call should return UNREGISTERED_SENTINEL
+        rather than crash or silently fall back to global.
         """
         max_cfgs = 1
         mgr = _make_manager(max_configs=max_cfgs)
@@ -1243,15 +1243,15 @@ class TestLazyInitCapacityExhaustion:
         mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
 
         # Overflow config is NOT registered — get_row_for_config
-        # must fall back to the global row.
+        # must return the sentinel.
         prefill_row = mgr.get_row_for_config(config_hash=999, is_prefill=True)
         decode_row = mgr.get_row_for_config(config_hash=999, is_prefill=False)
 
-        assert prefill_row == 1, (
-            "Unregistered prefill hash should fall back to global prefill row"
+        assert prefill_row == UNREGISTERED_SENTINEL, (
+            "Unregistered prefill hash should return UNREGISTERED_SENTINEL"
         )
-        assert decode_row == 2, (
-            "Unregistered decode hash should fall back to global decode row"
+        assert decode_row == UNREGISTERED_SENTINEL, (
+            "Unregistered decode hash should return UNREGISTERED_SENTINEL"
         )
 
 
@@ -1710,9 +1710,9 @@ class TestTransitionUnderCapacity:
         """When capacity is full, decode is deferred with phase='decode'
         and ``_req_steering_phase[req_id]`` is still set to 'decode'.
 
-        ``get_row_for_config`` falls back to row 2 so the request keeps
-        running with global-only decode steering until the deferred
-        entry is retried next step.
+        ``get_row_for_config`` returns UNREGISTERED_SENTINEL so the caller
+        maps to row 0 (no steering) until the deferred entry is retried
+        next step.
         """
         mgr = _make_manager(max_configs=1)
         pending_transitions: list = []
@@ -1741,8 +1741,8 @@ class TestTransitionUnderCapacity:
         assert pending_transitions[0] == ("req-A", 5, decode_vecs, "decode")
         # Phase tracking must be updated so the retry loop can match.
         assert req_phase["req-A"] == "decode"
-        # Row 2 is the decode fallback — unregistered decode hash yields 2.
-        assert mgr.get_row_for_config(5, is_prefill=False) == 2
+        # Unregistered decode hash returns UNREGISTERED_SENTINEL.
+        assert mgr.get_row_for_config(5, is_prefill=False) == UNREGISTERED_SENTINEL
         # The blocker slot is still owned by req-blocker.
         assert (99, "prefill") in mgr.config_to_row
         assert (5, "decode") not in mgr.config_to_row

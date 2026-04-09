@@ -3200,6 +3200,9 @@ class GPUModelRunner(
             HOOK_POINT_TABLE_ATTR,
             HOOK_POINT_VECTOR_ATTR,
         )
+        from vllm.v1.worker.steering_manager import (
+            UNREGISTERED_SENTINEL,
+        )
 
         # Lazy init
         if not hasattr(self, "_steering_manager"):
@@ -3439,6 +3442,14 @@ class GPUModelRunner(
                 row = self._steering_manager.get_row_for_config(
                     prefill_hash, is_prefill=True
                 )
+                if row == UNREGISTERED_SENTINEL:
+                    logger.warning_once(
+                        "Per-request steering config (hash=%d) not registered "
+                        "for prefill; applying no steering (row 0) instead of "
+                        "silently falling back to global.",
+                        prefill_hash,
+                    )
+                    row = 0
                 steering_index[token_offset : token_offset + n_tokens] = row
 
                 # Check if this request will transition to decode after
@@ -3454,6 +3465,14 @@ class GPUModelRunner(
                 row = self._steering_manager.get_row_for_config(
                     decode_hash, is_prefill=False
                 )
+                if row == UNREGISTERED_SENTINEL:
+                    logger.warning_once(
+                        "Per-request steering config (hash=%d) not registered "
+                        "for decode; applying no steering (row 0) instead of "
+                        "silently falling back to global.",
+                        decode_hash,
+                    )
+                    row = 0
                 steering_index[token_offset : token_offset + n_tokens] = row
 
             token_offset += n_tokens
@@ -3476,9 +3495,11 @@ class GPUModelRunner(
 
         If the steering table is at capacity, the decode registration
         is deferred to ``_pending_steering_registrations`` and retried
-        on the next scheduler step.  The existing ``get_row_for_config``
-        fallback (returns row 2 for unregistered decode hashes) provides
-        graceful degradation during the deferral period.
+        on the next scheduler step.  During the deferral period,
+        ``get_row_for_config`` returns ``UNREGISTERED_SENTINEL`` for
+        the unregistered decode hash.  The index builder maps this to
+        row 0 (no steering) and logs a warning, avoiding silent
+        application of global-only steering.
         """
         if prefill_hash != 0:
             self._steering_manager.release_config(prefill_hash, "prefill")

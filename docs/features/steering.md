@@ -346,6 +346,11 @@ as long as the model has been wired correctly.
 - Global HTTP endpoints are gated behind `VLLM_SERVER_DEV_MODE=1`
 - Per-request steering requires `--enable-steering`
 - Distinct steering configs in flight are capped by `--max-steering-configs`
+- When the steering table is at capacity and a per-request config cannot be
+  registered, the request temporarily receives no steering (rather than
+  silently falling back to global steering). A warning is logged, and the
+  system retries registration on subsequent steps via the deferred-registration
+  queues.
 
 ## References
 
