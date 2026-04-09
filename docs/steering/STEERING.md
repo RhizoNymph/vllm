@@ -50,7 +50,6 @@ vector buffer.
                                  │
                         ┌───────────────────────────────────────────────────┐
                         │ Gemma3DecoderLayer (per layer, per hook point)    │
-                        │   steering_vector_<hp>:  (1, H)  ← global API    │
                         │   steering_table_<hp>:   (max_configs+2, H)      │
                         │   steering_index:   (max_tokens,)  ← shared      │
                         │                                                   │
@@ -110,10 +109,10 @@ with phase awareness:
 
 ### 5. Worker Layer — Global API
 
-`WorkerBase` provides three RPC-callable methods that discover steerable layers by walking the model's module tree (looking for modules with `layer_idx` and any `steering_vector_*` attribute):
+`WorkerBase` provides three RPC-callable methods that discover steerable layers by walking the model's module tree (looking for modules with `layer_idx` and any `steering_table_*` attribute):
 
-- **`set_steering_vectors(vectors_data, validate_only)`** — Accepts `{hook_point: {layer_idx: [floats]}}`. Validates hook point validity, vector dimensions, and finiteness, then copies vectors into per-hook `steering_vector_*` buffers. Notifies SteeringManager of global changes.
-- **`clear_steering_vectors()`** — Zeros all `steering_vector_*` buffers across all hook points. Notifies SteeringManager.
+- **`set_steering_vectors(vectors_data, validate_only)`** — Accepts `{hook_point: {layer_idx: [floats]}}`. Validates hook point validity, vector dimensions, and finiteness, then stores vectors in the SteeringManager. Notifies SteeringManager of global changes.
+- **`clear_steering_vectors()`** — Clears all vectors in the SteeringManager across all hook points. Notifies SteeringManager.
 - **`get_steering_status()`** — Returns `{layer_idx: {hook_point: {"norm": float}}}` for non-zero layers/hook-points.
 
 ### 6. API Layer — REST Endpoints
@@ -189,7 +188,7 @@ To add steering to another model family (e.g., Llama, Qwen):
 2. **Add per-hook-point buffers** in the decoder layer `__init__`:
    ```python
    from vllm.model_executor.layers.steering import (
-       HOOK_POINT_TABLE_ATTR, HOOK_POINT_VECTOR_ATTR, SteeringHookPoint,
+       HOOK_POINT_TABLE_ATTR, SteeringHookPoint,
    )
 
    self.layer_idx = extract_layer_index(prefix)
@@ -197,8 +196,6 @@ To add steering to another model family (e.g., Llama, Qwen):
    # Register buffers for each active hook point
    for hp in active_hook_points:
        table_attr = HOOK_POINT_TABLE_ATTR[hp]
-       vec_attr = HOOK_POINT_VECTOR_ATTR[hp]
-       self.register_buffer(vec_attr, torch.zeros(1, config.hidden_size), persistent=False)
        self.register_buffer(table_attr, torch.zeros(max_steering_configs + 2, config.hidden_size), persistent=False)
 
    self.register_buffer("steering_index", torch.zeros(max_steering_tokens, dtype=torch.long), persistent=False)
@@ -220,7 +217,7 @@ To add steering to another model family (e.g., Llama, Qwen):
            layer.steering_index = shared_idx
    ```
 
-The model runner and worker code is model-agnostic — it discovers steerable layers by walking the module tree for modules that have `layer_idx` and any `steering_table_*` or `steering_vector_*` attribute.
+The model runner and worker code is model-agnostic — it discovers steerable layers by walking the module tree for modules that have `layer_idx` and any `steering_table_*` attribute.
 
 ## Related Docs
 

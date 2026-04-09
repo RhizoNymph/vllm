@@ -81,7 +81,7 @@ Key design decisions:
 
 - **Always-allocated buffers**: All 4 hook point buffers are registered on every decoder layer. Memory cost is trivial (~3.6 MB for 26 layers at `max_steering_configs=4`). Zero rows make unused hook points a no-op.
 - **No graph partitions**: The `apply_steering` custom op is opaque to the torch.compile tracer (preventing constant-folding) but is NOT a splitting op. Steering adds zero graph partitions regardless of hook point count.
-- **Per-hook-point buffers**: Each hook point gets its own `steering_table_<hook>` and `steering_vector_<hook>` buffer. The shared `steering_index` is reused across all hook points (token→row mapping is the same).
+- **Per-hook-point buffers**: Each hook point gets its own `steering_table_<hook>` buffer. The shared `steering_index` is reused across all hook points (token→row mapping is the same).
 - **API**: `SamplingParams.steering_vectors: dict[str, dict[int, list[float]]]` — hook point name → layer → vector. Same format for `SetSteeringRequest.vectors` (global HTTP API).
 
 ### Gemma 3 Intervention Points
