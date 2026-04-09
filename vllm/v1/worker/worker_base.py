@@ -13,7 +13,7 @@ from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.steering import (
-    HOOK_POINT_VECTOR_ATTR,
+    HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -130,7 +130,7 @@ class WorkerBase:
         successful discovery.
 
         A layer is considered steerable if it has ``layer_idx`` and at
-        least one ``steering_vector_*`` buffer for any hook point.
+        least one ``steering_table_*`` buffer for any hook point.
         """
         cache = getattr(self, "_steerable_layers_cache", None)
         if cache is not None:
@@ -143,10 +143,10 @@ class WorkerBase:
         for mod in mr.get_model().modules():
             if not hasattr(mod, "layer_idx"):
                 continue
-            has_any_vector = any(
-                hasattr(mod, attr) for attr in HOOK_POINT_VECTOR_ATTR.values()
+            has_any_table = any(
+                hasattr(mod, attr) for attr in HOOK_POINT_TABLE_ATTR.values()
             )
-            if has_any_vector:
+            if has_any_table:
                 layers[mod.layer_idx] = mod
 
         if layers:
@@ -173,17 +173,17 @@ class WorkerBase:
                 raise SteeringVectorError(
                     f"Invalid hook point: {hook_point_str!r}"
                 ) from exc
-            vec_attr = HOOK_POINT_VECTOR_ATTR[hp_enum]
+            table_attr = HOOK_POINT_TABLE_ATTR[hp_enum]
 
             for idx, vec_values in layer_vecs.items():
                 if idx not in steerable:
                     continue
                 mod = steerable[idx]
-                if not hasattr(mod, vec_attr):
+                if not hasattr(mod, table_attr):
                     raise SteeringVectorError(
                         f"Hook point {hook_point_str!r} not active on layer {idx}"
                     )
-                buf = getattr(mod, vec_attr)
+                buf = getattr(mod, table_attr)
                 expected_size = buf.shape[1]
                 if len(vec_values) != expected_size:
                     raise SteeringVectorError(
@@ -203,25 +203,6 @@ class WorkerBase:
     def list_steerable_layers(self) -> set[int]:
         """Return the steerable layer indices available on this worker."""
         return set(self._steerable_layers().keys())
-
-    def _apply_vectors_to_buffers(
-        self,
-        vectors_data: dict[str, dict[int, list[float]]],
-        steerable: dict,
-        valid_indices: set[int],
-    ) -> None:
-        """Copy validated vectors into layer steering buffers."""
-        for hook_point_str, layer_vecs in vectors_data.items():
-            vec_attr = HOOK_POINT_VECTOR_ATTR[SteeringHookPoint(hook_point_str)]
-            for idx, vec_values in layer_vecs.items():
-                if idx not in steerable or idx not in valid_indices:
-                    continue
-                mod = steerable[idx]
-                if not hasattr(mod, vec_attr):
-                    continue
-                buf = getattr(mod, vec_attr)
-                t = torch.tensor([vec_values], dtype=buf.dtype, device=buf.device)
-                buf.copy_(t)
 
     def _notify_manager_vectors(
         self,
@@ -248,18 +229,18 @@ class WorkerBase:
             return
         mgr = getattr(self.model_runner, "_steering_manager", None)
         if mgr is None:
-            # Manager not yet initialized -- capture current buffer
-            # values for replay during lazy init.
+            # Manager not yet initialized -- capture current vectors
+            # for replay during lazy init.
             captured: dict[str, dict[int, torch.Tensor]] = {}
             for hook_point_str, layer_vecs in vectors_data.items():
-                vec_attr = HOOK_POINT_VECTOR_ATTR[SteeringHookPoint(hook_point_str)]
+                table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_point_str)]
                 captured_layers: dict[int, torch.Tensor] = {}
                 for idx, vec_values in layer_vecs.items():
                     if idx not in valid_indices or idx not in steerable:
                         continue
                     mod = steerable[idx]
-                    if hasattr(mod, vec_attr):
-                        buf = getattr(mod, vec_attr)
+                    if hasattr(mod, table_attr):
+                        buf = getattr(mod, table_attr)
                         captured_layers[idx] = torch.tensor(
                             vec_values, dtype=buf.dtype, device=buf.device
                         )
@@ -273,13 +254,13 @@ class WorkerBase:
                 pending.append((captured, phase))
             return
         for hook_point_str, layer_vecs in vectors_data.items():
-            vec_attr = HOOK_POINT_VECTOR_ATTR[SteeringHookPoint(hook_point_str)]
+            table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_point_str)]
             for idx, vec_values in layer_vecs.items():
                 if idx not in valid_indices or idx not in steerable:
                     continue
                 mod = steerable[idx]
-                if hasattr(mod, vec_attr):
-                    buf = getattr(mod, vec_attr)
+                if hasattr(mod, table_attr):
+                    buf = getattr(mod, table_attr)
                     t = torch.tensor(vec_values, dtype=buf.dtype, device=buf.device)
                     mgr.update_global_vectors(hook_point_str, idx, t, phase=phase)
 
@@ -296,7 +277,7 @@ class WorkerBase:
         Supports three-tier steering:
 
         - *vectors*: base vectors applied to both prefill and decode.
-          These are stored in layer buffers (``steering_vector_*``).
+          Notified to SteeringManager with ``phase="base"``.
         - *prefill_vectors*: phase-specific vectors for prefill only.
           Notified to SteeringManager with ``phase="prefill"``.
         - *decode_vectors*: phase-specific vectors for decode only.
@@ -350,9 +331,8 @@ class WorkerBase:
         if replace:
             self.clear_steering_vectors()
 
-        # Apply base vectors to layer buffers and notify manager.
+        # Notify manager with base vectors.
         if vectors:
-            self._apply_vectors_to_buffers(vectors, steerable, valid_indices)
             self._notify_manager_vectors(vectors, steerable, valid_indices, "base")
 
         # Phase-specific vectors go only to the manager, not the shared
@@ -371,13 +351,7 @@ class WorkerBase:
         return sorted(valid_indices)
 
     def clear_steering_vectors(self) -> None:
-        """Zero all steering-vector buffers across all hook points and
-        clear all tiers (base, prefill, decode) in the SteeringManager."""
-        for mod in self._steerable_layers().values():
-            for vec_attr in HOOK_POINT_VECTOR_ATTR.values():
-                if hasattr(mod, vec_attr):
-                    getattr(mod, vec_attr).zero_()
-
+        """Clear all tiers (base, prefill, decode) in the SteeringManager."""
         # Notify SteeringManager
         if hasattr(self, "model_runner") and self.model_runner is not None:
             mgr = getattr(self.model_runner, "_steering_manager", None)
@@ -395,34 +369,38 @@ class WorkerBase:
         "prefill_norm"?: float, "decode_norm"?: float}}}`` for
         layers/hook-points that have a non-zero steering vector.
 
-        Base norms come from layer buffers. Phase-specific norms
-        (``prefill_norm``, ``decode_norm``) come from the
-        SteeringManager's global phase vectors and are only present
-        when those vectors have non-zero norms.
+        All norms (base, prefill, decode) are read from the
+        SteeringManager when it exists, or from
+        ``_pending_steering_globals`` before manager initialization.
         """
         result: dict = {}
-        # Base norms from layer buffers
-        for idx, mod in self._steerable_layers().items():
-            layer_info: dict[str, dict[str, float]] = {}
-            for hp, vec_attr in HOOK_POINT_VECTOR_ATTR.items():
-                if not hasattr(mod, vec_attr):
-                    continue
-                vec = getattr(mod, vec_attr)
-                norm = vec.norm().item()
-                if norm > 0.0:
-                    layer_info[hp.value] = {"norm": round(norm, 6)}
-            if layer_info:
-                result[idx] = layer_info
-
-        # Phase-specific norms from SteeringManager
-        if hasattr(self, "model_runner") and self.model_runner is not None:
-            mgr = getattr(self.model_runner, "_steering_manager", None)
-            if mgr is not None:
-                for phase_name, phase_dict in [
-                    ("prefill", mgr.global_prefill_vectors),
-                    ("decode", mgr.global_decode_vectors),
-                ]:
-                    for hp_str, layer_vecs in phase_dict.items():
+        if not hasattr(self, "model_runner") or self.model_runner is None:
+            return result
+        mgr = getattr(self.model_runner, "_steering_manager", None)
+        if mgr is not None:
+            # Read all norms from manager
+            for phase_name, phase_dict in [
+                ("base", mgr.global_base_vectors),
+                ("prefill", mgr.global_prefill_vectors),
+                ("decode", mgr.global_decode_vectors),
+            ]:
+                norm_key = "norm" if phase_name == "base" else f"{phase_name}_norm"
+                for hp_str, layer_vecs in phase_dict.items():
+                    for layer_idx, vec in layer_vecs.items():
+                        norm = vec.norm().item()
+                        if norm > 0.0:
+                            if layer_idx not in result:
+                                result[layer_idx] = {}
+                            if hp_str not in result[layer_idx]:
+                                result[layer_idx][hp_str] = {}
+                            result[layer_idx][hp_str][norm_key] = round(norm, 6)
+        else:
+            # Read from pending globals (all phases including base)
+            pending = getattr(self.model_runner, "_pending_steering_globals", None)
+            if pending:
+                for captured_vectors, phase in pending:
+                    norm_key = "norm" if phase == "base" else f"{phase}_norm"
+                    for hp_str, layer_vecs in captured_vectors.items():
                         for layer_idx, vec in layer_vecs.items():
                             norm = vec.norm().item()
                             if norm > 0.0:
@@ -430,28 +408,7 @@ class WorkerBase:
                                     result[layer_idx] = {}
                                 if hp_str not in result[layer_idx]:
                                     result[layer_idx][hp_str] = {}
-                                result[layer_idx][hp_str][f"{phase_name}_norm"] = round(
-                                    norm, 6
-                                )
-            else:
-                # Phase-specific norms from pending globals (before manager init)
-                pending = getattr(self.model_runner, "_pending_steering_globals", None)
-                if pending:
-                    for captured_vectors, phase in pending:
-                        if phase == "base":
-                            continue  # base vectors are in layer buffers
-                        phase_name = phase  # "prefill" or "decode"
-                        for hp_str, layer_vecs in captured_vectors.items():
-                            for layer_idx, vec in layer_vecs.items():
-                                norm = vec.norm().item()
-                                if norm > 0.0:
-                                    if layer_idx not in result:
-                                        result[layer_idx] = {}
-                                    if hp_str not in result[layer_idx]:
-                                        result[layer_idx][hp_str] = {}
-                                    result[layer_idx][hp_str][f"{phase_name}_norm"] = (
-                                        round(norm, 6)
-                                    )
+                                result[layer_idx][hp_str][norm_key] = round(norm, 6)
         return result
 
     def get_model_inspection(self) -> str:

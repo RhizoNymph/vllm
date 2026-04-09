@@ -42,12 +42,6 @@ HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.POST_MLP: "steering_table_post_mlp",
 }
 
-HOOK_POINT_VECTOR_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "steering_vector_pre_attn",
-    SteeringHookPoint.POST_ATTN: "steering_vector_post_attn",
-    SteeringHookPoint.POST_MLP: "steering_vector_post_mlp",
-}
-
 # Valid hook point string values for validation.
 VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHookPoint)
 
@@ -63,11 +57,6 @@ def register_steering_buffers(
 ) -> None:
     """Attach per-hook steering buffers to a decoder layer."""
     for hp in SteeringHookPoint:
-        module.register_buffer(
-            HOOK_POINT_VECTOR_ATTR[hp],
-            torch.zeros(1, hidden_size),
-            persistent=False,
-        )
         module.register_buffer(
             HOOK_POINT_TABLE_ATTR[hp],
             torch.zeros(max_steering_configs + 3, hidden_size),

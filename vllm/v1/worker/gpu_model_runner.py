@@ -3198,7 +3198,6 @@ class GPUModelRunner(
         """
         from vllm.model_executor.layers.steering import (
             HOOK_POINT_TABLE_ATTR,
-            HOOK_POINT_VECTOR_ATTR,
         )
 
         # Lazy init
@@ -3264,24 +3263,6 @@ class GPUModelRunner(
                                     phase=phase,
                                 )
                     self._pending_steering_globals = None
-                else:
-                    # No pending phase-specific globals -- fall back to
-                    # reading the steering_vector_* buffers as base-phase
-                    # globals.  This handles the case where vectors were
-                    # set via a path that doesn't use phase-aware
-                    # notifications.
-                    for hp, vec_attr in HOOK_POINT_VECTOR_ATTR.items():
-                        for layer_idx, mod in steerable.items():
-                            if not hasattr(mod, vec_attr):
-                                continue
-                            vec = getattr(mod, vec_attr)
-                            if vec.any():
-                                self._steering_manager.update_global_vectors(
-                                    hp.value,
-                                    layer_idx,
-                                    vec,
-                                    phase="base",
-                                )
                 # Register any configs that were added to the batch
                 # before the manager existed (first-step race).
                 for i in range(self.input_batch.num_reqs):

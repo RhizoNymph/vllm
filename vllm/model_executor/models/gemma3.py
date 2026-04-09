@@ -43,7 +43,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
-    HOOK_POINT_VECTOR_ATTR,
     SteeringHookPoint,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -258,11 +257,6 @@ class Gemma3DecoderLayer(nn.Module):
         # rows act as a no-op.  torch.compile lifts them as graph inputs,
         # so no splitting op is needed.
         for hp in SteeringHookPoint:
-            self.register_buffer(
-                HOOK_POINT_VECTOR_ATTR[hp],
-                torch.zeros(1, config.hidden_size),
-                persistent=False,
-            )
             self.register_buffer(
                 HOOK_POINT_TABLE_ATTR[hp],
                 torch.zeros(max_steering_configs + 3, config.hidden_size),

@@ -61,7 +61,7 @@ class SteeringManager:
         self.free_rows: list[int] = list(range(max_steering_configs + 2, 2, -1))
 
         # Global vectors split into three tiers:
-        #   base:    both-phases vectors (from global API steering_vector_* buffers)
+        #   base:    both-phases vectors (from global API)
         #   prefill: prefill-specific global vectors
         #   decode:  decode-specific global vectors
         self.global_base_vectors: dict[str, dict[int, torch.Tensor]] = {}
