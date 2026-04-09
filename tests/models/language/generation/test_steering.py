@@ -16,7 +16,7 @@ import torch
 from vllm import SamplingParams
 from vllm.model_executor.layers.steering import (
     DEFAULT_HOOK_POINT,
-    HOOK_POINT_VECTOR_ATTR,
+    HOOK_POINT_TABLE_ATTR,
 )
 from ...registry import HF_EXAMPLE_MODELS
 
@@ -696,7 +696,7 @@ PHASE5_GENERATION_CASES = [
 
 # Shorthand
 _HP = DEFAULT_HOOK_POINT.value
-_VEC_ATTR = HOOK_POINT_VECTOR_ATTR[DEFAULT_HOOK_POINT]
+_TABLE_ATTR = HOOK_POINT_TABLE_ATTR[DEFAULT_HOOK_POINT]
 
 
 # ---------------------------------------------------------------------------
@@ -711,8 +711,8 @@ def _discover_layers(llm):
         layers = {}
         model_inst = worker.model_runner.get_model()
         for mod in model_inst.modules():
-            if hasattr(mod, _VEC_ATTR) and hasattr(mod, "layer_idx"):
-                layers[mod.layer_idx] = getattr(mod, _VEC_ATTR).shape[1]
+            if hasattr(mod, _TABLE_ATTR) and hasattr(mod, "layer_idx"):
+                layers[mod.layer_idx] = getattr(mod, _TABLE_ATTR).shape[1]
         return layers
 
     layer_info = llm.llm.collective_rpc(_discover)[0]
