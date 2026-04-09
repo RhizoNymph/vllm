@@ -244,6 +244,7 @@ def _make_steering_runner():
     runner._steering_manager.register_config = Mock()
     runner._steering_manager.release_config = Mock()
     runner._req_steering_phase = {}
+    runner._pending_steering_transitions = []
     runner._pending_steering_registrations = []
     return runner
 
@@ -542,6 +543,7 @@ def test_streaming_update_decode_phase_no_hash_vector_mismatch():
     mgr = SteeringManager(max_steering_configs=4)
     runner._steering_manager = mgr
     runner._req_steering_phase = {}
+    runner._pending_steering_transitions = []
     runner._pending_steering_registrations = []
 
     req_id = "hash_mismatch_req"
@@ -627,6 +629,7 @@ def test_streaming_update_decode_phase_no_hash_vector_mismatch():
     assert "layer.0" in stored
     assert 0 in stored["layer.0"]
     import torch
+
     expected = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
     assert torch.allclose(stored["layer.0"][0].squeeze(), expected)
 

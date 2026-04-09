@@ -303,6 +303,9 @@ The main operational rules are:
 - Prefix-cache keys include prefill steering, not decode-only steering
 - Streaming continuation folds prior outputs back into the prompt, so
   prompt/decode boundaries can move between turns
+- Deferred steering registrations use a two-queue priority model:
+  prefill→decode transitions are retried before new-request deferrals,
+  ensuring in-flight requests get table rows first
 
 These rules matter for cache correctness and batch admission. See
 [Steering Runtime Design](../design/steering_runtime.md) for details.

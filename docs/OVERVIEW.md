@@ -37,6 +37,8 @@ Features Index:
             Scheduler predicts mid-step prefill-to-decode transitions and
             reserves capacity for both phases; model runner gracefully defers
             decode registration when capacity is temporarily exhausted.
+            Deferred entries use a two-queue priority model: prefill→decode
+            transitions are retried before new-request deferrals.
             Status endpoint reports base, prefill, and decode vector norms.
         entry_points:
             - POST /v1/steering/set (global)

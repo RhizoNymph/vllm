@@ -1080,12 +1080,18 @@ class GPUModelRunner(
                         if h != 0:
                             self._steering_manager.release_config(h, phase)
 
-            # Also remove any deferred steering registrations for
-            # finished requests to prevent registering rows for dead
-            # requests.  (The retry loop also checks, but this eagerly
-            # drops entries before self.requests is pruned below.)
+            # Also remove any deferred steering entries for finished
+            # requests to prevent registering rows for dead requests.
+            # (The retry loop also checks, but this eagerly drops
+            # entries before self.requests is pruned below.)
+            finished = set(scheduler_output.finished_req_ids)
+            if self._pending_steering_transitions:
+                self._pending_steering_transitions = [
+                    entry
+                    for entry in self._pending_steering_transitions
+                    if entry[0] not in finished
+                ]
             if self._pending_steering_registrations:
-                finished = set(scheduler_output.finished_req_ids)
                 self._pending_steering_registrations = [
                     entry
                     for entry in self._pending_steering_registrations
@@ -1624,7 +1630,13 @@ class GPUModelRunner(
                 elif old_phase == "decode" and old_decode_hash != 0:
                     self._steering_manager.release_config(old_decode_hash, "decode")
 
-            # Purge stale deferred registrations for this request.
+            # Purge stale deferred entries for this request.
+            if self._pending_steering_transitions:
+                self._pending_steering_transitions = [
+                    entry
+                    for entry in self._pending_steering_transitions
+                    if entry[0] != req_id
+                ]
             if self._pending_steering_registrations:
                 self._pending_steering_registrations = [
                     entry
@@ -3226,7 +3238,12 @@ class GPUModelRunner(
                     max_configs, device=table_device
                 )
                 # Each entry: (req_id, config_hash, vectors, phase).
-                # Retried with priority before new admissions.
+                # Transitions (prefill→decode) are retried before new
+                # admissions; the transitions queue must be fully
+                # drained before any registration entry is attempted.
+                self._pending_steering_transitions: list[
+                    tuple[str, int, dict[str, dict[int, list[float]]], str]
+                ] = []
                 self._pending_steering_registrations: list[
                     tuple[str, int, dict[str, dict[int, list[float]]], str]
                 ] = []
@@ -3329,10 +3346,39 @@ class GPUModelRunner(
         if self._steering_manager is None or not self._steerable_layers:
             return
 
-        # Process deferred steering registrations (priority over new
-        # admissions).  Entries are dropped when the originating request
-        # has finished or changed phase, preventing row leaks.
-        if self._pending_steering_registrations:
+        # Process deferred steering entries with a two-queue priority
+        # model.  Transitions (prefill→decode) are drained first because
+        # they represent in-flight requests that already consumed KV
+        # cache.  New-request registrations are only attempted once the
+        # transitions queue is empty.  Entries are dropped when the
+        # originating request has finished or changed phase, preventing
+        # row leaks.
+        if self._pending_steering_transitions:
+            still_transitions: list[
+                tuple[str, int, dict[str, dict[int, list[float]]], str]
+            ] = []
+            for (
+                d_req_id,
+                d_hash,
+                d_vecs,
+                d_phase,
+            ) in self._pending_steering_transitions:
+                if d_req_id not in self.requests:
+                    continue
+                if self._req_steering_phase.get(d_req_id) != d_phase:
+                    continue
+                try:
+                    self._steering_manager.register_config(
+                        d_hash, d_vecs, phase=d_phase
+                    )
+                except RuntimeError:
+                    still_transitions.append((d_req_id, d_hash, d_vecs, d_phase))
+            self._pending_steering_transitions = still_transitions
+
+        if (
+            not self._pending_steering_transitions
+            and self._pending_steering_registrations
+        ):
             still_pending: list[
                 tuple[str, int, dict[str, dict[int, list[float]]], str]
             ] = []
@@ -3342,11 +3388,8 @@ class GPUModelRunner(
                 d_vecs,
                 d_phase,
             ) in self._pending_steering_registrations:
-                # Drop entries for finished requests.
                 if d_req_id not in self.requests:
                     continue
-                # Drop entries whose request changed phase (e.g. prefill
-                # deferred but request already transitioned to decode).
                 if self._req_steering_phase.get(d_req_id) != d_phase:
                     continue
                 try:
@@ -3453,7 +3496,7 @@ class GPUModelRunner(
                             phase="decode",
                         )
                     except RuntimeError:
-                        self._pending_steering_registrations.append(
+                        self._pending_steering_transitions.append(
                             (
                                 req_id,
                                 decode_hash,
@@ -3500,6 +3543,10 @@ class GPUModelRunner(
             )
 
         # Drop any stale deferred entries for this request.
+        if self._pending_steering_transitions:
+            self._pending_steering_transitions = [
+                e for e in self._pending_steering_transitions if e[0] != req_id
+            ]
         if self._pending_steering_registrations:
             self._pending_steering_registrations = [
                 e for e in self._pending_steering_registrations if e[0] != req_id
