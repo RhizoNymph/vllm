@@ -160,12 +160,25 @@ If those are not refreshed together, cache hits and misses become incorrect.
 ## Deferred and Pending Registration
 
 Decode registration can be deferred when a request transitions phases but the
-worker has no free steering rows at that moment.
+worker has no free steering rows at that moment.  New-request registrations
+can also be deferred on capacity exhaustion during admission.
+
+The runtime uses a two-queue priority model:
+
+1. **Transitions queue** (`_pending_steering_transitions`): prefill→decode
+   transitions for in-flight requests that have already consumed KV cache.
+   This queue is drained first (FIFO).
+2. **Registrations queue** (`_pending_steering_registrations`): new-request
+   deferrals.  Only processed once the transitions queue is empty.
+
+This priority ordering ensures that requests already consuming resources get
+steering table rows before newly admitted requests that haven't started yet.
 
 The runtime has to preserve these invariants:
 
 - active requests keep running even if decode registration is deferred
-- pending registrations are retried when capacity frees up
+- transitions are retried before new-request registrations
+- new-request registrations are only attempted when no transitions are pending
 - stale pending entries are dropped if the request finishes or changes phase
 - fallback behavior must remain correct if a request temporarily uses a global row
 

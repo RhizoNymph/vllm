@@ -1656,7 +1656,7 @@ class TestTransitionUnderCapacity:
     @staticmethod
     def _transition(
         mgr: "SteeringManager",
-        pending: list,
+        pending_transitions: list,
         req_phase: dict,
         req_id: str,
         prefill_hash: int,
@@ -1665,8 +1665,9 @@ class TestTransitionUnderCapacity:
     ) -> None:
         """Transcription of ``GPUModelRunner._handle_steering_transition``.
 
-        Kept in lockstep with ``vllm/v1/worker/gpu_model_runner.py`` lines
-        3412-3458 (update when that code changes).
+        Kept in lockstep with ``vllm/v1/worker/gpu_model_runner.py``.
+        Deferred entries go to ``_pending_steering_transitions`` (not
+        ``_pending_steering_registrations``).
         """
         if prefill_hash != 0:
             mgr.release_config(prefill_hash, "prefill")
@@ -1674,14 +1675,16 @@ class TestTransitionUnderCapacity:
             try:
                 mgr.register_config(decode_hash, decode_vectors, phase="decode")
             except RuntimeError:
-                pending.append((req_id, decode_hash, decode_vectors, "decode"))
+                pending_transitions.append(
+                    (req_id, decode_hash, decode_vectors, "decode")
+                )
         req_phase[req_id] = "decode"
 
     def test_decode_registration_succeeds_with_headroom(self):
         """With capacity available, decode is registered and nothing is
         deferred."""
         mgr = _make_manager(max_configs=2)
-        pending: list = []
+        pending_transitions: list = []
         req_phase: dict = {}
         prefill_vecs = {_HP: {0: [1.0] * HIDDEN_SIZE}}
         decode_vecs = {_HP: {0: [2.0] * HIDDEN_SIZE}}
@@ -1691,14 +1694,14 @@ class TestTransitionUnderCapacity:
 
         self._transition(
             mgr,
-            pending,
+            pending_transitions,
             req_phase,
             req_id="req-A",
             prefill_hash=1,
             decode_hash=2,
             decode_vectors=decode_vecs,
         )
-        assert pending == []
+        assert pending_transitions == []
         assert (2, "decode") in mgr.config_to_row
         assert (1, "prefill") not in mgr.config_to_row
         assert req_phase["req-A"] == "decode"
@@ -1712,7 +1715,7 @@ class TestTransitionUnderCapacity:
         entry is retried next step.
         """
         mgr = _make_manager(max_configs=1)
-        pending: list = []
+        pending_transitions: list = []
         req_phase: dict = {}
         blocker_vecs = {_HP: {0: [9.0] * HIDDEN_SIZE}}
         # Fill the single per-request row with an unrelated running
@@ -1726,7 +1729,7 @@ class TestTransitionUnderCapacity:
         req_phase["req-A"] = "prefill"
         self._transition(
             mgr,
-            pending,
+            pending_transitions,
             req_phase,
             req_id="req-A",
             prefill_hash=0,
@@ -1734,8 +1737,8 @@ class TestTransitionUnderCapacity:
             decode_vectors=decode_vecs,
         )
         # Deferred
-        assert len(pending) == 1
-        assert pending[0] == ("req-A", 5, decode_vecs, "decode")
+        assert len(pending_transitions) == 1
+        assert pending_transitions[0] == ("req-A", 5, decode_vecs, "decode")
         # Phase tracking must be updated so the retry loop can match.
         assert req_phase["req-A"] == "decode"
         # Row 2 is the decode fallback — unregistered decode hash yields 2.
@@ -1748,7 +1751,7 @@ class TestTransitionUnderCapacity:
         """Round-trip: a deferred entry registers on the next retry once
         another request releases its slot."""
         mgr = _make_manager(max_configs=1)
-        pending: list = []
+        pending_transitions: list = []
         req_phase: dict = {}
         blocker_vecs = {_HP: {0: [9.0] * HIDDEN_SIZE}}
         mgr.register_config(99, blocker_vecs, phase="prefill")
@@ -1758,23 +1761,23 @@ class TestTransitionUnderCapacity:
         req_phase["req-A"] = "prefill"
         self._transition(
             mgr,
-            pending,
+            pending_transitions,
             req_phase,
             req_id="req-A",
             prefill_hash=0,
             decode_hash=5,
             decode_vectors=decode_vecs,
         )
-        assert len(pending) == 1
+        assert len(pending_transitions) == 1
 
         # Blocker request finishes, its row is freed.
         mgr.release_config(99, "prefill")
         req_phase.pop("req-blocker", None)
 
-        # Drive the retry loop (same body as the runner's retry at
-        # gpu_model_runner.py:3322-3345).
+        # Drive the transition retry loop (transitions are drained
+        # before registrations).
         still_pending: list = []
-        for d_req_id, d_hash, d_vecs, d_phase in pending:
+        for d_req_id, d_hash, d_vecs, d_phase in pending_transitions:
             if d_req_id not in req_phase:
                 continue
             if req_phase.get(d_req_id) != d_phase:
@@ -1783,9 +1786,9 @@ class TestTransitionUnderCapacity:
                 mgr.register_config(d_hash, d_vecs, phase=d_phase)
             except RuntimeError:
                 still_pending.append((d_req_id, d_hash, d_vecs, d_phase))
-        pending = still_pending
+        pending_transitions = still_pending
 
-        assert pending == []
+        assert pending_transitions == []
         assert (5, "decode") in mgr.config_to_row
         assert mgr.get_row_for_config(5, is_prefill=False) >= 3
 
@@ -1922,9 +1925,7 @@ class TestDevicePlacement:
         stored = mgr.config_vectors[(42, "prefill")][_HP][0]
         assert stored.device == torch.device("cpu")
 
-    @pytest.mark.skipif(
-        not torch.cuda.is_available(), reason="CUDA not available"
-    )
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_vectors_stored_on_specified_cuda_device(self):
         """When device=cuda, registered vectors must reside on that device."""
         cuda_device = torch.device("cuda:0")
@@ -1934,18 +1935,14 @@ class TestDevicePlacement:
         stored = mgr.config_vectors[(99, "prefill")][_HP][0]
         assert stored.device == cuda_device
 
-    @pytest.mark.skipif(
-        not torch.cuda.is_available(), reason="CUDA not available"
-    )
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_populate_per_request_only_on_gpu(self):
         """Per-request-only path (no globals) should work with GPU vectors."""
         cuda_device = torch.device("cuda:0")
         mgr = _make_manager(device=cuda_device)
         per_req_vec = torch.ones(HIDDEN_SIZE) * 7.0
         vectors = {_HP: {0: per_req_vec.tolist()}}
-        row = mgr.register_config(
-            config_hash=42, vectors=vectors, phase="prefill"
-        )
+        row = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
 
         # Create layer tables on GPU to match
         layers = _make_layers(mgr, layer_indices=[0])
@@ -1956,3 +1953,343 @@ class TestDevicePlacement:
         table = getattr(layers[0], _TABLE_ATTR)
         expected = per_req_vec.to(cuda_device)
         assert torch.allclose(table[row], expected)
+
+
+# ---------------------------------------------------------------------------
+# TestTransitionPriority
+# ---------------------------------------------------------------------------
+
+
+class TestTransitionPriority:
+    """Verify the two-queue priority model for deferred steering registrations.
+
+    Prefill→decode transitions go into ``_pending_steering_transitions``
+    and are drained entirely (FIFO) before any entries in
+    ``_pending_steering_registrations`` (new-request deferrals) are
+    processed.  This ensures that in-flight requests that have already
+    consumed KV cache and compute get steering table rows before newly
+    admitted requests.
+
+    Reference code: ``vllm/v1/worker/gpu_model_runner.py`` —
+    ``_update_steering_buffers`` retry loop and
+    ``_handle_steering_transition`` append site.
+    """
+
+    @staticmethod
+    def _run_retry_loop(
+        mgr: "SteeringManager",
+        pending_transitions: list,
+        pending_registrations: list,
+        active_requests: set[str],
+        req_phase: dict[str, str],
+    ) -> tuple[list, list]:
+        """Transcription of the two-queue retry loop in
+        ``_update_steering_buffers``.
+
+        Returns the updated (transitions, registrations) lists.
+        """
+        # Phase 1: drain transitions (must be empty before touching
+        # registrations).
+        if pending_transitions:
+            still: list = []
+            for d_req_id, d_hash, d_vecs, d_phase in pending_transitions:
+                if d_req_id not in active_requests:
+                    continue
+                if req_phase.get(d_req_id) != d_phase:
+                    continue
+                try:
+                    mgr.register_config(d_hash, d_vecs, phase=d_phase)
+                except RuntimeError:
+                    still.append((d_req_id, d_hash, d_vecs, d_phase))
+            pending_transitions = still
+
+        # Phase 2: only process registrations when transitions queue is
+        # empty.
+        if not pending_transitions and pending_registrations:
+            still_reg: list = []
+            for d_req_id, d_hash, d_vecs, d_phase in pending_registrations:
+                if d_req_id not in active_requests:
+                    continue
+                if req_phase.get(d_req_id) != d_phase:
+                    continue
+                try:
+                    mgr.register_config(d_hash, d_vecs, phase=d_phase)
+                except RuntimeError:
+                    still_reg.append((d_req_id, d_hash, d_vecs, d_phase))
+            pending_registrations = still_reg
+
+        return pending_transitions, pending_registrations
+
+    def test_transitions_processed_before_registrations(self):
+        """When both queues have entries and only one slot is available,
+        the transition entry gets the slot and the registration stays
+        pending."""
+        mgr = _make_manager(max_configs=1)
+        req_phase: dict[str, str] = {}
+        active: set[str] = set()
+
+        transition_vecs = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        registration_vecs = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+
+        # Both queues have one entry each.
+        pending_transitions = [("req-transition", 10, transition_vecs, "decode")]
+        pending_registrations = [("req-new", 20, registration_vecs, "prefill")]
+
+        req_phase["req-transition"] = "decode"
+        req_phase["req-new"] = "prefill"
+        active.add("req-transition")
+        active.add("req-new")
+
+        pending_transitions, pending_registrations = self._run_retry_loop(
+            mgr,
+            pending_transitions,
+            pending_registrations,
+            active,
+            req_phase,
+        )
+
+        # Transition got the slot.
+        assert (10, "decode") in mgr.config_to_row
+        assert pending_transitions == []
+        # Registration stayed pending.
+        assert len(pending_registrations) == 1
+        assert pending_registrations[0][0] == "req-new"
+
+    def test_registrations_processed_after_transitions_drained(self):
+        """When transitions queue is empty, registrations are processed."""
+        mgr = _make_manager(max_configs=1)
+        req_phase: dict[str, str] = {}
+        active: set[str] = set()
+
+        reg_vecs = {_HP: {0: [3.0] * HIDDEN_SIZE}}
+        pending_transitions: list = []
+        pending_registrations = [("req-new", 30, reg_vecs, "prefill")]
+        req_phase["req-new"] = "prefill"
+        active.add("req-new")
+
+        pending_transitions, pending_registrations = self._run_retry_loop(
+            mgr,
+            pending_transitions,
+            pending_registrations,
+            active,
+            req_phase,
+        )
+
+        assert (30, "prefill") in mgr.config_to_row
+        assert pending_registrations == []
+
+    def test_registrations_blocked_while_transitions_remain(self):
+        """If a transition cannot be registered (capacity still full),
+        registrations must NOT be attempted even if they could fit."""
+        mgr = _make_manager(max_configs=1)
+        req_phase: dict[str, str] = {}
+        active: set[str] = set()
+
+        # Fill the only slot with an unrelated config.
+        blocker_vecs = {_HP: {0: [9.0] * HIDDEN_SIZE}}
+        mgr.register_config(99, blocker_vecs, phase="prefill")
+
+        transition_vecs = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        registration_vecs = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+
+        pending_transitions = [("req-trans", 10, transition_vecs, "decode")]
+        pending_registrations = [("req-new", 20, registration_vecs, "prefill")]
+        req_phase["req-trans"] = "decode"
+        req_phase["req-new"] = "prefill"
+        active.add("req-trans")
+        active.add("req-new")
+
+        pending_transitions, pending_registrations = self._run_retry_loop(
+            mgr,
+            pending_transitions,
+            pending_registrations,
+            active,
+            req_phase,
+        )
+
+        # Transition still pending (no capacity).
+        assert len(pending_transitions) == 1
+        # Registration was NOT attempted — still pending.
+        assert len(pending_registrations) == 1
+
+    def test_multiple_transitions_fifo_order(self):
+        """Multiple transitions are drained in FIFO order."""
+        mgr = _make_manager(max_configs=2)
+        req_phase: dict[str, str] = {}
+        active: set[str] = set()
+
+        vecs_a = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        vecs_b = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+
+        pending_transitions = [
+            ("req-A", 10, vecs_a, "decode"),
+            ("req-B", 20, vecs_b, "decode"),
+        ]
+        pending_registrations: list = []
+        req_phase["req-A"] = "decode"
+        req_phase["req-B"] = "decode"
+        active.update(["req-A", "req-B"])
+
+        pending_transitions, pending_registrations = self._run_retry_loop(
+            mgr,
+            pending_transitions,
+            pending_registrations,
+            active,
+            req_phase,
+        )
+
+        # Both transitions registered (capacity = 2).
+        assert (10, "decode") in mgr.config_to_row
+        assert (20, "decode") in mgr.config_to_row
+        assert pending_transitions == []
+
+    def test_finished_requests_dropped_from_both_queues(self):
+        """Entries for requests no longer in the active set are dropped."""
+        mgr = _make_manager(max_configs=2)
+        req_phase: dict[str, str] = {}
+        active: set[str] = set()
+
+        vecs = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        pending_transitions = [("req-gone-t", 10, vecs, "decode")]
+        pending_registrations = [("req-gone-r", 20, vecs, "prefill")]
+
+        # Neither request is active.
+        req_phase["req-gone-t"] = "decode"
+        req_phase["req-gone-r"] = "prefill"
+        # active set is empty — both requests are finished.
+
+        pending_transitions, pending_registrations = self._run_retry_loop(
+            mgr,
+            pending_transitions,
+            pending_registrations,
+            active,
+            req_phase,
+        )
+
+        assert pending_transitions == []
+        assert pending_registrations == []
+        assert mgr.num_active_configs == 0
+
+    def test_phase_mismatch_dropped_from_both_queues(self):
+        """Entries whose request phase changed are dropped."""
+        mgr = _make_manager(max_configs=2)
+        req_phase: dict[str, str] = {}
+        active: set[str] = set()
+
+        vecs = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        # Transition entry says "decode" but phase is now something else.
+        pending_transitions = [("req-t", 10, vecs, "decode")]
+        pending_registrations = [("req-r", 20, vecs, "prefill")]
+
+        req_phase["req-t"] = "prefill"  # mismatch
+        req_phase["req-r"] = "decode"  # mismatch
+        active.update(["req-t", "req-r"])
+
+        pending_transitions, pending_registrations = self._run_retry_loop(
+            mgr,
+            pending_transitions,
+            pending_registrations,
+            active,
+            req_phase,
+        )
+
+        assert pending_transitions == []
+        assert pending_registrations == []
+        assert mgr.num_active_configs == 0
+
+    def test_transition_deferral_goes_to_transition_queue(self):
+        """``_handle_steering_transition`` appends to
+        ``_pending_steering_transitions``, not
+        ``_pending_steering_registrations``."""
+        mgr = _make_manager(max_configs=1)
+        pending_transitions: list = []
+        pending_registrations: list = []
+        req_phase: dict[str, str] = {}
+
+        # Fill the single slot.
+        blocker_vecs = {_HP: {0: [9.0] * HIDDEN_SIZE}}
+        mgr.register_config(99, blocker_vecs, phase="prefill")
+
+        decode_vecs = {_HP: {0: [5.0] * HIDDEN_SIZE}}
+        req_phase["req-A"] = "prefill"
+
+        # Transcription of _handle_steering_transition with the fix.
+        prefill_hash = 0
+        decode_hash = 5
+        if prefill_hash != 0:
+            mgr.release_config(prefill_hash, "prefill")
+        if decode_hash != 0 and decode_vecs:
+            try:
+                mgr.register_config(decode_hash, decode_vecs, phase="decode")
+            except RuntimeError:
+                # This is the key change: goes to transitions, not
+                # registrations.
+                pending_transitions.append(
+                    ("req-A", decode_hash, decode_vecs, "decode")
+                )
+        req_phase["req-A"] = "decode"
+
+        # Transition queue has the entry.
+        assert len(pending_transitions) == 1
+        assert pending_transitions[0] == (
+            "req-A",
+            5,
+            decode_vecs,
+            "decode",
+        )
+        # Registration queue is empty.
+        assert pending_registrations == []
+
+    def test_two_step_roundtrip_transition_before_registration(self):
+        """End-to-end: transition gets the slot on step 1 after the blocker
+        finishes, registration gets it on step 2 after the transition
+        request also finishes."""
+        mgr = _make_manager(max_configs=1)
+        req_phase: dict[str, str] = {}
+        active: set[str] = set()
+
+        blocker_vecs = {_HP: {0: [9.0] * HIDDEN_SIZE}}
+        mgr.register_config(99, blocker_vecs, phase="prefill")
+        req_phase["req-blocker"] = "prefill"
+        active.add("req-blocker")
+
+        transition_vecs = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        registration_vecs = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+        pending_transitions = [("req-trans", 10, transition_vecs, "decode")]
+        pending_registrations = [("req-new", 20, registration_vecs, "prefill")]
+        req_phase["req-trans"] = "decode"
+        req_phase["req-new"] = "prefill"
+        active.update(["req-trans", "req-new"])
+
+        # Step 1: blocker finishes, freeing the slot.
+        mgr.release_config(99, "prefill")
+        active.discard("req-blocker")
+
+        pending_transitions, pending_registrations = self._run_retry_loop(
+            mgr,
+            pending_transitions,
+            pending_registrations,
+            active,
+            req_phase,
+        )
+
+        # Transition got the slot; registration still waiting.
+        assert (10, "decode") in mgr.config_to_row
+        assert pending_transitions == []
+        assert len(pending_registrations) == 1
+
+        # Step 2: transition request finishes, freeing the slot.
+        mgr.release_config(10, "decode")
+        active.discard("req-trans")
+
+        pending_transitions, pending_registrations = self._run_retry_loop(
+            mgr,
+            pending_transitions,
+            pending_registrations,
+            active,
+            req_phase,
+        )
+
+        # Registration finally got the slot.
+        assert (20, "prefill") in mgr.config_to_row
+        assert pending_registrations == []
