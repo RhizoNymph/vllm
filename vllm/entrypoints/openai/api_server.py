@@ -360,6 +360,34 @@ async def init_app_state(
     )
     await state.openai_serving_models.init_static_loras()
 
+    if args.enable_steering:
+        # Initialize steering module registry for named steering vectors.
+        from vllm.entrypoints.openai.steering.registry import (
+            SteeringModuleRegistry,
+        )
+
+        steerable_layer_sets = await engine_client.collective_rpc(
+            "list_steerable_layers"
+        )
+        valid_layer_indices: set[int] = set()
+        for layer_set in steerable_layer_sets:
+            valid_layer_indices.update(layer_set)
+
+        steering_registry = SteeringModuleRegistry(
+            valid_layer_indices=valid_layer_indices
+        )
+        if getattr(args, "steering_modules", None):
+            for module in args.steering_modules:
+                await steering_registry.load_from_file(module.name, module.path)
+            logger.info(
+                "Loaded %d steering module(s): %s",
+                len(args.steering_modules),
+                steering_registry.list_modules(),
+            )
+        state.steering_module_registry = steering_registry
+    elif hasattr(state, "steering_module_registry"):
+        delattr(state, "steering_module_registry")
+
     state.openai_serving_render = OpenAIServingRender(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,

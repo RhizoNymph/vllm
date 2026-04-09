@@ -24,7 +24,10 @@ from vllm.entrypoints.constants import (
     H11_MAX_HEADER_COUNT_DEFAULT,
     H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
 )
-from vllm.entrypoints.openai.models.protocol import LoRAModulePath
+from vllm.entrypoints.openai.models.protocol import (
+    LoRAModulePath,
+    SteeringModulePath,
+)
 from vllm.logger import init_logger
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -66,6 +69,40 @@ class LoRAParserAction(argparse.Action):
         setattr(namespace, self.dest, lora_list)
 
 
+class SteeringModuleParserAction(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[str] | None,
+        option_string: str | None = None,
+    ):
+        if values is None:
+            values = []
+        if isinstance(values, str):
+            raise TypeError("Expected values to be a list")
+
+        module_list: list[SteeringModulePath] = []
+        for item in values:
+            if item in [None, ""]:  # Skip if item is None or empty string
+                continue
+            if "=" in item and "," not in item:  # Simple format: name=path
+                name, path = item.split("=")
+                module_list.append(SteeringModulePath(name, path))
+            else:  # Assume JSON format
+                try:
+                    module_dict = json.loads(item)
+                    module = SteeringModulePath(**module_dict)
+                    module_list.append(module)
+                except json.JSONDecodeError:
+                    parser.error(f"Invalid JSON format for --steering-modules: {item}")
+                except TypeError as e:
+                    parser.error(
+                        f"Invalid fields for --steering-modules: {item} - {str(e)}"
+                    )
+        setattr(namespace, self.dest, module_list)
+
+
 @config
 class BaseFrontendArgs:
     """Base arguments for the OpenAI-compatible frontend server.
@@ -80,6 +117,12 @@ class BaseFrontendArgs:
     or JSON list format. Example (old format): `'name=path'` Example (new
     format): `{\"name\": \"name\", \"path\": \"lora_path\",
     \"base_model_name\": \"id\"}`"""
+    steering_modules: list[SteeringModulePath] | None = None
+    """Named steering module configurations in either 'name=path' format or
+    JSON format. Each module is a JSON file containing steering vector
+    specifications. Example (simple): `'creativity=/path/to/creativity.json'`
+    Example (JSON): `{\"name\": \"creativity\",
+    \"path\": \"/path/to/creativity.json\"}`"""
     chat_template: str | None = None
     """The file path to the chat template, or the template in single-line form
     for the specified model."""
@@ -174,6 +217,11 @@ class BaseFrontendArgs:
         # optional_type(str)
         frontend_kwargs["lora_modules"]["type"] = optional_type(str)
         frontend_kwargs["lora_modules"]["action"] = LoRAParserAction
+
+        # Special case: Steering modules need custom parser action and
+        # optional_type(str)
+        frontend_kwargs["steering_modules"]["type"] = optional_type(str)
+        frontend_kwargs["steering_modules"]["action"] = SteeringModuleParserAction
 
         # Special case: Tool call parser shows built-in options.
         valid_tool_parsers = list(ToolParserManager.list_registered())

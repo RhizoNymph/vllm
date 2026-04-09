@@ -42,8 +42,13 @@ Features Index:
             - POST /v1/steering/set (global)
             - POST /v1/steering/clear (global)
             - GET /v1/steering (status with phase-specific norms)
+            - POST /v1/steering/modules/register (named module registration)
+            - POST /v1/steering/modules/unregister (named module removal)
+            - GET /v1/steering/modules (list named modules)
+            - --steering-modules name=path (CLI pre-registration)
             - SamplingParams.steering_vectors (per-request base)
             - SamplingParams.prefill_steering_vectors (per-request prefill)
             - SamplingParams.decode_steering_vectors (per-request decode)
+            - extra_body.steering_name (per-request named module reference)
         depends_on: []
         doc: docs/features/steering.md

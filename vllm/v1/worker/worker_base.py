@@ -200,6 +200,10 @@ class WorkerBase:
                 valid_indices.add(idx)
         return valid_indices
 
+    def list_steerable_layers(self) -> set[int]:
+        """Return the steerable layer indices available on this worker."""
+        return set(self._steerable_layers().keys())
+
     def _apply_vectors_to_buffers(
         self,
         vectors_data: dict[str, dict[int, list[float]]],
