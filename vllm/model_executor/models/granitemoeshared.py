@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from transformers.models.granitemoeshared import GraniteMoeSharedConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
@@ -24,6 +25,13 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -32,7 +40,12 @@ from vllm.sequence import IntermediateTensors
 
 from .granitemoe import GraniteMoeAttention, GraniteMoeModel, GraniteMoeMoE
 from .interfaces import SupportsLoRA, SupportsPP
-from .utils import AutoWeightsLoader, make_layers, maybe_prefix
+from .utils import (
+    AutoWeightsLoader,
+    extract_layer_index,
+    make_layers,
+    maybe_prefix,
+)
 
 
 class GraniteMoeSharedMLP(nn.Module):
@@ -81,9 +94,18 @@ class GraniteMoeSharedDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         self.self_attn = GraniteMoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -125,12 +147,16 @@ class GraniteMoeSharedDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
         hidden_states = residual + hidden_states * self.residual_multiplier
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_ATTN
+        )
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.shared_mlp is None:
@@ -142,6 +168,9 @@ class GraniteMoeSharedDecoderLayer(nn.Module):
             hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
             del moe_hidden_states
         hidden_states = residual + hidden_states * self.residual_multiplier
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
 
         return hidden_states
 
@@ -157,6 +186,9 @@ class GraniteMoeSharedModel(nn.Module):
 
         self.config = config
         self.quant_config = quant_config  # Required by MixtralModel
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -170,10 +202,16 @@ class GraniteMoeSharedModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: GraniteMoeSharedDecoderLayer(
-                config, cache_config, quant_config=quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config=quant_config,
+                prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

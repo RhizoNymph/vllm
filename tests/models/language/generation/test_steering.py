@@ -10,6 +10,7 @@ prefill/decode phase-specific steering.
 import math
 
 import pytest
+import requests
 import torch
 
 from vllm import SamplingParams
@@ -102,8 +103,167 @@ _AXK1_OVERRIDES = {
     "n_routed_experts": None,
 }
 
+_GENERIC_MOE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_hidden_layers": 2,
+    "num_local_experts": 2,
+    "num_experts_per_tok": 2,
+}
+
+_EXAONE_MOE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_hidden_layers": 2,
+    "num_experts": 2,
+    "num_experts_per_tok": 1,
+    "moe_intermediate_size": 1024,
+    "num_shared_experts": 0,
+    "routed_scaling_factor": 1.0,
+    "norm_topk_prob": True,
+    "n_group": 1,
+    "topk_group": 1,
+    "is_moe_layer": [True, True],
+}
+
+_GLM4_MOE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_hidden_layers": 2,
+    "head_dim": 64,
+    "n_routed_experts": 2,
+    "n_shared_experts": 0,
+    "num_experts_per_tok": 1,
+    "moe_intermediate_size": 1024,
+    "first_k_dense_replace": 0,
+    "norm_topk_prob": True,
+    "n_group": 1,
+    "topk_group": 1,
+    "routed_scaling_factor": 1.0,
+    "use_qk_norm": False,
+}
+
+_ERNIE45_MOE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_hidden_layers": 2,
+    "moe_num_experts": 2,
+    "moe_k": 1,
+    "moe_intermediate_size": 1024,
+    "moe_num_shared_experts": 0,
+    "moe_layer_start_index": 0,
+    "moe_layer_end_index": 1,
+    "moe_layer_interval": 1,
+    "use_moe": True,
+}
+
+_GRANITEMOE_OVERRIDES = {
+    **_GENERIC_MOE_OVERRIDES,
+    "attention_multiplier": 1.0,
+    "residual_multiplier": 1.0,
+    "embedding_multiplier": 1.0,
+}
+
+_GRANITEMOE_SHARED_OVERRIDES = {
+    **_GRANITEMOE_OVERRIDES,
+    "shared_intermediate_size": 1024,
+}
+
+_DEEPSEEK_MOE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_hidden_layers": 2,
+    "model_type": "deepseek",
+    "n_routed_experts": 2,
+    "n_shared_experts": 0,
+    "num_experts_per_tok": 1,
+    "first_k_dense_replace": 0,
+    "moe_layer_freq": 1,
+    "moe_intermediate_size": 1024,
+    "norm_topk_prob": True,
+    "qk_rope_head_dim": 0,
+}
+
+_EXAONE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "activation_function": "silu",
+    "layer_norm_epsilon": 1e-5,
+}
+
+_EXAONE4_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_hidden_layers": 2,
+    "hidden_act": "silu",
+    "rms_norm_eps": 1e-5,
+    "layer_types": ["full_attention", "full_attention"],
+    "sliding_window": 32,
+}
+
+_GRANITE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "hidden_act": "silu",
+    "attention_multiplier": 1.0,
+    "residual_multiplier": 1.0,
+    "embedding_multiplier": 1.0,
+}
+
+_OPT_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "ffn_dim": 1024,
+    "enable_bias": False,
+    "do_layer_norm_before": True,
+    "layer_norm_elementwise_affine": True,
+    "_remove_final_layer_norm": False,
+    "word_embed_proj_dim": 512,
+    "activation_function": "relu",
+}
+
+_GPT_NEOX_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "hidden_act": "gelu",
+    "intermediate_size": 1024,
+    "layer_norm_eps": 1e-5,
+    "use_parallel_residual": True,
+}
+
+_PHI_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "hidden_act": "gelu_new",
+    "tie_word_embeddings": False,
+}
+
+_PERSIMMON_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "qk_layernorm": False,
+    "layer_norm_eps": 1e-5,
+}
+
+_STARCODER2_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "hidden_act": "gelu_pytorch_tanh",
+    "norm_epsilon": 1e-5,
+    "use_bias": True,
+}
+
+_JAIS2_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "hidden_act": "relu2",
+    "layer_norm_eps": 1e-5,
+    "attention_bias": False,
+    "mlp_bias": False,
+}
+
+_OLMO_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "hidden_act": "silu",
+    "attention_bias": False,
+    "clip_qkv": None,
+}
+
+_FALCON_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "ffn_hidden_size": 1024,
+    "bias": False,
+}
+
 _TRUST_REMOTE_EAGER = {"trust_remote_code": True, "enforce_eager": True}
 _EAGER_ONLY = {"enforce_eager": True}
+_NO_REMOTE_EAGER = {"trust_remote_code": False, "enforce_eager": True}
 
 PHASE1_DISCOVERY_CASES = [
     pytest.param("Qwen/Qwen3-0.6B", None, None, id="qwen3"),
@@ -342,6 +502,198 @@ PHASE3_GENERATION_CASES = [
     ),
 ]
 
+PHASE4_DISCOVERY_CASES = [
+    pytest.param(
+        "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        _GENERIC_MOE_OVERRIDES,
+        _EAGER_ONLY,
+        id="mixtral",
+    ),
+    pytest.param(
+        "baidu/ERNIE-4.5-21B-A3B-PT",
+        _ERNIE45_MOE_OVERRIDES,
+        _EAGER_ONLY,
+        id="ernie45-moe",
+    ),
+    pytest.param(
+        "ibm/PowerMoE-3b",
+        _GRANITEMOE_OVERRIDES,
+        _EAGER_ONLY,
+        id="granitemoe",
+    ),
+    pytest.param(
+        "ibm-research/moe-7b-1b-active-shared-experts",
+        _GRANITEMOE_SHARED_OVERRIDES,
+        _EAGER_ONLY,
+        id="granitemoe-shared",
+    ),
+]
+
+PHASE4_GENERATION_CASES = [
+    pytest.param(
+        "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        _GENERIC_MOE_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="mixtral",
+    ),
+    pytest.param(
+        "ibm-research/moe-7b-1b-active-shared-experts",
+        _GRANITEMOE_SHARED_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="granitemoe-shared",
+    ),
+]
+
+PHASE5_DISCOVERY_CASES = [
+    pytest.param(
+        "LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct",
+        _EXAONE_OVERRIDES,
+        _TRUST_REMOTE_EAGER,
+        id="exaone",
+    ),
+    pytest.param(
+        "LGAI-EXAONE/EXAONE-4.0-32B",
+        _EXAONE4_OVERRIDES,
+        _EAGER_ONLY,
+        id="exaone4",
+    ),
+    pytest.param(
+        "ibm/PowerLM-3b",
+        _GRANITE_OVERRIDES,
+        _EAGER_ONLY,
+        id="granite",
+    ),
+    pytest.param(
+        "facebook/opt-350m",
+        _OPT_OVERRIDES,
+        _EAGER_ONLY,
+        id="opt",
+    ),
+    pytest.param(
+        "EleutherAI/pythia-70m",
+        _GPT_NEOX_OVERRIDES,
+        _EAGER_ONLY,
+        id="gpt-neox",
+    ),
+    pytest.param(
+        "microsoft/phi-2",
+        _PHI_OVERRIDES,
+        _EAGER_ONLY,
+        id="phi",
+    ),
+    pytest.param(
+        "adept/persimmon-8b-chat",
+        _PERSIMMON_OVERRIDES,
+        _EAGER_ONLY,
+        id="persimmon",
+    ),
+    pytest.param(
+        "bigcode/starcoder2-3b",
+        _STARCODER2_OVERRIDES,
+        _EAGER_ONLY,
+        id="starcoder2",
+    ),
+    pytest.param(
+        "inceptionai/Jais-2-8B-Chat",
+        _JAIS2_OVERRIDES,
+        _EAGER_ONLY,
+        id="jais2",
+    ),
+    pytest.param(
+        "allenai/OLMo-1B-hf",
+        _OLMO_OVERRIDES,
+        _EAGER_ONLY,
+        id="olmo",
+    ),
+    pytest.param(
+        "allenai/OLMo-2-0425-1B",
+        _SMALL_DECODER_OVERRIDES,
+        _EAGER_ONLY,
+        id="olmo2",
+    ),
+    pytest.param(
+        "tiiuae/falcon-7b",
+        _FALCON_OVERRIDES,
+        _NO_REMOTE_EAGER,
+        id="falcon",
+    ),
+]
+
+PHASE5_GENERATION_CASES = [
+    pytest.param(
+        "LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct",
+        _EXAONE_OVERRIDES,
+        _TRUST_REMOTE_EAGER,
+        500.0,
+        id="exaone",
+    ),
+    pytest.param(
+        "LGAI-EXAONE/EXAONE-4.0-32B",
+        _EXAONE4_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="exaone4",
+    ),
+    pytest.param(
+        "ibm/PowerLM-3b",
+        _GRANITE_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="granite",
+    ),
+    pytest.param(
+        "facebook/opt-350m",
+        _OPT_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="opt",
+    ),
+    pytest.param(
+        "EleutherAI/pythia-70m",
+        _GPT_NEOX_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="gpt-neox",
+    ),
+    pytest.param(
+        "microsoft/phi-2",
+        _PHI_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="phi",
+    ),
+    pytest.param(
+        "bigcode/starcoder2-3b",
+        _STARCODER2_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="starcoder2",
+    ),
+    pytest.param(
+        "inceptionai/Jais-2-8B-Chat",
+        _JAIS2_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="jais2",
+    ),
+    pytest.param(
+        "allenai/OLMo-2-0425-1B",
+        _SMALL_DECODER_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="olmo2",
+    ),
+    pytest.param(
+        "tiiuae/falcon-7b",
+        _FALCON_OVERRIDES,
+        _NO_REMOTE_EAGER,
+        500.0,
+        id="falcon",
+    ),
+]
+
 # Shorthand
 _HP = DEFAULT_HOOK_POINT.value
 _VEC_ATTR = HOOK_POINT_VECTOR_ATTR[DEFAULT_HOOK_POINT]
@@ -395,6 +747,32 @@ def _runner_kwargs(hf_overrides: dict | None,
     if extra_runner_kwargs is not None:
         kwargs.update(extra_runner_kwargs)
     return kwargs
+
+
+def _skip_if_cuda_unavailable_or_below(min_memory_gib: float,
+                                       model: str) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip(f"{model} real-weights steering test requires CUDA.")
+    total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    if total_memory_gib < min_memory_gib:
+        pytest.skip(
+            f"{model} real-weights steering test requires a GPU with at least "
+            f"{min_memory_gib:.0f} GiB of memory."
+        )
+
+
+def _maybe_skip_model_access_failure(exc: Exception, model: str) -> None:
+    if isinstance(exc, requests.exceptions.RequestException):
+        pytest.skip(f"{model} test skipped due to model download timeout/error: {exc}")
+    if isinstance(exc, OSError):
+        msg = str(exc).lower()
+        if ("gated repo" in msg or "connection error" in msg
+                or "read timeout" in msg):
+            pytest.skip(f"{model} test skipped due to model access error: {exc}")
+    if isinstance(exc, TypeError):
+        msg = str(exc)
+        if "expected str, bytes or os.PathLike object, not NoneType" in msg:
+            pytest.skip(f"{model} test skipped due to model setup issue: {exc}")
 
 
 @pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
@@ -792,6 +1170,547 @@ def test_phase3_step3p5_steering_changes_output_real_weights(
                 rel_tol=0.0,
                 abs_tol=1e-6,
             )
+
+
+@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
+                         PHASE4_DISCOVERY_CASES)
+def test_phase4_steering_layers_discovered_for_supported_families(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+) -> None:
+    """Phase-4 MoE families should expose steerable layers."""
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        with vllm_runner(model,
+                         **_runner_kwargs(hf_overrides,
+                                          extra_runner_kwargs)) as llm:
+            target_layer, hidden_size = _discover_layers(llm)
+
+            assert target_layer >= 0
+            assert hidden_size > 0
+
+
+@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs",
+                          "vector_scale"),
+                         PHASE4_GENERATION_CASES)
+def test_phase4_steering_changes_output(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+    vector_scale: float,
+) -> None:
+    """Representative phase-4 MoE families should respond to steering."""
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        prompt = "What does the fox say? " * 32
+        sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=5)
+
+        runner_kwargs = _runner_kwargs(hf_overrides, extra_runner_kwargs)
+        runner_kwargs["enable_prefix_caching"] = True
+
+        with vllm_runner(model, **runner_kwargs) as llm:
+            baseline_tokens, baseline_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert llm.llm.reset_prefix_cache()
+
+            target_layer, hidden_size = _discover_layers(llm)
+
+            vec = [vector_scale] * hidden_size
+            llm.llm.collective_rpc(
+                "set_steering_vectors",
+                kwargs={"vectors": {_HP: {target_layer: vec}}},
+            )
+
+            steered_tokens, steered_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert (
+                steered_tokens != baseline_tokens
+                or not math.isclose(
+                    steered_logprob,
+                    baseline_logprob,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+            ), (
+                f"Steering should change output or logprob for {model}"
+            )
+
+            llm.llm.collective_rpc("clear_steering_vectors")
+            assert llm.llm.reset_prefix_cache()
+
+            restored_tokens, restored_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert restored_tokens == baseline_tokens, (
+                f"Clearing steering should restore baseline for {model}"
+            )
+            assert math.isclose(
+                restored_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ), f"Clearing steering should restore baseline logprob for {model}"
+
+
+def test_phase4_mixtral_steering_changes_output_real_weights(
+    vllm_runner, monkeypatch
+) -> None:
+    """Mixtral gets a small real-weights check via the tiny HF variant."""
+    model = "TitanML/tiny-mixtral"
+    model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
+    model_info.check_available_online(on_fail="skip")
+    _skip_if_cuda_unavailable_or_below(16, "Mixtral")
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        prompt = "What does the fox say? " * 32
+        sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=5)
+
+        with vllm_runner(
+            model,
+            max_model_len=256,
+            enable_steering=True,
+            max_steering_configs=4,
+            enable_prefix_caching=True,
+            enforce_eager=True,
+        ) as llm:
+            baseline_tokens, baseline_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert llm.llm.reset_prefix_cache()
+
+            target_layer, hidden_size = _discover_layers(llm)
+
+            vec = [500.0] * hidden_size
+            llm.llm.collective_rpc(
+                "set_steering_vectors",
+                kwargs={"vectors": {_HP: {target_layer: vec}}},
+            )
+
+            steered_tokens, steered_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert (
+                steered_tokens != baseline_tokens
+                or not math.isclose(
+                    steered_logprob,
+                    baseline_logprob,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+            ), "Steering should change output or logprob for Mixtral"
+
+            llm.llm.collective_rpc("clear_steering_vectors")
+            assert llm.llm.reset_prefix_cache()
+
+            restored_tokens, restored_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert restored_tokens == baseline_tokens
+            assert math.isclose(
+                restored_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+
+
+def test_phase4_deepseek_v2_steering_changes_output_real_weights(
+    vllm_runner, monkeypatch
+) -> None:
+    """DeepSeek-V2 real-weights coverage is hardware-gated."""
+    model = "deepseek-ai/DeepSeek-V2-Lite-Chat"
+    model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
+    model_info.check_available_online(on_fail="skip")
+    _skip_if_cuda_unavailable_or_below(40, "DeepSeek-V2-Lite")
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        prompt = "What does the fox say? " * 32
+        sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=5)
+
+        with vllm_runner(
+            model,
+            max_model_len=256,
+            enable_steering=True,
+            max_steering_configs=4,
+            enable_prefix_caching=True,
+            enforce_eager=True,
+            trust_remote_code=True,
+        ) as llm:
+            baseline_tokens, baseline_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert llm.llm.reset_prefix_cache()
+
+            target_layer, hidden_size = _discover_layers(llm)
+
+            vec = [500.0] * hidden_size
+            llm.llm.collective_rpc(
+                "set_steering_vectors",
+                kwargs={"vectors": {_HP: {target_layer: vec}}},
+            )
+
+            steered_tokens, steered_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert (
+                steered_tokens != baseline_tokens
+                or not math.isclose(
+                    steered_logprob,
+                    baseline_logprob,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+            ), "Steering should change output or logprob for DeepSeek-V2-Lite"
+
+            llm.llm.collective_rpc("clear_steering_vectors")
+            assert llm.llm.reset_prefix_cache()
+
+            restored_tokens, restored_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert restored_tokens == baseline_tokens
+            assert math.isclose(
+                restored_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+
+
+def test_phase4_phimoe_steering_changes_output_real_weights(
+    vllm_runner, monkeypatch
+) -> None:
+    """PhiMoE gets real-weights coverage because the dummy path is not stable."""
+    model = "microsoft/Phi-3.5-MoE-instruct"
+    model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
+    model_info.check_available_online(on_fail="skip")
+    _skip_if_cuda_unavailable_or_below(24, "Phi-3.5-MoE")
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        prompt = "What does the fox say? " * 32
+        sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=5)
+
+        with vllm_runner(
+            model,
+            max_model_len=256,
+            enable_steering=True,
+            max_steering_configs=4,
+            enable_prefix_caching=True,
+            enforce_eager=True,
+        ) as llm:
+            baseline_tokens, baseline_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert llm.llm.reset_prefix_cache()
+
+            target_layer, hidden_size = _discover_layers(llm)
+
+            vec = [500.0] * hidden_size
+            llm.llm.collective_rpc(
+                "set_steering_vectors",
+                kwargs={"vectors": {_HP: {target_layer: vec}}},
+            )
+
+            steered_tokens, steered_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert (
+                steered_tokens != baseline_tokens
+                or not math.isclose(
+                    steered_logprob,
+                    baseline_logprob,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+            ), "Steering should change output or logprob for PhiMoE"
+
+            llm.llm.collective_rpc("clear_steering_vectors")
+            assert llm.llm.reset_prefix_cache()
+
+            restored_tokens, restored_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert restored_tokens == baseline_tokens
+            assert math.isclose(
+                restored_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+
+
+def test_phase4_glm4_moe_steering_changes_output_real_weights(
+    vllm_runner, monkeypatch
+) -> None:
+    """GLM-4.5 is covered with real weights and a hardware gate."""
+    model = "zai-org/GLM-4.5"
+    model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
+    model_info.check_available_online(on_fail="skip")
+    _skip_if_cuda_unavailable_or_below(40, "GLM-4.5")
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        prompt = "What does the fox say? " * 32
+        sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=5)
+
+        with vllm_runner(
+            model,
+            max_model_len=256,
+            enable_steering=True,
+            max_steering_configs=4,
+            enable_prefix_caching=True,
+            enforce_eager=True,
+            trust_remote_code=True,
+        ) as llm:
+            baseline_tokens, baseline_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert llm.llm.reset_prefix_cache()
+
+            target_layer, hidden_size = _discover_layers(llm)
+
+            vec = [500.0] * hidden_size
+            llm.llm.collective_rpc(
+                "set_steering_vectors",
+                kwargs={"vectors": {_HP: {target_layer: vec}}},
+            )
+
+            steered_tokens, steered_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert (
+                steered_tokens != baseline_tokens
+                or not math.isclose(
+                    steered_logprob,
+                    baseline_logprob,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+            ), "Steering should change output or logprob for GLM-4.5"
+
+            llm.llm.collective_rpc("clear_steering_vectors")
+            assert llm.llm.reset_prefix_cache()
+
+            restored_tokens, restored_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert restored_tokens == baseline_tokens
+            assert math.isclose(
+                restored_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+
+
+def test_phase4_exaone_moe_steering_changes_output_real_weights(
+    vllm_runner, monkeypatch
+) -> None:
+    """EXAONE MoE is too large for the dummy harness, so it is hardware-gated."""
+    model = "LGAI-EXAONE/K-EXAONE-236B-A23B"
+    model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
+    model_info.check_available_online(on_fail="skip")
+    _skip_if_cuda_unavailable_or_below(80, "EXAONE MoE")
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        prompt = "What does the fox say? " * 32
+        sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=5)
+
+        with vllm_runner(
+            model,
+            max_model_len=256,
+            enable_steering=True,
+            max_steering_configs=4,
+            enable_prefix_caching=True,
+            enforce_eager=True,
+            trust_remote_code=True,
+        ) as llm:
+            baseline_tokens, baseline_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert llm.llm.reset_prefix_cache()
+
+            target_layer, hidden_size = _discover_layers(llm)
+
+            vec = [500.0] * hidden_size
+            llm.llm.collective_rpc(
+                "set_steering_vectors",
+                kwargs={"vectors": {_HP: {target_layer: vec}}},
+            )
+
+            steered_tokens, steered_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert (
+                steered_tokens != baseline_tokens
+                or not math.isclose(
+                    steered_logprob,
+                    baseline_logprob,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+            ), "Steering should change output or logprob for EXAONE MoE"
+
+            llm.llm.collective_rpc("clear_steering_vectors")
+            assert llm.llm.reset_prefix_cache()
+
+            restored_tokens, restored_logprob = _gen_tokens_and_cumulative_logprob(
+                llm, prompt, sampling
+            )
+
+            assert restored_tokens == baseline_tokens
+            assert math.isclose(
+                restored_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+
+
+@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
+                         PHASE5_DISCOVERY_CASES)
+def test_phase5_steering_layers_discovered_for_supported_families(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+) -> None:
+    """Phase-5 decoder families should expose steerable layers."""
+    try:
+        model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
+        model_info.check_available_online(on_fail="skip")
+    except ValueError:
+        pass
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        try:
+            with vllm_runner(model,
+                             **_runner_kwargs(hf_overrides,
+                                              extra_runner_kwargs)) as llm:
+                target_layer, hidden_size = _discover_layers(llm)
+        except Exception as exc:
+            _maybe_skip_model_access_failure(exc, model)
+            raise
+
+        assert target_layer >= 0
+        assert hidden_size > 0
+
+
+@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs",
+                          "vector_scale"),
+                         PHASE5_GENERATION_CASES)
+def test_phase5_steering_changes_output(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+    vector_scale: float,
+) -> None:
+    """Representative phase-5 families should respond to steering."""
+    try:
+        model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
+        model_info.check_available_online(on_fail="skip")
+    except ValueError:
+        pass
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        prompt = "What does the fox say? " * 32
+        sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=5)
+
+        runner_kwargs = _runner_kwargs(hf_overrides, extra_runner_kwargs)
+        runner_kwargs["enable_prefix_caching"] = True
+
+        try:
+            with vllm_runner(model, **runner_kwargs) as llm:
+                baseline_tokens, baseline_logprob = _gen_tokens_and_cumulative_logprob(
+                    llm, prompt, sampling
+                )
+
+                assert llm.llm.reset_prefix_cache()
+
+                target_layer, hidden_size = _discover_layers(llm)
+
+                vec = [vector_scale] * hidden_size
+                llm.llm.collective_rpc(
+                    "set_steering_vectors",
+                    kwargs={"vectors": {_HP: {target_layer: vec}}},
+                )
+
+                steered_tokens, steered_logprob = _gen_tokens_and_cumulative_logprob(
+                    llm, prompt, sampling
+                )
+
+                assert (
+                    steered_tokens != baseline_tokens
+                    or not math.isclose(
+                        steered_logprob,
+                        baseline_logprob,
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                ), (
+                    f"Steering should change output or logprob for {model}"
+                )
+
+                llm.llm.collective_rpc("clear_steering_vectors")
+                assert llm.llm.reset_prefix_cache()
+
+                restored_tokens, restored_logprob = (
+                    _gen_tokens_and_cumulative_logprob(llm, prompt, sampling))
+        except Exception as exc:
+            _maybe_skip_model_access_failure(exc, model)
+            raise
+
+        assert restored_tokens == baseline_tokens, (
+            f"Clearing steering should restore baseline for {model}"
+        )
+        assert math.isclose(
+            restored_logprob,
+            baseline_logprob,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ), f"Clearing steering should restore baseline logprob for {model}"
 
 
 # ---------------------------------------------------------------------------

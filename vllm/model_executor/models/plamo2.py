@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
@@ -43,6 +44,13 @@ from vllm.model_executor.layers.mamba.ops.ssd_combined import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -646,6 +654,16 @@ class Plamo2DecoderLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         self.is_mamba = is_mamba(config, layer_idx)
         if self.is_mamba:
@@ -677,6 +695,7 @@ class Plamo2DecoderLayer(nn.Module):
             hidden_states = self.pre_mixer_norm(hidden_states)
         else:
             hidden_states, residual = self.pre_mixer_norm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         if self.is_mamba:
             # Plamo2MambaMixer writes output to this tensor
@@ -695,10 +714,16 @@ class Plamo2DecoderLayer(nn.Module):
         if self.is_mamba:
             hidden_states = output
         hidden_states = self.post_mixer_norm(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_ATTN
+        )
         # Fully Connected
         hidden_states, residual = self.pre_mlp_norm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_mlp_norm(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
         return hidden_states, residual
 
 
@@ -720,6 +745,7 @@ class Plamo2Decoder(torch.nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        share_steering_index_across_layers(self.layers)
 
     def forward(
         self,

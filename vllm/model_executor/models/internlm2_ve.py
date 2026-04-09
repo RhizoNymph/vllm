@@ -7,16 +7,23 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    register_steering_buffers,
+)
 from vllm.model_executor.models.internlm2 import (
     InternLM2Attention,
     InternLM2ForCausalLM,
     InternLM2MLP,
     InternLM2Model,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 
 
@@ -27,9 +34,18 @@ class InternLM2VEDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.attention = InternLM2Attention(
             hidden_size=self.hidden_size,
@@ -71,6 +87,7 @@ class InternLM2VEDecoderLayer(nn.Module):
             hidden_states = self.attention_norm(hidden_states)
         else:
             hidden_states, residual = self.attention_norm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.attention(
             positions=positions,
             hidden_states=hidden_states,
@@ -78,6 +95,7 @@ class InternLM2VEDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.ffn_norm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         if visual_token_mask is not None and visual_token_mask.any():
             visual_token_mask = visual_token_mask.repeat(1, self.hidden_size).bool()
             text_token_mask = ~visual_token_mask
@@ -90,6 +108,7 @@ class InternLM2VEDecoderLayer(nn.Module):
                 ).flatten()
         else:
             hidden_states = self.feed_forward(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 
 
