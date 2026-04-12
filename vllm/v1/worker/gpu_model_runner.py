@@ -3259,6 +3259,10 @@ class GPUModelRunner(
                     tuple[str, int, dict[str, dict[int, list[float]]], str]
                 ] = []
                 self._req_steering_phase: dict[str, str] = {}
+                # Tracks whether steering_index has been written with non-zero
+                # row references. Used by the no-active-state short-circuit
+                # to know if it needs to zero the index on transition.
+                self._steering_index_dirty: bool = False
 
                 # Replay any pending phase-specific global vectors that
                 # were set via set_steering_vectors() before the manager
@@ -3393,6 +3397,31 @@ class GPUModelRunner(
                     still_pending.append((d_req_id, d_hash, d_vecs, d_phase))
             self._pending_steering_registrations = still_pending
 
+        # Short-circuit when no steering state is actually active. The model
+        # runner allocates per-layer steering buffers (zero-initialized) and
+        # the forward path always calls apply_steering, but if no per-request
+        # configs are registered and no global vectors have been set, every
+        # gather hits the zero sentinel and adds nothing. There is nothing
+        # to populate.
+        #
+        # Correctness: when we previously had active steering and now don't
+        # (e.g., the last steered request just finished), the steering_index
+        # may still contain non-zero row references from the previous step.
+        # We must zero it before returning to ensure all gathers point to
+        # row 0. We only do this on the transition; in the steady "nothing
+        # ever active" case the index is already zero from initialization.
+        if (
+            not self._steering_manager.config_to_row
+            and not self._steering_manager.global_base_vectors
+            and not self._steering_manager.global_prefill_vectors
+            and not self._steering_manager.global_decode_vectors
+        ):
+            if self._steering_index_dirty:
+                any_layer = next(iter(self._steerable_layers.values()))
+                any_layer.steering_index.zero_()
+                self._steering_index_dirty = False
+            return
+
         # 1. Populate steering tables
         self._steering_manager.populate_steering_tables(self._steerable_layers)
 
@@ -3454,6 +3483,11 @@ class GPUModelRunner(
         # Zero out remaining positions
         if token_offset < steering_index.shape[0]:
             steering_index[token_offset:].zero_()
+
+        # Mark the index as having non-zero row references this step. The
+        # no-active-state short-circuit on a future step will zero the index
+        # if needed when transitioning back to "nothing active".
+        self._steering_index_dirty = True
 
     def _handle_steering_transition(
         self,
