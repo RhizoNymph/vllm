@@ -3200,6 +3200,18 @@ class GPUModelRunner(
             HOOK_POINT_TABLE_ATTR,
         )
 
+        # Short-circuit when steering is disabled.  Steerable models
+        # (e.g. Gemma3) unconditionally register per-layer steering_table
+        # buffers so the forward path can stay branch-free, but when
+        # --enable-steering is off there is no SteeringConfig and no work
+        # to do — populating tables and building the index every step is
+        # pure overhead.
+        if getattr(self.vllm_config, "steering_config", None) is None:
+            if not hasattr(self, "_steering_manager"):
+                self._steering_manager = None
+                self._steerable_layers = {}
+            return
+
         # Lazy init
         if not hasattr(self, "_steering_manager"):
             steerable: dict = {}
