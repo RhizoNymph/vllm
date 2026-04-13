@@ -68,6 +68,14 @@ class SteeringManager:
         self.global_prefill_vectors: dict[str, dict[int, torch.Tensor]] = {}
         self.global_decode_vectors: dict[str, dict[int, torch.Tensor]] = {}
 
+        # When True, populate_steering_tables() needs to run to bring the
+        # per-layer table buffers in sync with current state. Set by every
+        # state mutator (register_config new-row path, release_config
+        # refcount->0 path, update_global_vectors, clear_global_vectors);
+        # cleared at the end of populate_steering_tables. Initialized True
+        # so the first populate call always runs.
+        self._tables_dirty: bool = True
+
     def register_config(
         self,
         config_hash: int,
@@ -113,6 +121,10 @@ class SteeringManager:
                 for layer_idx, vec in layer_vecs.items()
             }
         self.config_vectors[key] = stored
+        # New row content needs to be written into the per-layer tables on
+        # the next populate call. (Refcount-hit path doesn't set this flag
+        # because the row's contents are already in the table.)
+        self._tables_dirty = True
         return row
 
     def release_config(self, config_hash: int, phase: str) -> None:
@@ -129,6 +141,10 @@ class SteeringManager:
             self.config_vectors.pop(key, None)
             del self.config_refcounts[key]
             self.free_rows.append(row)
+            # The row is now stale (no one references it), but mark dirty so
+            # if another config gets assigned to this row before the next
+            # populate, the populate runs and overwrites the stale content.
+            self._tables_dirty = True
 
     def get_row_for_config(self, config_hash: int, is_prefill: bool = False) -> int:
         """Return table row for a config.
@@ -172,12 +188,15 @@ class SteeringManager:
         if hook_point not in target:
             target[hook_point] = {}
         target[hook_point][layer_idx] = vector.clone()
+        # Global rows 1, 2 and all per-request rows depend on this state.
+        self._tables_dirty = True
 
     def clear_global_vectors(self) -> None:
         """Clear all cached global vectors across all phases and hook points."""
         self.global_base_vectors.clear()
         self.global_prefill_vectors.clear()
         self.global_decode_vectors.clear()
+        self._tables_dirty = True
 
     def _global_dict_for_phase(self, phase: str) -> dict[str, dict[int, torch.Tensor]]:
         """Return the global vector dict for the given phase."""
@@ -293,6 +312,10 @@ class SteeringManager:
                         )
                     else:
                         table[row].zero_()
+
+        # All per-layer table buffers now reflect current state. Subsequent
+        # calls can be skipped by the caller until a mutator sets dirty again.
+        self._tables_dirty = False
 
     @property
     def num_active_configs(self) -> int:

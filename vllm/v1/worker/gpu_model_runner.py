@@ -3422,8 +3422,15 @@ class GPUModelRunner(
                 self._steering_index_dirty = False
             return
 
-        # 1. Populate steering tables
-        self._steering_manager.populate_steering_tables(self._steerable_layers)
+        # 1. Populate steering tables — but only if state has changed since
+        # the last populate. populate_steering_tables() clears the flag at
+        # the end, and every state mutator (register_config new-row,
+        # release_config refcount->0, update_global_vectors,
+        # clear_global_vectors) sets it. In steady-state decode steps
+        # where no config churn happens, this skips ~102 kernel launches
+        # per step.
+        if self._steering_manager._tables_dirty:
+            self._steering_manager.populate_steering_tables(self._steerable_layers)
 
         # 2. Build steering index
         # Get the shared steering_index buffer (all layers share one tensor)
