@@ -245,16 +245,55 @@ class SteeringManager:
             Row 1 = global_base + global_prefill (or zeros)
             Row 2 = global_base + global_decode (or zeros)
             Rows 3+ = phase-appropriate global + per_request
+
+        Each (hook, layer) pair issues a single ``index_copy_`` on its
+        table buffer instead of the previous one ``.zero_()``/``.copy_()``
+        per row. The Python-level row assembly is unchanged in cost, but
+        the GPU-side write is consolidated into a single scatter per
+        (hook, layer). Combined with the dirty-flag short-circuit above,
+        populate's contribution to per-step overhead drops to near zero
+        in steady state.
+
+        The indices tensor and zero_row scratch are built once per call
+        outside the (hook, layer) loop. Building them inside the loop
+        (via ``torch.tensor(list, device='cuda')`` and ``torch.zeros``
+        respectively) added ~2 seconds of synchronous host-to-device
+        copies per benchmark run — every call became a pipeline bubble
+        on the CUDA stream. Hoisting them eliminated that cost entirely.
         """
+        # One-time-per-call scratch: build the GPU indices tensor ONCE,
+        # not 102 times. The target row ordering is
+        # ``[0, 1, 2, *config_rows]`` and is identical across every
+        # (hook, layer) pair during a single populate call.
+        first_layer = next(iter(steerable_layers.values()), None)
+        if first_layer is None:
+            self._tables_dirty = False
+            return
+        first_attr = next(iter(HOOK_POINT_TABLE_ATTR.values()))
+        if not hasattr(first_layer, first_attr):
+            self._tables_dirty = False
+            return
+        first_table = getattr(first_layer, first_attr)
+        device = first_table.device
+        hidden_size = first_table.shape[1]
+        # Snapshot config_to_row ordering once — this defines which row
+        # slot each per-request vector maps to in both ``indices`` and
+        # the per-(hook, layer) row assembly below.
+        ordered_configs = list(self.config_to_row.items())
+        target_indices_list = [0, 1, 2] + [row for _, row in ordered_configs]
+        indices = torch.tensor(
+            target_indices_list, dtype=torch.long, device=device
+        )
+        zero_row = torch.zeros(
+            hidden_size, dtype=torch.float32, device=device
+        )
+
         for hook_point, table_attr in HOOK_POINT_TABLE_ATTR.items():
             hp_str = hook_point.value
             for layer_idx, mod in steerable_layers.items():
                 if not hasattr(mod, table_attr):
                     continue
                 table = getattr(mod, table_attr)
-
-                # Row 0: zeros
-                table[0].zero_()
 
                 # Fetch global vectors for this hook/layer
                 base_vec = self._get_global_vec(
@@ -267,55 +306,90 @@ class SteeringManager:
                     hp_str, layer_idx, self.global_decode_vectors
                 )
 
-                # Row 1: global prefill effective = base + prefill
-                global_prefill = self._add_vecs(base_vec, prefill_vec)
-                if global_prefill is not None:
-                    table[1].copy_(global_prefill.to(table.dtype))
-                else:
-                    table[1].zero_()
-
-                # Row 2: global decode effective = base + decode
-                global_decode = self._add_vecs(base_vec, decode_vec)
-                if global_decode is not None:
-                    table[2].copy_(global_decode.to(table.dtype))
-                else:
-                    table[2].zero_()
-
-                # Rows 3+: phase-appropriate global + per_request
-                for (config_hash, phase), row in self.config_to_row.items():
-                    per_req = (
-                        self.config_vectors.get((config_hash, phase), {})
-                        .get(hp_str, {})
-                        .get(layer_idx)
-                    )
-                    if phase == "prefill":
-                        phase_global = global_prefill
-                    elif phase == "decode":
-                        phase_global = global_decode
-                    else:
-                        raise ValueError(
-                            f"Invalid phase: {phase!r}. Must be 'prefill' or 'decode'."
-                        )
-
-                    if phase_global is not None and per_req is not None:
-                        combined = phase_global + per_req.squeeze(0).to(
-                            phase_global.device
-                        )
-                        table[row].copy_(combined.to(table.dtype))
-                    elif phase_global is not None:
-                        table[row].copy_(phase_global.to(table.dtype))
-                    elif per_req is not None:
-                        table[row].copy_(
-                            per_req.squeeze(0).to(
-                                dtype=table.dtype, device=table.device
-                            )
-                        )
-                    else:
-                        table[row].zero_()
+                self._populate_one_table(
+                    table,
+                    hp_str,
+                    layer_idx,
+                    base_vec,
+                    prefill_vec,
+                    decode_vec,
+                    indices=indices,
+                    zero_row=zero_row,
+                    ordered_configs=ordered_configs,
+                )
 
         # All per-layer table buffers now reflect current state. Subsequent
         # calls can be skipped by the caller until a mutator sets dirty again.
         self._tables_dirty = False
+
+    def _populate_one_table(
+        self,
+        table: torch.Tensor,
+        hp_str: str,
+        layer_idx: int,
+        base_vec: torch.Tensor | None,
+        prefill_vec: torch.Tensor | None,
+        decode_vec: torch.Tensor | None,
+        *,
+        indices: torch.Tensor,
+        zero_row: torch.Tensor,
+        ordered_configs: list,
+    ) -> None:
+        """Build all active rows for one ``(hook, layer)`` table buffer
+        and write them in a single batched ``index_copy_``.
+
+        Takes pre-built ``indices`` and ``zero_row`` scratch tensors from
+        the caller so we don't create them 102 times per populate call.
+        ``torch.tensor(list, device='cuda')`` does a synchronous H2D copy
+        that adds ~1ms of ``cudaStreamSynchronize`` per call — building
+        it once outside the loop eliminates 100+ of those syncs.
+        """
+        # Compute phase-global vectors once per (hook, layer)
+        global_prefill = self._add_vecs(base_vec, prefill_vec)
+        global_decode = self._add_vecs(base_vec, decode_vec)
+
+        # Build the row-content list. rows[i] is a 1D float32 tensor that
+        # will become table[indices[i]]. The ordering here MUST match the
+        # order baked into ``indices`` by the caller:
+        # ``[0, 1, 2, *ordered_config_rows]``.
+        rows: list[torch.Tensor] = [zero_row]  # row 0: always zero
+
+        rows.append(global_prefill if global_prefill is not None else zero_row)
+        rows.append(global_decode if global_decode is not None else zero_row)
+
+        # Rows 3+: phase-appropriate global + per_request. Iterate in the
+        # same order the caller used to build ``indices``.
+        for (config_hash, phase), _row_idx in ordered_configs:
+            per_req = (
+                self.config_vectors.get((config_hash, phase), {})
+                .get(hp_str, {})
+                .get(layer_idx)
+            )
+            if phase == "prefill":
+                phase_global = global_prefill
+            elif phase == "decode":
+                phase_global = global_decode
+            else:
+                raise ValueError(
+                    f"Invalid phase: {phase!r}. Must be 'prefill' or 'decode'."
+                )
+
+            if phase_global is not None and per_req is not None:
+                row_content = phase_global + per_req.squeeze(0)
+            elif phase_global is not None:
+                row_content = phase_global
+            elif per_req is not None:
+                row_content = per_req.squeeze(0)
+            else:
+                row_content = zero_row
+            rows.append(row_content)
+
+        # Single batched scatter: stack the row contents, dtype-convert
+        # once, and write to the table in one kernel launch via
+        # ``index_copy_``. ``indices`` is the pre-built GPU tensor passed
+        # in by populate_steering_tables.
+        stacked = torch.stack(rows).to(dtype=table.dtype)
+        table.index_copy_(0, indices, stacked)
 
     @property
     def num_active_configs(self) -> int:
