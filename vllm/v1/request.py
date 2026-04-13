@@ -283,21 +283,24 @@ class Request:
 
     @cached_property
     def prefill_steering_config_hash(self) -> int:
-        """0 if no prefill steering, else deterministic hash of vectors."""
-        from vllm.config.steering_types import hash_steering_config
+        """0 if no prefill steering, else deterministic hash of vectors.
 
+        Delegates to ``SamplingParams.prefill_steering_config_hash``, which is
+        itself ``@cached_property``. This means many requests sharing the same
+        ``SamplingParams`` instance only compute the hash once across the
+        entire batch, instead of once per request.
+        """
         if self.sampling_params is None:
             return 0
-        return hash_steering_config(self.sampling_params.effective_prefill_steering)
+        return self.sampling_params.prefill_steering_config_hash
 
     @cached_property
     def decode_steering_config_hash(self) -> int:
-        """0 if no decode steering, else deterministic hash of vectors."""
-        from vllm.config.steering_types import hash_steering_config
-
+        """0 if no decode steering, else deterministic hash of vectors.
+        See ``prefill_steering_config_hash``."""
         if self.sampling_params is None:
             return 0
-        return hash_steering_config(self.sampling_params.effective_decode_steering)
+        return self.sampling_params.decode_steering_config_hash
 
     def invalidate_steering_hashes(self) -> None:
         """Clear cached steering hashes so they recompute from current

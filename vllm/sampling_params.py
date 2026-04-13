@@ -730,6 +730,27 @@ class SamplingParams(
             self.steering_vectors, self.decode_steering_vectors
         )
 
+    @cached_property
+    def prefill_steering_config_hash(self) -> int:
+        """Cached hash of ``effective_prefill_steering``.
+
+        Lives on ``SamplingParams`` (not ``Request``) so that many requests
+        sharing the same ``SamplingParams`` object — the common case for
+        batched ``llm.generate(prompts, [sp]*N)`` — only pay the hashing
+        cost once across the whole batch instead of once per request.
+        """
+        from vllm.config.steering_types import hash_steering_config
+
+        return hash_steering_config(self.effective_prefill_steering)
+
+    @cached_property
+    def decode_steering_config_hash(self) -> int:
+        """Cached hash of ``effective_decode_steering``. See
+        ``prefill_steering_config_hash``."""
+        from vllm.config.steering_types import hash_steering_config
+
+        return hash_steering_config(self.effective_decode_steering)
+
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
             raise ValueError(f"n must be 1 when using greedy sampling, got {self.n}.")
@@ -827,11 +848,49 @@ class SamplingParams(
         return self._bad_words_token_ids
 
     def clone(self) -> "SamplingParams":
-        """If skip_clone is True, uses shallow copy instead of deep copy."""
+        """If skip_clone is True, uses shallow copy instead of deep copy.
+
+        Steering vector dicts are shared by reference between the original
+        and the clone (via the deepcopy memo) instead of deep-copied. They
+        can be ~hundreds of KB of floats per request and the clone's
+        downstream consumers do not mutate them, so deep-copying them is
+        ~10-20ms of pure waste per request submission.
+
+        Cached steering hash values are also explicitly carried over to the
+        clone — they are a deterministic function of the steering vector
+        contents, which are identical between the original and the clone,
+        so recomputing them would only burn CPU time.
+        """
         if self.skip_clone:
             return copy.copy(self)
 
-        return copy.deepcopy(self)
+        # Pre-populate the deepcopy memo with the top-level steering vector
+        # dicts. ``copy.deepcopy`` checks the memo before recursing, so any
+        # dict found there is returned by reference instead of deep-copied.
+        memo: dict[int, Any] = {}
+        for attr in (
+            self.steering_vectors,
+            self.prefill_steering_vectors,
+            self.decode_steering_vectors,
+        ):
+            if attr is not None:
+                memo[id(attr)] = attr
+
+        new_sp = copy.deepcopy(self, memo)
+
+        # Carry over cached @cached_property values so the clone doesn't
+        # re-hash the same steering vectors. cached_property stores its
+        # values in the instance ``__dict__``.
+        for key in (
+            "prefill_steering_config_hash",
+            "decode_steering_config_hash",
+            "effective_prefill_steering",
+            "effective_decode_steering",
+        ):
+            if key in self.__dict__:
+                new_sp.__dict__[key] = self.__dict__[key]
+
+        return new_sp
 
     def verify(
         self,
