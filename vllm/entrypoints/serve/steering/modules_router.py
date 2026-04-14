@@ -7,7 +7,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import vllm.envs as envs
-from vllm.entrypoints.serve.steering_modules.protocol import (
+from vllm.entrypoints.serve.steering.modules_protocol import (
     RegisterSteeringModuleRequest,
     UnregisterSteeringModuleRequest,
 )
