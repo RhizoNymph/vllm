@@ -171,6 +171,14 @@ The runtime uses a two-queue priority model:
 2. **Registrations queue** (`_pending_steering_registrations`): new-request
    deferrals.  Only processed once the transitions queue is empty.
 
+A third deferral mechanism handles the lazy-init case: when the HTTP API sets
+global vectors before the `SteeringManager` has been constructed (the manager
+is lazily created on the first steering-relevant step), those vectors are
+queued on `_pending_steering_globals` at the model runner and replayed during
+manager init. This is distinct from the two queues above: those handle
+capacity exhaustion after the manager exists; `_pending_steering_globals`
+handles the case where the manager doesn't exist yet.
+
 This priority ordering ensures that requests already consuming resources get
 steering table rows before newly admitted requests that haven't started yet.
 
@@ -233,9 +241,27 @@ change.
 
 This design document reflects the v1 steering runtime. Known boundaries:
 
-- no v2 model runner integration yet
-- only Gemma 3 is wired
-- named steering configs are not implemented
+- no v2 model runner integration yet (v2 is dev-flag-gated in vllm; steering
+  integration is pending)
+- see [Activation Steering](../features/steering.md#supported-scope) for the
+  current list of wired decoder architectures
 
-The old `docs/steering/` notes remain useful as implementation history, but
-this document is intended to be the stable runtime overview.
+## Named Steering Modules (runtime)
+
+Named steering modules are pre-registered vector configurations that requests
+reference by name instead of sending vectors inline. The runtime shape is:
+
+- The registry lives on FastAPI app state
+  (`app.state.steering_module_registry`), populated either at startup via
+  `--steering-modules` or at runtime via
+  `POST /v1/steering/modules/register`. The registry implementation is in
+  `vllm/entrypoints/openai/steering/registry.py`.
+- Resolution happens in the OpenAI serving handlers
+  (`chat_completion/serving.py`, `completion/serving.py`) when a request
+  specifies `steering_name` in `extra_body`. The resolver looks up the named
+  module, merges it with any inline `steering_vectors` fields via
+  `merge_steering_specs`, and writes the merged spec back onto
+  `SamplingParams` before the request enters the scheduler.
+- The scheduler and worker do not distinguish named from inline vectors once
+  the spec is on `SamplingParams` — the rest of the runtime sees only the
+  final resolved vectors.
