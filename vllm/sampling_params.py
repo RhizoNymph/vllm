@@ -15,9 +15,16 @@ from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
-from vllm.config.steering_types import SteeringLayerEntry, SteeringVectorSpec
+from vllm.config.steering_types import (
+    SteeringLayerEntry,
+    SteeringVectorSpec,
+    hash_steering_config,
+    normalize_layer_entry,
+    resolve_effective_vectors,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.v1.serial_utils import PydanticMsgspecMixin
@@ -573,10 +580,6 @@ class SamplingParams(
                     for layer_idx, base_entry in layers.items():
                         if layer_idx not in phase_spec[hook]:
                             continue
-                        from vllm.config.steering_types import (
-                            normalize_layer_entry,
-                        )
-
                         base_vec, _ = normalize_layer_entry(base_entry)
                         phase_vec, _ = normalize_layer_entry(
                             phase_spec[hook][layer_idx]
@@ -596,8 +599,6 @@ class SamplingParams(
         # Cross-validate overlapping dimensions between prefill and decode
         # phase specs (caught even when no base ``steering_vectors`` is set).
         if self.prefill_steering_vectors and self.decode_steering_vectors:
-            from vllm.config.steering_types import normalize_layer_entry
-
             for hook, prefill_layers in self.prefill_steering_vectors.items():
                 if hook not in self.decode_steering_vectors:
                     continue
@@ -606,9 +607,7 @@ class SamplingParams(
                     if layer_idx not in decode_layers:
                         continue
                     prefill_vec, _ = normalize_layer_entry(prefill_entry)
-                    decode_vec, _ = normalize_layer_entry(
-                        decode_layers[layer_idx]
-                    )
+                    decode_vec, _ = normalize_layer_entry(decode_layers[layer_idx])
                     if len(prefill_vec) != len(decode_vec):
                         raise ValueError(
                             f"prefill_steering_vectors[{hook!r}]"
@@ -625,8 +624,6 @@ class SamplingParams(
         self, field_name: str, spec: SteeringVectorSpec
     ) -> None:
         """Validate a single steering vector spec."""
-        from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
-
         if not isinstance(spec, dict):
             raise ValueError(
                 f"{field_name} must be a dict mapping hook point "
@@ -713,8 +710,6 @@ class SamplingParams(
         self,
     ) -> dict[str, dict[int, list[float]]] | None:
         """Resolved prefill steering: base + prefill-specific, pre-scaled."""
-        from vllm.config.steering_types import resolve_effective_vectors
-
         return resolve_effective_vectors(
             self.steering_vectors, self.prefill_steering_vectors
         )
@@ -724,8 +719,6 @@ class SamplingParams(
         self,
     ) -> dict[str, dict[int, list[float]]] | None:
         """Resolved decode steering: base + decode-specific, pre-scaled."""
-        from vllm.config.steering_types import resolve_effective_vectors
-
         return resolve_effective_vectors(
             self.steering_vectors, self.decode_steering_vectors
         )
@@ -739,16 +732,12 @@ class SamplingParams(
         batched ``llm.generate(prompts, [sp]*N)`` — only pay the hashing
         cost once across the whole batch instead of once per request.
         """
-        from vllm.config.steering_types import hash_steering_config
-
         return hash_steering_config(self.effective_prefill_steering)
 
     @cached_property
     def decode_steering_config_hash(self) -> int:
         """Cached hash of ``effective_decode_steering``. See
         ``prefill_steering_config_hash``."""
-        from vllm.config.steering_types import hash_steering_config
-
         return hash_steering_config(self.effective_decode_steering)
 
     def _verify_greedy_sampling(self) -> None:
