@@ -10,24 +10,55 @@ runtime details, see [Steering Runtime Design](../design/steering_runtime.md).
 
 ## Supported Scope
 
-Steering currently supports:
+Steering is wired into the following decoder architectures:
+
+- Llama family: `llama`, `llama4`, `arcee`, `nemotron`, `nemotron_nas`,
+  `granite`, `solar`, `minicpm`, `minicpm3`, `mistral`, `apertus`
+- Qwen family: `qwen2`, `qwen3`, `qwen2_moe`, `qwen3_moe`, `qwen3_next`
+- Gemma family: `gemma`, `gemma2`, `gemma3`, `gemma3n`
+- Mixtral / MoE: `mixtral`, `phimoe`, `deepseek_v2`, `glm4_moe`,
+  `glm4_moe_lite`, `exaone_moe`, `granitemoe`, `granitemoeshared`, `dots1`,
+  `ernie45_moe`, `olmoe`, `openpangu`, `grok1`, `jais2`, `minimax_m2`,
+  `minimax_text_01`
+- GLM / ChatGLM: `glm4`
+- InternLM family: `internlm2`, `internlm2_ve`, `interns1_pro`,
+  `iquest_loopcoder`
+- Olmo family: `olmo`, `olmo2`, `olmo_hybrid`
+- Exaone family: `exaone`, `exaone4`
+- Phi family: `phi`
+- Plamo family: `plamo2`, `plamo3`
+- Step family: `step1`, `step3_text`, `step3p5`
+- Molmo family: `molmo`, `molmo2`
+- Falcon / Baichuan / Command / StableLM: `falcon`, `baichuan`, `commandr`,
+  `stablelm`
+- Other: `AXK1`, `gpt_neox`, `hyperclovax`, `opt`, `orion`, `ouro`,
+  `persimmon`, `seed_oss`, `starcoder2`
+
+End-to-end tested with real weights:
+
+- Gemma 3 (primary test target)
+- StableLM, step3p5, Mixtral, DeepSeek V2, PhiMoE, GLM4 MoE, Exaone MoE
+  (via `*_real_weights` tests in
+  `tests/models/language/generation/test_steering.py`)
+
+Other listed architectures have hook wiring and pass small-decoder fixture
+tests but have not been validated against released checkpoints.
+
+Also supported:
 
 - Global steering through HTTP endpoints
 - Per-request steering through `SamplingParams`
-- Three additive tiers:
-  - base: applied to both phases
-  - prefill-specific
-  - decode-specific
+- Three additive tiers (base / prefill-specific / decode-specific)
 - Three hook points: `pre_attn`, `post_attn`, `post_mlp`
 - Phase-aware scheduler admission for per-request steering
 - Prefix-cache separation for different prefill steering configs
 - Continuous batching
 - `torch.compile` and CUDA graph execution
-- Gemma 3
 
 Not currently supported:
 
-- v2 model runner integration
+- v2 model runner integration (dev-flag-gated in vllm main; steering
+  integration pending)
 
 ## Steering Model
 
@@ -79,8 +110,8 @@ activation that is discarded immediately afterward.
 | `post_attn` | Residual stream after attention |
 | `post_mlp` | Residual stream after MLP |
 
-For Gemma 3, these hooks are wired directly into the decoder layer forward
-path. Unused hook points are zero-valued no-ops.
+For supported models, these hooks are wired directly into each decoder
+layer's forward path. Unused hook points are zero-valued no-ops.
 
 ## Global Steering API
 
@@ -342,7 +373,8 @@ as long as the model has been wired correctly.
 
 ## Operational Limits
 
-- Gemma 3 is the only model family currently wired for steering
+- See [Supported Scope](#supported-scope) for the list of wired decoder
+  architectures
 - Global HTTP endpoints are gated behind `VLLM_SERVER_DEV_MODE=1`
 - Per-request steering requires `--enable-steering`
 - Distinct steering configs in flight are capped by `--max-steering-configs`
