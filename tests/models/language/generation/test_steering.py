@@ -18,6 +18,7 @@ from vllm.model_executor.layers.steering import (
     DEFAULT_HOOK_POINT,
     HOOK_POINT_TABLE_ATTR,
 )
+
 from ...registry import HF_EXAMPLE_MODELS
 
 MODEL = "google/gemma-3-4b-it"
@@ -734,8 +735,9 @@ def _gen_tokens_and_cumulative_logprob(llm, prompt, sampling):
     return list(output.token_ids), output.cumulative_logprob
 
 
-def _runner_kwargs(hf_overrides: dict | None,
-                   extra_runner_kwargs: dict | None = None) -> dict:
+def _runner_kwargs(
+    hf_overrides: dict | None, extra_runner_kwargs: dict | None = None
+) -> dict:
     kwargs = {
         "load_format": "dummy",
         "max_model_len": 256,
@@ -749,8 +751,7 @@ def _runner_kwargs(hf_overrides: dict | None,
     return kwargs
 
 
-def _skip_if_cuda_unavailable_or_below(min_memory_gib: float,
-                                       model: str) -> None:
+def _skip_if_cuda_unavailable_or_below(min_memory_gib: float, model: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip(f"{model} real-weights steering test requires CUDA.")
     total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
@@ -766,8 +767,7 @@ def _maybe_skip_model_access_failure(exc: Exception, model: str) -> None:
         pytest.skip(f"{model} test skipped due to model download timeout/error: {exc}")
     if isinstance(exc, OSError):
         msg = str(exc).lower()
-        if ("gated repo" in msg or "connection error" in msg
-                or "read timeout" in msg):
+        if "gated repo" in msg or "connection error" in msg or "read timeout" in msg:
             pytest.skip(f"{model} test skipped due to model access error: {exc}")
     if isinstance(exc, TypeError):
         msg = str(exc)
@@ -775,8 +775,9 @@ def _maybe_skip_model_access_failure(exc: Exception, model: str) -> None:
             pytest.skip(f"{model} test skipped due to model setup issue: {exc}")
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
-                         PHASE1_DISCOVERY_CASES)
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs"), PHASE1_DISCOVERY_CASES
+)
 def test_steering_layers_discovered_for_supported_families(
     vllm_runner,
     monkeypatch,
@@ -788,25 +789,26 @@ def test_steering_layers_discovered_for_supported_families(
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-        with vllm_runner(model,
-                         **_runner_kwargs(hf_overrides,
-                                          extra_runner_kwargs)) as llm:
+        with vllm_runner(
+            model, **_runner_kwargs(hf_overrides, extra_runner_kwargs)
+        ) as llm:
             target_layer, hidden_size = _discover_layers(llm)
 
             assert target_layer >= 0
             assert hidden_size > 0
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
-                         PHASE1_GENERATION_CASES)
-def test_phase1_steering_changes_output(
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs"), PHASE1_GENERATION_CASES
+)
+def test_steering_changes_output_qwen_and_bytedance_family(
     vllm_runner,
     monkeypatch,
     model: str,
     hf_overrides: dict | None,
     extra_runner_kwargs: dict | None,
 ) -> None:
-    """Representative phase-1 families should respond to steering."""
+    """Qwen and ByteDance decoder families should respond to steering."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
@@ -845,32 +847,36 @@ def test_phase1_steering_changes_output(
             )
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
-                         PHASE2_DISCOVERY_CASES)
-def test_phase2_steering_layers_discovered_for_supported_families(
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs"), PHASE2_DISCOVERY_CASES
+)
+def test_steering_layers_discovered_small_decoder_family(
     vllm_runner,
     monkeypatch,
     model: str,
     hf_overrides: dict | None,
     extra_runner_kwargs: dict | None,
 ) -> None:
-    """Phase-2 decoder families should expose steerable layers."""
+    """Small decoder families (baichuan, internlm2, orion, solar, stablelm,
+    nemotron, arcee, hyperclovax, glm4, grok1, commandr, openpangu) should
+    expose steerable layers."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-        with vllm_runner(model,
-                         **_runner_kwargs(hf_overrides,
-                                          extra_runner_kwargs)) as llm:
+        with vllm_runner(
+            model, **_runner_kwargs(hf_overrides, extra_runner_kwargs)
+        ) as llm:
             target_layer, hidden_size = _discover_layers(llm)
 
             assert target_layer >= 0
             assert hidden_size > 0
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs",
-                          "vector_scale"),
-                         PHASE2_GENERATION_CASES)
-def test_phase2_steering_changes_output(
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs", "vector_scale"),
+    PHASE2_GENERATION_CASES,
+)
+def test_steering_changes_output_small_decoder_family(
     vllm_runner,
     monkeypatch,
     model: str,
@@ -878,7 +884,7 @@ def test_phase2_steering_changes_output(
     extra_runner_kwargs: dict | None,
     vector_scale: float,
 ) -> None:
-    """Representative phase-2 families should respond to steering."""
+    """Small decoder families should respond to steering."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
@@ -907,17 +913,12 @@ def test_phase2_steering_changes_output(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
-            ), (
-                f"Steering should change output or logprob for {model}"
-            )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ), f"Steering should change output or logprob for {model}"
 
             llm.llm.collective_rpc("clear_steering_vectors")
             assert llm.llm.reset_prefix_cache()
@@ -937,7 +938,7 @@ def test_phase2_steering_changes_output(
             ), f"Clearing steering should restore baseline logprob for {model}"
 
 
-def test_phase2_stablelm_steering_changes_output_real_weights(
+def test_stablelm_steering_changes_output_real_weights(
     vllm_runner, monkeypatch
 ) -> None:
     """StableLM needs a real checkpoint to produce a meaningful steering signal."""
@@ -977,14 +978,11 @@ def test_phase2_stablelm_steering_changes_output_real_weights(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
             ), "Steering should change output or logprob for StableLM"
 
             llm.llm.collective_rpc("clear_steering_vectors")
@@ -1003,32 +1001,35 @@ def test_phase2_stablelm_steering_changes_output_real_weights(
             )
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
-                         PHASE3_DISCOVERY_CASES)
-def test_phase3_steering_layers_discovered_for_supported_families(
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs"), PHASE3_DISCOVERY_CASES
+)
+def test_steering_layers_discovered_apertus_minimax_family(
     vllm_runner,
     monkeypatch,
     model: str,
     hf_overrides: dict | None,
     extra_runner_kwargs: dict | None,
 ) -> None:
-    """Phase-3 norm-variant decoder families should expose steerable layers."""
+    """Apertus and MiniMax norm-variant decoder families should expose
+    steerable layers."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-        with vllm_runner(model,
-                         **_runner_kwargs(hf_overrides,
-                                          extra_runner_kwargs)) as llm:
+        with vllm_runner(
+            model, **_runner_kwargs(hf_overrides, extra_runner_kwargs)
+        ) as llm:
             target_layer, hidden_size = _discover_layers(llm)
 
             assert target_layer >= 0
             assert hidden_size > 0
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs",
-                          "vector_scale"),
-                         PHASE3_GENERATION_CASES)
-def test_phase3_steering_changes_output(
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs", "vector_scale"),
+    PHASE3_GENERATION_CASES,
+)
+def test_steering_changes_output_apertus_minimax_family(
     vllm_runner,
     monkeypatch,
     model: str,
@@ -1036,7 +1037,7 @@ def test_phase3_steering_changes_output(
     extra_runner_kwargs: dict | None,
     vector_scale: float,
 ) -> None:
-    """Representative phase-3 families should respond to steering."""
+    """Apertus and MiniMax decoder families should respond to steering."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
@@ -1065,17 +1066,12 @@ def test_phase3_steering_changes_output(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
-            ), (
-                f"Steering should change output or logprob for {model}"
-            )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ), f"Steering should change output or logprob for {model}"
 
             llm.llm.collective_rpc("clear_steering_vectors")
             assert llm.llm.reset_prefix_cache()
@@ -1095,18 +1091,14 @@ def test_phase3_steering_changes_output(
             ), f"Clearing steering should restore baseline logprob for {model}"
 
 
-def test_phase3_step3p5_steering_changes_output_real_weights(
-    vllm_runner, monkeypatch
-) -> None:
+def test_step3p5_steering_changes_output_real_weights(vllm_runner, monkeypatch) -> None:
     """Step-3.5 needs a real checkpoint for stable validation."""
     model = "stepfun-ai/Step-3.5-Flash"
     model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
     model_info.check_available_online(on_fail="skip")
     if not torch.cuda.is_available():
         pytest.skip("Step-3.5 real-weights steering test requires CUDA.")
-    total_memory_gib = (
-        torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    )
+    total_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     if total_memory_gib < 40:
         pytest.skip(
             "Step-3.5 real-weights steering test requires a GPU with at least "
@@ -1146,14 +1138,11 @@ def test_phase3_step3p5_steering_changes_output_real_weights(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
             ), "Steering should change output or logprob for Step-3.5"
 
             llm.llm.collective_rpc("clear_steering_vectors")
@@ -1172,32 +1161,35 @@ def test_phase3_step3p5_steering_changes_output_real_weights(
             )
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
-                         PHASE4_DISCOVERY_CASES)
-def test_phase4_steering_layers_discovered_for_supported_families(
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs"), PHASE4_DISCOVERY_CASES
+)
+def test_steering_layers_discovered_moe_family(
     vllm_runner,
     monkeypatch,
     model: str,
     hf_overrides: dict | None,
     extra_runner_kwargs: dict | None,
 ) -> None:
-    """Phase-4 MoE families should expose steerable layers."""
+    """MoE families (mixtral, ernie45-moe, granitemoe, granitemoe-shared)
+    should expose steerable layers."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-        with vllm_runner(model,
-                         **_runner_kwargs(hf_overrides,
-                                          extra_runner_kwargs)) as llm:
+        with vllm_runner(
+            model, **_runner_kwargs(hf_overrides, extra_runner_kwargs)
+        ) as llm:
             target_layer, hidden_size = _discover_layers(llm)
 
             assert target_layer >= 0
             assert hidden_size > 0
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs",
-                          "vector_scale"),
-                         PHASE4_GENERATION_CASES)
-def test_phase4_steering_changes_output(
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs", "vector_scale"),
+    PHASE4_GENERATION_CASES,
+)
+def test_steering_changes_output_moe_family(
     vllm_runner,
     monkeypatch,
     model: str,
@@ -1205,7 +1197,7 @@ def test_phase4_steering_changes_output(
     extra_runner_kwargs: dict | None,
     vector_scale: float,
 ) -> None:
-    """Representative phase-4 MoE families should respond to steering."""
+    """MoE families should respond to steering."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
@@ -1234,17 +1226,12 @@ def test_phase4_steering_changes_output(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
-            ), (
-                f"Steering should change output or logprob for {model}"
-            )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ), f"Steering should change output or logprob for {model}"
 
             llm.llm.collective_rpc("clear_steering_vectors")
             assert llm.llm.reset_prefix_cache()
@@ -1264,9 +1251,7 @@ def test_phase4_steering_changes_output(
             ), f"Clearing steering should restore baseline logprob for {model}"
 
 
-def test_phase4_mixtral_steering_changes_output_real_weights(
-    vllm_runner, monkeypatch
-) -> None:
+def test_mixtral_steering_changes_output_real_weights(vllm_runner, monkeypatch) -> None:
     """Mixtral gets a small real-weights check via the tiny HF variant."""
     model = "TitanML/tiny-mixtral"
     model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
@@ -1305,14 +1290,11 @@ def test_phase4_mixtral_steering_changes_output_real_weights(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
             ), "Steering should change output or logprob for Mixtral"
 
             llm.llm.collective_rpc("clear_steering_vectors")
@@ -1331,7 +1313,7 @@ def test_phase4_mixtral_steering_changes_output_real_weights(
             )
 
 
-def test_phase4_deepseek_v2_steering_changes_output_real_weights(
+def test_deepseek_v2_steering_changes_output_real_weights(
     vllm_runner, monkeypatch
 ) -> None:
     """DeepSeek-V2 real-weights coverage is hardware-gated."""
@@ -1373,14 +1355,11 @@ def test_phase4_deepseek_v2_steering_changes_output_real_weights(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
             ), "Steering should change output or logprob for DeepSeek-V2-Lite"
 
             llm.llm.collective_rpc("clear_steering_vectors")
@@ -1399,9 +1378,7 @@ def test_phase4_deepseek_v2_steering_changes_output_real_weights(
             )
 
 
-def test_phase4_phimoe_steering_changes_output_real_weights(
-    vllm_runner, monkeypatch
-) -> None:
+def test_phimoe_steering_changes_output_real_weights(vllm_runner, monkeypatch) -> None:
     """PhiMoE gets real-weights coverage because the dummy path is not stable."""
     model = "microsoft/Phi-3.5-MoE-instruct"
     model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
@@ -1440,14 +1417,11 @@ def test_phase4_phimoe_steering_changes_output_real_weights(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
             ), "Steering should change output or logprob for PhiMoE"
 
             llm.llm.collective_rpc("clear_steering_vectors")
@@ -1466,7 +1440,7 @@ def test_phase4_phimoe_steering_changes_output_real_weights(
             )
 
 
-def test_phase4_glm4_moe_steering_changes_output_real_weights(
+def test_glm4_moe_steering_changes_output_real_weights(
     vllm_runner, monkeypatch
 ) -> None:
     """GLM-4.5 is covered with real weights and a hardware gate."""
@@ -1508,14 +1482,11 @@ def test_phase4_glm4_moe_steering_changes_output_real_weights(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
             ), "Steering should change output or logprob for GLM-4.5"
 
             llm.llm.collective_rpc("clear_steering_vectors")
@@ -1534,7 +1505,7 @@ def test_phase4_glm4_moe_steering_changes_output_real_weights(
             )
 
 
-def test_phase4_exaone_moe_steering_changes_output_real_weights(
+def test_exaone_moe_steering_changes_output_real_weights(
     vllm_runner, monkeypatch
 ) -> None:
     """EXAONE MoE is too large for the dummy harness, so it is hardware-gated."""
@@ -1576,14 +1547,11 @@ def test_phase4_exaone_moe_steering_changes_output_real_weights(
                 llm, prompt, sampling
             )
 
-            assert (
-                steered_tokens != baseline_tokens
-                or not math.isclose(
-                    steered_logprob,
-                    baseline_logprob,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
+            assert steered_tokens != baseline_tokens or not math.isclose(
+                steered_logprob,
+                baseline_logprob,
+                rel_tol=0.0,
+                abs_tol=1e-6,
             ), "Steering should change output or logprob for EXAONE MoE"
 
             llm.llm.collective_rpc("clear_steering_vectors")
@@ -1602,16 +1570,19 @@ def test_phase4_exaone_moe_steering_changes_output_real_weights(
             )
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs"),
-                         PHASE5_DISCOVERY_CASES)
-def test_phase5_steering_layers_discovered_for_supported_families(
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs"), PHASE5_DISCOVERY_CASES
+)
+def test_steering_layers_discovered_legacy_decoder_family(
     vllm_runner,
     monkeypatch,
     model: str,
     hf_overrides: dict | None,
     extra_runner_kwargs: dict | None,
 ) -> None:
-    """Phase-5 decoder families should expose steerable layers."""
+    """Legacy decoder families (exaone, granite, opt, gpt-neox, phi,
+    persimmon, starcoder2, jais2, olmo, olmo2, falcon) should expose
+    steerable layers."""
     try:
         model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
         model_info.check_available_online(on_fail="skip")
@@ -1622,9 +1593,9 @@ def test_phase5_steering_layers_discovered_for_supported_families(
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
         try:
-            with vllm_runner(model,
-                             **_runner_kwargs(hf_overrides,
-                                              extra_runner_kwargs)) as llm:
+            with vllm_runner(
+                model, **_runner_kwargs(hf_overrides, extra_runner_kwargs)
+            ) as llm:
                 target_layer, hidden_size = _discover_layers(llm)
         except Exception as exc:
             _maybe_skip_model_access_failure(exc, model)
@@ -1634,10 +1605,11 @@ def test_phase5_steering_layers_discovered_for_supported_families(
         assert hidden_size > 0
 
 
-@pytest.mark.parametrize(("model", "hf_overrides", "extra_runner_kwargs",
-                          "vector_scale"),
-                         PHASE5_GENERATION_CASES)
-def test_phase5_steering_changes_output(
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs", "vector_scale"),
+    PHASE5_GENERATION_CASES,
+)
+def test_steering_changes_output_legacy_decoder_family(
     vllm_runner,
     monkeypatch,
     model: str,
@@ -1645,7 +1617,7 @@ def test_phase5_steering_changes_output(
     extra_runner_kwargs: dict | None,
     vector_scale: float,
 ) -> None:
-    """Representative phase-5 families should respond to steering."""
+    """Legacy decoder families should respond to steering."""
     try:
         model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
         model_info.check_available_online(on_fail="skip")
@@ -1681,23 +1653,19 @@ def test_phase5_steering_changes_output(
                     llm, prompt, sampling
                 )
 
-                assert (
-                    steered_tokens != baseline_tokens
-                    or not math.isclose(
-                        steered_logprob,
-                        baseline_logprob,
-                        rel_tol=0.0,
-                        abs_tol=1e-6,
-                    )
-                ), (
-                    f"Steering should change output or logprob for {model}"
-                )
+                assert steered_tokens != baseline_tokens or not math.isclose(
+                    steered_logprob,
+                    baseline_logprob,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ), f"Steering should change output or logprob for {model}"
 
                 llm.llm.collective_rpc("clear_steering_vectors")
                 assert llm.llm.reset_prefix_cache()
 
-                restored_tokens, restored_logprob = (
-                    _gen_tokens_and_cumulative_logprob(llm, prompt, sampling))
+                restored_tokens, restored_logprob = _gen_tokens_and_cumulative_logprob(
+                    llm, prompt, sampling
+                )
         except Exception as exc:
             _maybe_skip_model_access_failure(exc, model)
             raise
