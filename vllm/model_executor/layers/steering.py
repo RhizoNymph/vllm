@@ -13,6 +13,7 @@ from enum import Enum
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -96,6 +97,7 @@ def apply_layer_steering(
     hook_point: SteeringHookPoint,
 ) -> torch.Tensor:
     """Apply the steering table for ``hook_point`` to ``hidden_states``."""
+    maybe_capture_residual(hidden_states, module.layer_idx, hook_point.value)
     return torch.ops.vllm.apply_steering(
         hidden_states,
         getattr(module, HOOK_POINT_TABLE_ATTR[hook_point]),
