@@ -9,12 +9,16 @@ reading the live buffer values rather than baked-in constants.
 """
 
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.utils.torch_utils import direct_register_custom_op
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 class SteeringHookPoint(str, Enum):
