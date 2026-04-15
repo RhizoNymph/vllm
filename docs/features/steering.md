@@ -14,12 +14,13 @@ Steering is wired into the following decoder architectures:
 
 - Llama family: `llama`, `llama4`, `arcee`, `nemotron`, `nemotron_nas`,
   `granite`, `solar`, `minicpm`, `minicpm3`, `mistral`, `apertus`
-- Qwen family: `qwen2`, `qwen3`, `qwen2_moe`, `qwen3_moe`, `qwen3_next`
-- Gemma family: `gemma`, `gemma2`, `gemma3`, `gemma3n`
+- Qwen family: `qwen2`, `qwen3`, `qwen2_moe`, `qwen3_moe`, `qwen3_next`,
+  `qwen3_5`
+- Gemma family: `gemma`, `gemma2`, `gemma3`, `gemma3n`, `gemma4`
 - Mixtral / MoE: `mixtral`, `phimoe`, `deepseek_v2`, `glm4_moe`,
   `glm4_moe_lite`, `exaone_moe`, `granitemoe`, `granitemoeshared`, `dots1`,
   `ernie45_moe`, `olmoe`, `openpangu`, `grok1`, `jais2`, `minimax_m2`,
-  `minimax_text_01`
+  `minimax_text_01`, `arctic`, `param2moe`, `flex_olmo`
 - GLM / ChatGLM: `glm4`
 - InternLM family: `internlm2`, `internlm2_ve`, `interns1_pro`,
   `iquest_loopcoder`
@@ -32,7 +33,7 @@ Steering is wired into the following decoder architectures:
 - Falcon / Baichuan / Command / StableLM: `falcon`, `baichuan`, `commandr`,
   `stablelm`
 - Other: `AXK1`, `gpt_neox`, `hyperclovax`, `opt`, `orion`, `ouro`,
-  `persimmon`, `seed_oss`, `starcoder2`
+  `persimmon`, `seed_oss`, `starcoder2`, `hunyuan_v1`, `mimo_v2_flash`
 
 End-to-end tested with real weights:
 
