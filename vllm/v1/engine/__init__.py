@@ -10,6 +10,7 @@ import msgspec
 import numpy as np
 import torch
 
+from vllm.config.activation_storing_types import CaptureResult
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -153,6 +154,12 @@ class EngineCoreOutput(
 
     finish_reason: FinishReason | None = None
     stop_reason: int | str | None = None
+    # Per-request activation capture result, populated on the step the
+    # request finalizes (for any finish reason). ``None`` for every other
+    # step and for requests that never opted into activation storing.
+    # Phase 5 threads this onto ``RequestOutput.activation_storage`` from
+    # the output processor.
+    capture_result: CaptureResult | None = None
     events: list[EngineCoreEvent] | None = None
     kv_transfer_params: dict[str, Any] | None = None
 

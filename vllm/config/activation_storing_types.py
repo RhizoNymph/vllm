@@ -18,7 +18,7 @@ manager uses the resolved values to build per-step capture plans.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 # ---------------------------------------------------------------------------
@@ -451,3 +451,37 @@ class ActivationStoringSpec:
                 f"({sorted(VALID_POSITION_KINDS)}) or a list of ints, "
                 f"got {type(self.positions).__name__}"
             )
+
+
+# ---------------------------------------------------------------------------
+# CaptureResult
+# ---------------------------------------------------------------------------
+
+
+# ``CaptureStatus`` is the terminal status bubbled back to the API client in
+# ``RequestOutput.activation_storage``.  It is set by Phase 4's
+# finalize-request path (writer success / writer partial failure /
+# admission-time error) or by Phase 5's OpenAI entrypoint for the
+# ``"not_requested"`` cold-path case.
+CaptureStatus = Literal["ok", "partial_error", "error", "not_requested"]
+
+
+@dataclass
+class CaptureResult:
+    """Terminal per-request capture status, threaded back to the client.
+
+    Pure pointer: the bytes live on the filesystem, and ``paths`` holds the
+    final ``.bin`` / ``.json`` targets that were written (or attempted).
+    See the spec in ``docs/features/activation_storing.md`` for the
+    definition of each status.
+
+    Phase 4 constructs this inside the model runner after finalization and
+    drains it onto ``ModelRunnerOutput.capture_results``; Phase 5 surfaces
+    it onto ``RequestOutput.activation_storage``. Torch-free on purpose —
+    this object rides through the engine-core IPC boundary alongside
+    text-generation outputs.
+    """
+
+    status: CaptureStatus
+    error: str | None = None
+    paths: list[str] = field(default_factory=list)
