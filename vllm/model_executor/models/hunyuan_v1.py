@@ -495,6 +495,7 @@ class HunYuanDecoderLayer(nn.Module):
         super().__init__()
         assert layer_id >= 0
         self.layer_id = layer_id
+        self.layer_idx = layer_id
         self.hidden_size = config.hidden_size
         max_steering_tokens, max_steering_configs = get_steering_buffer_config(
             vllm_config

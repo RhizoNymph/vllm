@@ -31,6 +31,7 @@ from vllm.model_executor.layers.steering import (
     register_steering_buffers,
 )
 from vllm.model_executor.models.olmoe import OlmoeAttention, OlmoeForCausalLM
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.transformers_utils.configs.flex_olmo import FlexOlmoConfig
 
 logger = init_logger(__name__)
@@ -116,6 +117,7 @@ class FlexOlmoDecoderLayer(nn.Module):
         super().__init__()
         hf_config = vllm_config.model_config.hf_config
         assert isinstance(hf_config, FlexOlmoConfig)
+        self.layer_idx = extract_layer_index(prefix)
         max_steering_tokens, max_steering_configs = get_steering_buffer_config(
             vllm_config
         )

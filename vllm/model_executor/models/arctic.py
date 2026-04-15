@@ -321,6 +321,7 @@ class ArcticDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
         is_moe_layer = (layer_idx + 1) % config.moe_layer_frequency == 0
         self.use_residual = config.use_residual and is_moe_layer
         max_steering_tokens, max_steering_configs = get_steering_buffer_config(

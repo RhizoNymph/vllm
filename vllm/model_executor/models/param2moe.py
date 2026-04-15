@@ -438,6 +438,7 @@ class Param2MoEDecoderLayer(nn.Module):
         hidden_size = config.hidden_size
         # Derive the layer index from the prefix (e.g. "model.layers.3")
         layer_idx = int(prefix.split(".")[-1])
+        self.layer_idx = layer_idx
         max_steering_tokens, max_steering_configs = get_steering_buffer_config(
             vllm_config
         )
