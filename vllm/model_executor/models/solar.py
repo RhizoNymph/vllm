@@ -267,7 +267,9 @@ class SolarDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 

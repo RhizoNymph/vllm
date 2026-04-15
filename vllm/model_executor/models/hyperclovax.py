@@ -308,12 +308,14 @@ class HyperCLOVAXDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         hidden_states = self.mlp(hidden_states)
 
         # Custom ln
         if self.use_post_norm:
             hidden_states = self.post_norm2(hidden_states)
 
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         # The residual is added outside the layernorm function to apply muP.
         hidden_states = residual + hidden_states * self.residual_multiplier  # muP
         hidden_states = apply_layer_steering(

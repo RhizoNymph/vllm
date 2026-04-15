@@ -567,10 +567,12 @@ class Step3p5DecoderLayer(nn.Module):
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.post_attention_layernorm(hidden_states)
 
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         if self.use_moe:
             ffn_output = self.moe(hidden_states)
         else:
             ffn_output = self.mlp(hidden_states)
+        ffn_output = apply_layer_steering(self, ffn_output, SteeringHookPoint.MLP_OUT)
         hidden_states = ffn_output + residual
         hidden_states = apply_layer_steering(
             self, hidden_states, SteeringHookPoint.POST_MLP

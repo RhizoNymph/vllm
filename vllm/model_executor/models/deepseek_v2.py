@@ -1144,6 +1144,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
@@ -1153,6 +1154,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             # The scaling of DeepseekV2MOE output would be done in the forward
             # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
 
         return hidden_states, residual

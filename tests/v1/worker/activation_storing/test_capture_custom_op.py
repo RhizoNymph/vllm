@@ -94,6 +94,37 @@ def test_op_registered():
     assert out.shape == hidden.shape
 
 
+def test_hook_name_id_mapping_covers_all_hook_points():
+    # Pin the full set of hook names the capture op understands. This
+    # must stay in lockstep with ``SteeringHookPoint`` and
+    # ``VALID_ACTIVATION_HOOK_NAMES``; the custom op encodes the name
+    # as an int, so any drift would break the op dispatch silently.
+    assert set(_HOOK_NAME_TO_ID.keys()) == {
+        "pre_attn",
+        "post_attn",
+        "post_mlp",
+        "mlp_in",
+        "mlp_out",
+    }
+    # IDs must be dense starting at 0 and unique.
+    assert sorted(_HOOK_NAME_TO_ID.values()) == list(range(len(_HOOK_NAME_TO_ID)))
+
+
+def test_op_dispatches_all_hook_ids_round_trip_when_active(fake_manager):
+    # Every known hook id must round-trip through the op, reach the
+    # manager's ``on_hook``, and land there with the correct
+    # string name. Regression guard against ``_HOOK_ID_TO_NAME``
+    # drifting from ``_HOOK_NAME_TO_ID``.
+    hidden = torch.randn((2, HIDDEN_SIZE), dtype=torch.float32)
+    for hook_name, hook_id in _HOOK_NAME_TO_ID.items():
+        fake_manager.on_hook.reset_mock()
+        ac_module._capture_residual_impl(hidden, 3, hook_id)
+        fake_manager.on_hook.assert_called_once()
+        call_args = fake_manager.on_hook.call_args
+        assert call_args.args[0] == 3
+        assert call_args.args[1] == hook_name
+
+
 # ---------------------------------------------------------------------------
 # 2. Fake impl returns empty_like
 # ---------------------------------------------------------------------------

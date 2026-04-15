@@ -718,6 +718,7 @@ class AXK1DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         hidden_states = self.mlp(hidden_states)
 
         if self.is_layer_sparse:
@@ -730,6 +731,7 @@ class AXK1DecoderLayer(nn.Module):
             # The scaling of AXK1MOE output would be done in the forward
             # of AXK1MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
 
         return hidden_states, residual

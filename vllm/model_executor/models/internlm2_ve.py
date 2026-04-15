@@ -96,6 +96,7 @@ class InternLM2VEDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.ffn_norm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         if visual_token_mask is not None and visual_token_mask.any():
             visual_token_mask = visual_token_mask.repeat(1, self.hidden_size).bool()
             text_token_mask = ~visual_token_mask
@@ -108,6 +109,7 @@ class InternLM2VEDecoderLayer(nn.Module):
                 ).flatten()
         else:
             hidden_states = self.feed_forward(hidden_states)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 

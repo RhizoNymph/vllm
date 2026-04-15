@@ -365,7 +365,11 @@ class FalconDecoderLayer(nn.Module):
             mlp_layernorm_out = attention_layernorm_out
 
         # MLP.
+        mlp_layernorm_out = apply_layer_steering(
+            self, mlp_layernorm_out, SteeringHookPoint.MLP_IN
+        )
         mlp_output, mlp_bias = self.mlp(mlp_layernorm_out)
+        mlp_output = apply_layer_steering(self, mlp_output, SteeringHookPoint.MLP_OUT)
         if self.reduce_row_parallel_results and mlp_bias is not None:
             mlp_output += mlp_bias
 
