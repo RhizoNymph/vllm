@@ -14,6 +14,7 @@ from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnota
 from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
+from vllm.config.activation_storing_types import ActivationStoringSpec
 from vllm.config.steering_types import SteeringVectorSpec
 from vllm.config.utils import replace
 from vllm.entrypoints.chat_utils import (
@@ -50,6 +51,39 @@ logger = init_logger(__name__)
 
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+
+
+class ActivationStorageResponse(OpenAIBaseModel):
+    """Per-request activation storing result surfaced on the API response.
+
+    Exposed alongside the chat/completion response body when the request
+    included an ``activation_storing`` spec. The bytes are NEVER inlined
+    in the HTTP response; only the pointer (``paths``), ``status``, and an
+    optional ``error`` string are returned. Actual activation data lives
+    on the server-side filesystem root configured via
+    ``--activation-storing``.
+
+    Fields:
+
+    - ``status``: one of
+      - ``"ok"`` - all writes completed successfully.
+      - ``"partial_error"`` - some writes succeeded, some failed. ``error``
+        describes the first failure. Partial ``.tmp`` files remain on disk
+        for inspection.
+      - ``"error"`` - capture failed before any bytes were written. Text
+        generation still succeeded; the HTTP response is not downgraded.
+      - ``"not_requested"`` - request did not include ``activation_storing``.
+    - ``error``: first error message, or ``None``.
+    - ``paths``: list of absolute paths written. Usually one ``.bin`` +
+      one ``.json`` per ``(layer, hook)`` pair.
+
+    See ``docs/features/activation_storing.md`` for the path layout and
+    sidecar schema.
+    """
+
+    status: Literal["ok", "partial_error", "error", "not_requested"]
+    error: str | None = None
+    paths: list[str] = Field(default_factory=list)
 
 
 class ChatMessage(OpenAIBaseModel):
@@ -111,6 +145,15 @@ class ChatCompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    activation_storage: ActivationStorageResponse | None = Field(
+        default=None,
+        description=(
+            "Per-request activation storing result. Populated when the "
+            "request included an ``activation_storing`` spec; otherwise "
+            "omitted. The bytes themselves are never inlined here - only "
+            "the on-disk paths and a status pointer."
+        ),
+    )
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -132,6 +175,19 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     usage: UsageInfo | None = Field(default=None)
     # not part of the OpenAI spec but for tracing the tokens
     prompt_token_ids: list[int] | None = None
+    # vLLM-specific: per-request activation storing pointer. Placed as a
+    # sibling of ``usage`` (rather than inside it) so adding this field
+    # does not change the schema of ``UsageInfo`` for other consumers.
+    # Only populated on the final SSE frame when the originating request
+    # included an ``activation_storing`` spec.
+    activation_storage: ActivationStorageResponse | None = Field(
+        default=None,
+        description=(
+            "Per-request activation storing result, sent on the final SSE "
+            "frame alongside the final usage block. See "
+            "``ActivationStorageResponse`` for semantics."
+        ),
+    )
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -383,6 +439,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "composed with any inline steering vector fields.",
     )
 
+    activation_storing: ActivationStoringSpec | None = Field(
+        default=None,
+        description=(
+            "Per-request activation storing spec. When set, the server "
+            "captures residual-stream activations at the requested "
+            "``(layer, hook, position)`` tuples and writes them to the "
+            "filesystem root configured via ``--activation-storing``. The "
+            "HTTP response carries a small ``activation_storage`` pointer "
+            "(paths written, status, optional error) - never the bytes. "
+            "Rejected with HTTP 400 when the server was not started with "
+            "``--activation-storing`` or when the spec violates an "
+            "admission-time invariant (unknown layer, byte budget, "
+            "prefix-cache position, etc.)."
+        ),
+    )
+
     # --8<-- [end:chat-completion-extra-params]
 
     def build_chat_params(
@@ -518,7 +590,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        return SamplingParams.from_optional(
+        sampling_params = SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
@@ -553,6 +625,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             prefill_steering_vectors=self.prefill_steering_vectors,
             decode_steering_vectors=self.decode_steering_vectors,
         )
+        # Attach the activation_storing spec on the sampling params after
+        # construction. ``SamplingParams.from_optional`` does not accept
+        # this field (phase 1 reserved the slot on ``SamplingParams`` but
+        # did not widen ``from_optional``'s signature). Setting it here
+        # keeps the phase 5 edit scoped to entrypoint files.
+        sampling_params.activation_storing = self.activation_storing
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
