@@ -1154,6 +1154,22 @@ class EngineArgs:
             "--specialize-active-lora", **lora_kwargs["specialize_active_lora"]
         )
 
+        # Steering related configs
+        steering_kwargs = get_kwargs(SteeringConfig)
+        steering_group = parser.add_argument_group(
+            title="SteeringConfig",
+            description=SteeringConfig.__doc__,
+        )
+        steering_group.add_argument(
+            "--enable-steering",
+            action=argparse.BooleanOptionalAction,
+            help="If True, enable per-request activation steering.",
+        )
+        steering_group.add_argument(
+            "--max-steering-configs",
+            **steering_kwargs["max_steering_configs"],
+        )
+
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
         observability_group = parser.add_argument_group(
