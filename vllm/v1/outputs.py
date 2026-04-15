@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.config.activation_storing_types import CaptureResult
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -252,6 +253,15 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # req_id -> terminal activation capture result.  Only populated by the
+    # model runner for requests whose ``SamplingParams.activation_storing``
+    # was set and whose finalize fired on this step.  Phase 4 drains
+    # :class:`vllm.model_executor.layers.activation_capture.ActivationCaptureManager`
+    # pending finalize results into this dict on each forward; the engine
+    # core process then threads them through ``EngineCoreOutput`` to the
+    # output processor, which surfaces them on ``RequestOutput``.
+    capture_results: dict[str, CaptureResult] = field(default_factory=dict)
 
 
 # ModelRunnerOutput wrapper for async scheduling.

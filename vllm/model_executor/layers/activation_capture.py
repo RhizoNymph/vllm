@@ -27,17 +27,25 @@ ships the plumbing and exercises it via direct CPU unit tests.
 
 from __future__ import annotations
 
+import datetime
+import pathlib
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.config.activation_storing_types import resolve_positions
+from vllm.config.activation_storing_types import CaptureResult, resolve_positions
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.activation_storing_validation import (
         ResolvedActivationStoringSpec,
+    )
+    from vllm.v1.worker.activation_writer import (
+        ActivationWriter,
+        CaptureKey,
+        WriteResult,
     )
 
 
@@ -198,6 +206,17 @@ class _RequestCaptureState:
     produced at least one entry for this request. It is used for the
     ``step_index`` field on :class:`CapturePositionEntry`, which Phase 4
     uses to preserve append ordering across decode steps.
+
+    Sidecar provenance fields (``request_id_slug`` / ``tag_slug`` /
+    ``model_name`` / ``model_dtype_str`` / ``element_size_bytes`` /
+    ``vllm_internal_request_id`` / ``prompt_token_ids`` / ``created_at``)
+    are captured at admission time so :meth:`finalize_request` can
+    assemble the sidecar without reaching back into runner state.
+    ``captured_positions`` accumulates the absolute logical indices that
+    have actually been routed into scratch (one list per
+    ``(layer, hook)`` key) so the sidecar reflects the real rows that
+    were written — not whatever the spec asked for, which may diverge in
+    ``"all_generated"``/``"all"`` modes if the request is cut short.
     """
 
     request_id: str
@@ -207,6 +226,19 @@ class _RequestCaptureState:
     num_prompt_tokens: int
     error: str | None = None
     steps_seen: int = 0
+
+    # Phase 4 additive fields ------------------------------------------------
+    request_id_slug: str = ""
+    tag_slug: str = ""
+    model_name: str = ""
+    model_dtype_str: str = ""
+    element_size_bytes: int = 0
+    vllm_internal_request_id: str = ""
+    prompt_token_ids: list[int] = field(default_factory=list)
+    created_at: str = ""
+    generated_token_ids: list[int] = field(default_factory=list)
+    # (layer, hook) -> absolute positions captured so far, in row order.
+    captured_positions: dict[tuple[int, str], list[int]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +286,13 @@ class ActivationCaptureManager:
         self._device = torch.device(device) if isinstance(device, str) else device
         self._requests: dict[str, _RequestCaptureState] = {}
         self._step_plan: StepCapturePlan | None = None
+        # Terminal per-request errors populated by the runner at
+        # admission time (e.g., ``ActivationStoringValidationError``).
+        # When set, ``finalize_request`` returns a ``CaptureResult`` with
+        # ``status="error"`` and the stored message, without touching
+        # the writer. Keys are request ids; values are human-readable
+        # strings.
+        self._request_errors: dict[str, str] = {}
 
     # ------------------------------------------------------------------ props
 
@@ -284,6 +323,12 @@ class ActivationCaptureManager:
         req_id: str,
         resolved_spec: ResolvedActivationStoringSpec,
         num_prompt_tokens: int,
+        *,
+        model_name: str = "",
+        model_dtype_str: str = "",
+        element_size_bytes: int = 0,
+        vllm_internal_request_id: str = "",
+        prompt_token_ids: list[int] | None = None,
     ) -> None:
         """Admit a new request for capture.
 
@@ -292,6 +337,12 @@ class ActivationCaptureManager:
         validator has already resolved hooks + positions, so this path
         is pure bookkeeping. Idempotent re-registration is rejected to
         catch runner bugs early.
+
+        Phase 4 passes the sidecar-provenance fields (``model_name``,
+        ``model_dtype_str``, ``element_size_bytes``,
+        ``vllm_internal_request_id``, ``prompt_token_ids``) so the
+        manager can assemble the ``.json`` sidecar on
+        :meth:`finalize_request` without reaching back into runner state.
         """
         if req_id in self._requests:
             raise ValueError(
@@ -342,6 +393,14 @@ class ActivationCaptureManager:
             position_kind=resolved_spec.position_kind,
             static_positions=static_positions,
             num_prompt_tokens=num_prompt_tokens,
+            request_id_slug=resolved_spec.request_id_slug,
+            tag_slug=resolved_spec.tag_slug,
+            model_name=model_name,
+            model_dtype_str=model_dtype_str,
+            element_size_bytes=element_size_bytes,
+            vllm_internal_request_id=vllm_internal_request_id or req_id,
+            prompt_token_ids=list(prompt_token_ids or []),
+            created_at=_utc_now_iso(),
         )
         self._requests[req_id] = state
 
@@ -575,6 +634,209 @@ class ActivationCaptureManager:
             gathered = gathered.to(target_dtype)
         plan.scratch_gpu[key] = gathered
 
+    # -------------------------------------------------- admission/step errors
+
+    def has_request(self, req_id: str) -> bool:
+        """Return ``True`` if the manager knows about ``req_id`` at all.
+
+        Accounts for both normal registration and admission-time errors
+        recorded via :meth:`record_request_error`. Used by Phase 4's
+        finalize step to decide whether to emit a terminal
+        :class:`CaptureResult` or silently skip the request.
+        """
+        return req_id in self._requests or req_id in self._request_errors
+
+    def record_request_error(self, req_id: str, message: str) -> None:
+        """Record a terminal per-request error surfaced outside planning.
+
+        Phase 4 calls this when
+        :class:`vllm.entrypoints.openai.activation_storing_validation.ActivationStoringValidationError`
+        (or any other admission failure) fires for a request whose
+        ``SamplingParams.activation_storing`` was set. The request is
+        left unregistered so ``build_step_plan`` skips it entirely;
+        :meth:`finalize_request` materializes the error as
+        ``CaptureResult.status == "error"`` with this message.
+        """
+        if req_id in self._requests:
+            # Already registered: surface the error via the request
+            # state so it also flows through ``build_step_plan``'s
+            # request_errors channel.
+            self._requests[req_id].error = message
+        self._request_errors[req_id] = message
+
+    def record_generated_token_ids(
+        self, req_id: str, generated_token_ids: list[int]
+    ) -> None:
+        """Snapshot the request's final generated token list for the sidecar.
+
+        Called by Phase 4 during finalization (when the scheduler reports
+        a finished request) so the sidecar can echo the real generated
+        stream rather than reconstruct it from partial state. Silent
+        no-op for requests the manager never saw.
+        """
+        state = self._requests.get(req_id)
+        if state is not None:
+            state.generated_token_ids = list(generated_token_ids)
+
+    def get_request_path_info(
+        self, req_id: str
+    ) -> tuple[str, str, str] | None:
+        """Return ``(tag_slug, request_id_slug, model_dtype_str)`` or ``None``.
+
+        Used by Phase 4's finalize-step drain to compute per-chunk
+        ``.bin`` paths without reaching into the manager's private
+        state. ``None`` means the request was never registered (e.g.,
+        admission error; its chunks should be dropped not written).
+        """
+        state = self._requests.get(req_id)
+        if state is None:
+            return None
+        return (state.tag_slug, state.request_id_slug, state.model_dtype_str)
+
+    def record_captured_rows(
+        self,
+        req_id: str,
+        layer_idx: int,
+        hook_name: str,
+        positions: list[int],
+    ) -> None:
+        """Append newly-written rows' logical positions to the sidecar log.
+
+        Phase 4's finalize step walks ``StepCapturePlan.entries`` to
+        compute per-``(req_id, layer, hook)`` row chunks and calls this
+        method once per chunk in step / row order. The manager stores
+        them so :meth:`finalize_request` can bake the real set of
+        positions into the sidecar ``positions`` field.
+        """
+        state = self._requests.get(req_id)
+        if state is None or not positions:
+            return
+        key = (layer_idx, hook_name)
+        state.captured_positions.setdefault(key, []).extend(positions)
+
+    # ---------------------------------------------------------- finalization
+
+    def finalize_request(
+        self,
+        req_id: str,
+        *,
+        writer: "ActivationWriter | None" = None,
+        root: pathlib.Path | None = None,
+    ) -> CaptureResult:
+        """Assemble the sidecar payloads, submit finalize tasks, return status.
+
+        Phase 4 calls this from ``_update_states`` once the scheduler
+        reports that ``req_id`` has finished. The sequence is:
+
+        1. If the request was never registered and has an error recorded
+           via :meth:`record_request_error` (admission-time failure),
+           return a terminal ``CaptureResult.status == "error"`` and
+           clear any stored state. No writer traffic.
+        2. If the request has no recorded error but was never registered,
+           return ``CaptureResult.status == "error"`` with a generic
+           message (``"request was never registered"``) — this is a
+           runner bug, not normal flow.
+        3. Otherwise, for each ``(hook, layer)`` in ``resolved_hooks``,
+           build a :class:`~vllm.v1.worker.activation_writer.FinalizeTask`
+           with the sidecar dict and submit it. Writer failures during
+           submit are recorded against the result and converted to
+           ``status == "partial_error"``.
+        4. Drain the request state from the manager's internal dict
+           before returning so the next forward step doesn't see it.
+
+        The method does **not** synchronously wait for writer threads to
+        finalize. Spec invariant 6 is maintained by the writer's own
+        atomic rename logic: the returned ``CaptureResult`` tells the
+        caller what paths *will* exist (or did, for the
+        ``partial_error`` case), not that the bytes are visible yet.
+        """
+        state = self._requests.pop(req_id, None)
+        stored_error = self._request_errors.pop(req_id, None)
+
+        if state is None:
+            # Admission failure or spurious finalize: no scratch to
+            # flush, just report.
+            msg = stored_error or (
+                f"activation capture request {req_id!r} was never registered"
+            )
+            return CaptureResult(status="error", error=msg, paths=[])
+
+        # A registration that later hit a runtime error (step_plan
+        # surfaced something unusual) shows up on ``state.error``.
+        # Treat it the same as an admission failure: no writer traffic.
+        if state.error is not None and not state.captured_positions:
+            return CaptureResult(status="error", error=state.error, paths=[])
+
+        paths: list[str] = []
+        submit_errors: list[str] = []
+
+        if writer is None or root is None:
+            # Runner is configured without a writer (cold path or
+            # test fixture). Nothing to do beyond returning a clean
+            # result. Spec invariant 6 is vacuous here.
+            return CaptureResult(status="ok", error=None, paths=[])
+
+        # Import the writer types lazily so importing this module
+        # without a running Phase 2 writer stays cheap. The runner
+        # always has them available; tests may not.
+        from vllm.v1.worker.activation_writer import FinalizeTask, WriteError
+
+        # Build one FinalizeTask per (layer, hook). We walk
+        # resolved_hooks (rather than captured_positions) so that even
+        # zero-row captures emit a terminal sidecar — this matches the
+        # spec's "empty file is a valid outcome" behavior when a request
+        # finishes before any target position was touched (e.g.,
+        # "all_generated" with zero generated tokens).
+        finalize_tasks: list[tuple["CaptureKey", pathlib.Path, pathlib.Path]] = []
+        for hook_name, layers in state.resolved_hooks.items():
+            for layer_idx in layers:
+                bin_path, sidecar_path = _compute_paths(
+                    root=root,
+                    model_slug=_resolve_model_slug(state.model_name),
+                    model_dtype=state.model_dtype_str,
+                    tag_slug=state.tag_slug,
+                    layer=layer_idx,
+                    hook=hook_name,
+                    request_id_slug=state.request_id_slug,
+                )
+                sidecar_payload = _build_sidecar_payload(
+                    state=state,
+                    layer=layer_idx,
+                    hook=hook_name,
+                    hidden_size=self._hidden_size,
+                )
+                key: "CaptureKey" = (req_id, layer_idx, hook_name)
+                try:
+                    writer.submit(
+                        FinalizeTask(
+                            bin_path=bin_path,
+                            sidecar_path=sidecar_path,
+                            sidecar_payload=sidecar_payload,
+                            key=key,
+                        )
+                    )
+                except WriteError as exc:
+                    submit_errors.append(f"{bin_path}: {exc.message}")
+                    continue
+                finalize_tasks.append((key, bin_path, sidecar_path))
+                paths.append(str(bin_path))
+                paths.append(str(sidecar_path))
+
+        if submit_errors and finalize_tasks:
+            return CaptureResult(
+                status="partial_error",
+                error="; ".join(submit_errors),
+                paths=paths,
+            )
+        if submit_errors:
+            return CaptureResult(
+                status="error",
+                error="; ".join(submit_errors),
+                paths=paths,
+            )
+
+        return CaptureResult(status="ok", error=None, paths=paths)
+
 
 # ---------------------------------------------------------------------------
 # Hook helper + custom op
@@ -656,6 +918,128 @@ direct_register_custom_op(
     fake_impl=_capture_residual_fake,
     mutates_args=["hidden_states"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Path + sidecar helpers
+# ---------------------------------------------------------------------------
+
+# Slugging for path segments other than ``tag`` / ``request_id`` (which are
+# slugged at admission time by ``vllm.config.activation_storing_types.slug``).
+# Used on ``model_name`` fallback and ``model_dtype_str``.
+_PATH_SLUG_REGEX = re.compile(r"[^a-zA-Z0-9._-]")
+
+
+def _slug_segment(value: str) -> str:
+    return _PATH_SLUG_REGEX.sub("_", value) if value else "unknown"
+
+
+def _resolve_model_slug(model_name: str) -> str:
+    """Translate ``model_name`` into a filesystem-safe ``{model_slug}`` segment.
+
+    Mirrors the rules documented in the spec's "Model slug resolution"
+    section:
+
+    1. Exact ``org/name`` form (two path-like segments, no traversal) is
+       preserved as-is so the org becomes a real directory level.
+    2. Anything else gets the regex slug.
+
+    Phase 5 may eventually plug in ``served_model_name`` ahead of the
+    model config lookup; that's a call-site concern — by the time the
+    runner calls :meth:`register_request` it has already decided what
+    ``model_name`` to record.
+    """
+    if not model_name:
+        return "unknown"
+    parts = model_name.split("/")
+    if (
+        len(parts) == 2
+        and all(p for p in parts)
+        and ".." not in model_name
+        and not model_name.startswith("/")
+    ):
+        return "/".join(_slug_segment(p) for p in parts)
+    return _slug_segment(model_name)
+
+
+def _compute_paths(
+    *,
+    root: pathlib.Path,
+    model_slug: str,
+    model_dtype: str,
+    tag_slug: str,
+    layer: int,
+    hook: str,
+    request_id_slug: str,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Return ``(bin_path, sidecar_path)`` per the spec filesystem layout.
+
+    Layout: ``{root}/{model_slug}/{model_dtype}/{tag_slug}/{layer}/{hook}/{id}.{ext}``.
+    """
+    base = (
+        root
+        / model_slug
+        / _slug_segment(model_dtype or "unknown")
+        / tag_slug
+        / str(layer)
+        / hook
+    )
+    bin_path = base / f"{request_id_slug}.bin"
+    sidecar_path = base / f"{request_id_slug}.json"
+    return bin_path, sidecar_path
+
+
+def _utc_now_iso() -> str:
+    """Return an RFC-3339 UTC timestamp with millisecond precision."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+def _build_sidecar_payload(
+    *,
+    state: _RequestCaptureState,
+    layer: int,
+    hook: str,
+    hidden_size: int,
+) -> dict[str, object]:
+    """Assemble the ``.json`` sidecar payload for a single ``(layer, hook)``.
+
+    Captures the exact set of keys the spec requires (see
+    ``docs/features/activation_storing.md`` § File format). Keep this in
+    lockstep with the ``test_sidecar_payload_keys`` test.
+    """
+    positions = state.captured_positions.get((layer, hook), [])
+    num_rows = len(positions)
+    last_prompt_idx = state.num_prompt_tokens - 1
+
+    if state.error is not None:
+        capture_status = "error"
+        capture_error: str | None = state.error
+    else:
+        capture_status = "ok"
+        capture_error = None
+
+    return {
+        "request_id": state.request_id_slug,
+        "tag": state.tag_slug,
+        "model": state.model_name,
+        "model_dtype": state.model_dtype_str,
+        "layer": layer,
+        "hook": hook,
+        "shape": [num_rows, hidden_size],
+        "dtype": state.model_dtype_str,
+        "element_size": state.element_size_bytes,
+        "positions": list(positions),
+        "position_kind": state.position_kind,
+        "last_prompt_token_index": last_prompt_idx,
+        "prompt_token_ids": list(state.prompt_token_ids),
+        "generated_token_ids": list(state.generated_token_ids),
+        "created_at": state.created_at,
+        "finalized_at": _utc_now_iso(),
+        "vllm_internal_request_id": state.vllm_internal_request_id,
+        "capture_status": capture_status,
+        "capture_error": capture_error,
+    }
 
 
 __all__ = [

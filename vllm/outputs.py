@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from typing_extensions import TypeVar
 
+from vllm.config.activation_storing_types import CaptureResult
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
@@ -121,6 +122,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        activation_storage: CaptureResult | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -141,12 +143,24 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        # Terminal per-request activation capture status/paths, set on the
+        # final output when ``SamplingParams.activation_storing`` was
+        # provided. ``None`` both when the feature is off and on
+        # non-terminal outputs within a streaming run; Phase 4 / Phase 5
+        # thread the concrete :class:`CaptureResult` through from the
+        # engine core on the finalize step.
+        self.activation_storage = activation_storage
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        # Capture result rides on the terminal EngineCoreOutput; when
+        # ``add`` merges a finalize into an earlier streaming chunk, the
+        # later one is the one that carries the pointer.
+        if next_output.activation_storage is not None:
+            self.activation_storage = next_output.activation_storage
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
