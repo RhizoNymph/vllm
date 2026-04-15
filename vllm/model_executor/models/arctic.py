@@ -8,6 +8,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -29,6 +30,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -308,12 +316,22 @@ class ArcticDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        vllm_config: VllmConfig | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         layer_idx = extract_layer_index(prefix)
         is_moe_layer = (layer_idx + 1) % config.moe_layer_frequency == 0
         self.use_residual = config.use_residual and is_moe_layer
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         self.self_attn = ArcticAttention(
             config,
             cache_config,
@@ -348,6 +366,9 @@ class ArcticDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.PRE_ATTN
+        )
         residual_input = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -355,6 +376,9 @@ class ArcticDecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
         hidden_states = residual_input + hidden_states
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_ATTN
+        )
 
         residual_attn = hidden_states
         if self.use_residual:
@@ -370,6 +394,9 @@ class ArcticDecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.block_sparse_moe(hidden_states)
             hidden_states = residual_attn + hidden_states
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
         return hidden_states
 
 
@@ -390,10 +417,15 @@ class ArcticModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: ArcticDecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                vllm_config=vllm_config,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self._attn_implementation = config._attn_implementation
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
