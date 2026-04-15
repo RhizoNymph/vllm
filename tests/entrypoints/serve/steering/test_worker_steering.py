@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for WorkerBase steering methods using a mock model.
+"""Unit tests for steering model-runner mixin methods using a mock model.
 
 All hook-point-aware tests use the default hook point
 (``post_mlp``) unless testing multi-hook-point behaviour.
@@ -18,6 +18,7 @@ import torch.nn as nn
 from vllm.exceptions import SteeringVectorError
 from vllm.model_executor.layers.steering import DEFAULT_HOOK_POINT
 from vllm.v1.worker.steering_manager import SteeringManager
+from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 from vllm.v1.worker.worker_base import WorkerBase
 
 # Shorthand for test readability
@@ -67,19 +68,27 @@ class FakeModel(nn.Module):
                 layer.steering_index = shared_index
 
 
-class FakeModelRunner:
-    """Minimal model runner exposing get_model()."""
+class FakeModelRunner(SteeringModelRunnerMixin):
+    """Minimal model runner mixing in the steering methods."""
 
     def __init__(self, model: nn.Module):
         self._model = model
         self._steering_manager: SteeringManager | None = None
+        self._pending_steering_globals = None
+        self._steerable_layers_cache = None
 
     def get_model(self) -> nn.Module:
         return self._model
 
 
 class FakeWorker(WorkerBase):
-    """Concrete WorkerBase for testing (abstract methods stubbed)."""
+    """Concrete WorkerBase for testing (abstract methods stubbed).
+
+    Delegates the four public steering methods to ``self.model_runner``
+    the same way ``gpu_worker.py`` does, while still tolerating a
+    ``None`` model runner (so the legacy "no model runner" tests keep
+    exercising the graceful-degradation path).
+    """
 
     def __init__(self, model: nn.Module):
         # Don't call super().__init__ — just set model_runner directly
@@ -91,6 +100,31 @@ class FakeWorker(WorkerBase):
     def get_model(self):
         assert self.model_runner is not None
         return self.model_runner.get_model()
+
+    def set_steering_vectors(self, **kwargs):
+        if self.model_runner is None:
+            return []
+        return self.model_runner.set_steering_vectors(**kwargs)
+
+    def clear_steering_vectors(self):
+        if self.model_runner is None:
+            return
+        return self.model_runner.clear_steering_vectors()
+
+    def list_steerable_layers(self):
+        if self.model_runner is None:
+            return set()
+        return self.model_runner.list_steerable_layers()
+
+    def get_steering_status(self):
+        if self.model_runner is None:
+            return {}
+        return self.model_runner.get_steering_status()
+
+    def _steerable_layers(self):
+        if self.model_runner is None:
+            return {}
+        return self.model_runner._steerable_layers()
 
 
 @pytest.fixture
@@ -130,7 +164,7 @@ class TestSteerableLayers:
     def test_no_model_runner(self):
         w = FakeWorker.__new__(FakeWorker)
         w.model_runner = None
-        layers = WorkerBase._steerable_layers(w)
+        layers = w._steerable_layers()
         assert layers == {}
 
 
@@ -210,7 +244,10 @@ class TestSetSteeringVectorsBase:
         assert result == [0]
         mgr = worker_with_manager.model_runner._steering_manager
         # Manager should have no base vectors after validate_only
-        assert _HP not in mgr.global_base_vectors or 0 not in mgr.global_base_vectors.get(_HP, {})
+        assert (
+            _HP not in mgr.global_base_vectors
+            or 0 not in mgr.global_base_vectors.get(_HP, {})
+        )
 
     def test_validate_only_still_checks_size(self, worker_with_manager):
         with pytest.raises(SteeringVectorError, match="expected vector of size"):
@@ -232,7 +269,10 @@ class TestSetSteeringVectorsBase:
             )
         mgr = worker_with_manager.model_runner._steering_manager
         # Manager should have no base vectors after validation error
-        assert _HP not in mgr.global_base_vectors or 0 not in mgr.global_base_vectors.get(_HP, {})
+        assert (
+            _HP not in mgr.global_base_vectors
+            or 0 not in mgr.global_base_vectors.get(_HP, {})
+        )
 
     def test_empty_vectors_is_noop(self, worker_with_manager):
         result = worker_with_manager.set_steering_vectors(vectors={})
@@ -272,7 +312,10 @@ class TestSetSteeringVectorsThreeTier:
         assert _HP in mgr.global_prefill_vectors
         assert 0 in mgr.global_prefill_vectors[_HP]
         # No base vectors
-        assert _HP not in mgr.global_base_vectors or 0 not in mgr.global_base_vectors.get(_HP, {})
+        assert (
+            _HP not in mgr.global_base_vectors
+            or 0 not in mgr.global_base_vectors.get(_HP, {})
+        )
 
     def test_set_decode_only(self, worker_with_manager):
         """Decode-only vectors go to manager, not buffers."""
@@ -304,8 +347,14 @@ class TestSetSteeringVectorsThreeTier:
         assert result == [0, 1]
         # Nothing mutated
         mgr = worker_with_manager.model_runner._steering_manager
-        assert _HP not in mgr.global_base_vectors or 0 not in mgr.global_base_vectors.get(_HP, {})
-        assert _HP not in mgr.global_prefill_vectors or 1 not in mgr.global_prefill_vectors.get(_HP, {})
+        assert (
+            _HP not in mgr.global_base_vectors
+            or 0 not in mgr.global_base_vectors.get(_HP, {})
+        )
+        assert (
+            _HP not in mgr.global_prefill_vectors
+            or 1 not in mgr.global_prefill_vectors.get(_HP, {})
+        )
 
     def test_validation_error_in_prefill_tier(self, worker_with_manager):
         """Validation error in prefill tier prevents all mutation."""
@@ -523,7 +572,8 @@ class TestGetSteeringStatus:
         """Phase-specific vectors queued before manager init should be
         visible in status via _pending_steering_globals."""
         vec = [2.0] * 8
-        # Queue pending globals directly (simulates set_steering_vectors before manager init)
+        # Queue pending globals directly (simulates set_steering_vectors
+        # before manager init).
         t = torch.tensor(vec, dtype=torch.float32)
         worker.model_runner._pending_steering_globals = [
             ({"post_mlp": {0: t}}, "prefill"),

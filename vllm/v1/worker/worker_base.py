@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -9,13 +8,8 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.layers.steering import (
-    HOOK_POINT_TABLE_ATTR,
-    SteeringHookPoint,
-)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -122,295 +116,6 @@ class WorkerBase:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
-    def _steerable_layers(self) -> dict:
-        """Return ``{layer_idx: module}`` for layers with steering buffers.
-
-        Works with any model runner that exposes ``get_model()``,
-        including the V2 runner.  Result is cached after first
-        successful discovery.
-
-        A layer is considered steerable if it has ``layer_idx`` and at
-        least one ``steering_table_*`` buffer for any hook point.
-        """
-        cache = getattr(self, "_steerable_layers_cache", None)
-        if cache is not None:
-            return cache
-
-        mr = self.model_runner
-        if mr is None or not hasattr(mr, "get_model"):
-            return {}
-        layers: dict = {}
-        for mod in mr.get_model().modules():
-            if not hasattr(mod, "layer_idx"):
-                continue
-            has_any_table = any(
-                hasattr(mod, attr) for attr in HOOK_POINT_TABLE_ATTR.values()
-            )
-            if has_any_table:
-                layers[mod.layer_idx] = mod
-
-        if layers:
-            self._steerable_layers_cache = layers
-
-        return layers
-
-    def _validate_vectors_spec(
-        self,
-        vectors_data: dict[str, dict[int, list[float]]],
-        steerable: dict,
-    ) -> set[int]:
-        """Validate hook-point / layer / vector combinations.
-
-        Returns the set of valid layer indices on this worker.
-        Raises ``SteeringVectorError`` on invalid hook points,
-        mismatched sizes, or non-finite values.
-        """
-        valid_indices: set[int] = set()
-        for hook_point_str, layer_vecs in vectors_data.items():
-            try:
-                hp_enum = SteeringHookPoint(hook_point_str)
-            except ValueError as exc:
-                raise SteeringVectorError(
-                    f"Invalid hook point: {hook_point_str!r}"
-                ) from exc
-            table_attr = HOOK_POINT_TABLE_ATTR[hp_enum]
-
-            for idx, vec_values in layer_vecs.items():
-                if idx not in steerable:
-                    continue
-                mod = steerable[idx]
-                if not hasattr(mod, table_attr):
-                    raise SteeringVectorError(
-                        f"Hook point {hook_point_str!r} not active on layer {idx}"
-                    )
-                buf = getattr(mod, table_attr)
-                expected_size = buf.shape[1]
-                if len(vec_values) != expected_size:
-                    raise SteeringVectorError(
-                        f"Layer {idx} ({hook_point_str}): expected "
-                        f"vector of size {expected_size}, "
-                        f"got {len(vec_values)}"
-                    )
-                if not all(math.isfinite(v) for v in vec_values):
-                    raise SteeringVectorError(
-                        f"Layer {idx} ({hook_point_str}): steering "
-                        f"vector contains non-finite values "
-                        f"(NaN or Infinity)"
-                    )
-                valid_indices.add(idx)
-        return valid_indices
-
-    def list_steerable_layers(self) -> set[int]:
-        """Return the steerable layer indices available on this worker."""
-        return set(self._steerable_layers().keys())
-
-    def _notify_manager_vectors(
-        self,
-        vectors_data: dict[str, dict[int, list[float]]],
-        steerable: dict,
-        valid_indices: set[int],
-        phase: str,
-    ) -> None:
-        """Notify SteeringManager of global vector changes for a given
-        phase (``"base"``, ``"prefill"``, or ``"decode"``).
-
-        Converts the raw ``list[float]`` values from *vectors_data*
-        into tensors matching the layer buffer dtype/device, then passes
-        them to the manager.  This avoids reading from shared buffers,
-        which would silently use stale or overwritten data for
-        phase-specific tiers.
-
-        When the manager has not been lazily initialized yet, the
-        converted tensors are stored in
-        ``self.model_runner._pending_steering_globals`` for replay
-        during lazy init in ``_update_steering_buffers``.
-        """
-        if not hasattr(self, "model_runner") or self.model_runner is None:
-            return
-        mgr = getattr(self.model_runner, "_steering_manager", None)
-        if mgr is None:
-            # Manager not yet initialized -- capture current vectors
-            # for replay during lazy init.
-            captured: dict[str, dict[int, torch.Tensor]] = {}
-            for hook_point_str, layer_vecs in vectors_data.items():
-                table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_point_str)]
-                captured_layers: dict[int, torch.Tensor] = {}
-                for idx, vec_values in layer_vecs.items():
-                    if idx not in valid_indices or idx not in steerable:
-                        continue
-                    mod = steerable[idx]
-                    if hasattr(mod, table_attr):
-                        buf = getattr(mod, table_attr)
-                        captured_layers[idx] = torch.tensor(
-                            vec_values, dtype=buf.dtype, device=buf.device
-                        )
-                if captured_layers:
-                    captured[hook_point_str] = captured_layers
-            if captured:
-                pending = getattr(self.model_runner, "_pending_steering_globals", None)
-                if pending is None:
-                    self.model_runner._pending_steering_globals = []
-                    pending = self.model_runner._pending_steering_globals
-                pending.append((captured, phase))
-            return
-        for hook_point_str, layer_vecs in vectors_data.items():
-            table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_point_str)]
-            for idx, vec_values in layer_vecs.items():
-                if idx not in valid_indices or idx not in steerable:
-                    continue
-                mod = steerable[idx]
-                if hasattr(mod, table_attr):
-                    buf = getattr(mod, table_attr)
-                    t = torch.tensor(vec_values, dtype=buf.dtype, device=buf.device)
-                    mgr.update_global_vectors(hook_point_str, idx, t, phase=phase)
-
-    def set_steering_vectors(
-        self,
-        vectors: dict[str, dict[int, list[float]]] | None = None,
-        prefill_vectors: dict[str, dict[int, list[float]]] | None = None,
-        decode_vectors: dict[str, dict[int, list[float]]] | None = None,
-        replace: bool = False,
-        validate_only: bool = False,
-    ) -> list[int]:
-        """Set activation steering vectors from plain Python data.
-
-        Supports three-tier steering:
-
-        - *vectors*: base vectors applied to both prefill and decode.
-          Notified to SteeringManager with ``phase="base"``.
-        - *prefill_vectors*: phase-specific vectors for prefill only.
-          Notified to SteeringManager with ``phase="prefill"``.
-        - *decode_vectors*: phase-specific vectors for decode only.
-          Notified to SteeringManager with ``phase="decode"``.
-
-        All vectors should already be in pre-scaled flat-list form
-        (the API router normalizes co-located scales before calling
-        this method).
-
-        When *replace* is ``True``, all existing vectors across all
-        tiers are cleared before applying.
-
-        When *validate_only* is ``True``, vectors are validated
-        without being applied.
-
-        Returns:
-            Sorted list of layer indices that were actually updated (or
-            *would* be updated when *validate_only*) on this worker.
-            The router unions these across workers.
-        """
-        steerable = self._steerable_layers()
-        if not steerable:
-            return []
-
-        # Collect all tiers with data.
-        all_tiers: list[tuple[str, dict[str, dict[int, list[float]]]]] = []
-        if vectors:
-            all_tiers.append(("base", vectors))
-        if prefill_vectors:
-            all_tiers.append(("prefill", prefill_vectors))
-        if decode_vectors:
-            all_tiers.append(("decode", decode_vectors))
-
-        if not all_tiers:
-            if replace:
-                self.clear_steering_vectors()
-            return []
-
-        # Validate all tiers.
-        valid_indices: set[int] = set()
-        for _phase, tier_data in all_tiers:
-            valid_indices.update(self._validate_vectors_spec(tier_data, steerable))
-
-        if not valid_indices:
-            return []
-
-        if validate_only:
-            return sorted(valid_indices)
-
-        # Clear if replacing.
-        if replace:
-            self.clear_steering_vectors()
-
-        # Notify manager with base vectors.
-        if vectors:
-            self._notify_manager_vectors(vectors, steerable, valid_indices, "base")
-
-        # Phase-specific vectors go only to the manager, not the shared
-        # buffers — writing them would overwrite base values and cause
-        # get_steering_status() to report the wrong tier.
-        if prefill_vectors:
-            self._notify_manager_vectors(
-                prefill_vectors, steerable, valid_indices, "prefill"
-            )
-
-        if decode_vectors:
-            self._notify_manager_vectors(
-                decode_vectors, steerable, valid_indices, "decode"
-            )
-
-        return sorted(valid_indices)
-
-    def clear_steering_vectors(self) -> None:
-        """Clear all tiers (base, prefill, decode) in the SteeringManager."""
-        # Notify SteeringManager
-        if hasattr(self, "model_runner") and self.model_runner is not None:
-            mgr = getattr(self.model_runner, "_steering_manager", None)
-            if mgr is not None:
-                mgr.clear_global_vectors()
-            # Also clear any pending globals queued before manager init,
-            # so they are not replayed on lazy initialization.
-            if hasattr(self.model_runner, "_pending_steering_globals"):
-                self.model_runner._pending_steering_globals = None
-
-    def get_steering_status(self) -> dict:
-        """Return per-hook-point status for active layers.
-
-        Returns ``{layer_idx: {hook_point: {"norm": float,
-        "prefill_norm"?: float, "decode_norm"?: float}}}`` for
-        layers/hook-points that have a non-zero steering vector.
-
-        All norms (base, prefill, decode) are read from the
-        SteeringManager when it exists, or from
-        ``_pending_steering_globals`` before manager initialization.
-        """
-        result: dict = {}
-        if not hasattr(self, "model_runner") or self.model_runner is None:
-            return result
-        mgr = getattr(self.model_runner, "_steering_manager", None)
-        if mgr is not None:
-            # Read all norms from manager
-            for phase_name, phase_dict in [
-                ("base", mgr.global_base_vectors),
-                ("prefill", mgr.global_prefill_vectors),
-                ("decode", mgr.global_decode_vectors),
-            ]:
-                norm_key = "norm" if phase_name == "base" else f"{phase_name}_norm"
-                for hp_str, layer_vecs in phase_dict.items():
-                    for layer_idx, vec in layer_vecs.items():
-                        norm = vec.norm().item()
-                        if norm > 0.0:
-                            if layer_idx not in result:
-                                result[layer_idx] = {}
-                            if hp_str not in result[layer_idx]:
-                                result[layer_idx][hp_str] = {}
-                            result[layer_idx][hp_str][norm_key] = round(norm, 6)
-        else:
-            # Read from pending globals (all phases including base)
-            pending = getattr(self.model_runner, "_pending_steering_globals", None)
-            if pending:
-                for captured_vectors, phase in pending:
-                    norm_key = "norm" if phase == "base" else f"{phase}_norm"
-                    for hp_str, layer_vecs in captured_vectors.items():
-                        for layer_idx, vec in layer_vecs.items():
-                            norm = vec.norm().item()
-                            if norm > 0.0:
-                                if layer_idx not in result:
-                                    result[layer_idx] = {}
-                                if hp_str not in result[layer_idx]:
-                                    result[layer_idx][hp_str] = {}
-                                result[layer_idx][hp_str][norm_key] = round(norm, 6)
-        return result
-
     def get_model_inspection(self) -> str:
         """Return a transformers-style hierarchical view of the model."""
         from vllm.model_inspection import format_model_inspection
@@ -454,6 +159,25 @@ class WorkerBase:
         raise NotImplementedError
 
     def list_loras(self) -> set[int]:
+        raise NotImplementedError
+
+    def set_steering_vectors(
+        self,
+        vectors: dict[str, dict[int, list[float]]] | None = None,
+        prefill_vectors: dict[str, dict[int, list[float]]] | None = None,
+        decode_vectors: dict[str, dict[int, list[float]]] | None = None,
+        replace: bool = False,
+        validate_only: bool = False,
+    ) -> list[int]:
+        raise NotImplementedError
+
+    def clear_steering_vectors(self) -> None:
+        raise NotImplementedError
+
+    def list_steerable_layers(self) -> set[int]:
+        raise NotImplementedError
+
+    def get_steering_status(self) -> dict:
         raise NotImplementedError
 
     @property
