@@ -26,6 +26,7 @@ import torch
 from torch import nn
 from transformers import GPTNeoXConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -39,6 +40,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -49,6 +57,7 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsPP
 from .utils import (
     AutoWeightsLoader,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -154,9 +163,18 @@ class GPTNeoXLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ):
         super().__init__()
         self.use_parallel_residual = config.use_parallel_residual
+        self.layer_idx = extract_layer_index(prefix)
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_eps
         )
@@ -173,6 +191,8 @@ class GPTNeoXLayer(nn.Module):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         attn_input = self.input_layernorm(hidden_states)
         attn_output = self.attention(
             position_ids=position_ids,
@@ -185,14 +205,26 @@ class GPTNeoXLayer(nn.Module):
             mlp_input = self.post_attention_layernorm(hidden_states)
             mlp_output = self.mlp(mlp_input)
             hidden_states = mlp_output + attn_output + hidden_states
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.POST_ATTN
+            )
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.POST_MLP
+            )
         else:
             # pseudocode:
             # x = x + attn(ln1(x))
             # x = x + mlp(ln2(x))
             attn_output = attn_output + hidden_states
+            attn_output = apply_layer_steering(
+                self, attn_output, SteeringHookPoint.POST_ATTN
+            )
             mlp_input = self.post_attention_layernorm(attn_output)
             mlp_output = self.mlp(mlp_input)
             hidden_states = mlp_output + attn_output
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.POST_MLP
+            )
         return hidden_states
 
 
@@ -206,6 +238,9 @@ class GPTNeoXModel(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.config = config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.embed_in = VocabParallelEmbedding(
             config.vocab_size,
@@ -214,10 +249,16 @@ class GPTNeoXModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: GPTNeoXLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.final_layer_norm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_eps
         )

@@ -4,6 +4,7 @@
 
 import copy
 import json as json_mod
+import math
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
@@ -14,8 +15,16 @@ from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
+from vllm.config.steering_types import (
+    SteeringLayerEntry,
+    SteeringVectorSpec,
+    hash_steering_config,
+    normalize_layer_entry,
+    resolve_effective_vectors,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.v1.serial_utils import PydanticMsgspecMixin
@@ -298,6 +307,20 @@ class SamplingParams(
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
 
+    steering_vectors: SteeringVectorSpec | None = None
+    """Base steering vectors applied to both prefill and decode phases.
+    Keyed by hook point name (pre_attn, post_attn, post_mlp), then
+    layer index. Values are either bare
+    ``list[float]`` (scale=1.0) or ``{"vector": [...], "scale": float}``."""
+
+    prefill_steering_vectors: SteeringVectorSpec | None = None
+    """Phase-specific steering vectors added to base during prefill only.
+    Same format as ``steering_vectors``."""
+
+    decode_steering_vectors: SteeringVectorSpec | None = None
+    """Phase-specific steering vectors added to base during decode only.
+    Same format as ``steering_vectors``."""
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -337,6 +360,9 @@ class SamplingParams(
         extra_args: dict[str, Any] | None = None,
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
+        steering_vectors: SteeringVectorSpec | None = None,
+        prefill_steering_vectors: SteeringVectorSpec | None = None,
+        decode_steering_vectors: SteeringVectorSpec | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -378,6 +404,9 @@ class SamplingParams(
             extra_args=extra_args,
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
+            steering_vectors=steering_vectors,
+            prefill_steering_vectors=prefill_steering_vectors,
+            decode_steering_vectors=decode_steering_vectors,
         )
 
     def __post_init__(self) -> None:
@@ -528,6 +557,199 @@ class SamplingParams(
                 "Set detokenize=True to use stop."
             )
 
+        self._validate_steering_vectors()
+
+    def _validate_steering_vectors(self) -> None:
+        """Validate all steering vector fields if provided.
+
+        Expected format per field:
+        ``{hook_point: {layer_idx: SteeringLayerEntry}}``
+        where ``SteeringLayerEntry`` is either ``list[float]`` (scale=1.0)
+        or ``{"vector": list[float], "scale": float}``.
+        """
+        fields_to_check: list[tuple[str, SteeringVectorSpec | None]] = [
+            ("steering_vectors", self.steering_vectors),
+            ("prefill_steering_vectors", self.prefill_steering_vectors),
+            ("decode_steering_vectors", self.decode_steering_vectors),
+        ]
+        for field_name, spec in fields_to_check:
+            if spec is not None:
+                self._validate_single_steering_spec(field_name, spec)
+
+        # Cross-validate overlapping dimensions between base and phase specs.
+        if self.steering_vectors:
+            for phase_name, phase_spec in [
+                ("prefill_steering_vectors", self.prefill_steering_vectors),
+                ("decode_steering_vectors", self.decode_steering_vectors),
+            ]:
+                if phase_spec is None:
+                    continue
+                for hook, layers in self.steering_vectors.items():
+                    if hook not in phase_spec:
+                        continue
+                    for layer_idx, base_entry in layers.items():
+                        if layer_idx not in phase_spec[hook]:
+                            continue
+                        base_vec, _ = normalize_layer_entry(base_entry)
+                        phase_vec, _ = normalize_layer_entry(
+                            phase_spec[hook][layer_idx]
+                        )
+                        if len(base_vec) != len(phase_vec):
+                            raise ValueError(
+                                f"steering_vectors[{hook!r}]"
+                                f"[{layer_idx}] has "
+                                f"dimension {len(base_vec)} but "
+                                f"{phase_name}[{hook!r}]"
+                                f"[{layer_idx}] has "
+                                f"dimension {len(phase_vec)}. "
+                                f"Overlapping entries must have "
+                                f"matching dimensions."
+                            )
+
+        # Cross-validate overlapping dimensions between prefill and decode
+        # phase specs (caught even when no base ``steering_vectors`` is set).
+        if self.prefill_steering_vectors and self.decode_steering_vectors:
+            for hook, prefill_layers in self.prefill_steering_vectors.items():
+                if hook not in self.decode_steering_vectors:
+                    continue
+                decode_layers = self.decode_steering_vectors[hook]
+                for layer_idx, prefill_entry in prefill_layers.items():
+                    if layer_idx not in decode_layers:
+                        continue
+                    prefill_vec, _ = normalize_layer_entry(prefill_entry)
+                    decode_vec, _ = normalize_layer_entry(decode_layers[layer_idx])
+                    if len(prefill_vec) != len(decode_vec):
+                        raise ValueError(
+                            f"prefill_steering_vectors[{hook!r}]"
+                            f"[{layer_idx}] has "
+                            f"dimension {len(prefill_vec)} but "
+                            f"decode_steering_vectors[{hook!r}]"
+                            f"[{layer_idx}] has "
+                            f"dimension {len(decode_vec)}. "
+                            f"Overlapping entries must have "
+                            f"matching dimensions."
+                        )
+
+    def _validate_single_steering_spec(
+        self, field_name: str, spec: SteeringVectorSpec
+    ) -> None:
+        """Validate a single steering vector spec."""
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"{field_name} must be a dict mapping hook point "
+                "names to dicts of layer vectors."
+            )
+        for hook_name, layer_vecs in spec.items():
+            if hook_name not in VALID_HOOK_POINT_NAMES:
+                raise ValueError(
+                    f"{field_name} key {hook_name!r} is not a "
+                    f"valid hook point. Valid values: "
+                    f"{sorted(VALID_HOOK_POINT_NAMES)}."
+                )
+            if not isinstance(layer_vecs, dict):
+                raise ValueError(
+                    f"{field_name}[{hook_name!r}] must be a dict "
+                    f"mapping layer indices to layer entries."
+                )
+            for key, value in layer_vecs.items():
+                if not isinstance(key, int) or key < 0:
+                    raise ValueError(
+                        f"{field_name}[{hook_name!r}] keys must be "
+                        f"non-negative integers, got {key!r}."
+                    )
+                self._validate_layer_entry(field_name, hook_name, key, value)
+
+    def _validate_layer_entry(
+        self,
+        field_name: str,
+        hook_name: str,
+        layer_idx: int,
+        entry: SteeringLayerEntry,
+    ) -> None:
+        """Validate a single layer entry (bare list or dict with scale)."""
+        prefix = f"{field_name}[{hook_name!r}][{layer_idx}]"
+        if isinstance(entry, dict):
+            allowed = {"vector", "scale"}
+            extra = set(entry.keys()) - allowed
+            if extra:
+                raise ValueError(
+                    f"{prefix} dict entry has unexpected keys: {sorted(extra)}; "
+                    f"allowed keys: ['scale', 'vector']"
+                )
+            if "vector" not in entry or "scale" not in entry:
+                raise ValueError(
+                    f"{prefix} dict entries must have 'vector' "
+                    f"and 'scale' keys, got {sorted(entry.keys())}."
+                )
+            if not isinstance(entry["scale"], (int, float)):
+                raise ValueError(
+                    f"{prefix}['scale'] must be a finite float, got "
+                    f"{type(entry['scale']).__name__}."
+                )
+            if not math.isfinite(entry["scale"]):
+                raise ValueError(
+                    f"{prefix}['scale'] must be finite, got {entry['scale']}."
+                )
+            self._validate_float_list(prefix + "['vector']", entry["vector"])
+        elif isinstance(entry, list):
+            self._validate_float_list(prefix, entry)
+        else:
+            raise ValueError(
+                f"{prefix} must be a list of floats or a dict with "
+                f"'vector' and 'scale' keys, got "
+                f"{type(entry).__name__}."
+            )
+
+    @staticmethod
+    def _validate_float_list(prefix: str, values: Any) -> None:
+        """Validate that *values* is a list of finite floats."""
+        if not isinstance(values, list):
+            raise ValueError(
+                f"{prefix} must be a list of floats, got {type(values).__name__}."
+            )
+        for i, v in enumerate(values):
+            if not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"{prefix}[{i}] must be a finite float, got {type(v).__name__}."
+                )
+            if not math.isfinite(v):
+                raise ValueError(f"{prefix}[{i}] must be finite, got {v}.")
+
+    @cached_property
+    def effective_prefill_steering(
+        self,
+    ) -> dict[str, dict[int, list[float]]] | None:
+        """Resolved prefill steering: base + prefill-specific, pre-scaled."""
+        return resolve_effective_vectors(
+            self.steering_vectors, self.prefill_steering_vectors
+        )
+
+    @cached_property
+    def effective_decode_steering(
+        self,
+    ) -> dict[str, dict[int, list[float]]] | None:
+        """Resolved decode steering: base + decode-specific, pre-scaled."""
+        return resolve_effective_vectors(
+            self.steering_vectors, self.decode_steering_vectors
+        )
+
+    @cached_property
+    def prefill_steering_config_hash(self) -> int:
+        """Cached hash of ``effective_prefill_steering``.
+
+        Lives on ``SamplingParams`` (not ``Request``) so that many requests
+        sharing the same ``SamplingParams`` object — the common case for
+        batched ``llm.generate(prompts, [sp]*N)`` — only pay the hashing
+        cost once across the whole batch instead of once per request.
+        """
+        return hash_steering_config(self.effective_prefill_steering)
+
+    @cached_property
+    def decode_steering_config_hash(self) -> int:
+        """Cached hash of ``effective_decode_steering``. See
+        ``prefill_steering_config_hash``."""
+        return hash_steering_config(self.effective_decode_steering)
+
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
             raise ValueError(f"n must be 1 when using greedy sampling, got {self.n}.")
@@ -625,11 +847,49 @@ class SamplingParams(
         return self._bad_words_token_ids
 
     def clone(self) -> "SamplingParams":
-        """If skip_clone is True, uses shallow copy instead of deep copy."""
+        """If skip_clone is True, uses shallow copy instead of deep copy.
+
+        Steering vector dicts are shared by reference between the original
+        and the clone (via the deepcopy memo) instead of deep-copied. They
+        can be ~hundreds of KB of floats per request and the clone's
+        downstream consumers do not mutate them, so deep-copying them is
+        ~10-20ms of pure waste per request submission.
+
+        Cached steering hash values are also explicitly carried over to the
+        clone — they are a deterministic function of the steering vector
+        contents, which are identical between the original and the clone,
+        so recomputing them would only burn CPU time.
+        """
         if self.skip_clone:
             return copy.copy(self)
 
-        return copy.deepcopy(self)
+        # Pre-populate the deepcopy memo with the top-level steering vector
+        # dicts. ``copy.deepcopy`` checks the memo before recursing, so any
+        # dict found there is returned by reference instead of deep-copied.
+        memo: dict[int, Any] = {}
+        for attr in (
+            self.steering_vectors,
+            self.prefill_steering_vectors,
+            self.decode_steering_vectors,
+        ):
+            if attr is not None:
+                memo[id(attr)] = attr
+
+        new_sp = copy.deepcopy(self, memo)
+
+        # Carry over cached @cached_property values so the clone doesn't
+        # re-hash the same steering vectors. cached_property stores its
+        # values in the instance ``__dict__``.
+        for key in (
+            "prefill_steering_config_hash",
+            "decode_steering_config_hash",
+            "effective_prefill_steering",
+            "effective_decode_steering",
+        ):
+            if key in self.__dict__:
+                new_sp.__dict__[key] = self.__dict__[key]
+
+        return new_sp
 
     def verify(
         self,

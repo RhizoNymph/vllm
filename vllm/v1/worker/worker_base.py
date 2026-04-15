@@ -166,6 +166,25 @@ class WorkerBase:
     def list_loras(self) -> set[int]:
         raise NotImplementedError
 
+    def set_steering_vectors(
+        self,
+        vectors: dict[str, dict[int, list[float]]] | None = None,
+        prefill_vectors: dict[str, dict[int, list[float]]] | None = None,
+        decode_vectors: dict[str, dict[int, list[float]]] | None = None,
+        replace: bool = False,
+        validate_only: bool = False,
+    ) -> list[int]:
+        raise NotImplementedError
+
+    def clear_steering_vectors(self) -> None:
+        raise NotImplementedError
+
+    def list_steerable_layers(self) -> set[int]:
+        raise NotImplementedError
+
+    def get_steering_status(self) -> dict:
+        raise NotImplementedError
+
     @property
     def vocab_size(self) -> int:
         """Get vocabulary size from model configuration."""

@@ -29,6 +29,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (
@@ -57,6 +58,13 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -815,6 +823,8 @@ class OpenPanguDecoderLayer(nn.Module):
         config: PretrainedConfig,
         prefix: str,
         vllm_config: VllmConfig,
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
 
@@ -829,6 +839,12 @@ class OpenPanguDecoderLayer(nn.Module):
 
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         self.use_mla = (
             hasattr(config, "qk_nope_head_dim")
@@ -973,6 +989,7 @@ class OpenPanguDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -999,6 +1016,7 @@ class OpenPanguDecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
@@ -1012,6 +1030,7 @@ class OpenPanguDecoderLayer(nn.Module):
 
         if self.sandwich_norm:
             hidden_states = self.post_mlp_layernorm(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
 
         return hidden_states, residual
 
@@ -1026,6 +1045,9 @@ class OpenPanguModel(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         eplb_config = vllm_config.parallel_config.eplb_config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
         self.config = config
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
@@ -1045,9 +1067,16 @@ class OpenPanguModel(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: OpenPanguDecoderLayer(config, prefix, vllm_config),
+            lambda prefix: OpenPanguDecoderLayer(
+                config,
+                prefix,
+                vllm_config,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
+            ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

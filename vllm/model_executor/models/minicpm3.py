@@ -29,6 +29,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.attention import Attention
@@ -211,11 +212,18 @@ class MiniCPM3Model(MiniCPMModel):
         config: PretrainedConfig,
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
+        max_steering_tokens: int,
+        max_steering_configs: int,
     ):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: MiniCPM3DecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )

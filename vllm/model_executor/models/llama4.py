@@ -24,6 +24,7 @@ import torch
 from torch import nn
 from transformers import Llama4TextConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -45,6 +46,13 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -330,6 +338,15 @@ class Llama4DecoderLayer(nn.Module):
         self.layer_idx = extract_layer_index(prefix)
         self.global_layer = config.no_rope_layers[self.layer_idx] == 0
         self.hidden_size = config.hidden_size
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         max_position_embeddings = config.max_position_embeddings
 
         self.self_attn = Llama4Attention(
@@ -379,11 +396,14 @@ class Llama4DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.feed_forward(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 
 
@@ -401,6 +421,7 @@ class Llama4Model(LlamaModel):
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
         super().__init__(vllm_config=vllm_config, prefix=prefix, layer_type=layer_type)
+        share_steering_index_across_layers(self.layers)
 
     def load_moe_expert_weights(
         self,

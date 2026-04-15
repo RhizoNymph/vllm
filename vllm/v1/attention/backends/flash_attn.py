@@ -57,6 +57,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
+    split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -226,6 +227,7 @@ class FlashAttentionMetadata:
     #                                   |-- query_len ---|
 
     num_actual_tokens: int  # Number of tokens excluding padding.
+    num_decode_tokens: int
     max_query_len: int
     query_start_loc: torch.Tensor
     max_seq_len: int
@@ -388,6 +390,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         """
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
+        _, _, num_decode_tokens, _ = split_decodes_and_prefills(
+            common_attn_metadata)
         max_query_len = common_attn_metadata.max_query_len
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
@@ -547,6 +551,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
+            num_decode_tokens=num_decode_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,

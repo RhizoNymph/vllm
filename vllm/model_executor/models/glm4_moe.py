@@ -32,6 +32,7 @@ import torch
 from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -52,6 +53,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -333,6 +341,8 @@ class Glm4MoeDecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         enable_eplb: bool = False,
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -341,6 +351,12 @@ class Glm4MoeDecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         self.self_attn = Glm4MoeAttention(
             config=config,
@@ -393,9 +409,12 @@ class Glm4MoeDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 
 
@@ -416,6 +435,9 @@ class Glm4MoeModel(nn.Module):
         quant_config = vllm_config.quant_config
         enable_eplb = vllm_config.parallel_config.enable_eplb
         self.config = config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -434,9 +456,12 @@ class Glm4MoeModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 enable_eplb=enable_eplb,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

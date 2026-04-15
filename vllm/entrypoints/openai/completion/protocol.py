@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
+from vllm.config.steering_types import SteeringVectorSpec
 from vllm.config.utils import replace
 from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
@@ -177,6 +178,33 @@ class CompletionRequest(OpenAIBaseModel):
         "can detect such behavior and terminate early, saving time and tokens.",
     )
 
+    steering_vectors: SteeringVectorSpec | None = Field(
+        default=None,
+        description="Per-request activation steering vectors keyed by hook "
+        "point name (pre_attn, post_attn, post_mlp), then layer index. "
+        "Values are either bare "
+        'list[float] (scale=1.0) or {"vector": [...], "scale": float}.',
+    )
+
+    prefill_steering_vectors: SteeringVectorSpec | None = Field(
+        default=None,
+        description="Phase-specific steering vectors added to base during "
+        "prefill only. Same format as steering_vectors.",
+    )
+
+    decode_steering_vectors: SteeringVectorSpec | None = Field(
+        default=None,
+        description="Phase-specific steering vectors added to base during "
+        "decode only. Same format as steering_vectors.",
+    )
+
+    steering_name: str | None = Field(
+        default=None,
+        description="Name of a pre-registered steering module. "
+        "When set, the named vectors are resolved and additively "
+        "composed with any inline steering vector fields.",
+    )
+
     # --8<-- [end:completion-extra-params]
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
@@ -322,6 +350,9 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
+            steering_vectors=self.steering_vectors,
+            prefill_steering_vectors=self.prefill_steering_vectors,
+            decode_steering_vectors=self.decode_steering_vectors,
         )
 
     @model_validator(mode="before")

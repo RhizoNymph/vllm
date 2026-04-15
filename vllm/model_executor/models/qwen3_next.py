@@ -8,6 +8,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -42,6 +43,13 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -173,18 +181,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
-            final_hidden_states = self.experts(
+            shared_out, fused_out = self.experts(
                 hidden_states=hidden_states, router_logits=hidden_states
             )
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
+            shared_out, fused_out = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
-        if self.shared_expert is not None:
-            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+        final_hidden_states = (
+            shared_out + fused_out if shared_out is not None else fused_out
+        )
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -332,6 +341,15 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         if self.layer_type == "linear_attention":
             self.linear_attn = GatedDeltaNetAttention(
@@ -407,6 +425,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
@@ -436,6 +455,7 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
@@ -452,6 +472,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
 
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 
 
@@ -485,6 +506,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        share_steering_index_across_layers(self.layers)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )

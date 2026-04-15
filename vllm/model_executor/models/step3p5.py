@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -36,6 +37,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -433,8 +441,17 @@ class Step3p5DecoderLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            self.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         if cache_config is not None:
@@ -538,6 +555,7 @@ class Step3p5DecoderLayer(nn.Module):
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
@@ -546,6 +564,7 @@ class Step3p5DecoderLayer(nn.Module):
         )
         hidden_states += residual
         residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.use_moe:
@@ -553,6 +572,9 @@ class Step3p5DecoderLayer(nn.Module):
         else:
             ffn_output = self.mlp(hidden_states)
         hidden_states = ffn_output + residual
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
         return hidden_states
 
 
@@ -586,6 +608,7 @@ class Step3p5Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         if get_pp_group().is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         else:

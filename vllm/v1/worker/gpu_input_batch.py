@@ -53,6 +53,10 @@ class CachedRequestState:
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
 
+    # Per-request steering config hashes (0 = no per-request steering)
+    prefill_steering_config_hash: int = 0
+    decode_steering_config_hash: int = 0
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
@@ -227,6 +231,16 @@ class InputBatch:
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
+
+        # Steering config tracking (separate arrays for prefill and decode)
+        self.request_prefill_steering_hash = np.zeros(
+            (self.max_num_reqs,), dtype=np.int64
+        )
+        self.request_decode_steering_hash = np.zeros(
+            (self.max_num_reqs,), dtype=np.int64
+        )
+        # Tracks the union of both hashes (any non-zero hash gets tracked)
+        self.steering_hash_to_request_ids: dict[int, set[str]] = {}
 
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
@@ -458,6 +472,17 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
+        # Steering config tracking (prefill and decode)
+        prefill_hash = request.prefill_steering_config_hash
+        decode_hash = request.decode_steering_config_hash
+        self.request_prefill_steering_hash[req_index] = prefill_hash
+        self.request_decode_steering_hash[req_index] = decode_hash
+        for h in (prefill_hash, decode_hash):
+            if h != 0:
+                if h not in self.steering_hash_to_request_ids:
+                    self.steering_hash_to_request_ids[h] = set()
+                self.steering_hash_to_request_ids[h].add(request.req_id)
+
         return req_index
 
     def update_req_spec_token_ids(
@@ -515,6 +540,20 @@ class InputBatch:
                 del self.lora_id_to_request_ids[lora_id]
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
+
+        # Steering cleanup (both prefill and decode hashes)
+        for arr in (
+            self.request_prefill_steering_hash,
+            self.request_decode_steering_hash,
+        ):
+            steering_hash = int(arr[req_index])
+            if steering_hash != 0:
+                hash_req_ids = self.steering_hash_to_request_ids.get(steering_hash)
+                if hash_req_ids:
+                    hash_req_ids.discard(req_id)
+                    if not hash_req_ids:
+                        del self.steering_hash_to_request_ids[steering_hash]
+                arr[req_index] = 0
 
         if self.is_pooling_model:
             self.pooling_params.pop(req_id, None)
@@ -609,6 +648,18 @@ class InputBatch:
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] = (
             self.request_lora_mapping[i2],
             self.request_lora_mapping[i1],
+        )
+
+        (
+            self.request_prefill_steering_hash[i1],
+            self.request_prefill_steering_hash[i2],
+        ) = (
+            self.request_prefill_steering_hash[i2],
+            self.request_prefill_steering_hash[i1],
+        )
+        self.request_decode_steering_hash[i1], self.request_decode_steering_hash[i2] = (
+            self.request_decode_steering_hash[i2],
+            self.request_decode_steering_hash[i1],
         )
 
         if self.is_pooling_model:
@@ -738,6 +789,13 @@ class InputBatch:
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
                 last_req_index
             ]
+
+            self.request_prefill_steering_hash[empty_index] = (
+                self.request_prefill_steering_hash[last_req_index]
+            )
+            self.request_decode_steering_hash[empty_index] = (
+                self.request_decode_steering_hash[last_req_index]
+            )
 
             if self.is_pooling_model:
                 last_req_index -= 1

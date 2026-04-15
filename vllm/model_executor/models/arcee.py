@@ -16,12 +16,20 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -42,6 +50,7 @@ from .interfaces import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -106,9 +115,18 @@ class ArceeDecoderLayer(nn.Module):
         cache_config: Any | None = None,
         quant_config: Any | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Determine if attention bias is needed (some variants use bias terms)
         attention_bias = getattr(config, "attention_bias", False) or getattr(
@@ -168,10 +186,13 @@ class ArceeDecoderLayer(nn.Module):
         else:
             # Fused residual add + layernorm if supported
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         # Feed-forward block
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 
 
@@ -191,6 +212,9 @@ class ArceeModel(nn.Module, EagleModelMixin):
         config: LlamaConfig = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
         self.quant_config = quant_config
         self.config = config
         self.vocab_size = config.vocab_size
@@ -215,9 +239,12 @@ class ArceeModel(nn.Module, EagleModelMixin):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         # Final RMSNorm on the last pipeline stage
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

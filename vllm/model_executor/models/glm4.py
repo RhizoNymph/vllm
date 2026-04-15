@@ -29,6 +29,7 @@ import torch
 from torch import nn
 from transformers import Glm4Config
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -38,6 +39,12 @@ from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLine
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -52,6 +59,7 @@ from .llama import LlamaModel
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    extract_layer_index,
     is_pp_missing_parameter,
     maybe_prefix,
 )
@@ -161,6 +169,16 @@ class Glm4DecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         self.self_attn = Glm4Attention(
             config=config,
@@ -203,6 +221,7 @@ class Glm4DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -212,8 +231,10 @@ class Glm4DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_mlp_layernorm(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
 
         return hidden_states, residual
 

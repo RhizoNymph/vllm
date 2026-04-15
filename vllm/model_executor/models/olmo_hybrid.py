@@ -30,6 +30,7 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -76,6 +77,13 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -757,6 +765,15 @@ class OlmoHybridDecoderLayer(nn.Module):
         layer_idx = extract_layer_index(prefix)
         self.layer_type = config.layer_types[layer_idx]
         self.layer_idx = layer_idx
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         if self.layer_type == "linear_attention":
             self.linear_attn = OlmoHybridGatedDeltaNet(
@@ -802,6 +819,7 @@ class OlmoHybridDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if self.layer_type == "linear_attention":
             residual = hidden_states
+            residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
             hidden_states = self.input_layernorm(hidden_states)
 
             attn_output = torch.empty_like(hidden_states)
@@ -810,21 +828,34 @@ class OlmoHybridDecoderLayer(nn.Module):
                 output=attn_output,
             )
             hidden_states = residual + attn_output
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.POST_ATTN
+            )
 
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.POST_MLP
+            )
         else:
             residual = hidden_states
+            residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
             hidden_states = self.self_attn(positions, hidden_states)
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = residual + hidden_states
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.POST_ATTN
+            )
 
             residual = hidden_states
             hidden_states = self.mlp(hidden_states)
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = residual + hidden_states
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.POST_MLP
+            )
         return hidden_states
 
 
@@ -847,6 +878,7 @@ class OlmoHybridModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         self.norm = RMSNorm(
             self.config.hidden_size,

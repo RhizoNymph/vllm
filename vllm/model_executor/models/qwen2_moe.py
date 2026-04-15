@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen2MoeConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -51,6 +52,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -184,11 +192,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
+        shared_out, fused_out = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if self.shared_expert is not None:
-            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+        final_hidden_states = (
+            shared_out + fused_out if shared_out is not None else fused_out
+        )
         if self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
                 final_hidden_states
@@ -293,9 +302,18 @@ class Qwen2MoeDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
@@ -314,12 +332,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         # Note: Qwen/Qwen2-57B-A14B-Instruct does not have
         # `mlp_only_layers` in the config.
-        layer_idx = extract_layer_index(prefix)
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
-        if (layer_idx not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+        if (self.layer_idx not in mlp_only_layers) and (
+            config.num_experts > 0
+            and (self.layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 config=config, quant_config=quant_config, prefix=f"{prefix}.mlp"
@@ -349,6 +367,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -356,7 +375,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 
 
@@ -371,6 +392,9 @@ class Qwen2MoeModel(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.config = config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -385,9 +409,12 @@ class Qwen2MoeModel(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size

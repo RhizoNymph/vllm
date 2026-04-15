@@ -32,6 +32,7 @@ import torch
 from torch import nn
 from transformers import Olmo2Config, Olmo3Config
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -48,6 +49,13 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -242,6 +250,16 @@ class Olmo2DecoderLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         assert isinstance(config, (Olmo2Config, Olmo3Config))
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        self.layer_idx = extract_layer_index(prefix)
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         # Attention block.
         self.self_attn = Olmo2Attention(
             vllm_config=vllm_config, prefix=f"{prefix}.self_attn"
@@ -266,15 +284,22 @@ class Olmo2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Attention block.
         residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_ATTN
+        )
 
         # MLP block.
         residual = hidden_states
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
         return hidden_states
 
 
@@ -295,6 +320,7 @@ class Olmo2Model(nn.Module):
             lambda prefix: Olmo2DecoderLayer(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

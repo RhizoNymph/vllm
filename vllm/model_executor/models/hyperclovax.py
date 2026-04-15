@@ -32,6 +32,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -46,6 +47,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -61,6 +69,7 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -210,6 +219,16 @@ class HyperCLOVAXDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         self.residual_multiplier = config.residual_multiplier
         max_position_embeddings = getattr(
             config,
@@ -272,6 +291,7 @@ class HyperCLOVAXDecoderLayer(nn.Module):
 
         # Self Attention
         residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -282,6 +302,9 @@ class HyperCLOVAXDecoderLayer(nn.Module):
 
         # The residual is added outside the layernorm function to apply muP.
         hidden_states = residual + hidden_states * self.residual_multiplier  # muP
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_ATTN
+        )
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -293,6 +316,9 @@ class HyperCLOVAXDecoderLayer(nn.Module):
 
         # The residual is added outside the layernorm function to apply muP.
         hidden_states = residual + hidden_states * self.residual_multiplier  # muP
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
 
         return hidden_states, residual
 
@@ -330,6 +356,7 @@ class HyperCLOVAXModel(nn.Module):
             lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.norm: RMSNorm | PPMissingLayer
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

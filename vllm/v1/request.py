@@ -6,6 +6,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -160,6 +161,12 @@ class Request:
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []
+        self.block_hash_prefill_steering_config_hash = (
+            self.prefill_steering_config_hash
+        )
+        self.block_hash_decode_steering_config_hash = (
+            self.decode_steering_config_hash
+        )
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
@@ -215,6 +222,38 @@ class Request:
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
 
+    def set_block_hash_steering_overrides(
+        self,
+        prefill_hash: int | None = None,
+        decode_hash: int | None = None,
+    ) -> None:
+        """Update the steering hashes used for block-hash generation.
+
+        Prefix-cache keys must track the effective steering applied when KV
+        blocks are produced. Scheduler-side capacity checks may temporarily
+        force a request onto the global fallback rows before the per-request
+        steering config can be registered, in which case APC should hash with
+        0 for that phase rather than the deferred per-request hash.
+        """
+        new_prefill_hash = (
+            self.prefill_steering_config_hash
+            if prefill_hash is None
+            else prefill_hash
+        )
+        new_decode_hash = (
+            self.decode_steering_config_hash if decode_hash is None else decode_hash
+        )
+        if (
+            self.block_hash_prefill_steering_config_hash == new_prefill_hash
+            and self.block_hash_decode_steering_config_hash == new_decode_hash
+        ):
+            return
+
+        self.block_hash_prefill_steering_config_hash = new_prefill_hash
+        self.block_hash_decode_steering_config_hash = new_decode_hash
+        self.block_hashes.clear()
+        self.update_block_hashes()
+
     @property
     def use_structured_output(self) -> bool:
         return self.structured_output_request is not None
@@ -238,6 +277,34 @@ class Request:
     @property
     def has_encoder_inputs(self) -> bool:
         return self.num_encoder_inputs > 0
+
+    @cached_property
+    def prefill_steering_config_hash(self) -> int:
+        """0 if no prefill steering, else deterministic hash of vectors.
+
+        Delegates to ``SamplingParams.prefill_steering_config_hash``, which is
+        itself ``@cached_property``. This means many requests sharing the same
+        ``SamplingParams`` instance only compute the hash once across the
+        entire batch, instead of once per request.
+        """
+        if self.sampling_params is None:
+            return 0
+        return self.sampling_params.prefill_steering_config_hash
+
+    @cached_property
+    def decode_steering_config_hash(self) -> int:
+        """0 if no decode steering, else deterministic hash of vectors.
+        See ``prefill_steering_config_hash``."""
+        if self.sampling_params is None:
+            return 0
+        return self.sampling_params.decode_steering_config_hash
+
+    def invalidate_steering_hashes(self) -> None:
+        """Clear cached steering hashes so they recompute from current
+        sampling_params.  Must be called whenever sampling_params is
+        replaced (e.g. streaming session updates)."""
+        self.__dict__.pop("prefill_steering_config_hash", None)
+        self.__dict__.pop("decode_steering_config_hash", None)
 
     def get_skip_reading_prefix_cache(self) -> bool:
         if (

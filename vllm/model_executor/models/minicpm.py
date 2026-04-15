@@ -33,6 +33,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -54,6 +55,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -72,6 +80,7 @@ from .interfaces import (
 )
 from .utils import (
     AutoWeightsLoader,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -319,12 +328,21 @@ class MiniCPMDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
         self.config = config
         self.cache_config = cache_config
         self.quant_config = quant_config
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.prefix = prefix
         self._init_attn_block()
@@ -376,6 +394,7 @@ class MiniCPMDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
@@ -384,6 +403,9 @@ class MiniCPMDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states * (
             self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
         )
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_ATTN
+        )
 
         # Fully Connected
         residual = hidden_states
@@ -391,6 +413,9 @@ class MiniCPMDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states * (
             self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
+        )
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
         )
 
         return hidden_states, None
@@ -404,6 +429,9 @@ class MiniCPMModel(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.config = config
         self.cache_config = cache_config
@@ -416,7 +444,14 @@ class MiniCPMModel(nn.Module, EagleModelMixin):
             config.hidden_size,
         )
         self.num_experts = getattr(self.config, "num_experts", 0)
-        self._init_layers(prefix, config, cache_config, quant_config)
+        self._init_layers(
+            prefix,
+            config,
+            cache_config,
+            quant_config,
+            max_steering_tokens,
+            max_steering_configs,
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -429,14 +464,22 @@ class MiniCPMModel(nn.Module, EagleModelMixin):
         config: PretrainedConfig,
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
+        max_steering_tokens: int,
+        max_steering_configs: int,
     ):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: MiniCPMDecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         embedding = self.embed_tokens(input_ids)

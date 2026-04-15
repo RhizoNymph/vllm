@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from transformers import MiniMaxConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed.parallel_state import (
@@ -42,6 +43,13 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -283,6 +291,8 @@ class MiniMaxText01DecoderLayer(nn.Module):
         layer_id: int = None,
         linear_layer_id: int | None = None,
         prefix: str = "decoder",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         self._ilayer = layer_id
         self._irank = get_tensor_model_parallel_rank()
@@ -290,7 +300,14 @@ class MiniMaxText01DecoderLayer(nn.Module):
         super().__init__()
 
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_id
         self.expert_num = expert_num
+        register_steering_buffers(
+            self,
+            self.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         head_dim = getattr(config, "head_dim", None)
         if head_dim is None:
@@ -436,6 +453,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
         layernorm_input = hidden_states
         layernorm_output = self.input_layernorm(layernorm_input)
         residual = layernorm_output if self.postnorm else layernorm_input
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         self_attention_output = torch.empty_like(layernorm_output)
         self.self_attn(
             hidden_states=layernorm_output,
@@ -449,6 +467,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
         layernorm_input = residual + self_attention_output
         layernorm_output = self.post_attention_layernorm(layernorm_input)
         residual = layernorm_output if self.postnorm else layernorm_input
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
 
         if self.expert_num == 1:
             hidden_states = self.mlp(layernorm_output)
@@ -477,6 +496,9 @@ class MiniMaxText01DecoderLayer(nn.Module):
         hidden_states = hidden_states * self.layernorm_mlp_beta
 
         hidden_states = residual + hidden_states
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
 
         return hidden_states, None
 
@@ -499,6 +521,9 @@ class MiniMaxText01Model(nn.Module):
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
         scheduler_config = vllm_config.scheduler_config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
         self.config = config
         self.CONCAT_FFN = True
 
@@ -565,12 +590,17 @@ class MiniMaxText01Model(nn.Module):
                 decoder_kwargs["expert_num"] = 1
 
             return MiniMaxText01DecoderLayer(
-                layer_config, **decoder_kwargs, prefix=prefix
+                layer_config,
+                **decoder_kwargs,
+                prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, layer_fn, prefix=f"{prefix}.layers"
         )
+        share_steering_index_across_layers(self.layers)
 
         linear_layer_nums = sum(
             1

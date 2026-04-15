@@ -30,6 +30,7 @@ from torch import nn
 from torch.nn import LayerNorm
 from transformers import FalconConfig as HF_FalconConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -48,6 +49,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -59,6 +67,7 @@ from vllm.transformers_utils.configs.falcon import RWConfig
 from .interfaces import SupportsPP
 from .utils import (
     AutoWeightsLoader,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -271,9 +280,18 @@ class FalconDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ):
         super().__init__()
         hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
         self.num_heads = config.num_attention_heads
         self.self_attention = FalconAttention(
             config, cache_config, quant_config, prefix=f"{prefix}.self_attention"
@@ -313,6 +331,7 @@ class FalconDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         if self.config.num_ln_in_parallel_attn == 2:
             attention_layernorm_out = self.ln_attn(hidden_states)
@@ -333,6 +352,9 @@ class FalconDecoderLayer(nn.Module):
                 mlp_layernorm_out = attention_layernorm_out
             else:
                 residual += attention_output
+                residual = apply_layer_steering(
+                    self, residual, SteeringHookPoint.POST_ATTN
+                )
                 mlp_layernorm_out = self.post_attention_layernorm(residual)
 
         if (
@@ -359,6 +381,7 @@ class FalconDecoderLayer(nn.Module):
                 mlp_output += mlp_bias
 
         output = mlp_output + residual
+        output = apply_layer_steering(self, output, SteeringHookPoint.POST_MLP)
         return output
 
 
@@ -370,6 +393,9 @@ class FalconModel(nn.Module):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.config = config
         self.embed_dim = config.hidden_size
@@ -386,10 +412,16 @@ class FalconModel(nn.Module):
         self.start_layer, self.end_layer, self.h = make_layers(
             config.num_hidden_layers,
             lambda prefix: FalconDecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.h",
         )
+        share_steering_index_across_layers(self.h)
 
         # Final Layer Norm
         self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)

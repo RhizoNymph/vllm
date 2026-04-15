@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from transformers import Gemma3TextConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -40,6 +41,10 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    HOOK_POINT_TABLE_ATTR,
+    SteeringHookPoint,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -238,9 +243,33 @@ class Gemma3DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
+
+        # Activation steering buffers — one vector + table pair per hook
+        # point.  All four are always allocated (the memory cost is
+        # trivial) so the forward path is unconditional.  Buffers are
+        # updated in-place by the model runner before each step; zero
+        # rows act as a no-op.  torch.compile lifts them as graph inputs,
+        # so no splitting op is needed.
+        for hp in SteeringHookPoint:
+            self.register_buffer(
+                HOOK_POINT_TABLE_ATTR[hp],
+                torch.zeros(max_steering_configs + 3, config.hidden_size),
+                persistent=False,
+            )
+        # Shared steering index mapping token positions to table rows.
+        # Placeholder — replaced by a shared tensor during model init.
+        self.register_buffer(
+            "steering_index",
+            torch.zeros(max_steering_tokens, dtype=torch.long),
+            persistent=False,
+        )
+
         self.self_attn = Gemma3Attention(
             config=config,
             hidden_size=self.hidden_size,
@@ -284,6 +313,16 @@ class Gemma3DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # Steering: indexed gather from each hook point's table.
+        # Zero rows are no-ops.  The custom op is registered but NOT
+        # as a splitting op — it's opaque to the tracer (preventing
+        # constant-folding and AOT cache pickle issues) but does not
+        # partition the compiled graph.
+        residual = torch.ops.vllm.apply_steering(
+            residual, self.steering_table_pre_attn, self.steering_index
+        )
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -291,11 +330,21 @@ class Gemma3DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
 
+        residual = torch.ops.vllm.apply_steering(
+            residual, self.steering_table_post_attn, self.steering_index
+        )
+
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
         )
         hidden_states = self.mlp(hidden_states)
+
+        residual = torch.ops.vllm.apply_steering(
+            residual, self.steering_table_post_mlp, self.steering_index
+        )
+
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+
         return hidden_states, residual
 
 
@@ -309,6 +358,13 @@ class Gemma3Model(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        steering_config = getattr(vllm_config, "steering_config", None)
+        max_steering_configs = (
+            steering_config.max_steering_configs if steering_config else 0
+        )
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -318,10 +374,23 @@ class Gemma3Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Gemma3DecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                max_steering_tokens=max_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )
+
+        # Share one steering_index backing tensor across all decoder layers
+        # so the model runner updates it once and all layers see the change.
+        if self.layers:
+            shared_steering_index = self.layers[0].steering_index
+            for layer in self.layers[1:]:
+                layer.steering_index = shared_steering_index
+
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Normalize the embedding by sqrt(hidden_size)

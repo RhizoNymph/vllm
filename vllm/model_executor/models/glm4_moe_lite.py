@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 if TYPE_CHECKING:
     from transformers.models.glm4_moe_lite import Glm4MoeLiteConfig
 
@@ -44,6 +45,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -104,6 +112,8 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         prefix: str,
         config: "Glm4MoeLiteConfig | None" = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
     ) -> None:
         super().__init__()
 
@@ -120,6 +130,12 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         # verify MLA attention specific fields
         qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
@@ -186,6 +202,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         attn_kwargs = {
             "positions": positions,
@@ -195,7 +212,9 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         hidden_states = self.self_attn(**attn_kwargs)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
 
         return hidden_states, residual
 
@@ -216,6 +235,9 @@ class Glm4MoeLiteModel(nn.Module):
         quant_config = vllm_config.quant_config
         self.config = config
         self.device = current_platform.device_type
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
 
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
@@ -247,9 +269,12 @@ class Glm4MoeLiteModel(nn.Module):
                 config=config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

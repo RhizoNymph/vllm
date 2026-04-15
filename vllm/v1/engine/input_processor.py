@@ -49,6 +49,7 @@ class InputProcessor:
         self.speculative_config = vllm_config.speculative_config
         self.structured_outputs_config = vllm_config.structured_outputs_config
         self.observability_config = vllm_config.observability_config
+        self.steering_config = vllm_config.steering_config
 
         self.generation_config_fields = model_config.try_get_generation_config()
 
@@ -154,6 +155,21 @@ class InputProcessor:
                 "[lora_path]` to use the LoRA tokenizer."
             )
 
+    def _validate_steering(self, params: SamplingParams | PoolingParams) -> None:
+        if not isinstance(params, SamplingParams):
+            return
+        has_steering = (
+            params.steering_vectors is not None
+            or params.prefill_steering_vectors is not None
+            or params.decode_steering_vectors is not None
+        )
+        if has_steering and not self.steering_config:
+            raise ValueError(
+                "Per-request steering vectors were provided but steering "
+                "is not enabled. Start the server with --enable-steering "
+                "to use per-request steering vectors."
+            )
+
     def _get_mm_identifier(
         self,
         mm_hash: str,
@@ -208,6 +224,7 @@ class InputProcessor:
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
+        self._validate_steering(params)
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size
