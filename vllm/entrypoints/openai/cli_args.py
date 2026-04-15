@@ -290,6 +290,12 @@ class FrontendArgs(BaseFrontendArgs):
     api_key: list[str] | None = None
     """If provided, the server will require one of these keys to be presented in
     the header."""
+    steering_api_key: list[str] | None = None
+    """If provided, POST /v1/steering/set and POST /v1/steering/clear require
+    one of these keys to be presented as an `Authorization: Bearer` token,
+    in addition to any server-wide --api-key check.  Intended for operators
+    who want to issue a narrower credential for mutating global steering
+    state.  If unset, falls back to the VLLM_STEERING_API_KEY env var."""
     ssl_keyfile: str | None = None
     """The file path to the SSL key file."""
     ssl_certfile: str | None = None

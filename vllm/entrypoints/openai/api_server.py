@@ -343,6 +343,13 @@ async def init_app_state(
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
     state.args = args
+    # Resolve steering mutation API tokens.  --steering-api-key on the
+    # CLI takes precedence over VLLM_STEERING_API_KEY, mirroring how the
+    # server-wide --api-key / VLLM_API_KEY pair is resolved above.
+    steering_api_key_source = getattr(args, "steering_api_key", None) or [
+        envs.VLLM_STEERING_API_KEY
+    ]
+    state.steering_api_tokens = [key for key in steering_api_key_source if key]
     resolved_chat_template = load_chat_template(args.chat_template)
 
     # Merge default_mm_loras into the static lora_modules

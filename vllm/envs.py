@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
+    VLLM_STEERING_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
@@ -646,6 +647,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # API key for vLLM API server
     "VLLM_API_KEY": lambda: os.environ.get("VLLM_API_KEY", None),
+    # Separate API key required for mutating global steering state via
+    # POST /v1/steering/set and POST /v1/steering/clear.  When unset,
+    # those endpoints are not additionally gated beyond the server-wide
+    # --api-key / VLLM_API_KEY check (and VLLM_SERVER_DEV_MODE=1, which
+    # must also be set for the steering router to be attached at all).
+    "VLLM_STEERING_API_KEY": lambda: os.environ.get("VLLM_STEERING_API_KEY", None),
     # Whether to log responses from API Server for debugging
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": lambda: os.environ.get(
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False"

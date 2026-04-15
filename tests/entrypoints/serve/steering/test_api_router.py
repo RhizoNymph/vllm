@@ -519,3 +519,109 @@ class TestAttachRouter:
             attach_router(app)
         paths = {r.path for r in app.routes}
         assert "/v1/steering/set" not in paths
+
+
+# --- steering API key auth ---
+
+
+def _make_app_with_tokens(engine_mock, tokens: list[str] | None) -> FastAPI:
+    """Build a FastAPI app with steering_api_tokens on app.state."""
+    app = FastAPI()
+    app.state.engine_client = engine_mock
+    app.state.steering_api_tokens = tokens
+    app.include_router(router)
+    return app
+
+
+class TestSteeringAPIKeyAuth:
+    """Tests that /v1/steering/set and /clear honor the steering API key."""
+
+    def test_set_no_tokens_configured_is_open(self, engine):
+        """When no tokens configured, /set requires no Authorization."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        client = _SyncASGIClient(_make_app_with_tokens(engine, None))
+        resp = client.post("/v1/steering/set", json=_vecs({"0": [1.0]}))
+        assert resp.status_code == 200
+
+    def test_set_empty_tokens_configured_is_open(self, engine):
+        """An empty token list behaves the same as unconfigured."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        client = _SyncASGIClient(_make_app_with_tokens(engine, []))
+        resp = client.post("/v1/steering/set", json=_vecs({"0": [1.0]}))
+        assert resp.status_code == 200
+
+    def test_set_missing_bearer_returns_401(self, engine):
+        """Tokens configured but no Authorization header -> 401."""
+        client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
+        resp = client.post("/v1/steering/set", json=_vecs({"0": [1.0]}))
+        assert resp.status_code == 401
+        engine.collective_rpc.assert_not_called()
+
+    def test_set_wrong_bearer_returns_401(self, engine):
+        """Wrong bearer token -> 401, no RPC dispatched."""
+        client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [1.0]}),
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert resp.status_code == 401
+        engine.collective_rpc.assert_not_called()
+
+    def test_set_wrong_scheme_returns_401(self, engine):
+        """Non-Bearer scheme rejected even if the token value matches."""
+        client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [1.0]}),
+            headers={"Authorization": "Basic secret"},
+        )
+        assert resp.status_code == 401
+        engine.collective_rpc.assert_not_called()
+
+    def test_set_correct_bearer_is_allowed(self, engine):
+        """Correct bearer token lets the request through."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [1.0]}),
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert resp.status_code == 200
+
+    def test_set_accepts_any_configured_token(self, engine):
+        """Any token in the configured list is accepted."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        client = _SyncASGIClient(
+            _make_app_with_tokens(engine, ["primary", "backup"])
+        )
+        resp = client.post(
+            "/v1/steering/set",
+            json=_vecs({"0": [1.0]}),
+            headers={"Authorization": "Bearer backup"},
+        )
+        assert resp.status_code == 200
+
+    def test_clear_missing_bearer_returns_401(self, engine):
+        """Clear endpoint is gated the same as set."""
+        client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
+        resp = client.post("/v1/steering/clear")
+        assert resp.status_code == 401
+        engine.collective_rpc.assert_not_called()
+
+    def test_clear_correct_bearer_is_allowed(self, engine):
+        """Clear with a valid bearer token succeeds."""
+        client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
+        resp = client.post(
+            "/v1/steering/clear",
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert resp.status_code == 200
+
+    def test_get_status_is_not_gated(self, engine):
+        """Read-only GET /v1/steering is not gated by the steering key."""
+        engine.collective_rpc.return_value = [{}]
+        client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
+        resp = client.get("/v1/steering")
+        assert resp.status_code == 200

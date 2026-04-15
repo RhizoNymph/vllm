@@ -117,6 +117,38 @@ layer's forward path. Unused hook points are zero-valued no-ops.
 
 Global steering endpoints require `VLLM_SERVER_DEV_MODE=1`.
 
+### Gating Mutation Endpoints Behind a Steering API Key
+
+`POST /v1/steering/set` and `POST /v1/steering/clear` can optionally be
+gated behind a dedicated steering API key, separate from the server-wide
+`--api-key`.  This lets operators issue a narrower credential for
+mutating global steering state without handing out the main server key.
+
+Configure it with either the CLI flag or the env var:
+
+```bash
+vllm serve google/gemma-3-4b-it --steering-api-key my-steering-secret
+
+# or
+VLLM_STEERING_API_KEY=my-steering-secret vllm serve google/gemma-3-4b-it
+```
+
+The CLI flag accepts multiple values to support key rotation:
+
+```bash
+vllm serve google/gemma-3-4b-it \
+  --steering-api-key primary-key --steering-api-key rotation-key
+```
+
+When configured, requests to `/v1/steering/set` and `/v1/steering/clear`
+must include an `Authorization: Bearer <key>` header; anything else
+returns `401 Unauthorized` without dispatching the mutation.  This check
+is additive with the server-wide `--api-key` middleware: if both are
+set, requests must satisfy both.
+
+Read-only `GET /v1/steering` and the `/v1/steering/modules/*` endpoints
+are **not** gated by this key.
+
 ### Set Steering
 
 ```bash
@@ -376,6 +408,8 @@ as long as the model has been wired correctly.
 - See [Supported Scope](#supported-scope) for the list of wired decoder
   architectures
 - Global HTTP endpoints are gated behind `VLLM_SERVER_DEV_MODE=1`
+- `POST /v1/steering/set` and `POST /v1/steering/clear` can additionally
+  be gated behind `--steering-api-key` / `VLLM_STEERING_API_KEY`
 - Per-request steering requires `--enable-steering`
 - Distinct steering configs in flight are capped by `--max-steering-configs`
 
