@@ -10,8 +10,12 @@ from typing import Annotated, Any, Literal
 from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
+from vllm.config.activation_storing_types import ActivationStoringSpec
 from vllm.config.steering_types import SteeringVectorSpec
 from vllm.config.utils import replace
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ActivationStorageResponse,
+)
 from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
     LegacyStructuralTagResponseFormat,
@@ -205,6 +209,22 @@ class CompletionRequest(OpenAIBaseModel):
         "composed with any inline steering vector fields.",
     )
 
+    activation_storing: ActivationStoringSpec | None = Field(
+        default=None,
+        description=(
+            "Per-request activation storing spec. When set, the server "
+            "captures residual-stream activations at the requested "
+            "``(layer, hook, position)`` tuples and writes them to the "
+            "filesystem root configured via ``--activation-storing``. The "
+            "HTTP response carries a small ``activation_storage`` pointer "
+            "(paths written, status, optional error) - never the bytes. "
+            "Rejected with HTTP 400 when the server was not started with "
+            "``--activation-storing`` or when the spec violates an "
+            "admission-time invariant (unknown layer, byte budget, "
+            "prefix-cache position, etc.)."
+        ),
+    )
+
     # --8<-- [end:completion-extra-params]
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
@@ -321,7 +341,7 @@ class CompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        return SamplingParams.from_optional(
+        sampling_params = SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
@@ -354,6 +374,13 @@ class CompletionRequest(OpenAIBaseModel):
             prefill_steering_vectors=self.prefill_steering_vectors,
             decode_steering_vectors=self.decode_steering_vectors,
         )
+        # Attach the activation_storing spec on the sampling params after
+        # construction. ``SamplingParams.from_optional`` does not accept
+        # this field (phase 1 reserved the slot on ``SamplingParams`` but
+        # did not widen ``from_optional``'s signature). Setting it here
+        # keeps the phase 5 edit scoped to entrypoint files.
+        sampling_params.activation_storing = self.activation_storing
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
@@ -515,6 +542,15 @@ class CompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    activation_storage: ActivationStorageResponse | None = Field(
+        default=None,
+        description=(
+            "Per-request activation storing result. Populated when the "
+            "request included an ``activation_storing`` spec; otherwise "
+            "omitted. The bytes themselves are never inlined here - only "
+            "the on-disk paths and a status pointer."
+        ),
+    )
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
@@ -543,3 +579,16 @@ class CompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: list[CompletionResponseStreamChoice]
     usage: UsageInfo | None = Field(default=None)
+    # vLLM-specific: per-request activation storing pointer. Placed as a
+    # sibling of ``usage`` (rather than inside it) so adding this field
+    # does not change the schema of ``UsageInfo`` for other consumers.
+    # Only populated on the final SSE frame when the originating request
+    # included an ``activation_storing`` spec.
+    activation_storage: ActivationStorageResponse | None = Field(
+        default=None,
+        description=(
+            "Per-request activation storing result, sent on the final SSE "
+            "frame alongside the final usage block. See "
+            "``ActivationStorageResponse`` for semantics."
+        ),
+    )
