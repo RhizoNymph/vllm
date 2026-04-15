@@ -343,6 +343,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.config = config
         self.layer_id = layer_id
+        self.layer_idx = layer_id
         max_steering_tokens, max_steering_configs = get_steering_buffer_config(
             vllm_config
         )

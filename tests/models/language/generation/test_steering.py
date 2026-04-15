@@ -262,6 +262,78 @@ _FALCON_OVERRIDES = {
     "bias": False,
 }
 
+_ARCTIC_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_local_experts": 2,
+    "num_experts_per_tok": 2,
+    "moe_layer_frequency": 1,
+    "use_residual": True,
+    "parallel_attn_mlp_res": True,
+    "enable_expert_tensor_parallelism": False,
+}
+
+_FLEX_OLMO_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_experts": 2,
+    "num_experts_per_tok": 2,
+}
+
+_HUNYUAN_DENSE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "head_dim": 64,
+    "attention_head_dim": 64,
+    "use_cla": False,
+    "cla_share_factor": 1,
+    "use_qk_norm": True,
+    "mlp_bias": False,
+}
+
+def _mimo_v2_flash_overrides(config):
+    """Callable override: shrink dims and strip block-scaled fp8 quant.
+
+    Block-scaled fp8 (``quantization_config: fp8``) only works on Hopper/Ada;
+    the test targets must run without a real checkpoint on any CUDA card,
+    so we clear the quantization config entirely.
+    """
+    config.num_hidden_layers = 1
+    config.hidden_size = 512
+    config.intermediate_size = 1024
+    config.num_attention_heads = 8
+    config.num_key_value_heads = 4
+    config.head_dim = 64
+    config.v_head_dim = 64
+    config.partial_rotary_factor = 1.0
+    config.hybrid_layer_pattern = [0]
+    config.moe_layer_freq = [0]
+    config.attention_value_scale = None
+    if hasattr(config, "quantization_config"):
+        delattr(config, "quantization_config")
+    return config
+
+def _param2moe_overrides(config):
+    """Callable override: shrink dims, force MoE on layer 1, strip fp8."""
+    config.num_hidden_layers = 2
+    config.hidden_size = 512
+    config.intermediate_size = 1024
+    config.num_attention_heads = 8
+    config.num_key_value_heads = 8
+    config.head_dim = 64
+    config.first_k_dense_replace = 1
+    config.num_experts = 2
+    config.num_experts_per_tok = 2
+    config.num_shared_experts = 2
+    config.moe_intermediate_size = 1024
+    config.moe_shared_expert_intermediate_size = 1024
+    config.n_group = 1
+    config.topk_group = 1
+    config.num_nextn_predict_layers = 0
+    config.routed_scaling_factor = 1.0
+    config.partial_rotary_factor = 1.0
+    config.use_qk_norm = True
+    if hasattr(config, "quantization_config"):
+        delattr(config, "quantization_config")
+    return config
+
 _TRUST_REMOTE_EAGER = {"trust_remote_code": True, "enforce_eager": True}
 _EAGER_ONLY = {"enforce_eager": True}
 _NO_REMOTE_EAGER = {"trust_remote_code": False, "enforce_eager": True}
@@ -692,6 +764,68 @@ PHASE5_GENERATION_CASES = [
         _NO_REMOTE_EAGER,
         500.0,
         id="falcon",
+    ),
+]
+
+PHASE6_DISCOVERY_CASES = [
+    # arctic is steering-wired but cannot be loaded under torch >= 2.9 because
+    # ``arctic.local_moe_fused`` passes ``inplace=True`` to ``fused_experts``
+    # unconditionally. Re-enable once that pre-existing issue is fixed.
+    pytest.param(
+        "allenai/Flex-reddit-2x7B-1T",
+        _FLEX_OLMO_OVERRIDES,
+        _EAGER_ONLY,
+        id="flex-olmo",
+    ),
+    pytest.param(
+        "tencent/Hunyuan-7B-Instruct",
+        _HUNYUAN_DENSE_OVERRIDES,
+        _EAGER_ONLY,
+        id="hunyuan-dense",
+    ),
+    pytest.param(
+        "XiaomiMiMo/MiMo-V2-Flash",
+        _mimo_v2_flash_overrides,
+        _TRUST_REMOTE_EAGER,
+        id="mimo-v2-flash",
+    ),
+    pytest.param(
+        "bharatgenai/Param2-17B-A2.4B-Thinking",
+        _param2moe_overrides,
+        _TRUST_REMOTE_EAGER,
+        id="param2moe",
+    ),
+]
+
+PHASE6_GENERATION_CASES = [
+    # arctic skipped — see PHASE6_DISCOVERY_CASES comment above.
+    pytest.param(
+        "allenai/Flex-reddit-2x7B-1T",
+        _FLEX_OLMO_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="flex-olmo",
+    ),
+    pytest.param(
+        "tencent/Hunyuan-7B-Instruct",
+        _HUNYUAN_DENSE_OVERRIDES,
+        _EAGER_ONLY,
+        500.0,
+        id="hunyuan-dense",
+    ),
+    pytest.param(
+        "XiaomiMiMo/MiMo-V2-Flash",
+        _mimo_v2_flash_overrides,
+        _TRUST_REMOTE_EAGER,
+        500.0,
+        id="mimo-v2-flash",
+    ),
+    pytest.param(
+        "bharatgenai/Param2-17B-A2.4B-Thinking",
+        _param2moe_overrides,
+        _TRUST_REMOTE_EAGER,
+        500.0,
+        id="param2moe",
     ),
 ]
 
@@ -1618,6 +1752,116 @@ def test_steering_changes_output_legacy_decoder_family(
     vector_scale: float,
 ) -> None:
     """Legacy decoder families should respond to steering."""
+    try:
+        model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
+        model_info.check_available_online(on_fail="skip")
+    except ValueError:
+        pass
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        prompt = "What does the fox say? " * 32
+        sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=5)
+
+        runner_kwargs = _runner_kwargs(hf_overrides, extra_runner_kwargs)
+        runner_kwargs["enable_prefix_caching"] = True
+
+        try:
+            with vllm_runner(model, **runner_kwargs) as llm:
+                baseline_tokens, baseline_logprob = _gen_tokens_and_cumulative_logprob(
+                    llm, prompt, sampling
+                )
+
+                assert llm.llm.reset_prefix_cache()
+
+                target_layer, hidden_size = _discover_layers(llm)
+
+                vec = [vector_scale] * hidden_size
+                llm.llm.collective_rpc(
+                    "set_steering_vectors",
+                    kwargs={"vectors": {_HP: {target_layer: vec}}},
+                )
+
+                steered_tokens, steered_logprob = _gen_tokens_and_cumulative_logprob(
+                    llm, prompt, sampling
+                )
+
+                assert steered_tokens != baseline_tokens or not math.isclose(
+                    steered_logprob,
+                    baseline_logprob,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ), f"Steering should change output or logprob for {model}"
+
+                llm.llm.collective_rpc("clear_steering_vectors")
+                assert llm.llm.reset_prefix_cache()
+
+                restored_tokens, restored_logprob = _gen_tokens_and_cumulative_logprob(
+                    llm, prompt, sampling
+                )
+        except Exception as exc:
+            _maybe_skip_model_access_failure(exc, model)
+            raise
+
+        assert restored_tokens == baseline_tokens, (
+            f"Clearing steering should restore baseline for {model}"
+        )
+        assert math.isclose(
+            restored_logprob,
+            baseline_logprob,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ), f"Clearing steering should restore baseline logprob for {model}"
+
+
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs"), PHASE6_DISCOVERY_CASES
+)
+def test_steering_layers_discovered_new_decoder_family(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+) -> None:
+    """Newly-wired decoder families (arctic, flex_olmo, hunyuan_v1,
+    mimo_v2_flash, param2moe) should expose steerable layers."""
+    try:
+        model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
+        model_info.check_available_online(on_fail="skip")
+    except ValueError:
+        pass
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        try:
+            with vllm_runner(
+                model, **_runner_kwargs(hf_overrides, extra_runner_kwargs)
+            ) as llm:
+                target_layer, hidden_size = _discover_layers(llm)
+        except Exception as exc:
+            _maybe_skip_model_access_failure(exc, model)
+            raise
+
+        assert target_layer >= 0
+        assert hidden_size > 0
+
+
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs", "vector_scale"),
+    PHASE6_GENERATION_CASES,
+)
+def test_steering_changes_output_new_decoder_family(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+    vector_scale: float,
+) -> None:
+    """Newly-wired decoder families should respond to steering."""
     try:
         model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
         model_info.check_available_online(on_fail="skip")
