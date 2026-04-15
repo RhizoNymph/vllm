@@ -15,6 +15,7 @@ from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
+from vllm.config.activation_storing_types import ActivationStoringSpec
 from vllm.config.steering_types import (
     SteeringLayerEntry,
     SteeringVectorSpec,
@@ -311,6 +312,16 @@ class SamplingParams(
     """Phase-specific steering vectors added to base during decode only.
     Same format as ``steering_vectors``."""
 
+    activation_storing: ActivationStoringSpec | None = None
+    """Per-request activation storing spec. When set, the server captures
+    residual-stream activations at the requested ``(layer, hook,
+    position)`` tuples and writes them to the filesystem root configured
+    via ``--activation-storing``. Structural validation runs here at
+    construction; full admission validation (config enabled, TP/PP > 1
+    rejection, byte budget, prefix-cache position rejection) runs in the
+    OpenAI entrypoint and is *not* performed here — this field only
+    reserves the slot and validates its own shape."""
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -548,6 +559,35 @@ class SamplingParams(
             )
 
         self._validate_steering_vectors()
+        self._validate_activation_storing()
+
+    def _validate_activation_storing(self) -> None:
+        """Structural check on ``activation_storing``.
+
+        This mirrors :meth:`_validate_steering_vectors`: it runs at
+        construction and only checks that the spec is a well-formed
+        :class:`ActivationStoringSpec`. Full admission validation (config
+        enabled, TP/PP > 1 rejection, layer-in-range against the loaded
+        model, prefix-cache position rejection, byte budget) happens in
+        :mod:`vllm.entrypoints.openai.activation_storing_validation`
+        because it needs a ``VllmConfig`` and request context that are
+        not available at ``SamplingParams`` construction time.
+
+        Reviewers: do NOT add runtime behavior off this field here. The
+        field is a reserved slot in phase 1 of the activation-storing
+        roadmap; runtime wiring lands in later phases.
+        """
+        spec = self.activation_storing
+        if spec is None:
+            return
+        if not isinstance(spec, ActivationStoringSpec):
+            raise ValueError(
+                "activation_storing must be an ActivationStoringSpec, got "
+                f"{type(spec).__name__}"
+            )
+        # Re-run the dataclass post-init checks so mutations after
+        # construction (e.g., test fixtures) are re-validated.
+        spec.__post_init__()
 
     def _validate_steering_vectors(self) -> None:
         """Validate all steering vector fields if provided.

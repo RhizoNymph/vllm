@@ -33,6 +33,7 @@ from typing_extensions import TypeIs
 
 import vllm.envs as envs
 from vllm.config import (
+    ActivationStoringConfig,
     AttentionConfig,
     CacheConfig,
     CompilationConfig,
@@ -527,6 +528,23 @@ class EngineArgs:
     # Steering fields
     enable_steering: bool = False
     max_steering_configs: int = SteeringConfig.max_steering_configs
+
+    # Activation storing fields
+    # --activation-storing is the root-path flag; when unset, the whole
+    # feature is disabled and ``activation_storing_config`` stays ``None``.
+    # The remaining knobs only take effect when the root path is set.
+    activation_storing: str | None = None
+    activation_storing_writer_queue_size: int = (
+        ActivationStoringConfig.writer_queue_size
+    )
+    activation_storing_writer_timeout_seconds: int = (
+        ActivationStoringConfig.writer_timeout_seconds
+    )
+    activation_storing_writer_threads: int = ActivationStoringConfig.writer_threads
+    activation_storing_on_collision: str = ActivationStoringConfig.on_collision
+    activation_storing_max_bytes_per_request: int = (
+        ActivationStoringConfig.max_bytes_per_request
+    )
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -1152,6 +1170,69 @@ class EngineArgs:
         lora_group.add_argument("--default-mm-loras", **lora_kwargs["default_mm_loras"])
         lora_group.add_argument(
             "--specialize-active-lora", **lora_kwargs["specialize_active_lora"]
+        )
+
+        # Activation storing arguments.
+        #
+        # NOTE: Unlike the steering feature (whose ``EngineArgs`` fields
+        # are not wired to any ``add_argument`` calls and are therefore
+        # only usable from Python ``LLM(...)``), activation storing is
+        # required by spec to be usable from the ``vllm serve`` CLI. We
+        # register explicit argparse flags below instead of relying on
+        # the ``get_kwargs``-based auto-discovery used for most configs,
+        # because ``ActivationStoringConfig`` is instantiated conditionally
+        # (only when ``--activation-storing`` is set).
+        activation_storing_group = parser.add_argument_group(
+            title="ActivationStoringConfig",
+            description=ActivationStoringConfig.__doc__,
+        )
+        activation_storing_group.add_argument(
+            "--activation-storing",
+            type=str,
+            default=None,
+            metavar="ROOT_PATH",
+            help="Root directory for per-request activation captures. "
+            "Enables the activation storing feature when set; leave "
+            "unset to disable. When unset, any per-request "
+            "``activation_storing`` field is rejected at admission.",
+        )
+        activation_storing_group.add_argument(
+            "--activation-storing-writer-queue-size",
+            type=int,
+            default=ActivationStoringConfig.writer_queue_size,
+            help="Bounded queue size between the capture manager and the "
+            "writer thread pool. A full queue blocks the model runner's "
+            "finalize step up to --activation-storing-writer-timeout-seconds.",
+        )
+        activation_storing_group.add_argument(
+            "--activation-storing-writer-timeout-seconds",
+            type=int,
+            default=ActivationStoringConfig.writer_timeout_seconds,
+            help="Per-write timeout in seconds. Exceeding the timeout surfaces "
+            "as capture_status=partial_error on the owning request without "
+            "aborting text generation.",
+        )
+        activation_storing_group.add_argument(
+            "--activation-storing-writer-threads",
+            type=int,
+            default=ActivationStoringConfig.writer_threads,
+            help="Writer thread pool size. Raise if you have many concurrent "
+            "slow-disk writes.",
+        )
+        activation_storing_group.add_argument(
+            "--activation-storing-on-collision",
+            choices=["overwrite", "error", "suffix"],
+            default=ActivationStoringConfig.on_collision,
+            help="How to resolve collisions on (tag, layer, hook, request_id): "
+            "overwrite truncates in place, error rejects the request at "
+            "admission time, suffix appends a .{unix_ms} suffix to request_id.",
+        )
+        activation_storing_group.add_argument(
+            "--activation-storing-max-bytes-per-request",
+            type=int,
+            default=ActivationStoringConfig.max_bytes_per_request,
+            help="Per-request byte cap for estimated capture size, enforced "
+            "at admission time. 0 means unbounded.",
         )
 
         # Observability arguments
@@ -1872,6 +1953,29 @@ class EngineArgs:
             else None
         )
 
+        # Activation storing config is only materialized when the user
+        # passed a root path via ``--activation-storing``. Keeping it
+        # ``None`` preserves the cold path: the writer pool is not
+        # constructed, the capture custom op stays constant-folded out of
+        # compiled graphs, and the admission validator rejects any
+        # per-request ``activation_storing`` field with a clear error.
+        activation_storing_config = (
+            ActivationStoringConfig(
+                root_path=self.activation_storing,
+                writer_queue_size=self.activation_storing_writer_queue_size,
+                writer_timeout_seconds=(
+                    self.activation_storing_writer_timeout_seconds
+                ),
+                writer_threads=self.activation_storing_writer_threads,
+                on_collision=self.activation_storing_on_collision,  # type: ignore[arg-type]
+                max_bytes_per_request=(
+                    self.activation_storing_max_bytes_per_request
+                ),
+            )
+            if self.activation_storing is not None
+            else None
+        )
+
         if (
             lora_config is not None
             and speculative_config is not None
@@ -1988,6 +2092,7 @@ class EngineArgs:
             kernel_config=kernel_config,
             lora_config=lora_config,
             steering_config=steering_config,
+            activation_storing_config=activation_storing_config,
             speculative_config=speculative_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,

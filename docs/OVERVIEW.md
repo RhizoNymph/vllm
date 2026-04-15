@@ -54,3 +54,28 @@ Features Index:
             - extra_body.steering_name (per-request named module reference)
         depends_on: []
         doc: docs/features/steering.md
+    activation_storing:
+        description: >
+            Per-request activation storing — capture residual-stream
+            activations during the forward pass and write them directly to
+            a shared POSIX filesystem (typically NFS) for downstream SAE
+            training, linear probe training, and steering-vector
+            construction.  Clients opt in per request via an
+            ``activation_storing`` field on sampling params; the response
+            carries only a small pointer, never bytes.  Piggybacks on the
+            existing steering hook points (pre_attn, post_attn, post_mlp).
+            Phase 1 (this PR) ships types, config, CLI flags, and
+            admission validation only; runtime wiring (capture manager,
+            writer pool, runner integration, protocol surfacing) lands in
+            subsequent phases tracked in the roadmap doc.
+        entry_points:
+            - --activation-storing ROOT_PATH (CLI enable)
+            - --activation-storing-writer-queue-size (CLI)
+            - --activation-storing-writer-timeout-seconds (CLI)
+            - --activation-storing-writer-threads (CLI)
+            - --activation-storing-on-collision (CLI)
+            - --activation-storing-max-bytes-per-request (CLI)
+            - SamplingParams.activation_storing (per-request spec)
+        depends_on: [steering]
+        doc: docs/features/activation_storing.md
+        roadmap: docs/features/activation_storing_roadmap.md
