@@ -571,8 +571,12 @@ class Gemma3nDecoderLayer(nn.Module):
 
         # MLP.
         attn_norm = self.pre_feedforward_layernorm(attn_laurel)
+        attn_norm = apply_layer_steering(self, attn_norm, SteeringHookPoint.MLP_IN)
         attn_ffw = self.mlp(attn_norm)
         attn_ffw_norm = self.post_feedforward_layernorm(attn_ffw)
+        attn_ffw_norm = apply_layer_steering(
+            self, attn_ffw_norm, SteeringHookPoint.MLP_OUT
+        )
         attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
         attn_ffw_laurel_gated = apply_layer_steering(
             self, attn_ffw_laurel_gated, SteeringHookPoint.POST_MLP

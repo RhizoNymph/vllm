@@ -31,10 +31,18 @@ from typing import Any, Literal
 # whenever steering grows a new hook point, this tuple must be updated in
 # lockstep. A regression test in the admission validator pins the set so the
 # drift can't go unnoticed.
-HookPointName = Literal["pre_attn", "post_attn", "post_mlp"]
+#
+# ``pre_attn`` / ``post_attn`` / ``post_mlp`` tap the residual skip stream.
+# ``mlp_in`` / ``mlp_out`` tap the tensors inside the MLP sublayer:
+# ``mlp_in`` is the post-layernorm input to the MLP block, ``mlp_out`` is
+# the MLP block's output before it's added back to the residual. The two
+# MLP-internal taps have the same ``hidden_size`` shape as the residual
+# taps and live at the same ``(layer, hook)`` granularity, so the writer
+# byte math and sidecar format carry over unchanged.
+HookPointName = Literal["pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"]
 
 VALID_ACTIVATION_HOOK_NAMES: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_mlp")
+    ("pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out")
 )
 
 

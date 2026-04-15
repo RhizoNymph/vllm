@@ -1019,6 +1019,7 @@ class OpenPanguDecoderLayer(nn.Module):
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
 
         # Fully Connected
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         hidden_states = self.mlp(hidden_states)
 
         if (
@@ -1030,6 +1031,7 @@ class OpenPanguDecoderLayer(nn.Module):
 
         if self.sandwich_norm:
             hidden_states = self.post_mlp_layernorm(hidden_states)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
 
         return hidden_states, residual

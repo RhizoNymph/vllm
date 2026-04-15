@@ -159,6 +159,7 @@ class GraniteMoeSharedDecoderLayer(nn.Module):
         )
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         if self.shared_mlp is None:
             hidden_states = self.block_sparse_moe(hidden_states)
         else:
@@ -167,6 +168,7 @@ class GraniteMoeSharedDecoderLayer(nn.Module):
             moe_hidden_states = self.block_sparse_moe(moe_hidden_states)
             hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
             del moe_hidden_states
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         hidden_states = residual + hidden_states * self.residual_multiplier
         hidden_states = apply_layer_steering(
             self, hidden_states, SteeringHookPoint.POST_MLP

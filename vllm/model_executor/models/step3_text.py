@@ -320,12 +320,14 @@ class Step3TextDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
 
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         if self.use_moe:
             share_output = self.share_expert(hidden_states)
             moe_output = self.moe(hidden_states)
             hidden_states = share_output + moe_output
         else:
             hidden_states = self.mlp(hidden_states)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
 
         return hidden_states, residual

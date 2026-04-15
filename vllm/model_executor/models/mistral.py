@@ -205,7 +205,9 @@ class MistralDecoderLayer(LlamaDecoderLayer):
             assert t_cond is not None
             hidden_states = hidden_states * (1 + self.ada_rms_norm_t_cond(t_cond))
 
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 

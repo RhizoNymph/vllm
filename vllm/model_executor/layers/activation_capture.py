@@ -63,6 +63,8 @@ _HOOK_NAME_TO_ID: dict[str, int] = {
     "pre_attn": 0,
     "post_attn": 1,
     "post_mlp": 2,
+    "mlp_in": 3,
+    "mlp_out": 4,
 }
 _HOOK_ID_TO_NAME: dict[int, str] = {v: k for k, v in _HOOK_NAME_TO_ID.items()}
 

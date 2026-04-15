@@ -469,6 +469,9 @@ class MiniMaxText01DecoderLayer(nn.Module):
         residual = layernorm_output if self.postnorm else layernorm_input
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
 
+        layernorm_output = apply_layer_steering(
+            self, layernorm_output, SteeringHookPoint.MLP_IN
+        )
         if self.expert_num == 1:
             hidden_states = self.mlp(layernorm_output)
         else:
@@ -495,6 +498,9 @@ class MiniMaxText01DecoderLayer(nn.Module):
         residual = residual * self.layernorm_mlp_alpha
         hidden_states = hidden_states * self.layernorm_mlp_beta
 
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
         hidden_states = residual + hidden_states
         hidden_states = apply_layer_steering(
             self, hidden_states, SteeringHookPoint.POST_MLP

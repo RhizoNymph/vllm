@@ -302,10 +302,12 @@ class Exaone4DecoderLayer(nn.Module):
         residual = hidden_states
 
         # Fully Connected
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         hidden_states = self.mlp(hidden_states)
 
         # Use post-LN
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         hidden_states = residual + hidden_states
         hidden_states = apply_layer_steering(
             self, hidden_states, SteeringHookPoint.POST_MLP

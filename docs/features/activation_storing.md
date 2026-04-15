@@ -102,10 +102,14 @@ training machines, and the bytes are already in a format that
   decoder layer, joined by attention output and MLP output. The
   "pristine" residual at a hook point is the value before any
   steering vector has been added.
-- **Hook point**: one of three well-defined positions inside a
-  decoder layer where the residual is observable — `pre_attn`,
-  `post_attn`, `post_mlp`. These are the same three points the
-  existing `steering` feature writes to.
+- **Hook point**: one of five well-defined positions inside a decoder
+  layer where a hidden-state tensor is observable. Three of the five
+  tap the residual skip stream: `pre_attn`, `post_attn`, `post_mlp`.
+  The remaining two tap the tensors inside the MLP sublayer: `mlp_in`
+  is the post-layernorm input to the MLP block, `mlp_out` is the MLP
+  block's output before it's added back to the residual. All five
+  hook points are exposed by the existing `steering` feature and have
+  the same `hidden_size` shape.
 - **Logical position**: an absolute token index into the concatenated
   prompt + generated token sequence for a single request. Position
   0 is the first prompt token; position `len(prompt)` is the first
@@ -1052,7 +1056,7 @@ Steering writes, capture reads. Different lifetimes (capture persists
 to disk; steering is ephemeral), different ownership (capture owns
 the writer thread pool), different failure modes. Sharing config
 would couple two features that have nothing in common except the
-three hook-point positions.
+shared hook-point positions.
 
 **Can I capture without steering enabled?**
 Yes. `--activation-storing` works independently of
@@ -1092,10 +1096,14 @@ directories. v1 does not duplicate captures inside a single request.
 
 **Can I capture intermediate tensors other than the residual
 stream?**
-No. v1 captures exactly the residual at `pre_attn`, `post_attn`, and
-`post_mlp`. Attention patterns, MLP activations, and pre-norm
-tensors are out of scope because they'd require new model-file
-instrumentation on top of the steering hook points.
+Yes, but only at the MLP boundaries. v1 captures the residual at
+`pre_attn`, `post_attn`, `post_mlp`, plus the MLP-internal
+`mlp_in` (post-layernorm input to the MLP block) and `mlp_out`
+(MLP output before the residual add). Attention patterns, post-
+activation MLP "neuron" tensors (intermediate-size inside the MLP),
+and pre-norm residual tensors are still out of scope — they'd
+require new model-file instrumentation on top of the existing
+steering hook points.
 
 **Is the feature safe on a shared NAS with other writers?**
 Yes, under these assumptions: (1) no other process writes files with

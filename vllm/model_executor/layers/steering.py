@@ -24,10 +24,15 @@ if TYPE_CHECKING:
 class SteeringHookPoint(str, Enum):
     """Positions in a decoder layer where steering can be applied.
 
-    All hook points operate on the residual skip tensor carried through
-    the decoder layer, not on the post-norm sublayer input tensor.
-    The names identify approximate regions of the layer where the
-    residual skip tensor is steered.
+    The ``PRE_ATTN``, ``POST_ATTN``, and ``POST_MLP`` hook points
+    operate on the *residual* skip tensor carried through the decoder
+    layer. The ``MLP_IN`` and ``MLP_OUT`` hook points operate on the
+    tensors *inside* the MLP sublayer: ``MLP_IN`` is the post-layernorm
+    input to the MLP block, ``MLP_OUT`` is the MLP's output before it
+    is added back to the residual. Activation capture uses all five;
+    steering can also be applied at any of them (steering at ``MLP_IN``
+    perturbs the MLP's inputs, while steering at ``MLP_OUT`` is
+    mathematically equivalent to ``POST_MLP``).
     """
 
     PRE_ATTN = "pre_attn"
@@ -39,12 +44,20 @@ class SteeringHookPoint(str, Enum):
     POST_MLP = "post_mlp"
     """Steer the residual skip tensor in the post-MLP region."""
 
+    MLP_IN = "mlp_in"
+    """Steer the post-layernorm tensor that enters the MLP sublayer."""
+
+    MLP_OUT = "mlp_out"
+    """Steer the MLP sublayer's output before the residual add."""
+
 
 # Buffer attribute names on decoder layer modules, keyed by hook point.
 HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "steering_table_pre_attn",
     SteeringHookPoint.POST_ATTN: "steering_table_post_attn",
     SteeringHookPoint.POST_MLP: "steering_table_post_mlp",
+    SteeringHookPoint.MLP_IN: "steering_table_mlp_in",
+    SteeringHookPoint.MLP_OUT: "steering_table_mlp_out",
 }
 
 # Valid hook point string values for validation.

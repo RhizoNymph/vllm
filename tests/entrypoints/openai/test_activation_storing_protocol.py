@@ -302,8 +302,13 @@ class TestActivationStoringSpecPostInit:
         # this set drifts out of sync with the real enum, we'll silently
         # accept captures at hooks steering doesn't know about and the
         # runner will error out at forward time. Pin it here.
+        #
+        # ``pre_attn`` / ``post_attn`` / ``post_mlp`` are residual-stream
+        # hook points. ``mlp_in`` / ``mlp_out`` are inside the MLP
+        # sublayer (post-layernorm input to the MLP and the MLP output
+        # before the residual add respectively).
         assert VALID_ACTIVATION_HOOK_NAMES == frozenset(
-            {"pre_attn", "post_attn", "post_mlp"}
+            {"pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"}
         )
 
     def test_position_kind_set(self):

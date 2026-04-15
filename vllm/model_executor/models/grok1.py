@@ -439,6 +439,7 @@ class Grok1DecoderLayer(nn.Module):
         # MoE block with normalization
         hidden_states, residual = self.pre_moe_norm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
         if self.residual_moe:
             assert self.mlp is not None
             hidden_states = (
@@ -447,6 +448,7 @@ class Grok1DecoderLayer(nn.Module):
         else:
             hidden_states = self.moe_block(hidden_states)
         hidden_states = self.post_moe_norm(hidden_states)
+        hidden_states = apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_OUT)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
 
         return hidden_states, residual
