@@ -523,3 +523,48 @@ def test_human_readable_model_len():
     for invalid in ["1a", "pwd", "10.24", "1.23M", "1.22T"]:
         with pytest.raises(ArgumentError):
             parser.parse_args(["--max-model-len", invalid])
+
+
+# --------------------------------------------------------------------------- #
+# --capture-consumers CLI flag
+# --------------------------------------------------------------------------- #
+
+
+class TestCaptureConsumersFlag:
+    """Tests for the --capture-consumers CLI flag."""
+
+    def test_default_is_none(self) -> None:
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        args = parser.parse_args([])
+        assert args.capture_consumers is None
+
+    def test_single_consumer(self) -> None:
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        args = parser.parse_args(
+            ["--capture-consumers", "filesystem:root=/tmp/foo,threads=4"]
+        )
+        assert args.capture_consumers == ["filesystem:root=/tmp/foo,threads=4"]
+
+    def test_multiple_consumers(self) -> None:
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        args = parser.parse_args(
+            [
+                "--capture-consumers",
+                "filesystem:root=/tmp",
+                "--capture-consumers",
+                "logging",
+            ]
+        )
+        assert args.capture_consumers == [
+            "filesystem:root=/tmp",
+            "logging",
+        ]
+
+    def test_name_only_consumer(self) -> None:
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        args = parser.parse_args(["--capture-consumers", "logging"])
+        assert args.capture_consumers == ["logging"]
+
+    def test_engine_args_field_default(self) -> None:
+        engine_args = EngineArgs(model="facebook/opt-125m")
+        assert engine_args.capture_consumers is None

@@ -14,22 +14,27 @@ resolved ``name -> class`` map for the process lifetime. Cache
 invalidation is not supported — plugins are discovered once per
 engine startup.
 
-Phase G will extend this module with a plural ``build_consumers``
-helper that walks ``vllm_config.capture_consumers_config``. Phase A
-ships only the singular helpers used by ad-hoc instantiation.
+Phase A ships the singular helpers used by ad-hoc instantiation.
+Phase G adds the plural ``build_consumers`` helper that walks config
+and installs driver bridges for ``location = "driver"`` consumers.
 """
 
 from __future__ import annotations
 
 import importlib.metadata
+import logging
 import threading
 from typing import TYPE_CHECKING, Any
 
-from vllm.v1.capture.consumer import CaptureConsumer
+from vllm.v1.capture.consumer import CaptureConsumer, _BatchedAdapter
+from vllm.v1.capture.driver_bridge import install_driver_consumer
 from vllm.v1.capture.errors import UnknownCaptureConsumerError
+from vllm.v1.capture.sink import CaptureSink
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+logger = logging.getLogger(__name__)
 
 
 ENTRY_POINT_GROUP = "vllm.capture_consumers"
@@ -95,6 +100,73 @@ def build_consumer(
     """
     cls = load_consumer_class(name)
     return cls(vllm_config, params)
+
+
+def build_consumers(
+    vllm_config: VllmConfig,
+    consumer_instances: list[CaptureConsumer] | None = None,
+) -> tuple[CaptureSink, ...]:
+    """Build the complete consumer/sink tuple from config + instances.
+
+    Two sources of consumers are supported:
+
+    1. **Config entries** — dicts of the form
+       ``{"name": "...", "params": {...}}`` stored in
+       ``vllm_config``. These are resolved through the entry-point
+       registry via ``build_consumer`` and can have any ``location``.
+
+    2. **Pre-constructed instances** — passed directly (e.g. from
+       ``LLM(..., capture_consumers=[instance])``).  These *must*
+       declare ``location = "driver"`` since the ``LLM`` constructor
+       runs in the driver process.
+
+    For each consumer:
+
+    - ``location = "worker"`` → wrap in a ``_BatchedAdapter`` (runs
+      in-process on the worker).
+    - ``location = "driver"`` → install a driver bridge via
+      ``install_driver_consumer``, which returns a worker-side shim.
+
+    Returns:
+        A tuple of ``CaptureSink`` objects, one per consumer, in the
+        order they were provided (config entries first, then instances).
+    """
+    sinks: list[CaptureSink] = []
+
+    # --- config-driven consumers (entry-point registry) ---
+    config_entries: list[dict[str, Any]] = (
+        getattr(vllm_config, "capture_consumers_config", None) or []
+    )
+    for entry in config_entries:
+        name = entry["name"]
+        params = entry.get("params", {})
+        consumer = build_consumer(name, vllm_config, params)
+        sinks.append(_wrap_consumer(consumer))
+
+    # --- pre-constructed instances ---
+    for instance in consumer_instances or []:
+        if instance.location != "driver":
+            raise ValueError(
+                f"Pre-constructed CaptureConsumer instances passed to "
+                f"LLM() must have location='driver', but "
+                f"{type(instance).__name__} has "
+                f"location={instance.location!r}."
+            )
+        sinks.append(_wrap_consumer(instance))
+
+    return tuple(sinks)
+
+
+def _wrap_consumer(consumer: CaptureConsumer) -> CaptureSink:
+    """Wrap a consumer with the appropriate sink for its location."""
+    if consumer.location == "driver":
+        logger.info(
+            "Installing driver bridge for consumer %s",
+            type(consumer).__name__,
+        )
+        return install_driver_consumer(consumer)
+    # Worker consumers use the in-process batched adapter.
+    return _BatchedAdapter(consumer)
 
 
 def _reset_cache_for_testing() -> None:
