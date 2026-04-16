@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Standalone writer thread pool for activation storing.
+"""Standalone writer thread pool for the filesystem capture consumer.
 
 Accepts raw byte payloads from the capture path and persists them to a
-POSIX filesystem using the columnar layout documented in
-``docs/features/activation_storing.md``. The writer is intentionally
-isolated from the rest of vLLM - phase 4 is responsible for wiring it
-up to the model runner.
+POSIX filesystem using a columnar layout.  Driven by
+:class:`vllm.v1.capture.consumers.filesystem.consumer.FilesystemConsumer`.
 
 Design highlights:
 

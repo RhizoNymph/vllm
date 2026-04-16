@@ -299,11 +299,7 @@ def _resolve_positions(
 
 
 def _structural_validate(raw: FilesystemCaptureRequest) -> None:
-    """Structural validation of the raw request before resolving.
-
-    Mirrors the checks previously done in
-    ``ActivationStoringSpec.__post_init__``.
-    """
+    """Structural validation of the raw request before resolving."""
     if not isinstance(raw.request_id, str) or not raw.request_id:
         raise CaptureValidationError(
             f"capture.request_id must be a non-empty string, "
