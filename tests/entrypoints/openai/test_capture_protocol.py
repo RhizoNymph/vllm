@@ -18,8 +18,6 @@ These tests intentionally do not spin up a real engine. They cover:
 
 from __future__ import annotations
 
-import pytest
-
 from vllm.entrypoints.openai.chat_completion.protocol import (
     CaptureResultResponse,
     ChatCompletionRequest,
@@ -46,7 +44,6 @@ from vllm.v1.capture import (
     CaptureSpec,
     CaptureValidationError,
 )
-
 
 # ---------------------------------------------------------------------------
 # Pydantic round-trip: ChatCompletionRequest + ChatCompletionResponse
@@ -87,9 +84,7 @@ class TestChatProtocolRoundTrip:
                     message=ChatMessage(role="assistant", content="hello"),
                 )
             ],
-            usage=UsageInfo(
-                prompt_tokens=1, completion_tokens=1, total_tokens=2
-            ),
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
             capture_results={
                 "filesystem": CaptureResultResponse(
                     status="ok",
@@ -114,9 +109,7 @@ class TestChatProtocolRoundTrip:
                     message=ChatMessage(role="assistant", content="hello"),
                 )
             ],
-            usage=UsageInfo(
-                prompt_tokens=1, completion_tokens=1, total_tokens=2
-            ),
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
         )
         dumped = resp.model_dump(exclude_unset=True, exclude_none=True)
         # ``capture_results`` defaults to ``None`` and must be stripped
@@ -166,9 +159,7 @@ class TestLegacyCompletionProtocolRoundTrip:
                     finish_reason="stop",
                 )
             ],
-            usage=UsageInfo(
-                prompt_tokens=1, completion_tokens=1, total_tokens=2
-            ),
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
             capture_results={
                 "filesystem": CaptureResultResponse(
                     status="ok",
@@ -212,14 +203,18 @@ class _FakeFinal:
 class TestBuildCaptureResultsResponse:
     def test_none_when_attribute_missing(self) -> None:
         result = _build_capture_results_response(
-            ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "x"}]),
+            ChatCompletionRequest(
+                model="m", messages=[{"role": "user", "content": "x"}]
+            ),
             _FakeFinal(),  # type: ignore[arg-type]
         )
         assert result is None
 
     def test_none_when_empty_dict(self) -> None:
         result = _build_capture_results_response(
-            ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "x"}]),
+            ChatCompletionRequest(
+                model="m", messages=[{"role": "user", "content": "x"}]
+            ),
             _FakeFinal(capture_results={}),  # type: ignore[arg-type]
         )
         assert result is None
@@ -251,9 +246,7 @@ class TestBuildCaptureResultsResponse:
         assert result["fs"].status == "ok"
         # list payload is wrapped under ``items`` to keep the JSON schema
         # stable across consumers whose payload type varies.
-        assert result["fs"].payload == {
-            "items": ["/tmp/a.bin", "/tmp/a.json"]
-        }
+        assert result["fs"].payload == {"items": ["/tmp/a.bin", "/tmp/a.json"]}
         assert result["log"].status == "partial_error"
         assert result["log"].error == "dropped"
         # ``None`` payload becomes an empty dict so the response schema
@@ -467,9 +460,7 @@ class TestAdmitCaptureValidation:
 
             def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
                 received.append(ctx)
-                return CaptureSpec(
-                    hooks={"post_mlp": [0]}, positions="last_prompt"
-                )
+                return CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
 
             def on_capture(self, key, tensor, sidecar):  # pragma: no cover
                 pass

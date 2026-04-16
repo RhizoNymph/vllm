@@ -458,10 +458,7 @@ class OpenAIServingCompletion(OpenAIServing):
             # Additive capture-framework admission; runs alongside the
             # legacy activation_storing validation during the Phase F→I
             # window.
-            if (
-                isinstance(sampling_params, SamplingParams)
-                and sampling_params.capture
-            ):
+            if isinstance(sampling_params, SamplingParams) and sampling_params.capture:
                 error_response = self._admit_capture(
                     sampling_params=sampling_params,
                     engine_input=engine_input,

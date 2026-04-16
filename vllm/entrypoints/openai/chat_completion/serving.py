@@ -469,10 +469,7 @@ class OpenAIServingChat(OpenAIServing):
             # Additive admission for the new capture framework. Runs
             # alongside the legacy activation_storing path during the
             # Phase F→I window; clients can use either or both.
-            if (
-                isinstance(sampling_params, SamplingParams)
-                and sampling_params.capture
-            ):
+            if isinstance(sampling_params, SamplingParams) and sampling_params.capture:
                 error_response = self._admit_capture(
                     sampling_params=sampling_params,
                     engine_input=engine_input,
