@@ -95,3 +95,27 @@ Features Index:
             - VllmConfig.capture_consumers_config (programmatic)
         depends_on: [activation_storing]
         doc: docs/features/capture_consumers.md
+            Generic capture-consumer framework that decouples activation
+            capture from its destination. Consumers register via the
+            ``vllm.capture_consumers`` entry-point group and implement
+            either the ``CaptureSink`` streaming protocol or the
+            ``CaptureConsumer`` batched base class. Phase A ships the core
+            types, protocol, and registry. Phase C adds the built-in
+            filesystem consumer that wraps ``ActivationWriter``.
+        entry_points:
+            - pyproject.toml [project.entry-points."vllm.capture_consumers"]
+        depends_on: [activation_storing]
+        doc: docs/features/capture_consumers.md
+    capture_consumers_filesystem:
+        description: >
+            Built-in filesystem capture consumer (Phase C). Implements
+            ``CaptureSink`` directly to stream captured activations to
+            disk via ``ActivationWriter`` without buffering full tensors
+            in memory. Delegates per-request validation to the existing
+            activation-storing admission validator. Registered as the
+            ``filesystem`` entry point in the ``vllm.capture_consumers``
+            group.
+        entry_points:
+            - vllm.v1.capture.consumers.filesystem.FilesystemConsumer
+        depends_on: [capture_consumers, activation_storing]
+        doc: docs/features/capture_consumers_filesystem.md
