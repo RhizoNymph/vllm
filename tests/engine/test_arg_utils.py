@@ -568,3 +568,43 @@ class TestCaptureConsumersFlag:
     def test_engine_args_field_default(self) -> None:
         engine_args = EngineArgs(model="facebook/opt-125m")
         assert engine_args.capture_consumers is None
+
+
+def test_numa_bind_args():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--numa-bind",
+            "--numa-bind-nodes",
+            "0",
+            "0",
+            "1",
+            "1",
+            "--numa-bind-cpus",
+            "0-3",
+            "4-7",
+            "8-11",
+            "12-15",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.numa_bind is True
+    assert engine_args.numa_bind_nodes == [0, 0, 1, 1]
+    assert engine_args.numa_bind_cpus == ["0-3", "4-7", "8-11", "12-15"]
+
+
+def test_ir_op_priority():
+    from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
+
+    ir_op_priority = IrOpPriorityConfig(rms_norm=["vllm_c"])
+    cfg1 = EngineArgs(ir_op_priority=ir_op_priority).create_engine_config()
+    cfg2 = EngineArgs(
+        kernel_config=KernelConfig(ir_op_priority=ir_op_priority)
+    ).create_engine_config()
+    assert cfg1.kernel_config.ir_op_priority == cfg2.kernel_config.ir_op_priority
+
+    with pytest.raises(ValueError, match="rms_norm"):
+        _ = EngineArgs(
+            ir_op_priority=ir_op_priority,
+            kernel_config=KernelConfig(ir_op_priority=ir_op_priority),
+        ).create_engine_config()

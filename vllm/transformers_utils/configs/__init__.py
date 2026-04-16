@@ -90,6 +90,7 @@ __all__ = [
     "EAGLEConfig",
     "FireRedLIDConfig",
     "FlexOlmoConfig",
+    "FireRedLIDConfig",
     "FunAudioChatConfig",
     "FunAudioChatAudioEncoderConfig",
     "HunYuanVLConfig",
