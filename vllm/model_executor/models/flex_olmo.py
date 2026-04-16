@@ -17,13 +17,21 @@
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    register_steering_buffers,
+)
 from vllm.model_executor.models.olmoe import OlmoeAttention, OlmoeForCausalLM
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.transformers_utils.configs.flex_olmo import FlexOlmoConfig
 
 logger = init_logger(__name__)
@@ -109,6 +117,16 @@ class FlexOlmoDecoderLayer(nn.Module):
         super().__init__()
         hf_config = vllm_config.model_config.hf_config
         assert isinstance(hf_config, FlexOlmoConfig)
+        self.layer_idx = extract_layer_index(prefix)
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            hf_config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         self.self_attn = FlexOlmoAttention(
             vllm_config=vllm_config, prefix=f"{prefix}.self_attn"
@@ -129,16 +147,31 @@ class FlexOlmoDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Attention block.
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.PRE_ATTN
+        )
         residual = hidden_states
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_ATTN
+        )
 
         # MLP block.
         residual = hidden_states
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
         hidden_states = self.mlp(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
         return hidden_states, None
 
 

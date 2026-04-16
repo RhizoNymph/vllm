@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -46,6 +47,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
+)
+from vllm.model_executor.layers.steering import (
+    get_steering_buffer_config,
+    register_steering_buffers,
+    share_steering_index_across_layers,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -131,6 +137,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+        )
 
         if self.layer_type == "linear_attention":
             self.linear_attn = GatedDeltaNetAttention(
@@ -236,6 +251,7 @@ class Qwen3_5Model(Qwen3NextModel):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        share_steering_index_across_layers(self.layers)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -489,6 +505,7 @@ class Qwen3_5ForCausalLMBase(
             self.packed_modules_mapping = {k: list(v) for k, v in base.items()}
             self.packed_modules_mapping.pop("in_proj_qkvz", None)
             self.packed_modules_mapping["in_proj_qkv"] = ["in_proj_qkv"]
+            self.packed_modules_mapping["in_proj_z"] = ["in_proj_z"]
             self.packed_modules_mapping["in_proj_z"] = ["in_proj_z"]
 
         if get_pp_group().is_last_rank:
