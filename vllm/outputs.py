@@ -10,11 +10,10 @@ import numpy as np
 import torch
 from typing_extensions import TypeVar
 
-from vllm.config.activation_storing_types import CaptureResult
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
-from vllm.v1.capture.types import CaptureResult as CaptureConsumerResult
+from vllm.v1.capture.types import CaptureResult
 from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
@@ -123,8 +122,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
-        activation_storage: CaptureResult | None = None,
-        capture_results: dict[str, CaptureConsumerResult] | None = None,
+        capture_results: dict[str, CaptureResult] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -145,19 +143,11 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
-        # Terminal per-request activation capture status/paths, set on the
-        # final output when ``SamplingParams.activation_storing`` was
-        # provided. ``None`` both when the feature is off and on
-        # non-terminal outputs within a streaming run; Phase 4 / Phase 5
-        # thread the concrete :class:`CaptureResult` through from the
-        # engine core on the finalize step.
-        self.activation_storage = activation_storage
-        # Per-consumer capture results from the new capture-consumer
-        # framework. Keyed by consumer instance name; empty dict when no
-        # consumer produced a result for this request. Phase D threads
-        # this field via ``setattr`` during the D→F gap; after both land
-        # the dict flows as a plain kwarg.
-        self.capture_results: dict[str, CaptureConsumerResult] = (
+        # Per-consumer capture results from the capture-consumer
+        # framework. Keyed by consumer instance name; empty dict when
+        # no consumer produced a result for this request. Threaded in
+        # from the engine core on the terminal output.
+        self.capture_results: dict[str, CaptureResult] = (
             capture_results if capture_results is not None else {}
         )
 
@@ -166,16 +156,11 @@ class RequestOutput:
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
-        # Capture result rides on the terminal EngineCoreOutput; when
-        # ``add`` merges a finalize into an earlier streaming chunk, the
-        # later one is the one that carries the pointer.
-        if next_output.activation_storage is not None:
-            self.activation_storage = next_output.activation_storage
-        # Per-consumer capture results from the new capture-consumer
-        # framework arrive on the terminal EngineCoreOutput as well. Union
-        # the dicts so entries from earlier streaming chunks are preserved
-        # alongside entries from the finalize step; same-key entries from
-        # the later output win.
+        # Per-consumer capture results from the capture-consumer
+        # framework arrive on the terminal EngineCoreOutput. Union the
+        # dicts so entries from earlier streaming chunks are preserved
+        # alongside entries from the finalize step; same-key entries
+        # from the later output win.
         next_capture_results = getattr(next_output, "capture_results", None)
         if next_capture_results:
             if not self.capture_results:

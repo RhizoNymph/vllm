@@ -10,7 +10,7 @@ import msgspec
 import numpy as np
 import torch
 
-from vllm.config.activation_storing_types import CaptureResult
+from vllm.v1.capture.types import CaptureResult
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
