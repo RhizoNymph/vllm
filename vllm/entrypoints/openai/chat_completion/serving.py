@@ -23,13 +23,7 @@ from vllm.entrypoints.chat_utils import (
     make_tool_call_id,
 )
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.activation_storing_validation import (
-    ActivationStoringContext,
-    ActivationStoringValidationError,
-    validate_activation_storing,
-)
 from vllm.entrypoints.openai.chat_completion.protocol import (
-    ActivationStorageResponse,
     CaptureResultResponse,
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -97,44 +91,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _build_activation_storage_response(
-    request: ChatCompletionRequest,
-    final_res: RequestOutput,
-) -> ActivationStorageResponse | None:
-    """Convert a :class:`RequestOutput`'s capture result into the response.
-
-    Phase 4 adds ``RequestOutput.activation_storage`` as an attribute
-    carrying a capture result (status + paths + optional error). We read
-    it via ``getattr`` so this module works even before phase 4 has
-    landed - in that case the attribute is missing and we fall back to
-    ``"not_requested"`` (or ``None`` if the request didn't ask for it).
-
-    Returns ``None`` when the request did not include
-    ``activation_storing``, so the response field is cleanly omitted and
-    existing OpenAI clients that don't know about the field see nothing.
-    """
-    if request.activation_storing is None:
-        return None
-    capture = getattr(final_res, "activation_storage", None)
-    if capture is None:
-        # Request asked for capture, but phase 4 hasn't landed OR the
-        # engine never produced a capture result. Surface the intent as
-        # ``"error"`` so clients don't silently trust a missing field.
-        return ActivationStorageResponse(
-            status="error",
-            error=(
-                "activation storage was requested but the engine did not "
-                "return a capture result"
-            ),
-            paths=[],
-        )
-    return ActivationStorageResponse(
-        status=capture.status,
-        error=capture.error,
-        paths=list(capture.paths),
-    )
-
-
 def _capture_result_to_response_payload(payload: Any) -> dict[str, Any]:
     """Coerce an opaque consumer payload into a JSON-serializable dict.
 
@@ -179,7 +135,7 @@ def _build_capture_results_response(
     response field entirely, keeping the payload small for the common
     uncaptured request.
     """
-    del request  # signature mirrors _build_activation_storage_response
+    del request  # kept for uniform signature with other response builders
     results = getattr(final_res, "capture_results", None)
     if not results:
         return None
@@ -441,34 +397,19 @@ class OpenAIServingChat(OpenAIServing):
                     self.default_sampling_params,
                 )
 
-            # Per-request activation storing: admission validation.
+            # Per-request capture-consumer admission validation.
             #
             # Order of operations:
             #   1. Tokenize prompt (already done by ``render_chat_request``).
             #   2. Build sampling params (above).
-            #   3. Validate the ``activation_storing`` spec against the full
-            #      request context (prompt length, model shape, TP/PP).
-            #   4. On failure, return HTTP 400 with the validator's message.
+            #   3. For each consumer the request opted into, run the
+            #      consumer's ``validate_client_spec`` against the full
+            #      request context. On failure, return HTTP 400.
             #
             # Validation runs AFTER ``to_sampling_params`` so we already
-            # have the tokenized prompt length. It runs BEFORE the request
-            # is handed to the engine so admission failures never consume
-            # an inference slot or a writer pool slot.
-            if (
-                isinstance(sampling_params, SamplingParams)
-                and request.activation_storing is not None
-            ):
-                error_response = self._admit_activation_storing(
-                    request_spec=request.activation_storing,
-                    sampling_params=sampling_params,
-                    engine_input=engine_input,
-                )
-                if error_response is not None:
-                    return error_response
-
-            # Additive admission for the new capture framework. Runs
-            # alongside the legacy activation_storing path during the
-            # Phase F→I window; clients can use either or both.
+            # have the tokenized prompt length, and BEFORE the request is
+            # handed to the engine so admission failures never consume an
+            # inference slot.
             if isinstance(sampling_params, SamplingParams) and sampling_params.capture:
                 error_response = self._admit_capture(
                     sampling_params=sampling_params,
@@ -547,94 +488,6 @@ class OpenAIServingChat(OpenAIServing):
             request_metadata,
             reasoning_parser,
         )
-
-    def _admit_activation_storing(
-        self,
-        *,
-        request_spec,
-        sampling_params: SamplingParams,
-        engine_input: EngineInput,
-    ) -> ErrorResponse | None:
-        """Run admission validation for a per-request activation storing spec.
-
-        On success, mutates ``sampling_params`` to carry the validated spec
-        so the runner sees it downstream. On failure, returns an
-        :class:`ErrorResponse` with HTTP 400 that the caller should return
-        verbatim.
-
-        Admission context construction:
-
-        - ``num_prompt_tokens`` comes from the already-tokenized prompt
-          (``_extract_prompt_len``). Validation therefore runs *after*
-          ``render_chat_request`` / ``to_sampling_params``.
-        - ``num_computed_tokens`` is ``0`` at the entrypoint. Prefix-cache
-          hits are evaluated again at the runner when the true value is
-          known; we pass ``0`` here because the entrypoint cannot see the
-          cache state.
-        - TP/PP sizes come from ``vllm_config.parallel_config``.
-        - ``num_hidden_layers``, ``hidden_size``, ``element_size_bytes``
-          come from ``model_config``. The byte-budget estimate uses these
-          three values plus the position count.
-        """
-        try:
-            num_prompt_tokens = self._extract_prompt_len(engine_input)
-        except Exception as exc:  # pragma: no cover - defensive
-            return self.create_error_response(
-                f"activation_storing: failed to determine prompt length: {exc}",
-                status_code=HTTPStatus.BAD_REQUEST,
-                param="activation_storing",
-            )
-
-        vllm_config = self.engine_client.vllm_config
-        parallel_config = vllm_config.parallel_config
-        model_config = vllm_config.model_config
-
-        try:
-            num_hidden_layers = model_config.get_total_num_hidden_layers()
-            hidden_size = model_config.get_hidden_size()
-            # torch.dtype exposes ``itemsize`` on modern torch versions.
-            # Fall back to ``torch.tensor([], dtype=dt).element_size()`` if
-            # ``itemsize`` is missing so this layer stays torch-agnostic.
-            dt = model_config.dtype
-            element_size_bytes = getattr(dt, "itemsize", None)
-            if element_size_bytes is None:
-                import torch
-
-                element_size_bytes = torch.tensor([], dtype=dt).element_size()
-        except Exception as exc:  # pragma: no cover - defensive
-            return self.create_error_response(
-                f"activation_storing: failed to read model shape: {exc}",
-                status_code=HTTPStatus.BAD_REQUEST,
-                param="activation_storing",
-            )
-
-        ctx = ActivationStoringContext(
-            num_prompt_tokens=num_prompt_tokens,
-            num_computed_tokens=0,
-            tensor_parallel_size=parallel_config.tensor_parallel_size,
-            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
-            num_hidden_layers=num_hidden_layers,
-            hidden_size=hidden_size,
-            element_size_bytes=int(element_size_bytes),
-        )
-        try:
-            resolved = validate_activation_storing(
-                request_spec,
-                vllm_config,
-                ctx,
-            )
-        except ActivationStoringValidationError as exc:
-            return self.create_error_response(
-                str(exc),
-                status_code=HTTPStatus.BAD_REQUEST,
-                param=exc.field or "activation_storing",
-            )
-
-        # Reattach the raw spec to sampling params so the downstream runner
-        # sees it. The resolved spec's ``raw`` field is the exact spec the
-        # runner consumes (phase 4 owns the runner-side plan building).
-        sampling_params.activation_storing = resolved.raw
-        return None
 
     def _admit_capture(
         self,
@@ -1595,21 +1448,12 @@ class OpenAIServingChat(OpenAIServing):
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
-            activation_storage = (
-                _build_activation_storage_response(request, last_res)
-                if last_res is not None
-                else None
-            )
             capture_results = (
                 _build_capture_results_response(request, last_res)
                 if last_res is not None
                 else None
             )
-            if (
-                include_usage
-                or activation_storage is not None
-                or capture_results is not None
-            ):
+            if include_usage or capture_results is not None:
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(
                     prompt_tokens=num_prompt_tokens,
@@ -1621,11 +1465,11 @@ class OpenAIServingChat(OpenAIServing):
                         cached_tokens=num_cached_tokens
                     )
 
-                # Activation storage is attached as a sibling of ``usage``
-                # on the final SSE frame. It is only emitted if the
-                # request asked for capture; otherwise we still emit the
-                # usage frame (if requested) but omit the field, so
-                # existing OpenAI clients see the same envelope as before.
+                # Capture results are attached as a sibling of ``usage``
+                # on the final SSE frame. They are only emitted if at
+                # least one consumer produced a result; otherwise we
+                # still emit the usage frame (if requested) but omit the
+                # field.
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
@@ -1633,7 +1477,6 @@ class OpenAIServingChat(OpenAIServing):
                     choices=[],
                     model=model_name,
                     usage=final_usage if include_usage else None,
-                    activation_storage=activation_storage,
                     capture_results=capture_results,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
@@ -2028,7 +1871,6 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
-            activation_storage=_build_activation_storage_response(request, final_res),
             capture_results=_build_capture_results_response(request, final_res),
         )
 
