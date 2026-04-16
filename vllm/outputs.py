@@ -14,6 +14,7 @@ from vllm.config.activation_storing_types import CaptureResult
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.v1.capture.types import CaptureResult as CaptureConsumerResult
 from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
@@ -123,6 +124,7 @@ class RequestOutput:
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         activation_storage: CaptureResult | None = None,
+        capture_results: dict[str, CaptureConsumerResult] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -150,6 +152,14 @@ class RequestOutput:
         # thread the concrete :class:`CaptureResult` through from the
         # engine core on the finalize step.
         self.activation_storage = activation_storage
+        # Per-consumer capture results from the new capture-consumer
+        # framework. Keyed by consumer instance name; empty dict when no
+        # consumer produced a result for this request. Phase D threads
+        # this field via ``setattr`` during the D→F gap; after both land
+        # the dict flows as a plain kwarg.
+        self.capture_results: dict[str, CaptureConsumerResult] = (
+            capture_results if capture_results is not None else {}
+        )
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
@@ -161,6 +171,17 @@ class RequestOutput:
         # later one is the one that carries the pointer.
         if next_output.activation_storage is not None:
             self.activation_storage = next_output.activation_storage
+        # Per-consumer capture results from the new capture-consumer
+        # framework arrive on the terminal EngineCoreOutput as well. Union
+        # the dicts so entries from earlier streaming chunks are preserved
+        # alongside entries from the finalize step; same-key entries from
+        # the later output win.
+        next_capture_results = getattr(next_output, "capture_results", None)
+        if next_capture_results:
+            if not self.capture_results:
+                self.capture_results = dict(next_capture_results)
+            else:
+                self.capture_results.update(next_capture_results)
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

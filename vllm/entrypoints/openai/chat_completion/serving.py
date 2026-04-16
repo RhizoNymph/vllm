@@ -30,6 +30,7 @@ from vllm.entrypoints.openai.activation_storing_validation import (
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ActivationStorageResponse,
+    CaptureResultResponse,
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
     ChatCompletionLogProbsContent,
@@ -83,6 +84,12 @@ from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.tool_parsers.utils import partial_json_loads
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer
+from vllm.v1.capture import (
+    CaptureConsumer,
+    CaptureContext,
+    CaptureValidationError,
+)
+from vllm.v1.capture import registry as capture_registry
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -126,6 +133,64 @@ def _build_activation_storage_response(
         error=capture.error,
         paths=list(capture.paths),
     )
+
+
+def _capture_result_to_response_payload(payload: Any) -> dict[str, Any]:
+    """Coerce an opaque consumer payload into a JSON-serializable dict.
+
+    The framework's ``CaptureResult.payload`` is intentionally
+    unconstrained — filesystem consumers typically produce a list of
+    paths, other consumers may return ``None``, a dashboard URL, or
+    arbitrary structured data. Responses need a dict for stable JSON
+    emission, so:
+
+    - ``dict`` flows through unchanged.
+    - ``None`` becomes ``{}`` (consumer declined to share a payload).
+    - ``list`` becomes ``{"items": <list>}``. The filesystem consumer
+      emits ``list[Path]``; converting ``Path`` to ``str`` keeps the
+      dict JSON-safe.
+    - Everything else is wrapped as ``{"value": <payload>}``.
+
+    The wrapper keys (``items``, ``value``) mirror the minimum surface
+    the filesystem consumer needs while leaving room for richer
+    consumer-defined schemas to pass through untouched.
+    """
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, (list, tuple)):
+        return {"items": [str(p) if hasattr(p, "__fspath__") else p for p in payload]}
+    return {"value": payload}
+
+
+def _build_capture_results_response(
+    request: ChatCompletionRequest,
+    final_res: RequestOutput,
+) -> dict[str, CaptureResultResponse] | None:
+    """Convert per-consumer capture results into the response dict.
+
+    Reads ``RequestOutput.capture_results`` via ``getattr`` so this
+    module continues to work during the Phase D→F gap — before D lands,
+    the attribute may be absent; after D+F both land it is a declared
+    field.
+
+    Returns ``None`` when the dict is empty so serializers omit the
+    response field entirely, keeping the payload small for the common
+    uncaptured request.
+    """
+    del request  # signature mirrors _build_activation_storage_response
+    results = getattr(final_res, "capture_results", None)
+    if not results:
+        return None
+    response: dict[str, CaptureResultResponse] = {}
+    for name, result in results.items():
+        response[name] = CaptureResultResponse(
+            status=result.status,
+            error=result.error,
+            payload=_capture_result_to_response_payload(result.payload),
+        )
+    return response
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -198,6 +263,29 @@ class OpenAIServingChat(OpenAIServing):
             )
 
         self.tool_call_id_type = get_tool_call_id_type(self.model_config)
+
+        # Build a capture-consumer instance cache at serving-layer init so
+        # per-request ``validate_client_spec`` calls do not re-import or
+        # re-instantiate consumers. This intentionally uses
+        # ``registry.build_consumer`` (singular) rather than
+        # ``build_consumers`` (plural) so Phase F does not touch the
+        # registry.py file Phase D owns. Instances are driver-side
+        # (the entrypoint runs in the driver process) and used only for
+        # admission validation — not for dispatching captures. Keyed by
+        # ``spec.instance_name or spec.name`` so multiple instances of
+        # the same class can coexist.
+        self._capture_consumers: dict[str, CaptureConsumer] = {}
+        capture_config = getattr(
+            self.engine_client.vllm_config, "capture_consumers_config", None
+        )
+        if capture_config is not None:
+            for spec in capture_config.consumers:
+                key = spec.instance_name or spec.name
+                self._capture_consumers[key] = capture_registry.build_consumer(
+                    spec.name,
+                    self.engine_client.vllm_config,
+                    spec.params,
+                )
 
         # NOTE(woosuk): While OpenAI's chat completion API supports browsing
         # for some models, currently vLLM doesn't support it. Please use the
@@ -378,6 +466,18 @@ class OpenAIServingChat(OpenAIServing):
                 if error_response is not None:
                     return error_response
 
+            # Additive admission for the new capture framework. Runs
+            # alongside the legacy activation_storing path during the
+            # Phase F→I window; clients can use either or both.
+            if isinstance(sampling_params, SamplingParams) and sampling_params.capture:
+                error_response = self._admit_capture(
+                    sampling_params=sampling_params,
+                    engine_input=engine_input,
+                    request_id=sub_request_id,
+                )
+                if error_response is not None:
+                    return error_response
+
             self._log_inputs(
                 sub_request_id,
                 engine_input,
@@ -534,6 +634,105 @@ class OpenAIServingChat(OpenAIServing):
         # sees it. The resolved spec's ``raw`` field is the exact spec the
         # runner consumes (phase 4 owns the runner-side plan building).
         sampling_params.activation_storing = resolved.raw
+        return None
+
+    def _admit_capture(
+        self,
+        *,
+        sampling_params: SamplingParams,
+        engine_input: EngineInput,
+        request_id: str,
+    ) -> ErrorResponse | None:
+        """Run admission validation for the per-request capture dict.
+
+        Iterates each ``(consumer_name, raw_spec)`` entry in
+        ``sampling_params.capture``:
+
+        1. Look up the consumer instance in the serving-layer cache
+           (built at ``__init__`` via
+           :func:`vllm.v1.capture.registry.build_consumer`). A missing
+           name raises HTTP 400 with ``param=f"capture.{name}"``.
+        2. Build a fresh :class:`CaptureContext` from the model shape
+           and the tokenized prompt length. ``num_computed_tokens`` is
+           ``0`` at the entrypoint (prefix-cache is evaluated again at
+           the runner).
+        3. Call ``consumer.validate_client_spec(raw, ctx)``. A
+           :class:`CaptureValidationError` surfaces as HTTP 400 with
+           ``param=f"capture.{name}"``.
+        4. Mutate ``sampling_params.capture[name]`` to the validated
+           :class:`CaptureSpec`. The runner tolerates either shape.
+
+        Admission happens AFTER tokenization and sampling-params
+        construction (we need the tokenized prompt length) but BEFORE
+        the request is handed to the engine (admission failures never
+        consume an inference slot).
+        """
+        if sampling_params.capture is None:
+            return None
+
+        vllm_config = self.engine_client.vllm_config
+        parallel_config = vllm_config.parallel_config
+        model_config = vllm_config.model_config
+
+        try:
+            num_prompt_tokens = self._extract_prompt_len(engine_input)
+        except Exception as exc:  # pragma: no cover - defensive
+            return self.create_error_response(
+                f"capture: failed to determine prompt length: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="capture",
+            )
+
+        try:
+            num_hidden_layers = model_config.get_total_num_hidden_layers()
+            hidden_size = model_config.get_hidden_size()
+            dt = model_config.dtype
+            element_size_bytes = getattr(dt, "itemsize", None)
+            if element_size_bytes is None:
+                import torch
+
+                element_size_bytes = torch.tensor([], dtype=dt).element_size()
+        except Exception as exc:  # pragma: no cover - defensive
+            return self.create_error_response(
+                f"capture: failed to read model shape: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="capture",
+            )
+
+        ctx = CaptureContext(
+            vllm_internal_request_id=request_id,  # type: ignore[arg-type]
+            num_prompt_tokens=num_prompt_tokens,
+            num_computed_tokens=0,
+            num_hidden_layers=num_hidden_layers,
+            hidden_size=hidden_size,
+            element_size_bytes=int(element_size_bytes),
+            tensor_parallel_size=parallel_config.tensor_parallel_size,
+            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+        )
+
+        validated: dict[str, Any] = {}
+        for name, raw_spec in sampling_params.capture.items():
+            consumer = self._capture_consumers.get(name)
+            if consumer is None:
+                available = sorted(self._capture_consumers.keys())
+                return self.create_error_response(
+                    (
+                        f"capture: no consumer named {name!r} is registered. "
+                        f"Available consumers: {available}."
+                    ),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    param=f"capture.{name}",
+                )
+            try:
+                validated[name] = consumer.validate_client_spec(raw_spec, ctx)
+            except CaptureValidationError as exc:
+                return self.create_error_response(
+                    str(exc),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    param=f"capture.{name}",
+                )
+
+        sampling_params.capture = validated
         return None
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -1401,7 +1600,16 @@ class OpenAIServingChat(OpenAIServing):
                 if last_res is not None
                 else None
             )
-            if include_usage or activation_storage is not None:
+            capture_results = (
+                _build_capture_results_response(request, last_res)
+                if last_res is not None
+                else None
+            )
+            if (
+                include_usage
+                or activation_storage is not None
+                or capture_results is not None
+            ):
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(
                     prompt_tokens=num_prompt_tokens,
@@ -1426,6 +1634,7 @@ class OpenAIServingChat(OpenAIServing):
                     model=model_name,
                     usage=final_usage if include_usage else None,
                     activation_storage=activation_storage,
+                    capture_results=capture_results,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True
@@ -1820,6 +2029,7 @@ class OpenAIServingChat(OpenAIServing):
             ),
             kv_transfer_params=final_res.kv_transfer_params,
             activation_storage=_build_activation_storage_response(request, final_res),
+            capture_results=_build_capture_results_response(request, final_res),
         )
 
         # Log complete response if output logging is enabled

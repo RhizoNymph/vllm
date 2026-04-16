@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import Request
 
@@ -19,6 +19,10 @@ from vllm.entrypoints.openai.activation_storing_validation import (
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ActivationStorageResponse,
+    CaptureResultResponse,
+)
+from vllm.entrypoints.openai.chat_completion.serving import (
+    _build_capture_results_response as _build_capture_results_response_chat,
 )
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionLogProbs,
@@ -50,6 +54,12 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
+from vllm.v1.capture import (
+    CaptureConsumer,
+    CaptureContext,
+    CaptureValidationError,
+)
+from vllm.v1.capture import registry as capture_registry
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -92,6 +102,21 @@ def _build_activation_storage_response(
     )
 
 
+def _build_capture_results_response(
+    request: CompletionRequest,
+    final_res: RequestOutput,
+) -> dict[str, CaptureResultResponse] | None:
+    """Convert per-consumer capture results into the legacy-completion response.
+
+    Thin adapter over
+    :func:`vllm.entrypoints.openai.chat_completion.serving._build_capture_results_response`
+    so the two endpoints share a single payload-coercion code path. The
+    chat-completion helper ignores its ``request`` argument; passing the
+    legacy-completion request is safe.
+    """
+    return _build_capture_results_response_chat(request, final_res)  # type: ignore[arg-type]
+
+
 class OpenAIServingCompletion(OpenAIServing):
     def __init__(
         self,
@@ -122,6 +147,23 @@ class OpenAIServingCompletion(OpenAIServing):
             if mc.generation_config not in ("auto", "vllm")
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
+
+        # Capture-consumer instance cache — mirrors
+        # ``OpenAIServingChat.__init__``. See the note there for why
+        # ``build_consumer`` (singular) is used instead of
+        # ``build_consumers`` (plural).
+        self._capture_consumers: dict[str, CaptureConsumer] = {}
+        capture_config = getattr(
+            self.engine_client.vllm_config, "capture_consumers_config", None
+        )
+        if capture_config is not None:
+            for spec in capture_config.consumers:
+                key = spec.instance_name or spec.name
+                self._capture_consumers[key] = capture_registry.build_consumer(
+                    spec.name,
+                    self.engine_client.vllm_config,
+                    spec.params,
+                )
 
     def _admit_activation_storing(
         self,
@@ -188,6 +230,90 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
         sampling_params.activation_storing = resolved.raw
+        return None
+
+    def _admit_capture(
+        self,
+        *,
+        sampling_params: SamplingParams,
+        engine_input: EngineInput,
+        request_id: str,
+    ) -> ErrorResponse | None:
+        """Run admission validation for the per-request capture dict.
+
+        Mirrors :meth:`OpenAIServingChat._admit_capture`. See that docstring
+        for the full rationale. Legacy completions admits per-prompt: when
+        a single request expands into multiple engine inputs, each one
+        calls this method against the same spec dict. Each call mutates
+        ``sampling_params.capture`` in place to the validated
+        :class:`CaptureSpec` dict.
+        """
+        if sampling_params.capture is None:
+            return None
+
+        vllm_config = self.engine_client.vllm_config
+        parallel_config = vllm_config.parallel_config
+        model_config = vllm_config.model_config
+
+        try:
+            num_prompt_tokens = self._extract_prompt_len(engine_input)
+        except Exception as exc:  # pragma: no cover - defensive
+            return self.create_error_response(
+                f"capture: failed to determine prompt length: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="capture",
+            )
+
+        try:
+            num_hidden_layers = model_config.get_total_num_hidden_layers()
+            hidden_size = model_config.get_hidden_size()
+            dt = model_config.dtype
+            element_size_bytes = getattr(dt, "itemsize", None)
+            if element_size_bytes is None:
+                import torch
+
+                element_size_bytes = torch.tensor([], dtype=dt).element_size()
+        except Exception as exc:  # pragma: no cover - defensive
+            return self.create_error_response(
+                f"capture: failed to read model shape: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="capture",
+            )
+
+        ctx = CaptureContext(
+            vllm_internal_request_id=request_id,  # type: ignore[arg-type]
+            num_prompt_tokens=num_prompt_tokens,
+            num_computed_tokens=0,
+            num_hidden_layers=num_hidden_layers,
+            hidden_size=hidden_size,
+            element_size_bytes=int(element_size_bytes),
+            tensor_parallel_size=parallel_config.tensor_parallel_size,
+            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+        )
+
+        validated: dict[str, Any] = {}
+        for name, raw_spec in sampling_params.capture.items():
+            consumer = self._capture_consumers.get(name)
+            if consumer is None:
+                available = sorted(self._capture_consumers.keys())
+                return self.create_error_response(
+                    (
+                        f"capture: no consumer named {name!r} is registered. "
+                        f"Available consumers: {available}."
+                    ),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    param=f"capture.{name}",
+                )
+            try:
+                validated[name] = consumer.validate_client_spec(raw_spec, ctx)
+            except CaptureValidationError as exc:
+                return self.create_error_response(
+                    str(exc),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    param=f"capture.{name}",
+                )
+
+        sampling_params.capture = validated
         return None
 
     async def render_completion_request(
@@ -328,6 +454,18 @@ class OpenAIServingCompletion(OpenAIServing):
                     return error_response
 
             request_id_item = f"{request_id}-{i}"
+
+            # Additive capture-framework admission; runs alongside the
+            # legacy activation_storing validation during the Phase F→I
+            # window.
+            if isinstance(sampling_params, SamplingParams) and sampling_params.capture:
+                error_response = self._admit_capture(
+                    sampling_params=sampling_params,
+                    engine_input=engine_input,
+                    request_id=request_id_item,
+                )
+                if error_response is not None:
+                    return error_response
 
             self._log_inputs(
                 request_id_item,
@@ -600,7 +738,16 @@ class OpenAIServingCompletion(OpenAIServing):
                 if last_res is not None
                 else None
             )
-            if include_usage or activation_storage is not None:
+            capture_results = (
+                _build_capture_results_response(request, last_res)
+                if last_res is not None
+                else None
+            )
+            if (
+                include_usage
+                or activation_storage is not None
+                or capture_results is not None
+            ):
                 # Emit a final SSE frame that carries the usage block
                 # and/or the activation storage pointer. If only
                 # ``activation_storage`` is set (client did not request
@@ -613,6 +760,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     choices=[],
                     usage=final_usage_info if include_usage else None,
                     activation_storage=activation_storage,
+                    capture_results=capture_results,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=False, exclude_none=True
@@ -748,6 +896,15 @@ class OpenAIServingCompletion(OpenAIServing):
             activation_storage = _build_activation_storage_response(
                 request, final_res_batch[0]
             )
+        # Mirror activation_storage: legacy completions collapses the
+        # multi-prompt expansion to a single response, so pick the first
+        # populated capture_results dict across the batch (common case is
+        # a single prompt anyway).
+        capture_results: dict[str, CaptureResultResponse] | None = None
+        if final_res_batch:
+            capture_results = _build_capture_results_response(
+                request, final_res_batch[0]
+            )
         return CompletionResponse(
             id=request_id,
             created=created_time,
@@ -756,6 +913,7 @@ class OpenAIServingCompletion(OpenAIServing):
             usage=usage,
             kv_transfer_params=kv_transfer_params,
             activation_storage=activation_storage,
+            capture_results=capture_results,
         )
 
     def _create_completion_logprobs(
