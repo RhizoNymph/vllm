@@ -698,9 +698,7 @@ class Scheduler(SchedulerInterface):
                             len(scheduled_steering_configs) + len(new_unique)
                             > self.steering_config.max_steering_configs
                         ):
-                            request.set_block_hash_steering_overrides(
-                                prefill_hash=0
-                            )
+                            request.set_block_hash_steering_overrides(prefill_hash=0)
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
@@ -1630,7 +1628,7 @@ class Scheduler(SchedulerInterface):
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
-                        capture_result=capture_results.get(req_id),
+                        capture_results=capture_results.get(req_id, {}),
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,

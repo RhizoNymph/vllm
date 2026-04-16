@@ -254,14 +254,14 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-    # req_id -> terminal activation capture result.  Only populated by the
-    # model runner for requests whose ``SamplingParams.activation_storing``
-    # was set and whose finalize fired on this step.  Phase 4 drains
-    # :class:`vllm.model_executor.layers.activation_capture.ActivationCaptureManager`
-    # pending finalize results into this dict on each forward; the engine
-    # core process then threads them through ``EngineCoreOutput`` to the
-    # output processor, which surfaces them on ``RequestOutput``.
-    capture_results: dict[str, CaptureResult] = field(default_factory=dict)
+    # req_id -> consumer_name -> terminal capture result.  Only
+    # populated by the model runner for requests whose capture-consumer
+    # finalize fired on this step.  Phase D's ``CaptureManager``
+    # finalize path produces a ``dict[consumer_name, CaptureResult]``
+    # per request; the nested shape flows through
+    # ``EngineCoreOutput.capture_results`` to the output processor,
+    # which surfaces it on ``RequestOutput.capture_results``.
+    capture_results: dict[str, dict[str, CaptureResult]] = field(default_factory=dict)
 
 
 # ModelRunnerOutput wrapper for async scheduling.

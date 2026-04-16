@@ -119,6 +119,28 @@ class EngineCore:
                 "Multi-rank residual collection is out of scope for v1."
             )
 
+        # Capture consumers: same constraint as the legacy activation-
+        # storing path.  Reject early with an error that names the
+        # configured consumers so operators can correlate with their
+        # config.  Phase I removes the activation_storing assertion
+        # above; the capture-consumers check stays.
+        if vllm_config.capture_consumers_config is not None and (
+            vllm_config.parallel_config.tensor_parallel_size > 1
+            or vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            consumers = vllm_config.capture_consumers_config.consumers
+            names = [(spec.instance_name or spec.name) for spec in consumers]
+            raise ValueError(
+                "capture consumers are only supported with "
+                "tensor_parallel_size == 1 and pipeline_parallel_size == 1; "
+                f"got tensor_parallel_size="
+                f"{vllm_config.parallel_config.tensor_parallel_size}, "
+                f"pipeline_parallel_size="
+                f"{vllm_config.parallel_config.pipeline_parallel_size}. "
+                f"Configured consumers: {names}. "
+                "Multi-rank residual collection is out of scope for v1."
+            )
+
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -1273,8 +1295,9 @@ class EngineCoreProc(EngineCore):
                 return
             output = UtilityOutput(call_id)
             # Lazily look-up utility method so that failure will be handled/returned.
-            get_result = lambda: (method := getattr(self, method_name)) and method(
-                *self._convert_msgspec_args(method, args)
+            get_result = lambda: (
+                (method := getattr(self, method_name))
+                and method(*self._convert_msgspec_args(method, args))
             )
             enqueue_output = lambda out: self.output_queue.put_nowait(
                 (client_idx, EngineCoreOutputs(utility_output=out))
