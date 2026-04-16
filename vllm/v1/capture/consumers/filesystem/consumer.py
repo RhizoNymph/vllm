@@ -30,7 +30,7 @@ from vllm.v1.capture.types import (
     CaptureResult,
     CaptureSpec,
 )
-from vllm.v1.worker.activation_writer import (
+from vllm.v1.capture.consumers.filesystem.writer import (
     ActivationWriter,
     FinalizeTask,
     WriteTask,

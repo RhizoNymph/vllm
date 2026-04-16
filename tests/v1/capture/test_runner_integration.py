@@ -213,7 +213,7 @@ def test_filesystem_consumer_byte_for_byte_matches_writer(
         CaptureChunk,
         CaptureFinalize,
     )
-    from vllm.v1.worker.activation_writer import (
+    from vllm.v1.capture.consumers.filesystem.writer import (
         ActivationWriter,
         FinalizeTask,
         WriteTask,

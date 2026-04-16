@@ -1943,7 +1943,7 @@ class GPUModelRunner(
 
         from pathlib import Path as _ActPath
 
-        from vllm.v1.worker.activation_writer import WriteError, WriteTask
+        from vllm.v1.capture.consumers.filesystem.writer import WriteError, WriteTask
 
         # 1. Stage each (layer, hook) scratch tensor to pinned CPU with
         # non_blocking copies. One synchronize at the end pays the wait

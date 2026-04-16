@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.activation_storing_validation import (
         ResolvedActivationStoringSpec,
     )
-    from vllm.v1.worker.activation_writer import (
+    from vllm.v1.capture.consumers.filesystem.writer import (
         ActivationWriter,
         CaptureKey,
         WriteResult,
@@ -781,7 +781,7 @@ class ActivationCaptureManager:
         # Import the writer types lazily so importing this module
         # without a running Phase 2 writer stays cheap. The runner
         # always has them available; tests may not.
-        from vllm.v1.worker.activation_writer import FinalizeTask, WriteError
+        from vllm.v1.capture.consumers.filesystem.writer import FinalizeTask, WriteError
 
         # Build one FinalizeTask per (layer, hook). We walk
         # resolved_hooks (rather than captured_positions) so that even
