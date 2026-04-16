@@ -27,7 +27,6 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
 
-from .activation_storing import ActivationStoringConfig
 from .attention import AttentionConfig
 from .cache import CacheConfig
 from .capture_consumers import CaptureConsumersConfig
@@ -282,10 +281,6 @@ class VllmConfig:
     """LoRA configuration."""
     steering_config: SteeringConfig | None = None
     """Per-request activation steering configuration."""
-    activation_storing_config: ActivationStoringConfig | None = None
-    """Per-request activation storing configuration. ``None`` means the
-    feature is disabled; set to an :class:`ActivationStoringConfig` (e.g.
-    via ``--activation-storing /path``) to enable capture."""
     capture_consumers_config: CaptureConsumersConfig | None = None
     """Capture-consumer framework configuration.  ``None`` means no
     consumers are registered.  Set via repeated ``--capture-consumers``
@@ -415,10 +410,6 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.steering_config:
             vllm_factors.append(self.steering_config.compute_hash())
-        else:
-            vllm_factors.append("None")
-        if self.activation_storing_config:
-            vllm_factors.append(self.activation_storing_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.capture_consumers_config:

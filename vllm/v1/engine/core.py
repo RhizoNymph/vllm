@@ -102,28 +102,11 @@ class EngineCore:
 
         self.vllm_config = vllm_config
 
-        # Activation storing (spec invariant 9): reject TP/PP > 1 loudly at
-        # engine init rather than leaving a half-working capture path behind.
-        # Multi-rank residual collection is explicitly out of scope for v1.
-        if vllm_config.activation_storing_config is not None and (
-            vllm_config.parallel_config.tensor_parallel_size > 1
-            or vllm_config.parallel_config.pipeline_parallel_size > 1
-        ):
-            raise ValueError(
-                "activation storing is only supported with "
-                "tensor_parallel_size == 1 and pipeline_parallel_size == 1; "
-                f"got tensor_parallel_size="
-                f"{vllm_config.parallel_config.tensor_parallel_size}, "
-                f"pipeline_parallel_size="
-                f"{vllm_config.parallel_config.pipeline_parallel_size}. "
-                "Multi-rank residual collection is out of scope for v1."
-            )
-
-        # Capture consumers: same constraint as the legacy activation-
-        # storing path.  Reject early with an error that names the
-        # configured consumers so operators can correlate with their
-        # config.  Phase I removes the activation_storing assertion
-        # above; the capture-consumers check stays.
+        # Capture consumers (spec invariant 9): reject TP/PP > 1 loudly
+        # at engine init rather than leaving a half-working capture
+        # path behind.  Multi-rank residual collection is explicitly
+        # out of scope for v1.  The error names the configured
+        # consumers so operators can correlate with their config.
         if vllm_config.capture_consumers_config is not None and (
             vllm_config.parallel_config.tensor_parallel_size > 1
             or vllm_config.parallel_config.pipeline_parallel_size > 1
