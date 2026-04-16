@@ -15,6 +15,7 @@ from vllm.config.steering_types import SteeringVectorSpec
 from vllm.config.utils import replace
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ActivationStorageResponse,
+    CaptureResultResponse,
 )
 from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
@@ -225,6 +226,15 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    capture: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Per-request opt-in for capture consumers, keyed by consumer "
+            "instance name. Mirrors the chat-completions endpoint; see "
+            "``ChatCompletionRequest.capture`` for the full schema."
+        ),
+    )
+
     # --8<-- [end:completion-extra-params]
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
@@ -380,6 +390,12 @@ class CompletionRequest(OpenAIBaseModel):
         # did not widen ``from_optional``'s signature). Setting it here
         # keeps the phase 5 edit scoped to entrypoint files.
         sampling_params.activation_storing = self.activation_storing
+        # Attach the new capture dict (keyed by consumer name). The
+        # entrypoint's ``_admit_capture`` mutates each value in place
+        # from the raw shape to a ``CaptureSpec`` once the consumer
+        # validator accepts it.
+        if self.capture is not None:
+            sampling_params.capture = dict(self.capture)
         return sampling_params
 
     @model_validator(mode="before")
@@ -551,6 +567,14 @@ class CompletionResponse(OpenAIBaseModel):
             "the on-disk paths and a status pointer."
         ),
     )
+    capture_results: dict[str, CaptureResultResponse] | None = Field(
+        default=None,
+        description=(
+            "Per-consumer capture results from the capture-consumer "
+            "framework. Keyed by consumer instance name. Omitted when no "
+            "consumer produced a result for this request."
+        ),
+    )
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
@@ -590,5 +614,13 @@ class CompletionStreamResponse(OpenAIBaseModel):
             "Per-request activation storing result, sent on the final SSE "
             "frame alongside the final usage block. See "
             "``ActivationStorageResponse`` for semantics."
+        ),
+    )
+    capture_results: dict[str, CaptureResultResponse] | None = Field(
+        default=None,
+        description=(
+            "Per-consumer capture results, sent on the final SSE frame "
+            "alongside the final usage block. Omitted when no consumer "
+            "produced a result for this request."
         ),
     )
