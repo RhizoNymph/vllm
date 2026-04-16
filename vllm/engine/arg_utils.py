@@ -551,6 +551,13 @@ class EngineArgs:
     # whole capture-consumer pipeline stays disabled.
     capture_consumers: list[str] | None = None
 
+    # Programmatic override: Python callers (``LLM(capture_consumers=[...])``)
+    # pre-build a ``CaptureConsumersConfig`` directly and skip the CLI
+    # shorthand parser. When set, takes precedence over ``capture_consumers``.
+    # Typed as ``Any`` to avoid importing the capture config at module
+    # load time (the v1 capture package imports torch).
+    capture_consumers_config_override: Any = None
+
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
@@ -1996,10 +2003,14 @@ class EngineArgs:
             else None
         )
 
-        # Capture consumers config — only materialized when the user
-        # passed at least one ``--capture-consumers`` spec.
+        # Capture consumers config — materialized from either the Python
+        # programmatic override (``LLM(capture_consumers=[...])``) or the
+        # repeatable ``--capture-consumers`` CLI flag.  The override takes
+        # precedence when both are set.
         capture_consumers_config = None
-        if self.capture_consumers:
+        if self.capture_consumers_config_override is not None:
+            capture_consumers_config = self.capture_consumers_config_override
+        elif self.capture_consumers:
             from vllm.v1.capture.config import (
                 CaptureConsumersConfig,
                 parse_consumer_spec,
