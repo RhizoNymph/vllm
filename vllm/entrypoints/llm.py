@@ -95,6 +95,7 @@ from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.sample.logits_processor import LogitsProcessor
 
 if TYPE_CHECKING:
+    from vllm.v1.capture.consumer import CaptureConsumer
     from vllm.v1.metrics.reader import Metric
 
 logger = init_logger(__name__)
@@ -254,9 +255,33 @@ class LLM:
         kv_cache_memory_bytes: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
+        capture_consumers: "list[dict[str, Any] | CaptureConsumer] | None" = None,
         **kwargs: Any,
     ) -> None:
         """LLM constructor."""
+
+        # -- capture consumers: split into config dicts vs instances --------
+        from vllm.v1.capture.consumer import CaptureConsumer
+
+        self._capture_consumer_instances: list[CaptureConsumer] = []
+        self._capture_consumer_configs: list[dict[str, Any]] = []
+        for entry in capture_consumers or []:
+            if isinstance(entry, dict):
+                self._capture_consumer_configs.append(entry)
+            elif isinstance(entry, CaptureConsumer):
+                if entry.location != "driver":
+                    raise ValueError(
+                        "Pre-constructed CaptureConsumer instances passed "
+                        "to LLM() must have location='driver', but "
+                        f"{type(entry).__name__} has "
+                        f"location={entry.location!r}."
+                    )
+                self._capture_consumer_instances.append(entry)
+            else:
+                raise TypeError(
+                    "capture_consumers entries must be dicts or "
+                    f"CaptureConsumer instances, got {type(entry).__name__}"
+                )
 
         if "swap_space" in kwargs:
             kwargs.pop("swap_space")
