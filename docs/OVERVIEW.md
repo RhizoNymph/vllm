@@ -54,6 +54,20 @@ Features Index:
             - extra_body.steering_name (per-request named module reference)
         depends_on: []
         doc: docs/features/steering.md
+    capture_consumers:
+        description: >
+            Pluggable capture consumer framework — observe, record, or
+            react to activations captured during the forward pass.
+            Replaces the activation_storing feature with a general-purpose
+            plugin system. Built-in consumers: filesystem (streaming writer),
+            logging (debug observer). Third-party consumers register via
+            Python entry points.
+        entry_points:
+            - --capture-consumers (CLI)
+            - SamplingParams.capture (per-request)
+            - LLM(capture_consumers=[...]) (Python API)
+        depends_on: [steering]
+        doc: docs/capture_consumers/design.md
     activation_storing:
         description: >
             Per-request activation storing — capture residual-stream
