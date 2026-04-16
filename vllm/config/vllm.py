@@ -30,6 +30,7 @@ from vllm.utils.hashing import safe_hash
 from .activation_storing import ActivationStoringConfig
 from .attention import AttentionConfig
 from .cache import CacheConfig
+from .capture_consumers import CaptureConsumersConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
 from .ec_transfer import ECTransferConfig
@@ -285,6 +286,10 @@ class VllmConfig:
     """Per-request activation storing configuration. ``None`` means the
     feature is disabled; set to an :class:`ActivationStoringConfig` (e.g.
     via ``--activation-storing /path``) to enable capture."""
+    capture_consumers_config: CaptureConsumersConfig | None = None
+    """Capture-consumer framework configuration.  ``None`` means no
+    consumers are registered.  Set via repeated ``--capture-consumers``
+    CLI flags or programmatically."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
     structured_outputs_config: StructuredOutputsConfig = Field(
@@ -414,6 +419,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.activation_storing_config:
             vllm_factors.append(self.activation_storing_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.capture_consumers_config:
+            vllm_factors.append(self.capture_consumers_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.speculative_config:
