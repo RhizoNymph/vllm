@@ -81,6 +81,20 @@ Features Index:
         roadmap: docs/features/activation_storing_roadmap.md
     capture_consumers:
         description: >
+            Pluggable capture-consumer framework — generalises activation
+            storing into a registry of named consumer backends (filesystem,
+            S3, logging, custom entry-points).  Consumers are registered at
+            server startup via repeatable ``--capture-consumers`` CLI flags
+            or programmatically through ``CaptureConsumersConfig``.  The
+            config surface (Phase E) wires into ``VllmConfig`` alongside the
+            existing ``ActivationStoringConfig``; runtime integration lands
+            in Phase D.  Core types, protocol, and registry were added in
+            earlier phases.
+        entry_points:
+            - --capture-consumers SPEC (CLI, repeatable)
+            - VllmConfig.capture_consumers_config (programmatic)
+        depends_on: [activation_storing]
+        doc: docs/features/capture_consumers.md
             Generic capture-consumer framework that decouples activation
             capture from its destination. Consumers register via the
             ``vllm.capture_consumers`` entry-point group and implement

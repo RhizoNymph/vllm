@@ -4,6 +4,7 @@
 from vllm.config.activation_storing import ActivationStoringConfig
 from vllm.config.attention import AttentionConfig
 from vllm.config.cache import CacheConfig
+from vllm.config.capture_consumers import CaptureConsumersConfig
 from vllm.config.compilation import (
     CompilationConfig,
     CompilationMode,
@@ -66,6 +67,8 @@ __all__ = [
     "ActivationStoringConfig",
     # From vllm.config.attention
     "AttentionConfig",
+    # From vllm.config.capture_consumers
+    "CaptureConsumersConfig",
     # From vllm.config.cache
     "CacheConfig",
     # From vllm.config.compilation
