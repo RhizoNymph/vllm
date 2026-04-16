@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import hashlib
+import secrets
 from http import HTTPStatus
 
 from fastapi import APIRouter, FastAPI, Request
@@ -30,6 +32,39 @@ _steering_lock = asyncio.Lock()
 
 def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
+
+
+def _authorize_steering_mutation(request: Request) -> JSONResponse | None:
+    """Gate mutating steering endpoints behind the steering API key."""
+    tokens: list[str] = getattr(request.app.state, "steering_api_tokens", None) or []
+    if not tokens:
+        return None
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return JSONResponse(
+            content={"error": "Unauthorized: steering API key required."},
+            status_code=HTTPStatus.UNAUTHORIZED.value,
+        )
+
+    scheme, _, param = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not param:
+        return JSONResponse(
+            content={"error": "Unauthorized: steering API key required."},
+            status_code=HTTPStatus.UNAUTHORIZED.value,
+        )
+
+    presented = hashlib.sha256(param.encode("utf-8")).digest()
+    matched = False
+    for token in tokens:
+        expected = hashlib.sha256(token.encode("utf-8")).digest()
+        matched |= secrets.compare_digest(presented, expected)
+    if not matched:
+        return JSONResponse(
+            content={"error": "Unauthorized: invalid steering API key."},
+            status_code=HTTPStatus.UNAUTHORIZED.value,
+        )
+    return None
 
 
 def _normalize_spec(
@@ -88,6 +123,9 @@ async def set_steering(
     When ``replace`` is ``True``, all existing vectors across all tiers
     are cleared atomically before the new ones are applied.
     """
+    if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
+        return unauthorized
+
     engine = engine_client(raw_request)
 
     # Collect all tiers that have data.
@@ -286,6 +324,9 @@ async def set_steering(
 @router.post("/v1/steering/clear")
 async def clear_steering(raw_request: Request) -> JSONResponse:
     """Reset all steering vectors to zero (no-op steering)."""
+    if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
+        return unauthorized
+
     engine = engine_client(raw_request)
 
     try:

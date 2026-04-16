@@ -290,6 +290,8 @@ class FrontendArgs(BaseFrontendArgs):
     api_key: list[str] | None = None
     """If provided, the server will require one of these keys to be presented in
     the header."""
+    steering_api_key: list[str] | None = None
+    """Optional Bearer token(s) for POST /v1/steering/set and /clear."""
     ssl_keyfile: str | None = None
     """The file path to the SSL key file."""
     ssl_certfile: str | None = None
