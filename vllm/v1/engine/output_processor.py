@@ -278,6 +278,7 @@ class RequestState:
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: np.ndarray | None = None,
         activation_storage: "CaptureResult | None" = None,
+        capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -317,6 +318,7 @@ class RequestState:
                 [self._new_pooling_output(pooling_output)],
                 finished,
                 activation_storage=activation_storage,
+                capture_results=capture_results,
             )
 
         output = self._new_completion_output(
@@ -337,6 +339,7 @@ class RequestState:
             finished,
             kv_transfer_params,
             activation_storage=activation_storage,
+            capture_results=capture_results,
         )
 
     def _new_request_output(
@@ -346,6 +349,7 @@ class RequestState:
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
         activation_storage: "CaptureResult | None" = None,
+        capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -370,7 +374,7 @@ class RequestState:
         else:
             prompt_logprobs = self.logprobs_processor.prompt_logprobs
 
-        return RequestOutput(
+        request_output = RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally
             lora_request=self.lora_request,
             prompt=self.prompt,
@@ -383,6 +387,16 @@ class RequestState:
             metrics=self.stats,
             activation_storage=activation_storage,
         )
+        # Phase D → Phase F shim: until ``RequestOutput`` declares a
+        # first-class ``capture_results`` field, we attach the per-request
+        # consumer result map via ``setattr``.  Phase F converts this
+        # into a normal kwarg; Phase I removes the shim entirely.
+        setattr(  # noqa: B010
+            request_output,
+            "capture_results",
+            dict(capture_results) if capture_results else {},
+        )
+        return request_output
 
     def _new_completion_output(
         self,
@@ -654,7 +668,8 @@ class OutputProcessor:
                 stop_reason,
                 kv_transfer_params,
                 routed_experts,
-                activation_storage=engine_core_output.capture_result,
+                activation_storage=None,
+                capture_results=engine_core_output.capture_results,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

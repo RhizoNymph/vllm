@@ -261,13 +261,28 @@ class LLM:
         """LLM constructor."""
 
         # -- capture consumers: split into config dicts vs instances --------
+        # Dict entries become ``CaptureConsumerSpec``s that flow into a
+        # ``CaptureConsumersConfig`` on ``VllmConfig``; pre-constructed
+        # instances (driver-side only) ride on a transient attribute that
+        # the runner reads at init time.
+        from vllm.v1.capture.config import (
+            CaptureConsumersConfig,
+            CaptureConsumerSpec,
+            validate_consumer_specs,
+        )
         from vllm.v1.capture.consumer import CaptureConsumer
 
         self._capture_consumer_instances: list[CaptureConsumer] = []
-        self._capture_consumer_configs: list[dict[str, Any]] = []
+        _capture_consumer_specs: list[CaptureConsumerSpec] = []
         for entry in capture_consumers or []:
             if isinstance(entry, dict):
-                self._capture_consumer_configs.append(entry)
+                _capture_consumer_specs.append(
+                    CaptureConsumerSpec(
+                        name=entry["name"],
+                        instance_name=entry.get("instance_name"),
+                        params=dict(entry.get("params", {})),
+                    )
+                )
             elif isinstance(entry, CaptureConsumer):
                 if entry.location != "driver":
                     raise ValueError(
@@ -282,6 +297,13 @@ class LLM:
                     "capture_consumers entries must be dicts or "
                     f"CaptureConsumer instances, got {type(entry).__name__}"
                 )
+
+        self._capture_consumers_config: CaptureConsumersConfig | None = None
+        if _capture_consumer_specs:
+            validate_consumer_specs(_capture_consumer_specs)
+            self._capture_consumers_config = CaptureConsumersConfig(
+                consumers=_capture_consumer_specs,
+            )
 
         if "swap_space" in kwargs:
             kwargs.pop("swap_space")
@@ -364,6 +386,12 @@ class LLM:
                 "'examples/offline_inference/data_parallel.py'."
             )
 
+        engine_args_kwargs: dict[str, Any] = {}
+        if self._capture_consumers_config is not None:
+            engine_args_kwargs["capture_consumers_config_override"] = (
+                self._capture_consumers_config
+            )
+
         engine_args = EngineArgs(
             model=model,
             runner=runner,
@@ -399,6 +427,7 @@ class LLM:
             attention_config=attention_config_instance,
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,
+            **engine_args_kwargs,
             **kwargs,
         )
 

@@ -162,6 +162,7 @@ class CaptureManager:
         num_hidden_layers: int,
         hidden_size: int,
         model_dtype: torch.dtype,
+        device: torch.device | str = "cpu",
     ) -> None:
         if len(consumers) != len(consumer_specs):
             msg = (
@@ -174,7 +175,13 @@ class CaptureManager:
         self._num_hidden_layers = num_hidden_layers
         self._hidden_size = hidden_size
         self._model_dtype = model_dtype
+        self._device = torch.device(device) if isinstance(device, str) else device
         self._requests: dict[str, _RequestCaptureState] = {}
+        # Active plan buffered between ``build_step_plan`` (called by the
+        # runner pre-forward) and ``on_hook`` fires from inside the
+        # compiled forward graph.  Cleared by ``consume_step_plan`` once
+        # the runner's finalize path has copied the scratch tensors out.
+        self._step_plan: StepCapturePlan | None = None
 
     # ------------------------------------------------------------------ props
 
@@ -389,26 +396,85 @@ class CaptureManager:
                         )
                     )
 
-        # Materialize tensors.
+        # Materialize tensors.  ``gather_indices`` lives on the model's
+        # device so ``hidden_states.index_select`` during
+        # :meth:`on_hook` is a device-local op.  ``scratch_gpu`` is a
+        # placeholder here — :meth:`on_hook` overwrites the entry with
+        # the gathered result, which keeps the dtype/shape but may end
+        # up on the device the hidden states are on.
         gather_indices: dict[tuple[int, str], torch.Tensor] = {}
         scratch_gpu: dict[tuple[int, str], torch.Tensor] = {}
         scratch_dtype: dict[tuple[int, str], torch.dtype] = {}
         for key, rows in gather_rows.items():
-            gather_indices[key] = torch.tensor(rows, dtype=torch.int64, device="cpu")
+            gather_indices[key] = torch.tensor(
+                rows, dtype=torch.int64, device=self._device
+            )
             scratch_gpu[key] = torch.empty(
                 (len(rows), self._hidden_size),
                 dtype=self._model_dtype,
-                device="cpu",
+                device=self._device,
             )
             scratch_dtype[key] = self._model_dtype
 
-        return StepCapturePlan(
+        plan = StepCapturePlan(
             gather_indices=gather_indices,
             scratch_gpu=scratch_gpu,
             scratch_dtype=scratch_dtype,
             entries=entries,
             request_errors=request_errors,
         )
+        self._step_plan = plan
+        return plan
+
+    # ---------------------------------------- runner/custom-op glue helpers
+
+    def set_step_plan(self, plan: StepCapturePlan | None) -> None:
+        """Install *plan* as the active plan without re-running the builder.
+
+        Used by unit tests that exercise :meth:`on_hook` in isolation.
+        """
+        self._step_plan = plan
+
+    def consume_step_plan(self) -> StepCapturePlan | None:
+        """Return and clear the active plan.
+
+        The runner's finalize path calls this once per forward step to
+        take ownership of scratch tensors before copying them out.
+        Returning ``None`` guards the next forward pass against stale
+        plans.
+        """
+        plan = self._step_plan
+        self._step_plan = None
+        return plan
+
+    def on_hook(
+        self,
+        layer_idx: int,
+        hook_name: str,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        """Custom-op callback fired from inside the compiled forward graph.
+
+        For any ``(layer, hook)`` key the active plan wants, gather the
+        rows out of ``hidden_states`` into ``plan.scratch_gpu``.  Keys
+        absent from the plan are silently skipped — the op is a no-op
+        on any forward step that isn't capturing.
+
+        The tensor passed in is the pristine residual (spec invariant
+        1); we must not mutate it.
+        """
+        plan = self._step_plan
+        if plan is None:
+            return
+        key = (layer_idx, hook_name)
+        idx = plan.gather_indices.get(key)
+        if idx is None:
+            return
+        gathered = hidden_states.index_select(0, idx)
+        target_dtype = plan.scratch_dtype[key]
+        if gathered.dtype != target_dtype:
+            gathered = gathered.to(target_dtype)
+        plan.scratch_gpu[key] = gathered
 
     # ----------------------------------------------------- dispatch
 
