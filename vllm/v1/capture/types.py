@@ -7,7 +7,7 @@ so consumers can dispatch on captured activations without further
 round-tripping. Unit tests exercising the dataclasses stay cheap by
 using small CPU tensors.
 
-See ``docs/capture_consumers/design.md`` § "Core types" for the
+See ``docs/design/capture_consumers.md`` § "Core Types" for the
 authoritative field-by-field spec.
 """
 
@@ -104,8 +104,9 @@ class CaptureChunk:
     row_offset: int
     # Which forward step produced this chunk.
     step_index: int
-    # Per-chunk context — see ``docs/capture_consumers/design.md``
-    # § "Sidecar schema".
+    # Per-chunk context — see ``docs/design/capture_consumers.md``
+    # § "Manager Runtime" for what the manager populates and
+    # § "Known Limitations" for the gaps.
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

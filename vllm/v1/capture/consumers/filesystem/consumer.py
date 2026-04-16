@@ -9,7 +9,7 @@ memory. Each ``CaptureChunk`` is converted to bytes and submitted as a
 ``WriteTask``; ``CaptureFinalize`` produces a ``FinalizeTask`` with
 sidecar JSON.
 
-See ``docs/capture_consumers/design.md`` for the rationale.
+See ``docs/design/capture_consumers.md`` for the rationale.
 """
 
 from __future__ import annotations

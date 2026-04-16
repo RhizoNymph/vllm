@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Public API for the capture-consumer framework.
 
-See ``docs/capture_consumers/design.md`` for the design spec and
+See ``docs/design/capture_consumers.md`` for the design spec and
 ``docs/capture_consumers/roadmap.md`` for the phase-by-phase rollout.
 """
 

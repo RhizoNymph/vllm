@@ -16,7 +16,7 @@ framework. Responsibilities:
   no active manager, the gate constant-folds and the custom op never
   enters the compiled graph (spec invariant 3).
 
-See ``docs/capture_consumers/design.md`` for the framework design. The
+See ``docs/design/capture_consumers.md`` for the framework design. The
 manager implementation lives in ``vllm/v1/capture/manager.py``.
 """
 

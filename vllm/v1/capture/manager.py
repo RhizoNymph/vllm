@@ -24,7 +24,7 @@ Key design properties:
   explicit ``list[int]``) and intersects the result with the step's
   ``[num_computed, num_computed + num_scheduled)`` window.
 
-See ``docs/capture_consumers/design.md`` for the full spec.
+See ``docs/design/capture_consumers.md`` for the full spec.
 """
 
 from __future__ import annotations
@@ -43,14 +43,24 @@ from vllm.v1.capture.plan import (
 )
 from vllm.v1.capture.sink import CaptureSink
 from vllm.v1.capture.types import (
+    CaptureKey,
     CaptureChunk,
     CaptureFinalize,
     CaptureResult,
+    CaptureStatus,
     CaptureSpec,
     VllmInternalRequestId,
 )
 
 logger = logging.getLogger(__name__)
+
+_CAPTURE_RESULT_SEVERITY: dict[CaptureStatus, int] = {
+    "pending": 0,
+    "ok": 1,
+    "not_requested": 2,
+    "partial_error": 3,
+    "error": 4,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +172,7 @@ class CaptureManager:
         hidden_size: int,
         model_dtype: torch.dtype,
         device: torch.device | str = "cpu",
+        finalize_timeout_s: float = 5.0,
     ) -> None:
         if len(consumers) != len(consumer_specs):
             msg = (
@@ -175,6 +186,7 @@ class CaptureManager:
         self._hidden_size = hidden_size
         self._model_dtype = model_dtype
         self._device = torch.device(device) if isinstance(device, str) else device
+        self._finalize_timeout = finalize_timeout_s
         self._requests: dict[str, _RequestCaptureState] = {}
         # Active plan buffered between ``build_step_plan`` (called by the
         # runner pre-forward) and ``on_hook`` fires from inside the
@@ -558,7 +570,8 @@ class CaptureManager:
         """Finalize capture for a request across all consumers.
 
         For each consumer that had a spec for this request, call
-        ``submit_finalize`` on the sink and then ``get_result``.
+        ``submit_finalize`` on the sink and aggregate the terminal
+        per-key results.
 
         Returns a dict mapping consumer index to ``CaptureResult``.
         """
@@ -576,8 +589,7 @@ class CaptureManager:
             sidecar = dict(state.sidecar_fields)
             sidecar["consumer_index"] = consumer_idx
 
-            # For each (hook, layer) in this consumer's spec, send a
-            # finalize signal.
+            capture_keys: list[CaptureKey] = []
             for hook_name, layers in spec.hooks.items():
                 for layer_idx in layers:
                     capture_key = (
@@ -585,6 +597,7 @@ class CaptureManager:
                         layer_idx,
                         hook_name,
                     )
+                    capture_keys.append(capture_key)
                     finalize = CaptureFinalize(
                         key=capture_key,
                         sidecar=sidecar,
@@ -598,40 +611,31 @@ class CaptureManager:
                             capture_key,
                         )
 
-            # Retrieve the result for the first key (representative).
-            # A more complete implementation would aggregate across keys,
-            # but for now a single result per consumer suffices.
-            first_key = None
-            for hook_name, layers in spec.hooks.items():
-                for layer_idx in layers:
-                    first_key = (
-                        VllmInternalRequestId(req_id),
-                        layer_idx,
-                        hook_name,
-                    )
-                    break
-                if first_key is not None:
-                    break
+            if capture_keys:
+                per_key_results: list[CaptureResult] = []
+                for capture_key in capture_keys:
+                    try:
+                        result = sink.wait_for_result(
+                            capture_key,
+                            timeout=self._finalize_timeout,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Consumer %d wait_for_result failed for %s",
+                            consumer_idx,
+                            capture_key,
+                        )
+                        result = None
 
-            if first_key is not None:
-                try:
-                    result = sink.get_result(first_key)
-                except Exception:
-                    logger.exception(
-                        "Consumer %d get_result failed for %s",
-                        consumer_idx,
-                        first_key,
-                    )
-                    result = None
+                    if result is None:
+                        result = CaptureResult(
+                            key=capture_key,
+                            status="error",
+                            error=f"finalize timed out for {capture_key}",
+                        )
+                    per_key_results.append(result)
 
-                if result is not None:
-                    results[consumer_idx] = result
-                else:
-                    # Sink hasn't produced a result yet — synthesize one.
-                    results[consumer_idx] = CaptureResult(
-                        key=first_key,
-                        status="ok",
-                    )
+                results[consumer_idx] = _aggregate_capture_results(per_key_results)
             else:
                 # No hooks in spec — unusual but not impossible.
                 dummy_key = (
@@ -665,6 +669,33 @@ class CaptureManager:
         return req_id in self._requests
 
 
+def _aggregate_capture_results(results: list[CaptureResult]) -> CaptureResult:
+    """Reduce per-key capture results into one per-consumer result."""
+    if not results:
+        raise ValueError("results must not be empty")
+
+    worst_severity = max(_CAPTURE_RESULT_SEVERITY[r.status] for r in results)
+    representative = next(
+        result
+        for result in results
+        if _CAPTURE_RESULT_SEVERITY[result.status] == worst_severity
+    )
+    errors = [result.error for result in results if result.error]
+
+    if len(results) == 1:
+        payload: Any = results[0].payload
+    else:
+        payload = {result.key: result.payload for result in results}
+
+    return CaptureResult(
+        key=representative.key,
+        status=representative.status,
+        error="; ".join(errors) if errors else None,
+        payload=payload,
+    )
+
+
 __all__ = [
     "CaptureManager",
+    "_aggregate_capture_results",
 ]

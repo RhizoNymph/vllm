@@ -185,5 +185,12 @@ class _BatchedAdapter:
         with self._lock:
             return self._results.get(key)
 
+    def wait_for_result(
+        self,
+        key: CaptureKey,
+        timeout: float,
+    ) -> CaptureResult | None:
+        return self.get_result(key)
+
     def shutdown(self, timeout: float = 30.0) -> None:
         self._consumer.shutdown(timeout)

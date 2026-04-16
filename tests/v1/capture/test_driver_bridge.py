@@ -15,6 +15,7 @@ result queue -> shim's ``get_result``.
 from __future__ import annotations
 
 import queue
+import threading
 import time
 from typing import Any, ClassVar, Literal
 
@@ -30,6 +31,7 @@ from vllm.v1.capture.types import (
     CaptureChunk,
     CaptureFinalize,
     CaptureKey,
+    CaptureResult,
     VllmInternalRequestId,
 )
 
@@ -129,15 +131,7 @@ def test_round_trip_chunk_and_finalize():
     shim.submit_chunk(chunk)
     shim.submit_finalize(CaptureFinalize(key=key, sidecar={"tag": "test"}))
 
-    # Give the receiver thread time to process.
-    deadline = time.monotonic() + 5.0
-    result = None
-    while time.monotonic() < deadline:
-        result = shim.get_result(key)
-        if result is not None:
-            break
-        time.sleep(0.05)
-
+    result = shim.wait_for_result(key, timeout=5.0)
     assert result is not None, "Timed out waiting for result"
     assert result.status == "ok"
     assert result.error is None
@@ -312,14 +306,7 @@ def test_exception_in_on_capture_produces_error_result():
     )
     shim.submit_finalize(CaptureFinalize(key=bad_key))
 
-    deadline = time.monotonic() + 5.0
-    result = None
-    while time.monotonic() < deadline:
-        result = shim.get_result(bad_key)
-        if result is not None:
-            break
-        time.sleep(0.05)
-
+    result = shim.wait_for_result(bad_key, timeout=5.0)
     assert result is not None, "Timed out waiting for error result"
     assert result.status == "error"
     assert result.error is not None
@@ -331,6 +318,42 @@ def test_exception_in_on_capture_produces_error_result():
 
     shim.shutdown()
     receiver.join(timeout=5.0)
+
+
+def test_wait_for_result_blocks_until_delayed_result_arrives():
+    event_q, result_q = _make_queue_pair()
+    shim = _DriverQueueShim(event_q, result_q, timeout=5.0)
+    key = _key("req-delayed")
+
+    def _post_result() -> None:
+        time.sleep(0.2)
+        result_q.put(CaptureResult(key=key, status="error", error="delayed failure"))
+
+    thread = threading.Thread(target=_post_result)
+    thread.start()
+
+    start = time.monotonic()
+    result = shim.wait_for_result(key, timeout=1.0)
+    elapsed = time.monotonic() - start
+    thread.join(timeout=1.0)
+
+    assert result is not None
+    assert result.status == "error"
+    assert result.error == "delayed failure"
+    assert elapsed >= 0.15
+
+
+def test_wait_for_result_times_out_when_no_result_arrives():
+    event_q, result_q = _make_queue_pair()
+    shim = _DriverQueueShim(event_q, result_q, timeout=0.1)
+    key = _key("req-timeout")
+
+    start = time.monotonic()
+    result = shim.wait_for_result(key, timeout=0.2)
+    elapsed = time.monotonic() - start
+
+    assert result is None
+    assert elapsed >= 0.15
 
 
 # ---------------------------------------------------------------------------

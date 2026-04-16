@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from typing import ClassVar, Literal
 
 import torch.multiprocessing as mp
@@ -122,6 +123,34 @@ class _DriverQueueShim:
         with self._lock:
             self._drain_results()
             return self._results.get(key)
+
+    def wait_for_result(
+        self,
+        key: CaptureKey,
+        timeout: float,
+    ) -> CaptureResult | None:
+        deadline = time.monotonic() + timeout
+
+        with self._lock:
+            self._drain_results()
+            result = self._results.get(key)
+            if result is not None:
+                return result
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+
+            try:
+                result = self._result_queue.get(timeout=remaining)
+            except queue.Empty:
+                return None
+
+            with self._lock:
+                self._results[result.key] = result
+                if result.key == key:
+                    return result
 
     def shutdown(self, timeout: float = 30.0) -> None:
         """Send the sentinel to stop the driver receiver, then drain."""

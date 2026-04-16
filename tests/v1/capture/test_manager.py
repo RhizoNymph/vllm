@@ -9,9 +9,13 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm.v1.capture.manager import CaptureManager
+from vllm.v1.capture.manager import (
+    CaptureManager,
+    _aggregate_capture_results,
+)
 from vllm.v1.capture.plan import CaptureBatchView, StepCapturePlan
 from vllm.v1.capture.types import (
+    CaptureKey,
     CaptureResult,
     CaptureSpec,
     VllmInternalRequestId,
@@ -33,6 +37,7 @@ def _make_sink(name: str = "sink") -> MagicMock:
     sink.submit_chunk = MagicMock()
     sink.submit_finalize = MagicMock()
     sink.get_result = MagicMock(return_value=None)
+    sink.wait_for_result = MagicMock(return_value=None)
     sink.shutdown = MagicMock()
     return sink
 
@@ -382,10 +387,13 @@ class TestFinalizeResults:
 
         # Make sink0 return a specific result.
         expected_key = (VllmInternalRequestId("r1"), 0, "post_mlp")
-        sink0.get_result.return_value = CaptureResult(
+        sink0.wait_for_result.return_value = CaptureResult(
             key=expected_key, status="ok", payload={"path": "/tmp/test"}
         )
-        sink1.get_result.return_value = CaptureResult(key=expected_key, status="ok")
+        sink1.wait_for_result.return_value = CaptureResult(
+            key=expected_key,
+            status="ok",
+        )
 
         mgr, _ = _make_manager(
             sinks=(sink0, sink1),
@@ -403,6 +411,138 @@ class TestFinalizeResults:
         mgr, _ = _make_manager()
         results = mgr.finalize_request("nonexistent")
         assert results == {}
+
+    def test_finalize_aggregates_all_keys_and_preserves_payloads(self):
+        sink = _make_sink("sink0")
+        spec = CaptureSpec(
+            hooks={"post_mlp": [0, 1]},
+            positions="last_prompt",
+        )
+        key0 = (VllmInternalRequestId("r1"), 0, "post_mlp")
+        key1 = (VllmInternalRequestId("r1"), 1, "post_mlp")
+        payload0 = {"path": "/tmp/layer0"}
+        payload1 = {"path": "/tmp/layer1"}
+
+        def _wait_for_result(key: CaptureKey, timeout: float) -> CaptureResult:
+            assert timeout == 5.0
+            if key == key0:
+                return CaptureResult(key=key, status="ok", payload=payload0)
+            if key == key1:
+                return CaptureResult(key=key, status="ok", payload=payload1)
+            raise AssertionError(f"unexpected key {key!r}")
+
+        sink.wait_for_result.side_effect = _wait_for_result
+
+        mgr, _ = _make_manager(sinks=(sink,), specs=(spec,))
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+
+        results = mgr.finalize_request("r1")
+
+        assert sink.submit_finalize.call_count == 2
+        assert sink.wait_for_result.call_count == 2
+        assert results[0].status == "ok"
+        assert results[0].key == key0
+        assert results[0].error is None
+        assert results[0].payload == {
+            key0: payload0,
+            key1: payload1,
+        }
+
+    def test_finalize_uses_worst_key_result(self):
+        sink = _make_sink("sink0")
+        spec = CaptureSpec(
+            hooks={"post_mlp": [0, 1]},
+            positions="last_prompt",
+        )
+        key0 = (VllmInternalRequestId("r1"), 0, "post_mlp")
+        key1 = (VllmInternalRequestId("r1"), 1, "post_mlp")
+
+        def _wait_for_result(key: CaptureKey, timeout: float) -> CaptureResult:
+            if key == key0:
+                return CaptureResult(key=key, status="ok", payload="first")
+            if key == key1:
+                return CaptureResult(
+                    key=key,
+                    status="error",
+                    error=f"boom at {key}",
+                    payload="second",
+                )
+            raise AssertionError(f"unexpected key {key!r}")
+
+        sink.wait_for_result.side_effect = _wait_for_result
+
+        mgr, _ = _make_manager(sinks=(sink,), specs=(spec,))
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+
+        result = mgr.finalize_request("r1")[0]
+
+        assert result.status == "error"
+        assert result.key == key1
+        assert result.error is not None
+        assert str(key1) in result.error
+        assert result.payload == {
+            key0: "first",
+            key1: "second",
+        }
+
+    def test_finalize_timeout_becomes_error(self):
+        sink = _make_sink("sink0")
+        spec = CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        key = (VllmInternalRequestId("r1"), 0, "post_mlp")
+        sink.wait_for_result.return_value = None
+
+        mgr, _ = _make_manager(sinks=(sink,), specs=(spec,))
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+
+        result = mgr.finalize_request("r1")[0]
+
+        assert result.status == "error"
+        assert result.key == key
+        assert result.error == f"finalize timed out for {key}"
+
+
+class TestAggregateCaptureResults:
+    def test_prefers_error_over_partial_error_over_ok(self):
+        key_ok = (VllmInternalRequestId("r1"), 0, "post_mlp")
+        key_partial = (VllmInternalRequestId("r1"), 1, "post_mlp")
+        key_error = (VllmInternalRequestId("r1"), 2, "post_mlp")
+
+        result = _aggregate_capture_results([
+            CaptureResult(key=key_ok, status="ok", payload="ok"),
+            CaptureResult(
+                key=key_partial,
+                status="partial_error",
+                error="partial",
+                payload="partial",
+            ),
+            CaptureResult(
+                key=key_error,
+                status="error",
+                error="fatal",
+                payload="error",
+            ),
+        ])
+
+        assert result.status == "error"
+        assert result.key == key_error
+        assert result.error == "partial; fatal"
+        assert result.payload == {
+            key_ok: "ok",
+            key_partial: "partial",
+            key_error: "error",
+        }
+
+    def test_single_result_preserves_payload_shape(self):
+        key = (VllmInternalRequestId("r1"), 0, "post_mlp")
+        payload = ["/tmp/capture.bin"]
+
+        result = _aggregate_capture_results([
+            CaptureResult(key=key, status="ok", payload=payload)
+        ])
+
+        assert result.status == "ok"
+        assert result.key == key
+        assert result.payload == payload
 
 
 # ---------------------------------------------------------------------------

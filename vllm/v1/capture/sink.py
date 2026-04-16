@@ -15,7 +15,7 @@ only when you need one of:
   what the batched consumer exposes.
 - A custom threading / concurrency model.
 
-See ``docs/capture_consumers/design.md`` § "CaptureSink protocol".
+See ``docs/design/capture_consumers.md`` § "Sinks and Consumers".
 """
 
 from __future__ import annotations
@@ -65,6 +65,19 @@ class CaptureSink(Protocol):
     def get_result(self, key: CaptureKey) -> CaptureResult | None:
         """Return the terminal result for ``key``, or ``None`` if the
         sink has not yet finalized that key."""
+        ...
+
+    def wait_for_result(
+        self,
+        key: CaptureKey,
+        timeout: float,
+    ) -> CaptureResult | None:
+        """Block up to ``timeout`` seconds for the terminal result for
+        ``key``.
+
+        Returns ``None`` if the result is still unavailable when the
+        timeout expires.
+        """
         ...
 
     def shutdown(self, timeout: float = 30.0) -> None:
