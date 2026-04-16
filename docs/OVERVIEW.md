@@ -56,80 +56,31 @@ Features Index:
         doc: docs/features/steering.md
     capture_consumers:
         description: >
-            Pluggable capture consumer framework — observe, record, or
+            Pluggable capture-consumer framework — observe, record, or
             react to activations captured during the forward pass.
-            Replaces the activation_storing feature with a general-purpose
-            plugin system. Built-in consumers: filesystem (streaming writer),
-            logging (debug observer). Third-party consumers register via
-            Python entry points.
-        entry_points:
-            - --capture-consumers (CLI)
-            - SamplingParams.capture (per-request)
-            - LLM(capture_consumers=[...]) (Python API)
-        depends_on: [steering]
-        doc: docs/capture_consumers/design.md
-    activation_storing:
-        description: >
-            Per-request activation storing — capture residual-stream
-            activations during the forward pass and write them directly to
-            a shared POSIX filesystem (typically NFS) for downstream SAE
-            training, linear probe training, and steering-vector
-            construction.  Clients opt in per request via an
-            ``activation_storing`` field on sampling params; the response
-            carries only a small pointer, never bytes.  Piggybacks on the
-            existing steering hook points (pre_attn, post_attn, post_mlp).
-            Phase 1 (this PR) ships types, config, CLI flags, and
-            admission validation only; runtime wiring (capture manager,
-            writer pool, runner integration, protocol surfacing) lands in
-            subsequent phases tracked in the roadmap doc.
-        entry_points:
-            - --activation-storing ROOT_PATH (CLI enable)
-            - --activation-storing-writer-queue-size (CLI)
-            - --activation-storing-writer-timeout-seconds (CLI)
-            - --activation-storing-writer-threads (CLI)
-            - --activation-storing-on-collision (CLI)
-            - --activation-storing-max-bytes-per-request (CLI)
-            - SamplingParams.activation_storing (per-request spec)
-        depends_on: [steering]
-        doc: docs/features/activation_storing.md
-        roadmap: docs/features/activation_storing_roadmap.md
-    capture_consumers:
-        description: >
-            Pluggable capture-consumer framework — generalises activation
-            storing into a registry of named consumer backends (filesystem,
-            S3, logging, custom entry-points).  Consumers are registered at
-            server startup via repeatable ``--capture-consumers`` CLI flags
-            or programmatically through ``CaptureConsumersConfig``.  The
-            config surface (Phase E) wires into ``VllmConfig`` alongside the
-            existing ``ActivationStoringConfig``; runtime integration lands
-            in Phase D.  Core types, protocol, and registry were added in
-            earlier phases.
+            Replaces the legacy activation_storing feature with a general-
+            purpose plugin system.  Built-in consumers: filesystem
+            (streaming writer), logging (debug observer).  Third-party
+            consumers register via Python entry points in the
+            ``vllm.capture_consumers`` group, implementing either the
+            ``CaptureSink`` streaming protocol or the ``CaptureConsumer``
+            batched base class.
         entry_points:
             - --capture-consumers SPEC (CLI, repeatable)
+            - SamplingParams.capture (per-request, dict keyed by consumer name)
+            - LLM(capture_consumers=[...]) (Python API)
             - VllmConfig.capture_consumers_config (programmatic)
-        depends_on: [activation_storing]
-        doc: docs/features/capture_consumers.md
-            Generic capture-consumer framework that decouples activation
-            capture from its destination. Consumers register via the
-            ``vllm.capture_consumers`` entry-point group and implement
-            either the ``CaptureSink`` streaming protocol or the
-            ``CaptureConsumer`` batched base class. Phase A ships the core
-            types, protocol, and registry. Phase C adds the built-in
-            filesystem consumer that wraps ``ActivationWriter``.
-        entry_points:
             - pyproject.toml [project.entry-points."vllm.capture_consumers"]
-        depends_on: [activation_storing]
-        doc: docs/features/capture_consumers.md
+        depends_on: [steering]
+        doc: docs/capture_consumers/design.md
     capture_consumers_filesystem:
         description: >
-            Built-in filesystem capture consumer (Phase C). Implements
-            ``CaptureSink`` directly to stream captured activations to
-            disk via ``ActivationWriter`` without buffering full tensors
-            in memory. Delegates per-request validation to the existing
-            activation-storing admission validator. Registered as the
+            Built-in filesystem capture consumer.  Implements ``CaptureSink``
+            directly to stream captured activations to disk without
+            buffering full tensors in memory.  Registered as the
             ``filesystem`` entry point in the ``vllm.capture_consumers``
-            group.
+            group.  Per-request validation is in-package.
         entry_points:
             - vllm.v1.capture.consumers.filesystem.FilesystemConsumer
-        depends_on: [capture_consumers, activation_storing]
+        depends_on: [capture_consumers]
         doc: docs/features/capture_consumers_filesystem.md

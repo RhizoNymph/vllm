@@ -90,11 +90,3 @@ class TestCaptureStructuralValidation:
         # One non-string key anywhere in the dict is enough to fail.
         with pytest.raises(ValueError, match="capture keys must be strings"):
             SamplingParams(capture={"filesystem": {}, 1: {}})
-
-    def test_coexists_with_activation_storing_none(self) -> None:
-        params = SamplingParams(
-            capture={"filesystem": {"tag": "t"}},
-            activation_storing=None,
-        )
-        assert params.capture == {"filesystem": {"tag": "t"}}
-        assert params.activation_storing is None

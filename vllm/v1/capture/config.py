@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration dataclasses for the capture-consumer framework.
 
-``CaptureConsumersConfig`` lives alongside the existing
-``ActivationStoringConfig`` — both coexist after Phase E lands.  The new
-config is wired into ``VllmConfig`` but is **not** yet read by the runner;
-that happens in Phase D.
+``CaptureConsumersConfig`` is wired into ``VllmConfig`` and read by
+the runner at engine init.  It enumerates the ordered set of consumer
+instances to construct, each identified by a registry ``name`` plus an
+optional ``instance_name`` disambiguator and opaque ``params`` dict.
 """
 
 from __future__ import annotations

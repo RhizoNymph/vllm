@@ -31,7 +31,7 @@ from vllm.v1.capture.types import (
     CaptureSpec,
     VllmInternalRequestId,
 )
-from vllm.v1.worker.activation_writer import (
+from vllm.v1.capture.consumers.filesystem.writer import (
     ActivationWriter,
     FinalizeTask,
     WriteResult,
@@ -56,13 +56,14 @@ def _make_vllm_config(
     root_path: str | None = "/tmp/activations",
     max_bytes: int = 0,
 ) -> MagicMock:
-    """Build a minimal mock ``VllmConfig`` with activation storing enabled."""
-    cfg = MagicMock()
-    ast_config = MagicMock()
-    ast_config.root_path = root_path
-    ast_config.max_bytes_per_request = max_bytes
-    cfg.activation_storing_config = ast_config
-    return cfg
+    """Build a minimal mock ``VllmConfig`` for the filesystem consumer.
+
+    ``root_path`` / ``max_bytes`` are accepted for backwards compatibility
+    with older call sites but are no longer consulted by the validator;
+    the consumer receives its ``root`` via its constructor ``params``.
+    """
+    del root_path, max_bytes
+    return MagicMock()
 
 
 def _make_context(

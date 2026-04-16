@@ -30,7 +30,7 @@ from vllm.v1.capture.types import (
     CaptureResult,
     CaptureSpec,
 )
-from vllm.v1.worker.activation_writer import (
+from vllm.v1.capture.consumers.filesystem.writer import (
     ActivationWriter,
     FinalizeTask,
     WriteTask,
@@ -67,8 +67,8 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
 class FilesystemConsumer:
     """Capture consumer that streams activations to the filesystem.
 
-    Implements the ``CaptureSink`` protocol directly. Wraps
-    ``ActivationWriter`` from ``vllm.v1.worker.activation_writer``.
+    Implements the ``CaptureSink`` protocol directly. Wraps the
+    in-package ``ActivationWriter`` thread pool.
 
     Path layout: ``{root}/{tag_slug}/{request_id_slug}/{layer}_{hook}.bin``
     """

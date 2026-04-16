@@ -32,7 +32,7 @@ from vllm.config import (
     set_current_vllm_config,
     update_config,
 )
-from vllm.config.activation_storing_types import CaptureResult
+from vllm.v1.capture.types import CaptureResult
 from vllm.config.cache import CacheConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -482,17 +482,8 @@ class GPUModelRunner(
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
-        # Per-request activation capture — Phase D cutover.
-        # The legacy ``ActivationCaptureManager`` / ``ActivationWriter``
-        # members remain declared (as ``None``) so any residual
-        # references in the legacy code paths keep compiling until
-        # Phase I deletes them; nothing on the live code path
-        # constructs them anymore.
-        self._activation_capture_manager: (
-            "ActivationCaptureManager | None"  # noqa: F821, UP037
-        ) = None
-        self._activation_writer: "ActivationWriter | None" = None  # noqa: F821, UP037
-        # New-style capture manager + tables populated when
+        # Per-request activation capture.
+        # Capture manager + tables are populated when
         # ``capture_consumers_config`` is non-empty.  Each consumer is
         # addressed by its config order index; ``_capture_name_to_index``
         # lets the runner translate ``sampling_params.capture``'s
@@ -1172,17 +1163,6 @@ class GPUModelRunner(
                 results = self._finalize_capture_for_request(req_id)
                 if results:
                     self._pending_capture_results[req_id] = results
-            elif self._activation_capture_manager is not None:
-                # Legacy path: guarded on the old manager, no-op
-                # post-Phase D.
-                cap_result = self._finalize_capture_for_request_legacy(req_id)
-                if cap_result is not None:
-                    # The legacy result is a single ``CaptureResult``;
-                    # bridge it under a synthetic ``"filesystem"``
-                    # name so downstream code sees the nested shape.
-                    self._pending_capture_results[req_id] = {
-                        "filesystem": cap_result,
-                    }
             self.input_batch.remove_request(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
@@ -1282,24 +1262,13 @@ class GPUModelRunner(
             self._register_initial_steering_config(req_id, new_req_data, req_state)
 
             # Admit the request for activation capture, if the feature
-            # is enabled and the request asked for it (via the new
-            # capture-consumers framework) or legacy activation_storing
-            # is still installed.  Admission failures are recorded on
-            # the manager and surfaced later as a terminal
+            # is enabled and the request asked for it via the
+            # capture-consumers framework.  Admission failures are
+            # recorded on the manager and surfaced later as a terminal
             # ``CaptureResult.status == "error"`` — they never abort
             # text generation (spec invariant 7).
             if self._capture_manager is not None and sampling_params is not None:
                 self._register_capture_request(new_req_data, req_state)
-            elif (
-                self._activation_capture_manager is not None
-                and sampling_params is not None
-                and sampling_params.activation_storing is not None
-            ):
-                # Legacy path: gated on the old manager, which Phase D
-                # no longer constructs.  Kept for compat with any
-                # residual call sites until Phase I removes the
-                # legacy code entirely.
-                self._register_activation_storing_request(new_req_data, req_state)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1548,104 +1517,7 @@ class GPUModelRunner(
             return None
 
     # ------------------------------------------------------------------ #
-    # Activation storing (spec: docs/features/activation_storing.md)     #
-    # ------------------------------------------------------------------ #
-
-    def _register_activation_storing_request(
-        self,
-        new_req_data: "NewRequestData",
-        req_state: CachedRequestState,
-    ) -> None:
-        """Admit a new capture request or record the admission error.
-
-        Runs in :meth:`_update_states` once per newly-scheduled request
-        whose ``SamplingParams.activation_storing`` is set. On success,
-        the manager knows the request and the next
-        :meth:`build_step_plan` call will include it. On failure, the
-        per-request error is stashed on the manager; :meth:`finalize_request`
-        surfaces it as ``CaptureResult.status == "error"`` without
-        aborting text generation (spec invariant 7).
-        """
-        assert self._activation_capture_manager is not None
-        mgr = self._activation_capture_manager
-
-        from vllm.entrypoints.openai.activation_storing_validation import (
-            ActivationStoringContext,
-            ActivationStoringValidationError,
-            validate_activation_storing,
-        )
-
-        sp = new_req_data.sampling_params
-        assert sp is not None and sp.activation_storing is not None
-        spec = sp.activation_storing
-
-        prompt_len = length_from_prompt_token_ids_or_embeds(
-            new_req_data.prompt_token_ids,
-            new_req_data.prompt_embeds,
-        )
-
-        # The element size comes from the model's residual dtype. Use
-        # ``get_dtype_size`` which already handles bf16 etc.
-        try:
-            element_size_bytes = get_dtype_size(self.model_config.dtype)
-        except Exception:
-            element_size_bytes = 2  # fallback for unknown dtypes
-
-        ctx = ActivationStoringContext(
-            num_prompt_tokens=prompt_len,
-            num_computed_tokens=new_req_data.num_computed_tokens,
-            tensor_parallel_size=self.vllm_config.parallel_config.tensor_parallel_size,
-            pipeline_parallel_size=(
-                self.vllm_config.parallel_config.pipeline_parallel_size
-            ),
-            num_hidden_layers=self.model_config.get_num_layers(
-                self.vllm_config.parallel_config
-            ),
-            hidden_size=self.model_config.get_hidden_size(),
-            element_size_bytes=element_size_bytes,
-        )
-
-        try:
-            resolved = validate_activation_storing(spec, self.vllm_config, ctx)
-        except ActivationStoringValidationError as exc:
-            mgr.record_request_error(new_req_data.req_id, str(exc))
-            logger.warning(
-                "activation_storing admission rejected req=%s: %s",
-                new_req_data.req_id,
-                exc,
-            )
-            return
-
-        # Resolve model_name for the sidecar + path. Prefer the operator's
-        # ``--served-model-name`` override; fall back to the HF repo id.
-        model_name = self._resolve_activation_storing_model_name()
-        model_dtype_str = str(self.model_config.dtype).removeprefix("torch.")
-
-        try:
-            mgr.register_request(
-                new_req_data.req_id,
-                resolved,
-                prompt_len,
-                model_name=model_name,
-                model_dtype_str=model_dtype_str,
-                element_size_bytes=element_size_bytes,
-                vllm_internal_request_id=new_req_data.req_id,
-                prompt_token_ids=(
-                    list(new_req_data.prompt_token_ids)
-                    if new_req_data.prompt_token_ids is not None
-                    else []
-                ),
-            )
-        except ValueError as exc:
-            mgr.record_request_error(new_req_data.req_id, str(exc))
-            logger.warning(
-                "activation_storing register rejected req=%s: %s",
-                new_req_data.req_id,
-                exc,
-            )
-
-    # ------------------------------------------------------------------ #
-    # New-framework capture admission (Phase D cutover)                   #
+    # Capture-consumer admission                                          #
     # ------------------------------------------------------------------ #
 
     def _register_capture_request(
@@ -1829,21 +1701,6 @@ class GPUModelRunner(
             return
         self._capture_manager.dispatch_step_captures(plan)
 
-    def _resolve_activation_storing_model_name(self) -> str:
-        """Return the model name string used for the ``{model_slug}`` segment.
-
-        Prefers ``--served-model-name`` when the operator set it (so
-        captures live under a stable public name); otherwise falls back
-        to the HF-style repo id. The slugging itself happens inside the
-        capture manager's helper.
-        """
-        served = getattr(self.model_config, "served_model_name", None)
-        if isinstance(served, list) and served:
-            return served[0]
-        if isinstance(served, str) and served:
-            return served
-        return self.model_config.model
-
     def _build_capture_batch_view(
         self, scheduler_output: "SchedulerOutput"
     ) -> "CaptureBatchView":  # noqa: F821
@@ -1856,19 +1713,8 @@ class GPUModelRunner(
         same cumulative ``token_offset``. A mismatch here violates spec
         invariant 4 and corrupts ``gather_indices`` on multi-request
         batches.
-
-        Prefer the new ``vllm.v1.capture.plan.CaptureBatchView`` when
-        the new manager is active so the manager's planner does not
-        have to cross the v1 / model-executor module boundary at
-        runtime.  Both views have identical fields so either flows
-        through ``build_step_plan`` safely.
         """
-        if self._capture_manager is not None:
-            from vllm.v1.capture.plan import CaptureBatchView
-        else:
-            from vllm.model_executor.layers.activation_capture import (
-                CaptureBatchView,
-            )
+        from vllm.v1.capture.plan import CaptureBatchView
 
         num_reqs = self.input_batch.num_reqs
         req_ids = self.input_batch.req_ids
@@ -1914,183 +1760,6 @@ class GPUModelRunner(
             num_scheduled_tokens=num_scheduled_tokens,
             token_offsets=token_offsets,
         )
-
-    def _finalize_activation_storing_step(self, plan) -> None:
-        """Drain ``plan``'s GPU scratch into the writer pool.
-
-        Runs in :meth:`sample_tokens` right after the model forward
-        completes. Walks ``plan.scratch_gpu`` to copy each
-        ``(layer, hook)`` tensor D2H into pinned CPU, synchronizes the
-        device once, chunks the rows per-``(req_id, layer, hook)``, and
-        submits a :class:`~vllm.v1.worker.activation_writer.WriteTask`
-        per chunk. Errors during submit (queue full, writer shutting
-        down) are recorded against the owning request so ``finalize_request``
-        surfaces them as ``capture_status == "partial_error"``.
-        """
-        if plan is None:
-            return
-        if self._activation_capture_manager is None or self._activation_writer is None:
-            return
-        if not plan.scratch_gpu and not plan.request_errors:
-            return
-
-        # Surface any request errors that build_step_plan accumulated.
-        for req_id, msg in plan.request_errors.items():
-            self._activation_capture_manager.record_request_error(req_id, msg)
-
-        if not plan.scratch_gpu:
-            return
-
-        from pathlib import Path as _ActPath
-
-        from vllm.v1.worker.activation_writer import WriteError, WriteTask
-
-        # 1. Stage each (layer, hook) scratch tensor to pinned CPU with
-        # non_blocking copies. One synchronize at the end pays the wait
-        # cost exactly once for the whole step.
-        cpu_by_key: dict[tuple[int, str], torch.Tensor] = {}
-        for key, gpu_tensor in plan.scratch_gpu.items():
-            if gpu_tensor is None or gpu_tensor.numel() == 0:
-                cpu_by_key[key] = gpu_tensor.cpu() if gpu_tensor is not None else None
-                continue
-            try:
-                cpu_tensor = torch.empty(
-                    gpu_tensor.shape,
-                    dtype=gpu_tensor.dtype,
-                    device="cpu",
-                    pin_memory=self.pin_memory,
-                )
-                cpu_tensor.copy_(gpu_tensor, non_blocking=True)
-            except Exception:
-                cpu_tensor = gpu_tensor.detach().cpu()
-            cpu_by_key[key] = cpu_tensor
-
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-
-        # 2. Walk entries to chunk rows per (req_id, layer, hook). Each
-        # request's entries for one key are always contiguous because
-        # build_step_plan emits them in that order.
-        cfg = self.vllm_config.activation_storing_config
-        assert cfg is not None and cfg.root_path is not None
-        root = _ActPath(cfg.root_path)
-        model_name = self._resolve_activation_storing_model_name()
-        from vllm.model_executor.layers.activation_capture import (
-            _compute_paths,
-            _resolve_model_slug,
-        )
-
-        model_slug = _resolve_model_slug(model_name)
-
-        # Index entries by (layer, hook) -> list of entries preserving order.
-        entries_by_key: dict[tuple[int, str], list] = {}
-        for entry in plan.entries:
-            entries_by_key.setdefault((entry.layer, entry.hook), []).append(entry)
-
-        for key, entries in entries_by_key.items():
-            layer_idx, hook_name = key
-            cpu_tensor = cpu_by_key.get(key)
-            if cpu_tensor is None or cpu_tensor.numel() == 0:
-                continue
-
-            # Chunk contiguous runs of the same request id.
-            run_start = 0
-            while run_start < len(entries):
-                run_end = run_start + 1
-                while (
-                    run_end < len(entries)
-                    and entries[run_end].request_id == entries[run_start].request_id
-                ):
-                    run_end += 1
-                req_id = entries[run_start].request_id
-                row_start = entries[run_start].scratch_row
-                row_end = entries[run_end - 1].scratch_row + 1
-                positions = [entries[i].logical_pos for i in range(run_start, run_end)]
-
-                chunk = cpu_tensor[row_start:row_end].contiguous()
-                # bf16 -> uint16 bit-punned bytes (numpy has no bf16)
-                if chunk.dtype == torch.bfloat16:
-                    byte_view = chunk.view(torch.uint16)
-                else:
-                    byte_view = chunk
-                payload = bytes(byte_view.numpy().tobytes())
-
-                # Resolve the canonical sidecar state so we have
-                # tag/request_id slugs and model_dtype. If the request
-                # was never registered (should be unreachable — we get
-                # here only because we planned capture rows for it),
-                # fall back to a best-effort path.
-                path_info = self._activation_capture_manager.get_request_path_info(
-                    req_id
-                )
-                if path_info is None:
-                    run_start = run_end
-                    continue
-                tag_slug, request_id_slug, model_dtype_str = path_info
-
-                bin_path, _sidecar_path = _compute_paths(
-                    root=root,
-                    model_slug=model_slug,
-                    model_dtype=model_dtype_str,
-                    tag_slug=tag_slug,
-                    layer=layer_idx,
-                    hook=hook_name,
-                    request_id_slug=request_id_slug,
-                )
-
-                task = WriteTask(
-                    path=bin_path,
-                    payload=payload,
-                    append=True,
-                    key=(req_id, layer_idx, hook_name),
-                )
-                try:
-                    self._activation_writer.submit(task)
-                except WriteError as exc:
-                    self._activation_capture_manager.record_request_error(
-                        req_id,
-                        f"writer rejected chunk for layer={layer_idx} "
-                        f"hook={hook_name}: {exc.message}",
-                    )
-                    run_start = run_end
-                    continue
-
-                self._activation_capture_manager.record_captured_rows(
-                    req_id, layer_idx, hook_name, positions
-                )
-                run_start = run_end
-
-    def _finalize_capture_for_request_legacy(
-        self, req_id: str
-    ) -> "CaptureResult | None":
-        """Legacy (pre-Phase-D) finalize that drains the old manager.
-
-        Kept only so the legacy call chain compiles.  The live code path
-        never reaches this method because Phase D stops constructing
-        ``_activation_capture_manager``.  Phase I removes it.
-        """
-        if self._activation_capture_manager is None:
-            return None
-        mgr = self._activation_capture_manager
-
-        if not mgr.has_request(req_id):
-            return None
-
-        req_state = self.requests.get(req_id)
-        if req_state is not None:
-            mgr.record_generated_token_ids(req_id, list(req_state.output_token_ids))
-
-        if self._activation_writer is not None:
-            from pathlib import Path as _ActPath
-
-            cfg = self.vllm_config.activation_storing_config
-            assert cfg is not None and cfg.root_path is not None
-            return mgr.finalize_request(
-                req_id,
-                writer=self._activation_writer,
-                root=_ActPath(cfg.root_path),
-            )
-        return mgr.finalize_request(req_id)
 
     def _finalize_capture_for_request(self, req_id: str) -> dict[str, "CaptureResult"]:
         """Drive the new capture manager to finalize *req_id*.
@@ -4726,17 +4395,9 @@ class GPUModelRunner(
         # Build the per-step activation capture plan.  Must match the
         # steering offset math exactly (spec invariant 4) so the
         # ``gather_indices`` rows land on the correct absolute batch
-        # positions.  Phase D routes through the new ``CaptureManager``;
-        # the legacy branch is retained for the (now dead) path where
-        # ``activation_storing_config`` is set but no consumers are.
+        # positions.
         if self._capture_manager is not None:
             self._prepare_capture_step(scheduler_output)
-        elif (
-            self._activation_capture_manager is not None
-            and self._activation_capture_manager.is_active()
-        ):
-            batch_view = self._build_capture_batch_view(scheduler_output)
-            self._activation_capture_manager.build_step_plan(batch_view)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -4900,15 +4561,9 @@ class GPUModelRunner(
             sampler_output.sampled_token_ids, scheduler_output
         )
 
-        # Drain the active activation-capture plan.  Phase D dispatches
-        # to every consumer via the new ``CaptureManager``; the legacy
-        # branch is retained for the (now dead) path.
+        # Drain the active capture plan.
         if self._capture_manager is not None:
             self._finalize_capture_step()
-        elif self._activation_capture_manager is not None:
-            self._finalize_activation_storing_step(
-                self._activation_capture_manager.consume_step_plan()
-            )
 
         if self.use_async_scheduling:
             pp = get_pp_group()

@@ -4,8 +4,7 @@
 
 The canonical definitions live in :mod:`vllm.v1.capture.config`.  This
 module exists so that ``vllm/config/vllm.py`` can follow the same
-relative-import pattern used by all other config submodules (e.g.
-``from .activation_storing import ActivationStoringConfig``).
+relative-import pattern used by all other config submodules.
 """
 
 from __future__ import annotations

@@ -19,11 +19,10 @@ Key design properties:
   Errors are captured per ``(consumer, request)`` and surfaced through
   ``CaptureResult``.
 
-- **Position expansion:** The manager reimplements the five selector
+- **Position expansion:** The manager resolves the five selector
   modes (``last_prompt``, ``all_prompt``, ``all_generated``, ``all``,
-  explicit ``list[int]``) from the legacy
-  ``ActivationCaptureManager`` and intersects the result with the
-  step's ``[num_computed, num_computed + num_scheduled)`` window.
+  explicit ``list[int]``) and intersects the result with the step's
+  ``[num_computed, num_computed + num_scheduled)`` window.
 
 See ``docs/capture_consumers/design.md`` for the full spec.
 """

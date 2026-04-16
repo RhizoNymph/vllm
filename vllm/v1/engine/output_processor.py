@@ -20,7 +20,7 @@ from vllm.outputs import (
 )
 
 if TYPE_CHECKING:
-    from vllm.config.activation_storing_types import CaptureResult
+    from vllm.v1.capture.types import CaptureResult
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import (
@@ -277,7 +277,6 @@ class RequestState:
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: np.ndarray | None = None,
-        activation_storage: "CaptureResult | None" = None,
         capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
@@ -317,7 +316,6 @@ class RequestState:
                 external_req_id,
                 [self._new_pooling_output(pooling_output)],
                 finished,
-                activation_storage=activation_storage,
                 capture_results=capture_results,
             )
 
@@ -338,7 +336,6 @@ class RequestState:
             outputs,
             finished,
             kv_transfer_params,
-            activation_storage=activation_storage,
             capture_results=capture_results,
         )
 
@@ -348,7 +345,6 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
-        activation_storage: "CaptureResult | None" = None,
         capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
@@ -374,7 +370,7 @@ class RequestState:
         else:
             prompt_logprobs = self.logprobs_processor.prompt_logprobs
 
-        request_output = RequestOutput(
+        return RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally
             lora_request=self.lora_request,
             prompt=self.prompt,
@@ -385,18 +381,8 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
-            activation_storage=activation_storage,
+            capture_results=dict(capture_results) if capture_results else {},
         )
-        # Phase D → Phase F shim: until ``RequestOutput`` declares a
-        # first-class ``capture_results`` field, we attach the per-request
-        # consumer result map via ``setattr``.  Phase F converts this
-        # into a normal kwarg; Phase I removes the shim entirely.
-        setattr(  # noqa: B010
-            request_output,
-            "capture_results",
-            dict(capture_results) if capture_results else {},
-        )
-        return request_output
 
     def _new_completion_output(
         self,
@@ -668,7 +654,6 @@ class OutputProcessor:
                 stop_reason,
                 kv_transfer_params,
                 routed_experts,
-                activation_storage=None,
                 capture_results=engine_core_output.capture_results,
             ):
                 if req_state.streaming_input:
