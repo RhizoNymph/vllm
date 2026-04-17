@@ -81,6 +81,8 @@ class SteeringManager:
         config_hash: int,
         vectors: dict[str, dict[int, list[float]]],
         phase: str = "prefill",
+        *,
+        locally_owned_layers: frozenset[int] | None = None,
     ) -> int:
         """Register a steering config, return its table row index.
 
@@ -88,6 +90,13 @@ class SteeringManager:
             config_hash: Deterministic hash identifying the config.
             vectors: ``{hook_point_str: {layer_idx: [floats]}}``
             phase: ``"prefill"`` or ``"decode"``
+            locally_owned_layers: If provided, only layers in this set
+                have tensors materialized on this worker.  Layers
+                outside the set are skipped at tensor-construction time
+                but row allocation still proceeds, so row IDs remain
+                identical across ranks (distributed-steering
+                determinism contract).  When ``None`` (default), no
+                filtering — all layers in ``vectors`` get tensors.
 
         If the ``(config_hash, phase)`` pair is already registered,
         increments refcount and returns the existing row. Otherwise
@@ -111,7 +120,12 @@ class SteeringManager:
         row = self.free_rows.pop()
         self.config_to_row[key] = row
         self.config_refcounts[key] = 1
-        # Store per-request vectors as tensors, keyed by hook point
+        # Store per-request vectors as tensors, keyed by hook point.
+        # Under PP, each rank only owns a subset of decoder layers, so
+        # materializing tensors for non-local layers is pure waste.
+        # Row allocation above is unconditional — the filter only
+        # affects what tensors get constructed, not which row is
+        # assigned.
         stored: dict[str, dict[int, torch.Tensor]] = {}
         for hook_point, layer_vecs in vectors.items():
             stored[hook_point] = {
@@ -119,6 +133,7 @@ class SteeringManager:
                     vec, dtype=torch.float32, device=self.device
                 ).unsqueeze(0)
                 for layer_idx, vec in layer_vecs.items()
+                if locally_owned_layers is None or layer_idx in locally_owned_layers
             }
         self.config_vectors[key] = stored
         # New row content needs to be written into the per-layer tables on
@@ -175,6 +190,8 @@ class SteeringManager:
         layer_idx: int,
         vector: torch.Tensor,
         phase: str = "base",
+        *,
+        locally_owned_layers: frozenset[int] | None = None,
     ) -> None:
         """Update cached global vector for a hook point and layer.
 
@@ -183,7 +200,15 @@ class SteeringManager:
             layer_idx: Layer index.
             vector: The global vector tensor.
             phase: ``"base"``, ``"prefill"``, or ``"decode"``.
+            locally_owned_layers: If provided and ``layer_idx`` is not
+                in the set, this call is a no-op.  Defense-in-depth
+                for the distributed-steering determinism contract:
+                callers in the mixin already filter by locally-present
+                layers, but self-defending the manager means its
+                invariants do not depend on the caller.
         """
+        if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
+            return
         target = self._global_dict_for_phase(phase)
         if hook_point not in target:
             target[hook_point] = {}
@@ -281,12 +306,8 @@ class SteeringManager:
         # the per-(hook, layer) row assembly below.
         ordered_configs = list(self.config_to_row.items())
         target_indices_list = [0, 1, 2] + [row for _, row in ordered_configs]
-        indices = torch.tensor(
-            target_indices_list, dtype=torch.long, device=device
-        )
-        zero_row = torch.zeros(
-            hidden_size, dtype=torch.float32, device=device
-        )
+        indices = torch.tensor(target_indices_list, dtype=torch.long, device=device)
+        zero_row = torch.zeros(hidden_size, dtype=torch.float32, device=device)
 
         for hook_point, table_attr in HOOK_POINT_TABLE_ATTR.items():
             hp_str = hook_point.value
