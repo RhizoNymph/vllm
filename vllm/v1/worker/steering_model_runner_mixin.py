@@ -65,6 +65,14 @@ class SteeringModelRunnerMixin:
     ]
     _req_steering_phase: dict[str, str]
     _steering_index_dirty: bool
+    # Set of layer indices physically owned by this worker.  Under PP,
+    # this is a contiguous subset of ``[0, num_layers)``; under single-
+    # worker and under TP (which replicates all layers per rank), it
+    # equals the full model's layer set.  Populated during lazy init
+    # from ``_steerable_layers_cache`` and threaded into
+    # ``SteeringManager`` calls so non-local tensors are never
+    # materialized on this rank.
+    _locally_owned_layers: frozenset[int]
 
     # Attributes provided by the concrete model runner that mixes this
     # class in.  Declared here purely so static type checking can see
@@ -219,7 +227,13 @@ class SteeringModelRunnerMixin:
                 if hasattr(mod, table_attr):
                     buf = getattr(mod, table_attr)
                     t = torch.tensor(vec_values, dtype=buf.dtype, device=buf.device)
-                    mgr.update_global_vectors(hook_point_str, idx, t, phase=phase)
+                    mgr.update_global_vectors(
+                        hook_point_str,
+                        idx,
+                        t,
+                        phase=phase,
+                        locally_owned_layers=self._locally_owned_layers,
+                    )
 
     # -----------------------------------------------------------------------
     # Public steering API (mirrored by thin passthroughs on the worker)
@@ -406,6 +420,14 @@ class SteeringModelRunnerMixin:
                 if has_any_table:
                     steerable[mod.layer_idx] = mod
             self._steerable_layers_cache = steerable
+            # Snapshot the set of layer indices this worker physically
+            # owns.  Used to skip tensor materialization for non-local
+            # layers when passing vectors into the SteeringManager.
+            # Under PP this is a contiguous subset; under TP/single-
+            # worker it's the full set.  Row allocation in the manager
+            # stays rank-oblivious so row IDs remain identical across
+            # ranks — only the stored tensors are filtered.
+            self._locally_owned_layers = frozenset(steerable.keys())
 
             if steerable:
                 steering_config = getattr(self.vllm_config, "steering_config", None)
@@ -457,6 +479,7 @@ class SteeringModelRunnerMixin:
                                     layer_idx,
                                     vec,
                                     phase=phase,
+                                    locally_owned_layers=(self._locally_owned_layers),
                                 )
                     self._pending_steering_globals = None
                 # Register any configs that were added to the batch
@@ -481,7 +504,12 @@ class SteeringModelRunnerMixin:
                             if eff:
                                 try:
                                     self._steering_manager.register_config(
-                                        ph, eff, phase="prefill"
+                                        ph,
+                                        eff,
+                                        phase="prefill",
+                                        locally_owned_layers=(
+                                            self._locally_owned_layers
+                                        ),
                                     )
                                 except RuntimeError:
                                     self._pending_steering_registrations.append(
@@ -503,7 +531,12 @@ class SteeringModelRunnerMixin:
                             if eff:
                                 try:
                                     self._steering_manager.register_config(
-                                        dh, eff, phase="decode"
+                                        dh,
+                                        eff,
+                                        phase="decode",
+                                        locally_owned_layers=(
+                                            self._locally_owned_layers
+                                        ),
                                     )
                                 except RuntimeError:
                                     self._pending_steering_registrations.append(
@@ -546,7 +579,10 @@ class SteeringModelRunnerMixin:
                     continue
                 try:
                     self._steering_manager.register_config(
-                        d_hash, d_vecs, phase=d_phase
+                        d_hash,
+                        d_vecs,
+                        phase=d_phase,
+                        locally_owned_layers=self._locally_owned_layers,
                     )
                 except RuntimeError:
                     still_transitions.append((d_req_id, d_hash, d_vecs, d_phase))
@@ -571,7 +607,10 @@ class SteeringModelRunnerMixin:
                     continue
                 try:
                     self._steering_manager.register_config(
-                        d_hash, d_vecs, phase=d_phase
+                        d_hash,
+                        d_vecs,
+                        phase=d_phase,
+                        locally_owned_layers=self._locally_owned_layers,
                     )
                 except RuntimeError:
                     still_pending.append((d_req_id, d_hash, d_vecs, d_phase))
@@ -714,6 +753,7 @@ class SteeringModelRunnerMixin:
                             decode_hash,
                             sp.effective_decode_steering,
                             phase="decode",
+                            locally_owned_layers=self._locally_owned_layers,
                         )
                     except RuntimeError:
                         self._pending_steering_transitions.append(
@@ -779,7 +819,10 @@ class SteeringModelRunnerMixin:
             return
         try:
             mgr.register_config(
-                prefill_hash, sp.effective_prefill_steering, phase="prefill"
+                prefill_hash,
+                sp.effective_prefill_steering,
+                phase="prefill",
+                locally_owned_layers=self._locally_owned_layers,
             )
         except RuntimeError:
             self._pending_steering_registrations.append(
@@ -868,6 +911,7 @@ class SteeringModelRunnerMixin:
                         new_req_data.decode_steering_config_hash,
                         sp.effective_decode_steering,
                         phase="decode",
+                        locally_owned_layers=self._locally_owned_layers,
                     )
                 except RuntimeError:
                     self._pending_steering_registrations.append(
@@ -897,6 +941,7 @@ class SteeringModelRunnerMixin:
                         new_req_data.prefill_steering_config_hash,
                         sp.effective_prefill_steering,
                         phase="prefill",
+                        locally_owned_layers=self._locally_owned_layers,
                     )
                 except RuntimeError:
                     self._pending_steering_registrations.append(
@@ -967,6 +1012,7 @@ class SteeringModelRunnerMixin:
                     new_prefill_hash,
                     sp.effective_prefill_steering,
                     phase="prefill",
+                    locally_owned_layers=self._locally_owned_layers,
                 )
             except RuntimeError:
                 self._pending_steering_registrations.append(
