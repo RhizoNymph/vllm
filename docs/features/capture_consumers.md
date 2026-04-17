@@ -328,3 +328,13 @@ Third-party consumers ship as separate Python packages. See
 [Plugin Authoring Guide](../capture_consumers/plugin_authoring.md)
 for the worked examples (quick-start consumer, driver-side training
 loop, streaming consumer, tests).
+
+Example plugins live under `examples/capture_consumers/`:
+
+- `minimal_plugin/` — the simplest `CaptureConsumer` subclass; records
+  the sum of every captured tensor.
+- `activation_reward_producer/` — a direct `CaptureSink` that returns
+  a cosine-alignment reward plus diagnostic fields on
+  `CaptureResult.payload`. Designed for RL loops; the README covers
+  vector drift, detection via the diagnostic payload, and the
+  frozen-scorer deployment pattern.
