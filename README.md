@@ -7,19 +7,175 @@
 </p>
 
 <h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
+vLLM — feat/steering branch
 </h3>
 
 <p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
+Activation steering support for vLLM inference
 </p>
-
-🔥 We have built a vllm website to help you get started with vllm. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
-## About
+This branch adds **activation steering** to vLLM: injecting precomputed
+vectors into the residual stream of decoder layers during inference, enabling
+tone/style changes, behavioral interventions, and SAE-derived steering vectors
+without fine-tuning.
+
+Full docs live in the repo:
+
+- [User guide](docs/features/steering.md) — setup, API reference, examples
+- [Runtime design](docs/design/steering_runtime.md) — internals for contributors
+
+---
+
+## Steering Model
+
+Steering uses a three-tier additive composition:
+
+```
+effective_prefill = global_base + global_prefill + request_base + request_prefill
+effective_decode  = global_base + global_decode  + request_base + request_decode
+```
+
+Three hook points are available per decoder layer:
+
+| Hook | Where |
+| --- | --- |
+| `pre_attn` | Residual stream before attention |
+| `post_attn` | Residual stream after attention |
+| `post_mlp` | Residual stream after MLP |
+
+---
+
+## Quickstart
+
+### Serving
+
+```bash
+# Global steering only (always available for steerable models)
+vllm serve google/gemma-3-4b-it
+
+# Enable per-request steering
+vllm serve google/gemma-3-4b-it \
+  --enable-steering \
+  --max-steering-configs 4
+```
+
+### Global steering via HTTP
+
+Global endpoints require `VLLM_SERVER_DEV_MODE=1`.
+
+```bash
+# Set steering vectors
+curl -X POST http://localhost:8000/v1/steering/set \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": {
+      "post_mlp": {
+        "15": {"vector": [0.1, 0.2], "scale": 2.0}
+      }
+    },
+    "prefill_vectors": {"pre_attn": {"15": [0.3, 0.4]}},
+    "decode_vectors":  {"pre_attn": {"15": [0.5, 0.6]}},
+    "replace": false
+  }'
+
+# Clear all global steering
+curl -X POST http://localhost:8000/v1/steering/clear
+
+# Inspect active steering
+curl http://localhost:8000/v1/steering
+```
+
+### Per-request steering (Python)
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="google/gemma-3-4b-it", enable_steering=True, max_steering_configs=4)
+
+params = SamplingParams(
+    max_tokens=64,
+    temperature=0.0,
+    steering_vectors={"post_mlp": {15: {"vector": [0.1, 0.2], "scale": 2.0}}},
+    prefill_steering_vectors={"pre_attn": {15: [0.3, 0.4]}},
+    decode_steering_vectors={"pre_attn": {15: [0.5, 0.6]}},
+)
+outputs = llm.generate(["Hello"], params)
+```
+
+### Per-request steering (OpenAI-compatible server)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+response = client.chat.completions.create(
+    model="google/gemma-3-4b-it",
+    messages=[{"role": "user", "content": "Hello"}],
+    extra_body={
+        "steering_vectors":         {"post_mlp": {15: [0.1, 0.2]}},
+        "prefill_steering_vectors": {"pre_attn": {15: [0.3, 0.4]}},
+        "decode_steering_vectors":  {"pre_attn": {15: [0.5, 0.6]}},
+    },
+)
+```
+
+### Named steering modules
+
+Pre-register a config once; reference it by name in requests.
+
+```bash
+# Register
+curl -X POST http://localhost:8000/v1/steering/modules/register \
+  -H "Content-Type: application/json" \
+  -d '{"name": "creativity", "vectors": {"post_mlp": {"15": [0.1, 0.2, 0.3]}}}'
+
+# Use in a request
+client.chat.completions.create(
+    model="google/gemma-3-4b-it",
+    messages=[{"role": "user", "content": "Write a poem"}],
+    extra_body={"steering_name": "creativity"},
+)
+```
+
+Named modules and inline vectors compose additively per tier.
+
+---
+
+## Runtime Design Summary
+
+The runtime is built around these invariants:
+
+- **Persistent GPU buffers** — steering data lives in pre-allocated tables
+  updated between steps; CUDA graph replay reads live values, no recompilation.
+- **Phase-aware admission** — prefill and decode consume separate steering-table
+  capacity; the scheduler tracks per-request phase transitions.
+- **Prefix-cache correctness** — prefill steering is part of the cache key;
+  decode-only steering is not; global base/prefill changes invalidate cache reuse.
+- **Two-queue deferral** — decode transitions are retried before new-request
+  registrations so in-flight requests are never starved of table rows.
+
+See [docs/design/steering_runtime.md](docs/design/steering_runtime.md) for full details.
+
+---
+
+## Supported Architectures
+
+Steering is wired into all major decoder families:
+
+- Llama, Qwen, Gemma, Mixtral/MoE, GLM4, InternLM, Olmo, Exaone, Phi, Plamo,
+  Step, Molmo, Falcon, Baichuan, CommandR, StableLM, and more.
+
+End-to-end tested with real weights: Gemma 3, StableLM, step3p5, Mixtral,
+DeepSeek V2, PhiMoE, GLM4 MoE, Exaone MoE.
+
+See the [full list](docs/features/steering.md#supported-scope).
+
+---
+
+## About vLLM
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
 
@@ -33,49 +189,16 @@ vLLM is fast with:
 - Fast and flexible model execution with piecewise and full CUDA/HIP graphs
 - Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
 - Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
 - Speculative decoding including n-gram, suffix, EAGLE, DFlash
 - Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
 
 vLLM is flexible and easy to use with:
 
 - Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
 - Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
 - OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
 - Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on HuggingFace, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
-
-```bash
-uv pip install vllm
-```
-
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
-
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
-
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+- Support for NVIDIA GPUs, AMD GPUs, and x86/ARM/PowerPC CPUs
 
 ## Contributing
 
