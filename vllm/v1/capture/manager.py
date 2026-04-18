@@ -530,7 +530,7 @@ class CaptureManager:
 
                     # Slice the rows this consumer needs from scratch.
                     row_indices = [e.scratch_row for e in chunk_entries]
-                    idx_tensor = torch.tensor(row_indices, dtype=torch.long)
+                    idx_tensor = torch.tensor(row_indices, dtype=torch.long, device=scratch.device)
                     chunk_tensor = scratch.index_select(0, idx_tensor).cpu()
 
                     step_index = chunk_entries[0].step_index
