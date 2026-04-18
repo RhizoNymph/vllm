@@ -77,7 +77,7 @@ class TestSetSteeringBase:
 
     def test_set_basic(self, client, engine):
         """Set vectors on one layer."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json=_vecs({"0": [1.0, 2.0, 3.0]}),
@@ -88,7 +88,7 @@ class TestSetSteeringBase:
         assert body["layers_updated"] == [0]
 
     def test_set_multiple_layers(self, client, engine):
-        engine.collective_rpc.side_effect = [[[0, 3]], [[0, 3]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0, 3])], [(0, 0, [0, 3])]]
         resp = client.post(
             "/v1/steering/set",
             json=_vecs({"0": [1.0], "3": [2.0]}),
@@ -98,7 +98,7 @@ class TestSetSteeringBase:
 
     def test_set_with_co_located_scale(self, client, engine):
         """Co-located scale factors are pre-multiplied before sending."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json={"vectors": {_HP: {"0": {"vector": [1.0, 2.0], "scale": 3.0}}}},
@@ -111,7 +111,7 @@ class TestSetSteeringBase:
 
     def test_set_bare_list_scale_one(self, client, engine):
         """Bare list vectors pass through with scale=1.0."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json=_vecs({"0": [5.0, 10.0]}),
@@ -123,7 +123,7 @@ class TestSetSteeringBase:
         assert vectors[_HP][0] == [5.0, 10.0]
 
     def test_set_missing_layer_returns_400(self, client, engine):
-        engine.collective_rpc.side_effect = [[[]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [])]]
         resp = client.post(
             "/v1/steering/set",
             json=_vecs({"999": [1.0]}),
@@ -132,7 +132,7 @@ class TestSetSteeringBase:
         assert "999" in resp.json()["error"]
 
     def test_set_partial_missing_layers(self, client, engine):
-        engine.collective_rpc.side_effect = [[[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json=_vecs({"0": [1.0], "999": [1.0]}),
@@ -141,7 +141,7 @@ class TestSetSteeringBase:
         assert "999" in resp.json()["error"]
 
     def test_set_no_steerable_layers(self, client, engine):
-        engine.collective_rpc.side_effect = [[[]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [])]]
         resp = client.post(
             "/v1/steering/set",
             json=_vecs({"0": [1.0]}),
@@ -182,7 +182,7 @@ class TestSetSteeringBase:
 
     def test_set_with_replace(self, client, engine):
         """replace=True passes replace flag to set_steering_vectors."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json={**_vecs({"0": [1.0]}), "replace": True},
@@ -194,7 +194,7 @@ class TestSetSteeringBase:
         assert kwargs["replace"] is True
 
     def test_set_without_replace_no_clear(self, client, engine):
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json=_vecs({"0": [1.0]}),
@@ -204,7 +204,7 @@ class TestSetSteeringBase:
 
     def test_set_without_replace_passes_false(self, client, engine):
         """Default replace=False is passed through to workers."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json=_vecs({"0": [1.0]}),
@@ -248,7 +248,7 @@ class TestSetSteeringThreeTier:
 
     def test_set_prefill_only(self, client, engine):
         """Set prefill-specific vectors without base."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json={"prefill_vectors": {_HP: {"0": [1.0, 2.0]}}},
@@ -260,7 +260,7 @@ class TestSetSteeringThreeTier:
 
     def test_set_decode_only(self, client, engine):
         """Set decode-specific vectors without base."""
-        engine.collective_rpc.side_effect = [[[1]], [[1]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [1])], [(0, 0, [1])]]
         resp = client.post(
             "/v1/steering/set",
             json={"decode_vectors": {_HP: {"1": [3.0, 4.0]}}},
@@ -270,7 +270,7 @@ class TestSetSteeringThreeTier:
 
     def test_set_all_three_tiers(self, client, engine):
         """Set all three tiers simultaneously."""
-        engine.collective_rpc.side_effect = [[[0, 1, 2]], [[0, 1, 2]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0, 1, 2])], [(0, 0, [0, 1, 2])]]
         resp = client.post(
             "/v1/steering/set",
             json={
@@ -285,7 +285,7 @@ class TestSetSteeringThreeTier:
 
     def test_prefill_with_co_located_scale(self, client, engine):
         """Prefill vectors support co-located scale format."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json={
@@ -300,7 +300,7 @@ class TestSetSteeringThreeTier:
 
     def test_decode_with_co_located_scale(self, client, engine):
         """Decode vectors support co-located scale format."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json={"decode_vectors": {_HP: {"0": {"vector": [3.0, 6.0], "scale": 0.5}}}},
@@ -313,7 +313,7 @@ class TestSetSteeringThreeTier:
 
     def test_replace_clears_all_tiers(self, client, engine):
         """replace=True passes replace flag to set_steering_vectors."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json={
@@ -346,7 +346,7 @@ class TestSetSteeringThreeTier:
 
     def test_hook_points_response_includes_all_tiers(self, client, engine):
         """Response includes hook points from all tiers."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         resp = client.post(
             "/v1/steering/set",
             json={
@@ -394,7 +394,7 @@ class TestSetSteeringCacheInvalidation:
 
     def test_base_vectors_cache_failure_returns_503(self, client, engine):
         """Base vectors affect cache; failure returns 503."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         engine.reset_prefix_cache.return_value = False
         resp = client.post(
             "/v1/steering/set",
@@ -405,7 +405,7 @@ class TestSetSteeringCacheInvalidation:
 
     def test_decode_only_cache_failure_returns_503(self, client, engine):
         """Decode-only vectors also require cache invalidation."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         engine.reset_prefix_cache.return_value = False
         resp = client.post(
             "/v1/steering/set",
@@ -416,7 +416,7 @@ class TestSetSteeringCacheInvalidation:
 
     def test_cache_success_returns_200(self, client, engine):
         """When cache reset succeeds, set returns 200."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         engine.reset_prefix_cache.return_value = True
         resp = client.post(
             "/v1/steering/set",
@@ -437,20 +437,23 @@ class TestGetSteering:
 
     def test_get_active_layers(self, client, engine):
         engine.collective_rpc.return_value = [
-            {0: {"norm": 1.5}, 3: {"norm": 2.0}},
+            {
+                0: {_HP: {"norm": 1.5}},
+                3: {_HP: {"norm": 2.0}},
+            },
         ]
         resp = client.get("/v1/steering")
         assert resp.status_code == 200
         active = resp.json()["active_layers"]
         assert "0" in active
         assert "3" in active
-        assert active["0"]["norm"] == 1.5
+        assert active["0"][_HP]["norm"] == 1.5
 
     def test_get_merges_multiple_workers(self, client, engine):
         """PP workers own disjoint layers — results are merged."""
         engine.collective_rpc.return_value = [
-            {0: {"norm": 1.0}},
-            {5: {"norm": 2.0}},
+            {0: {_HP: {"norm": 1.0}}},
+            {5: {_HP: {"norm": 2.0}}},
         ]
         resp = client.get("/v1/steering")
         assert resp.status_code == 200
@@ -538,14 +541,14 @@ class TestSteeringAPIKeyAuth:
 
     def test_set_no_tokens_configured_is_open(self, engine):
         """When no tokens configured, /set requires no Authorization."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         client = _SyncASGIClient(_make_app_with_tokens(engine, None))
         resp = client.post("/v1/steering/set", json=_vecs({"0": [1.0]}))
         assert resp.status_code == 200
 
     def test_set_empty_tokens_configured_is_open(self, engine):
         """An empty token list behaves the same as unconfigured."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         client = _SyncASGIClient(_make_app_with_tokens(engine, []))
         resp = client.post("/v1/steering/set", json=_vecs({"0": [1.0]}))
         assert resp.status_code == 200
@@ -581,7 +584,7 @@ class TestSteeringAPIKeyAuth:
 
     def test_set_correct_bearer_is_allowed(self, engine):
         """Correct bearer token lets the request through."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
         client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
         resp = client.post(
             "/v1/steering/set",
@@ -592,10 +595,8 @@ class TestSteeringAPIKeyAuth:
 
     def test_set_accepts_any_configured_token(self, engine):
         """Any token in the configured list is accepted."""
-        engine.collective_rpc.side_effect = [[[0]], [[0]]]
-        client = _SyncASGIClient(
-            _make_app_with_tokens(engine, ["primary", "backup"])
-        )
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
+        client = _SyncASGIClient(_make_app_with_tokens(engine, ["primary", "backup"]))
         resp = client.post(
             "/v1/steering/set",
             json=_vecs({"0": [1.0]}),

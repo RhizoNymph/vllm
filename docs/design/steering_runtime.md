@@ -246,6 +246,85 @@ This design document reflects the v1 steering runtime. Known boundaries:
 - see [Activation Steering](../features/steering.md#supported-scope) for the
   current list of wired decoder architectures
 
+## Distributed Execution
+
+Steering runs on every tensor-parallel (TP) and pipeline-parallel (PP) rank
+and relies on a *determinism contract* rather than cross-rank collectives in
+the hot path.
+
+### Determinism contract
+
+> Steering state is shared-nothing with deterministic replay. Every worker
+> executes identical `set_steering_vectors` / `clear_steering_vectors` calls
+> (via `collective_rpc`) and sees an identical `SchedulerOutput` stream, so
+> every worker's `SteeringManager` derives identical `config_to_row`
+> assignments, identical `free_rows` state, and an identical
+> `steering_index` tensor each step — even though each worker stores
+> vectors only for layers it physically owns. No cross-rank collectives
+> are needed in the hot path.
+
+### What each rank stores vs. doesn't
+
+Per rank:
+
+- **Full** `config_to_row`, `free_rows`, `pending` queues on the local
+  `SteeringManager`. Row allocation is fully rank-local and runs for every
+  config on every rank, even configs whose layers are all owned by other
+  PP stages. Row ids flow through `steering_index` into the
+  `apply_steering` gather on every rank, so they *must* match across ranks.
+- **Only locally-owned tensors** in `global_base_vectors`,
+  `global_prefill_vectors`, `global_decode_vectors`, and per-config tensor
+  dicts (PR 1 filters these by `locally_owned_layers`).
+- A `steering_index` tensor shared across all layers on this worker.
+
+What does *not* happen at the worker layer:
+
+- NCCL all-reduce / broadcast of steering tables.
+- Any inter-rank coordination of row ids.
+- Any inter-rank coordination of `SchedulerOutput`.
+
+### Collective operations
+
+- `POST /v1/steering/set`, `POST /v1/steering/clear`: one
+  `collective_rpc` per endpoint call (two for set — validate then apply).
+  All ranks receive identical kwargs.
+- `GET /v1/steering`, `GET /v1/steering/layers`: one read-only
+  `collective_rpc` each; router aggregates.
+- Per-forward-step: none.
+
+### Row-allocation invariants
+
+Because every rank processes the same sequence of `register_config` calls
+(driven by the shared `SchedulerOutput`), their `SteeringManager` state
+stays in lock-step:
+
+- `config_to_row` is identical on every rank.
+- `free_rows` is identical on every rank.
+- `steering_index` is identical on every rank.
+
+This holds even for configs whose layers are not locally owned: row
+allocation is independent of whether tensors actually materialize on this
+rank.
+
+### Failure modes and debugging
+
+- **TP divergence** (TP ranks within the same PP stage reporting different
+  valid layer sets from `set_steering_vectors` validate) is a *server-side
+  invariant violation*, not user error. The router returns HTTP 500 with a
+  message naming the diverging ranks. Typical root cause: model-loading
+  asymmetry (one rank loaded different weights).
+- **PP disjointness** is expected. PP ranks report disjoint layer sets;
+  the router unions them.
+- Deep-merge of `GET /v1/steering` payloads asserts per-triple equality.
+  If two workers report the same `(layer, hook, norm_key)` with different
+  values, the merge raises and the router returns HTTP 500.
+- Debug endpoints:
+    - `GET /v1/steering/layers` — per-layer hook-point availability
+    aggregated across ranks. Useful to confirm which layers are
+    steerable on the current model shape.
+    - `GET /v1/steering` — per-layer active norms aggregated across
+    ranks.
+
 ## Named Steering Modules (runtime)
 
 Named steering modules are pre-registered vector configurations that requests

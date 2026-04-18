@@ -403,7 +403,9 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
     engine_client.model_config = MagicMock()
     engine_client.renderer = MagicMock()
     engine_client.io_processor = MagicMock()
-    engine_client.collective_rpc = AsyncMock(return_value=[{0, 1}])
+    engine_client.collective_rpc = AsyncMock(
+        return_value=[{0: ["post_mlp"], 1: ["post_mlp"]}]
+    )
 
     args = Namespace(
         served_model_name=None,

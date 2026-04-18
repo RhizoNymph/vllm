@@ -917,7 +917,7 @@ class Worker(WorkerBase):
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
-    ) -> list[int]:
+    ) -> tuple[int, int, list[int]]:
         return self.model_runner.set_steering_vectors(
             vectors=vectors,
             prefill_vectors=prefill_vectors,
@@ -929,7 +929,7 @@ class Worker(WorkerBase):
     def clear_steering_vectors(self) -> None:
         return self.model_runner.clear_steering_vectors()
 
-    def list_steerable_layers(self) -> set[int]:
+    def list_steerable_layers(self) -> dict[int, list[str]]:
         return self.model_runner.list_steerable_layers()
 
     def get_steering_status(self) -> dict:

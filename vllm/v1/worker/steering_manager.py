@@ -1,17 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Manages per-request steering vector state for the model runner.
+"""Per-request steering state manager (shared-nothing, deterministic replay).
+
+Determinism contract
+--------------------
+Steering state is shared-nothing with deterministic replay. Every worker
+executes identical ``set_steering_vectors`` / ``clear_steering_vectors``
+calls (via ``collective_rpc``) and sees an identical ``SchedulerOutput``
+stream, so every worker's ``SteeringManager`` derives identical
+``config_to_row`` assignments, identical ``free_rows`` state, and an
+identical ``steering_index`` tensor each step -- even though each worker
+stores vectors only for layers it physically owns. No cross-rank
+collectives are needed in the hot path.
+
+Concrete implications:
+
+* Row allocation is fully rank-local. ``register_config`` runs on every
+  rank for every config, regardless of whether that rank owns an
+  affected layer. This is a correctness requirement, not an optimization:
+  row IDs flow through ``steering_index`` into the ``apply_steering``
+  gather on every rank, so they MUST match.
+* Global-vector broadcast lives at the API layer (one ``collective_rpc``),
+  not at the worker layer. There is no NCCL all-reduce of steering tables.
+* ``SamplingParams.prefill_steering_config_hash`` and
+  ``decode_steering_config_hash`` are pure functions of the request
+  payload, identical on every rank.
+
+See ``docs/design/steering_runtime.md`` section "Distributed execution"
+for the full mental model.
+
+Class responsibilities (unchanged by the contract):
 
 Tracks registered steering configs, assigns table rows, handles
 reference counting, and populates per-layer steering_table buffers
-with the correct combined (global + per_request) vectors.
-
-Supports multiple hook points per layer. Each hook point has its own
-steering table buffer (e.g. ``steering_table_pre_attn``) and global
-vector cache.
-
-Supports phase-aware (prefill vs decode) steering with separate
-global effective vectors for each phase.
+with the correct combined (global + per_request) vectors. Supports
+multiple hook points per layer; each hook point has its own steering
+table buffer (e.g. ``steering_table_pre_attn``) and global vector cache.
+Supports phase-aware (prefill vs decode) steering with separate global
+effective vectors for each phase.
 """
 
 from collections import defaultdict

@@ -103,7 +103,7 @@ class FakeWorker(WorkerBase):
 
     def set_steering_vectors(self, **kwargs):
         if self.model_runner is None:
-            return []
+            return (0, 0, [])
         return self.model_runner.set_steering_vectors(**kwargs)
 
     def clear_steering_vectors(self):
@@ -113,7 +113,7 @@ class FakeWorker(WorkerBase):
 
     def list_steerable_layers(self):
         if self.model_runner is None:
-            return set()
+            return {}
         return self.model_runner.list_steerable_layers()
 
     def get_steering_status(self):
@@ -177,7 +177,7 @@ class TestSetSteeringVectorsBase:
     def test_set_single_layer(self, worker_with_manager):
         vec = [1.0] * 8
         result = worker_with_manager.set_steering_vectors(vectors={_HP: {2: vec}})
-        assert result == [2]
+        assert result[2] == [2]
         mgr = worker_with_manager.model_runner._steering_manager
         assert _HP in mgr.global_base_vectors
         assert 2 in mgr.global_base_vectors[_HP]
@@ -190,7 +190,7 @@ class TestSetSteeringVectorsBase:
         result = worker_with_manager.set_steering_vectors(
             vectors={_HP: {0: vec_a, 3: vec_b}}
         )
-        assert result == [0, 3]
+        assert result[2] == [0, 3]
         mgr = worker_with_manager.model_runner._steering_manager
         assert mgr.global_base_vectors[_HP][0].sum().item() == 8.0
         assert mgr.global_base_vectors[_HP][3].sum().item() == 16.0
@@ -206,14 +206,14 @@ class TestSetSteeringVectorsBase:
         result = worker_with_manager.set_steering_vectors(
             vectors={_HP: {999: [1.0] * 8}}
         )
-        assert result == []
+        assert result[2] == []
 
     def test_mixed_valid_and_invalid_layers(self, worker_with_manager):
         vec = [3.0] * 8
         result = worker_with_manager.set_steering_vectors(
             vectors={_HP: {1: vec, 999: [1.0] * 8}}
         )
-        assert result == [1]
+        assert result[2] == [1]
         mgr = worker_with_manager.model_runner._steering_manager
         assert mgr.global_base_vectors[_HP][1].sum().item() == 24.0
 
@@ -241,7 +241,7 @@ class TestSetSteeringVectorsBase:
         result = worker_with_manager.set_steering_vectors(
             vectors={_HP: {0: vec}}, validate_only=True
         )
-        assert result == [0]
+        assert result[2] == [0]
         mgr = worker_with_manager.model_runner._steering_manager
         # Manager should have no base vectors after validate_only
         assert (
@@ -276,11 +276,11 @@ class TestSetSteeringVectorsBase:
 
     def test_empty_vectors_is_noop(self, worker_with_manager):
         result = worker_with_manager.set_steering_vectors(vectors={})
-        assert result == []
+        assert result[2] == []
 
     def test_no_vectors_is_noop(self, worker_with_manager):
         result = worker_with_manager.set_steering_vectors()
-        assert result == []
+        assert result[2] == []
 
     def test_invalid_hook_point_raises(self, worker_with_manager):
         with pytest.raises(SteeringVectorError, match="Invalid hook point"):
@@ -307,7 +307,7 @@ class TestSetSteeringVectorsThreeTier:
         result = worker_with_manager.set_steering_vectors(
             prefill_vectors={_HP: {0: vec}}
         )
-        assert result == [0]
+        assert result[2] == [0]
         mgr = worker_with_manager.model_runner._steering_manager
         assert _HP in mgr.global_prefill_vectors
         assert 0 in mgr.global_prefill_vectors[_HP]
@@ -323,7 +323,7 @@ class TestSetSteeringVectorsThreeTier:
         result = worker_with_manager.set_steering_vectors(
             decode_vectors={_HP: {1: vec}}
         )
-        assert result == [1]
+        assert result[2] == [1]
         mgr = worker_with_manager.model_runner._steering_manager
         assert _HP in mgr.global_decode_vectors
         assert 1 in mgr.global_decode_vectors[_HP]
@@ -335,7 +335,7 @@ class TestSetSteeringVectorsThreeTier:
             prefill_vectors={_HP: {1: [2.0] * 8}},
             decode_vectors={_HP: {2: [3.0] * 8}},
         )
-        assert result == [0, 1, 2]
+        assert result[2] == [0, 1, 2]
 
     def test_validate_only_checks_all_tiers(self, worker_with_manager):
         """Validate mode checks all tiers without mutation."""
@@ -344,7 +344,7 @@ class TestSetSteeringVectorsThreeTier:
             prefill_vectors={_HP: {1: [2.0] * 8}},
             validate_only=True,
         )
-        assert result == [0, 1]
+        assert result[2] == [0, 1]
         # Nothing mutated
         mgr = worker_with_manager.model_runner._steering_manager
         assert (
@@ -406,7 +406,7 @@ class TestSetSteeringVectorsThreeTier:
         result = worker_with_manager.set_steering_vectors(replace=True)
 
         # Should return empty (no new layers updated)
-        assert result == []
+        assert result[2] == []
         # But all existing vectors should be cleared
         assert not mgr.global_base_vectors
 
@@ -418,7 +418,7 @@ class TestSetSteeringVectorsThreeTier:
         ]
         # Call replace=True with NO vector arguments
         result = worker.set_steering_vectors(replace=True)
-        assert result == []
+        assert result[2] == []
         # Pending globals should be cleared
         assert worker.model_runner._pending_steering_globals is None
 
@@ -643,7 +643,7 @@ class TestNoModelRunner:
     def test_set_with_no_runner(self):
         w = FakeWorker.__new__(FakeWorker)
         w.model_runner = None
-        assert w.set_steering_vectors(vectors={_HP: {0: [1.0]}}) == []
+        assert w.set_steering_vectors(vectors={_HP: {0: [1.0]}}) == (0, 0, [])
 
     def test_clear_with_no_runner(self):
         w = FakeWorker.__new__(FakeWorker)
