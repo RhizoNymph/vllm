@@ -415,6 +415,94 @@ class TestGetResultLifecycle:
             consumer.shutdown(timeout=5.0)
 
 
+class TestWaitForResult:
+    """Verify the event-based ``wait_for_result`` method."""
+
+    def test_returns_ok_after_finalize(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path)
+        try:
+            request_id = VllmInternalRequestId("wait-ok")
+            key: CaptureKey = (request_id, 2, "post_mlp")
+
+            tensor = torch.randn(1, 4, dtype=torch.float32)
+            consumer.submit_chunk(
+                CaptureChunk(
+                    key=key,
+                    tensor=tensor,
+                    dtype=tensor.dtype,
+                    row_offset=0,
+                    step_index=0,
+                    metadata={"tag_slug": "t", "request_id_slug": "wait-ok"},
+                )
+            )
+            consumer.submit_finalize(
+                CaptureFinalize(
+                    key=key,
+                    sidecar={"tag_slug": "t", "request_id_slug": "wait-ok"},
+                )
+            )
+
+            result = consumer.wait_for_result(key, timeout=5.0)
+            assert result is not None
+            assert result.status == "ok"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_returns_immediately_if_already_terminal(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        consumer = _make_consumer(tmp_path)
+        try:
+            request_id = VllmInternalRequestId("wait-already-done")
+            key: CaptureKey = (request_id, 0, "pre_attn")
+
+            tensor = torch.zeros(1, 4, dtype=torch.float32)
+            consumer.submit_chunk(
+                CaptureChunk(
+                    key=key,
+                    tensor=tensor,
+                    dtype=tensor.dtype,
+                    row_offset=0,
+                    step_index=0,
+                    metadata={"tag_slug": "t", "request_id_slug": "wait-already-done"},
+                )
+            )
+            consumer.submit_finalize(
+                CaptureFinalize(
+                    key=key,
+                    sidecar={"tag_slug": "t", "request_id_slug": "wait-already-done"},
+                )
+            )
+
+            # Poll until terminal so we know the result is already ready.
+            ready = _wait_for_result(consumer, key)
+            assert ready is not None and ready.status == "ok"
+
+            # Second call via wait_for_result must return immediately (no timeout).
+            t0 = time.monotonic()
+            result = consumer.wait_for_result(key, timeout=5.0)
+            elapsed = time.monotonic() - t0
+
+            assert result is not None
+            assert result.status == "ok"
+            assert elapsed < 1.0, f"Expected immediate return, took {elapsed:.3f}s"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_returns_none_on_timeout_for_unknown_key(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        consumer = _make_consumer(tmp_path)
+        try:
+            key: CaptureKey = (VllmInternalRequestId("never-submitted"), 0, "post_attn")
+            result = consumer.wait_for_result(key, timeout=0.05)
+            # No WriteTask or FinalizeTask was ever submitted, so the
+            # writer has no result row — get_result returns None.
+            assert result is None
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+
 class TestShutdown:
     """Verify shutdown forwards to the underlying writer."""
 
