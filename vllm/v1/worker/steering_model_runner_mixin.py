@@ -18,6 +18,26 @@ from vllm.model_executor.layers.steering import (
 )
 from vllm.v1.worker.steering_manager import SteeringManager
 
+
+def _get_steering_ranks() -> tuple[int, int]:
+    """Return ``(tp_rank, pp_rank)`` for the current worker.
+
+    Used to tag steering RPC results so the router can detect TP
+    divergence (a server-side invariant violation). Guarded so that
+    tests / single-rank setups that haven't initialized the
+    distributed groups still work.
+    """
+    try:
+        from vllm.distributed.parallel_state import (
+            get_pp_group,
+            get_tp_group,
+        )
+
+        return (get_tp_group().rank_in_group, get_pp_group().rank_in_group)
+    except Exception:
+        return (0, 0)
+
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
@@ -165,9 +185,23 @@ class SteeringModelRunnerMixin:
                 valid_indices.add(idx)
         return valid_indices
 
-    def list_steerable_layers(self) -> set[int]:
-        """Return the steerable layer indices available on this worker."""
-        return set(self._steerable_layers().keys())
+    def list_steerable_layers(self) -> dict[int, list[str]]:
+        """Return steerable layers on this worker with their hook points.
+
+        Returns ``{layer_idx: [hook_point_name, ...]}`` for every
+        layer owned by this worker that has at least one steering
+        table buffer registered. Hook-point names are sorted for
+        determinism.
+        """
+        result: dict[int, list[str]] = {}
+        for idx, mod in self._steerable_layers().items():
+            hooks = sorted(
+                hp.value
+                for hp, attr in HOOK_POINT_TABLE_ATTR.items()
+                if hasattr(mod, attr)
+            )
+            result[idx] = hooks
+        return result
 
     def _notify_manager_vectors(
         self,
@@ -251,7 +285,7 @@ class SteeringModelRunnerMixin:
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
-    ) -> list[int]:
+    ) -> tuple[int, int, list[int]]:
         """Set activation steering vectors from plain Python data.
 
         Supports three-tier steering:
@@ -274,13 +308,18 @@ class SteeringModelRunnerMixin:
         without being applied.
 
         Returns:
-            Sorted list of layer indices that were actually updated (or
-            *would* be updated when *validate_only*) on this worker.
-            The router unions these across workers.
+            ``(tp_rank, pp_rank, sorted_valid_layers)``. The rank info
+            lets the router detect TP-divergence (a server-side
+            invariant violation — TP ranks within the same PP stage
+            must own identical layer sets). The sorted layer list is
+            the set of layer indices actually updated (or *would* be
+            updated when *validate_only*) on this worker. The router
+            unions these across workers.
         """
+        tp_rank, pp_rank = _get_steering_ranks()
         steerable = self._steerable_layers()
         if not steerable:
-            return []
+            return (tp_rank, pp_rank, [])
 
         # Collect all tiers with data.
         all_tiers: list[tuple[str, dict[str, dict[int, list[float]]]]] = []
@@ -294,7 +333,7 @@ class SteeringModelRunnerMixin:
         if not all_tiers:
             if replace:
                 self.clear_steering_vectors()
-            return []
+            return (tp_rank, pp_rank, [])
 
         # Validate all tiers.
         valid_indices: set[int] = set()
@@ -302,10 +341,10 @@ class SteeringModelRunnerMixin:
             valid_indices.update(self._validate_vectors_spec(tier_data, steerable))
 
         if not valid_indices:
-            return []
+            return (tp_rank, pp_rank, [])
 
         if validate_only:
-            return sorted(valid_indices)
+            return (tp_rank, pp_rank, sorted(valid_indices))
 
         # Clear if replacing.
         if replace:
@@ -328,7 +367,7 @@ class SteeringModelRunnerMixin:
                 decode_vectors, steerable, valid_indices, "decode"
             )
 
-        return sorted(valid_indices)
+        return (tp_rank, pp_rank, sorted(valid_indices))
 
     def clear_steering_vectors(self) -> None:
         """Clear all tiers (base, prefill, decode) in the SteeringManager."""
