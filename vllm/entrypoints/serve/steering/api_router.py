@@ -15,6 +15,10 @@ from vllm.config.steering_types import (
     normalize_layer_entry,
 )
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.serve.steering._merge import (
+    deep_merge_status,
+    normalize_worker_err,
+)
 from vllm.entrypoints.serve.steering.protocol import SetSteeringRequest
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
@@ -206,9 +210,41 @@ async def set_steering(
                     validate_only=True,
                 ),
             )
+            # Each worker now returns ``(tp_rank, pp_rank, valid_layers)``.
+            # Detect TP divergence: within a given PP stage, all TP
+            # ranks must own identical layer sets. A mismatch is a
+            # server-side invariant violation, not user error.
+            by_pp: dict[int, list[tuple[int, frozenset[int]]]] = {}
+            for entry in results:
+                tp_rank, pp_rank, layers = entry
+                by_pp.setdefault(pp_rank, []).append((tp_rank, frozenset(layers)))
+            for pp_rank, entries in by_pp.items():
+                layer_sets = {s for _, s in entries}
+                if len(layer_sets) > 1:
+                    detail = ", ".join(
+                        f"tp={tp}:{sorted(s)}" for tp, s in sorted(entries)
+                    )
+                    logger.error(
+                        "Steering TP divergence at pp_rank=%d: %s",
+                        pp_rank,
+                        detail,
+                    )
+                    return JSONResponse(
+                        content={
+                            "error": (
+                                "Server-side invariant violation: TP "
+                                f"ranks within pp_rank={pp_rank} "
+                                "reported divergent valid layer sets "
+                                f"({detail}). Check for model-loading "
+                                "asymmetries."
+                            )
+                        },
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    )
+
             validated_layers: set[int] = set()
-            for per_worker in results:
-                validated_layers.update(per_worker)
+            for _, _, layers in results:
+                validated_layers.update(layers)
 
             # Collect all requested layers across all tiers.
             requested_layers: set[int] = set()
@@ -310,11 +346,11 @@ async def set_steering(
         )
     except SteeringVectorError as err:
         return JSONResponse(
-            content={"error": str(err)},
+            content={"error": normalize_worker_err(str(err))},
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
     except Exception as err:
-        err_str = str(err)
+        err_str = normalize_worker_err(str(err))
         if "expected vector of size" in err_str or "non-finite" in err_str:
             return JSONResponse(
                 content={"error": err_str},
@@ -322,7 +358,7 @@ async def set_steering(
             )
         logger.exception("Failed to set steering vectors")
         return JSONResponse(
-            content={"error": f"Failed to set steering vectors: {err}"},
+            content={"error": f"Failed to set steering vectors: {err_str}"},
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
         )
 
@@ -373,9 +409,20 @@ async def get_steering(raw_request: Request) -> JSONResponse:
 
     try:
         results = await engine.collective_rpc("get_steering_status")
-        active: dict = {}
-        for worker_result in results:
-            active.update(worker_result)
+        try:
+            active = deep_merge_status(results)
+        except RuntimeError as err:
+            logger.error("Steering status divergence across workers: %s", err)
+            return JSONResponse(
+                content={
+                    "error": (
+                        "Server-side invariant violation: workers "
+                        f"disagree on steering state ({err}). Check "
+                        "for model-loading asymmetries."
+                    )
+                },
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            )
         return JSONResponse(
             content={
                 "active_layers": {str(k): v for k, v in sorted(active.items())},
@@ -385,6 +432,41 @@ async def get_steering(raw_request: Request) -> JSONResponse:
         logger.exception("Failed to get steering status")
         return JSONResponse(
             content={"error": f"Failed to get steering status: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
+@router.get("/v1/steering/layers")
+async def get_steering_layers(raw_request: Request) -> JSONResponse:
+    """Return per-layer steerable hook-point availability.
+
+    Fans out ``list_steerable_layers`` across all workers and unions
+    the results. PP ranks report disjoint layer sets; TP ranks within
+    a given PP stage report identical sets — both behaviors are
+    handled by the union.
+    """
+    engine = engine_client(raw_request)
+
+    try:
+        results = await engine.collective_rpc("list_steerable_layers")
+        merged: dict[int, set[str]] = {}
+        for worker_result in results:
+            if not worker_result:
+                continue
+            for layer_idx, hook_points in worker_result.items():
+                merged.setdefault(layer_idx, set()).update(hook_points)
+        return JSONResponse(
+            content={
+                "layers": {
+                    str(layer_idx): {"hook_points": sorted(hooks)}
+                    for layer_idx, hooks in sorted(merged.items())
+                }
+            },
+        )
+    except Exception as err:
+        logger.exception("Failed to list steerable layers")
+        return JSONResponse(
+            content={"error": f"Failed to list steerable layers: {err}"},
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
         )
 
