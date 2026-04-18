@@ -294,11 +294,18 @@ class SteeringManager:
         if first_layer is None:
             self._tables_dirty = False
             return
-        first_attr = next(iter(HOOK_POINT_TABLE_ATTR.values()))
-        if not hasattr(first_layer, first_attr):
+        # Find any table buffer on the first layer to derive device and
+        # hidden_size. Layers may register only a subset of hook-point
+        # tables (e.g. only ``post_mlp``), so we scan HOOK_POINT_TABLE_ATTR
+        # rather than assuming the first entry is present.
+        first_table = None
+        for attr in HOOK_POINT_TABLE_ATTR.values():
+            if hasattr(first_layer, attr):
+                first_table = getattr(first_layer, attr)
+                break
+        if first_table is None:
             self._tables_dirty = False
             return
-        first_table = getattr(first_layer, first_attr)
         device = first_table.device
         hidden_size = first_table.shape[1]
         # Snapshot config_to_row ordering once — this defines which row
@@ -396,7 +403,12 @@ class SteeringManager:
                 )
 
             if phase_global is not None and per_req is not None:
-                row_content = phase_global + per_req.squeeze(0)
+                # Per-request vectors are registered from raw Python lists
+                # and default to CPU; global vectors inherit the model's
+                # device. Align to the global's device before adding so a
+                # CPU/CUDA mix doesn't raise.
+                per_req_aligned = per_req.squeeze(0).to(phase_global.device)
+                row_content = phase_global + per_req_aligned
             elif phase_global is not None:
                 row_content = phase_global
             elif per_req is not None:

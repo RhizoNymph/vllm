@@ -218,6 +218,11 @@ class SteeringModelRunnerMixin:
                     pending = self._pending_steering_globals
                 pending.append((captured, phase))
             return
+        # ``_locally_owned_layers`` is set during lazy init in
+        # ``_update_steering_buffers``. Callers that construct a manager
+        # directly (e.g. unit tests) skip that path, so fall back to
+        # ``None`` (no filtering — manager already stored the full set).
+        locally_owned = getattr(self, "_locally_owned_layers", None)
         for hook_point_str, layer_vecs in vectors_data.items():
             table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_point_str)]
             for idx, vec_values in layer_vecs.items():
@@ -232,7 +237,7 @@ class SteeringModelRunnerMixin:
                         idx,
                         t,
                         phase=phase,
-                        locally_owned_layers=self._locally_owned_layers,
+                        locally_owned_layers=locally_owned,
                     )
 
     # -----------------------------------------------------------------------
