@@ -414,6 +414,47 @@ as long as the model has been wired correctly.
 - Per-request steering requires `--enable-steering`
 - Distinct steering configs in flight are capped by `--max-steering-configs`
 
+## Distributed Execution
+
+Steering is compatible with tensor and pipeline parallelism.
+
+| Configuration        | Supported | Notes                                                   |
+|----------------------|-----------|---------------------------------------------------------|
+| `TP=1, PP=1`         | yes       | baseline                                                |
+| `TP>1, PP=1`         | yes       | vectors replicated on every TP rank                     |
+| `TP=1, PP>1`         | yes       | vectors sharded by layer ownership                      |
+| `TP>1, PP>1`         | yes       | both behaviors compose                                  |
+| Expert parallelism   | untested  |                                                         |
+| Speculative decoding | partial   | target model only; draft-model support is separate      |
+
+Global-vector API calls (`/v1/steering/set`, `/v1/steering/clear`) fan out
+to every worker with identical arguments via `collective_rpc`. Each worker
+stores vectors only for layers it physically owns but allocates table rows
+independently for every config it sees — that keeps row IDs in lock-step
+across ranks without any cross-rank coordination in the hot path. See
+[Distributed Execution](../design/steering_runtime.md#distributed-execution)
+in the design doc for the full contract.
+
+### Debug endpoint: `GET /v1/steering/layers`
+
+Returns per-layer hook-point availability aggregated across TP × PP ranks:
+
+```bash
+curl http://localhost:8000/v1/steering/layers
+# {"layers": {"0": {"hook_points": ["post_mlp"]}, "1": {"hook_points": ["post_mlp", "pre_attn"]}, ...}}
+```
+
+Useful to confirm which layers of the loaded model are steerable before
+sending a `/v1/steering/set` request.
+
+### TP-rank divergence
+
+TP ranks within the same PP stage must own identical layer sets. If they
+do not, `/v1/steering/set` returns HTTP 500 labelled "Server-side
+invariant violation" naming the diverging ranks. This indicates a
+model-loading asymmetry (e.g., different weights loaded on different
+ranks) and not a user error.
+
 ## References
 
 - [Steering Runtime Design](../design/steering_runtime.md)
