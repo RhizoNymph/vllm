@@ -19,7 +19,10 @@ from vllm.entrypoints.serve.steering._merge import (
     deep_merge_status,
     normalize_worker_err,
 )
-from vllm.entrypoints.serve.steering.protocol import SetSteeringRequest
+from vllm.entrypoints.serve.steering.protocol import (
+    ClearSteeringRequest,
+    SetSteeringRequest,
+)
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
@@ -136,6 +139,21 @@ async def set_steering(
     if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
         return unauthorized
 
+    if request.target == "draft":
+        return JSONResponse(
+            content={
+                "error": (
+                    "target='draft' steering is not yet implemented. "
+                    "Only target='main' (or omitted, which currently "
+                    "routes to the main model) is supported. Draft-model "
+                    "steering is tracked in a follow-up PR; see the "
+                    "Speculative decoding section of "
+                    "docs/features/steering.md."
+                )
+            },
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+        )
+
     engine = engine_client(raw_request)
 
     # Collect all tiers that have data.
@@ -208,6 +226,7 @@ async def set_steering(
                     prefill_vectors=normalized_prefill,
                     decode_vectors=normalized_decode,
                     validate_only=True,
+                    target=request.target,
                 ),
             )
             # Each worker now returns ``(tp_rank, pp_rank, valid_layers)``.
@@ -248,9 +267,9 @@ async def set_steering(
 
             # Collect all requested layers across all tiers.
             requested_layers: set[int] = set()
-            for spec in [normalized_base, normalized_prefill, normalized_decode]:
-                if spec:
-                    for layer_vecs in spec.values():
+            for tier in (normalized_base, normalized_prefill, normalized_decode):
+                if tier:
+                    for layer_vecs in tier.values():
                         requested_layers.update(layer_vecs.keys())
 
             missing = requested_layers - validated_layers
@@ -288,6 +307,7 @@ async def set_steering(
                     decode_vectors=normalized_decode,
                     replace=request.replace,
                     validate_only=False,
+                    target=request.target,
                 ),
             )
 
@@ -333,9 +353,9 @@ async def set_steering(
 
         # Build response with all hook points across tiers.
         all_hooks: set[str] = set()
-        for spec in [normalized_base, normalized_prefill, normalized_decode]:
-            if spec:
-                all_hooks.update(spec.keys())
+        for tier in (normalized_base, normalized_prefill, normalized_decode):
+            if tier:
+                all_hooks.update(tier.keys())
 
         return JSONResponse(
             content={
@@ -365,15 +385,46 @@ async def set_steering(
 
 @router.post("/v1/steering/clear")
 async def clear_steering(raw_request: Request) -> JSONResponse:
-    """Reset all steering vectors to zero (no-op steering)."""
+    """Reset all steering vectors to zero (no-op steering).
+
+    Accepts an optional JSON body ``{"target": "main"|"draft"}``.
+    ``"draft"`` returns HTTP 501; any other value (including omitted)
+    clears the main model's steering state.
+    """
     if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
         return unauthorized
+
+    # Body is optional; tolerate missing/empty body for legacy callers.
+    target: str | None = None
+    try:
+        body = await raw_request.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        parsed = ClearSteeringRequest(**body)
+        target = parsed.target
+
+    if target == "draft":
+        return JSONResponse(
+            content={
+                "error": (
+                    "target='draft' steering is not yet implemented. "
+                    "See the Speculative decoding section of "
+                    "docs/features/steering.md."
+                )
+            },
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+        )
 
     engine = engine_client(raw_request)
 
     try:
         async with _steering_lock:
-            await engine.collective_rpc("clear_steering_vectors")
+            await engine.collective_rpc(
+                "clear_steering_vectors",
+                args=(),
+                kwargs=dict(target=target),
+            )
             # Clearing removes all steering vectors, so invalidate
             # prefix cache to prevent reuse of stale KV blocks.
             success = await engine.reset_prefix_cache(reset_running_requests=True)
