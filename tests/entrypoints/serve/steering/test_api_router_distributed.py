@@ -219,19 +219,40 @@ class TestGetSteeringDivergence:
 
 class TestGetSteeringLayers:
     def test_merges_hook_points_across_workers(self, client, engine):
-        """PP-disjoint layers + TP-identical hooks are merged correctly."""
+        """PP-disjoint layers + TP-identical hooks are merged correctly.
+
+        With PR 5a, the default (no ``?target=``) query returns the
+        nested form. Each worker now returns ``{role: {layer: hooks}}``.
+        """
+        engine.collective_rpc.return_value = [
+            {"main": {0: ["post_mlp"], 1: ["post_mlp", "pre_attn"]}},
+            {"main": {0: ["post_mlp"], 1: ["post_mlp", "pre_attn"]}},
+            {"main": {2: ["post_mlp"], 3: ["post_mlp"]}},
+            {"main": {2: ["post_mlp"], 3: ["post_mlp"]}},
+        ]
+        resp = client.get("/v1/steering/layers")
+        assert resp.status_code == 200
+        layers = resp.json()["layers"]
+        assert set(layers.keys()) == {"main"}
+        main_layers = layers["main"]
+        assert set(main_layers.keys()) == {"0", "1", "2", "3"}
+        assert main_layers["1"]["hook_points"] == ["post_mlp", "pre_attn"]
+        assert main_layers["2"]["hook_points"] == ["post_mlp"]
+
+    def test_target_main_returns_flat(self, client, engine):
+        """With ``?target=main``, each worker returns flat form."""
         engine.collective_rpc.return_value = [
             {0: ["post_mlp"], 1: ["post_mlp", "pre_attn"]},
             {0: ["post_mlp"], 1: ["post_mlp", "pre_attn"]},
             {2: ["post_mlp"], 3: ["post_mlp"]},
             {2: ["post_mlp"], 3: ["post_mlp"]},
         ]
-        resp = client.get("/v1/steering/layers")
+        resp = client.get("/v1/steering/layers?target=main")
         assert resp.status_code == 200
         layers = resp.json()["layers"]
+        assert "main" not in layers  # flat form
         assert set(layers.keys()) == {"0", "1", "2", "3"}
         assert layers["1"]["hook_points"] == ["post_mlp", "pre_attn"]
-        assert layers["2"]["hook_points"] == ["post_mlp"]
 
     def test_empty_worker_results(self, client, engine):
         engine.collective_rpc.return_value = [{}, {}]
