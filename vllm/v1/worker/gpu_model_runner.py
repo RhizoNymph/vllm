@@ -569,7 +569,9 @@ class GPUModelRunner(
                     )
             elif self.speculative_config.method == "medusa":
                 self.drafter = MedusaProposer(
-                    vllm_config=self.vllm_config, device=self.device
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
                 )
             elif self.speculative_config.method == "extract_hidden_states":
                 self.drafter = ExtractHiddenStatesProposer(
