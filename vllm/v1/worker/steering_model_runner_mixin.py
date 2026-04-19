@@ -5,6 +5,7 @@ Define activation steering functionality mixin for model runners.
 """
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,6 +19,25 @@ from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
+
+
+@dataclass(frozen=True)
+class _RoleState:
+    """Per-role state descriptor returned by ``_select_role_state``.
+
+    Groups the four pieces the public steering methods need so each
+    method's role-dispatch loop stays readable. ``manager_attr`` and
+    ``pending_attr`` are attribute names on the mixin; callers read
+    them with ``getattr`` to preserve the lazy-init sentinel (the
+    mixin uses ``hasattr(self, "_steering_manager")`` as the trigger,
+    so class-level defaults would defeat initialisation).
+    """
+
+    role: ModelRole
+    steerable: dict
+    manager_attr: str
+    pending_attr: str
+    locally_owned: frozenset[int] | None
 
 
 def _get_steering_ranks() -> tuple[int, int]:
@@ -197,6 +217,50 @@ class SteeringModelRunnerMixin:
 
         return layers
 
+    def _select_role_state(self, target: ModelRole) -> _RoleState:
+        """Return the per-role state descriptor for *target*.
+
+        The manager itself is not returned — the caller reads it via
+        ``getattr(self, state.manager_attr, None)`` to preserve the
+        lazy-init sentinel. Callers that mutate pending globals read
+        / write through ``state.pending_attr``.
+        """
+        if target == "draft":
+            return _RoleState(
+                role="draft",
+                steerable=self._draft_steerable_layers(),
+                manager_attr="_draft_steering_manager",
+                pending_attr="_draft_pending_steering_globals",
+                locally_owned=getattr(self, "_draft_locally_owned_layers", frozenset()),
+            )
+        return _RoleState(
+            role="main",
+            steerable=self._steerable_layers(),
+            manager_attr="_steering_manager",
+            pending_attr="_pending_steering_globals",
+            locally_owned=getattr(self, "_locally_owned_layers", None),
+        )
+
+    def _resolve_target_roles(self, target: ModelRole | None) -> tuple[ModelRole, ...]:
+        """Expand ``target`` into the sequence of roles to dispatch to.
+
+        - ``"main"`` / ``"draft"`` → that role only.
+        - ``None`` (tags-along) → every role that actually has
+          steerable layers on this worker. Roles with no steerable
+          layers are dropped silently so a flat-spec request never
+          fails on a worker that happens to not host a draft model.
+        """
+        if target == "draft":
+            return ("draft",)
+        if target == "main":
+            return ("main",)
+        # Tags-along: drop roles with no steerable layers.
+        out: list[ModelRole] = []
+        for role in MODEL_ROLES:
+            if self._select_role_state(role).steerable:
+                out.append(role)
+        return tuple(out) if out else ("main",)
+
     def _validate_vectors_spec(
         self,
         vectors_data: dict[str, dict[int, list[float]]],
@@ -244,59 +308,65 @@ class SteeringModelRunnerMixin:
         return valid_indices
 
     def list_steerable_layers(
-        self, target: ModelRole | None = None
-    ) -> dict[int, list[str]]:
+        self,
+        target: ModelRole | None = None,
+    ) -> dict[int, list[str]] | dict[ModelRole, dict[int, list[str]]]:
         """Return steerable layers on this worker with their hook points.
 
-        Returns ``{layer_idx: [hook_point_name, ...]}`` for every
-        layer owned by this worker that has at least one steering
-        table buffer registered. Hook-point names are sorted for
-        determinism.
+        *target* selects the return shape:
 
-        *target* selects which model's steerable layers to return:
-        ``"main"`` (default when ``None``) — the target model; or
-        ``"draft"`` — the speculative-decoding draft. Returns ``{}``
-        when the requested role has no steerable layers (e.g. draft
-        model absent or using a non-steerable architecture).
+        - ``"main"`` or ``"draft"`` → flat ``{layer_idx: [hook_name, ...]}``
+          for that role. Empty dict if the role has no steerable layers.
+        - ``None`` → nested ``{"main": {...}, "draft": {...}}``.
+          Roles without steerable layers are omitted.
+
+        Hook-point names are sorted for determinism. The router uses
+        the flat form for per-role queries and the nested form to
+        validate tags-along requests (shape / hook-point mismatch) in
+        a single RPC.
         """
-        if target == "draft":
-            layers = self._draft_steerable_layers()
-        else:
-            layers = self._steerable_layers()
+        if target is not None:
+            layers = self._select_role_state(target).steerable
+            return self._describe_layers(layers)
+        nested: dict[ModelRole, dict[int, list[str]]] = {}
+        for role in MODEL_ROLES:
+            described = self._describe_layers(self._select_role_state(role).steerable)
+            if described:
+                nested[role] = described
+        return nested
+
+    @staticmethod
+    def _describe_layers(layers: dict) -> dict[int, list[str]]:
+        """Map ``{layer_idx: Module}`` → ``{layer_idx: sorted hook names}``."""
         result: dict[int, list[str]] = {}
         for idx, mod in layers.items():
-            hooks = sorted(
+            result[idx] = sorted(
                 hp.value
                 for hp, attr in HOOK_POINT_TABLE_ATTR.items()
                 if hasattr(mod, attr)
             )
-            result[idx] = hooks
         return result
 
     def _notify_manager_vectors(
         self,
+        state: _RoleState,
         vectors_data: dict[str, dict[int, list[float]]],
-        steerable: dict,
         valid_indices: set[int],
         phase: str,
     ) -> None:
-        """Notify SteeringManager of global vector changes for a given
-        phase (``"base"``, ``"prefill"``, or ``"decode"``).
+        """Notify a role's SteeringManager of global vector changes.
 
         Converts the raw ``list[float]`` values from *vectors_data*
         into tensors matching the layer buffer dtype/device, then passes
-        them to the manager.  This avoids reading from shared buffers,
-        which would silently use stale or overwritten data for
-        phase-specific tiers.
-
-        When the manager has not been lazily initialized yet, the
-        converted tensors are stored in ``self._pending_steering_globals``
-        for replay during lazy init in ``_update_steering_buffers``.
+        them to the manager for *state.role*. When the manager has not
+        been lazily initialized yet, the converted tensors are stored in
+        ``state.pending_attr`` for replay during lazy init in
+        ``_update_steering_buffers``.
         """
-        # Use getattr to preserve the ``hasattr(self, "_steering_manager")``
-        # lazy-init sentinel used by _update_steering_buffers — a
-        # class-level default would defeat it.
-        mgr = getattr(self, "_steering_manager", None)
+        steerable = state.steerable
+        # Use getattr so the lazy-init sentinel on the main manager
+        # (``hasattr(self, "_steering_manager")``) is preserved.
+        mgr = getattr(self, state.manager_attr, None)
         if mgr is None:
             # Manager not yet initialized -- capture current vectors
             # for replay during lazy init.
@@ -316,17 +386,13 @@ class SteeringModelRunnerMixin:
                 if captured_layers:
                     captured[hook_point_str] = captured_layers
             if captured:
-                pending = self._pending_steering_globals
+                pending = getattr(self, state.pending_attr, None)
                 if pending is None:
-                    self._pending_steering_globals = []
-                    pending = self._pending_steering_globals
+                    pending = []
+                    setattr(self, state.pending_attr, pending)
                 pending.append((captured, phase))
             return
-        # ``_locally_owned_layers`` is set during lazy init in
-        # ``_update_steering_buffers``. Callers that construct a manager
-        # directly (e.g. unit tests) skip that path, so fall back to
-        # ``None`` (no filtering — manager already stored the full set).
-        locally_owned = getattr(self, "_locally_owned_layers", None)
+        locally_owned = state.locally_owned
         for hook_point_str, layer_vecs in vectors_data.items():
             table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_point_str)]
             for idx, vec_values in layer_vecs.items():
@@ -378,38 +444,40 @@ class SteeringModelRunnerMixin:
         When *validate_only* is ``True``, vectors are validated
         without being applied.
 
-        *target* selects which model (``"main"`` or ``"draft"``) the
-        vectors apply to. ``None`` means "apply to main, and — in a
-        future PR — to the speculative-decoding draft as well". For
-        now only ``None`` and ``"main"`` are implemented; ``"draft"``
-        raises :class:`NotImplementedError` (the router surfaces this
-        as HTTP 501). See ``docs/features/steering.md`` → "Speculative
-        decoding" for the deferral rationale.
+        *target* selects which model the vectors apply to:
+
+        - ``"main"`` — apply only to the target (primary) model.
+        - ``"draft"`` — apply only to the speculative-decoding draft.
+          Raises :class:`SteeringVectorError` when no draft model is
+          steerable on this worker.
+        - ``None`` (tags-along) — apply to every role that has
+          steerable layers. Roles without steerable layers are silently
+          skipped so a flat request never fails on a worker that
+          happens not to host a draft.
 
         Returns:
             ``(tp_rank, pp_rank, sorted_valid_layers)``. The rank info
             lets the router detect TP-divergence (a server-side
             invariant violation — TP ranks within the same PP stage
             must own identical layer sets). The sorted layer list is
-            the set of layer indices actually updated (or *would* be
-            updated when *validate_only*) on this worker. The router
-            unions these across workers.
+            the union across every dispatched role of layer indices
+            actually updated (or *would* be updated when
+            *validate_only*) on this worker. The router unions these
+            across workers.
         """
-        if target == "draft":
-            raise NotImplementedError(
-                "target='draft' steering is not yet implemented. Only "
-                "target='main' (or omitted, which currently routes to "
-                "the main model) is supported in this release."
-            )
-        if target is not None and target not in MODEL_ROLES:
-            raise SteeringVectorError(
-                f"Invalid target {target!r}; expected one of "
-                f"{list(MODEL_ROLES)!r} or None."
-            )
+        self._validate_target(target)
         tp_rank, pp_rank = _get_steering_ranks()
-        steerable = self._steerable_layers()
-        if not steerable:
-            return (tp_rank, pp_rank, [])
+
+        # Tags-along drops roles with no steerable layers; explicit
+        # "draft" with no draft model is an error.
+        if target == "draft" and not self._draft_steerable_layers():
+            raise SteeringVectorError(
+                "target='draft' requested but no draft model is "
+                "steerable on this worker (no speculative-decoding "
+                "draft present, or the draft's architecture does not "
+                "register steering buffers)."
+            )
+        roles = self._resolve_target_roles(target)
 
         # Collect all tiers with data.
         all_tiers: list[tuple[str, dict[str, dict[int, list[float]]]]] = []
@@ -422,64 +490,72 @@ class SteeringModelRunnerMixin:
 
         if not all_tiers:
             if replace:
-                self.clear_steering_vectors()
+                self.clear_steering_vectors(target=target)
             return (tp_rank, pp_rank, [])
 
-        # Validate all tiers.
-        valid_indices: set[int] = set()
-        for _phase, tier_data in all_tiers:
-            valid_indices.update(self._validate_vectors_spec(tier_data, steerable))
+        # Validate per role and collect the union of valid indices.
+        role_valid: dict[ModelRole, set[int]] = {}
+        all_valid: set[int] = set()
+        for role in roles:
+            state = self._select_role_state(role)
+            if not state.steerable:
+                continue
+            valid: set[int] = set()
+            for _phase, tier_data in all_tiers:
+                valid.update(self._validate_vectors_spec(tier_data, state.steerable))
+            role_valid[role] = valid
+            all_valid.update(valid)
 
-        if not valid_indices:
+        if not all_valid:
             return (tp_rank, pp_rank, [])
 
         if validate_only:
-            return (tp_rank, pp_rank, sorted(valid_indices))
+            return (tp_rank, pp_rank, sorted(all_valid))
 
-        # Clear if replacing.
-        if replace:
-            self.clear_steering_vectors()
+        # Clear per role if replacing. Phase-specific vectors go only
+        # to the manager, not the shared buffers — writing them would
+        # overwrite base values and cause get_steering_status() to
+        # report the wrong tier.
+        for role in roles:
+            state = self._select_role_state(role)
+            if not state.steerable:
+                continue
+            valid = role_valid.get(role, set())
+            if replace:
+                self._clear_role_vectors(state)
+            if vectors:
+                self._notify_manager_vectors(state, vectors, valid, "base")
+            if prefill_vectors:
+                self._notify_manager_vectors(state, prefill_vectors, valid, "prefill")
+            if decode_vectors:
+                self._notify_manager_vectors(state, decode_vectors, valid, "decode")
 
-        # Notify manager with base vectors.
-        if vectors:
-            self._notify_manager_vectors(vectors, steerable, valid_indices, "base")
-
-        # Phase-specific vectors go only to the manager, not the shared
-        # buffers — writing them would overwrite base values and cause
-        # get_steering_status() to report the wrong tier.
-        if prefill_vectors:
-            self._notify_manager_vectors(
-                prefill_vectors, steerable, valid_indices, "prefill"
-            )
-
-        if decode_vectors:
-            self._notify_manager_vectors(
-                decode_vectors, steerable, valid_indices, "decode"
-            )
-
-        return (tp_rank, pp_rank, sorted(valid_indices))
+        return (tp_rank, pp_rank, sorted(all_valid))
 
     def clear_steering_vectors(self, target: ModelRole | None = None) -> None:
         """Clear all tiers (base, prefill, decode) in the SteeringManager.
 
         *target* selects which model's steering state to clear. See
-        :meth:`set_steering_vectors` for semantics. ``target='draft'``
-        raises :class:`NotImplementedError` (surfaced as HTTP 501).
+        :meth:`set_steering_vectors` for target semantics.
         """
-        if target == "draft":
-            raise NotImplementedError("target='draft' steering is not yet implemented.")
-        if target is not None and target not in MODEL_ROLES:
+        self._validate_target(target)
+        if target == "draft" and not self._draft_steerable_layers():
             raise SteeringVectorError(
-                f"Invalid target {target!r}; expected one of "
-                f"{list(MODEL_ROLES)!r} or None."
+                "target='draft' requested but no draft model is "
+                "steerable on this worker."
             )
-        # getattr preserves the hasattr lazy-init sentinel.
-        mgr = getattr(self, "_steering_manager", None)
+        for role in self._resolve_target_roles(target):
+            state = self._select_role_state(role)
+            self._clear_role_vectors(state)
+
+    def _clear_role_vectors(self, state: _RoleState) -> None:
+        """Clear one role's manager state and pending queue."""
+        mgr = getattr(self, state.manager_attr, None)
         if mgr is not None:
             mgr.clear_global_vectors()
         # Also clear any pending globals queued before manager init,
         # so they are not replayed on lazy initialization.
-        self._pending_steering_globals = None
+        setattr(self, state.pending_attr, None)
 
     def get_steering_status(self, target: ModelRole | None = None) -> dict:
         """Return per-hook-point status for active layers.
@@ -489,54 +565,59 @@ class SteeringModelRunnerMixin:
         layers/hook-points that have a non-zero steering vector.
 
         All norms (base, prefill, decode) are read from the
-        SteeringManager when it exists, or from
-        ``_pending_steering_globals`` before manager initialization.
+        SteeringManager when it exists, or from the role's pending
+        globals queue before manager initialization.
 
-        *target* selects which model's state to inspect. ``"main"``
-        (default when ``None``) returns the target model's status;
-        ``"draft"`` returns the speculative-decoding draft's status
-        (empty until draft steering is wired up in a follow-up PR).
+        *target* selects which model's state to inspect. ``None``
+        (tags-along) merges main and draft role status — roles
+        typically report disjoint layer indices so the merge is lossless.
         """
+        self._validate_target(target)
+        if target == "draft" and not self._draft_steerable_layers():
+            return {}
         result: dict = {}
-        if target == "draft":
-            # Placeholder — draft manager is reserved for a follow-up
-            # PR. Returning an empty dict keeps the aggregator happy.
-            return result
-        # getattr preserves the hasattr lazy-init sentinel.
-        mgr = getattr(self, "_steering_manager", None)
+        for role in self._resolve_target_roles(target):
+            state = self._select_role_state(role)
+            self._read_role_status_into(state, result)
+        return result
+
+    def _read_role_status_into(self, state: _RoleState, result: dict) -> None:
+        """Merge one role's live-or-pending global-vector norms into *result*."""
+        mgr = getattr(self, state.manager_attr, None)
         if mgr is not None:
-            # Read all norms from manager
-            for phase_name, phase_dict in [
+            for phase_name, phase_dict in (
                 ("base", mgr.global_base_vectors),
                 ("prefill", mgr.global_prefill_vectors),
                 ("decode", mgr.global_decode_vectors),
-            ]:
+            ):
                 norm_key = "norm" if phase_name == "base" else f"{phase_name}_norm"
                 for hp_str, layer_vecs in phase_dict.items():
                     for layer_idx, vec in layer_vecs.items():
                         norm = vec.norm().item()
                         if norm > 0.0:
-                            if layer_idx not in result:
-                                result[layer_idx] = {}
-                            if hp_str not in result[layer_idx]:
-                                result[layer_idx][hp_str] = {}
-                            result[layer_idx][hp_str][norm_key] = round(norm, 6)
-        else:
-            # Read from pending globals (all phases including base)
-            pending = self._pending_steering_globals
-            if pending:
-                for captured_vectors, phase in pending:
-                    norm_key = "norm" if phase == "base" else f"{phase}_norm"
-                    for hp_str, layer_vecs in captured_vectors.items():
-                        for layer_idx, vec in layer_vecs.items():
-                            norm = vec.norm().item()
-                            if norm > 0.0:
-                                if layer_idx not in result:
-                                    result[layer_idx] = {}
-                                if hp_str not in result[layer_idx]:
-                                    result[layer_idx][hp_str] = {}
-                                result[layer_idx][hp_str][norm_key] = round(norm, 6)
-        return result
+                            result.setdefault(layer_idx, {}).setdefault(hp_str, {})[
+                                norm_key
+                            ] = round(norm, 6)
+            return
+        pending = getattr(self, state.pending_attr, None)
+        if not pending:
+            return
+        for captured_vectors, phase in pending:
+            norm_key = "norm" if phase == "base" else f"{phase}_norm"
+            for hp_str, layer_vecs in captured_vectors.items():
+                for layer_idx, vec in layer_vecs.items():
+                    norm = vec.norm().item()
+                    if norm > 0.0:
+                        result.setdefault(layer_idx, {}).setdefault(hp_str, {})[
+                            norm_key
+                        ] = round(norm, 6)
+
+    def _validate_target(self, target: ModelRole | None) -> None:
+        if target is not None and target not in MODEL_ROLES:
+            raise SteeringVectorError(
+                f"Invalid target {target!r}; expected one of "
+                f"{list(MODEL_ROLES)!r} or None."
+            )
 
     # -----------------------------------------------------------------------
     # Per-step buffer / index maintenance
@@ -708,7 +789,54 @@ class SteeringModelRunnerMixin:
                 self._steering_manager = None
                 self._steerable_layers_cache = {}
 
+            # --- Draft manager lazy init ---------------------------------
+            # When speculative decoding is active AND the draft model's
+            # architecture registers steering buffers, bring up a parallel
+            # SteeringManager for it. Row allocation on the draft manager
+            # is independent of main's: each worker's draft manager sees
+            # the same collective_rpc calls and SchedulerOutput stream
+            # (determinism contract), so rows stay in lock-step per role
+            # without needing to agree with main's rows for the same hash.
+            draft_steerable = self._draft_steerable_layers()
+            if draft_steerable:
+                steering_config = getattr(self.vllm_config, "steering_config", None)
+                draft_max_configs = (
+                    steering_config.max_steering_configs if steering_config else 0
+                )
+                draft_table_device: torch.device | None = None
+                for mod in draft_steerable.values():
+                    for attr in HOOK_POINT_TABLE_ATTR.values():
+                        if hasattr(mod, attr):
+                            draft_table_device = getattr(mod, attr).device
+                            break
+                    if draft_table_device is not None:
+                        break
+                self._draft_steering_manager = SteeringManager(
+                    draft_max_configs, device=draft_table_device
+                )
+                self._draft_locally_owned_layers = frozenset(draft_steerable.keys())
+                # Replay any pending draft global vectors queued before
+                # the manager existed.
+                draft_pending = getattr(self, "_draft_pending_steering_globals", None)
+                if draft_pending:
+                    for captured_vectors, phase in draft_pending:
+                        for hook_point_str, layer_vecs in captured_vectors.items():
+                            for layer_idx, vec in layer_vecs.items():
+                                self._draft_steering_manager.update_global_vectors(
+                                    hook_point_str,
+                                    layer_idx,
+                                    vec,
+                                    phase=phase,
+                                    locally_owned_layers=(
+                                        self._draft_locally_owned_layers
+                                    ),
+                                )
+                    self._draft_pending_steering_globals = None
+
         if self._steering_manager is None or not self._steerable_layers_cache:
+            # Main disabled → draft steering cannot meaningfully run
+            # alone either (the main model's forward is the outer loop
+            # driving the draft), so short-circuit.
             return
 
         # Process deferred steering entries with a two-queue priority
@@ -807,6 +935,19 @@ class SteeringModelRunnerMixin:
             self._steering_manager.populate_steering_tables(
                 self._steerable_layers_cache
             )
+
+        # Populate draft tables when the draft manager exists. Draft's
+        # ``_tables_dirty`` flag is independent of main's, so this may
+        # or may not trigger a write on any given step. The draft
+        # ``steering_index`` is NOT populated here — that lives in
+        # the per-proposer ``propose()`` hook and arrives in a later PR.
+        draft_mgr = self._draft_steering_manager
+        if (
+            draft_mgr is not None
+            and self._draft_steerable_layers_cache
+            and draft_mgr._tables_dirty
+        ):
+            draft_mgr.populate_steering_tables(self._draft_steerable_layers_cache)
 
         # 2. Build steering index
         # Get the shared steering_index buffer (all layers share one tensor)

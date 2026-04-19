@@ -934,7 +934,7 @@ class Worker(WorkerBase):
 
     def list_steerable_layers(
         self, target: ModelRole | None = None
-    ) -> dict[int, list[str]]:
+    ) -> dict[int, list[str]] | dict[ModelRole, dict[int, list[str]]]:
         return self.model_runner.list_steerable_layers(target=target)
 
     def get_steering_status(self, target: ModelRole | None = None) -> dict:
