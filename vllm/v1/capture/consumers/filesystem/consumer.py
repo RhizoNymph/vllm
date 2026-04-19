@@ -96,6 +96,11 @@ class FilesystemConsumer:
         # components per CaptureKey for use at finalize time.
         self._lock = threading.Lock()
         self._key_paths: dict[CaptureKey, tuple[str, str]] = {}
+        # Per writer-key events set by _on_write_result when a result
+        # goes terminal. Keyed by writer-side (str, int, str) tuples.
+        self._wait_lock = threading.Lock()
+        self._wait_events: dict[tuple[str, int, str], threading.Event] = {}
+        self._writer.add_status_callback(self._on_write_result)
 
     # ------------------------------------------------------------------
     # CaptureSink protocol
@@ -234,6 +239,45 @@ class FilesystemConsumer:
             error=error_str,
             payload=payload,
         )
+
+    def wait_for_result(
+        self,
+        key: CaptureKey,
+        timeout: float,
+    ) -> CaptureResult | None:
+        """Block up to ``timeout`` seconds for the terminal result for ``key``.
+
+        Uses a per-key :class:`threading.Event` that
+        :meth:`_on_write_result` sets when the underlying
+        ``ActivationWriter`` worker transitions the result to a terminal
+        status.  If the result is already terminal on entry the method
+        returns immediately without waiting.
+        """
+        _request_id, layer_idx, hook_name = key
+        writer_key = (str(_request_id), layer_idx, hook_name)
+
+        with self._wait_lock:
+            wr = self._writer.get_result(writer_key)
+            if wr is not None and wr.status in ("ok", "error"):
+                return self.get_result(key)
+            event = self._wait_events.setdefault(writer_key, threading.Event())
+
+        event.wait(timeout=timeout)
+        return self.get_result(key)
+
+    def _on_write_result(self, write_result: Any) -> None:
+        """Status callback fired by ``ActivationWriter`` on terminal transitions.
+
+        Called outside ``ActivationWriter._results_lock`` (see the
+        ``fired`` list pattern in ``_record_ok`` / ``_record_error``).
+        Sets the per-key event so any thread blocked in
+        :meth:`wait_for_result` can wake up.
+        """
+        if write_result.status in ("ok", "error"):
+            with self._wait_lock:
+                event = self._wait_events.pop(write_result.key, None)
+            if event is not None:
+                event.set()
 
     def shutdown(self, timeout: float = 30.0) -> None:
         """Forward shutdown to the underlying ``ActivationWriter``."""

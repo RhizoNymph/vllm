@@ -407,23 +407,17 @@ class CaptureManager:
                         )
                     )
 
-        # Materialize tensors.  ``gather_indices`` lives on the model's
-        # device so ``hidden_states.index_select`` during
-        # :meth:`on_hook` is a device-local op.  ``scratch_gpu`` is a
-        # placeholder here — :meth:`on_hook` overwrites the entry with
-        # the gathered result, which keeps the dtype/shape but may end
-        # up on the device the hidden states are on.
+        # Materialize index tensors.  ``gather_indices`` lives on the
+        # model's device so ``hidden_states.index_select`` during
+        # :meth:`on_hook` is a device-local op.  ``scratch_gpu`` starts
+        # empty — :meth:`on_hook` populates it by storing the gathered
+        # tensor directly, so there is no point pre-allocating here.
         gather_indices: dict[tuple[int, str], torch.Tensor] = {}
         scratch_gpu: dict[tuple[int, str], torch.Tensor] = {}
         scratch_dtype: dict[tuple[int, str], torch.dtype] = {}
         for key, rows in gather_rows.items():
             gather_indices[key] = torch.tensor(
                 rows, dtype=torch.int64, device=self._device
-            )
-            scratch_gpu[key] = torch.empty(
-                (len(rows), self._hidden_size),
-                dtype=self._model_dtype,
-                device=self._device,
             )
             scratch_dtype[key] = self._model_dtype
 
@@ -496,11 +490,34 @@ class CaptureManager:
         set in ``consumer_mask``, slice rows out of scratch tensors, and
         call ``submit_chunk``.
 
+        GPU→CPU transfers are coalesced: every scratch tensor is moved
+        to host memory non-blocking (one transfer per ``(layer, hook)``
+        key), followed by a single ``cuda.synchronize()``.  Consumers
+        then slice their rows on the CPU, replacing the previous
+        O(consumers × layers) device-sync overhead with O(layers) async
+        transfers and O(consumers) cheap CPU index ops.
+
         Each consumer's dispatch is wrapped in try/except so a failure in
         one sink never blocks delivery to the others.
         """
         if not plan.entries:
             return
+
+        # Transfer all scratch tensors to host in one shot, non-blocking.
+        # On-device index_select is not needed here — the union gather
+        # already ran in on_hook; we just need the host-side bytes.
+        # This replaces the previous O(consumers × layers) per-consumer
+        # GPU→CPU round-trips with O(layers) transfers + one sync.
+        scratch_cpu: dict[tuple[int, str], torch.Tensor] = {}
+        needs_sync = False
+        for key, scratch in plan.scratch_gpu.items():
+            if scratch.is_cuda:
+                scratch_cpu[key] = scratch.to("cpu", non_blocking=True)
+                needs_sync = True
+            else:
+                scratch_cpu[key] = scratch
+        if needs_sync:
+            torch.cuda.synchronize()
 
         for consumer_idx, sink in enumerate(self._consumers):
             bit = 1 << consumer_idx
@@ -524,11 +541,12 @@ class CaptureManager:
             try:
                 for (req_id, layer, hook), chunk_entries in grouped.items():
                     scratch_key = (layer, hook)
-                    scratch = plan.scratch_gpu.get(scratch_key)
-                    if scratch is None:
+                    cpu_scratch = scratch_cpu.get(scratch_key)
+                    if cpu_scratch is None:
                         continue
 
-                    # Slice the rows this consumer needs from scratch.
+                    # Slice rows for this consumer on the CPU.  All
+                    # consumers share the same already-transferred tensor.
                     row_indices = [e.scratch_row for e in chunk_entries]
                     idx_tensor = torch.tensor(row_indices, dtype=torch.long, device=scratch.device)
                     chunk_tensor = scratch.index_select(0, idx_tensor).cpu()
