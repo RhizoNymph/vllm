@@ -325,6 +325,30 @@ rank.
     - `GET /v1/steering` — per-layer active norms aggregated across
     ranks.
 
+### Per-role managers (main / draft)
+
+When speculative decoding is active and the draft model's architecture
+registers steering buffers, each worker lazily constructs a **second**
+`SteeringManager` bound to the draft's steerable layers. Both managers
+live on the same worker and follow the same determinism contract
+independently — there is no cross-role coordination. Concretely:
+
+- `_steering_manager` holds main-model state; `_draft_steering_manager`
+  holds draft-model state. Each allocates rows for every `register_config`
+  call it sees, independently of the other.
+- Row IDs for the same `config_hash` are **not** guaranteed to match
+  across roles — each manager indexes into its own `steering_table_*` and
+  its own `steering_index` tensor.
+- The public mixin methods (`set_steering_vectors`, `clear_steering_vectors`,
+  `list_steerable_layers`, `get_steering_status`) take an optional
+  `target: ModelRole | None` kwarg. `None` tags-along (dispatch to every
+  role with steerable layers on this worker); `"main"` or `"draft"`
+  scopes to one role.
+- Draft tables are populated alongside main's in `_update_steering_buffers`.
+  The draft's `steering_index` is **not** yet populated here — that is
+  handled by the next release's proposer-side hook. Until then,
+  per-request draft steering requires using the HTTP global-vector path.
+
 ## Named Steering Modules (runtime)
 
 Named steering modules are pre-registered vector configurations that requests
