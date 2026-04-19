@@ -455,6 +455,46 @@ invariant violation" naming the diverging ranks. This indicates a
 model-loading asymmetry (e.g., different weights loaded on different
 ranks) and not a user error.
 
+## Speculative Decoding
+
+`POST /v1/steering/set` and `POST /v1/steering/clear` accept an optional
+`target` field selecting which model the vectors apply to.
+
+| `target` value        | Effect                                                      |
+|-----------------------|-------------------------------------------------------------|
+| `"main"` (or omitted) | Apply/clear on the target model only (today's behavior).    |
+| `"draft"`             | Returns HTTP 501 — draft-model steering is not yet wired up.|
+
+Example:
+
+```bash
+curl -X POST http://localhost:8000/v1/steering/set \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "main", "vectors": {"post_mlp": {"10": [0.1, 0.2, 0.3]}}}'
+```
+
+Omitting `target` is equivalent to passing `"main"` in this release and
+preserves the legacy request shape. A follow-up PR will extend `target`
+so that an omitted value means "tags along: apply to both main and
+draft", matching the roadmap plan. Until that lands, requests with
+`target="draft"` are rejected at the router and no steering is applied
+to the speculative-decoding draft model. If steering is required on the
+draft, disable speculative decoding or wait for the follow-up.
+
+### Request protocol type
+
+```jsonc
+{
+  "vectors": { "<hook>": { "<layer_idx>": [<float>, ...] } },
+  "prefill_vectors": { ... },
+  "decode_vectors": { ... },
+  "replace": false,
+  "target": "main" | "draft" | null
+}
+```
+
+`target` defaults to `null` and shares the semantics above.
+
 ## References
 
 - [Steering Runtime Design](../design/steering_runtime.md)
