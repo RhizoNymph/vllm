@@ -17,6 +17,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
+from vllm.config.steering_types import ModelRole
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -917,6 +918,7 @@ class Worker(WorkerBase):
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
+        target: ModelRole | None = None,
     ) -> tuple[int, int, list[int]]:
         return self.model_runner.set_steering_vectors(
             vectors=vectors,
@@ -924,16 +926,19 @@ class Worker(WorkerBase):
             decode_vectors=decode_vectors,
             replace=replace,
             validate_only=validate_only,
+            target=target,
         )
 
-    def clear_steering_vectors(self) -> None:
-        return self.model_runner.clear_steering_vectors()
+    def clear_steering_vectors(self, target: ModelRole | None = None) -> None:
+        return self.model_runner.clear_steering_vectors(target=target)
 
-    def list_steerable_layers(self) -> dict[int, list[str]]:
-        return self.model_runner.list_steerable_layers()
+    def list_steerable_layers(
+        self, target: ModelRole | None = None
+    ) -> dict[int, list[str]]:
+        return self.model_runner.list_steerable_layers(target=target)
 
-    def get_steering_status(self) -> dict:
-        return self.model_runner.get_steering_status()
+    def get_steering_status(self, target: ModelRole | None = None) -> dict:
+        return self.model_runner.get_steering_status(target=target)
 
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+from vllm.config.steering_types import MODEL_ROLES, ModelRole
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
@@ -94,6 +95,20 @@ class SteeringModelRunnerMixin:
     # materialized on this rank.
     _locally_owned_layers: frozenset[int]
 
+    # --- Draft-model ("draft" role) state --------------------------------
+    # A second SteeringManager and layer cache for the speculative-decoding
+    # draft model. ``None`` when spec decoding is disabled, when the
+    # drafter is an n-gram proposer (no nn.Module), or when the draft
+    # model's architecture does not register steering buffers. Under the
+    # same determinism contract as the main manager: every rank derives
+    # identical state from identical ``collective_rpc`` calls.
+    _draft_steering_manager: SteeringManager | None = None
+    _draft_steerable_layers_cache: dict[int, nn.Module] | None = None
+    _draft_locally_owned_layers: frozenset[int] = frozenset()
+    _draft_pending_steering_globals: (
+        list[tuple[dict[str, dict[int, torch.Tensor]], str]] | None
+    ) = None
+
     # Attributes provided by the concrete model runner that mixes this
     # class in.  Declared here purely so static type checking can see
     # them — there is no runtime assignment.
@@ -136,6 +151,49 @@ class SteeringModelRunnerMixin:
 
         if layers:
             self._steerable_layers_cache = layers
+
+        return layers
+
+    def _get_drafter_model(self) -> "nn.Module | None":
+        """Return the speculative-decoding draft ``nn.Module`` if one exists.
+
+        The draft model lives on the concrete model runner as
+        ``self.drafter`` (a :class:`SpecDecodeBaseProposer` subclass —
+        ``DraftModelProposer``, ``EagleProposer``, ``MedusaProposer``,
+        etc.) which exposes the loaded draft as ``self.drafter.model``.
+        ``NgramProposer`` / suffix-decoding proposers do not carry a
+        neural model and return ``None`` here.
+        """
+        drafter = getattr(self, "drafter", None)
+        if drafter is None:
+            return None
+        return getattr(drafter, "model", None)
+
+    def _draft_steerable_layers(self) -> dict:
+        """Like :meth:`_steerable_layers` but over the draft model.
+
+        Returns ``{}`` when no draft model is present or when the
+        draft's architecture does not register steering buffers.
+        """
+        cache = self._draft_steerable_layers_cache
+        if cache is not None:
+            return cache
+
+        drafter_model = self._get_drafter_model()
+        if drafter_model is None:
+            return {}
+        layers: dict = {}
+        for mod in drafter_model.modules():
+            if not hasattr(mod, "layer_idx"):
+                continue
+            has_any_table = any(
+                hasattr(mod, attr) for attr in HOOK_POINT_TABLE_ATTR.values()
+            )
+            if has_any_table:
+                layers[mod.layer_idx] = mod
+
+        if layers:
+            self._draft_steerable_layers_cache = layers
 
         return layers
 
@@ -185,16 +243,28 @@ class SteeringModelRunnerMixin:
                 valid_indices.add(idx)
         return valid_indices
 
-    def list_steerable_layers(self) -> dict[int, list[str]]:
+    def list_steerable_layers(
+        self, target: ModelRole | None = None
+    ) -> dict[int, list[str]]:
         """Return steerable layers on this worker with their hook points.
 
         Returns ``{layer_idx: [hook_point_name, ...]}`` for every
         layer owned by this worker that has at least one steering
         table buffer registered. Hook-point names are sorted for
         determinism.
+
+        *target* selects which model's steerable layers to return:
+        ``"main"`` (default when ``None``) — the target model; or
+        ``"draft"`` — the speculative-decoding draft. Returns ``{}``
+        when the requested role has no steerable layers (e.g. draft
+        model absent or using a non-steerable architecture).
         """
+        if target == "draft":
+            layers = self._draft_steerable_layers()
+        else:
+            layers = self._steerable_layers()
         result: dict[int, list[str]] = {}
-        for idx, mod in self._steerable_layers().items():
+        for idx, mod in layers.items():
             hooks = sorted(
                 hp.value
                 for hp, attr in HOOK_POINT_TABLE_ATTR.items()
@@ -285,6 +355,7 @@ class SteeringModelRunnerMixin:
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
+        target: ModelRole | None = None,
     ) -> tuple[int, int, list[int]]:
         """Set activation steering vectors from plain Python data.
 
@@ -307,6 +378,14 @@ class SteeringModelRunnerMixin:
         When *validate_only* is ``True``, vectors are validated
         without being applied.
 
+        *target* selects which model (``"main"`` or ``"draft"``) the
+        vectors apply to. ``None`` means "apply to main, and — in a
+        future PR — to the speculative-decoding draft as well". For
+        now only ``None`` and ``"main"`` are implemented; ``"draft"``
+        raises :class:`NotImplementedError` (the router surfaces this
+        as HTTP 501). See ``docs/features/steering.md`` → "Speculative
+        decoding" for the deferral rationale.
+
         Returns:
             ``(tp_rank, pp_rank, sorted_valid_layers)``. The rank info
             lets the router detect TP-divergence (a server-side
@@ -316,6 +395,17 @@ class SteeringModelRunnerMixin:
             updated when *validate_only*) on this worker. The router
             unions these across workers.
         """
+        if target == "draft":
+            raise NotImplementedError(
+                "target='draft' steering is not yet implemented. Only "
+                "target='main' (or omitted, which currently routes to "
+                "the main model) is supported in this release."
+            )
+        if target is not None and target not in MODEL_ROLES:
+            raise SteeringVectorError(
+                f"Invalid target {target!r}; expected one of "
+                f"{list(MODEL_ROLES)!r} or None."
+            )
         tp_rank, pp_rank = _get_steering_ranks()
         steerable = self._steerable_layers()
         if not steerable:
@@ -369,8 +459,20 @@ class SteeringModelRunnerMixin:
 
         return (tp_rank, pp_rank, sorted(valid_indices))
 
-    def clear_steering_vectors(self) -> None:
-        """Clear all tiers (base, prefill, decode) in the SteeringManager."""
+    def clear_steering_vectors(self, target: ModelRole | None = None) -> None:
+        """Clear all tiers (base, prefill, decode) in the SteeringManager.
+
+        *target* selects which model's steering state to clear. See
+        :meth:`set_steering_vectors` for semantics. ``target='draft'``
+        raises :class:`NotImplementedError` (surfaced as HTTP 501).
+        """
+        if target == "draft":
+            raise NotImplementedError("target='draft' steering is not yet implemented.")
+        if target is not None and target not in MODEL_ROLES:
+            raise SteeringVectorError(
+                f"Invalid target {target!r}; expected one of "
+                f"{list(MODEL_ROLES)!r} or None."
+            )
         # getattr preserves the hasattr lazy-init sentinel.
         mgr = getattr(self, "_steering_manager", None)
         if mgr is not None:
@@ -379,7 +481,7 @@ class SteeringModelRunnerMixin:
         # so they are not replayed on lazy initialization.
         self._pending_steering_globals = None
 
-    def get_steering_status(self) -> dict:
+    def get_steering_status(self, target: ModelRole | None = None) -> dict:
         """Return per-hook-point status for active layers.
 
         Returns ``{layer_idx: {hook_point: {"norm": float,
@@ -389,8 +491,17 @@ class SteeringModelRunnerMixin:
         All norms (base, prefill, decode) are read from the
         SteeringManager when it exists, or from
         ``_pending_steering_globals`` before manager initialization.
+
+        *target* selects which model's state to inspect. ``"main"``
+        (default when ``None``) returns the target model's status;
+        ``"draft"`` returns the speculative-decoding draft's status
+        (empty until draft steering is wired up in a follow-up PR).
         """
         result: dict = {}
+        if target == "draft":
+            # Placeholder — draft manager is reserved for a follow-up
+            # PR. Returning an empty dict keeps the aggregator happy.
+            return result
         # getattr preserves the hasattr lazy-init sentinel.
         mgr = getattr(self, "_steering_manager", None)
         if mgr is not None:
