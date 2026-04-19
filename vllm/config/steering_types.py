@@ -19,7 +19,7 @@ Where ``scale(entry)`` means: if entry is a bare list, scale=1.0; if entry is
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import Any, Literal, cast
 
 import numpy as np
 
@@ -28,6 +28,53 @@ SteeringLayerEntry = list[float] | dict[str, Any]
 
 # Full spec: {hook_point_name: {layer_idx: SteeringLayerEntry}}
 SteeringVectorSpec = dict[str, dict[int, SteeringLayerEntry]]
+
+# Role-aware spec: either the flat form above (applied to both models) or a
+# nested dict keyed by role. See :func:`normalize_to_per_role` for the
+# detection and expansion rules.
+ModelRole = Literal["main", "draft"]
+MODEL_ROLES: tuple[ModelRole, ...] = ("main", "draft")
+PerRoleSteeringVectorSpec = dict[ModelRole, SteeringVectorSpec]
+RoleAwareSteeringVectorSpec = SteeringVectorSpec | PerRoleSteeringVectorSpec
+
+
+def normalize_to_per_role(
+    spec: RoleAwareSteeringVectorSpec | None,
+) -> dict[ModelRole, SteeringVectorSpec] | None:
+    """Expand a role-aware spec into ``{role: spec}`` form.
+
+    - ``None`` or empty → ``None``.
+    - Top-level keys ⊆ ``{"main", "draft"}`` → interpreted as nested
+      form; returned with exactly the roles the caller provided
+      (absent roles stay absent).
+    - Otherwise (top-level keys are hook-point names) → flat form;
+      expanded to ``{"main": spec, "draft": spec}`` (tags-along — the
+      same vectors apply to both target and draft models).
+
+    Hook-point names can never collide with role names because the
+    valid hook-point set is a disjoint constant from
+    ``{"main", "draft"}``.
+    """
+    if not spec:
+        return None
+    keys = set(spec.keys())
+    if keys <= {"main", "draft"}:
+        # Nested form — keep only roles with non-empty content so that
+        # a nested payload with every role empty normalizes to None,
+        # matching the no-steering case. ``spec`` is typed as the
+        # role-aware union; cast to the nested-form view so mypy lets
+        # us index by role.
+        nested = cast(dict[ModelRole, SteeringVectorSpec], spec)
+        result: dict[ModelRole, SteeringVectorSpec] = {}
+        for role in ("main", "draft"):
+            payload = nested.get(role)  # type: ignore[arg-type]
+            if payload:
+                result[cast(ModelRole, role)] = payload
+        return result if result else None
+    # Flat form — tags-along to both roles. Install the same object
+    # under both role keys; callers treat this as read-only.
+    flat_spec = cast(SteeringVectorSpec, spec)
+    return {"main": flat_spec, "draft": flat_spec}
 
 
 def normalize_layer_entry(entry: SteeringLayerEntry) -> tuple[list[float], float]:
