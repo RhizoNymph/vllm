@@ -139,6 +139,21 @@ async def set_steering(
     if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
         return unauthorized
 
+    if request.target == "draft":
+        return JSONResponse(
+            content={
+                "error": (
+                    "target='draft' steering is not yet implemented. "
+                    "Only target='main' (or omitted, which currently "
+                    "routes to the main model) is supported. Draft-model "
+                    "steering is tracked in a follow-up PR; see the "
+                    "Speculative decoding section of "
+                    "docs/features/steering.md."
+                )
+            },
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+        )
+
     engine = engine_client(raw_request)
 
     # Collect all tiers that have data.
@@ -302,11 +317,7 @@ async def set_steering(
             # which can also be cached and reused via automatic prefix
             # caching (APC) — stale decode-phase blocks would produce
             # outputs inconsistent with the new steering state.
-            #
-            # Draft-only writes never touch main's KV blocks, so we
-            # skip the reset when target="draft" — cached main prefill
-            # remains valid and we save a potentially expensive flush.
-            affects_cache = request.target != "draft" and (
+            affects_cache = (
                 normalized_base is not None
                 or normalized_prefill is not None
                 or normalized_decode is not None
@@ -377,12 +388,8 @@ async def clear_steering(raw_request: Request) -> JSONResponse:
     """Reset all steering vectors to zero (no-op steering).
 
     Accepts an optional JSON body ``{"target": "main"|"draft"}``.
-    Empty / missing body is equivalent to ``target=null``, which
-    applies the clear to every role that has steerable layers (main
-    and, when spec decoding is active, draft — "tags-along").
-    ``target="draft"`` scopes the clear to the draft model only and
-    skips the prefix-cache reset (draft vectors don't invalidate
-    main's KV blocks).
+    ``"draft"`` returns HTTP 501; any other value (including omitted)
+    clears the main model's steering state.
     """
     if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
         return unauthorized
@@ -397,6 +404,18 @@ async def clear_steering(raw_request: Request) -> JSONResponse:
         parsed = ClearSteeringRequest(**body)
         target = parsed.target
 
+    if target == "draft":
+        return JSONResponse(
+            content={
+                "error": (
+                    "target='draft' steering is not yet implemented. "
+                    "See the Speculative decoding section of "
+                    "docs/features/steering.md."
+                )
+            },
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+        )
+
     engine = engine_client(raw_request)
 
     try:
@@ -406,9 +425,6 @@ async def clear_steering(raw_request: Request) -> JSONResponse:
                 args=(),
                 kwargs=dict(target=target),
             )
-            if target == "draft":
-                # Draft-only clear doesn't affect main KV blocks.
-                return JSONResponse(content={"status": "ok"})
             # Clearing removes all steering vectors, so invalidate
             # prefix cache to prevent reuse of stale KV blocks.
             success = await engine.reset_prefix_cache(reset_running_requests=True)
@@ -439,22 +455,11 @@ async def clear_steering(raw_request: Request) -> JSONResponse:
 
 @router.get("/v1/steering")
 async def get_steering(raw_request: Request) -> JSONResponse:
-    """Return which layers currently have non-zero steering vectors.
-
-    Accepts an optional ``?target=main|draft`` query param that scopes
-    the query to one role. When omitted, main and draft state are
-    merged — typically disjoint (each role holds vectors for its own
-    layers) or identical under tags-along.
-    """
-    target = _parse_target_query(raw_request)
-    if isinstance(target, JSONResponse):
-        return target
+    """Return which layers currently have non-zero steering vectors."""
     engine = engine_client(raw_request)
 
     try:
-        results = await engine.collective_rpc(
-            "get_steering_status", args=(), kwargs=dict(target=target)
-        )
+        results = await engine.collective_rpc("get_steering_status")
         try:
             active = deep_merge_status(results)
         except RuntimeError as err:
@@ -490,41 +495,11 @@ async def get_steering_layers(raw_request: Request) -> JSONResponse:
     the results. PP ranks report disjoint layer sets; TP ranks within
     a given PP stage report identical sets — both behaviors are
     handled by the union.
-
-    Accepts ``?target=main|draft`` to scope to a single role; omitted
-    returns both roles nested under ``{"main": {...}, "draft": {...}}``.
     """
-    target = _parse_target_query(raw_request)
-    if isinstance(target, JSONResponse):
-        return target
     engine = engine_client(raw_request)
 
     try:
-        results = await engine.collective_rpc(
-            "list_steerable_layers", args=(), kwargs=dict(target=target)
-        )
-        if target is None:
-            # Nested form: each worker returns {role: {layer: hooks}}.
-            merged_nested: dict[str, dict[int, set[str]]] = {}
-            for worker_result in results:
-                if not worker_result:
-                    continue
-                for role, per_role in worker_result.items():
-                    dest = merged_nested.setdefault(role, {})
-                    for layer_idx, hooks in per_role.items():
-                        dest.setdefault(layer_idx, set()).update(hooks)
-            return JSONResponse(
-                content={
-                    "layers": {
-                        role: {
-                            str(layer_idx): {"hook_points": sorted(hooks)}
-                            for layer_idx, hooks in sorted(dest.items())
-                        }
-                        for role, dest in sorted(merged_nested.items())
-                    }
-                },
-            )
-        # Flat form: per-role query.
+        results = await engine.collective_rpc("list_steerable_layers")
         merged: dict[int, set[str]] = {}
         for worker_result in results:
             if not worker_result:
@@ -545,25 +520,6 @@ async def get_steering_layers(raw_request: Request) -> JSONResponse:
             content={"error": f"Failed to list steerable layers: {err}"},
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
         )
-
-
-def _parse_target_query(raw_request: Request) -> str | None | JSONResponse:
-    """Extract ``?target=`` from a GET request.
-
-    Returns ``None`` when the param is absent, the role string when
-    valid, or a 400 JSONResponse when the value is invalid.
-    """
-    value = raw_request.query_params.get("target")
-    if value is None:
-        return None
-    if value not in ("main", "draft"):
-        return JSONResponse(
-            content={
-                "error": (f"Invalid target={value!r}; expected 'main' or 'draft'.")
-            },
-            status_code=HTTPStatus.BAD_REQUEST.value,
-        )
-    return value
 
 
 def attach_router(app: FastAPI):

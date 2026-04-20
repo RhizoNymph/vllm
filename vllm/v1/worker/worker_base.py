@@ -183,7 +183,7 @@ class WorkerBase:
 
     def list_steerable_layers(
         self, target: ModelRole | None = None
-    ) -> dict[int, list[str]] | dict[ModelRole, dict[int, list[str]]]:
+    ) -> dict[int, list[str]]:
         raise NotImplementedError
 
     def get_steering_status(self, target: ModelRole | None = None) -> dict:

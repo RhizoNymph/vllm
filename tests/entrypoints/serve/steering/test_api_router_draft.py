@@ -90,19 +90,14 @@ class TestSetTarget:
         for call in engine.collective_rpc.await_args_list:
             assert call.kwargs["kwargs"]["target"] is None
 
-    def test_target_draft_is_accepted(self, client, engine):
-        """target='draft' routes the RPC through but skips the prefix-cache
-        reset (draft vectors don't invalidate main's KV blocks)."""
-        engine.collective_rpc.side_effect = [
-            [(0, 0, [0])],
-            [(0, 0, [0])],
-        ]
+    def test_target_draft_returns_501(self, client, engine):
         body = {**_vecs({0: [1.0]}), "target": "draft"}
         resp = client.post("/v1/steering/set", json=body)
-        assert resp.status_code == 200
-        for call in engine.collective_rpc.await_args_list:
-            assert call.kwargs["kwargs"]["target"] == "draft"
-        engine.reset_prefix_cache.assert_not_called()
+        assert resp.status_code == 501
+        body_json = resp.json()
+        assert "not yet implemented" in body_json["error"]
+        # No RPC fired.
+        engine.collective_rpc.assert_not_called()
 
     def test_target_invalid_returns_422(self, client, engine):
         """Pydantic rejects values outside the Literal at parse time."""
@@ -132,58 +127,8 @@ class TestClearTarget:
             kwargs={"target": "main"},
         )
 
-    def test_clear_target_draft_is_accepted(self, client, engine):
-        """Draft-only clear is accepted and skips prefix-cache reset."""
-        engine.collective_rpc.return_value = None
+    def test_clear_target_draft_returns_501(self, client, engine):
         resp = client.post("/v1/steering/clear", json={"target": "draft"})
-        assert resp.status_code == 200
-        engine.collective_rpc.assert_awaited_once_with(
-            "clear_steering_vectors",
-            args=(),
-            kwargs={"target": "draft"},
-        )
-        engine.reset_prefix_cache.assert_not_called()
-
-    def test_clear_target_main_resets_prefix_cache(self, client, engine):
-        engine.collective_rpc.return_value = None
-        engine.reset_prefix_cache.return_value = True
-        resp = client.post("/v1/steering/clear", json={"target": "main"})
-        assert resp.status_code == 200
-        engine.reset_prefix_cache.assert_called_once()
-
-    def test_get_steering_target_main(self, client, engine):
-        engine.collective_rpc.return_value = [{}]
-        resp = client.get("/v1/steering?target=main")
-        assert resp.status_code == 200
-        engine.collective_rpc.assert_awaited_once_with(
-            "get_steering_status", args=(), kwargs={"target": "main"}
-        )
-
-    def test_get_steering_target_invalid_returns_400(self, client, engine):
-        resp = client.get("/v1/steering?target=nonsense")
-        assert resp.status_code == 400
+        assert resp.status_code == 501
+        assert "not yet implemented" in resp.json()["error"]
         engine.collective_rpc.assert_not_called()
-
-    def test_get_layers_target_null_returns_nested(self, client, engine):
-        # Nested form: each worker returns {role: {layer: hooks}}.
-        engine.collective_rpc.return_value = [
-            {
-                "main": {0: ["post_mlp"], 1: ["post_mlp"]},
-                "draft": {0: ["post_mlp"]},
-            }
-        ]
-        resp = client.get("/v1/steering/layers")
-        assert resp.status_code == 200
-        layers = resp.json()["layers"]
-        assert set(layers.keys()) == {"main", "draft"}
-        assert set(layers["main"].keys()) == {"0", "1"}
-        assert set(layers["draft"].keys()) == {"0"}
-
-    def test_get_layers_target_main_returns_flat(self, client, engine):
-        engine.collective_rpc.return_value = [{0: ["post_mlp"]}]
-        resp = client.get("/v1/steering/layers?target=main")
-        assert resp.status_code == 200
-        layers = resp.json()["layers"]
-        # Flat form: no role nesting.
-        assert "main" not in layers
-        assert "0" in layers

@@ -460,50 +460,26 @@ ranks) and not a user error.
 `POST /v1/steering/set` and `POST /v1/steering/clear` accept an optional
 `target` field selecting which model the vectors apply to.
 
-| `target` value | Effect                                                                                                                                                                                 |
-|----------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `"main"`       | Apply/clear on the target (primary) model only.                                                                                                                                        |
-| `"draft"`      | Apply/clear on the speculative-decoding draft only. Skips prefix-cache invalidation (draft vectors don't affect main KV blocks). HTTP 400 when no draft model is present.              |
-| omitted        | Tags-along: apply to every role with steerable layers. Main on its own when there's no draft, or main + draft together. HTTP 400 when tiers would leave one role with mismatched shape.|
-
-Only global-vector HTTP mutations respect `target` today. Per-request
-inline steering vectors in `SamplingParams` still route to the main
-model only; nested-form `SamplingParams` (`{"main": ..., "draft": ...}`)
-arrives in the next release.
+| `target` value        | Effect                                                      |
+|-----------------------|-------------------------------------------------------------|
+| `"main"` (or omitted) | Apply/clear on the target model only (today's behavior).    |
+| `"draft"`             | Returns HTTP 501 — draft-model steering is not yet wired up.|
 
 Example:
 
 ```bash
-# Tags-along: applies to main + draft when speculative decoding is on.
 curl -X POST http://localhost:8000/v1/steering/set \
   -H 'Content-Type: application/json' \
-  -d '{"vectors": {"post_mlp": {"10": [0.1, 0.2, 0.3]}}}'
-
-# Draft-only — no prefix-cache churn.
-curl -X POST http://localhost:8000/v1/steering/set \
-  -H 'Content-Type: application/json' \
-  -d '{"target": "draft", "vectors": {"post_mlp": {"10": [0.1, 0.2, 0.3]}}}'
+  -d '{"target": "main", "vectors": {"post_mlp": {"10": [0.1, 0.2, 0.3]}}}'
 ```
 
-The read endpoints accept `?target=main|draft` to scope the query. The
-default (omitted) returns state for every role with steerable layers:
-
-- `GET /v1/steering` — active-layer status merged across roles
-  (flat `{layer: {hook: {...}}}` since each role typically owns
-  disjoint layers).
-- `GET /v1/steering/layers` — per-role steerable layers nested as
-  `{"layers": {"main": {...}, "draft": {...}}}`. Pass
-  `?target=main` (or `?target=draft`) for the flat form.
-
-### Shape mismatches and missing draft
-
-- Tags-along with mismatched hidden sizes (main and draft hold the
-  same layer × hook at different widths): HTTP 400. Specify `target`
-  explicitly to scope to one role.
-- `target="draft"` with no draft model steerable: HTTP 400.
-- `target="draft"` with a draft present but the requested hook point
-  not registered on any draft layer: HTTP 400 naming the layer that
-  failed validation.
+Omitting `target` is equivalent to passing `"main"` in this release and
+preserves the legacy request shape. A follow-up PR will extend `target`
+so that an omitted value means "tags along: apply to both main and
+draft", matching the roadmap plan. Until that lands, requests with
+`target="draft"` are rejected at the router and no steering is applied
+to the speculative-decoding draft model. If steering is required on the
+draft, disable speculative decoding or wait for the follow-up.
 
 ### Request protocol type
 
@@ -517,7 +493,7 @@ default (omitted) returns state for every role with steerable layers:
 }
 ```
 
-`target` defaults to `null` (tags-along).
+`target` defaults to `null` and shares the semantics above.
 
 ## References
 
