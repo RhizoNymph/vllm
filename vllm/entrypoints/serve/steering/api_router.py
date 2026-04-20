@@ -248,9 +248,9 @@ async def set_steering(
 
             # Collect all requested layers across all tiers.
             requested_layers: set[int] = set()
-            for spec in [normalized_base, normalized_prefill, normalized_decode]:
-                if spec:
-                    for layer_vecs in spec.values():
+            for tier in (normalized_base, normalized_prefill, normalized_decode):
+                if tier:
+                    for layer_vecs in tier.values():
                         requested_layers.update(layer_vecs.keys())
 
             missing = requested_layers - validated_layers
@@ -333,9 +333,9 @@ async def set_steering(
 
         # Build response with all hook points across tiers.
         all_hooks: set[str] = set()
-        for spec in [normalized_base, normalized_prefill, normalized_decode]:
-            if spec:
-                all_hooks.update(spec.keys())
+        for tier in (normalized_base, normalized_prefill, normalized_decode):
+            if tier:
+                all_hooks.update(tier.keys())
 
         return JSONResponse(
             content={
