@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Literal
-
 from pydantic import BaseModel, ConfigDict, Field
 
 from vllm.config.steering_types import SteeringVectorSpec
@@ -35,30 +33,4 @@ class SetSteeringRequest(BaseModel):
         "before applying the new ones, making the operation an atomic "
         "replacement. When False (default), only the specified layers "
         "are updated and other layers keep their current state.",
-    )
-    target: Literal["main", "draft"] | None = Field(
-        default=None,
-        description="Which model the vectors apply to. 'main' targets the "
-        "primary model only; 'draft' targets the speculative-decoding "
-        "draft model only; omitted means apply to the main model (and — "
-        "in a future release — to the draft model as well via "
-        "tags-along). 'draft' is currently returned as HTTP 501; see "
-        "the Speculative decoding section of docs/features/steering.md.",
-    )
-
-
-class ClearSteeringRequest(BaseModel):
-    """Optional body for ``POST /v1/steering/clear``.
-
-    Passing no body (or an empty JSON object) clears the main model's
-    steering state, matching legacy behavior. Pass ``{"target": "main"}``
-    or ``{"target": "draft"}`` to scope the clear. ``"draft"`` returns
-    HTTP 501 in this release.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    target: Literal["main", "draft"] | None = Field(
-        default=None,
-        description="See `SetSteeringRequest.target`.",
     )
