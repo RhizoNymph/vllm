@@ -466,10 +466,19 @@ ranks) and not a user error.
 | `"draft"`      | Apply/clear on the speculative-decoding draft only. Skips prefix-cache invalidation (draft vectors don't affect main KV blocks). HTTP 400 when no draft model is present.              |
 | omitted        | Tags-along: apply to every role with steerable layers. Main on its own when there's no draft, or main + draft together. HTTP 400 when tiers would leave one role with mismatched shape.|
 
-Only global-vector HTTP mutations respect `target` today. Per-request
-inline steering vectors in `SamplingParams` still route to the main
-model only; nested-form `SamplingParams` (`{"main": ..., "draft": ...}`)
-arrives in the next release.
+`SamplingParams` steering fields accept both flat and nested form:
+
+- **Flat** — `steering_vectors={"post_mlp": {10: [...]}}`. Applied to
+  the target model, and tags-along to the speculative-decoding draft
+  when spec decoding is on (identical vectors, identical hash).
+- **Nested** — `steering_vectors={"main": {...}, "draft": {...}}`.
+  Apply distinct vectors to the target and draft. Either key may be
+  omitted; omitted roles are not steered.
+
+Hook-point names never collide with role names (`"main"` / `"draft"`
+are not valid hook points), so shape detection is unambiguous. Flat
+payloads produce byte-identical hashes to pre-PR behaviour — no
+prefix-cache churn for legacy clients.
 
 Example:
 
