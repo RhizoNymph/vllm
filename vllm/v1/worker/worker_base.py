@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.config.steering_types import ModelRole
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -174,19 +173,16 @@ class WorkerBase:
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
-        target: ModelRole | None = None,
     ) -> tuple[int, int, list[int]]:
         raise NotImplementedError
 
-    def clear_steering_vectors(self, target: ModelRole | None = None) -> None:
+    def clear_steering_vectors(self) -> None:
         raise NotImplementedError
 
-    def list_steerable_layers(
-        self, target: ModelRole | None = None
-    ) -> dict[int, list[str]] | dict[ModelRole, dict[int, list[str]]]:
+    def list_steerable_layers(self) -> dict[int, list[str]]:
         raise NotImplementedError
 
-    def get_steering_status(self, target: ModelRole | None = None) -> dict:
+    def get_steering_status(self) -> dict:
         raise NotImplementedError
 
     @property

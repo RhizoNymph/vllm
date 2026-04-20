@@ -369,11 +369,7 @@ class TestClearSteering:
         resp = client.post("/v1/steering/clear")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
-        engine.collective_rpc.assert_called_once_with(
-            "clear_steering_vectors",
-            args=(),
-            kwargs={"target": None},
-        )
+        engine.collective_rpc.assert_called_once_with("clear_steering_vectors")
 
     def test_clear_engine_error(self, client, engine):
         engine.collective_rpc.side_effect = RuntimeError("fail")

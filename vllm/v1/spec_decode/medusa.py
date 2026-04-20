@@ -24,7 +24,6 @@ class MedusaProposer:
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-        runner=None,
     ):
         # Save config parameters
         self.vllm_config = vllm_config
@@ -36,9 +35,6 @@ class MedusaProposer:
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.hidden_size = self.spec_config.draft_model_config.get_hidden_size()
         self.dtype = vllm_config.model_config.dtype
-        # See ``SpecDecodeBaseProposer.__init__`` for the back-reference
-        # contract; used by per-role steering to locate the draft manager.
-        self.runner = runner
 
     def propose(
         self,

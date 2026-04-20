@@ -71,10 +71,6 @@ class SpecDecodeBaseProposer:
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
-        # Store a back-reference to the model runner so steering code can
-        # reach ``_draft_steering_manager`` / ``_last_scheduler_output``
-        # during ``propose()`` (follow-up PR wires draft ``steering_index``).
-        self.runner = runner
 
         self.device = device
         self.dtype = vllm_config.model_config.dtype
