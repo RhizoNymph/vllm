@@ -16,10 +16,14 @@ from pydantic.dataclasses import dataclass
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
 from vllm.config.steering_types import (
+    MODEL_ROLES,
+    ModelRole,
+    RoleAwareSteeringVectorSpec,
     SteeringLayerEntry,
     SteeringVectorSpec,
     hash_steering_config,
     normalize_layer_entry,
+    normalize_to_per_role,
     resolve_effective_vectors,
 )
 from vllm.exceptions import VLLMValidationError
@@ -307,19 +311,30 @@ class SamplingParams(
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
 
-    steering_vectors: SteeringVectorSpec | None = None
+    steering_vectors: RoleAwareSteeringVectorSpec | None = None
     """Base steering vectors applied to both prefill and decode phases.
-    Keyed by hook point name (pre_attn, post_attn, post_mlp), then
-    layer index. Values are either bare
-    ``list[float]`` (scale=1.0) or ``{"vector": [...], "scale": float}``."""
 
-    prefill_steering_vectors: SteeringVectorSpec | None = None
+    Flat form (legacy / default): keyed by hook point name (pre_attn,
+    post_attn, post_mlp), then layer index. Values are either bare
+    ``list[float]`` (scale=1.0) or ``{"vector": [...], "scale": float}``.
+    The flat form is applied to the main model; when speculative
+    decoding is active with a steerable draft, the same vectors are
+    tagged-along to the draft (identical hash, identical effect).
+
+    Nested form: ``{"main": <SteeringVectorSpec>, "draft":
+    <SteeringVectorSpec>}`` applies different vectors to the target
+    and speculative-decoding draft models. Either role may be omitted
+    (equivalent to not steering that role). Hook-point names can never
+    collide with role names (``main`` / ``draft`` are not valid
+    hook points), so shape detection is unambiguous."""
+
+    prefill_steering_vectors: RoleAwareSteeringVectorSpec | None = None
     """Phase-specific steering vectors added to base during prefill only.
-    Same format as ``steering_vectors``."""
+    Accepts the same flat or nested form as ``steering_vectors``."""
 
-    decode_steering_vectors: SteeringVectorSpec | None = None
+    decode_steering_vectors: RoleAwareSteeringVectorSpec | None = None
     """Phase-specific steering vectors added to base during decode only.
-    Same format as ``steering_vectors``."""
+    Accepts the same flat or nested form as ``steering_vectors``."""
 
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
@@ -562,73 +577,108 @@ class SamplingParams(
     def _validate_steering_vectors(self) -> None:
         """Validate all steering vector fields if provided.
 
-        Expected format per field:
-        ``{hook_point: {layer_idx: SteeringLayerEntry}}``
-        where ``SteeringLayerEntry`` is either ``list[float]`` (scale=1.0)
-        or ``{"vector": list[float], "scale": float}``.
+        Accepts both flat form (``{hook: {layer: entry}}``) and
+        nested form (``{"main": <flat>, "draft": <flat>}``). Nested
+        keys are restricted to known :data:`~vllm.config.steering_types.MODEL_ROLES`.
+        Inner entries are either ``list[float]`` (scale=1.0) or
+        ``{"vector": list[float], "scale": float}``.
         """
-        fields_to_check: list[tuple[str, SteeringVectorSpec | None]] = [
+        fields_to_check: list[tuple[str, RoleAwareSteeringVectorSpec | None]] = [
             ("steering_vectors", self.steering_vectors),
             ("prefill_steering_vectors", self.prefill_steering_vectors),
             ("decode_steering_vectors", self.decode_steering_vectors),
         ]
-        for field_name, spec in fields_to_check:
-            if spec is not None:
-                self._validate_single_steering_spec(field_name, spec)
+        for field_name, raw_spec in fields_to_check:
+            if raw_spec is None:
+                continue
+            for role, spec in self._iter_role_specs(field_name, raw_spec):
+                self._validate_single_steering_spec(
+                    self._role_field_name(field_name, role), spec
+                )
 
-        # Cross-validate overlapping dimensions between base and phase specs.
-        if self.steering_vectors:
-            for phase_name, phase_spec in [
-                ("prefill_steering_vectors", self.prefill_steering_vectors),
-                ("decode_steering_vectors", self.decode_steering_vectors),
-            ]:
-                if phase_spec is None:
-                    continue
-                for hook, layers in self.steering_vectors.items():
-                    if hook not in phase_spec:
+        # Cross-validate overlapping dimensions between base and phase
+        # specs — done per role since role specs are independent.
+        for role in MODEL_ROLES:
+            base_spec = self._role_spec(self.steering_vectors, role)
+            if base_spec:
+                for phase_field, phase_raw in (
+                    ("prefill_steering_vectors", self.prefill_steering_vectors),
+                    ("decode_steering_vectors", self.decode_steering_vectors),
+                ):
+                    phase_spec = self._role_spec(phase_raw, role)
+                    if phase_spec is None:
                         continue
-                    for layer_idx, base_entry in layers.items():
-                        if layer_idx not in phase_spec[hook]:
-                            continue
-                        base_vec, _ = normalize_layer_entry(base_entry)
-                        phase_vec, _ = normalize_layer_entry(
-                            phase_spec[hook][layer_idx]
-                        )
-                        if len(base_vec) != len(phase_vec):
-                            raise ValueError(
-                                f"steering_vectors[{hook!r}]"
-                                f"[{layer_idx}] has "
-                                f"dimension {len(base_vec)} but "
-                                f"{phase_name}[{hook!r}]"
-                                f"[{layer_idx}] has "
-                                f"dimension {len(phase_vec)}. "
-                                f"Overlapping entries must have "
-                                f"matching dimensions."
-                            )
+                    self._cross_validate_dims(
+                        self._role_field_name("steering_vectors", role),
+                        base_spec,
+                        self._role_field_name(phase_field, role),
+                        phase_spec,
+                    )
+            prefill_spec = self._role_spec(self.prefill_steering_vectors, role)
+            decode_spec = self._role_spec(self.decode_steering_vectors, role)
+            if prefill_spec and decode_spec:
+                self._cross_validate_dims(
+                    self._role_field_name("prefill_steering_vectors", role),
+                    prefill_spec,
+                    self._role_field_name("decode_steering_vectors", role),
+                    decode_spec,
+                )
 
-        # Cross-validate overlapping dimensions between prefill and decode
-        # phase specs (caught even when no base ``steering_vectors`` is set).
-        if self.prefill_steering_vectors and self.decode_steering_vectors:
-            for hook, prefill_layers in self.prefill_steering_vectors.items():
-                if hook not in self.decode_steering_vectors:
+    @staticmethod
+    def _role_field_name(field_name: str, role: ModelRole) -> str:
+        """Build a role-qualified field name for error messages."""
+        return f"{field_name}[{role!r}]"
+
+    def _iter_role_specs(self, field_name: str, spec: RoleAwareSteeringVectorSpec):
+        """Yield ``(role, flat_spec)`` pairs for nested or flat input.
+
+        Flat input yields ``("main", spec)`` only — the tags-along
+        mapping to draft happens downstream at the hash/effective
+        layer, so we don't re-validate the same spec twice.
+        """
+        if not isinstance(spec, dict):
+            raise ValueError(f"{field_name} must be a dict, got {type(spec).__name__}.")
+        keys = set(spec.keys())
+        if keys and keys <= {"main", "draft"}:
+            for role, inner in spec.items():
+                if inner is None:
                     continue
-                decode_layers = self.decode_steering_vectors[hook]
-                for layer_idx, prefill_entry in prefill_layers.items():
-                    if layer_idx not in decode_layers:
-                        continue
-                    prefill_vec, _ = normalize_layer_entry(prefill_entry)
-                    decode_vec, _ = normalize_layer_entry(decode_layers[layer_idx])
-                    if len(prefill_vec) != len(decode_vec):
-                        raise ValueError(
-                            f"prefill_steering_vectors[{hook!r}]"
-                            f"[{layer_idx}] has "
-                            f"dimension {len(prefill_vec)} but "
-                            f"decode_steering_vectors[{hook!r}]"
-                            f"[{layer_idx}] has "
-                            f"dimension {len(decode_vec)}. "
-                            f"Overlapping entries must have "
-                            f"matching dimensions."
-                        )
+                if not isinstance(inner, dict):
+                    raise ValueError(
+                        f"{field_name}[{role!r}] must be a dict, "
+                        f"got {type(inner).__name__}."
+                    )
+                yield role, inner  # type: ignore[misc]
+            return
+        yield "main", spec  # type: ignore[misc]
+
+    def _cross_validate_dims(
+        self,
+        a_name: str,
+        a_spec: SteeringVectorSpec,
+        b_name: str,
+        b_spec: SteeringVectorSpec,
+    ) -> None:
+        """Raise on dimension mismatch between overlapping ``(hook, layer)``
+        entries in *a_spec* and *b_spec*."""
+        for hook, a_layers in a_spec.items():
+            if hook not in b_spec:
+                continue
+            b_layers = b_spec[hook]
+            for layer_idx, a_entry in a_layers.items():
+                if layer_idx not in b_layers:
+                    continue
+                a_vec, _ = normalize_layer_entry(a_entry)
+                b_vec, _ = normalize_layer_entry(b_layers[layer_idx])
+                if len(a_vec) != len(b_vec):
+                    raise ValueError(
+                        f"{a_name}[{hook!r}][{layer_idx}] has "
+                        f"dimension {len(a_vec)} but "
+                        f"{b_name}[{hook!r}][{layer_idx}] has "
+                        f"dimension {len(b_vec)}. "
+                        f"Overlapping entries must have "
+                        f"matching dimensions."
+                    )
 
     def _validate_single_steering_spec(
         self, field_name: str, spec: SteeringVectorSpec
@@ -715,40 +765,124 @@ class SamplingParams(
             if not math.isfinite(v):
                 raise ValueError(f"{prefix}[{i}] must be finite, got {v}.")
 
+    def _role_spec(
+        self,
+        field: RoleAwareSteeringVectorSpec | None,
+        role: ModelRole,
+    ) -> SteeringVectorSpec | None:
+        """Extract a single role's spec from a role-aware field.
+
+        Flat form tags-along to both roles (same object under each
+        role key, so ``_main`` and ``_draft`` carry the same spec
+        object — and therefore the same hash). Nested form returns
+        the role's own spec or ``None`` when that role was omitted.
+        """
+        per_role = normalize_to_per_role(field)
+        if per_role is None:
+            return None
+        return per_role.get(role)
+
+    @cached_property
+    def effective_prefill_steering_main(
+        self,
+    ) -> dict[str, dict[int, list[float]]] | None:
+        """Main-role resolved prefill steering: base + prefill, pre-scaled."""
+        return resolve_effective_vectors(
+            self._role_spec(self.steering_vectors, "main"),
+            self._role_spec(self.prefill_steering_vectors, "main"),
+        )
+
+    @cached_property
+    def effective_prefill_steering_draft(
+        self,
+    ) -> dict[str, dict[int, list[float]]] | None:
+        """Draft-role resolved prefill steering. ``None`` when the
+        request does not steer the draft (either flat form without a
+        draft model in play, or nested form without a ``"draft"`` key).
+        Flat form tags-along, so flat specs produce the same value as
+        :attr:`effective_prefill_steering_main`.
+        """
+        return resolve_effective_vectors(
+            self._role_spec(self.steering_vectors, "draft"),
+            self._role_spec(self.prefill_steering_vectors, "draft"),
+        )
+
+    @cached_property
+    def effective_decode_steering_main(
+        self,
+    ) -> dict[str, dict[int, list[float]]] | None:
+        """Main-role resolved decode steering."""
+        return resolve_effective_vectors(
+            self._role_spec(self.steering_vectors, "main"),
+            self._role_spec(self.decode_steering_vectors, "main"),
+        )
+
+    @cached_property
+    def effective_decode_steering_draft(
+        self,
+    ) -> dict[str, dict[int, list[float]]] | None:
+        """Draft-role resolved decode steering."""
+        return resolve_effective_vectors(
+            self._role_spec(self.steering_vectors, "draft"),
+            self._role_spec(self.decode_steering_vectors, "draft"),
+        )
+
     @cached_property
     def effective_prefill_steering(
         self,
     ) -> dict[str, dict[int, list[float]]] | None:
-        """Resolved prefill steering: base + prefill-specific, pre-scaled."""
-        return resolve_effective_vectors(
-            self.steering_vectors, self.prefill_steering_vectors
-        )
+        """Backward-compat alias for the main-role effective prefill spec.
+
+        Callers that predate nested-form support (flat specs only)
+        receive the unchanged single-model view.
+        """
+        return self.effective_prefill_steering_main
 
     @cached_property
     def effective_decode_steering(
         self,
     ) -> dict[str, dict[int, list[float]]] | None:
-        """Resolved decode steering: base + decode-specific, pre-scaled."""
-        return resolve_effective_vectors(
-            self.steering_vectors, self.decode_steering_vectors
-        )
+        """Backward-compat alias for the main-role effective decode spec."""
+        return self.effective_decode_steering_main
+
+    @cached_property
+    def prefill_steering_config_hash_main(self) -> int:
+        """Cached hash of :attr:`effective_prefill_steering_main`."""
+        return hash_steering_config(self.effective_prefill_steering_main)
+
+    @cached_property
+    def prefill_steering_config_hash_draft(self) -> int:
+        """Cached hash of :attr:`effective_prefill_steering_draft`."""
+        return hash_steering_config(self.effective_prefill_steering_draft)
+
+    @cached_property
+    def decode_steering_config_hash_main(self) -> int:
+        """Cached hash of :attr:`effective_decode_steering_main`."""
+        return hash_steering_config(self.effective_decode_steering_main)
+
+    @cached_property
+    def decode_steering_config_hash_draft(self) -> int:
+        """Cached hash of :attr:`effective_decode_steering_draft`."""
+        return hash_steering_config(self.effective_decode_steering_draft)
 
     @cached_property
     def prefill_steering_config_hash(self) -> int:
-        """Cached hash of ``effective_prefill_steering``.
+        """Backward-compat alias for the main-role prefill hash.
 
-        Lives on ``SamplingParams`` (not ``Request``) so that many requests
-        sharing the same ``SamplingParams`` object — the common case for
-        batched ``llm.generate(prompts, [sp]*N)`` — only pay the hashing
-        cost once across the whole batch instead of once per request.
+        Lives on ``SamplingParams`` (not ``Request``) so that many
+        requests sharing the same object — the common case for
+        batched ``llm.generate(prompts, [sp]*N)`` — only pay the
+        hashing cost once across the whole batch. Flat-form callers
+        observe byte-identical hashes as before this PR (the flat
+        spec is normalized to ``{"main": spec, ...}`` and ``_main``
+        receives the original spec unchanged).
         """
-        return hash_steering_config(self.effective_prefill_steering)
+        return self.prefill_steering_config_hash_main
 
     @cached_property
     def decode_steering_config_hash(self) -> int:
-        """Cached hash of ``effective_decode_steering``. See
-        ``prefill_steering_config_hash``."""
-        return hash_steering_config(self.effective_decode_steering)
+        """Backward-compat alias for the main-role decode hash."""
+        return self.decode_steering_config_hash_main
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
