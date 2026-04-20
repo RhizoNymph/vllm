@@ -161,12 +161,8 @@ class Request:
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []
-        self.block_hash_prefill_steering_config_hash = (
-            self.prefill_steering_config_hash
-        )
-        self.block_hash_decode_steering_config_hash = (
-            self.decode_steering_config_hash
-        )
+        self.block_hash_prefill_steering_config_hash = self.prefill_steering_config_hash
+        self.block_hash_decode_steering_config_hash = self.decode_steering_config_hash
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
@@ -236,9 +232,7 @@ class Request:
         0 for that phase rather than the deferred per-request hash.
         """
         new_prefill_hash = (
-            self.prefill_steering_config_hash
-            if prefill_hash is None
-            else prefill_hash
+            self.prefill_steering_config_hash if prefill_hash is None else prefill_hash
         )
         new_decode_hash = (
             self.decode_steering_config_hash if decode_hash is None else decode_hash
@@ -279,32 +273,60 @@ class Request:
         return self.num_encoder_inputs > 0
 
     @cached_property
-    def prefill_steering_config_hash(self) -> int:
-        """0 if no prefill steering, else deterministic hash of vectors.
-
-        Delegates to ``SamplingParams.prefill_steering_config_hash``, which is
-        itself ``@cached_property``. This means many requests sharing the same
-        ``SamplingParams`` instance only compute the hash once across the
-        entire batch, instead of once per request.
-        """
+    def prefill_steering_config_hash_main(self) -> int:
+        """Main-role prefill steering hash (0 if no steering)."""
         if self.sampling_params is None:
             return 0
-        return self.sampling_params.prefill_steering_config_hash
+        return self.sampling_params.prefill_steering_config_hash_main
 
     @cached_property
-    def decode_steering_config_hash(self) -> int:
-        """0 if no decode steering, else deterministic hash of vectors.
-        See ``prefill_steering_config_hash``."""
+    def prefill_steering_config_hash_draft(self) -> int:
+        """Draft-role prefill steering hash (0 if no draft steering)."""
         if self.sampling_params is None:
             return 0
-        return self.sampling_params.decode_steering_config_hash
+        return self.sampling_params.prefill_steering_config_hash_draft
+
+    @cached_property
+    def decode_steering_config_hash_main(self) -> int:
+        """Main-role decode steering hash (0 if no steering)."""
+        if self.sampling_params is None:
+            return 0
+        return self.sampling_params.decode_steering_config_hash_main
+
+    @cached_property
+    def decode_steering_config_hash_draft(self) -> int:
+        """Draft-role decode steering hash (0 if no draft steering)."""
+        if self.sampling_params is None:
+            return 0
+        return self.sampling_params.decode_steering_config_hash_draft
+
+    @property
+    def prefill_steering_config_hash(self) -> int:
+        """Backward-compat alias for the main-role prefill hash.
+
+        Delegates to ``SamplingParams.prefill_steering_config_hash_main``,
+        which is itself ``@cached_property``. This means many requests
+        sharing the same ``SamplingParams`` instance only compute the
+        hash once across the entire batch.
+        """
+        return self.prefill_steering_config_hash_main
+
+    @property
+    def decode_steering_config_hash(self) -> int:
+        """Backward-compat alias for the main-role decode hash."""
+        return self.decode_steering_config_hash_main
 
     def invalidate_steering_hashes(self) -> None:
         """Clear cached steering hashes so they recompute from current
-        sampling_params.  Must be called whenever sampling_params is
+        sampling_params. Must be called whenever sampling_params is
         replaced (e.g. streaming session updates)."""
-        self.__dict__.pop("prefill_steering_config_hash", None)
-        self.__dict__.pop("decode_steering_config_hash", None)
+        for key in (
+            "prefill_steering_config_hash_main",
+            "prefill_steering_config_hash_draft",
+            "decode_steering_config_hash_main",
+            "decode_steering_config_hash_draft",
+        ):
+            self.__dict__.pop(key, None)
 
     def get_skip_reading_prefix_cache(self) -> bool:
         if (

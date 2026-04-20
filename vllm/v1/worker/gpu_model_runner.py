@@ -1175,10 +1175,18 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
-                prefill_steering_config_hash=(
-                    new_req_data.prefill_steering_config_hash
+                prefill_steering_config_hash_main=(
+                    new_req_data.prefill_steering_config_hash_main
                 ),
-                decode_steering_config_hash=(new_req_data.decode_steering_config_hash),
+                prefill_steering_config_hash_draft=(
+                    new_req_data.prefill_steering_config_hash_draft
+                ),
+                decode_steering_config_hash_main=(
+                    new_req_data.decode_steering_config_hash_main
+                ),
+                decode_steering_config_hash_draft=(
+                    new_req_data.decode_steering_config_hash_draft
+                ),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1512,13 +1520,19 @@ class GPUModelRunner(
         # Streaming re-adds go back through prefill, so we must release
         # the old phase config, update the hashes on CachedRequestState,
         # and re-register the new prefill config.
-        old_prefill_hash = req_state.prefill_steering_config_hash
-        old_decode_hash = req_state.decode_steering_config_hash
-        new_prefill_hash = new_req_data.prefill_steering_config_hash
-        new_decode_hash = new_req_data.decode_steering_config_hash
+        old_prefill_hash = req_state.prefill_steering_config_hash_main
+        old_decode_hash = req_state.decode_steering_config_hash_main
+        new_prefill_hash = new_req_data.prefill_steering_config_hash_main
+        new_decode_hash = new_req_data.decode_steering_config_hash_main
 
-        req_state.prefill_steering_config_hash = new_prefill_hash
-        req_state.decode_steering_config_hash = new_decode_hash
+        req_state.prefill_steering_config_hash_main = new_prefill_hash
+        req_state.prefill_steering_config_hash_draft = (
+            new_req_data.prefill_steering_config_hash_draft
+        )
+        req_state.decode_steering_config_hash_main = new_decode_hash
+        req_state.decode_steering_config_hash_draft = (
+            new_req_data.decode_steering_config_hash_draft
+        )
 
         self._refresh_streaming_steering(
             req_id,

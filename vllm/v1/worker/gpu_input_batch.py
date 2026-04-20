@@ -53,9 +53,15 @@ class CachedRequestState:
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
 
-    # Per-request steering config hashes (0 = no per-request steering)
-    prefill_steering_config_hash: int = 0
-    decode_steering_config_hash: int = 0
+    # Per-request steering config hashes (0 = no per-request steering).
+    # Per-role: ``_main`` covers the target model, ``_draft`` covers
+    # the speculative-decoding draft. For flat-form ``SamplingParams``
+    # the draft hash tags-along to the same value as main (identical
+    # vectors apply to both); under nested-form specs they can differ.
+    prefill_steering_config_hash_main: int = 0
+    prefill_steering_config_hash_draft: int = 0
+    decode_steering_config_hash_main: int = 0
+    decode_steering_config_hash_draft: int = 0
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -64,6 +70,16 @@ class CachedRequestState:
 
         if self.pooling_params is not None:
             self.pooling_states = PoolingStates()
+
+    @property
+    def prefill_steering_config_hash(self) -> int:
+        """Backward-compat alias for the main-role prefill hash."""
+        return self.prefill_steering_config_hash_main
+
+    @property
+    def decode_steering_config_hash(self) -> int:
+        """Backward-compat alias for the main-role decode hash."""
+        return self.decode_steering_config_hash_main
 
     @property
     def num_tokens(self) -> int:
@@ -232,14 +248,28 @@ class InputBatch:
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
 
-        # Steering config tracking (separate arrays for prefill and decode)
-        self.request_prefill_steering_hash = np.zeros(
+        # Steering config tracking — per role (main / draft). Separate
+        # arrays per role because a request may steer the main model
+        # and the speculative-decoding draft with different vectors
+        # (nested-form ``SamplingParams.steering_vectors``). The
+        # singular ``request_{prefill,decode}_steering_hash`` names
+        # are kept as read-only aliases pointing at the ``_main``
+        # array so pre-existing callers see no behaviour change when
+        # a flat-form spec is used (flat tags-along to draft, so
+        # the ``_main`` hash equals the flat hash by construction).
+        self.request_prefill_steering_hash_main = np.zeros(
             (self.max_num_reqs,), dtype=np.int64
         )
-        self.request_decode_steering_hash = np.zeros(
+        self.request_prefill_steering_hash_draft = np.zeros(
             (self.max_num_reqs,), dtype=np.int64
         )
-        # Tracks the union of both hashes (any non-zero hash gets tracked)
+        self.request_decode_steering_hash_main = np.zeros(
+            (self.max_num_reqs,), dtype=np.int64
+        )
+        self.request_decode_steering_hash_draft = np.zeros(
+            (self.max_num_reqs,), dtype=np.int64
+        )
+        # Tracks the union of both hashes (any non-zero hash gets tracked).
         self.steering_hash_to_request_ids: dict[int, set[str]] = {}
 
         # req_index -> generator
@@ -304,6 +334,16 @@ class InputBatch:
         # None elements should only be present transiently
         # while performing state updates to the batch.
         return cast(list[str], self._req_ids)
+
+    @property
+    def request_prefill_steering_hash(self) -> np.ndarray:
+        """Backward-compat alias for the main-role prefill hash array."""
+        return self.request_prefill_steering_hash_main
+
+    @property
+    def request_decode_steering_hash(self) -> np.ndarray:
+        """Backward-compat alias for the main-role decode hash array."""
+        return self.request_decode_steering_hash_main
 
     def _register_add_request(self, request: "CachedRequestState") -> int:
         """Track add-request operations for logits processors.
@@ -472,12 +512,21 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
-        # Steering config tracking (prefill and decode)
-        prefill_hash = request.prefill_steering_config_hash
-        decode_hash = request.decode_steering_config_hash
-        self.request_prefill_steering_hash[req_index] = prefill_hash
-        self.request_decode_steering_hash[req_index] = decode_hash
-        for h in (prefill_hash, decode_hash):
+        # Steering config tracking (per-role prefill and decode).
+        prefill_hash_main = request.prefill_steering_config_hash_main
+        prefill_hash_draft = request.prefill_steering_config_hash_draft
+        decode_hash_main = request.decode_steering_config_hash_main
+        decode_hash_draft = request.decode_steering_config_hash_draft
+        self.request_prefill_steering_hash_main[req_index] = prefill_hash_main
+        self.request_prefill_steering_hash_draft[req_index] = prefill_hash_draft
+        self.request_decode_steering_hash_main[req_index] = decode_hash_main
+        self.request_decode_steering_hash_draft[req_index] = decode_hash_draft
+        for h in (
+            prefill_hash_main,
+            prefill_hash_draft,
+            decode_hash_main,
+            decode_hash_draft,
+        ):
             if h != 0:
                 if h not in self.steering_hash_to_request_ids:
                     self.steering_hash_to_request_ids[h] = set()
@@ -541,10 +590,12 @@ class InputBatch:
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
 
-        # Steering cleanup (both prefill and decode hashes)
+        # Steering cleanup (both prefill and decode hashes × both roles).
         for arr in (
-            self.request_prefill_steering_hash,
-            self.request_decode_steering_hash,
+            self.request_prefill_steering_hash_main,
+            self.request_prefill_steering_hash_draft,
+            self.request_decode_steering_hash_main,
+            self.request_decode_steering_hash_draft,
         ):
             steering_hash = int(arr[req_index])
             if steering_hash != 0:
@@ -650,17 +701,13 @@ class InputBatch:
             self.request_lora_mapping[i1],
         )
 
-        (
-            self.request_prefill_steering_hash[i1],
-            self.request_prefill_steering_hash[i2],
-        ) = (
-            self.request_prefill_steering_hash[i2],
-            self.request_prefill_steering_hash[i1],
-        )
-        self.request_decode_steering_hash[i1], self.request_decode_steering_hash[i2] = (
-            self.request_decode_steering_hash[i2],
-            self.request_decode_steering_hash[i1],
-        )
+        for arr in (
+            self.request_prefill_steering_hash_main,
+            self.request_prefill_steering_hash_draft,
+            self.request_decode_steering_hash_main,
+            self.request_decode_steering_hash_draft,
+        ):
+            arr[i1], arr[i2] = arr[i2], arr[i1]
 
         if self.is_pooling_model:
             # Sampling and logits parameters don't apply to pooling models.
@@ -790,12 +837,13 @@ class InputBatch:
                 last_req_index
             ]
 
-            self.request_prefill_steering_hash[empty_index] = (
-                self.request_prefill_steering_hash[last_req_index]
-            )
-            self.request_decode_steering_hash[empty_index] = (
-                self.request_decode_steering_hash[last_req_index]
-            )
+            for arr in (
+                self.request_prefill_steering_hash_main,
+                self.request_prefill_steering_hash_draft,
+                self.request_decode_steering_hash_main,
+                self.request_decode_steering_hash_draft,
+            ):
+                arr[empty_index] = arr[last_req_index]
 
             if self.is_pooling_model:
                 last_req_index -= 1

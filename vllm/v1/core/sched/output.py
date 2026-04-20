@@ -39,12 +39,28 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
 
-    # Per-request steering config hashes (0 = no per-request steering)
-    prefill_steering_config_hash: int = 0
-    decode_steering_config_hash: int = 0
+    # Per-request steering config hashes (0 = no per-request steering).
+    # Per-role: ``_main`` for the target model, ``_draft`` for the
+    # speculative-decoding draft. Flat-form ``SamplingParams`` produces
+    # identical main and draft values (tags-along); nested-form specs
+    # can yield distinct hashes per role.
+    prefill_steering_config_hash_main: int = 0
+    prefill_steering_config_hash_draft: int = 0
+    decode_steering_config_hash_main: int = 0
+    decode_steering_config_hash_draft: int = 0
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+
+    @property
+    def prefill_steering_config_hash(self) -> int:
+        """Backward-compat alias for the main-role prefill hash."""
+        return self.prefill_steering_config_hash_main
+
+    @property
+    def decode_steering_config_hash(self) -> int:
+        """Backward-compat alias for the main-role decode hash."""
+        return self.decode_steering_config_hash_main
 
     @classmethod
     def from_request(
@@ -63,8 +79,16 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
-            prefill_steering_config_hash=request.prefill_steering_config_hash,
-            decode_steering_config_hash=request.decode_steering_config_hash,
+            prefill_steering_config_hash_main=(
+                request.prefill_steering_config_hash_main
+            ),
+            prefill_steering_config_hash_draft=(
+                request.prefill_steering_config_hash_draft
+            ),
+            decode_steering_config_hash_main=(request.decode_steering_config_hash_main),
+            decode_steering_config_hash_draft=(
+                request.decode_steering_config_hash_draft
+            ),
             prefill_token_ids=prefill_token_ids,
         )
 
