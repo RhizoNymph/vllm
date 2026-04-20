@@ -73,7 +73,7 @@ class SpecDecodeBaseProposer:
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
         # Store a back-reference to the model runner so steering code can
         # reach ``_draft_steering_manager`` / ``_last_scheduler_output``
-        # during ``propose()`` (follow-up PR wires draft ``steering_index``).
+        # during ``propose()`` for draft ``steering_index`` population.
         self.runner = runner
 
         self.device = device
@@ -296,6 +296,20 @@ class SpecDecodeBaseProposer:
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(self.max_batch_size, 1)
 
+    def _populate_draft_steering(self, mode: str, n_tokens: int) -> None:
+        """Thin passthrough to the mixin's draft steering-index populator.
+
+        Guarded so proposers without a runner (e.g. unit tests that
+        bypass ``gpu_model_runner``) no-op cleanly.
+        """
+        runner = self.runner
+        if runner is None:
+            return
+        helper = getattr(runner, "_populate_draft_steering_index", None)
+        if helper is None:
+            return
+        helper(mode, n_tokens)
+
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
             raise NotImplementedError(
@@ -464,6 +478,12 @@ class SpecDecodeBaseProposer:
             num_tokens, num_input_tokens, mm_embed_inputs
         )
 
+        # Populate the draft model's ``steering_index`` before its
+        # first forward so any request with non-zero draft steering
+        # reaches the correct row. No-ops when no draft manager is
+        # active (steering disabled, or no speculative config).
+        self._populate_draft_steering("first", num_tokens)
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -623,6 +643,10 @@ class SpecDecodeBaseProposer:
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+
+            # Per-iteration draft ``steering_index`` refresh (one row
+            # per active request in batch order, decode-phase).
+            self._populate_draft_steering("loop", batch_size)
 
             with set_forward_context(
                 per_layer_attn_metadata,

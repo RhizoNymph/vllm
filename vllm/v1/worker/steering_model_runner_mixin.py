@@ -631,6 +631,11 @@ class SteeringModelRunnerMixin:
         2. Build the steering_index mapping tokens to table rows
         3. Detect prefill->decode phase transitions and swap configs
         """
+        # Stash the scheduler output on the runner so spec-decode
+        # proposers (``EagleProposer.propose()`` etc.) can replicate
+        # main's token walk on the draft model during their forward
+        # pass. See ``_populate_draft_steering_index``.
+        self._last_scheduler_output = scheduler_output
         # Short-circuit when steering is disabled.  Steerable models
         # (e.g. Gemma3) unconditionally register per-layer steering_table
         # buffers so the forward path can stay branch-free, but when
@@ -734,7 +739,9 @@ class SteeringModelRunnerMixin:
 
                     if num_computed < num_prompt:
                         # In prefill — register prefill config
-                        ph = int(self.input_batch.request_prefill_steering_hash[ri])
+                        ph = int(
+                            self.input_batch.request_prefill_steering_hash_main[ri]
+                        )
                         if ph != 0:
                             eff = rs.sampling_params.effective_prefill_steering
                             if eff:
@@ -761,7 +768,7 @@ class SteeringModelRunnerMixin:
                     else:
                         # In decode (full prefix-cache hit) — register
                         # decode config
-                        dh = int(self.input_batch.request_decode_steering_hash[ri])
+                        dh = int(self.input_batch.request_decode_steering_hash_main[ri])
                         if dh != 0:
                             eff = rs.sampling_params.effective_decode_steering
                             if eff:
@@ -980,7 +987,7 @@ class SteeringModelRunnerMixin:
             if is_prefilling:
                 # Prefill: use prefill steering hash
                 prefill_hash = int(
-                    self.input_batch.request_prefill_steering_hash[req_index]
+                    self.input_batch.request_prefill_steering_hash_main[req_index]
                 )
                 row = self._steering_manager.get_row_for_config(
                     prefill_hash, is_prefill=True
@@ -995,7 +1002,7 @@ class SteeringModelRunnerMixin:
             else:
                 # Decode: use decode steering hash
                 decode_hash = int(
-                    self.input_batch.request_decode_steering_hash[req_index]
+                    self.input_batch.request_decode_steering_hash_main[req_index]
                 )
                 row = self._steering_manager.get_row_for_config(
                     decode_hash, is_prefill=False
@@ -1012,6 +1019,150 @@ class SteeringModelRunnerMixin:
         # no-active-state short-circuit on a future step will zero the index
         # if needed when transitioning back to "nothing active".
         self._steering_index_dirty = True
+
+    def _populate_draft_steering_index(
+        self,
+        mode: str,
+        n_tokens: int,
+    ) -> None:
+        """Write the draft model's per-forward ``steering_index`` buffer.
+
+        Called from inside a speculative-decoding proposer's
+        ``propose()`` method, once per draft forward pass.
+
+        ``mode="first"`` mirrors the main runner's token walk: for each
+        request in batch order, assign the request's ``_draft`` row
+        (prefill or decode depending on the request's phase) to the
+        ``num_scheduled_tokens[req]`` contiguous index slots. Used
+        when the draft's first forward consumes the full set of
+        accepted tokens (Eagle / Draft-model first pass).
+
+        ``mode="loop"`` writes ``n_tokens`` entries in batch order,
+        one row per request, always using the decode-phase ``_draft``
+        hash. Used for Eagle's per-speculative-token loop and for
+        Medusa's single-shot proposer — both consume one draft token
+        per active request per forward.
+
+        No-ops when the draft manager is absent or the draft has no
+        steerable layers. Bails quickly when steering is disabled.
+        """
+        draft_mgr = getattr(self, "_draft_steering_manager", None)
+        draft_layers = self._draft_steerable_layers_cache
+        if draft_mgr is None or not draft_layers:
+            return
+        scheduler_output = getattr(self, "_last_scheduler_output", None)
+        if scheduler_output is None:
+            return
+        any_layer = next(iter(draft_layers.values()))
+        steering_index = any_layer.steering_index
+
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids
+
+        if mode == "first":
+            token_offset = 0
+            for i in range(num_reqs):
+                req_id = req_ids[i]
+                n = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                if n == 0:
+                    continue
+                ri = self.input_batch.req_id_to_index.get(req_id)
+                if ri is None:
+                    steering_index[token_offset : token_offset + n] = 0
+                    token_offset += n
+                    continue
+                num_computed = int(self.input_batch.num_computed_tokens_cpu[ri])
+                num_prompt = int(self.input_batch.num_prompt_tokens[ri])
+                is_prefilling = num_computed < num_prompt
+                if is_prefilling:
+                    h = int(self.input_batch.request_prefill_steering_hash_draft[ri])
+                    row = self._get_draft_row_for_config(
+                        h, is_prefill=True, req_id=req_id
+                    )
+                else:
+                    h = int(self.input_batch.request_decode_steering_hash_draft[ri])
+                    row = self._get_draft_row_for_config(
+                        h, is_prefill=False, req_id=req_id
+                    )
+                steering_index[token_offset : token_offset + n] = row
+                token_offset += n
+            if token_offset < steering_index.shape[0]:
+                steering_index[token_offset:].zero_()
+            return
+
+        if mode == "loop":
+            # One row per active request in batch order; always decode.
+            write_count = min(n_tokens, num_reqs, steering_index.shape[0])
+            for i in range(write_count):
+                req_id = req_ids[i]
+                ri = self.input_batch.req_id_to_index.get(req_id)
+                if ri is None:
+                    steering_index[i] = 0
+                    continue
+                h = int(self.input_batch.request_decode_steering_hash_draft[ri])
+                steering_index[i] = self._get_draft_row_for_config(
+                    h, is_prefill=False, req_id=req_id
+                )
+            if write_count < steering_index.shape[0]:
+                steering_index[write_count:].zero_()
+            return
+
+        raise ValueError(
+            f"_populate_draft_steering_index: unknown mode {mode!r}; "
+            f"expected 'first' or 'loop'."
+        )
+
+    def _get_draft_row_for_config(
+        self,
+        config_hash: int,
+        is_prefill: bool,
+        req_id: str,
+    ) -> int:
+        """Look up (and lazily register) a per-request row on the draft
+        manager, falling back to the phase-global row on capacity /
+        missing-config.
+
+        Lazy registration is a concession: unlike main's scheduler-
+        level capacity tracking, the draft manager has no upstream
+        admission gate — so we register here on first sight and fall
+        back on ``RuntimeError`` (capacity full). Accept the
+        capacity-loss edge case as a PR-B MVP limitation: per-request
+        draft steering silently degrades to the global-vector path.
+        """
+        mgr = self._draft_steering_manager
+        if mgr is None or config_hash == 0:
+            return 1 if is_prefill else 2
+        phase = "prefill" if is_prefill else "decode"
+        row = mgr.config_to_row.get((config_hash, phase))
+        if row is not None:
+            return row
+        # Lazy register from the owning request's SamplingParams.
+        rs = self.requests.get(req_id)
+        if rs is None or rs.sampling_params is None:
+            return 1 if is_prefill else 2
+        eff = (
+            rs.sampling_params.effective_prefill_steering_draft
+            if is_prefill
+            else rs.sampling_params.effective_decode_steering_draft
+        )
+        if not eff:
+            return 1 if is_prefill else 2
+        try:
+            return mgr.register_config(
+                config_hash,
+                eff,
+                phase=phase,
+                locally_owned_layers=self._draft_locally_owned_layers,
+            )
+        except RuntimeError:
+            logger.warning(
+                "Draft steering manager capacity exhausted — falling "
+                "back to phase-global row for config_hash=%d (%s). "
+                "Draft request receives global steering only.",
+                config_hash,
+                phase,
+            )
+            return 1 if is_prefill else 2
 
     def _handle_steering_transition(
         self,
@@ -1038,7 +1189,7 @@ class SteeringModelRunnerMixin:
         if prefill_hash != 0:
             mgr.release_config(prefill_hash, "prefill")
 
-        decode_hash = int(self.input_batch.request_decode_steering_hash[req_index])
+        decode_hash = int(self.input_batch.request_decode_steering_hash_main[req_index])
         if decode_hash != 0:
             req_state = self.requests.get(req_id)
             if req_state is not None and req_state.sampling_params is not None:

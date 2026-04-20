@@ -40,6 +40,18 @@ class MedusaProposer:
         # contract; used by per-role steering to locate the draft manager.
         self.runner = runner
 
+    def _populate_draft_steering(self, mode: str, n_tokens: int) -> None:
+        """Thin passthrough to
+        ``SteeringModelRunnerMixin._populate_draft_steering_index``.
+        """
+        runner = self.runner
+        if runner is None:
+            return
+        helper = getattr(runner, "_populate_draft_steering_index", None)
+        if helper is None:
+            return
+        helper(mode, n_tokens)
+
     def propose(
         self,
         target_hidden_states: torch.Tensor,
@@ -48,6 +60,9 @@ class MedusaProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,  # unused
     ) -> torch.Tensor:
+        # Medusa predicts all k speculative tokens in one forward, one
+        # per active request — the "loop" mode matches that shape.
+        self._populate_draft_steering("loop", target_hidden_states.shape[0])
         # Generate blocks and compute logits
         blocks = self.model(target_hidden_states)
         logits = self.model.compute_logits(blocks)
