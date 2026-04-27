@@ -1509,5 +1509,3 @@ class TestDevicePlacement:
         table = getattr(layers[0], _TABLE_ATTR)
         expected = per_req_vec.to(cuda_device)
         assert torch.allclose(table[row], expected)
-
-
