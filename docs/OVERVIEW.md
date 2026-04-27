@@ -37,6 +37,7 @@ or model forward pass).
 ## Features Index
 
 ### steering
+
 - **description**: Activation steering adds precomputed vectors into the
   residual stream of decoder layers during inference, enabling per-request
   behavioral shifts without fine-tuning. The scheduler guarantees
@@ -49,6 +50,7 @@ or model forward pass).
 - **doc**: [docs/features/steering.md](features/steering.md)
 
 ### automatic_prefix_caching
+
 - **description**: Reuses KV cache blocks across requests that share prompt
   prefixes, reducing redundant computation.
 - **entry_points**: `--enable-prefix-caching`
@@ -56,6 +58,7 @@ or model forward pass).
 - **doc**: [docs/features/automatic_prefix_caching.md](features/automatic_prefix_caching.md)
 
 ### lora
+
 - **description**: Serves multiple LoRA adapters concurrently on a single
   base model, with per-request adapter selection.
 - **entry_points**: `--enable-lora`, `SamplingParams.lora_request`
@@ -63,6 +66,7 @@ or model forward pass).
 - **doc**: [docs/features/lora.md](features/lora.md)
 
 ### speculative_decoding
+
 - **description**: Uses a smaller draft model to propose tokens verified by
   the target model, improving generation throughput.
 - **entry_points**: `--speculative-model`
@@ -70,6 +74,7 @@ or model forward pass).
 - **doc**: [docs/features/speculative_decoding/](features/speculative_decoding)
 
 ### structured_outputs
+
 - **description**: Constrains generation to follow JSON schemas, regex
   patterns, or grammar specifications.
 - **entry_points**: `SamplingParams.guided_decoding`
@@ -77,6 +82,7 @@ or model forward pass).
 - **doc**: [docs/features/structured_outputs.md](features/structured_outputs.md)
 
 ### tool_calling
+
 - **description**: Enables models to produce structured tool/function calls
   in chat completions.
 - **entry_points**: `tools` parameter in chat API
@@ -84,6 +90,7 @@ or model forward pass).
 - **doc**: [docs/features/tool_calling.md](features/tool_calling.md)
 
 ### multimodal_inputs
+
 - **description**: Supports image, audio, and video inputs alongside text
   for multimodal models.
 - **entry_points**: `SamplingParams.multi_modal_data`
@@ -91,6 +98,7 @@ or model forward pass).
 - **doc**: [docs/features/multimodal_inputs.md](features/multimodal_inputs.md)
 
 ### disaggregated_prefill
+
 - **description**: Separates prefill and decode across different worker
   groups for improved resource utilization.
 - **entry_points**: `--disagg-prefill`
