@@ -175,8 +175,7 @@ class SteeringManager:
             Returns the assigned row (3+), looked up by
             ``(config_hash, "prefill"/"decode")``.
 
-        For unregistered nonzero hashes:
-            Falls back to row 1 (prefill) or row 2 (decode).
+        Raises RuntimeError for unregistered nonzero hashes.
         """
         if config_hash == 0:
             return 1 if is_prefill else 2
@@ -184,8 +183,10 @@ class SteeringManager:
         row = self.config_to_row.get((config_hash, phase))
         if row is not None:
             return row
-        # Fallback for unregistered nonzero hash
-        return 1 if is_prefill else 2
+        raise RuntimeError(
+            f"Steering config (hash={config_hash}, phase={phase}) not "
+            f"registered. The scheduler must guarantee capacity."
+        )
 
     def update_global_vectors(
         self,
