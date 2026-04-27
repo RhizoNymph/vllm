@@ -705,9 +705,7 @@ class Scheduler(SchedulerInterface):
                             len(scheduled_steering_configs) + len(new_unique)
                             > self.steering_config.max_steering_configs
                         ):
-                            request.set_block_hash_steering_overrides(
-                                prefill_hash=0
-                            )
+                            request.set_block_hash_steering_overrides(prefill_hash=0)
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
