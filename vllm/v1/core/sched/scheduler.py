@@ -619,8 +619,7 @@ class Scheduler(SchedulerInterface):
                         req.num_computed_tokens + n_sched >= req.num_prompt_tokens
                     )
                     needs_decode_reservation = (
-                        will_complete
-                        or req.prefill_steering_config_hash == 0
+                        will_complete or req.prefill_steering_config_hash == 0
                     )
                     if (
                         needs_decode_reservation
@@ -699,9 +698,7 @@ class Scheduler(SchedulerInterface):
                             (request.prefill_steering_config_hash, "prefill")
                         )
                     elif request.decode_steering_config_hash != 0:
-                        new_hashes.add(
-                            (request.decode_steering_config_hash, "decode")
-                        )
+                        new_hashes.add((request.decode_steering_config_hash, "decode"))
                     if new_hashes:
                         new_unique = new_hashes - scheduled_steering_configs
                         if (
@@ -973,8 +970,7 @@ class Scheduler(SchedulerInterface):
                             >= request.num_prompt_tokens
                         )
                         needs_decode_reservation = (
-                            will_complete
-                            or request.prefill_steering_config_hash == 0
+                            will_complete or request.prefill_steering_config_hash == 0
                         )
                         if (
                             needs_decode_reservation
