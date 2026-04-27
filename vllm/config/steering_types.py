@@ -19,7 +19,7 @@ Where ``scale(entry)`` means: if entry is a bare list, scale=1.0; if entry is
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 
@@ -28,6 +28,13 @@ SteeringLayerEntry = list[float] | dict[str, Any]
 
 # Full spec: {hook_point_name: {layer_idx: SteeringLayerEntry}}
 SteeringVectorSpec = dict[str, dict[int, SteeringLayerEntry]]
+
+# Pre-resolved per-layer vector: a flat sequence of floats with no scale wrapper.
+# The resolver produces ``np.ndarray`` (float32); ``register_config`` and
+# ``hash_steering_config`` also accept plain ``list[float]`` so direct
+# unit-test callers don't have to wrap inputs.
+ResolvedLayerVector: TypeAlias = list[float] | np.ndarray
+ResolvedSteeringVectors: TypeAlias = dict[str, dict[int, ResolvedLayerVector]]
 
 
 def normalize_layer_entry(entry: SteeringLayerEntry) -> tuple[list[float], float]:
@@ -59,31 +66,17 @@ def normalize_layer_entry(entry: SteeringLayerEntry) -> tuple[list[float], float
     )
 
 
-def _scale_vector(vec: list[float], scale: float) -> list[float]:
-    """Multiply each element of *vec* by *scale*."""
-    return [v * scale for v in vec]
-
-
-def _add_vectors(a: list[float], b: list[float]) -> list[float]:
-    """Element-wise addition of two equal-length vectors."""
-    if len(a) != len(b):
-        raise ValueError(
-            f"Cannot add steering vectors of different lengths: {len(a)} vs {len(b)}"
-        )
-    return [x + y for x, y in zip(a, b)]
-
-
 def resolve_effective_vectors(
     base: SteeringVectorSpec | None,
     phase_specific: SteeringVectorSpec | None,
-) -> dict[str, dict[int, list[float]]] | None:
+) -> ResolvedSteeringVectors | None:
     """Merge *base* and *phase_specific* steering specs additively.
 
     For each ``(hook, layer)`` pair, both the base and phase-specific entries
     are pre-scaled and then summed.  Non-overlapping entries pass through
     unchanged (pre-scaled).
 
-    Returns pre-scaled flat vectors (``list[float]``, no scale wrapper).
+    Returns pre-scaled flat ``np.ndarray`` (float32) values, no scale wrapper.
     Returns ``None`` if both inputs are ``None`` or empty.
     """
     base_empty = not base
@@ -91,9 +84,8 @@ def resolve_effective_vectors(
     if base_empty and phase_empty:
         return None
 
-    result: dict[str, dict[int, list[float]]] = {}
+    result: ResolvedSteeringVectors = {}
 
-    # Collect all hook points from both specs
     all_hooks: set[str] = set()
     if not base_empty:
         assert base is not None
@@ -113,7 +105,7 @@ def resolve_effective_vectors(
         if not all_layer_idxs:
             continue
 
-        hook_result: dict[int, list[float]] = {}
+        hook_result: dict[int, ResolvedLayerVector] = {}
         for layer_idx in all_layer_idxs:
             base_entry = base_layers.get(layer_idx)
             phase_entry = phase_layers.get(layer_idx)
@@ -121,16 +113,21 @@ def resolve_effective_vectors(
             if base_entry is not None and phase_entry is not None:
                 base_vec, base_scale = normalize_layer_entry(base_entry)
                 phase_vec, phase_scale = normalize_layer_entry(phase_entry)
-                scaled_base = _scale_vector(base_vec, base_scale)
-                scaled_phase = _scale_vector(phase_vec, phase_scale)
-                hook_result[layer_idx] = _add_vectors(scaled_base, scaled_phase)
+                base_arr = np.asarray(base_vec, dtype=np.float32)
+                phase_arr = np.asarray(phase_vec, dtype=np.float32)
+                if base_arr.shape != phase_arr.shape:
+                    raise ValueError(
+                        "Cannot add steering vectors of different lengths: "
+                        f"{base_arr.shape[0]} vs {phase_arr.shape[0]}"
+                    )
+                hook_result[layer_idx] = base_arr * base_scale + phase_arr * phase_scale
             elif base_entry is not None:
                 vec, scale = normalize_layer_entry(base_entry)
-                hook_result[layer_idx] = _scale_vector(vec, scale)
+                hook_result[layer_idx] = np.asarray(vec, dtype=np.float32) * scale
             else:
                 assert phase_entry is not None
                 vec, scale = normalize_layer_entry(phase_entry)
-                hook_result[layer_idx] = _scale_vector(vec, scale)
+                hook_result[layer_idx] = np.asarray(vec, dtype=np.float32) * scale
 
         if hook_result:
             result[hook] = hook_result
@@ -144,10 +141,10 @@ def merge_steering_specs(
 ) -> SteeringVectorSpec | None:
     """Additively merge two :class:`SteeringVectorSpec` dicts.
 
-    For overlapping ``(hook, layer)`` entries both sides are pre-scaled
-    (via :func:`normalize_layer_entry` + :func:`_scale_vector`) then
-    summed (via :func:`_add_vectors`).  Non-overlapping entries pass
-    through pre-scaled.
+    For overlapping ``(hook, layer)`` entries both sides are pre-scaled and
+    summed.  Non-overlapping entries pass through pre-scaled.  The result
+    keeps the bare-list ``SteeringVectorSpec`` shape so it can be fed back
+    in as input to other spec-consuming code.
 
     Returns ``None`` if both inputs are ``None`` or empty.
     """
@@ -185,16 +182,25 @@ def merge_steering_specs(
             if a_entry is not None and b_entry is not None:
                 a_vec, a_scale = normalize_layer_entry(a_entry)
                 b_vec, b_scale = normalize_layer_entry(b_entry)
-                scaled_a = _scale_vector(a_vec, a_scale)
-                scaled_b = _scale_vector(b_vec, b_scale)
-                hook_result[layer_idx] = _add_vectors(scaled_a, scaled_b)
+                a_arr = np.asarray(a_vec, dtype=np.float32)
+                b_arr = np.asarray(b_vec, dtype=np.float32)
+                if a_arr.shape != b_arr.shape:
+                    raise ValueError(
+                        "Cannot add steering vectors of different lengths: "
+                        f"{a_arr.shape[0]} vs {b_arr.shape[0]}"
+                    )
+                hook_result[layer_idx] = (a_arr * a_scale + b_arr * b_scale).tolist()
             elif a_entry is not None:
                 vec, scale = normalize_layer_entry(a_entry)
-                hook_result[layer_idx] = _scale_vector(vec, scale)
+                hook_result[layer_idx] = (
+                    np.asarray(vec, dtype=np.float32) * scale
+                ).tolist()
             else:
                 assert b_entry is not None
                 vec, scale = normalize_layer_entry(b_entry)
-                hook_result[layer_idx] = _scale_vector(vec, scale)
+                hook_result[layer_idx] = (
+                    np.asarray(vec, dtype=np.float32) * scale
+                ).tolist()
 
         if hook_result:
             result[hook] = hook_result
@@ -203,7 +209,7 @@ def merge_steering_specs(
 
 
 def hash_steering_config(
-    effective_vectors: dict[str, dict[int, list[float]]] | None,
+    effective_vectors: ResolvedSteeringVectors | None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 
@@ -225,19 +231,7 @@ def hash_steering_config(
         layer_dict = effective_vectors[hook]
         for layer_idx in sorted(layer_dict.keys()):
             entry = layer_dict[layer_idx]
-            # An entry is either a bare list/array of floats or a dict
-            # ``{"vector": [...], "scale": float}``. By the time we get here
-            # the resolver has flattened the dict form into a plain list, so
-            # we expect the bare form — but handle both for safety.
-            if isinstance(entry, dict):
-                vec = entry.get("vector", entry)
-                scale = float(entry.get("scale", 1.0))
-            else:
-                vec = entry
-                scale = 1.0
-            arr = np.asarray(vec, dtype=np.float32)
+            arr = np.asarray(entry, dtype=np.float32)
             h.update(layer_idx.to_bytes(4, "little", signed=True))
             h.update(arr.tobytes())
-            if scale != 1.0:
-                h.update(np.float64(scale).tobytes())
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
