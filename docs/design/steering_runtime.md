@@ -10,7 +10,7 @@ For user-facing setup and examples, see [Activation Steering](../features/steeri
 
 The runtime has to satisfy all of the following at once:
 
-- support global and per-request steering
+- support per-request steering
 - distinguish prefill and decode behavior
 - preserve prefix-cache correctness
 - work under continuous batching
@@ -28,17 +28,16 @@ effective_prefill = base + prefill_specific
 effective_decode  = base + decode_specific
 ```
 
-This exists independently for:
-
-- global steering state
-- per-request steering state
-
 At runtime, the effective per-token steering seen by the model is:
 
 ```text
-prefill token -> global_prefill_effective + request_prefill_effective
-decode token  -> global_decode_effective  + request_decode_effective
+prefill token -> request_prefill_effective
+decode token  -> request_decode_effective
 ```
+
+The table layout below reserves rows for global prefill/decode vectors that a
+later PR exposes through an HTTP API; until then those rows are always zero
+and have no effect.
 
 ## Main Components
 
@@ -68,12 +67,17 @@ These are phase-specific identities used by:
 ### `Scheduler`
 
 The scheduler admits requests subject to steering-capacity limits and must
-reason about phase transitions:
+guarantee that capacity is available for every admitted request across all
+phases:
 
 - prefill requests consume prefill steering capacity
 - decode requests consume decode steering capacity
-- requests near the prefill/decode boundary may require transition-aware
-  reservation so decode admission does not fail mid-step
+- decode-only requests (e.g., full cache hits that skip prefill) are now
+  capacity-checked at admission, closing a previous gap where they could
+  bypass steering accounting
+- the scheduler guarantees that by the time a request reaches the worker,
+  its steering row can be allocated; there is no deferred-registration
+  fallback path
 
 ### `SteeringManager`
 
@@ -82,7 +86,6 @@ The worker-side `SteeringManager` owns:
 - per-request config registration
 - refcounting
 - table row assignment
-- global vector caches
 - population of per-layer steering tables
 
 Rows are phase-aware. A config hash is not enough on its own; the manager
@@ -96,8 +99,11 @@ The model runner assembles:
 - token-to-row steering index buffers
 - per-layer steering tables
 
-It also handles deferred registration when decode registration cannot happen
-immediately because the batch is at steering capacity.
+Registration is expected to succeed for every request in the batch. If
+`get_row_for_config` is called with an unregistered nonzero config hash,
+the manager raises `RuntimeError` instead of silently falling back to a
+global row. This fail-fast behavior is safe because the scheduler has
+already guaranteed capacity before admission.
 
 ## Table and Index Layout
 
@@ -137,7 +143,6 @@ That means:
 
 - prefill steering is part of the cache identity
 - decode-only steering is not part of prompt KV identity
-- global base/prefill steering changes invalidate cache reuse
 
 The cache key integration happens through extra block-hash components attached
 to prefill hashing.
@@ -157,48 +162,44 @@ When that happens, the request must refresh all APC-related state:
 
 If those are not refreshed together, cache hits and misses become incorrect.
 
-## Deferred and Pending Registration
+## Guaranteed Capacity and Hard Registration Errors
 
-Decode registration can be deferred when a request transitions phases but the
-worker has no free steering rows at that moment.  New-request registrations
-can also be deferred on capacity exhaustion during admission.
+The scheduler guarantees that by the time a request reaches the worker, its
+steering row can be allocated. There are no pending queues or deferred
+registration paths at the worker.
 
-The runtime uses a two-queue priority model:
+This guarantee is enforced end-to-end:
 
-1. **Transitions queue** (`_pending_steering_transitions`): prefill→decode
-   transitions for in-flight requests that have already consumed KV cache.
-   This queue is drained first (FIFO).
-2. **Registrations queue** (`_pending_steering_registrations`): new-request
-   deferrals.  Only processed once the transitions queue is empty.
+- The scheduler tracks both prefill and decode steering capacity, including
+  decode-only requests that skip prefill entirely (e.g., full cache hits).
+- Admission is refused if there is no free steering row for the request's
+  phase-specific config hash.
+- At the worker, `SteeringManager.get_row_for_config` raises `RuntimeError`
+  if called with an unregistered nonzero config hash, rather than silently
+  falling back to a global (zero-steering) row.
 
-A third deferral mechanism handles the lazy-init case: when the HTTP API sets
-global vectors before the `SteeringManager` has been constructed (the manager
-is lazily created on the first steering-relevant step), those vectors are
-queued on `_pending_steering_globals` at the model runner and replayed during
-manager init. This is distinct from the two queues above: those handle
-capacity exhaustion after the manager exists; `_pending_steering_globals`
-handles the case where the manager doesn't exist yet.
+The pending queues (`_pending_steering_transitions` and
+`_pending_steering_registrations`) and their associated two-queue priority
+drain have been removed. The rationale: tokens generated under wrong steering
+poison the KV cache permanently. A request that runs with zero steering while
+"waiting" for a row produces KV entries that cannot be corrected later. The
+only safe behavior is to never admit a request unless its steering row is
+guaranteed.
 
-This priority ordering ensures that requests already consuming resources get
-steering table rows before newly admitted requests that haven't started yet.
+Invariants the runtime preserves:
 
-The runtime has to preserve these invariants:
-
-- active requests keep running even if decode registration is deferred
-- transitions are retried before new-request registrations
-- new-request registrations are only attempted when no transitions are pending
-- stale pending entries are dropped if the request finishes or changes phase
-- fallback behavior must remain correct if a request temporarily uses a global row
-
-This is one of the places where scheduler capacity logic and worker state must
-match exactly.
+- every admitted request has a steering row available at registration time
+- `get_row_for_config` never silently degrades to a global row for
+  unregistered configs
+- decode-only requests are capacity-checked at the scheduler, closing the
+  gap where they previously bypassed steering accounting
+- the scheduler and worker capacity models are kept in strict agreement
 
 ## Continuous Batching
 
 Steering has to work with mixed batches containing:
 
 - unsteered requests
-- globally steered requests
 - distinct per-request steered requests
 - prefill and decode tokens in the same step
 
@@ -243,25 +244,6 @@ This design document reflects the v1 steering runtime. Known boundaries:
 
 - no v2 model runner integration yet (v2 is dev-flag-gated in vllm; steering
   integration is pending)
-- see [Activation Steering](../features/steering.md#supported-scope) for the
-  current list of wired decoder architectures
-
-## Named Steering Modules (runtime)
-
-Named steering modules are pre-registered vector configurations that requests
-reference by name instead of sending vectors inline. The runtime shape is:
-
-- The registry lives on FastAPI app state
-  (`app.state.steering_module_registry`), populated either at startup via
-  `--steering-modules` or at runtime via
-  `POST /v1/steering/modules/register`. The registry implementation is in
-  `vllm/entrypoints/openai/steering/registry.py`.
-- Resolution happens in the OpenAI serving handlers
-  (`chat_completion/serving.py`, `completion/serving.py`) when a request
-  specifies `steering_name` in `extra_body`. The resolver looks up the named
-  module, merges it with any inline `steering_vectors` fields via
-  `merge_steering_specs`, and writes the merged spec back onto
-  `SamplingParams` before the request enters the scheduler.
-- The scheduler and worker do not distinguish named from inline vectors once
-  the spec is on `SamplingParams` — the rest of the runtime sees only the
-  final resolved vectors.
+- only the Gemma 3 decoder is wired; additional model families, a global HTTP
+  API, named modules, and distributed-execution support land in follow-up PRs
+  per the staged plan in the RFC
