@@ -19,7 +19,7 @@ Where ``scale(entry)`` means: if entry is a bare list, scale=1.0; if entry is
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 
@@ -33,8 +33,8 @@ SteeringVectorSpec = dict[str, dict[int, SteeringLayerEntry]]
 # The resolver produces ``np.ndarray`` (float32); ``register_config`` and
 # ``hash_steering_config`` also accept plain ``list[float]`` so direct
 # unit-test callers don't have to wrap inputs.
-ResolvedLayerVector = list[float] | np.ndarray
-ResolvedSteeringVectors = dict[str, dict[int, ResolvedLayerVector]]
+ResolvedLayerVector: TypeAlias = list[float] | np.ndarray
+ResolvedSteeringVectors: TypeAlias = dict[str, dict[int, ResolvedLayerVector]]
 
 
 def normalize_layer_entry(entry: SteeringLayerEntry) -> tuple[list[float], float]:
@@ -189,9 +189,7 @@ def merge_steering_specs(
                         "Cannot add steering vectors of different lengths: "
                         f"{a_arr.shape[0]} vs {b_arr.shape[0]}"
                     )
-                hook_result[layer_idx] = (
-                    a_arr * a_scale + b_arr * b_scale
-                ).tolist()
+                hook_result[layer_idx] = (a_arr * a_scale + b_arr * b_scale).tolist()
             elif a_entry is not None:
                 vec, scale = normalize_layer_entry(a_entry)
                 hook_result[layer_idx] = (
@@ -233,19 +231,7 @@ def hash_steering_config(
         layer_dict = effective_vectors[hook]
         for layer_idx in sorted(layer_dict.keys()):
             entry = layer_dict[layer_idx]
-            # An entry is either a bare list/array of floats or a dict
-            # ``{"vector": [...], "scale": float}``. By the time we get here
-            # the resolver has flattened the dict form into a plain list, so
-            # we expect the bare form — but handle both for safety.
-            if isinstance(entry, dict):
-                vec = entry.get("vector", entry)
-                scale = float(entry.get("scale", 1.0))
-            else:
-                vec = entry
-                scale = 1.0
-            arr = np.asarray(vec, dtype=np.float32)
+            arr = np.asarray(entry, dtype=np.float32)
             h.update(layer_idx.to_bytes(4, "little", signed=True))
             h.update(arr.tobytes())
-            if scale != 1.0:
-                h.update(np.float64(scale).tobytes())
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
