@@ -307,9 +307,7 @@ class TestTransitionAwareCapacity:
                     req["num_computed_tokens"] + req["num_scheduled_tokens"]
                     >= req["num_prompt_tokens"]
                 )
-                needs_decode_reservation = (
-                    will_complete or req["prefill_hash"] == 0
-                )
+                needs_decode_reservation = will_complete or req["prefill_hash"] == 0
                 if needs_decode_reservation and req["decode_hash"] != 0:
                     configs.add((req["decode_hash"], "decode"))
             else:
@@ -633,9 +631,7 @@ class TestWaitingTransitionPrediction:
             if prefill_hash != 0:
                 scheduled_configs.add((prefill_hash, "prefill"))
             will_complete = num_computed_tokens + num_new_tokens >= num_prompt_tokens
-            needs_decode_reservation = (
-                will_complete or prefill_hash == 0
-            )
+            needs_decode_reservation = will_complete or prefill_hash == 0
             if needs_decode_reservation and decode_hash != 0:
                 scheduled_configs.add((decode_hash, "decode"))
         else:
