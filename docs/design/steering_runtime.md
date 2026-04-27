@@ -67,12 +67,17 @@ These are phase-specific identities used by:
 ### `Scheduler`
 
 The scheduler admits requests subject to steering-capacity limits and must
-reason about phase transitions:
+guarantee that capacity is available for every admitted request across all
+phases:
 
 - prefill requests consume prefill steering capacity
 - decode requests consume decode steering capacity
-- requests near the prefill/decode boundary may require transition-aware
-  reservation so decode admission does not fail mid-step
+- decode-only requests (e.g., full cache hits that skip prefill) are now
+  capacity-checked at admission, closing a previous gap where they could
+  bypass steering accounting
+- the scheduler guarantees that by the time a request reaches the worker,
+  its steering row can be allocated; there is no deferred-registration
+  fallback path
 
 ### `SteeringManager`
 
@@ -94,8 +99,11 @@ The model runner assembles:
 - token-to-row steering index buffers
 - per-layer steering tables
 
-It also handles deferred registration when decode registration cannot happen
-immediately because the batch is at steering capacity.
+Registration is expected to succeed for every request in the batch. If
+`get_row_for_config` is called with an unregistered nonzero config hash,
+the manager raises `RuntimeError` instead of silently falling back to a
+global row. This fail-fast behavior is safe because the scheduler has
+already guaranteed capacity before admission.
 
 ## Table and Index Layout
 
@@ -154,33 +162,38 @@ When that happens, the request must refresh all APC-related state:
 
 If those are not refreshed together, cache hits and misses become incorrect.
 
-## Deferred and Pending Registration
+## Guaranteed Capacity and Hard Registration Errors
 
-Decode registration can be deferred when a request transitions phases but the
-worker has no free steering rows at that moment.  New-request registrations
-can also be deferred on capacity exhaustion during admission.
+The scheduler guarantees that by the time a request reaches the worker, its
+steering row can be allocated. There are no pending queues or deferred
+registration paths at the worker.
 
-The runtime uses a two-queue priority model:
+This guarantee is enforced end-to-end:
 
-1. **Transitions queue** (`_pending_steering_transitions`): prefill→decode
-   transitions for in-flight requests that have already consumed KV cache.
-   This queue is drained first (FIFO).
-2. **Registrations queue** (`_pending_steering_registrations`): new-request
-   deferrals.  Only processed once the transitions queue is empty.
+- The scheduler tracks both prefill and decode steering capacity, including
+  decode-only requests that skip prefill entirely (e.g., full cache hits).
+- Admission is refused if there is no free steering row for the request's
+  phase-specific config hash.
+- At the worker, `SteeringManager.get_row_for_config` raises `RuntimeError`
+  if called with an unregistered nonzero config hash, rather than silently
+  falling back to a global (zero-steering) row.
 
-This priority ordering ensures that requests already consuming resources get
-steering table rows before newly admitted requests that haven't started yet.
+The pending queues (`_pending_steering_transitions` and
+`_pending_steering_registrations`) and their associated two-queue priority
+drain have been removed. The rationale: tokens generated under wrong steering
+poison the KV cache permanently. A request that runs with zero steering while
+"waiting" for a row produces KV entries that cannot be corrected later. The
+only safe behavior is to never admit a request unless its steering row is
+guaranteed.
 
-The runtime has to preserve these invariants:
+Invariants the runtime preserves:
 
-- active requests keep running even if decode registration is deferred
-- transitions are retried before new-request registrations
-- new-request registrations are only attempted when no transitions are pending
-- stale pending entries are dropped if the request finishes or changes phase
-- fallback behavior must remain correct if a request temporarily uses a global row
-
-This is one of the places where scheduler capacity logic and worker state must
-match exactly.
+- every admitted request has a steering row available at registration time
+- `get_row_for_config` never silently degrades to a global row for
+  unregistered configs
+- decode-only requests are capacity-checked at the scheduler, closing the
+  gap where they previously bypassed steering accounting
+- the scheduler and worker capacity models are kept in strict agreement
 
 ## Continuous Batching
 
