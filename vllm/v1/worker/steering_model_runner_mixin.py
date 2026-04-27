@@ -137,12 +137,8 @@ class SteeringModelRunnerMixin:
                 # Transitions (prefill→decode) are retried before new
                 # admissions; the transitions queue must be fully
                 # drained before any registration entry is attempted.
-                self._pending_steering_transitions: list[
-                    _PendingSteeringEntry
-                ] = []
-                self._pending_steering_registrations: list[
-                    _PendingSteeringEntry
-                ] = []
+                self._pending_steering_transitions: list[_PendingSteeringEntry] = []
+                self._pending_steering_registrations: list[_PendingSteeringEntry] = []
                 self._req_steering_phase: dict[str, str] = {}
                 # Tracks whether steering_index has been written with non-zero
                 # row references. Used by the no-active-state short-circuit
