@@ -297,10 +297,16 @@ class LLM:
                 )
 
         self._capture_consumers_config: CaptureConsumersConfig | None = None
-        if _capture_consumer_specs:
-            validate_consumer_specs(_capture_consumer_specs)
+        if _capture_consumer_specs or self._capture_consumer_instances:
+            if _capture_consumer_specs:
+                validate_consumer_specs(_capture_consumer_specs)
+            # Always materialize the config when there's *any* capture
+            # work to do — pre-constructed instances need it too so that
+            # ``vllm_config.capture_consumers_config`` is non-None in the
+            # runner and the capture manager actually gets set up.
             self._capture_consumers_config = CaptureConsumersConfig(
                 consumers=_capture_consumer_specs,
+                instances=list(self._capture_consumer_instances),
             )
 
         if "swap_space" in kwargs:

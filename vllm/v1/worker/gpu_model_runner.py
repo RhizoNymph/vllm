@@ -509,10 +509,12 @@ class GPUModelRunner(
             from vllm.v1.capture import registry as _capture_registry
             from vllm.v1.capture.manager import CaptureManager
 
-            # Pre-constructed driver-side instances ride on a transient
-            # attribute the ``LLM`` constructor sets; ``None`` in the
-            # engine-core path where only config-driven consumers exist.
-            instances = getattr(self.vllm_config, "_capture_consumer_instances", None)
+            # Pre-constructed driver-side instances ride on the
+            # ``CaptureConsumersConfig.instances`` field populated by the
+            # ``LLM`` constructor.  Dict-form consumers come through
+            # ``config.consumers`` as before; both paths are handled by
+            # ``build_consumers``.
+            instances = list(self.vllm_config.capture_consumers_config.instances)
 
             sinks, validators, name_to_index = _capture_registry.build_consumers(
                 self.vllm_config, consumer_instances=instances

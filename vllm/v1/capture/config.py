@@ -31,9 +31,20 @@ class CaptureConsumerSpec:
 
 @dataclass
 class CaptureConsumersConfig:
-    """Top-level capture-consumers configuration."""
+    """Top-level capture-consumers configuration.
+
+    ``consumers`` lists config-driven entries (entry-point name + params).
+    ``instances`` carries pre-constructed ``CaptureConsumer`` instances
+    passed directly to ``LLM(capture_consumers=[...])``.  Instances ride
+    on this config so they survive the ``EngineArgs → VllmConfig`` plumbing
+    and reach the runner alongside the dict-form entries.  Only
+    ``location='driver'`` instances are permitted (the runner's registry
+    enforces this).  Instances don't contribute to ``compute_hash``
+    because they're per-run driver-side state, not compile-cache inputs.
+    """
 
     consumers: list[CaptureConsumerSpec]
+    instances: list[Any] = field(default_factory=list)
 
     def compute_hash(self) -> str:
         """Deterministic hash for ``VllmConfig.compute_hash()``."""

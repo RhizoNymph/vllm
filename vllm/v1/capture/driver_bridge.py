@@ -201,6 +201,12 @@ class _DriverReceiver:
         while True:
             try:
                 event = self._event_queue.get()
+            except EOFError:
+                # Queue was closed (normal on process shutdown — the
+                # daemon thread reads EOF once the owning subprocess
+                # tears down the engine).  Exit quietly.
+                logger.debug("Driver event queue closed (EOFError); exiting receiver")
+                break
             except Exception:
                 logger.exception("Unexpected error reading from driver event queue")
                 break
