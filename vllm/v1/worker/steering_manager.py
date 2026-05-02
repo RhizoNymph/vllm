@@ -388,6 +388,14 @@ class SteeringManager:
         that adds ~1ms of ``cudaStreamSynchronize`` per call — building
         it once outside the loop eliminates 100+ of those syncs.
         """
+        base_vec = base_vec.to(device=table.device) if base_vec is not None else None
+        prefill_vec = (
+            prefill_vec.to(device=table.device) if prefill_vec is not None else None
+        )
+        decode_vec = (
+            decode_vec.to(device=table.device) if decode_vec is not None else None
+        )
+
         # Compute phase-global vectors once per (hook, layer)
         global_prefill = self._add_vecs(base_vec, prefill_vec)
         global_decode = self._add_vecs(base_vec, decode_vec)
@@ -419,11 +427,13 @@ class SteeringManager:
                 )
 
             if phase_global is not None and per_req is not None:
-                row_content = phase_global + per_req.squeeze(0)
+                row_content = phase_global + per_req.squeeze(0).to(
+                    device=table.device
+                )
             elif phase_global is not None:
                 row_content = phase_global
             elif per_req is not None:
-                row_content = per_req.squeeze(0)
+                row_content = per_req.squeeze(0).to(device=table.device)
             else:
                 row_content = zero_row
             rows.append(row_content)
