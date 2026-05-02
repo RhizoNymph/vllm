@@ -15,6 +15,7 @@ global effective vectors for each phase.
 """
 
 from collections import defaultdict
+from collections.abc import Collection
 
 import torch
 
@@ -81,6 +82,7 @@ class SteeringManager:
         config_hash: int,
         vectors: dict[str, dict[int, list[float]]],
         phase: str = "prefill",
+        locally_owned_layers: Collection[int] | None = None,
     ) -> int:
         """Register a steering config, return its table row index.
 
@@ -88,6 +90,9 @@ class SteeringManager:
             config_hash: Deterministic hash identifying the config.
             vectors: ``{hook_point_str: {layer_idx: [floats]}}``
             phase: ``"prefill"`` or ``"decode"``
+            locally_owned_layers: Optional set of layer indices physically
+                owned by this worker. When provided, vector tensors for
+                non-local layers are not materialized on this rank.
 
         If the ``(config_hash, phase)`` pair is already registered,
         increments refcount and returns the existing row. Otherwise
@@ -111,14 +116,24 @@ class SteeringManager:
         row = self.free_rows.pop()
         self.config_to_row[key] = row
         self.config_refcounts[key] = 1
-        # Store per-request vectors as tensors, keyed by hook point
+        # Store per-request vectors as tensors, keyed by hook point.  In
+        # pipeline-parallel setups each worker only needs tensors for the
+        # layers it owns, but the config row is still allocated/refcounted
+        # on every worker so request lifecycle bookkeeping remains aligned.
         stored: dict[str, dict[int, torch.Tensor]] = {}
         for hook_point, layer_vecs in vectors.items():
+            local_layer_vecs = {
+                layer_idx: vec
+                for layer_idx, vec in layer_vecs.items()
+                if locally_owned_layers is None or layer_idx in locally_owned_layers
+            }
+            if not local_layer_vecs:
+                continue
             stored[hook_point] = {
                 layer_idx: torch.tensor(
                     vec, dtype=torch.float32, device=self.device
                 ).unsqueeze(0)
-                for layer_idx, vec in layer_vecs.items()
+                for layer_idx, vec in local_layer_vecs.items()
             }
         self.config_vectors[key] = stored
         # New row content needs to be written into the per-layer tables on

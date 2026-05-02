@@ -189,6 +189,39 @@ class TestRegisterRelease:
         row2 = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
         assert row1 == row2
 
+    def test_locally_owned_layers_filters_stored_vectors(self):
+        """Non-local layer vectors should not be materialized on this worker."""
+        mgr = _make_manager()
+        vectors = {
+            _HP: {
+                0: [1.0] * HIDDEN_SIZE,
+                1: [2.0] * HIDDEN_SIZE,
+            }
+        }
+        row = mgr.register_config(
+            config_hash=42,
+            vectors=vectors,
+            phase="prefill",
+            locally_owned_layers=frozenset({1}),
+        )
+        assert row >= 3
+        stored = mgr.config_vectors[(42, "prefill")][_HP]
+        assert set(stored) == {1}
+
+    def test_locally_owned_layers_still_allocates_row_when_none_match(self):
+        """A worker with no matching local layers still tracks lifecycle state."""
+        mgr = _make_manager()
+        vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        row = mgr.register_config(
+            config_hash=42,
+            vectors=vectors,
+            phase="prefill",
+            locally_owned_layers=frozenset({2}),
+        )
+        assert row >= 3
+        assert mgr.config_to_row[(42, "prefill")] == row
+        assert mgr.config_vectors[(42, "prefill")] == {}
+
 
 # ---------------------------------------------------------------------------
 # TestGetRow
