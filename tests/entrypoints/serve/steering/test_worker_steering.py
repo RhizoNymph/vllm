@@ -10,6 +10,7 @@ scale format (bare list vs dict with scale).
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,7 +35,7 @@ class FakeDecoderLayer(nn.Module):
         # Default hook point buffers (post_mlp) — table + index only
         self.register_buffer(
             "steering_table_post_mlp",
-            torch.zeros(max_steering_configs + 2, hidden_size),
+            torch.zeros(max_steering_configs + 3, hidden_size),
             persistent=False,
         )
         self.register_buffer(
@@ -634,6 +635,64 @@ class TestGetSteeringStatus:
         # Decode norm from manager
         expected_decode = round(torch.tensor(decode_vec).norm().item(), 6)
         assert layer_status["decode_norm"] == expected_decode
+
+
+# --- lazy init replay ---
+
+
+class TestLazyGlobalReplay:
+    def test_pending_globals_replay_to_manager_and_tables(self):
+        """Vectors set before manager init should replay on lazy init."""
+        model = FakeModel(num_layers=1, hidden_size=8, max_steering_configs=4)
+        runner = FakeModelRunner(model)
+
+        # Simulate the real lazy-init state: GPUModelRunner does not have
+        # _steering_manager until _update_steering_buffers creates it.
+        delattr(runner, "_steering_manager")
+        runner.vllm_config = SimpleNamespace(
+            steering_config=SimpleNamespace(max_steering_configs=4)
+        )
+        runner.input_batch = SimpleNamespace(
+            num_reqs=0,
+            req_ids=[],
+        )
+        runner.requests = {}
+
+        vec = [2.0] * 8
+        assert runner.set_steering_vectors(vectors={_HP: {0: vec}}) == [0]
+        assert runner._pending_steering_globals is not None
+
+        runner._update_steering_buffers(SimpleNamespace(num_scheduled_tokens={}))
+
+        assert runner._pending_steering_globals is None
+        assert runner._steering_manager is not None
+        mgr = runner._steering_manager
+        assert torch.allclose(
+            mgr.global_base_vectors[_HP][0],
+            torch.tensor(vec, dtype=torch.float32),
+        )
+
+        table = model.layers[0].steering_table_post_mlp
+        expected = torch.tensor(vec, dtype=table.dtype)
+        assert torch.allclose(table[1], expected)
+        assert torch.allclose(table[2], expected)
+
+
+# --- concrete model runner wiring ---
+
+
+class TestConcreteGPUModelRunner:
+    def test_gpu_model_runner_exposes_worker_forwarded_methods(self):
+        """GPUWorker forwards these names to its model_runner."""
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+        for method_name in (
+            "set_steering_vectors",
+            "clear_steering_vectors",
+            "list_steerable_layers",
+            "get_steering_status",
+        ):
+            assert callable(getattr(GPUModelRunner, method_name, None))
 
 
 # --- no model runner ---

@@ -87,6 +87,48 @@ class TestSetSteeringBase:
         assert body["status"] == "ok"
         assert body["layers_updated"] == [0]
 
+    def test_set_rpc_contract(self, client, engine):
+        """Set validates then applies using the worker steering RPC."""
+        engine.collective_rpc.side_effect = [[[0]], [[0]]]
+        engine.reset_prefix_cache.return_value = True
+
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "vectors": {_HP: {"0": [1.0]}},
+                "prefill_vectors": {_HP: {"0": [2.0]}},
+                "decode_vectors": {_HP: {"0": [3.0]}},
+                "replace": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert engine.collective_rpc.call_count == 2
+
+        validate_call = engine.collective_rpc.call_args_list[0]
+        assert validate_call.args == ("set_steering_vectors",)
+        validate_kwargs = validate_call.kwargs["kwargs"]
+        assert validate_kwargs == {
+            "vectors": {_HP: {0: [1.0]}},
+            "prefill_vectors": {_HP: {0: [2.0]}},
+            "decode_vectors": {_HP: {0: [3.0]}},
+            "validate_only": True,
+        }
+
+        apply_call = engine.collective_rpc.call_args_list[1]
+        assert apply_call.args == ("set_steering_vectors",)
+        apply_kwargs = apply_call.kwargs["kwargs"]
+        assert apply_kwargs == {
+            "vectors": {_HP: {0: [1.0]}},
+            "prefill_vectors": {_HP: {0: [2.0]}},
+            "decode_vectors": {_HP: {0: [3.0]}},
+            "replace": True,
+            "validate_only": False,
+        }
+        engine.reset_prefix_cache.assert_awaited_once_with(
+            reset_running_requests=True
+        )
+
     def test_set_multiple_layers(self, client, engine):
         engine.collective_rpc.side_effect = [[[0, 3]], [[0, 3]]]
         resp = client.post(
