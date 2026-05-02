@@ -60,6 +60,7 @@ class SteeringModelRunnerMixin:
     # non-local tensors are never materialized on this rank.  Under TP/
     # single-worker execution this equals the full model's layer set.
     _locally_owned_layers: frozenset[int]
+    _locally_owned_layer_hidden_sizes: dict[int, int]
 
     # Attributes provided by the concrete model runner that mixes this
     # class in.  Declared here purely so static type checking can see
@@ -112,6 +113,9 @@ class SteeringModelRunnerMixin:
             # owns.  Used to skip tensor materialization for non-local
             # layers when passing vectors into the SteeringManager.
             self._locally_owned_layers = frozenset(steerable.keys())
+            self._locally_owned_layer_hidden_sizes = (
+                self._get_steering_layer_hidden_sizes(steerable)
+            )
 
             if steerable:
                 steering_config = getattr(self.vllm_config, "steering_config", None)
@@ -171,6 +175,9 @@ class SteeringModelRunnerMixin:
                                     eff,
                                     phase="prefill",
                                     locally_owned_layers=(self._locally_owned_layers),
+                                    local_layer_hidden_sizes=(
+                                        self._locally_owned_layer_hidden_sizes
+                                    ),
                                 )
                         self._req_steering_phase[rid] = "prefill"
                     else:
@@ -185,6 +192,9 @@ class SteeringModelRunnerMixin:
                                     eff,
                                     phase="decode",
                                     locally_owned_layers=(self._locally_owned_layers),
+                                    local_layer_hidden_sizes=(
+                                        self._locally_owned_layer_hidden_sizes
+                                    ),
                                 )
                         self._req_steering_phase[rid] = "decode"
             else:
@@ -328,6 +338,9 @@ class SteeringModelRunnerMixin:
                         sp.effective_decode_steering,
                         phase="decode",
                         locally_owned_layers=self._locally_owned_layers,
+                        local_layer_hidden_sizes=(
+                            self._locally_owned_layer_hidden_sizes
+                        ),
                     )
 
         self._req_steering_phase[req_id] = "decode"
@@ -370,6 +383,7 @@ class SteeringModelRunnerMixin:
             sp.effective_prefill_steering,
             phase="prefill",
             locally_owned_layers=self._locally_owned_layers,
+            local_layer_hidden_sizes=self._locally_owned_layer_hidden_sizes,
         )
 
     # -----------------------------------------------------------------------
@@ -430,6 +444,7 @@ class SteeringModelRunnerMixin:
                     sp.effective_decode_steering,
                     phase="decode",
                     locally_owned_layers=self._locally_owned_layers,
+                    local_layer_hidden_sizes=self._locally_owned_layer_hidden_sizes,
                 )
             self._req_steering_phase[req_id] = "decode"
         else:
@@ -444,6 +459,7 @@ class SteeringModelRunnerMixin:
                     sp.effective_prefill_steering,
                     phase="prefill",
                     locally_owned_layers=self._locally_owned_layers,
+                    local_layer_hidden_sizes=self._locally_owned_layer_hidden_sizes,
                 )
             self._req_steering_phase[req_id] = "prefill"
 
@@ -484,6 +500,7 @@ class SteeringModelRunnerMixin:
                 sp.effective_prefill_steering,
                 phase="prefill",
                 locally_owned_layers=self._locally_owned_layers,
+                local_layer_hidden_sizes=self._locally_owned_layer_hidden_sizes,
             )
             self._req_steering_phase[req_id] = "prefill"
         elif new_prefill_hash == 0 and new_decode_hash == 0:
@@ -518,6 +535,20 @@ class SteeringModelRunnerMixin:
     def list_steerable_layers(self) -> set[int]:
         """Return layer indices that can receive steering vectors."""
         return set(self._steerable_layers().keys())
+
+    @staticmethod
+    def _get_steering_layer_hidden_sizes(
+        steerable_layers: dict[int, nn.Module],
+    ) -> dict[int, int]:
+        """Return hidden size for each local steerable layer."""
+        hidden_sizes: dict[int, int] = {}
+        for layer_idx, layer in steerable_layers.items():
+            for table_attr in HOOK_POINT_TABLE_ATTR.values():
+                if hasattr(layer, table_attr):
+                    table = getattr(layer, table_attr)
+                    hidden_sizes[layer_idx] = int(table.shape[1])
+                    break
+        return hidden_sizes
 
     def set_steering_vectors(
         self,

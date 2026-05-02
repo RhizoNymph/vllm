@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm.exceptions import SteeringVectorError
 from vllm.model_executor.layers.steering import DEFAULT_HOOK_POINT
 from vllm.v1.worker.steering_manager import SteeringManager
 
@@ -220,6 +221,34 @@ class TestRegisterRelease:
         )
         assert row >= 3
         assert mgr.config_to_row[(42, "prefill")] == row
+        assert mgr.config_vectors[(42, "prefill")] == {}
+
+    def test_local_vector_size_validated_before_row_allocation(self):
+        """Bad local dimensions should fail before any row state is mutated."""
+        mgr = _make_manager()
+        with pytest.raises(SteeringVectorError, match="expected vector of size 8"):
+            mgr.register_config(
+                config_hash=42,
+                vectors={_HP: {0: [1.0] * 3}},
+                phase="prefill",
+                locally_owned_layers=frozenset({0}),
+                local_layer_hidden_sizes={0: HIDDEN_SIZE},
+            )
+        assert (42, "prefill") not in mgr.config_to_row
+        assert (42, "prefill") not in mgr.config_vectors
+        assert mgr.num_active_configs == 0
+
+    def test_non_local_bad_vector_size_is_ignored(self):
+        """Remote layer dimensions are validated by the owning worker."""
+        mgr = _make_manager()
+        row = mgr.register_config(
+            config_hash=42,
+            vectors={_HP: {0: [1.0] * 3}},
+            phase="prefill",
+            locally_owned_layers=frozenset({1}),
+            local_layer_hidden_sizes={1: HIDDEN_SIZE},
+        )
+        assert row >= 3
         assert mgr.config_vectors[(42, "prefill")] == {}
 
 

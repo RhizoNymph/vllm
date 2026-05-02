@@ -15,10 +15,11 @@ global effective vectors for each phase.
 """
 
 from collections import defaultdict
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 
 import torch
 
+from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import HOOK_POINT_TABLE_ATTR
 
@@ -83,6 +84,7 @@ class SteeringManager:
         vectors: dict[str, dict[int, list[float]]],
         phase: str = "prefill",
         locally_owned_layers: Collection[int] | None = None,
+        local_layer_hidden_sizes: Mapping[int, int] | None = None,
     ) -> int:
         """Register a steering config, return its table row index.
 
@@ -93,6 +95,9 @@ class SteeringManager:
             locally_owned_layers: Optional set of layer indices physically
                 owned by this worker. When provided, vector tensors for
                 non-local layers are not materialized on this rank.
+            local_layer_hidden_sizes: Optional hidden sizes for local layer
+                indices. When provided, local vectors are validated before
+                any row/refcount state is mutated.
 
         If the ``(config_hash, phase)`` pair is already registered,
         increments refcount and returns the existing row. Otherwise
@@ -106,6 +111,45 @@ class SteeringManager:
             self.config_refcounts[key] += 1
             return self.config_to_row[key]
 
+        # Store per-request vectors as tensors, keyed by hook point.  In
+        # pipeline-parallel setups each worker only needs tensors for the
+        # layers it owns, but the config row is still allocated/refcounted
+        # on every worker so request lifecycle bookkeeping remains aligned.
+        # Build and validate this before mutating row state so bad request
+        # vectors fail cleanly at registration rather than later in
+        # populate_steering_tables().
+        stored: dict[str, dict[int, torch.Tensor]] = {}
+        for hook_point, layer_vecs in vectors.items():
+            local_layer_vecs = {
+                layer_idx: vec
+                for layer_idx, vec in layer_vecs.items()
+                if locally_owned_layers is None or layer_idx in locally_owned_layers
+            }
+            if not local_layer_vecs:
+                continue
+            stored_hook: dict[int, torch.Tensor] = {}
+            for layer_idx, vec in local_layer_vecs.items():
+                expected_size = (
+                    None
+                    if local_layer_hidden_sizes is None
+                    else local_layer_hidden_sizes.get(layer_idx)
+                )
+                if expected_size is not None and len(vec) != expected_size:
+                    raise SteeringVectorError(
+                        f"Layer {layer_idx} hook {hook_point!r} expected "
+                        f"vector of size {expected_size}, got {len(vec)}."
+                    )
+                tensor = torch.tensor(
+                    vec, dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
+                if not torch.isfinite(tensor).all():
+                    raise SteeringVectorError(
+                        f"Layer {layer_idx} hook {hook_point!r} has "
+                        "non-finite values."
+                    )
+                stored_hook[layer_idx] = tensor
+            stored[hook_point] = stored_hook
+
         if not self.free_rows:
             raise RuntimeError(
                 f"No free steering table rows. max_steering_configs="
@@ -116,25 +160,6 @@ class SteeringManager:
         row = self.free_rows.pop()
         self.config_to_row[key] = row
         self.config_refcounts[key] = 1
-        # Store per-request vectors as tensors, keyed by hook point.  In
-        # pipeline-parallel setups each worker only needs tensors for the
-        # layers it owns, but the config row is still allocated/refcounted
-        # on every worker so request lifecycle bookkeeping remains aligned.
-        stored: dict[str, dict[int, torch.Tensor]] = {}
-        for hook_point, layer_vecs in vectors.items():
-            local_layer_vecs = {
-                layer_idx: vec
-                for layer_idx, vec in layer_vecs.items()
-                if locally_owned_layers is None or layer_idx in locally_owned_layers
-            }
-            if not local_layer_vecs:
-                continue
-            stored[hook_point] = {
-                layer_idx: torch.tensor(
-                    vec, dtype=torch.float32, device=self.device
-                ).unsqueeze(0)
-                for layer_idx, vec in local_layer_vecs.items()
-            }
         self.config_vectors[key] = stored
         # New row content needs to be written into the per-layer tables on
         # the next populate call. (Refcount-hit path doesn't set this flag
@@ -285,11 +310,14 @@ class SteeringManager:
         if first_layer is None:
             self._tables_dirty = False
             return
-        first_attr = next(iter(HOOK_POINT_TABLE_ATTR.values()))
-        if not hasattr(first_layer, first_attr):
+        first_table: torch.Tensor | None = None
+        for table_attr in HOOK_POINT_TABLE_ATTR.values():
+            if hasattr(first_layer, table_attr):
+                first_table = getattr(first_layer, table_attr)
+                break
+        if first_table is None:
             self._tables_dirty = False
             return
-        first_table = getattr(first_layer, first_attr)
         device = first_table.device
         hidden_size = first_table.shape[1]
         # Snapshot config_to_row ordering once — this defines which row
