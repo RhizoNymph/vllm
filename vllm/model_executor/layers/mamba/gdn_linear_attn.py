@@ -62,7 +62,6 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
-from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
@@ -121,9 +120,9 @@ def fi_chunk_gated_delta_rule(
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
         super().__init__()
-        backend_cfg = get_current_vllm_config().additional_config.get(
-            "gdn_prefill_backend", "auto"
-        )
+        additional_config = get_current_vllm_config().additional_config
+        assert isinstance(additional_config, dict)
+        backend_cfg = additional_config.get("gdn_prefill_backend", "auto")
         backend = str(backend_cfg).strip().lower()
 
         supports_flashinfer = (
@@ -144,15 +143,14 @@ class ChunkGatedDeltaRule(CustomOp):
             use_flashinfer = supports_flashinfer
 
         if use_flashinfer:
-            logger.info_once("Using FlashInfer GDN prefill kernel", scope="local")
+            logger.info_once("Using FlashInfer GDN prefill kernel")
             logger.info_once(
                 "FlashInfer GDN prefill kernel is JIT-compiled; first run may "
                 "take a while to compile. Set `--gdn-prefill-backend triton` to "
                 "avoid JIT compile time.",
-                scope="local",
             )
         else:
-            logger.info_once("Using Triton/FLA GDN prefill kernel", scope="local")
+            logger.info_once("Using Triton/FLA GDN prefill kernel")
 
         self._forward_method = (
             self.forward_cuda if use_flashinfer else self.forward_native
@@ -357,11 +355,19 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
+        output_gate_type = getattr(config, "output_gate_type", "silu")
+        if output_gate_type == "swish":
+            output_gate_type = "silu"
+        assert output_gate_type in ["silu", "swish", "sigmoid"], (
+            f"unsupported {output_gate_type=}"
+        )
+
         self.norm = RMSNormGated(
             self.head_v_dim,
             eps=self.layer_norm_epsilon,
             group_size=None,
             norm_before_gate=True,
+            activation=output_gate_type,
             device=current_platform.current_device(),
         )
 
@@ -612,6 +618,57 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         # Part 2: Core Attention
         # ============================================================
+        core_attn_out = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        z = torch.empty_like(core_attn_out)
+
+        torch.ops.vllm.gdn_attention_core_xpu(
+            core_attn_out,
+            z,
+            projected_states_qkvz,
+            projected_states_ba,
+            self.prefix,
+        )
+
+        # ============================================================
+        # Part 3: Output Projection
+        # ============================================================
+        z_shape_og = z.shape
+        # Reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        output[:num_tokens], _ = self.out_proj(core_attn_out)
+
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ):
+        """
+        Forward pass with three parts:
+        1. Input projection
+        2. Core attention (custom op)
+        3. Output projection
+        """
+        num_tokens = hidden_states.size(0)
+
+        assert not hasattr(self, "in_proj_qkv"), "lora isn't supported on XPU."
+
+        # ============================================================
+        # Part 1: Input Projection
+        # ============================================================
+        projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+
+        # ============================================================
+        # Part 2: Core Attention
+        # ============================================================
         forward_context = get_forward_context()
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
         core_attn_out = torch.zeros(
@@ -784,16 +841,16 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         core_attn_out: torch.Tensor,
     ):
         forward_context = get_forward_context()
-        attn_metadata: AttentionMetadata = forward_context.attn_metadata
+        attn_metadata_raw = forward_context.attn_metadata
 
-        if attn_metadata is None:
+        if attn_metadata_raw is None:
             # V1 profile run — warm up prefill kernels so that
             # autotuning completes before KV cache allocation.
             self._warmup_prefill_kernels(mixed_qkv)
             return
 
-        assert isinstance(attn_metadata, dict)
-        attn_metadata = attn_metadata[self.prefix]
+        assert isinstance(attn_metadata_raw, dict)
+        attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
         if (
@@ -852,14 +909,16 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            # spec_state_indices_tensor is always set when spec_sequence_masks is set
+            assert spec_state_indices_tensor is not None
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][
-                    : attn_metadata.num_spec_decodes
+                conv_state_indices=spec_state_indices_tensor[:, 0][  # type: ignore[index]
+                    : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
@@ -892,8 +951,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[
-                    : attn_metadata.num_actual_tokens
+                conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+                    : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
                 ],
                 validate_data=True,
             )
@@ -957,8 +1016,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     v=value_spec,
                     initial_state=ssm_state,
                     inplace_final_state=True,
-                    cu_seqlens=spec_query_start_loc[
-                        : attn_metadata.num_spec_decodes + 1
+                    cu_seqlens=spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_spec_decodes
+                        + 1  # type: ignore[attr-defined]
                     ],
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
@@ -970,8 +1030,10 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-            initial_state[~has_initial_state, ...] = 0
+            assert non_spec_state_indices_tensor is not None
+            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()  # type: ignore[index]
+            assert has_initial_state is not None
+            initial_state[~has_initial_state, ...] = 0  # type: ignore[operator]
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1004,8 +1066,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     v=value_non_spec,
                     initial_state=ssm_state,
                     inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : attn_metadata.num_decodes + 1
+                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_decodes
+                        + 1  # type: ignore[attr-defined]
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
@@ -1065,7 +1128,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             conv_weights,
             self.conv1d.bias,
             self.activation,
-            conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
+            conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             validate_data=False,
         )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
@@ -1078,7 +1141,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             scale=self.head_k_dim**-0.5,
             initial_state=ssm_state,
             out=out_buf,
-            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
+            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
         )
         return

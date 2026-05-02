@@ -570,11 +570,6 @@ class CompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: list[CompletionResponseStreamChoice]
     usage: UsageInfo | None = Field(default=None)
-    capture_results: dict[str, CaptureResultResponse] | None = Field(
-        default=None,
-        description=(
-            "Per-consumer capture results, sent on the final SSE frame "
-            "alongside the final usage block. Omitted when no consumer "
-            "produced a result for this request."
-        ),
-    )
+    # Set only on the final chunk of a stream to mirror non-streaming responses
+    # without the per-chunk serialization overhead.
+    system_fingerprint: str | None = None
