@@ -18,6 +18,7 @@ import torch.nn as nn
 
 from vllm.exceptions import SteeringVectorError
 from vllm.model_executor.layers.steering import DEFAULT_HOOK_POINT
+from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.steering_manager import SteeringManager
 from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 from vllm.v1.worker.worker_base import WorkerBase
@@ -80,6 +81,42 @@ class FakeModelRunner(SteeringModelRunnerMixin):
 
     def get_model(self) -> nn.Module:
         return self._model
+
+
+def _make_runner_for_update_states(
+    model: nn.Module,
+    *,
+    req_ids: list[str],
+    sampling_params: dict[str, SamplingParams],
+    num_computed_tokens: list[int],
+    num_prompt_tokens: list[int],
+    max_steering_configs: int = 4,
+) -> FakeModelRunner:
+    """Build a FakeModelRunner with enough state for _update_steering_buffers."""
+    runner = FakeModelRunner(model)
+    delattr(runner, "_steering_manager")
+    runner.vllm_config = SimpleNamespace(
+        steering_config=SimpleNamespace(max_steering_configs=max_steering_configs)
+    )
+    runner.requests = {
+        req_id: SimpleNamespace(sampling_params=sp)
+        for req_id, sp in sampling_params.items()
+    }
+    runner.input_batch = SimpleNamespace(
+        num_reqs=len(req_ids),
+        req_ids=req_ids,
+        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+        num_computed_tokens_cpu=num_computed_tokens,
+        num_prompt_tokens=num_prompt_tokens,
+        request_prefill_steering_hash=[
+            sampling_params[req_id].prefill_steering_config_hash
+            for req_id in req_ids
+        ],
+        request_decode_steering_hash=[
+            sampling_params[req_id].decode_steering_config_hash for req_id in req_ids
+        ],
+    )
+    return runner
 
 
 class FakeWorker(WorkerBase):
@@ -676,6 +713,112 @@ class TestLazyGlobalReplay:
         expected = torch.tensor(vec, dtype=table.dtype)
         assert torch.allclose(table[1], expected)
         assert torch.allclose(table[2], expected)
+
+
+# --- per-request lifecycle correctness ---
+
+
+class TestPerRequestLifecycle:
+    def test_prefill_to_decode_transition_uses_phase_rows(self):
+        """Last prompt token uses prefill steering; next step uses decode."""
+        model = FakeModel(num_layers=1, hidden_size=8, max_steering_configs=4)
+        sp = SamplingParams(
+            prefill_steering_vectors={_HP: {0: [1.0] * 8}},
+            decode_steering_vectors={_HP: {0: [2.0] * 8}},
+        )
+        runner = _make_runner_for_update_states(
+            model,
+            req_ids=["req"],
+            sampling_params={"req": sp},
+            num_computed_tokens=[7],
+            num_prompt_tokens=[8],
+        )
+
+        runner._update_steering_buffers(
+            SimpleNamespace(num_scheduled_tokens={"req": 1})
+        )
+
+        mgr = runner._steering_manager
+        assert mgr is not None
+        assert (sp.prefill_steering_config_hash, "prefill") not in mgr.config_to_row
+        assert (sp.decode_steering_config_hash, "decode") in mgr.config_to_row
+
+        row = int(model.layers[0].steering_index[0])
+        assert row >= 3
+        # Tables were populated before the transition handler registered
+        # decode, so this step's scheduled prompt token still sees prefill.
+        assert torch.allclose(
+            model.layers[0].steering_table_post_mlp[row],
+            torch.tensor([1.0] * 8),
+        )
+
+        runner.input_batch.num_computed_tokens_cpu[0] = 8
+        runner._update_steering_buffers(
+            SimpleNamespace(num_scheduled_tokens={"req": 1})
+        )
+
+        decode_row = int(model.layers[0].steering_index[0])
+        assert decode_row == mgr.config_to_row[(sp.decode_steering_config_hash, "decode")]
+        assert torch.allclose(
+            model.layers[0].steering_table_post_mlp[decode_row],
+            torch.tensor([2.0] * 8),
+        )
+
+    def test_batch_isolation_uses_per_request_rows(self):
+        """Different requests in one batch should receive distinct row slices."""
+        model = FakeModel(num_layers=1, hidden_size=8, max_steering_configs=4)
+        sp_a = SamplingParams(decode_steering_vectors={_HP: {0: [1.0] * 8}})
+        sp_b = SamplingParams(decode_steering_vectors={_HP: {0: [3.0] * 8}})
+        sp_c = SamplingParams()
+        runner = _make_runner_for_update_states(
+            model,
+            req_ids=["a", "b", "c"],
+            sampling_params={"a": sp_a, "b": sp_b, "c": sp_c},
+            num_computed_tokens=[1, 1, 1],
+            num_prompt_tokens=[1, 1, 1],
+        )
+
+        runner._update_steering_buffers(
+            SimpleNamespace(num_scheduled_tokens={"a": 2, "b": 1, "c": 3})
+        )
+
+        mgr = runner._steering_manager
+        assert mgr is not None
+        row_a = mgr.config_to_row[(sp_a.decode_steering_config_hash, "decode")]
+        row_b = mgr.config_to_row[(sp_b.decode_steering_config_hash, "decode")]
+        index = model.layers[0].steering_index
+
+        assert index[:2].tolist() == [row_a, row_a]
+        assert index[2:3].tolist() == [row_b]
+        # Unsteered decode requests use row 2, the global decode/no-op row.
+        assert index[3:6].tolist() == [2, 2, 2]
+        assert torch.count_nonzero(index[6:]).item() == 0
+
+        table = model.layers[0].steering_table_post_mlp
+        assert torch.allclose(table[row_a], torch.tensor([1.0] * 8))
+        assert torch.allclose(table[row_b], torch.tensor([3.0] * 8))
+        assert torch.allclose(table[2], torch.zeros(8))
+
+    def test_bad_per_request_dimension_fails_before_forward(self):
+        """Bad local per-request vectors should fail during registration."""
+        model = FakeModel(num_layers=1, hidden_size=8, max_steering_configs=4)
+        sp = SamplingParams(prefill_steering_vectors={_HP: {0: [1.0] * 3}})
+        runner = _make_runner_for_update_states(
+            model,
+            req_ids=["req"],
+            sampling_params={"req": sp},
+            num_computed_tokens=[0],
+            num_prompt_tokens=[4],
+        )
+
+        with pytest.raises(SteeringVectorError, match="expected vector of size 8"):
+            runner._update_steering_buffers(
+                SimpleNamespace(num_scheduled_tokens={"req": 1})
+            )
+
+        mgr = runner._steering_manager
+        assert mgr is not None
+        assert mgr.num_active_configs == 0
 
 
 # --- concrete model runner wiring ---
