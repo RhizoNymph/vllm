@@ -9,8 +9,12 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
-from vllm.model_executor.layers.steering import HOOK_POINT_TABLE_ATTR
+from vllm.model_executor.layers.steering import (
+    HOOK_POINT_TABLE_ATTR,
+    VALID_HOOK_POINT_NAMES,
+)
 from vllm.v1.worker.steering_manager import SteeringManager
 
 if TYPE_CHECKING:
@@ -41,6 +45,9 @@ class SteeringModelRunnerMixin:
     # as the lazy-init trigger, so assigning a class-level default would
     # make initialisation skip permanently.
     _steerable_layers_cache: dict[int, nn.Module] | None = None
+    _pending_steering_globals: list[
+        tuple[dict[str, dict[int, torch.Tensor]], str]
+    ] | None = None
     # The attributes below are populated by the lazy init in
     # ``_update_steering_buffers`` and are only read after that path
     # has run.  Test fixtures that exercise the mixin in isolation
@@ -132,6 +139,12 @@ class SteeringModelRunnerMixin:
                 # row references. Used by the no-active-state short-circuit
                 # to know if it needs to zero the index on transition.
                 self._steering_index_dirty: bool = False
+
+                pending_globals = getattr(self, "_pending_steering_globals", None)
+                if pending_globals:
+                    for vectors, phase in pending_globals:
+                        self._apply_global_vectors_to_manager(vectors, phase)
+                    self._pending_steering_globals = None
 
                 # Register any configs that were added to the batch
                 # before the manager existed (first-step race).
@@ -482,3 +495,191 @@ class SteeringModelRunnerMixin:
             # request re-enters prefill; transition to decode
             # will handle decode registration.
             self._req_steering_phase[req_id] = "prefill"
+
+    # -----------------------------------------------------------------------
+    # Global steering API called by worker RPC endpoints
+    # -----------------------------------------------------------------------
+
+    def _steerable_layers(self) -> dict[int, nn.Module]:
+        """Return decoder layers that expose at least one steering table."""
+        if self._steerable_layers_cache is not None:
+            return self._steerable_layers_cache
+
+        steerable: dict[int, nn.Module] = {}
+        model = self.get_model()
+        for mod in model.modules():
+            if not hasattr(mod, "layer_idx"):
+                continue
+            if any(hasattr(mod, attr) for attr in HOOK_POINT_TABLE_ATTR.values()):
+                steerable[int(mod.layer_idx)] = mod
+        self._steerable_layers_cache = steerable
+        return steerable
+
+    def list_steerable_layers(self) -> set[int]:
+        """Return layer indices that can receive steering vectors."""
+        return set(self._steerable_layers().keys())
+
+    def set_steering_vectors(
+        self,
+        vectors: dict[str, dict[int, list[float]]] | None = None,
+        prefill_vectors: dict[str, dict[int, list[float]]] | None = None,
+        decode_vectors: dict[str, dict[int, list[float]]] | None = None,
+        replace: bool = False,
+        validate_only: bool = False,
+    ) -> list[int]:
+        """Validate and set global steering vectors.
+
+        ``vectors`` are base vectors used in both phases; ``prefill_vectors``
+        and ``decode_vectors`` are phase-specific global additions.
+        """
+        tier_specs = [
+            (vectors, "base"),
+            (prefill_vectors, "prefill"),
+            (decode_vectors, "decode"),
+        ]
+
+        validated: list[tuple[dict[str, dict[int, torch.Tensor]], str]] = []
+        updated_layers: set[int] = set()
+        for spec, phase in tier_specs:
+            normalized = self._validate_global_steering_spec(spec)
+            if normalized:
+                validated.append((normalized, phase))
+                for layer_vecs in normalized.values():
+                    updated_layers.update(layer_vecs.keys())
+
+        if validate_only:
+            return sorted(updated_layers)
+
+        if replace:
+            self.clear_steering_vectors()
+
+        for normalized, phase in validated:
+            self._set_global_steering_vectors(normalized, phase)
+
+        return sorted(updated_layers)
+
+    def clear_steering_vectors(self) -> None:
+        """Clear all global steering vectors and pending lazy-init state."""
+        self._pending_steering_globals = None
+        mgr = getattr(self, "_steering_manager", None)
+        if mgr is not None:
+            mgr.clear_global_vectors()
+
+    def get_steering_status(self) -> dict[int, dict[str, dict[str, float]]]:
+        """Return per-layer, per-hook norms for active global steering."""
+        status: dict[int, dict[str, dict[str, float]]] = {}
+        mgr = getattr(self, "_steering_manager", None)
+        if mgr is not None:
+            self._add_global_status(status, mgr.global_base_vectors, "base")
+            self._add_global_status(status, mgr.global_prefill_vectors, "prefill")
+            self._add_global_status(status, mgr.global_decode_vectors, "decode")
+
+        pending_globals = getattr(self, "_pending_steering_globals", None)
+        if pending_globals:
+            for vectors, phase in pending_globals:
+                self._add_global_status(status, vectors, phase)
+
+        return status
+
+    def _validate_global_steering_spec(
+        self, spec: dict[str, dict[int, list[float]]] | None
+    ) -> dict[str, dict[int, torch.Tensor]]:
+        """Validate one global steering tier and convert values to tensors."""
+        if not spec:
+            return {}
+
+        steerable_layers = self._steerable_layers()
+        normalized: dict[str, dict[int, torch.Tensor]] = {}
+        for hook_point, layer_vecs in spec.items():
+            if hook_point not in VALID_HOOK_POINT_NAMES:
+                raise SteeringVectorError(f"Invalid hook point: {hook_point!r}")
+
+            table_attr = self._table_attr_for_hook_point(hook_point)
+            hook_result: dict[int, torch.Tensor] = {}
+            for layer_idx, vector in layer_vecs.items():
+                layer = steerable_layers.get(layer_idx)
+                if layer is None:
+                    continue
+                if not hasattr(layer, table_attr):
+                    raise SteeringVectorError(
+                        f"Hook point {hook_point!r} is not active for "
+                        f"layer {layer_idx}."
+                    )
+
+                table = getattr(layer, table_attr)
+                expected_size = int(table.shape[1])
+                if len(vector) != expected_size:
+                    raise SteeringVectorError(
+                        f"Layer {layer_idx} hook {hook_point!r} expected "
+                        f"vector of size {expected_size}, got {len(vector)}."
+                    )
+
+                tensor = torch.tensor(
+                    vector, dtype=torch.float32, device=table.device
+                )
+                if not torch.isfinite(tensor).all():
+                    raise SteeringVectorError(
+                        f"Layer {layer_idx} hook {hook_point!r} has "
+                        "non-finite values."
+                    )
+                hook_result[layer_idx] = tensor
+
+            if hook_result:
+                normalized[hook_point] = hook_result
+        return normalized
+
+    @staticmethod
+    def _table_attr_for_hook_point(hook_point: str) -> str:
+        for hp, attr in HOOK_POINT_TABLE_ATTR.items():
+            if hp.value == hook_point:
+                return attr
+        raise SteeringVectorError(f"Invalid hook point: {hook_point!r}")
+
+    def _set_global_steering_vectors(
+        self,
+        vectors: dict[str, dict[int, torch.Tensor]],
+        phase: str,
+    ) -> None:
+        mgr = getattr(self, "_steering_manager", None)
+        if mgr is None:
+            pending = getattr(self, "_pending_steering_globals", None)
+            if pending is None:
+                pending = []
+                self._pending_steering_globals = pending
+            pending.append((vectors, phase))
+            return
+        self._apply_global_vectors_to_manager(vectors, phase)
+
+    def _apply_global_vectors_to_manager(
+        self,
+        vectors: dict[str, dict[int, torch.Tensor]],
+        phase: str,
+    ) -> None:
+        mgr = getattr(self, "_steering_manager", None)
+        if mgr is None:
+            return
+        for hook_point, layer_vecs in vectors.items():
+            for layer_idx, vector in layer_vecs.items():
+                mgr.update_global_vectors(
+                    hook_point,
+                    layer_idx,
+                    vector,
+                    phase=phase,
+                )
+
+    @staticmethod
+    def _add_global_status(
+        status: dict[int, dict[str, dict[str, float]]],
+        vectors: dict[str, dict[int, torch.Tensor]],
+        phase: str,
+    ) -> None:
+        key = {
+            "base": "norm",
+            "prefill": "prefill_norm",
+            "decode": "decode_norm",
+        }[phase]
+        for hook_point, layer_vecs in vectors.items():
+            for layer_idx, vector in layer_vecs.items():
+                layer_status = status.setdefault(layer_idx, {})
+                hook_status = layer_status.setdefault(hook_point, {})
+                hook_status[key] = round(vector.norm().item(), 6)
