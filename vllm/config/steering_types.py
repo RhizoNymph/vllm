@@ -60,17 +60,32 @@ def normalize_layer_entry(entry: SteeringLayerEntry) -> tuple[list[float], float
 
 
 def _scale_vector(vec: list[float], scale: float) -> list[float]:
-    """Multiply each element of *vec* by *scale*."""
-    return [v * scale for v in vec]
+    """Multiply each element of *vec* by *scale*.
+
+    Uses numpy under the hood for vectorised multiplication; the public
+    return type is preserved as ``list[float]`` so downstream callers
+    (including ``hash_steering_config``) see identical values to the
+    legacy list-comprehension implementation. Arithmetic is performed in
+    ``float64`` to match Python ``float * float`` semantics bit-for-bit.
+    """
+    arr = np.asarray(vec, dtype=np.float64)
+    return (arr * scale).tolist()
 
 
 def _add_vectors(a: list[float], b: list[float]) -> list[float]:
-    """Element-wise addition of two equal-length vectors."""
+    """Element-wise addition of two equal-length vectors.
+
+    Vectorised via numpy. ``float64`` arithmetic preserves bit-exact
+    parity with the previous Python-scalar implementation, which keeps
+    ``hash_steering_config`` deterministic across this refactor.
+    """
     if len(a) != len(b):
         raise ValueError(
             f"Cannot add steering vectors of different lengths: {len(a)} vs {len(b)}"
         )
-    return [x + y for x, y in zip(a, b)]
+    arr_a = np.asarray(a, dtype=np.float64)
+    arr_b = np.asarray(b, dtype=np.float64)
+    return np.add(arr_a, arr_b).tolist()
 
 
 def resolve_effective_vectors(
