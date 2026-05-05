@@ -44,6 +44,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
+    apply_layer_steering_and_norm,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -330,12 +331,21 @@ class Gemma3DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        residual = torch.ops.vllm.apply_steering(
-            residual, self.steering_table_post_attn, self.steering_index
-        )
-
-        hidden_states, residual = self.pre_feedforward_layernorm(
-            hidden_states, residual
+        # Fused: steering(POST_ATTN) + GemmaRMSNorm(hidden, residual).
+        # Replaces the unfused
+        #   residual = apply_steering(residual, ..., POST_ATTN)
+        #   hidden_states, residual = pre_feedforward_layernorm(hidden, residual)
+        # pair with one Triton launch (one read of hidden + residual,
+        # one indexed gather, one fp32 variance accumulation, one write
+        # of normed output). The other two hooks (PRE_ATTN, POST_MLP)
+        # stay on the unfused path until follow-up branches address
+        # their cross-layer / semantic wrinkles.
+        hidden_states, residual = apply_layer_steering_and_norm(
+            self,
+            hidden_states,
+            residual,
+            SteeringHookPoint.POST_ATTN,
+            self.pre_feedforward_layernorm,
         )
         hidden_states = self.mlp(hidden_states)
 

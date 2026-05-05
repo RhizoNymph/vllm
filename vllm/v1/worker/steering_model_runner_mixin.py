@@ -224,6 +224,9 @@ class SteeringModelRunnerMixin:
             from vllm.model_executor.layers.steering_kernel import (
                 warmup_apply_steering_kernel,
             )
+            from vllm.model_executor.layers.steering_norm_kernel import (
+                warmup_apply_steering_and_norm_kernel,
+            )
 
             compute_dtype = getattr(self.vllm_config.model_config, "dtype", table_dtype)
             warmup_apply_steering_kernel(
@@ -231,6 +234,17 @@ class SteeringModelRunnerMixin:
                 table_rows=steering_config.max_steering_configs + 3,
                 table_dtype=table_dtype,
                 compute_dtype=compute_dtype,
+                device=table_device,
+            )
+            # Fused steering + Gemma RMSNorm kernel (used by gemma3 only
+            # in the MVP wiring). Warm with the same shape so the
+            # captured forward path doesn't trigger JIT mid-capture.
+            warmup_apply_steering_and_norm_kernel(
+                hidden_size=hidden_size,
+                table_rows=steering_config.max_steering_configs + 3,
+                table_dtype=table_dtype,
+                compute_dtype=compute_dtype,
+                weight_dtype=compute_dtype,
                 device=table_device,
             )
 

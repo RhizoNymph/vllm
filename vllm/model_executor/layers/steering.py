@@ -177,3 +177,100 @@ direct_register_custom_op(
     fake_impl=apply_steering_fake,
     mutates_args=[],
 )
+
+
+def apply_steering_and_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    steering_table: torch.Tensor,
+    steering_index: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused ``apply_steering`` + Gemma RMSNorm with residual.
+
+    Replaces the two-call pattern at every Gemma 3 ``post_attn`` site:
+
+        residual = apply_steering(residual, table, idx)
+        hidden_states, residual = gemma_rms_norm(hidden_states, residual)
+
+    with a single Triton kernel launch. The output is two freshly
+    allocated tensors ``(normed, new_residual)`` matching the shape /
+    dtype of ``hidden_states`` — never in place — so the
+    ``torch.compile`` graph keeps stable value semantics.
+
+    The kernel encodes Gemma's ``x * (1 + w)`` RMSNorm departure inline,
+    so ``weight`` is the *raw* ``GemmaRMSNorm.weight`` (the ``+ 1.0`` is
+    added in fp32 inside the kernel). Non-Gemma RMSNorm flavors are out
+    of scope for the MVP and would either pass a flag or use a sibling
+    kernel.
+    """
+    if hidden_states.is_cuda:
+        from vllm.model_executor.layers.steering_norm_kernel import (
+            apply_steering_and_norm_triton,
+        )
+
+        return apply_steering_and_norm_triton(
+            hidden_states, residual, steering_table, steering_index, weight, eps
+        )
+
+    # CPU fallback: equivalent to apply_steering followed by GemmaRMSNorm
+    # with residual (matches GemmaRMSNorm.forward_native semantics for
+    # bf16/fp32; the fp16 upcast branch is intentionally elided since
+    # bf16 is the only compute dtype exercised by gemma-3-4b-it).
+    new_residual = (
+        hidden_states
+        + residual
+        + steering_table[steering_index[: hidden_states.shape[0]]]
+    )
+    nr_fp32 = new_residual.to(torch.float32)
+    var = nr_fp32.pow(2).mean(dim=-1, keepdim=True)
+    rstd = torch.rsqrt(var + eps)
+    weight_fp32 = weight.to(torch.float32) + 1.0
+    normed = (nr_fp32 * rstd * weight_fp32).to(hidden_states.dtype)
+    return normed, new_residual
+
+
+def apply_steering_and_norm_fake(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    steering_table: torch.Tensor,
+    steering_index: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FX-tracing fake — correct shapes, no computation."""
+    return torch.empty_like(hidden_states), torch.empty_like(residual)
+
+
+direct_register_custom_op(
+    op_name="apply_steering_and_norm",
+    op_func=apply_steering_and_norm,
+    fake_impl=apply_steering_and_norm_fake,
+    mutates_args=[],
+)
+
+
+def apply_layer_steering_and_norm(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    hook_point: SteeringHookPoint,
+    layernorm: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused replacement for the two-call ``apply_layer_steering`` +
+    ``layernorm(hidden_states, residual)`` pattern.
+
+    Returns ``(normed_hidden, new_residual)`` matching the contract of
+    the unfused pair. The MVP wires this only at Gemma 3's ``post_attn``
+    site (`vllm/model_executor/models/gemma3.py`); other models continue
+    to use :func:`apply_layer_steering`.
+    """
+    return torch.ops.vllm.apply_steering_and_norm(
+        hidden_states,
+        residual,
+        getattr(module, HOOK_POINT_TABLE_ATTR[hook_point]),
+        module.steering_index,
+        layernorm.weight,
+        float(layernorm.variance_epsilon),
+    )
