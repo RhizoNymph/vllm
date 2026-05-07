@@ -20,15 +20,53 @@ Layout assumptions:
 The kernel launches one program per token row (``grid = (N,)``) and
 walks the hidden dimension in ``BLOCK_H`` chunks with masked loads
 and stores so non-power-of-two hidden sizes are handled correctly.
+
+Autotuning
+----------
+
+``BLOCK_H``, ``num_warps``, and ``num_stages`` are selected by
+``triton.autotune`` over a small static config list, keyed by ``H``
+(the hidden size). The cache is therefore per-hidden-size: the first
+launch for a given ``H`` pays the autotune-benchmark cost, and every
+subsequent launch reuses the picked config. ``warmup_apply_steering_kernel``
+is invoked once per ``(hidden_size, dtype)`` before CUDA graph capture
+to amortize that cost.
+
+If ``triton.autotune`` is unavailable (no real Triton — e.g. CPU-only
+test envs), the placeholder ``triton`` module exposes a no-op decorator
+and the kernel is still importable; it just is never launched there.
 """
 
 from __future__ import annotations
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
+
+# Static autotune config list for the apply-steering kernel.
+#
+# The kernel is memory-bound: each program reads one row of ``hidden_states``
+# (H elements), one row of ``steering_table`` (H elements), and writes one
+# row of output (H elements). The interesting axes are ``BLOCK_H`` (how
+# much of the row each iteration of the inner loop touches) and
+# ``num_warps`` (how many warps contribute to the load/store). On the
+# common shapes seen in vLLM (H ∈ {2048, 2560, 3072, 4096}) the
+# best-performing config varies, so we let Triton's autotuner pick.
+#
+# Configs are intentionally small — autotune benchmark cost grows
+# linearly with the list, and the warmup launch pays it for every H.
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_H": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_H": 512}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_H": 1024}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_H": 1024}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_H": 2048}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_H": 2048}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_H": 2048}, num_warps=8, num_stages=4),
+]
 
 
+@triton.autotune(configs=AUTOTUNE_CONFIGS, key=["H"])
 @triton.jit
 def _apply_steering_kernel(
     hidden_ptr,
@@ -45,7 +83,11 @@ def _apply_steering_kernel(
     o_stride_h,
     BLOCK_H: tl.constexpr,
 ):
-    """Compute ``out[i, j] = hidden[i, j] + cast(table[index[i], j])``."""
+    """Compute ``out[i, j] = hidden[i, j] + cast(table[index[i], j])``.
+
+    ``BLOCK_H`` is supplied by ``triton.autotune`` from ``AUTOTUNE_CONFIGS``;
+    do not pass it explicitly at the launch site.
+    """
     pid_n = tl.program_id(axis=0)
     if pid_n >= N:
         return
@@ -69,6 +111,10 @@ def _apply_steering_kernel(
 
 def _choose_block_h(hidden_size: int) -> int:
     """Pick a sensible ``BLOCK_H`` for the kernel given the hidden size.
+
+    Retained for backward compatibility with any external importer; the
+    kernel itself now uses ``triton.autotune`` to pick ``BLOCK_H`` and
+    no longer consults this helper.
 
     For small hidden sizes (< 2048) round up to the next power of two so
     a single iteration covers the row. For larger hidden sizes cap at
@@ -96,6 +142,10 @@ def apply_steering_triton(
     Returns a freshly allocated output tensor with the same shape and
     dtype as ``hidden_states``. Empty batches (``N == 0``) short-circuit
     without launching the kernel — Triton can fail on zero-sized grids.
+
+    ``BLOCK_H`` / ``num_warps`` / ``num_stages`` are picked by
+    ``triton.autotune`` keyed on ``H`` (see ``AUTOTUNE_CONFIGS``); the
+    launcher passes only the runtime arguments.
     """
     out = torch.empty_like(hidden_states)
     N = hidden_states.shape[0]
@@ -103,7 +153,6 @@ def apply_steering_triton(
         return out
 
     H = hidden_states.shape[1]
-    block_h = _choose_block_h(H)
 
     _apply_steering_kernel[(N,)](
         hidden_states,
@@ -118,7 +167,6 @@ def apply_steering_triton(
         steering_table.stride(1),
         out.stride(0),
         out.stride(1),
-        BLOCK_H=block_h,
     )
     return out
 
@@ -134,11 +182,17 @@ def warmup_apply_steering_kernel(
     """JIT-compile the kernel ahead of CUDA graph capture.
 
     The kernel is launched with a tiny dummy batch so Triton's first-call
-    JIT cost happens before any captured forward pass. The shapes used
-    here only need to share ``BLOCK_H`` and dtypes with the real launch
-    for the compiled artifact to be reused.
+    JIT cost happens before any captured forward pass. With autotune
+    enabled, this single launch also drives the autotune-benchmark sweep
+    over ``AUTOTUNE_CONFIGS`` for the given ``hidden_size``; the picked
+    config is cached and reused on every subsequent launch.
+
+    Expect this call to take a few hundred milliseconds the first time
+    it is invoked for a new ``H``.
     """
     if device.type != "cuda":
+        return
+    if not HAS_TRITON:
         return
     dummy_hidden = torch.zeros(1, hidden_size, dtype=compute_dtype, device=device)
     dummy_table = torch.zeros(

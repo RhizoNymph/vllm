@@ -181,3 +181,84 @@ class TestIndexedGatherSteering:
         assert torch.allclose(result2[1], torch.ones(hidden_size) * 20.0)
         assert torch.allclose(result2[2], torch.zeros(hidden_size))
         assert torch.allclose(result2[3], torch.ones(hidden_size) * 20.0)
+
+
+class TestTritonKernelAutotune:
+    """Smoke tests for the autotuned Triton apply_steering kernel.
+
+    These exercise the realistic vLLM hidden sizes (Gemma-3-4B uses 2560,
+    Llama-class models use 2048/3072/4096) to ensure ``triton.autotune``
+    picks a config and that the kernel still produces numerically correct
+    output. They are skipped on CPU-only environments since the kernel
+    itself only launches on CUDA.
+    """
+
+    @staticmethod
+    def _reference(hidden, table, index):
+        N = hidden.shape[0]
+        return hidden + table[index[:N]].to(hidden.dtype)
+
+    @staticmethod
+    def _skip_if_no_cuda():
+        if not torch.cuda.is_available():
+            import pytest
+
+            pytest.skip("CUDA unavailable; Triton kernel only runs on GPU")
+
+    def test_autotune_correctness_across_hidden_sizes(self):
+        """Kernel output matches reference for the common hidden sizes."""
+        self._skip_if_no_cuda()
+        from vllm.model_executor.layers.steering_kernel import (
+            apply_steering_triton,
+        )
+
+        device = torch.device("cuda")
+        for hidden_size in (2048, 2560, 3072, 4096):
+            for dtype in (torch.float16, torch.bfloat16, torch.float32):
+                torch.manual_seed(0)
+                N = 8
+                hidden = torch.randn(N, hidden_size, dtype=dtype, device=device)
+                table = torch.randn(6, hidden_size, dtype=dtype, device=device)
+                index = torch.tensor(
+                    [0, 1, 2, 3, 4, 5, 0, 1], dtype=torch.long, device=device
+                )
+
+                out = apply_steering_triton(hidden, table, index)
+                expected = self._reference(hidden, table, index)
+                tol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-5
+                assert torch.allclose(out, expected, atol=tol, rtol=tol), (
+                    f"H={hidden_size} dtype={dtype} mismatch"
+                )
+
+    def test_autotune_handles_decode_n_equals_one(self):
+        """Decode-shape (N=1) launches autotune and produces correct output."""
+        self._skip_if_no_cuda()
+        from vllm.model_executor.layers.steering_kernel import (
+            apply_steering_triton,
+        )
+
+        device = torch.device("cuda")
+        hidden_size = 2560  # Gemma-3-4B
+        hidden = torch.randn(1, hidden_size, dtype=torch.bfloat16, device=device)
+        table = torch.randn(4, hidden_size, dtype=torch.bfloat16, device=device)
+        index = torch.tensor([2], dtype=torch.long, device=device)
+
+        out = apply_steering_triton(hidden, table, index)
+        expected = self._reference(hidden, table, index)
+        assert torch.allclose(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_autotune_empty_batch_short_circuits(self):
+        """N=0 must not launch the kernel (Triton dislikes zero grids)."""
+        self._skip_if_no_cuda()
+        from vllm.model_executor.layers.steering_kernel import (
+            apply_steering_triton,
+        )
+
+        device = torch.device("cuda")
+        hidden = torch.empty(0, 2048, dtype=torch.bfloat16, device=device)
+        table = torch.zeros(4, 2048, dtype=torch.bfloat16, device=device)
+        index = torch.zeros(0, dtype=torch.long, device=device)
+
+        out = apply_steering_triton(hidden, table, index)
+        assert out.shape == (0, 2048)
+        assert out.dtype == torch.bfloat16
