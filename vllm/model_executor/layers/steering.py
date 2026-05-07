@@ -155,9 +155,15 @@ def apply_steering(
     The CPU path is a plain eager add. ``steering_table`` is allocated in
     the model's compute dtype via :func:`register_steering_buffers`, so
     the gather already matches ``hidden_states.dtype`` and no cast is
-    needed in either path. The output is always a freshly allocated
-    tensor so the ``torch.compile`` graph keeps value semantics — never
-    in place.
+    needed in either path.
+
+    Mutates ``hidden_states`` in place and returns the same tensor
+    (aliased return). This halves the per-call memory bandwidth versus
+    allocating a fresh output: the kernel reads ``hidden_states``, reads
+    ``table[idx]``, and writes back to ``hidden_states`` — 2× hidden-size
+    traffic instead of 3×. ``mutates_args=["hidden_states"]`` is declared
+    on the custom-op registration so ``torch.compile`` is aware of the
+    mutation.
     """
     if hidden_states.is_cuda:
         from vllm.model_executor.layers.steering_kernel import (
@@ -165,7 +171,8 @@ def apply_steering(
         )
 
         return apply_steering_triton(hidden_states, steering_table, steering_index)
-    return hidden_states + steering_table[steering_index[: hidden_states.shape[0]]]
+    hidden_states.add_(steering_table[steering_index[: hidden_states.shape[0]]])
+    return hidden_states
 
 
 def apply_steering_fake(
@@ -173,13 +180,17 @@ def apply_steering_fake(
     steering_table: torch.Tensor,
     steering_index: torch.Tensor,
 ) -> torch.Tensor:
-    """FX-tracing fake — correct shape, no computation."""
-    return torch.empty_like(hidden_states)
+    """FX-tracing fake — returns the aliased input.
+
+    The op mutates ``hidden_states`` in place and returns the same tensor;
+    the fake reflects that contract so torch.compile sees the alias.
+    """
+    return hidden_states
 
 
 direct_register_custom_op(
     op_name="apply_steering",
     op_func=apply_steering,
     fake_impl=apply_steering_fake,
-    mutates_args=[],
+    mutates_args=["hidden_states"],
 )

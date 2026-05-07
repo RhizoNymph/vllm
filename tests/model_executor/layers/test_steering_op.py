@@ -3,7 +3,7 @@
 """Unit tests for the indexed-gather steering operation.
 
 The steering math in each decoder layer is:
-    result = hidden_states + steering_table[steering_index[:N]]
+    hidden_states += steering_table[steering_index[:N]]
 
 where ``steering_table`` is a per-layer buffer of shape
 ``(max_configs + 2, hidden_size)`` and ``steering_index`` is a shared
@@ -15,9 +15,12 @@ Row layout:
     row 1  — global-only steering vector
     rows 2+ — global + per-request combined vectors
 
-These tests exercise the tensor math directly with standard PyTorch ops
-rather than going through the registered custom op (which requires the
-full vllm build).
+The custom op mutates ``hidden_states`` in place and returns the same
+tensor (aliased return) — this halves per-call memory bandwidth versus
+allocating a fresh output. These tests exercise the tensor math directly
+with standard PyTorch ops rather than going through the registered
+custom op (which requires the full vllm build), but mirror the in-place
+contract so any divergence is caught at the math level.
 """
 
 import torch
@@ -30,11 +33,14 @@ def _apply_steering(
 ) -> torch.Tensor:
     """Reference implementation of the indexed-gather steering math.
 
-    ``steering_table`` is expected to already be in ``hidden_states.dtype``
-    (the model's compute dtype), so no cast is performed at the gather.
+    Mirrors the production contract: mutates ``hidden_states`` in place
+    and returns the same tensor (aliased return). ``steering_table`` is
+    expected to already be in ``hidden_states.dtype`` (the model's
+    compute dtype), so no cast is performed at the gather.
     """
     N = hidden_states.shape[0]
-    return hidden_states + steering_table[steering_index[:N]]
+    hidden_states.add_(steering_table[steering_index[:N]])
+    return hidden_states
 
 
 class TestIndexedGatherSteering:
@@ -49,8 +55,11 @@ class TestIndexedGatherSteering:
 
         index = torch.zeros(batch_size, dtype=torch.long)
 
+        # Snapshot the input so the assertion is meaningful even though
+        # the op aliases its return into ``hidden``.
+        original = hidden.clone()
         result = _apply_steering(hidden, table, index)
-        assert torch.allclose(result, hidden), (
+        assert torch.allclose(result, original), (
             "Index 0 should select the zero row, leaving hidden unchanged."
         )
 
@@ -105,8 +114,9 @@ class TestIndexedGatherSteering:
         # Indices beyond batch_size should be irrelevant.
         index[batch_size:] = 999  # out-of-bounds if ever accessed
 
-        result = _apply_steering(hidden, table, index)
+        # Snapshot before the in-place op so we can verify the math.
         expected = hidden + torch.ones(hidden_size) * 5.0
+        result = _apply_steering(hidden, table, index)
         assert torch.allclose(result, expected), (
             "Only index[:N] should be read; extra elements must be ignored."
         )
@@ -129,8 +139,11 @@ class TestIndexedGatherSteering:
         table = torch.zeros(6, hidden_size)
         index = torch.tensor([0, 1, 2, 3], dtype=torch.long)
 
+        # Snapshot the input so the assertion stays meaningful even
+        # though the op aliases its return into ``hidden``.
+        original = hidden.clone()
         result = _apply_steering(hidden, table, index)
-        assert torch.allclose(result, hidden), (
+        assert torch.allclose(result, original), (
             "All-zeros table should leave hidden states unchanged."
         )
 
@@ -154,6 +167,25 @@ class TestIndexedGatherSteering:
         assert torch.allclose(result2, expected), (
             "In-place table update should be visible on the next forward pass."
         )
+
+    def test_returns_aliased_input_in_place(self):
+        """Op mutates ``hidden_states`` in place and returns the same tensor.
+
+        Locks in the in-place contract: the returned tensor must share
+        storage with the input. This halves per-call memory bandwidth
+        versus allocating a fresh output (3× → 2× hidden-size traffic).
+        """
+        batch_size, hidden_size = 4, 8
+        hidden = torch.randn(batch_size, hidden_size)
+        table = torch.randn(6, hidden_size)
+        index = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+
+        result = _apply_steering(hidden, table, index)
+        assert result.data_ptr() == hidden.data_ptr(), (
+            "apply_steering must return the aliased input tensor "
+            "(in-place mutation), not a fresh allocation."
+        )
+        assert result is hidden, "Returned tensor must be the input object."
 
     def test_inplace_index_update_visible_on_next_use(self):
         """In-place updates to the index buffer are visible on next call."""

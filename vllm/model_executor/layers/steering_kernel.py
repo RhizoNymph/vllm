@@ -4,10 +4,12 @@
 
 The kernel fuses the gather, dtype cast, and add operations performed by
 ``apply_steering`` into a single launch and a single pass over
-``hidden_states``. The eager Python implementation produces a fresh
-output tensor (matching ``hidden_states.dtype``); this kernel preserves
-that contract — output is written to a freshly allocated tensor, never
-in place, to keep the ``torch.compile`` graph contract stable.
+``hidden_states``. The kernel mutates ``hidden_states`` in place: each
+program loads its row, adds the gathered table row, and stores the
+result back to the same row. This halves per-call memory bandwidth
+versus a fresh-output formulation (2× hidden-size traffic instead of
+3×). The custom-op registration declares ``mutates_args=["hidden_states"]``
+so ``torch.compile`` understands the mutation.
 
 Layout assumptions:
 
@@ -20,6 +22,9 @@ Layout assumptions:
 The kernel launches one program per token row (``grid = (N,)``) and
 walks the hidden dimension in ``BLOCK_H`` chunks with masked loads
 and stores so non-power-of-two hidden sizes are handled correctly.
+Aliasing the input and output pointers is safe: each program reads its
+entire row before writing back to it, and programs operate on disjoint
+rows.
 """
 
 from __future__ import annotations
@@ -31,30 +36,30 @@ from vllm.triton_utils import tl, triton
 
 @triton.jit
 def _apply_steering_kernel(
-    hidden_ptr,
+    inout_ptr,
     table_ptr,
     index_ptr,
-    out_ptr,
     N,
     H,
     h_stride_n,
     h_stride_h,
     t_stride_r,
     t_stride_h,
-    o_stride_n,
-    o_stride_h,
     BLOCK_H: tl.constexpr,
 ):
-    """Compute ``out[i, j] = hidden[i, j] + cast(table[index[i], j])``."""
+    """Compute ``inout[i, j] += cast(table[index[i], j])`` in place.
+
+    Each program owns one row ``i`` and writes back to that same row,
+    so the read-modify-write pattern is safe with aliased input/output.
+    """
     pid_n = tl.program_id(axis=0)
     if pid_n >= N:
         return
 
     row = tl.load(index_ptr + pid_n)
 
-    hidden_row_ptr = hidden_ptr + pid_n * h_stride_n
+    hidden_row_ptr = inout_ptr + pid_n * h_stride_n
     table_row_ptr = table_ptr + row * t_stride_r
-    out_row_ptr = out_ptr + pid_n * o_stride_n
 
     for h_off in range(0, H, BLOCK_H):
         h_idx = h_off + tl.arange(0, BLOCK_H)
@@ -64,7 +69,7 @@ def _apply_steering_kernel(
         # Cast table values to hidden dtype so dtype-mismatched tables
         # (fp32 table + bf16 hidden, common before PR 1 lands) work.
         result = h_vals + t_vals.to(h_vals.dtype)
-        tl.store(out_row_ptr + h_idx * o_stride_h, result, mask=mask)
+        tl.store(hidden_row_ptr + h_idx * h_stride_h, result, mask=mask)
 
 
 def _choose_block_h(hidden_size: int) -> int:
@@ -91,16 +96,15 @@ def apply_steering_triton(
     steering_table: torch.Tensor,
     steering_index: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute ``hidden_states + table[index[:N]].to(hidden_states.dtype)``.
+    """Compute ``hidden_states += table[index[:N]].to(hidden_states.dtype)``.
 
-    Returns a freshly allocated output tensor with the same shape and
-    dtype as ``hidden_states``. Empty batches (``N == 0``) short-circuit
-    without launching the kernel — Triton can fail on zero-sized grids.
+    Mutates ``hidden_states`` in place and returns the same tensor
+    (aliased return). Empty batches (``N == 0``) short-circuit without
+    launching the kernel — Triton can fail on zero-sized grids.
     """
-    out = torch.empty_like(hidden_states)
     N = hidden_states.shape[0]
     if N == 0:
-        return out
+        return hidden_states
 
     H = hidden_states.shape[1]
     block_h = _choose_block_h(H)
@@ -109,18 +113,15 @@ def apply_steering_triton(
         hidden_states,
         steering_table,
         steering_index,
-        out,
         N,
         H,
         hidden_states.stride(0),
         hidden_states.stride(1),
         steering_table.stride(0),
         steering_table.stride(1),
-        out.stride(0),
-        out.stride(1),
         BLOCK_H=block_h,
     )
-    return out
+    return hidden_states
 
 
 def warmup_apply_steering_kernel(
