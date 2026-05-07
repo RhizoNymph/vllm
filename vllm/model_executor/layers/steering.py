@@ -52,6 +52,18 @@ VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHo
 
 DEFAULT_HOOK_POINT = SteeringHookPoint.POST_MLP
 
+# ``steering_index`` is stored as ``torch.int16`` so that the per-token
+# gather in :func:`apply_steering` reads at one quarter of the bandwidth
+# the previous int64 layout required.  Row IDs are written as positive
+# values only; we keep them in the ``[0, 32767]`` range so the cast to
+# ``int32`` inside the Triton kernel produces the same offset that an
+# int64 load would, regardless of how Triton interprets the int16 sign
+# bit.  The table layout is ``[max_configs + 3, hidden_size]`` (rows 0,
+# 1, 2 are sentinels), so ``max_configs`` must satisfy
+# ``max_configs + 3 <= 32767`` -> ``max_configs <= 32764``.
+MAX_STEERING_INDEX_ROWS: int = 32767
+MAX_STEERING_CONFIGS_LIMIT: int = MAX_STEERING_INDEX_ROWS - 3
+
 
 def register_steering_buffers(
     module: nn.Module,
@@ -69,7 +81,22 @@ def register_steering_buffers(
     model's compute dtype (typically bf16) so the indexed gather in
     :func:`apply_steering` returns rows already aligned with the residual
     tensor and no dtype cast is required at the gather site.
+
+    Raises:
+        ValueError: If ``max_steering_configs + 3`` exceeds
+            :data:`MAX_STEERING_INDEX_ROWS` (32767).  ``steering_index``
+            is stored as ``torch.int16`` to quarter the per-gather index
+            bandwidth, so row IDs must fit in the positive int16 range.
     """
+    if max_steering_configs + 3 > MAX_STEERING_INDEX_ROWS:
+        raise ValueError(
+            f"max_steering_configs={max_steering_configs} exceeds the "
+            f"int16 steering_index limit of "
+            f"{MAX_STEERING_CONFIGS_LIMIT} (table needs "
+            f"{max_steering_configs + 3} rows but the int16 row-id range "
+            f"only covers [0, {MAX_STEERING_INDEX_ROWS}]).  Lower "
+            f"max_steering_configs or widen the steering_index dtype."
+        )
     table_dtype = dtype if dtype is not None else torch.float32
     for hp in SteeringHookPoint:
         module.register_buffer(
@@ -80,7 +107,7 @@ def register_steering_buffers(
 
     module.register_buffer(
         "steering_index",
-        torch.zeros(max_steering_tokens, dtype=torch.long),
+        torch.zeros(max_steering_tokens, dtype=torch.int16),
         persistent=False,
     )
 
@@ -165,7 +192,17 @@ def apply_steering(
         )
 
         return apply_steering_triton(hidden_states, steering_table, steering_index)
-    return hidden_states + steering_table[steering_index[: hidden_states.shape[0]]]
+    # ``steering_index`` is stored as ``torch.int16`` on the device buffer
+    # to quarter the per-gather bandwidth on CUDA.  PyTorch's eager
+    # tensor-indexing only accepts long/int/byte/bool index tensors, so
+    # widen to int64 at the gather site for the CPU eager fallback.
+    # The widening is a no-op on the hot CUDA path (which uses the Triton
+    # kernel above) and only fires in the rare CPU-eager case.
+    n = hidden_states.shape[0]
+    idx = steering_index[:n]
+    if idx.dtype != torch.int64:
+        idx = idx.to(torch.int64)
+    return hidden_states + steering_table[idx]
 
 
 def apply_steering_fake(

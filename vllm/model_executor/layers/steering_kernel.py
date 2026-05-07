@@ -14,7 +14,8 @@ Layout assumptions:
 - ``hidden_states`` is row-contiguous ``[N, H]`` in compute dtype.
 - ``steering_table`` is row-contiguous ``[num_rows, H]`` in any dtype;
   values are cast to ``hidden_states.dtype`` inside the kernel.
-- ``steering_index`` is ``int64`` and may be longer than ``N``; only
+- ``steering_index`` is ``int16``, cast to ``int32`` inside the kernel
+  for stride arithmetic.  Must be longer than or equal to ``N``; only
   the first ``N`` entries are read.
 
 The kernel launches one program per token row (``grid = (N,)``) and
@@ -51,6 +52,11 @@ def _apply_steering_kernel(
         return
 
     row = tl.load(index_ptr + pid_n)
+    # ``steering_index`` is stored as int16 to quarter the per-gather
+    # bandwidth.  Cast to int32 before any arithmetic so multiplying by
+    # ``t_stride_r`` (which can exceed the int16 range for typical
+    # hidden sizes) cannot overflow inside Triton.
+    row = row.to(tl.int32)
 
     hidden_row_ptr = hidden_ptr + pid_n * h_stride_n
     table_row_ptr = table_ptr + row * t_stride_r
@@ -144,5 +150,5 @@ def warmup_apply_steering_kernel(
     dummy_table = torch.zeros(
         max(table_rows, 1), hidden_size, dtype=table_dtype, device=device
     )
-    dummy_index = torch.zeros(1, dtype=torch.long, device=device)
+    dummy_index = torch.zeros(1, dtype=torch.int16, device=device)
     apply_steering_triton(dummy_hidden, dummy_table, dummy_index)

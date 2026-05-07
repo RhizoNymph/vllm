@@ -32,9 +32,15 @@ def _apply_steering(
 
     ``steering_table`` is expected to already be in ``hidden_states.dtype``
     (the model's compute dtype), so no cast is performed at the gather.
+    Mirrors :func:`vllm.model_executor.layers.steering.apply_steering`'s
+    CPU eager fallback by widening ``steering_index`` to int64 for the
+    indexing op (PyTorch eager indexing rejects int16).
     """
     N = hidden_states.shape[0]
-    return hidden_states + steering_table[steering_index[:N]]
+    idx = steering_index[:N]
+    if idx.dtype != torch.int64:
+        idx = idx.to(torch.int64)
+    return hidden_states + steering_table[idx]
 
 
 class TestIndexedGatherSteering:
@@ -47,7 +53,7 @@ class TestIndexedGatherSteering:
         table = torch.randn(6, hidden_size)
         table[0] = 0.0  # row 0 must be zeros
 
-        index = torch.zeros(batch_size, dtype=torch.long)
+        index = torch.zeros(batch_size, dtype=torch.int16)
 
         result = _apply_steering(hidden, table, index)
         assert torch.allclose(result, hidden), (
@@ -62,7 +68,7 @@ class TestIndexedGatherSteering:
         global_vec = torch.ones(hidden_size) * 3.0
         table[1] = global_vec
 
-        index = torch.ones(batch_size, dtype=torch.long)
+        index = torch.ones(batch_size, dtype=torch.int16)
 
         result = _apply_steering(hidden, table, index)
         expected = global_vec.unsqueeze(0).expand(batch_size, -1)
@@ -81,7 +87,7 @@ class TestIndexedGatherSteering:
         table[3] = torch.ones(hidden_size) * 100.0  # config B
 
         # Tokens 0,1 -> no steering; 2,3 -> global; 4 -> A; 5 -> B
-        index = torch.tensor([0, 0, 1, 1, 2, 3], dtype=torch.long)
+        index = torch.tensor([0, 0, 1, 1, 2, 3], dtype=torch.int16)
 
         result = _apply_steering(hidden, table, index)
 
@@ -100,7 +106,7 @@ class TestIndexedGatherSteering:
         table[2] = torch.ones(hidden_size) * 5.0
 
         # Index buffer is much larger than batch.
-        index = torch.zeros(100, dtype=torch.long)
+        index = torch.zeros(100, dtype=torch.int16)
         index[:batch_size] = 2
         # Indices beyond batch_size should be irrelevant.
         index[batch_size:] = 999  # out-of-bounds if ever accessed
@@ -116,7 +122,7 @@ class TestIndexedGatherSteering:
         batch_size, hidden_size = 5, 16
         hidden = torch.randn(batch_size, hidden_size, dtype=torch.float32)
         table = torch.randn(6, hidden_size, dtype=torch.float32)
-        index = torch.zeros(batch_size, dtype=torch.long)
+        index = torch.zeros(batch_size, dtype=torch.int16)
 
         result = _apply_steering(hidden, table, index)
         assert result.shape == hidden.shape
@@ -127,7 +133,7 @@ class TestIndexedGatherSteering:
         batch_size, hidden_size = 4, 8
         hidden = torch.randn(batch_size, hidden_size)
         table = torch.zeros(6, hidden_size)
-        index = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+        index = torch.tensor([0, 1, 2, 3], dtype=torch.int16)
 
         result = _apply_steering(hidden, table, index)
         assert torch.allclose(result, hidden), (
@@ -139,7 +145,7 @@ class TestIndexedGatherSteering:
         batch_size, hidden_size = 2, 4
         hidden = torch.zeros(batch_size, hidden_size)
         table = torch.zeros(6, hidden_size)
-        index = torch.ones(batch_size, dtype=torch.long)
+        index = torch.ones(batch_size, dtype=torch.int16)
 
         # First call: row 1 is zeros.
         result1 = _apply_steering(hidden, table, index)
@@ -164,7 +170,7 @@ class TestIndexedGatherSteering:
         table[1] = torch.ones(hidden_size) * 1.0
         table[2] = torch.ones(hidden_size) * 20.0
 
-        index = torch.zeros(batch_size, dtype=torch.long)
+        index = torch.zeros(batch_size, dtype=torch.int16)
 
         # First call: all index 0 -> no steering.
         result1 = _apply_steering(hidden, table, index)
@@ -181,3 +187,74 @@ class TestIndexedGatherSteering:
         assert torch.allclose(result2[1], torch.ones(hidden_size) * 20.0)
         assert torch.allclose(result2[2], torch.zeros(hidden_size))
         assert torch.allclose(result2[3], torch.ones(hidden_size) * 20.0)
+
+    def test_eager_path_works_with_int16_index(self):
+        """Tensor indexing via int16 index produces the same result as int64."""
+        batch_size, hidden_size = 4, 4
+        hidden = torch.zeros(batch_size, hidden_size)
+        table = torch.zeros(6, hidden_size)
+        table[1] = torch.ones(hidden_size) * 1.0
+        table[2] = torch.ones(hidden_size) * 2.0
+        table[3] = torch.ones(hidden_size) * 3.0
+
+        index_i16 = torch.tensor([0, 1, 2, 3], dtype=torch.int16)
+        index_i64 = index_i16.to(torch.int64)
+
+        result_i16 = _apply_steering(hidden, table, index_i16)
+        result_i64 = _apply_steering(hidden, table, index_i64)
+
+        assert torch.allclose(result_i16, result_i64), (
+            "int16 and int64 steering_index must produce identical gathers."
+        )
+
+
+class TestSteeringIndexInt16Bounds:
+    """Verify the int16 row-id range guard added with the int16 migration.
+
+    The on-device ``steering_index`` is stored as ``torch.int16`` so that
+    the per-token gather inside the Triton kernel reads at one quarter
+    of the bandwidth of the previous int64 layout.  Row IDs are written
+    as positive values only, so the table row count is bounded to
+    ``MAX_STEERING_INDEX_ROWS = 32767`` (positive int16 range).  These
+    tests guard against accidentally raising the limit without also
+    widening the dtype.
+    """
+
+    def test_register_steering_buffers_accepts_max_rows(self):
+        """``max_steering_configs == MAX_STEERING_CONFIGS_LIMIT`` is OK."""
+        from vllm.model_executor.layers.steering import (
+            MAX_STEERING_CONFIGS_LIMIT,
+            MAX_STEERING_INDEX_ROWS,
+            register_steering_buffers,
+        )
+
+        module = torch.nn.Module()
+        register_steering_buffers(
+            module,
+            hidden_size=4,
+            max_steering_tokens=8,
+            max_steering_configs=MAX_STEERING_CONFIGS_LIMIT,
+        )
+
+        # Index buffer is int16.
+        assert module.steering_index.dtype == torch.int16
+        # Table row count is exactly the int16 cap.
+        assert module.steering_table_post_mlp.shape[0] == MAX_STEERING_INDEX_ROWS
+
+    def test_register_steering_buffers_rejects_overflow(self):
+        """``max_steering_configs + 3`` over the cap must raise ValueError."""
+        import pytest
+
+        from vllm.model_executor.layers.steering import (
+            MAX_STEERING_CONFIGS_LIMIT,
+            register_steering_buffers,
+        )
+
+        module = torch.nn.Module()
+        with pytest.raises(ValueError, match="int16 steering_index limit"):
+            register_steering_buffers(
+                module,
+                hidden_size=4,
+                max_steering_tokens=8,
+                max_steering_configs=MAX_STEERING_CONFIGS_LIMIT + 1,
+            )

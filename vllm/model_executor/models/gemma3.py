@@ -43,6 +43,8 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
+    MAX_STEERING_CONFIGS_LIMIT,
+    MAX_STEERING_INDEX_ROWS,
     SteeringHookPoint,
     apply_layer_steering,
 )
@@ -257,6 +259,14 @@ class Gemma3DecoderLayer(nn.Module):
         # updated in-place by the model runner before each step; zero
         # rows act as a no-op.  torch.compile lifts them as graph inputs,
         # so no splitting op is needed.
+        if max_steering_configs + 3 > MAX_STEERING_INDEX_ROWS:
+            raise ValueError(
+                f"max_steering_configs={max_steering_configs} exceeds the "
+                f"int16 steering_index limit of "
+                f"{MAX_STEERING_CONFIGS_LIMIT} (table needs "
+                f"{max_steering_configs + 3} rows but the int16 row-id "
+                f"range only covers [0, {MAX_STEERING_INDEX_ROWS}])."
+            )
         for hp in SteeringHookPoint:
             self.register_buffer(
                 HOOK_POINT_TABLE_ATTR[hp],
@@ -267,7 +277,7 @@ class Gemma3DecoderLayer(nn.Module):
         # Placeholder — replaced by a shared tensor during model init.
         self.register_buffer(
             "steering_index",
-            torch.zeros(max_steering_tokens, dtype=torch.long),
+            torch.zeros(max_steering_tokens, dtype=torch.int16),
             persistent=False,
         )
 

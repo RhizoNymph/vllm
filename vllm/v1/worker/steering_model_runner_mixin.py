@@ -105,12 +105,14 @@ class SteeringModelRunnerMixin:
     # CPU scratch arrays used by ``_update_steering_buffers`` to build
     # the per-token row mapping in a single ``np.repeat`` + non-blocking
     # H2D copy, replacing the per-request slice-assign loop.  The
-    # per-request scratches are sized to ``max_num_seqs``; the
-    # row-per-token scratch is a pinned-memory torch tensor sized to
-    # ``max_num_batched_tokens`` so the H2D copy can actually overlap
-    # compute (``non_blocking=True`` on a non-pinned source silently
-    # falls back to a synchronous copy).  ``None`` when steering is
-    # inactive.
+    # per-request rows scratch is ``int16`` to match the on-device
+    # ``steering_index`` dtype; the per-request token-count scratch
+    # stays ``int64`` because token counts can exceed the int16 range.
+    # The row-per-token scratch is a pinned-memory ``int16`` torch
+    # tensor sized to ``max_num_batched_tokens`` so the H2D copy can
+    # actually overlap compute (``non_blocking=True`` on a non-pinned
+    # source silently falls back to a synchronous copy).  ``None`` when
+    # steering is inactive.
     _steering_rows_scratch: np.ndarray | None = None
     _steering_n_tokens_scratch: np.ndarray | None = None
     _steering_index_pinned: torch.Tensor | None = None
@@ -200,16 +202,16 @@ class SteeringModelRunnerMixin:
         if scheduler_config is not None:
             max_tokens = int(scheduler_config.max_num_batched_tokens)
             max_seqs = int(getattr(scheduler_config, "max_num_seqs", max_tokens))
-            self._steering_rows_scratch = np.zeros(max_seqs, dtype=np.int64)
+            self._steering_rows_scratch = np.zeros(max_seqs, dtype=np.int16)
             self._steering_n_tokens_scratch = np.zeros(max_seqs, dtype=np.int64)
             try:
                 self._steering_index_pinned = torch.zeros(
-                    max_tokens, dtype=torch.long, pin_memory=True
+                    max_tokens, dtype=torch.int16, pin_memory=True
                 )
             except RuntimeError:
                 # Pinned memory unavailable (e.g. CPU-only test
                 # environment); fall back to a regular CPU tensor.
-                self._steering_index_pinned = torch.zeros(max_tokens, dtype=torch.long)
+                self._steering_index_pinned = torch.zeros(max_tokens, dtype=torch.int16)
 
         # Warm the fused-apply Triton kernel so first-call JIT cost
         # happens before any captured forward pass. Without this, the
@@ -780,12 +782,15 @@ class SteeringModelRunnerMixin:
         req_ids = self.input_batch.req_ids
 
         # Vectorized build: walk requests once to record each request's
-        # table row + token count into pre-allocated CPU int64 scratch
-        # buffers, then expand the row-per-request array into a
-        # row-per-token array via ``np.repeat`` and copy the whole
-        # thing to the GPU in a single non-blocking H2D.  Replaces
-        # ``num_reqs`` independent ``_set_item`` kernel launches per
-        # step with one ``copy_``.
+        # table row (int16) + token count (int64) into pre-allocated
+        # CPU scratch buffers, then expand the row-per-request array
+        # into a row-per-token array via ``np.repeat`` and copy the
+        # whole thing to the GPU in a single non-blocking H2D.
+        # Replaces ``num_reqs`` independent ``_set_item`` kernel
+        # launches per step with one ``copy_``.  ``np.repeat`` of an
+        # int16 array preserves the dtype, so the resulting per-token
+        # row array stays int16 and matches the pinned scratch / device
+        # ``steering_index`` dtypes without an extra cast.
         rows_scratch = self._steering_rows_scratch
         n_tokens_scratch = self._steering_n_tokens_scratch
         index_pinned = self._steering_index_pinned
@@ -797,7 +802,7 @@ class SteeringModelRunnerMixin:
         # initial sizing.  This is defensive — ``max_num_seqs`` should
         # bound ``num_reqs`` — but cheap to handle.
         if rows_scratch.shape[0] < num_reqs:
-            rows_scratch = np.zeros(num_reqs, dtype=np.int64)
+            rows_scratch = np.zeros(num_reqs, dtype=np.int16)
             n_tokens_scratch = np.zeros(num_reqs, dtype=np.int64)
             self._steering_rows_scratch = rows_scratch
             self._steering_n_tokens_scratch = n_tokens_scratch

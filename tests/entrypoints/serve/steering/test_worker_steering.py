@@ -39,7 +39,7 @@ class FakeDecoderLayer(nn.Module):
         )
         self.register_buffer(
             "steering_index",
-            torch.zeros(16, dtype=torch.long),  # small for testing
+            torch.zeros(16, dtype=torch.int16),  # small for testing
             persistent=False,
         )
 
