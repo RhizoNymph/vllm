@@ -45,6 +45,7 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
     apply_layer_steering,
+    apply_layer_steering_pre_post,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -320,8 +321,13 @@ class Gemma3DecoderLayer(nn.Module):
         # as a splitting op — it's opaque to the tracer (preventing
         # constant-folding and AOT cache pickle issues) but does not
         # partition the compiled graph.
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
-
+        #
+        # PRE_ATTN + POST_ATTN are fused into a single op: ``residual``
+        # is not read or mutated by ``self_attn`` or
+        # ``post_attention_layernorm`` (both take only ``hidden_states``
+        # and write to it), so applying both updates after the attention
+        # block is mathematically equivalent to applying them at their
+        # original positions and saves one launch per layer per forward.
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -329,7 +335,7 @@ class Gemma3DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        residual = apply_layer_steering_pre_post(self, residual)
 
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual

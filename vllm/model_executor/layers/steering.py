@@ -133,6 +133,38 @@ def apply_layer_steering(
     )
 
 
+def apply_layer_steering_pre_post(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the fused PRE_ATTN + POST_ATTN steering update to ``hidden_states``.
+
+    Equivalent to::
+
+        h = apply_layer_steering(module, h, SteeringHookPoint.PRE_ATTN)
+        h = apply_layer_steering(module, h, SteeringHookPoint.POST_ATTN)
+
+    when the residual tensor is *not* mutated between the two hook
+    points. Saves one kernel launch per layer per forward.
+
+    Capture consumers see the pre-steering residual via
+    :func:`maybe_capture_residual` for both hook points so capture
+    semantics are unchanged from the unfused two-call path.
+    """
+    maybe_capture_residual(
+        hidden_states, module.layer_idx, SteeringHookPoint.PRE_ATTN.value
+    )
+    maybe_capture_residual(
+        hidden_states, module.layer_idx, SteeringHookPoint.POST_ATTN.value
+    )
+    return torch.ops.vllm.apply_steering_pre_post(
+        hidden_states,
+        getattr(module, HOOK_POINT_TABLE_ATTR[SteeringHookPoint.PRE_ATTN]),
+        getattr(module, HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_ATTN]),
+        module.steering_index,
+    )
+
+
 def apply_steering(
     hidden_states: torch.Tensor,
     steering_table: torch.Tensor,
@@ -181,5 +213,59 @@ direct_register_custom_op(
     op_name="apply_steering",
     op_func=apply_steering,
     fake_impl=apply_steering_fake,
+    mutates_args=[],
+)
+
+
+def apply_steering_pre_post(
+    hidden_states: torch.Tensor,
+    table_pre: torch.Tensor,
+    table_post: torch.Tensor,
+    steering_index: torch.Tensor,
+) -> torch.Tensor:
+    """Fused PRE_ATTN + POST_ATTN steering: ``h + pre[idx] + post[idx]``.
+
+    Mathematically equivalent to two back-to-back calls to
+    :func:`apply_steering` against ``table_pre`` then ``table_post``,
+    but performed as a single launch. Valid only when the caller has
+    verified that the residual tensor is not mutated between the
+    PRE_ATTN and POST_ATTN hook points (true for Gemma3).
+
+    The CUDA path dispatches to a Triton kernel that accumulates in
+    fp32 to keep numerics tight in bf16 / fp16 compute. The CPU path
+    is a plain eager add using the same fp32 accumulation. The output
+    is always a freshly allocated tensor so the ``torch.compile``
+    graph keeps value semantics — never in place.
+    """
+    if hidden_states.is_cuda:
+        from vllm.model_executor.layers.steering_pre_post_kernel import (
+            apply_steering_pre_post_triton,
+        )
+
+        return apply_steering_pre_post_triton(
+            hidden_states, table_pre, table_post, steering_index
+        )
+    idx = steering_index[: hidden_states.shape[0]]
+    # Accumulate in fp32 for parity with the Triton kernel, then cast.
+    h_f32 = hidden_states.to(torch.float32)
+    pre_f32 = table_pre[idx].to(torch.float32)
+    post_f32 = table_post[idx].to(torch.float32)
+    return (h_f32 + pre_f32 + post_f32).to(hidden_states.dtype)
+
+
+def apply_steering_pre_post_fake(
+    hidden_states: torch.Tensor,
+    table_pre: torch.Tensor,
+    table_post: torch.Tensor,
+    steering_index: torch.Tensor,
+) -> torch.Tensor:
+    """FX-tracing fake — correct shape, no computation."""
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="apply_steering_pre_post",
+    op_func=apply_steering_pre_post,
+    fake_impl=apply_steering_pre_post_fake,
     mutates_args=[],
 )

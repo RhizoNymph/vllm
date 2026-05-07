@@ -224,9 +224,23 @@ class SteeringModelRunnerMixin:
             from vllm.model_executor.layers.steering_kernel import (
                 warmup_apply_steering_kernel,
             )
+            from vllm.model_executor.layers.steering_pre_post_kernel import (
+                warmup_apply_steering_pre_post_kernel,
+            )
 
             compute_dtype = getattr(self.vllm_config.model_config, "dtype", table_dtype)
             warmup_apply_steering_kernel(
+                hidden_size=hidden_size,
+                table_rows=steering_config.max_steering_configs + 3,
+                table_dtype=table_dtype,
+                compute_dtype=compute_dtype,
+                device=table_device,
+            )
+            # Warm the fused PRE_ATTN+POST_ATTN kernel as well — Gemma3
+            # uses it in place of the two-call pattern, and the first
+            # CUDA-graph capture step would otherwise trigger a Triton
+            # compile and fail capture.
+            warmup_apply_steering_pre_post_kernel(
                 hidden_size=hidden_size,
                 table_rows=steering_config.max_steering_configs + 3,
                 table_dtype=table_dtype,
