@@ -125,6 +125,86 @@ class TestRegisterSAE:
             )
 
 
+class TestValidateAdditiveLookup:
+    """The kind-aware ``steering_name`` validator that both OpenAI
+    serving entrypoints share."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_returns_error(self):
+        reg = SteeringModuleRegistry()
+        err = reg.validate_additive_lookup("missing")
+        assert err is not None
+        assert "Unknown steering module" in err
+        assert "'missing'" in err
+
+    @pytest.mark.asyncio
+    async def test_additive_returns_none(self):
+        reg = SteeringModuleRegistry()
+        await reg.register(name="m", vectors={"post_mlp": {0: [0.1]}})
+        assert reg.validate_additive_lookup("m") is None
+
+    @pytest.mark.asyncio
+    async def test_sae_returns_kind_error(self):
+        """An SAE-kind module under the same name must reject as a
+        client error here, not bubble up as a worker-side missing-name
+        runtime crash."""
+        reg = SteeringModuleRegistry()
+        await reg.register(
+            name="g",
+            kind=SteeringModuleKind.SAE_DELTA,
+            sae_manifest=_manifest(),
+        )
+        err = reg.validate_additive_lookup("g")
+        assert err is not None
+        assert "kind='sae_delta'" in err
+        assert "sae_clamp_specs" in err
+
+
+class TestMixedKindRegistration:
+    """Phase-0 must reject SAE registrations that also carry additive
+    fields — the API server's router forwards every field, so the
+    registry rejection here protects against silent payload loss."""
+
+    @pytest.mark.asyncio
+    async def test_sae_with_vectors_rejected(self):
+        reg = SteeringModuleRegistry()
+        with pytest.raises(
+            ValueError, match="additive vector fields are not valid"
+        ):
+            await reg.register(
+                name="x",
+                kind=SteeringModuleKind.SAE_DELTA,
+                sae_manifest=_manifest(),
+                vectors={"post_mlp": {0: [0.1]}},
+            )
+
+    @pytest.mark.asyncio
+    async def test_sae_with_prefill_vectors_rejected(self):
+        reg = SteeringModuleRegistry()
+        with pytest.raises(
+            ValueError, match="additive vector fields are not valid"
+        ):
+            await reg.register(
+                name="x",
+                kind=SteeringModuleKind.SAE_DELTA,
+                sae_manifest=_manifest(),
+                prefill_vectors={"pre_attn": {0: [0.1]}},
+            )
+
+    @pytest.mark.asyncio
+    async def test_sae_with_decode_vectors_rejected(self):
+        reg = SteeringModuleRegistry()
+        with pytest.raises(
+            ValueError, match="additive vector fields are not valid"
+        ):
+            await reg.register(
+                name="x",
+                kind=SteeringModuleKind.SAE_DELTA,
+                sae_manifest=_manifest(),
+                decode_vectors={"post_mlp": {0: [0.1]}},
+            )
+
+
 class TestBroadcastRoundTrip:
     """The dump/restore path that crosses the multiprocessing boundary."""
 

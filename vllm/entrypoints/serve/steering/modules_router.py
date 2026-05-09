@@ -114,9 +114,18 @@ async def register_steering_module(
                 ),
                 weights_uri=request.sae_manifest.weights_uri,
             )
+            # Forward the additive vector fields too, even though the
+            # SAE branch must reject them: ``SteeringModuleRegistry.register``
+            # raises a 400-shaped ValueError when an SAE registration
+            # carries any additive payload, so a mixed-kind request
+            # surfaces as a clear client error instead of being
+            # silently discarded at the router.
             await registry.register(
                 name=request.name,
                 kind=kind,
+                vectors=request.vectors,
+                prefill_vectors=request.prefill_vectors,
+                decode_vectors=request.decode_vectors,
                 sae_manifest=manifest,
             )
             payload = {

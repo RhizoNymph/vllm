@@ -184,6 +184,32 @@ class SteeringModuleRegistry:
         """Look up a module by name. Thread-safe for reads."""
         return self._modules.get(name)
 
+    def validate_additive_lookup(self, name: str) -> str | None:
+        """Validate ``name`` for use as the OpenAI ``steering_name`` field.
+
+        ``steering_name`` references an additive-tier module only.  An
+        SAE-kind module under the same name must produce a 400-style
+        client error here rather than slipping through to the worker
+        (where additive resolution would crash with a missing-name
+        error).  Returns ``None`` when the module exists and is
+        additive; otherwise returns an English error message suitable
+        for a ``HTTPStatus.BAD_REQUEST`` response.
+        """
+        module = self._modules.get(name)
+        if module is None:
+            return (
+                f"Unknown steering module {name!r}. "
+                f"Available: {self.list_modules() or 'none'}"
+            )
+        if module.kind is not SteeringModuleKind.ADDITIVE:
+            return (
+                f"Steering module {name!r} is "
+                f"kind={module.kind.value!r}; the 'steering_name' field "
+                "references additive modules only.  Use 'sae_clamp_specs' "
+                "to drive SAE feature surgery."
+            )
+        return None
+
     def list_modules(self) -> list[str]:
         """Return sorted list of registered module names."""
         return sorted(self._modules.keys())

@@ -360,13 +360,12 @@ class OpenAIServingChat(OpenAIServing):
                     "Ensure the server was started with steering enabled.",
                     status_code=HTTPStatus.BAD_REQUEST,
                 )
-            if steering_registry.get(request.steering_name) is None:
+            err = steering_registry.validate_additive_lookup(
+                request.steering_name
+            )
+            if err is not None:
                 return self.create_error_response(
-                    (
-                        f"Unknown steering module '{request.steering_name}'. "
-                        f"Available: {steering_registry.list_modules() or 'none'}"
-                    ),
-                    status_code=HTTPStatus.BAD_REQUEST,
+                    err, status_code=HTTPStatus.BAD_REQUEST
                 )
             steering_module_ref = (request.steering_name, 1.0)
 
