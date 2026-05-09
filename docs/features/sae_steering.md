@@ -404,10 +404,21 @@ encoder/decoder row sets are equal.
      `attach_sae_weights(name, weights)` injects encoder/decoder
      tensors into the per-(layer, hook) buffers — the test-fixture
      and future-loader entry point.
-   - **Stage 3.** Decoder-model wiring: call `apply_layer_sae_delta`
-     from the same hook-point sites that already invoke
-     `apply_layer_steering`.  End-to-end tiny-model fixture tests
-     for prefill and decode.
+   - **Stage 3 (shipped).** Decoder-model wiring: rather than touch
+     all 70+ model files that call `apply_layer_steering`, the
+     SAE delta is dispatched from inside that function — additive
+     first, SAE second, both branches `hasattr`-gated for
+     `torch.compile`-friendly static branching.  This centralises
+     the composition order at the design-doc default ("SAE after
+     additive") and means every existing layer-hook site picks up
+     SAE for free, with zero per-model edits.  End-to-end tests
+     in `tests/v1/worker/test_sae_end_to_end.py` exercise the full
+     per-step pipeline (register → attach weights → admit clamps →
+     populate buffers → forward → assert clamped output) against a
+     synthetic decoder layer, including per-token routing across
+     two requests, prefill→decode transition, and disabled-mode
+     parity (no SAE module → forward bit-identical to the additive-
+     only path).
 
 4. **Phase 2 — Triton kernel + CUDA-graph integration.**
    - Replace the eager body with a Triton kernel under the same

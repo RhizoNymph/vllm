@@ -131,27 +131,39 @@ def apply_layer_steering(
 ) -> torch.Tensor:
     """Apply the steering table for ``hook_point`` to ``hidden_states``.
 
-    Capture consumers (when configured) see the pre-steering residual via
-    :func:`maybe_capture_residual`, which runs unconditionally — capture
-    is independent of whether steering is enabled.
+    Composition order at this hook (per ``docs/features/sae_steering.md``):
 
-    When the layer has no steering table buffer registered (engine
-    started with ``enable_steering=False``, so
-    :func:`register_steering_buffers` was a no-op), this short-circuits
-    and returns ``hidden_states`` unchanged.  The ``hasattr`` check is
-    decided once at module ``__init__`` and is constant for the rest
-    of the layer's lifetime, so ``torch.compile`` traces it as a static
-    branch and the disabled path emits no steering kernel at all.
+    1. Additive steering (the existing precomputed-vector path).
+    2. SAE feature-surgery delta (encode → clamp → decoder-direction
+       add).  Runs on the additively-steered residual so the additive
+       behaviour is unchanged when SAE is added on top.
+
+    Both stages short-circuit independently — a layer without
+    additive buffers skips step 1, a layer without SAE buffers skips
+    step 2.  Both ``hasattr`` checks resolve to a static branch under
+    ``torch.compile`` (decided once at module instantiation), so a
+    disabled-mode forward emits zero steering kernels.
+
+    Capture consumers (when configured) see the pre-steering residual
+    via :func:`maybe_capture_residual`, which runs unconditionally —
+    capture is independent of whether steering is enabled.
     """
     maybe_capture_residual(hidden_states, module.layer_idx, hook_point.value)
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
-    if not hasattr(module, table_attr):
-        return hidden_states
-    return torch.ops.vllm.apply_steering(
-        hidden_states,
-        getattr(module, table_attr),
-        module.steering_index,
-    )
+    if hasattr(module, table_attr):
+        hidden_states = torch.ops.vllm.apply_steering(
+            hidden_states,
+            getattr(module, table_attr),
+            module.steering_index,
+        )
+    # SAE feature-surgery delta runs after the additive op on the
+    # same hook.  Local import keeps ``steering.py`` free of any
+    # dependency on ``sae_steering.py`` at module load time
+    # (``sae_steering.py`` imports ``SteeringHookPoint`` from here, so
+    # a top-level import would form a cycle).
+    from vllm.model_executor.layers.sae_steering import apply_layer_sae_delta
+
+    return apply_layer_sae_delta(module, hidden_states, hook_point)
 
 
 def apply_steering(
