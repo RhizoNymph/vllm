@@ -12,10 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from vllm.config.sae_steering_types import SAEActivation, SteeringModuleKind
 from vllm.config.steering_types import (
     SteeringVectorSpec,
     merge_steering_specs,
@@ -28,13 +29,55 @@ logger = init_logger(__name__)
 
 
 @dataclass
+class SAEModuleManifest:
+    """Shape description for an SAE-kind named steering module.
+
+    Phase-0 stores the manifest only — the runtime accepts requests
+    that reference SAE modules but the worker raises
+    ``NotImplementedError`` if asked to apply them.  The full loader
+    (weights, encoder/decoder GEMMs, kernel) lands in Phase-1+.
+
+    The manifest is the authoritative description of the SAE that
+    the kernel will need: model and dictionary dimensions, activation
+    function, the set of (layer, hook) sites it covers, and the set
+    of feature indices that may be clamped at runtime (so encoder
+    rows can be restricted to that set).
+    """
+
+    d_model: int
+    d_sae: int
+    activation: SAEActivation
+    layers: tuple[tuple[int, str], ...]
+    clampable_features: tuple[int, ...]
+    activation_params: dict[str, float] = field(default_factory=dict)
+    weights_uri: str | None = None
+
+
+@dataclass
 class SteeringModule:
-    """A named steering vector configuration."""
+    """A named steering module.
+
+    Distinguishes two kinds via :pyattr:`kind`:
+
+    * ``ADDITIVE`` — existing precomputed-vector path; ``vectors`` /
+      ``prefill_vectors`` / ``decode_vectors`` carry per-(hook, layer)
+      directions and ``sae_manifest`` is ``None``.
+    * ``SAE_DELTA`` — SAE feature-surgery path; ``sae_manifest``
+      describes the SAE's shape and the additive vector fields are
+      ``None``.
+
+    A request references the module by name via either
+    ``SamplingParams.steering_module_ref`` (additive) or
+    ``SamplingParams.sae_clamp_specs`` (SAE delta).  The worker
+    dispatches based on :pyattr:`kind`.
+    """
 
     name: str
+    kind: SteeringModuleKind = SteeringModuleKind.ADDITIVE
     vectors: SteeringVectorSpec | None = None
     prefill_vectors: SteeringVectorSpec | None = None
     decode_vectors: SteeringVectorSpec | None = None
+    sae_manifest: SAEModuleManifest | None = None
 
 
 class SteeringModuleRegistry:
@@ -51,42 +94,77 @@ class SteeringModuleRegistry:
         vectors: SteeringVectorSpec | None = None,
         prefill_vectors: SteeringVectorSpec | None = None,
         decode_vectors: SteeringVectorSpec | None = None,
+        *,
+        kind: SteeringModuleKind = SteeringModuleKind.ADDITIVE,
+        sae_manifest: SAEModuleManifest | None = None,
     ) -> None:
-        """Register a named steering module. Overwrites if name exists."""
-        # Validate that at least one tier has vectors
-        if not vectors and not prefill_vectors and not decode_vectors:
-            raise ValueError(f"Steering module '{name}' has no vectors in any tier")
+        """Register a named steering module. Overwrites if name exists.
 
-        # Validate hook point names and entry format
-        for spec in [vectors, prefill_vectors, decode_vectors]:
-            if spec:
-                invalid = set(spec.keys()) - VALID_HOOK_POINT_NAMES
-                if invalid:
-                    raise ValueError(
-                        f"Invalid hook point name(s) in module '{name}': "
-                        f"{sorted(invalid)}. "
-                        f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}"
-                    )
-                # Validate entries are well-formed
-                for hook_name, layers in spec.items():
-                    for layer_idx, entry in layers.items():
-                        self._validate_layer_index(name=name, layer_idx=layer_idx)
-                        self._validate_layer_entry(
-                            name=name,
-                            hook_name=hook_name,
-                            layer_idx=layer_idx,
-                            entry=entry,
+        For ``kind=ADDITIVE`` (default) the additive vector tiers are
+        validated as before; passing a non-empty ``sae_manifest`` is
+        an error.  For ``kind=SAE_DELTA`` the manifest is required and
+        all additive vector fields must be empty.
+        """
+        if kind is SteeringModuleKind.ADDITIVE:
+            if sae_manifest is not None:
+                raise ValueError(
+                    f"Steering module '{name}': sae_manifest is only valid "
+                    "for kind=SAE_DELTA."
+                )
+            if not vectors and not prefill_vectors and not decode_vectors:
+                raise ValueError(f"Steering module '{name}' has no vectors in any tier")
+
+            # Validate hook point names and entry format
+            for spec in [vectors, prefill_vectors, decode_vectors]:
+                if spec:
+                    invalid = set(spec.keys()) - VALID_HOOK_POINT_NAMES
+                    if invalid:
+                        raise ValueError(
+                            f"Invalid hook point name(s) in module '{name}': "
+                            f"{sorted(invalid)}. "
+                            f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}"
                         )
+                    # Validate entries are well-formed
+                    for hook_name, layers in spec.items():
+                        for layer_idx, entry in layers.items():
+                            self._validate_layer_index(name=name, layer_idx=layer_idx)
+                            self._validate_layer_entry(
+                                name=name,
+                                hook_name=hook_name,
+                                layer_idx=layer_idx,
+                                entry=entry,
+                            )
 
-        module = SteeringModule(
-            name=name,
-            vectors=vectors,
-            prefill_vectors=prefill_vectors,
-            decode_vectors=decode_vectors,
-        )
+            module = SteeringModule(
+                name=name,
+                kind=kind,
+                vectors=vectors,
+                prefill_vectors=prefill_vectors,
+                decode_vectors=decode_vectors,
+            )
+        elif kind is SteeringModuleKind.SAE_DELTA:
+            if vectors or prefill_vectors or decode_vectors:
+                raise ValueError(
+                    f"Steering module '{name}': additive vector fields are "
+                    "not valid for kind=SAE_DELTA."
+                )
+            if sae_manifest is None:
+                raise ValueError(
+                    f"Steering module '{name}': sae_manifest is required "
+                    "for kind=SAE_DELTA."
+                )
+            self._validate_sae_manifest(name=name, manifest=sae_manifest)
+            module = SteeringModule(
+                name=name,
+                kind=kind,
+                sae_manifest=sae_manifest,
+            )
+        else:
+            raise ValueError(f"Steering module '{name}': unsupported kind {kind!r}")
+
         async with self._lock:
             self._modules[name] = module
-        logger.info("Registered steering module '%s'", name)
+        logger.info("Registered steering module '%s' (kind=%s)", name, kind.value)
 
     async def unregister(self, name: str) -> bool:
         """Remove a named module. Returns True if it existed."""
@@ -100,6 +178,80 @@ class SteeringModuleRegistry:
         """Look up a module by name. Thread-safe for reads."""
         return self._modules.get(name)
 
+    def validate_sae_clamp_specs(
+        self, specs: list[Any] | tuple[Any, ...] | None
+    ) -> str | None:
+        """Validate ``sae_clamp_specs`` against the registry.
+
+        Symmetric with :meth:`validate_additive_lookup`: returns an
+        English error message when any spec references a name that
+        either isn't registered or isn't an SAE-kind module, otherwise
+        returns ``None``.
+
+        Doing this at the API server (instead of only at the worker)
+        means a request that names a missing or wrong-kind SAE module
+        becomes a 400 immediately rather than either crashing the
+        worker (steering enabled) or being silently dropped (steering
+        disabled, the worker mixin's admission guard never fires).
+        ``specs`` may be a tuple of :class:`SAEClampSpec` (typed
+        ``SamplingParams`` form) or a list of dicts (raw OpenAI
+        payload before coercion); only the ``module_name`` field is
+        read so both shapes work.
+        """
+        if not specs:
+            return None
+        for i, spec in enumerate(specs):
+            if isinstance(spec, dict):
+                module_name = spec.get("module_name")
+            else:
+                module_name = getattr(spec, "module_name", None)
+            if not isinstance(module_name, str) or not module_name:
+                return (
+                    f"sae_clamp_specs[{i}] is missing a non-empty 'module_name' field."
+                )
+            module = self._modules.get(module_name)
+            if module is None:
+                return (
+                    f"sae_clamp_specs[{i}] references unknown module "
+                    f"{module_name!r}.  Available: "
+                    f"{self.list_modules() or 'none'}"
+                )
+            if module.kind is not SteeringModuleKind.SAE_DELTA:
+                return (
+                    f"sae_clamp_specs[{i}] references module "
+                    f"{module_name!r} of kind {module.kind.value!r}; "
+                    "only kind='sae_delta' modules can be referenced "
+                    "from sae_clamp_specs.  Use 'steering_name' for "
+                    "additive modules."
+                )
+        return None
+
+    def validate_additive_lookup(self, name: str) -> str | None:
+        """Validate ``name`` for use as the OpenAI ``steering_name`` field.
+
+        ``steering_name`` references an additive-tier module only.  An
+        SAE-kind module under the same name must produce a 400-style
+        client error here rather than slipping through to the worker
+        (where additive resolution would crash with a missing-name
+        error).  Returns ``None`` when the module exists and is
+        additive; otherwise returns an English error message suitable
+        for a ``HTTPStatus.BAD_REQUEST`` response.
+        """
+        module = self._modules.get(name)
+        if module is None:
+            return (
+                f"Unknown steering module {name!r}. "
+                f"Available: {self.list_modules() or 'none'}"
+            )
+        if module.kind is not SteeringModuleKind.ADDITIVE:
+            return (
+                f"Steering module {name!r} is "
+                f"kind={module.kind.value!r}; the 'steering_name' field "
+                "references additive modules only.  Use 'sae_clamp_specs' "
+                "to drive SAE feature surgery."
+            )
+        return None
+
     def list_modules(self) -> list[str]:
         """Return sorted list of registered module names."""
         return sorted(self._modules.keys())
@@ -110,26 +262,33 @@ class SteeringModuleRegistry:
         Used by the API server to broadcast the full registry to workers
         via ``collective_rpc`` so every worker holds an identical
         ``_steering_module_registry``.  The returned mapping is keyed by
-        module name; each value is a ``dict`` with ``vectors``,
-        ``prefill_vectors`` and ``decode_vectors`` entries (any of which
-        may be ``None``).  All structures are plain Python collections
-        suitable for cloudpickle serialization across the engine
-        multiprocess boundary.
+        module name; each value is a ``dict`` carrying a ``kind``
+        discriminator plus the kind-specific payload:
 
-        Note: this returns the *unresolved* :class:`SteeringVectorSpec`
-        form — per-layer entries may still be in
-        ``{"vector": [...], "scale": float}`` form.  The worker-side
-        merge step normalizes scales just like the original
-        ``resolve_for_request`` did on the server.
+        * Additive: ``vectors``, ``prefill_vectors``, ``decode_vectors``
+        * SAE delta: ``sae_manifest`` (a JSON-safe dict)
+
+        All structures are plain Python collections suitable for
+        cloudpickle serialization across the engine multiprocess
+        boundary.
+
+        Note: the additive form returns *unresolved*
+        :class:`SteeringVectorSpec` entries — per-layer values may
+        still be in ``{"vector": [...], "scale": float}`` form.  The
+        worker-side merge step normalizes scales just like the
+        original ``resolve_for_request`` did on the server.
         """
-        return {
-            name: {
-                "vectors": module.vectors,
-                "prefill_vectors": module.prefill_vectors,
-                "decode_vectors": module.decode_vectors,
-            }
-            for name, module in self._modules.items()
-        }
+        out: dict[str, dict[str, Any]] = {}
+        for name, module in self._modules.items():
+            payload: dict[str, Any] = {"kind": module.kind.value}
+            if module.kind is SteeringModuleKind.ADDITIVE:
+                payload["vectors"] = module.vectors
+                payload["prefill_vectors"] = module.prefill_vectors
+                payload["decode_vectors"] = module.decode_vectors
+            else:
+                payload["sae_manifest"] = _sae_manifest_to_dict(module.sae_manifest)
+            out[name] = payload
+        return out
 
     async def load_from_file(self, name: str, path: str) -> None:
         """Load a steering module from a JSON file and register it.
@@ -267,6 +426,99 @@ class SteeringModuleRegistry:
                 f"{layer_idx}. Valid steerable layers: "
                 f"{sorted(self._valid_layer_indices) or 'none'}"
             )
+
+    def _validate_sae_manifest(self, *, name: str, manifest: SAEModuleManifest) -> None:
+        """Structural validation for an SAE manifest.
+
+        Phase-0 only stores the manifest, but we still want bad shapes to
+        fail loudly at registration time rather than at request time.
+        """
+        prefix = f"SAE module {name!r}"
+        if not isinstance(manifest.d_model, int) or manifest.d_model <= 0:
+            raise ValueError(
+                f"{prefix}: d_model must be a positive int, got {manifest.d_model!r}."
+            )
+        if not isinstance(manifest.d_sae, int) or manifest.d_sae <= 0:
+            raise ValueError(
+                f"{prefix}: d_sae must be a positive int, got {manifest.d_sae!r}."
+            )
+        if not isinstance(manifest.activation, SAEActivation):
+            raise ValueError(
+                f"{prefix}: activation must be an SAEActivation enum, "
+                f"got {type(manifest.activation).__name__}."
+            )
+        if not isinstance(manifest.layers, tuple) or not manifest.layers:
+            raise ValueError(
+                f"{prefix}: layers must be a non-empty tuple of "
+                "(layer_idx, hook_point) pairs."
+            )
+        for entry in manifest.layers:
+            if (
+                not isinstance(entry, tuple)
+                or len(entry) != 2
+                or not isinstance(entry[0], int)
+                or not isinstance(entry[1], str)
+            ):
+                raise ValueError(
+                    f"{prefix}: layer entries must be (int, str) tuples, got {entry!r}."
+                )
+            layer_idx, hook_point = entry
+            self._validate_layer_index(name=name, layer_idx=layer_idx)
+            if hook_point not in VALID_HOOK_POINT_NAMES:
+                raise ValueError(
+                    f"{prefix}: unknown hook point {hook_point!r}.  "
+                    f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}."
+                )
+        if not isinstance(manifest.clampable_features, tuple):
+            raise ValueError(
+                f"{prefix}: clampable_features must be a tuple of "
+                "non-negative integers."
+            )
+        for feat in manifest.clampable_features:
+            if not isinstance(feat, int) or feat < 0 or feat >= manifest.d_sae:
+                raise ValueError(
+                    f"{prefix}: clampable_features entry {feat!r} is out "
+                    f"of range [0, d_sae={manifest.d_sae})."
+                )
+
+
+def _sae_manifest_to_dict(manifest: SAEModuleManifest | None) -> dict[str, Any]:
+    """JSON-safe representation of an :class:`SAEModuleManifest`.
+
+    Used by :meth:`SteeringModuleRegistry.dump_for_broadcast` so the
+    manifest crosses the multiprocessing boundary as a plain dict.
+    The worker reconstructs the dataclass via
+    :func:`sae_manifest_from_dict`.
+    """
+    assert manifest is not None
+    return {
+        "d_model": manifest.d_model,
+        "d_sae": manifest.d_sae,
+        "activation": manifest.activation.value,
+        "layers": [list(p) for p in manifest.layers],
+        "clampable_features": list(manifest.clampable_features),
+        "activation_params": dict(manifest.activation_params),
+        "weights_uri": manifest.weights_uri,
+    }
+
+
+def sae_manifest_from_dict(payload: dict[str, Any]) -> SAEModuleManifest:
+    """Reconstruct an :class:`SAEModuleManifest` from a broadcast dict.
+
+    Mirrors :func:`_sae_manifest_to_dict`.  Validates only the fields
+    that aren't already covered by
+    :meth:`SteeringModuleRegistry._validate_sae_manifest` — the worker
+    calls the registry validator after reconstruction.
+    """
+    return SAEModuleManifest(
+        d_model=int(payload["d_model"]),
+        d_sae=int(payload["d_sae"]),
+        activation=SAEActivation(payload["activation"]),
+        layers=tuple((int(li), str(hp)) for li, hp in payload["layers"]),
+        clampable_features=tuple(int(f) for f in payload["clampable_features"]),
+        activation_params=dict(payload.get("activation_params") or {}),
+        weights_uri=payload.get("weights_uri"),
+    )
 
 
 def _convert_layer_keys(

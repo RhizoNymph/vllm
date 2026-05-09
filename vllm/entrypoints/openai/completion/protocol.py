@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
+from vllm.config.sae_steering_types import coerce_sae_clamp_specs
 from vllm.config.steering_types import SteeringVectorSpec
 from vllm.config.utils import replace
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -208,6 +209,20 @@ class CompletionRequest(OpenAIBaseModel):
         "composed with any inline steering vector fields.",
     )
 
+    sae_clamp_specs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of SAE feature-surgery clamp directives.  Each entry "
+            "references a named SAE-kind module (registered via "
+            "POST /v1/steering/modules/register with kind='sae_delta') "
+            "and declares which feature activations to clamp on which "
+            "(hook, layer) pairs.  See docs/features/sae_steering.md "
+            "for the schema.  Phase-0 plumbs clamps through the request "
+            "and rejects any application attempt with a clear error; "
+            "the kernel lands in Phase-1."
+        ),
+    )
+
     capture: dict[str, Any] | None = Field(
         default=None,
         description=(
@@ -365,6 +380,7 @@ class CompletionRequest(OpenAIBaseModel):
             steering_vectors=self.steering_vectors,
             prefill_steering_vectors=self.prefill_steering_vectors,
             decode_steering_vectors=self.decode_steering_vectors,
+            sae_clamp_specs=coerce_sae_clamp_specs(self.sae_clamp_specs),
         )
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)

@@ -16,6 +16,10 @@ from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
+from vllm.config.sae_steering_types import (
+    SAEClampSpec,
+    coerce_sae_clamp_specs,
+)
 from vllm.config.steering_types import (
     SteeringLayerEntry,
     SteeringVectorSpec,
@@ -350,6 +354,25 @@ class SamplingParams(
     hash bit-for-bit identically to today, preserving prefix-cache
     reuse."""
 
+    sae_clamp_specs: tuple[SAEClampSpec, ...] | None = None
+    """Optional SAE feature-surgery clamps (delta intervention).
+
+    Each entry references a named SAE module (registered via the
+    standard module-registration API with ``kind="sae_delta"``) and
+    declares which feature activations to clamp on which
+    (hook, layer) pairs.  See :class:`SAEClampSpec` and
+    ``docs/features/sae_steering.md`` for the runtime contract.
+
+    Hash determinism: SAE clamp state is folded into
+    :pyattr:`prefill_steering_config_hash` /
+    :pyattr:`decode_steering_config_hash` via
+    :func:`hash_steering_config`'s ``sae_clamp_specs`` argument, so
+    different clamp configurations produce different prefix-cache
+    keys.  Requests that do not use SAE clamps
+    (``sae_clamp_specs is None``) hash bit-for-bit identically to
+    requests on a build without SAE support, preserving prefix-cache
+    reuse."""
+
     capture: dict[str, Any] | None = None
     """Per-request opt-in for capture consumers, keyed by consumer name.
 
@@ -412,6 +435,7 @@ class SamplingParams(
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
         steering_module_ref: tuple[str, float] | None = None,
+        sae_clamp_specs: object = None,
         capture: dict[str, Any] | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
@@ -458,6 +482,7 @@ class SamplingParams(
             prefill_steering_vectors=prefill_steering_vectors,
             decode_steering_vectors=decode_steering_vectors,
             steering_module_ref=steering_module_ref,
+            sae_clamp_specs=coerce_sae_clamp_specs(sae_clamp_specs),
             capture=capture,
         )
 
@@ -703,6 +728,15 @@ class SamplingParams(
                                 f"matching dimensions."
                             )
 
+        # Normalize SAE clamp specs.  Direct ``SamplingParams(...)`` callers
+        # may pass raw JSON-shaped dicts; coerce them into validated
+        # ``SAEClampSpec`` tuples here so downstream code only ever sees
+        # the typed form.  ``coerce_sae_clamp_specs`` is idempotent for
+        # already-typed input (no allocation when the field is already a
+        # tuple of SAEClampSpec).
+        if self.sae_clamp_specs is not None:
+            self.sae_clamp_specs = coerce_sae_clamp_specs(self.sae_clamp_specs)
+
         # Cross-validate overlapping dimensions between prefill and decode
         # phase specs (caught even when no base ``steering_vectors`` is set).
         if self.prefill_steering_vectors and self.decode_steering_vectors:
@@ -836,36 +870,60 @@ class SamplingParams(
             self.steering_vectors, self.decode_steering_vectors
         )
 
+    def _phase_filtered_sae_specs(
+        self, want_phase: str
+    ) -> tuple[SAEClampSpec, ...] | None:
+        """Filter ``sae_clamp_specs`` to those active in *want_phase*.
+
+        A spec with ``phase="both"`` enters both prefill and decode
+        digests; a spec with ``phase="prefill"`` only enters the
+        prefill digest; ``phase="decode"`` only the decode digest.
+        Returns ``None`` when no spec applies — letting
+        :func:`hash_steering_config` skip the SAE block entirely so
+        the resulting digest is bit-for-bit identical to a request
+        without ``sae_clamp_specs``.
+        """
+        if not self.sae_clamp_specs:
+            return None
+        filtered = tuple(
+            s for s in self.sae_clamp_specs if s.phase in ("both", want_phase)
+        )
+        return filtered if filtered else None
+
     @cached_property
     def prefill_steering_config_hash(self) -> int:
         """Cached hash of ``effective_prefill_steering`` plus
-        ``steering_module_ref``.
+        ``steering_module_ref`` plus prefill-active ``sae_clamp_specs``.
 
         Lives on ``SamplingParams`` (not ``Request``) so that many requests
         sharing the same ``SamplingParams`` object — the common case for
         batched ``llm.generate(prompts, [sp]*N)`` — only pay the hashing
         cost once across the whole batch instead of once per request.
 
-        When ``steering_module_ref`` is ``None`` this reduces to the
-        original inline-only hash bit-for-bit, preserving prefix-cache
-        reuse for requests that don't reference a named module.  When set,
-        the ``(name, scale)`` tuple is folded into the digest so two
-        requests with the same reference + identical inline overrides
-        produce the same hash regardless of when the named module was
-        registered worker-side.
+        When ``steering_module_ref`` and ``sae_clamp_specs`` are both
+        ``None`` this reduces to the original inline-only hash
+        bit-for-bit, preserving prefix-cache reuse for requests that
+        don't reference a named module or SAE clamp.  When set, those
+        fields are folded into the digest so two requests with the
+        same reference + identical inline overrides + identical SAE
+        clamps produce the same hash regardless of when the named
+        modules were registered worker-side.
         """
         return hash_steering_config(
             self.effective_prefill_steering,
             module_ref=self.steering_module_ref,
+            sae_clamp_specs=self._phase_filtered_sae_specs("prefill"),
         )
 
     @cached_property
     def decode_steering_config_hash(self) -> int:
         """Cached hash of ``effective_decode_steering`` plus
-        ``steering_module_ref``. See ``prefill_steering_config_hash``."""
+        ``steering_module_ref`` plus decode-active ``sae_clamp_specs``.
+        See ``prefill_steering_config_hash``."""
         return hash_steering_config(
             self.effective_decode_steering,
             module_ref=self.steering_module_ref,
+            sae_clamp_specs=self._phase_filtered_sae_specs("decode"),
         )
 
     def _verify_greedy_sampling(self) -> None:

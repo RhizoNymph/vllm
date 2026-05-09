@@ -246,11 +246,13 @@ def merge_steering_specs(
 def hash_steering_config(
     effective_vectors: dict[str, dict[int, list[float] | np.ndarray]] | None,
     module_ref: tuple[str, float] | None = None,
+    sae_clamp_specs: tuple[Any, ...] | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 
-    Returns 0 if both *effective_vectors* and *module_ref* are ``None``
-    or empty.  The hash is masked to fit in ``np.int64``.
+    Returns 0 if *effective_vectors*, *module_ref*, and
+    *sae_clamp_specs* are all ``None`` or empty.  The hash is masked
+    to fit in ``np.int64``.
 
     *module_ref* is an optional ``(name, scale)`` reference to a
     worker-side named steering module.  When set, the reference is
@@ -261,13 +263,20 @@ def hash_steering_config(
     function reduces to the original "hash inline-only vectors" behavior
     bit-for-bit, preserving prefix-cache reuse for existing requests.
 
+    *sae_clamp_specs* is an optional tuple of
+    :class:`vllm.config.sae_steering_types.SAEClampSpec` describing
+    SAE feature-surgery clamps.  When ``None`` or empty the SAE block
+    is omitted from the digest, so requests that don't use SAE
+    steering hash bit-for-bit identically to before this argument
+    existed.  This is required for prefix-cache reuse.
+
     Accepts entries as either ``list[float]`` (legacy callers) or
     ``np.ndarray`` (the float64 arrays produced by
     :func:`resolve_effective_vectors`).  In both cases the float→float32
     cast happens exactly once at the ``tobytes`` boundary, so hashes are
     bit-for-bit identical regardless of the input container.
     """
-    if not effective_vectors and module_ref is None:
+    if not effective_vectors and module_ref is None and not sae_clamp_specs:
         return 0
     h = hashlib.sha256()
     if effective_vectors:
@@ -301,4 +310,17 @@ def hash_steering_config(
         h.update(b"\x00module_ref\x00")
         h.update(name.encode("utf-8"))
         h.update(np.float64(scale).tobytes())
+    if sae_clamp_specs:
+        # Defer the import to avoid a circular dependency: sae_steering_types
+        # imports VALID_HOOK_POINT_NAMES from model_executor.layers.steering,
+        # which transitively does not depend on this module — but the cycle
+        # is fragile, and a function-local import keeps this file's import
+        # graph minimal.  ``hash_sae_clamp_specs`` writes its own domain
+        # separator into the digest it computes; we incorporate that result
+        # via ``int.to_bytes`` to keep the composition associative.
+        from vllm.config.sae_steering_types import hash_sae_clamp_specs
+
+        sae_hash = hash_sae_clamp_specs(sae_clamp_specs)
+        h.update(b"\x00sae_block\x00")
+        h.update(sae_hash.to_bytes(8, "little", signed=False))
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF

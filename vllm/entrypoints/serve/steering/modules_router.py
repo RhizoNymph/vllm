@@ -7,7 +7,9 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import vllm.envs as envs
+from vllm.config.sae_steering_types import SAEActivation, SteeringModuleKind
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.openai.steering.registry import SAEModuleManifest
 from vllm.entrypoints.serve.steering.modules_protocol import (
     RegisterSteeringModuleRequest,
     UnregisterSteeringModuleRequest,
@@ -77,29 +79,76 @@ async def register_steering_module(
         )
 
     try:
-        await registry.register(
-            name=request.name,
-            vectors=request.vectors,
-            prefill_vectors=request.prefill_vectors,
-            decode_vectors=request.decode_vectors,
-        )
-        # Push the freshly-registered module to every worker so requests
-        # carrying ``SamplingParams.steering_module_ref`` resolve it
-        # locally instead of forcing the API server to materialize the
-        # full vector spec into the multiprocessing payload.
-        await _broadcast_module_to_workers(
-            _engine_client(raw_request),
-            request.name,
-            {
+        kind = SteeringModuleKind(request.kind)
+        if kind is SteeringModuleKind.ADDITIVE:
+            await registry.register(
+                name=request.name,
+                kind=kind,
+                vectors=request.vectors,
+                prefill_vectors=request.prefill_vectors,
+                decode_vectors=request.decode_vectors,
+            )
+            payload: dict = {
+                "kind": kind.value,
                 "vectors": request.vectors,
                 "prefill_vectors": request.prefill_vectors,
                 "decode_vectors": request.decode_vectors,
-            },
+            }
+        else:  # SAE_DELTA
+            if request.sae_manifest is None:
+                raise ValueError("kind='sae_delta' requires a 'sae_manifest' payload.")
+            manifest = SAEModuleManifest(
+                d_model=request.sae_manifest.d_model,
+                d_sae=request.sae_manifest.d_sae,
+                activation=SAEActivation(request.sae_manifest.activation),
+                layers=tuple((li, hp) for li, hp in request.sae_manifest.layers),
+                clampable_features=tuple(
+                    sorted(set(request.sae_manifest.clampable_features))
+                ),
+                activation_params=dict(request.sae_manifest.activation_params),
+                weights_uri=request.sae_manifest.weights_uri,
+            )
+            # Forward the additive vector fields too, even though the
+            # SAE branch must reject them: ``SteeringModuleRegistry.register``
+            # raises a 400-shaped ValueError when an SAE registration
+            # carries any additive payload, so a mixed-kind request
+            # surfaces as a clear client error instead of being
+            # silently discarded at the router.
+            await registry.register(
+                name=request.name,
+                kind=kind,
+                vectors=request.vectors,
+                prefill_vectors=request.prefill_vectors,
+                decode_vectors=request.decode_vectors,
+                sae_manifest=manifest,
+            )
+            payload = {
+                "kind": kind.value,
+                "sae_manifest": {
+                    "d_model": manifest.d_model,
+                    "d_sae": manifest.d_sae,
+                    "activation": manifest.activation.value,
+                    "layers": [list(p) for p in manifest.layers],
+                    "clampable_features": list(manifest.clampable_features),
+                    "activation_params": dict(manifest.activation_params),
+                    "weights_uri": manifest.weights_uri,
+                },
+            }
+        # Push the freshly-registered module to every worker so requests
+        # carrying ``SamplingParams.steering_module_ref`` (additive) or
+        # ``SamplingParams.sae_clamp_specs`` (sae_delta) resolve names
+        # locally without crossing the multiprocessing boundary with
+        # the full payload.
+        await _broadcast_module_to_workers(
+            _engine_client(raw_request),
+            request.name,
+            payload,
         )
         return JSONResponse(
             content={
                 "status": "ok",
                 "name": request.name,
+                "kind": kind.value,
                 "modules": registry.list_modules(),
             },
         )

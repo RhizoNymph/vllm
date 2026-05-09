@@ -14,6 +14,7 @@ from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnota
 from pydantic import Field, PrivateAttr, model_serializer, model_validator
 
 from vllm.config import ModelConfig
+from vllm.config.sae_steering_types import coerce_sae_clamp_specs
 from vllm.config.steering_types import SteeringVectorSpec
 from vllm.config.utils import replace
 from vllm.entrypoints.chat_utils import (
@@ -76,7 +77,6 @@ class CaptureResultResponse(OpenAIBaseModel):
     status: Literal["pending", "ok", "partial_error", "error", "not_requested"]
     error: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
-
 
 
 class ChatMessage(OpenAIBaseModel):
@@ -458,6 +458,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "composed with any inline steering vector fields.",
     )
 
+    sae_clamp_specs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of SAE feature-surgery clamp directives.  Each entry "
+            "references a named SAE-kind module (registered via "
+            "POST /v1/steering/modules/register with kind='sae_delta') "
+            "and declares which feature activations to clamp on which "
+            "(hook, layer) pairs.  See docs/features/sae_steering.md "
+            "for the schema.  Phase-0 plumbs clamps through the request "
+            "and rejects any application attempt with a clear error; "
+            "the kernel lands in Phase-1."
+        ),
+    )
+
     capture: dict[str, Any] | None = Field(
         default=None,
         description=(
@@ -686,6 +700,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             steering_vectors=self.steering_vectors,
             prefill_steering_vectors=self.prefill_steering_vectors,
             decode_steering_vectors=self.decode_steering_vectors,
+            sae_clamp_specs=coerce_sae_clamp_specs(self.sae_clamp_specs),
         )
         # Attach the capture dict (keyed by consumer name). The
         # entrypoint's ``_admit_capture`` mutates each value in place
