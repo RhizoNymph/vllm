@@ -371,15 +371,33 @@ encoder/decoder row sets are equal.
      hand-rolled per-(token, feature) reference, all activations
      and clamp variants, dtype contract, shape validation.
 
-3. **Phase 1B — Layer-hook integration.**
-   - Per-layer SAE buffers, `SAEClampManager` (parallel to
-     `SteeringManager`), worker-side weight registry that loads
-     encoder/decoder rows, `apply_layer_sae_delta` shim that wraps
-     `apply_sae_delta` and is registered as
-     `torch.ops.vllm.apply_sae_delta`.
-   - End-to-end tiny-model fixture tests for prefill and decode.
-   - Replaces the Phase-0 admission-time `NotImplementedError` with
-     real dispatch.
+3. **Phase 1B — Layer-hook integration.** Split into stages so each
+   piece is reviewable on its own; integration touches the additive
+   path's hot loops, so each stage gets independent testing.
+   - **Stage 1 (shipped).** Worker-side machinery, no decoder-model
+     wiring and no worker-mixin integration.  `SAEClampManager` in
+     `vllm/v1/worker/sae_clamp_manager.py` — row allocation /
+     refcount / strict capacity / deterministic-replay parallel to
+     `SteeringManager`, but with no global tier (row 0 is no-op,
+     rows 1+ are per-request).  `register_sae_buffers`,
+     `apply_layer_sae_delta`, and `populate_sae_clamp_table` in
+     `vllm/model_executor/layers/sae_steering.py` — buffer attach
+     / detach, the layer-hook shim that gathers per-token clamps
+     from the row table and dispatches to `apply_sae_delta`, and
+     the projector that writes manager rows back into the per-
+     `(layer, hook)` buffers.  Phase 1B Stage 1 enforces "at most
+     one SAE module per (layer, hook) site"; multi-module overlap
+     is a follow-up.
+   - **Stage 2.** Worker mixin integration: replace the Phase-0
+     admission `NotImplementedError` with real `register_clamp_spec`
+     / `release_clamp_spec` calls; add SAE handling to
+     `_handle_steering_transition`, `_refresh_streaming_steering`,
+     and the per-step `_update_steering_buffers`; attach SAE
+     buffers when an SAE module registers and detach on unregister.
+   - **Stage 3.** Decoder-model wiring: call `apply_layer_sae_delta`
+     from the same hook-point sites that already invoke
+     `apply_layer_steering`.  End-to-end tiny-model fixture tests
+     for prefill and decode.
 
 4. **Phase 2 — Triton kernel + CUDA-graph integration.**
    - Replace the eager body with a Triton kernel under the same
