@@ -14,7 +14,7 @@ from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnota
 from pydantic import Field, PrivateAttr, model_serializer, model_validator
 
 from vllm.config import ModelConfig
-from vllm.config.sae_steering_types import SAEClampSpec, coerce_sae_clamp_specs
+from vllm.config.sae_steering_types import coerce_sae_clamp_specs
 from vllm.config.steering_types import SteeringVectorSpec
 from vllm.config.utils import replace
 from vllm.entrypoints.chat_utils import (
@@ -77,7 +77,6 @@ class CaptureResultResponse(OpenAIBaseModel):
     status: Literal["pending", "ok", "partial_error", "error", "not_requested"]
     error: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
-
 
 
 class ChatMessage(OpenAIBaseModel):

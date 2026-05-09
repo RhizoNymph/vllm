@@ -578,8 +578,8 @@ class SteeringModelRunnerMixin:
             kind = payload.get("kind", "additive")
             if kind == "additive":
                 # Legacy paths and additive registrations both flow here.
-                self._steering_module_registry[name] = (
-                    self._module_payload_to_specs(payload)
+                self._steering_module_registry[name] = self._module_payload_to_specs(
+                    payload
                 )
                 # If a name is being re-registered as additive, drop any
                 # stale SAE entry so the registries stay disjoint.

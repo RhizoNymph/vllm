@@ -37,8 +37,7 @@ class SAEModuleManifestRequest(BaseModel):
     activation_params: dict[str, float] = Field(
         default_factory=dict,
         description=(
-            "Activation-specific parameters (e.g. JumpReLU threshold, "
-            "TopK k)."
+            "Activation-specific parameters (e.g. JumpReLU threshold, TopK k)."
         ),
     )
     weights_uri: str | None = Field(

@@ -10,8 +10,8 @@ from typing import Annotated, Any, Literal
 from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
+from vllm.config.sae_steering_types import coerce_sae_clamp_specs
 from vllm.config.steering_types import SteeringVectorSpec
-from vllm.config.sae_steering_types import SAEClampSpec, coerce_sae_clamp_specs
 from vllm.config.utils import replace
 from vllm.entrypoints.openai.chat_completion.protocol import (
     CaptureResultResponse,

@@ -83,9 +83,7 @@ class TestRegisterSAE:
     @pytest.mark.asyncio
     async def test_sae_rejects_additive_vectors(self):
         reg = SteeringModuleRegistry()
-        with pytest.raises(
-            ValueError, match="additive vector fields are not valid"
-        ):
+        with pytest.raises(ValueError, match="additive vector fields are not valid"):
             await reg.register(
                 name="g",
                 kind=SteeringModuleKind.SAE_DELTA,
@@ -160,6 +158,56 @@ class TestValidateAdditiveLookup:
         assert "sae_clamp_specs" in err
 
 
+class TestValidateSAEClampSpecs:
+    """API-side validation of sae_clamp_specs against the registry."""
+
+    @pytest.mark.asyncio
+    async def test_none_returns_none(self):
+        reg = SteeringModuleRegistry()
+        assert reg.validate_sae_clamp_specs(None) is None
+        assert reg.validate_sae_clamp_specs([]) is None
+        assert reg.validate_sae_clamp_specs(()) is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_module_dict_form(self):
+        reg = SteeringModuleRegistry()
+        err = reg.validate_sae_clamp_specs(
+            [{"module_name": "missing", "clamps": {"post_mlp": {0: []}}}]
+        )
+        assert err is not None
+        assert "unknown module 'missing'" in err
+
+    @pytest.mark.asyncio
+    async def test_additive_module_rejected(self):
+        """An additive-kind module under the same name must surface as
+        an API-side 400 instead of crashing the worker."""
+        reg = SteeringModuleRegistry()
+        await reg.register(name="m", vectors={"post_mlp": {0: [0.1]}})
+        err = reg.validate_sae_clamp_specs([{"module_name": "m", "clamps": {}}])
+        assert err is not None
+        assert "kind 'additive'" in err
+        assert "steering_name" in err
+
+    @pytest.mark.asyncio
+    async def test_sae_module_passes(self):
+        reg = SteeringModuleRegistry()
+        await reg.register(
+            name="g",
+            kind=SteeringModuleKind.SAE_DELTA,
+            sae_manifest=_manifest(),
+        )
+        assert (
+            reg.validate_sae_clamp_specs([{"module_name": "g", "clamps": {}}]) is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_module_name_field(self):
+        reg = SteeringModuleRegistry()
+        err = reg.validate_sae_clamp_specs([{"clamps": {}}])
+        assert err is not None
+        assert "module_name" in err
+
+
 class TestMixedKindRegistration:
     """Phase-0 must reject SAE registrations that also carry additive
     fields — the API server's router forwards every field, so the
@@ -168,9 +216,7 @@ class TestMixedKindRegistration:
     @pytest.mark.asyncio
     async def test_sae_with_vectors_rejected(self):
         reg = SteeringModuleRegistry()
-        with pytest.raises(
-            ValueError, match="additive vector fields are not valid"
-        ):
+        with pytest.raises(ValueError, match="additive vector fields are not valid"):
             await reg.register(
                 name="x",
                 kind=SteeringModuleKind.SAE_DELTA,
@@ -181,9 +227,7 @@ class TestMixedKindRegistration:
     @pytest.mark.asyncio
     async def test_sae_with_prefill_vectors_rejected(self):
         reg = SteeringModuleRegistry()
-        with pytest.raises(
-            ValueError, match="additive vector fields are not valid"
-        ):
+        with pytest.raises(ValueError, match="additive vector fields are not valid"):
             await reg.register(
                 name="x",
                 kind=SteeringModuleKind.SAE_DELTA,
@@ -194,9 +238,7 @@ class TestMixedKindRegistration:
     @pytest.mark.asyncio
     async def test_sae_with_decode_vectors_rejected(self):
         reg = SteeringModuleRegistry()
-        with pytest.raises(
-            ValueError, match="additive vector fields are not valid"
-        ):
+        with pytest.raises(ValueError, match="additive vector fields are not valid"):
             await reg.register(
                 name="x",
                 kind=SteeringModuleKind.SAE_DELTA,

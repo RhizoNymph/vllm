@@ -65,7 +65,9 @@ class TestSamplingParamsSAEField:
                         "module_name": "g",
                         "clamps": {
                             "bogus_hook": {
-                                0: [{"feature_idx": 0, "kind": "absolute", "value": 1.0}]
+                                0: [
+                                    {"feature_idx": 0, "kind": "absolute", "value": 1.0}
+                                ]
                             }
                         },
                     }

@@ -246,7 +246,7 @@ def merge_steering_specs(
 def hash_steering_config(
     effective_vectors: dict[str, dict[int, list[float] | np.ndarray]] | None,
     module_ref: tuple[str, float] | None = None,
-    sae_clamp_specs: object = None,
+    sae_clamp_specs: tuple[Any, ...] | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 

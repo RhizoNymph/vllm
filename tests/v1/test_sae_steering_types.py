@@ -24,7 +24,6 @@ from vllm.config.sae_steering_types import (
 )
 from vllm.config.steering_types import hash_steering_config
 
-
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -117,9 +116,7 @@ def _spec(
         clamps={
             hook: {
                 layer: (
-                    SAEClampEntry(
-                        feature_idx=feature_idx, kind=kind, value=value
-                    ),  # type: ignore[arg-type]
+                    SAEClampEntry(feature_idx=feature_idx, kind=kind, value=value),  # type: ignore[arg-type]
                 )
             }
         },
@@ -137,9 +134,7 @@ class TestSAEClampSpec:
         with pytest.raises(ValueError, match="module_name"):
             SAEClampSpec(
                 module_name="",
-                clamps={
-                    "post_mlp": {0: (SAEClampEntry(0, "absolute", 1.0),)}
-                },
+                clamps={"post_mlp": {0: (SAEClampEntry(0, "absolute", 1.0),)}},
             )
 
     def test_invalid_phase_rejected(self):
@@ -161,9 +156,7 @@ class TestSAEClampSpec:
         with pytest.raises(ValueError, match="non-negative"):
             SAEClampSpec(
                 module_name="m",
-                clamps={
-                    "post_mlp": {-1: (SAEClampEntry(0, "absolute", 1.0),)}
-                },
+                clamps={"post_mlp": {-1: (SAEClampEntry(0, "absolute", 1.0),)}},
             )
 
     def test_duplicate_feature_idx_rejected(self):
@@ -181,7 +174,7 @@ class TestSAEClampSpec:
             )
 
     def test_empty_entries_tuple_rejected(self):
-        with pytest.raises(ValueError, match="non-empty tuple"):
+        with pytest.raises(ValueError, match="non-empty sequence"):
             SAEClampSpec(
                 module_name="m",
                 clamps={"post_mlp": {0: ()}},
@@ -319,12 +312,8 @@ class TestHashSAEClampSpecs:
         of the order the user passed them in."""
         e1 = SAEClampEntry(1, "absolute", 1.0)
         e2 = SAEClampEntry(2, "additive", 2.0)
-        a = SAEClampSpec(
-            module_name="m", clamps={"post_mlp": {0: (e1, e2)}}
-        )
-        b = SAEClampSpec(
-            module_name="m", clamps={"post_mlp": {0: (e2, e1)}}
-        )
+        a = SAEClampSpec(module_name="m", clamps={"post_mlp": {0: (e1, e2)}})
+        b = SAEClampSpec(module_name="m", clamps={"post_mlp": {0: (e2, e1)}})
         assert hash_sae_clamp_specs((a,)) == hash_sae_clamp_specs((b,))
 
     def test_returns_positive_int63(self):
@@ -366,14 +355,10 @@ class TestHashSteeringConfigWithSAE:
     def test_sae_state_changes_hash(self):
         vecs = {"post_mlp": {0: [0.1, 0.2]}}
         h_no_sae = hash_steering_config(vecs)
-        h_with_sae = hash_steering_config(
-            vecs, sae_clamp_specs=(_spec(),)
-        )
+        h_with_sae = hash_steering_config(vecs, sae_clamp_specs=(_spec(),))
         assert h_no_sae != h_with_sae
 
     def test_returns_positive_int63(self):
-        h = hash_steering_config(
-            {"post_mlp": {0: [0.1]}}, sae_clamp_specs=(_spec(),)
-        )
+        h = hash_steering_config({"post_mlp": {0: [0.1]}}, sae_clamp_specs=(_spec(),))
         assert h >= 0
         assert h <= 0x7FFFFFFFFFFFFFFF

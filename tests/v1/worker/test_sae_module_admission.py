@@ -108,9 +108,7 @@ class TestRegisterDispatch:
 
     def test_replace_clears_both_registries(self):
         h = _MixinHarness()
-        h.register_steering_modules(
-            {"m": _additive_payload(), "g": _sae_payload()}
-        )
+        h.register_steering_modules({"m": _additive_payload(), "g": _sae_payload()})
         h.register_steering_modules({"only": _additive_payload()}, replace=True)
         assert list(h._steering_module_registry.keys()) == ["only"]
         assert h._sae_module_registry == {}
@@ -127,9 +125,7 @@ class TestRegisterDispatch:
 
     def test_unregister_removes_from_both(self):
         h = _MixinHarness()
-        h.register_steering_modules(
-            {"m": _additive_payload(), "g": _sae_payload()}
-        )
+        h.register_steering_modules({"m": _additive_payload(), "g": _sae_payload()})
         h.unregister_steering_modules(["m", "g"])
         assert h._steering_module_registry == {}
         assert h._sae_module_registry == {}
@@ -148,17 +144,11 @@ class TestSAEClampAdmissionGuard:
             sae_clamp_specs=(
                 SAEClampSpec(
                     module_name="missing",
-                    clamps={
-                        "post_mlp": {
-                            0: (SAEClampEntry(0, "absolute", 1.0),)
-                        }
-                    },
+                    clamps={"post_mlp": {0: (SAEClampEntry(0, "absolute", 1.0),)}},
                 ),
             ),
         )
-        with pytest.raises(
-            SteeringVectorError, match="unknown module 'missing'"
-        ):
+        with pytest.raises(SteeringVectorError, match="unknown module 'missing'"):
             h._assert_sae_clamps_can_be_applied(sp)
 
     def test_known_module_still_raises_not_implemented(self):
@@ -171,11 +161,7 @@ class TestSAEClampAdmissionGuard:
             sae_clamp_specs=(
                 SAEClampSpec(
                     module_name="g",
-                    clamps={
-                        "post_mlp": {
-                            20: (SAEClampEntry(34, "absolute", 5.0),)
-                        }
-                    },
+                    clamps={"post_mlp": {20: (SAEClampEntry(34, "absolute", 5.0),)}},
                 ),
             ),
         )

@@ -96,22 +96,16 @@ async def register_steering_module(
             }
         else:  # SAE_DELTA
             if request.sae_manifest is None:
-                raise ValueError(
-                    "kind='sae_delta' requires a 'sae_manifest' payload."
-                )
+                raise ValueError("kind='sae_delta' requires a 'sae_manifest' payload.")
             manifest = SAEModuleManifest(
                 d_model=request.sae_manifest.d_model,
                 d_sae=request.sae_manifest.d_sae,
                 activation=SAEActivation(request.sae_manifest.activation),
-                layers=tuple(
-                    (li, hp) for li, hp in request.sae_manifest.layers
-                ),
+                layers=tuple((li, hp) for li, hp in request.sae_manifest.layers),
                 clampable_features=tuple(
                     sorted(set(request.sae_manifest.clampable_features))
                 ),
-                activation_params=dict(
-                    request.sae_manifest.activation_params
-                ),
+                activation_params=dict(request.sae_manifest.activation_params),
                 weights_uri=request.sae_manifest.weights_uri,
             )
             # Forward the additive vector fields too, even though the

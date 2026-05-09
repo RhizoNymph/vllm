@@ -112,9 +112,7 @@ class SteeringModuleRegistry:
                     "for kind=SAE_DELTA."
                 )
             if not vectors and not prefill_vectors and not decode_vectors:
-                raise ValueError(
-                    f"Steering module '{name}' has no vectors in any tier"
-                )
+                raise ValueError(f"Steering module '{name}' has no vectors in any tier")
 
             # Validate hook point names and entry format
             for spec in [vectors, prefill_vectors, decode_vectors]:
@@ -129,9 +127,7 @@ class SteeringModuleRegistry:
                     # Validate entries are well-formed
                     for hook_name, layers in spec.items():
                         for layer_idx, entry in layers.items():
-                            self._validate_layer_index(
-                                name=name, layer_idx=layer_idx
-                            )
+                            self._validate_layer_index(name=name, layer_idx=layer_idx)
                             self._validate_layer_entry(
                                 name=name,
                                 hook_name=hook_name,
@@ -164,9 +160,7 @@ class SteeringModuleRegistry:
                 sae_manifest=sae_manifest,
             )
         else:
-            raise ValueError(
-                f"Steering module '{name}': unsupported kind {kind!r}"
-            )
+            raise ValueError(f"Steering module '{name}': unsupported kind {kind!r}")
 
         async with self._lock:
             self._modules[name] = module
@@ -183,6 +177,54 @@ class SteeringModuleRegistry:
     def get(self, name: str) -> SteeringModule | None:
         """Look up a module by name. Thread-safe for reads."""
         return self._modules.get(name)
+
+    def validate_sae_clamp_specs(
+        self, specs: list[Any] | tuple[Any, ...] | None
+    ) -> str | None:
+        """Validate ``sae_clamp_specs`` against the registry.
+
+        Symmetric with :meth:`validate_additive_lookup`: returns an
+        English error message when any spec references a name that
+        either isn't registered or isn't an SAE-kind module, otherwise
+        returns ``None``.
+
+        Doing this at the API server (instead of only at the worker)
+        means a request that names a missing or wrong-kind SAE module
+        becomes a 400 immediately rather than either crashing the
+        worker (steering enabled) or being silently dropped (steering
+        disabled, the worker mixin's admission guard never fires).
+        ``specs`` may be a tuple of :class:`SAEClampSpec` (typed
+        ``SamplingParams`` form) or a list of dicts (raw OpenAI
+        payload before coercion); only the ``module_name`` field is
+        read so both shapes work.
+        """
+        if not specs:
+            return None
+        for i, spec in enumerate(specs):
+            if isinstance(spec, dict):
+                module_name = spec.get("module_name")
+            else:
+                module_name = getattr(spec, "module_name", None)
+            if not isinstance(module_name, str) or not module_name:
+                return (
+                    f"sae_clamp_specs[{i}] is missing a non-empty 'module_name' field."
+                )
+            module = self._modules.get(module_name)
+            if module is None:
+                return (
+                    f"sae_clamp_specs[{i}] references unknown module "
+                    f"{module_name!r}.  Available: "
+                    f"{self.list_modules() or 'none'}"
+                )
+            if module.kind is not SteeringModuleKind.SAE_DELTA:
+                return (
+                    f"sae_clamp_specs[{i}] references module "
+                    f"{module_name!r} of kind {module.kind.value!r}; "
+                    "only kind='sae_delta' modules can be referenced "
+                    "from sae_clamp_specs.  Use 'steering_name' for "
+                    "additive modules."
+                )
+        return None
 
     def validate_additive_lookup(self, name: str) -> str | None:
         """Validate ``name`` for use as the OpenAI ``steering_name`` field.
@@ -244,9 +286,7 @@ class SteeringModuleRegistry:
                 payload["prefill_vectors"] = module.prefill_vectors
                 payload["decode_vectors"] = module.decode_vectors
             else:
-                payload["sae_manifest"] = _sae_manifest_to_dict(
-                    module.sae_manifest
-                )
+                payload["sae_manifest"] = _sae_manifest_to_dict(module.sae_manifest)
             out[name] = payload
         return out
 
@@ -387,9 +427,7 @@ class SteeringModuleRegistry:
                 f"{sorted(self._valid_layer_indices) or 'none'}"
             )
 
-    def _validate_sae_manifest(
-        self, *, name: str, manifest: SAEModuleManifest
-    ) -> None:
+    def _validate_sae_manifest(self, *, name: str, manifest: SAEModuleManifest) -> None:
         """Structural validation for an SAE manifest.
 
         Phase-0 only stores the manifest, but we still want bad shapes to
@@ -398,13 +436,11 @@ class SteeringModuleRegistry:
         prefix = f"SAE module {name!r}"
         if not isinstance(manifest.d_model, int) or manifest.d_model <= 0:
             raise ValueError(
-                f"{prefix}: d_model must be a positive int, "
-                f"got {manifest.d_model!r}."
+                f"{prefix}: d_model must be a positive int, got {manifest.d_model!r}."
             )
         if not isinstance(manifest.d_sae, int) or manifest.d_sae <= 0:
             raise ValueError(
-                f"{prefix}: d_sae must be a positive int, "
-                f"got {manifest.d_sae!r}."
+                f"{prefix}: d_sae must be a positive int, got {manifest.d_sae!r}."
             )
         if not isinstance(manifest.activation, SAEActivation):
             raise ValueError(
@@ -424,8 +460,7 @@ class SteeringModuleRegistry:
                 or not isinstance(entry[1], str)
             ):
                 raise ValueError(
-                    f"{prefix}: layer entries must be (int, str) tuples, "
-                    f"got {entry!r}."
+                    f"{prefix}: layer entries must be (int, str) tuples, got {entry!r}."
                 )
             layer_idx, hook_point = entry
             self._validate_layer_index(name=name, layer_idx=layer_idx)

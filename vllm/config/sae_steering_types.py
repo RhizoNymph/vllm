@@ -19,10 +19,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
-
-from pydantic.dataclasses import dataclass
 
 from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
 
@@ -164,6 +163,14 @@ class SAEClampSpec:
                 "hook-point names to per-layer clamp lists, got "
                 f"{self.clamps!r}."
             )
+        # ``self.clamps`` may arrive with list-valued entries (the
+        # natural shape from JSON / direct test construction); we
+        # canonicalize each to a tuple so the runtime contract holds
+        # invariantly.  Frozen dataclasses don't allow attribute
+        # mutation, so write through ``object.__setattr__`` after
+        # building a fresh dict — the field type is still
+        # ``SAEClampHookMap`` so downstream code sees ``tuple``.
+        coerced: SAEClampHookMap = {}
         for hook_name, layer_map in self.clamps.items():
             if hook_name not in VALID_HOOK_POINT_NAMES:
                 raise ValueError(
@@ -175,16 +182,17 @@ class SAEClampSpec:
                     f"SAEClampSpec.clamps[{hook_name!r}] must be a non-empty "
                     "dict mapping layer indices to clamp-entry tuples."
                 )
+            coerced_layer: SAEClampLayerMap = {}
             for layer_idx, entries in layer_map.items():
                 if not isinstance(layer_idx, int) or layer_idx < 0:
                     raise ValueError(
                         f"SAEClampSpec.clamps[{hook_name!r}] keys must be "
                         f"non-negative integers, got {layer_idx!r}."
                     )
-                if not isinstance(entries, tuple) or not entries:
+                if not isinstance(entries, (list, tuple)) or not entries:
                     raise ValueError(
                         f"SAEClampSpec.clamps[{hook_name!r}][{layer_idx}] "
-                        "must be a non-empty tuple of SAEClampEntry, got "
+                        "must be a non-empty sequence of SAEClampEntry, got "
                         f"{type(entries).__name__}."
                     )
                 feature_seen: set[int] = set()
@@ -205,6 +213,9 @@ class SAEClampSpec:
                             "(hook, layer)."
                         )
                     feature_seen.add(entry.feature_idx)
+                coerced_layer[layer_idx] = tuple(entries)
+            coerced[hook_name] = coerced_layer
+        object.__setattr__(self, "clamps", coerced)
 
 
 def coerce_sae_clamp_specs(
@@ -216,15 +227,19 @@ def coerce_sae_clamp_specs(
 
         {
             "module_name": "golden_gate",
-            "phase": "both",                  # optional, default "both"
+            "phase": "both",  # optional, default "both"
             "clamps": {
                 "post_mlp": {
                     20: [
-                        {"feature_idx": 34, "kind": "absolute",
-                         "value": 5.0, "only_if_active": false}
+                        {
+                            "feature_idx": 34,
+                            "kind": "absolute",
+                            "value": 5.0,
+                            "only_if_active": false,
+                        }
                     ]
                 }
-            }
+            },
         }
 
     Returns ``None`` for empty input so downstream code can short-circuit
@@ -250,13 +265,17 @@ def coerce_sae_clamp_specs(
                 f"sae_clamp_specs[{i}] must be a dict or SAEClampSpec, got "
                 f"{type(item).__name__}."
             )
-        module_name = item.get("module_name")
+        module_name_raw = item.get("module_name")
+        if not isinstance(module_name_raw, str):
+            raise ValueError(
+                f"sae_clamp_specs[{i}]['module_name'] must be a str, got "
+                f"{type(module_name_raw).__name__}."
+            )
+        module_name: str = module_name_raw
         phase = item.get("phase", "both")
         clamps_raw = item.get("clamps")
         if clamps_raw is None:
-            raise ValueError(
-                f"sae_clamp_specs[{i}] missing required 'clamps' field."
-            )
+            raise ValueError(f"sae_clamp_specs[{i}] missing required 'clamps' field.")
         if not isinstance(clamps_raw, dict):
             raise ValueError(
                 f"sae_clamp_specs[{i}]['clamps'] must be a dict, got "
@@ -289,9 +308,7 @@ def coerce_sae_clamp_specs(
                 entries = tuple(_coerce_clamp_entry(e) for e in entries_raw)
                 layer_map[layer_idx] = entries
             clamps[hook_name] = layer_map
-        out.append(
-            SAEClampSpec(module_name=module_name, phase=phase, clamps=clamps)
-        )
+        out.append(SAEClampSpec(module_name=module_name, phase=phase, clamps=clamps))
     return tuple(out)
 
 
@@ -348,9 +365,7 @@ def hash_sae_clamp_specs(specs: tuple[SAEClampSpec, ...] | None) -> int:
             for layer_idx in sorted(layer_map.keys()):
                 h.update(b"\x03layer\x03")
                 h.update(layer_idx.to_bytes(4, "little", signed=True))
-                entries = sorted(
-                    layer_map[layer_idx], key=lambda e: e.feature_idx
-                )
+                entries = sorted(layer_map[layer_idx], key=lambda e: e.feature_idx)
                 for entry in entries:
                     h.update(b"\x04entry\x04")
                     h.update(entry.feature_idx.to_bytes(4, "little", signed=True))
