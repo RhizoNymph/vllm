@@ -420,11 +420,38 @@ encoder/decoder row sets are equal.
      parity (no SAE module → forward bit-identical to the additive-
      only path).
 
-4. **Phase 2 — Triton kernel + CUDA-graph integration.**
-   - Replace the eager body with a Triton kernel under the same
-     custom-op shim, mirroring `steering_kernel.py`'s shape.
-   - CUDA graph replay test (steering already exercises this; extend
-     the suite to cover SAE clamps).
+4. **Phase 2 — Triton kernel + CUDA-graph integration (shipped).**
+   - The eager Python body is preserved as the CPU fallback and the
+     test ground truth.  CUDA tensors now route through a fused
+     Triton kernel in
+     `vllm/model_executor/layers/sae_steering_kernel.py` that
+     computes the encoder GEMM, activation, clamp logic, decoder
+     GEMM, and add-back in a single launch — one program per token,
+     two streaming sweeps over the hidden dimension, with the clamp
+     axis register-resident as a `BLOCK_C`-wide tile.
+   - The compute path is registered as
+     `torch.ops.vllm.apply_sae_delta` (tensor-only schema with an
+     integer activation code + single float scalar param), so the
+     layer-hook dispatch shim `apply_layer_sae_delta` calls through
+     `torch.ops` and `torch.compile` treats the SAE op as an opaque
+     splitting point, matching the additive `apply_steering` shape.
+     The public Python API `apply_sae_delta(activation: SAEActivation,
+     activation_params: dict, ...)` keeps its enum-flavoured signature
+     for tests and direct callers; it validates shapes and delegates
+     to `apply_sae_delta_op` *directly* (bypassing `torch.ops`) so
+     CPU-only test environments don't hit dispatch-key mismatches
+     when the op was registered for CUDA.
+   - The activation function is encoded as a constexpr in the kernel
+     so each `(activation, n_clamp, d_model)` site JITs once.  A
+     `warmup_apply_sae_delta_kernel` helper mirrors
+     `warmup_apply_steering_kernel` and is invoked from
+     `_attach_sae_buffers` for every newly-attached SAE module so
+     the first-call JIT happens before any captured forward pass.
+     CUDA-graph capture/replay parity is covered by
+     `tests/model_executor/layers/test_sae_steering_kernel.py`,
+     alongside ReLU / JumpReLU / TopK kernel-vs-eager parity, fp16 /
+     bf16 dtype parity, non-power-of-two `d_model` correctness, and
+     the empty-batch / `n_clamp == 0` short-circuit contract.
 
 5. **Phase 3 — Real SAE checkpoint integration test.**
    - Add a Gemma-Scope-driven end-to-end test alongside the existing

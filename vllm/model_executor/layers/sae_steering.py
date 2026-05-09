@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Eager reference op for SAE feature-surgery (delta) steering.
+"""SAE feature-surgery (delta) custom op + per-layer dispatch glue.
 
 The op math, per token ``t`` with clamp set ``I``:
 
@@ -12,13 +12,23 @@ The op math, per token ``t`` with clamp set ``I``:
     delta_i    = (new_f_i - f_i) gated by only_if_active when set
     h_t_new    = h_t + Σ_{i ∈ I} delta_i · W_dec[i, :]
 
-This is the **eager reference implementation** for Phase 1 of the SAE
-steering rollout: a vectorized PyTorch path with the same input shape
-and dtype contract that the Phase-2 Triton kernel will adopt.  Layer-
-hook integration (per-layer buffers, custom-op registration with
-``torch.ops.vllm.apply_sae_delta``, and the model_runner_mixin wires)
-arrives in a follow-up so this op stays standalone, unit-testable, and
-reusable in tests that assemble inputs directly.
+The compute path dispatches via :func:`apply_sae_delta_op`, which is
+registered as ``torch.ops.vllm.apply_sae_delta`` so :mod:`torch.compile`
+treats the call as an opaque splitting point (mirroring
+``apply_steering`` in :mod:`vllm.model_executor.layers.steering`).
+Inside the op, CUDA tensors are routed to a fused Triton kernel
+(:mod:`sae_steering_kernel`) and CPU tensors fall back to a vectorised
+PyTorch eager body kept in this module.  The eager body remains the
+ground truth for tests and for environments without Triton.
+
+The torch-op signature uses an integer ``activation_code`` and a single
+``float activation_param`` so :func:`torch.library.infer_schema` accepts
+it without bespoke type adapters.  The public Python API
+:func:`apply_sae_delta` keeps the original
+``(SAEActivation, dict[str, float])`` shape and translates internally
+before calling the op directly (i.e. *not* through ``torch.ops``) so
+CPU-only test environments don't hit dispatch-key mismatches when the
+op is registered for CUDA.
 
 Numeric dtype contract (matches ``docs/features/sae_steering.md``):
 
@@ -28,11 +38,12 @@ Numeric dtype contract (matches ``docs/features/sae_steering.md``):
   subtraction; results are cast back to compute dtype before the
   decoder GEMM.
 
-Phase-1 supports ``ReLU``, ``JumpReLU`` (``activation_params['threshold']``),
-and ``TopK`` (``activation_params['k']``).  TopK selects k largest
-pre-activations across the **encoder rows passed in** — for a partial
-encoder this is "TopK among the clampable subset".  Operators who
-need full-d_sae TopK semantics must load the full encoder.
+Activation support: ``ReLU``, ``JumpReLU``
+(``activation_params['threshold']``), and ``TopK``
+(``activation_params['k']``).  TopK selects k largest pre-activations
+across the **encoder rows passed in** — for a partial encoder this is
+"TopK among the clampable subset".  Operators who need full-d_sae
+TopK semantics must load the full encoder.
 """
 
 from __future__ import annotations
@@ -44,6 +55,7 @@ from torch import nn
 
 from vllm.config.sae_steering_types import SAEActivation
 from vllm.model_executor.layers.steering import SteeringHookPoint
+from vllm.utils.torch_utils import direct_register_custom_op
 
 # Integer codes for ``clamp_kind`` tensors.  Kept explicit so the
 # Triton kernel (Phase 2) and any other consumer can use the same
@@ -51,6 +63,52 @@ from vllm.model_executor.layers.steering import SteeringHookPoint
 CLAMP_KIND_NONE = 0
 CLAMP_KIND_ABSOLUTE = 1
 CLAMP_KIND_ADDITIVE = 2
+
+# Integer encoding of :class:`SAEActivation`.  The Triton kernel (and
+# the registered torch op) take an ``int`` activation code so the
+# schema stays primitive-typed; the eager body and the kernel switch
+# on these codes to pick the right activation.  Values must stay in
+# sync with ``ACTIVATION_CODE_*`` in :mod:`sae_steering_kernel`.
+ACTIVATION_CODE_RELU = 0
+ACTIVATION_CODE_JUMPRELU = 1
+ACTIVATION_CODE_TOPK = 2
+
+_ACTIVATION_TO_CODE: dict[SAEActivation, int] = {
+    SAEActivation.RELU: ACTIVATION_CODE_RELU,
+    SAEActivation.JUMPRELU: ACTIVATION_CODE_JUMPRELU,
+    SAEActivation.TOPK: ACTIVATION_CODE_TOPK,
+}
+_CODE_TO_ACTIVATION: dict[int, SAEActivation] = {
+    code: act for act, code in _ACTIVATION_TO_CODE.items()
+}
+
+
+def _activation_to_scalar(
+    activation: SAEActivation, activation_params: Mapping[str, float]
+) -> float:
+    """Pack ``activation_params`` into a single ``float`` for the op.
+
+    The custom-op schema only supports primitive scalars, so the
+    activation-specific parameter (``threshold`` for JumpReLU, ``k``
+    for TopK) is collapsed into one ``float`` argument.  ReLU has no
+    parameter; ``0.0`` is passed and ignored.
+    """
+    if activation is SAEActivation.JUMPRELU:
+        return float(activation_params["threshold"])
+    if activation is SAEActivation.TOPK:
+        return float(activation_params["k"])
+    return 0.0
+
+
+def _scalar_to_activation_params(
+    activation: SAEActivation, activation_param: float
+) -> dict[str, float]:
+    """Inverse of :func:`_activation_to_scalar` for the eager body."""
+    if activation is SAEActivation.JUMPRELU:
+        return {"threshold": float(activation_param)}
+    if activation is SAEActivation.TOPK:
+        return {"k": float(activation_param)}
+    return {}
 
 
 # Per-(layer, hook) buffer attribute names.  Using flat per-hook
@@ -323,6 +381,131 @@ def sae_encode(
     raise ValueError(f"Unsupported SAE activation: {activation!r}")
 
 
+def _apply_sae_delta_eager(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> torch.Tensor:
+    """Vectorized PyTorch eager body for the SAE feature-surgery op.
+
+    Same numerics as the Triton kernel; this path is the CPU fallback
+    and the test ground truth.  Inputs are tensor-only (the activation
+    enum is encoded as ``activation_code`` / ``activation_param`` for
+    the registered torch op).
+    """
+    activation = _CODE_TO_ACTIVATION[int(activation_code)]
+    activation_params = _scalar_to_activation_params(activation, activation_param)
+
+    # (n_tokens, n_clamp) fp32 — encoder pass.
+    f = sae_encode(
+        hidden_states, encoder_weight, encoder_bias, activation, activation_params
+    )
+
+    kind = clamp_kind.to(torch.int8)
+    value = clamp_value.to(torch.float32)
+    gated = clamp_only_if_active.to(torch.bool)
+    active = f > 0.0
+
+    new_f_absolute = value
+    new_f_additive = f + value
+    new_f = torch.where(
+        kind == CLAMP_KIND_ABSOLUTE,
+        new_f_absolute,
+        torch.where(kind == CLAMP_KIND_ADDITIVE, new_f_additive, f),
+    )
+    apply_clamp = (kind != CLAMP_KIND_NONE) & (~gated | active)
+    delta = torch.where(apply_clamp, new_f - f, torch.zeros_like(f))
+
+    delta_compute = delta.to(hidden_states.dtype)
+    decoder_compute = decoder_weight.to(hidden_states.dtype)
+    residual_delta = delta_compute @ decoder_compute
+    return hidden_states + residual_delta
+
+
+def apply_sae_delta_op(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> torch.Tensor:
+    """Tensor-only entry point registered as ``torch.ops.vllm.apply_sae_delta``.
+
+    On CUDA, dispatches to the fused Triton kernel from
+    :mod:`sae_steering_kernel`.  On CPU, falls back to
+    :func:`_apply_sae_delta_eager`.  The output is always a freshly
+    allocated tensor with the same shape and dtype as
+    ``hidden_states`` so the ``torch.compile`` graph keeps value
+    semantics — never in place.
+
+    No shape validation is performed here: callers in this module
+    (:func:`apply_sae_delta`, :func:`apply_layer_sae_delta`) validate
+    shapes before calling.  The custom-op schema is intentionally
+    primitive-typed so :func:`torch.library.infer_schema` can produce
+    a valid signature without bespoke type handling.
+    """
+    if hidden_states.is_cuda:
+        from vllm.model_executor.layers.sae_steering_kernel import (
+            apply_sae_delta_triton,
+        )
+
+        return apply_sae_delta_triton(
+            hidden_states,
+            encoder_weight,
+            encoder_bias,
+            decoder_weight,
+            clamp_kind,
+            clamp_value,
+            clamp_only_if_active,
+            int(activation_code),
+            float(activation_param),
+        )
+    return _apply_sae_delta_eager(
+        hidden_states,
+        encoder_weight,
+        encoder_bias,
+        decoder_weight,
+        clamp_kind,
+        clamp_value,
+        clamp_only_if_active,
+        int(activation_code),
+        float(activation_param),
+    )
+
+
+def apply_sae_delta_op_fake(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> torch.Tensor:
+    """FX-tracing fake — correct shape, no computation."""
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="apply_sae_delta",
+    op_func=apply_sae_delta_op,
+    fake_impl=apply_sae_delta_op_fake,
+    mutates_args=[],
+)
+
+
 def apply_sae_delta(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
@@ -334,7 +517,7 @@ def apply_sae_delta(
     clamp_value: torch.Tensor,
     clamp_only_if_active: torch.Tensor,
 ) -> torch.Tensor:
-    """Eager reference for the SAE feature-surgery delta op.
+    """Public Python API for the SAE feature-surgery delta op.
 
     Args:
         hidden_states: ``(n_tokens, d_model)``, compute dtype.  Output
@@ -363,11 +546,13 @@ def apply_sae_delta(
         ``hidden_states + Σ_i delta_i · W_dec[i]`` in the same dtype
         as ``hidden_states``.
 
-    Notes:
-        Always runs the encoder pass.  The "skip encoder when no clamp
-        needs it" optimization (a kernel-level concern; cf.
-        ``SAEClampEntry.requires_encoder_pass``) is reserved for the
-        Phase-2 fused kernel where it pays off.
+    The compute path goes through :func:`apply_sae_delta_op` (the
+    registered torch custom op).  Calling it directly here — rather
+    than via ``torch.ops.vllm.apply_sae_delta`` — keeps CPU-only test
+    environments insulated from the registered dispatch key (which
+    follows the platform: "CPU" on CPU-only, "CUDA" on a CUDA build).
+    The internal branch on ``hidden_states.is_cuda`` picks the right
+    backend without going through the dispatcher.
     """
     n_tokens, d_model = hidden_states.shape
     n_clamp = encoder_weight.shape[0]
@@ -403,36 +588,19 @@ def apply_sae_delta(
     if n_clamp == 0:
         return hidden_states.clone()
 
-    # (n_tokens, n_clamp) fp32 — encoder pass.
-    f = sae_encode(
-        hidden_states, encoder_weight, encoder_bias, activation, activation_params
+    code = _ACTIVATION_TO_CODE[activation]
+    param = _activation_to_scalar(activation, activation_params)
+    return apply_sae_delta_op(
+        hidden_states,
+        encoder_weight,
+        encoder_bias,
+        decoder_weight,
+        clamp_kind,
+        clamp_value,
+        clamp_only_if_active,
+        code,
+        param,
     )
-
-    kind = clamp_kind.to(torch.int8)
-    value = clamp_value.to(torch.float32)
-    gated = clamp_only_if_active.to(torch.bool)
-    active = f > 0.0
-
-    # Per-(token, feature) new-f computation.  Branchless via where().
-    new_f_absolute = value
-    new_f_additive = f + value
-    new_f = torch.where(
-        kind == CLAMP_KIND_ABSOLUTE,
-        new_f_absolute,
-        torch.where(kind == CLAMP_KIND_ADDITIVE, new_f_additive, f),
-    )
-    # only_if_active gates everything: when gated and not active, the
-    # clamp is suppressed (delta = 0).
-    apply_clamp = (kind != CLAMP_KIND_NONE) & (~gated | active)
-    delta = torch.where(apply_clamp, new_f - f, torch.zeros_like(f))
-
-    # Cast tiny (n_tokens, n_clamp) tensor back to compute dtype before
-    # the d_model GEMM, per the dtype contract.
-    delta_compute = delta.to(hidden_states.dtype)
-    decoder_compute = decoder_weight.to(hidden_states.dtype)
-    # (n_tokens, n_clamp) @ (n_clamp, d_model) → (n_tokens, d_model)
-    residual_delta = delta_compute @ decoder_compute
-    return hidden_states + residual_delta
 
 
 def apply_layer_sae_delta(
@@ -453,8 +621,12 @@ def apply_layer_sae_delta(
 
     The shim performs a per-token gather from the row table to build
     the ``(n_tokens, n_clamp)`` clamp tensors, then dispatches to
-    :func:`apply_sae_delta`.  Phase 2 will replace the gather + math
-    with a fused Triton kernel under the same surface.
+    ``torch.ops.vllm.apply_sae_delta``.  The torch-op indirection is
+    what makes :mod:`torch.compile` treat the SAE call as an opaque
+    splitting point (mirroring :func:`apply_layer_steering` →
+    ``torch.ops.vllm.apply_steering``); under CUDA the op routes to a
+    fused Triton kernel.  ``n_clamp == 0`` short-circuits before the
+    op call so we never launch a degenerate kernel.
     """
     if not sae_buffers_attached(module, hook_point):
         return hidden_states
@@ -473,21 +645,26 @@ def apply_layer_sae_delta(
         module, HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR[hook_point]
     )
 
+    if enc_w.shape[0] == 0:
+        return hidden_states
+
     # Per-token gather: (max_rows, n_clamp) → (n_tokens, n_clamp).
     clamp_kind = kind_table[sae_index]
     clamp_value = value_table[sae_index]
     clamp_only_if_active = only_table[sae_index]
 
-    return apply_sae_delta(
-        hidden_states=hidden_states,
-        encoder_weight=enc_w,
-        encoder_bias=enc_b,
-        decoder_weight=dec_w,
-        activation=activation,
-        activation_params=activation_params,
-        clamp_kind=clamp_kind,
-        clamp_value=clamp_value,
-        clamp_only_if_active=clamp_only_if_active,
+    code = _ACTIVATION_TO_CODE[activation]
+    param = _activation_to_scalar(activation, activation_params)
+    return torch.ops.vllm.apply_sae_delta(
+        hidden_states,
+        enc_w,
+        enc_b,
+        dec_w,
+        clamp_kind,
+        clamp_value,
+        clamp_only_if_active,
+        code,
+        param,
     )
 
 
