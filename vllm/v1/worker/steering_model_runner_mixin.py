@@ -17,6 +17,10 @@ from vllm.config.steering_types import (
     resolve_effective_vectors,
     scale_steering_spec,
 )
+from vllm.entrypoints.openai.steering.registry import (
+    SAEModuleManifest,
+    sae_manifest_from_dict,
+)
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
@@ -89,6 +93,14 @@ class SteeringModelRunnerMixin:
             SteeringVectorSpec | None,
         ],
     ]
+    # Worker-side mirror of registered SAE-kind modules.  Phase-0
+    # stores the manifest only — the runtime accepts requests that
+    # carry ``SamplingParams.sae_clamp_specs`` referencing these
+    # names but the application path raises ``NotImplementedError``
+    # because the kernel does not yet exist.  Disjoint from
+    # ``_steering_module_registry``; the broadcast payload's ``kind``
+    # field discriminates which dict an incoming module lands in.
+    _sae_module_registry: dict[str, "SAEModuleManifest"]
     # Set of layer indices physically owned by this worker.  Under PP,
     # this is a contiguous subset of ``[0, num_layers)``; under single-
     # worker and under TP (which replicates all layers per rank), it
@@ -152,6 +164,7 @@ class SteeringModelRunnerMixin:
         self._req_steering_phase = {}
         self._steering_index_dirty = False
         self._steering_module_registry = {}
+        self._sae_module_registry = {}
 
         steering_config = getattr(self.vllm_config, "steering_config", None)
         if steering_config is None or not steerable:
@@ -536,28 +549,57 @@ class SteeringModelRunnerMixin:
     ) -> None:
         """Worker-side handler for the named-module broadcast.
 
-        *modules* maps module name to a dict with optional ``vectors``,
-        ``prefill_vectors`` and ``decode_vectors`` (the same shape that
-        :class:`SteeringModuleRegistry.dump_for_broadcast` emits).  When
-        *replace* is ``True`` the worker's registry is cleared before the
-        new entries are stored — used during API-server startup to push
-        the initial registry state.
+        *modules* maps module name to a JSON-safe dict produced by
+        :meth:`SteeringModuleRegistry.dump_for_broadcast`.  Each payload
+        carries a ``kind`` discriminator: ``"additive"`` (the default
+        for legacy payloads without the field) routes the module into
+        the additive ``_steering_module_registry``;  ``"sae_delta"``
+        routes it into ``_sae_module_registry`` (Phase-0 stores the
+        manifest only).
 
-        Mirrors the strict-capacity contract of the rest of the steering
-        runtime: requests referencing a name that has not yet been
-        broadcast raise loudly in :meth:`_resolve_request_steering`
-        rather than silently falling back to inline-only behaviour.
+        When *replace* is ``True`` both worker-side registries are
+        cleared before the new entries are stored — used during
+        API-server startup to push the initial registry state.
+
+        Mirrors the strict-capacity contract of the rest of the
+        steering runtime: requests referencing a name that has not yet
+        been broadcast raise loudly in
+        :meth:`_resolve_request_steering` rather than silently falling
+        back to inline-only behaviour.
         """
         if replace:
             self._steering_module_registry.clear()
+            self._sae_module_registry.clear()
         for name, payload in modules.items():
             if not isinstance(payload, dict):
                 raise SteeringVectorError(
                     f"Steering module '{name}' broadcast payload is not a dict"
                 )
-            self._steering_module_registry[name] = self._module_payload_to_specs(
-                payload
-            )
+            kind = payload.get("kind", "additive")
+            if kind == "additive":
+                # Legacy paths and additive registrations both flow here.
+                self._steering_module_registry[name] = (
+                    self._module_payload_to_specs(payload)
+                )
+                # If a name is being re-registered as additive, drop any
+                # stale SAE entry so the registries stay disjoint.
+                self._sae_module_registry.pop(name, None)
+            elif kind == "sae_delta":
+                manifest_payload = payload.get("sae_manifest")
+                if not isinstance(manifest_payload, dict):
+                    raise SteeringVectorError(
+                        f"Steering module '{name}': kind='sae_delta' "
+                        "requires 'sae_manifest' dict in broadcast payload."
+                    )
+                self._sae_module_registry[name] = sae_manifest_from_dict(
+                    manifest_payload
+                )
+                self._steering_module_registry.pop(name, None)
+            else:
+                raise SteeringVectorError(
+                    f"Steering module '{name}': unknown kind {kind!r} in "
+                    "broadcast payload."
+                )
         if modules:
             logger.debug(
                 "Worker received %d steering module(s) (replace=%s)",
@@ -566,14 +608,59 @@ class SteeringModelRunnerMixin:
             )
 
     def unregister_steering_modules(self, names: list[str]) -> None:
-        """Drop the listed names from the worker-side registry."""
+        """Drop the listed names from the worker-side registries.
+
+        A name might exist in either the additive registry or the SAE
+        registry; remove from both so re-registration with a different
+        kind always lands in a clean slot.
+        """
         for name in names:
             self._steering_module_registry.pop(name, None)
+            self._sae_module_registry.pop(name, None)
         if names:
             logger.debug(
                 "Worker unregistered %d steering module(s)",
                 len(names),
             )
+
+    def _assert_sae_clamps_can_be_applied(self, sp: SamplingParams) -> None:
+        """Raise if a request carries SAE clamps but the runtime can't apply them.
+
+        Phase-0 plumbs ``sae_clamp_specs`` through ``SamplingParams``
+        and folds them into prefix-cache hashing, but no kernel exists
+        yet to actually compute the encode→clamp→decode delta.  Until
+        Phase-1 lands, any request that asks for SAE application is
+        rejected at admission with a clear message — fail-loud
+        matches the strict-capacity contract elsewhere in the runtime
+        and surfaces integration bugs immediately rather than silently
+        running with the SAE state ignored.
+
+        Also rejects references to module names that aren't registered
+        as ``sae_delta`` on the worker, since that's a programming
+        error regardless of whether the kernel exists.
+        """
+        specs = sp.sae_clamp_specs
+        if not specs:
+            return
+        for spec in specs:
+            if spec.module_name not in self._sae_module_registry:
+                available = sorted(self._sae_module_registry.keys())
+                raise SteeringVectorError(
+                    f"SAE clamp spec references unknown module "
+                    f"{spec.module_name!r}.  Available SAE modules on "
+                    f"this worker: {available or 'none'}.  "
+                    "Register the module via "
+                    "POST /v1/steering/modules/register with "
+                    "kind='sae_delta' before submitting a clamp spec."
+                )
+        raise NotImplementedError(
+            "SAE feature-surgery (kind='sae_delta') is plumbed through "
+            "SamplingParams and the registry, but the per-layer "
+            "encode-clamp-decode kernel is not implemented yet "
+            "(Phase-0).  Refusing to admit a request that carries "
+            "sae_clamp_specs so the SAE state cannot be silently "
+            "ignored.  Track Phase-1 in docs/features/sae_steering.md."
+        )
 
     def _resolve_request_steering(
         self,
@@ -954,6 +1041,10 @@ class SteeringModelRunnerMixin:
             return
 
         sp = new_req_data.sampling_params
+        # Phase-0 admission guard: refuse SAE clamp specs because the
+        # apply-side kernel isn't wired yet.  Once Phase-1 lands this
+        # call is replaced with the SAE-aware admission path.
+        self._assert_sae_clamps_can_be_applied(sp)
         if new_req_data.num_computed_tokens >= req_state.num_prompt_tokens:
             # Already past prefill — register decode config.
             effective_decode = self._resolve_request_steering(sp, "decode")
