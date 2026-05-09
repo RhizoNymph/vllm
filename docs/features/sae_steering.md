@@ -388,12 +388,22 @@ encoder/decoder row sets are equal.
      `(layer, hook)` buffers.  Phase 1B Stage 1 enforces "at most
      one SAE module per (layer, hook) site"; multi-module overlap
      is a follow-up.
-   - **Stage 2.** Worker mixin integration: replace the Phase-0
-     admission `NotImplementedError` with real `register_clamp_spec`
-     / `release_clamp_spec` calls; add SAE handling to
+   - **Stage 2 (shipped).** Worker mixin integration: the Phase-0
+     admission `NotImplementedError` is replaced by real validation
+     in `_assert_sae_clamps_can_be_applied` (rejects unknown
+     modules, uncovered (layer, hook) sites, and unclampable
+     features) plus admission via the SAE manager.  SAE-aware
+     handlers added to `_register_initial_steering_config`,
      `_handle_steering_transition`, `_refresh_streaming_steering`,
-     and the per-step `_update_steering_buffers`; attach SAE
-     buffers when an SAE module registers and detach on unregister.
+     `_reset_steering_for_resumption`, and
+     `_release_finished_steering_configs`; per-step buffer state
+     is materialised by `_update_sae_buffers`.  SAE buffers attach
+     to owned layers when an SAE module registers (with PP
+     filtering on `_locally_owned_layers`) and detach on
+     unregister or kind-swap.  New worker-side method
+     `attach_sae_weights(name, weights)` injects encoder/decoder
+     tensors into the per-(layer, hook) buffers — the test-fixture
+     and future-loader entry point.
    - **Stage 3.** Decoder-model wiring: call `apply_layer_sae_delta`
      from the same hook-point sites that already invoke
      `apply_layer_steering`.  End-to-end tiny-model fixture tests

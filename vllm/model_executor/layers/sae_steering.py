@@ -498,8 +498,8 @@ def populate_sae_clamp_table(
     hook_point: SteeringHookPoint,
     module_name: str,
     clampable_features: tuple[int, ...],
-    worker_phase: str,
     layer_idx: int | None = None,
+    worker_phase: str | None = None,
 ) -> None:
     """Project active manager rows into the per-(layer, hook) clamp tables.
 
@@ -508,12 +508,15 @@ def populate_sae_clamp_table(
     ``hook_point``, gated by:
 
     * **Module match** — the spec's ``module_name`` must equal this
-      site's ``module_name``.  Rows that name a different module are
-      zeroed at this site.
+      site's ``module_name``.  Specs from other modules are skipped
+      at this site.
     * **Phase match** — the spec's ``phase`` field (``"both"`` /
-      ``"prefill"`` / ``"decode"``) must be compatible with
-      ``worker_phase`` (the worker's current execution phase, derived
-      from the hash that allocated this row).  Mismatch zeroes the row.
+      ``"prefill"`` / ``"decode"``) must be compatible with the
+      row's ``row_phase`` (the worker phase the row was admitted
+      under, recorded by
+      :meth:`SAEClampManager.register_clamp_spec`).  Each row is
+      written under its own phase in a single pass so prefill and
+      decode rows coexist without overwriting each other.
     * **Layer/hook match** — when ``layer_idx`` is given, only entries
       under ``spec.clamps[hook_point.value][layer_idx]`` are projected.
 
@@ -524,6 +527,12 @@ def populate_sae_clamp_table(
     Row 0 (the no-op sentinel) is always reset to all-zero so it stays
     a true no-op.
 
+    The optional ``worker_phase`` argument is retained for tests that
+    want to assert phase-gating behaviour explicitly: when given, the
+    populator only writes rows whose ``row_phase`` matches it, leaving
+    other rows' existing buffer content untouched.  Production
+    callers omit it so every row is populated under its own phase.
+
     Phase 1B uses this populator as a Python-eager reference; Phase 2
     will replace it with a batched index_copy_ that mirrors the
     additive populator.
@@ -533,22 +542,22 @@ def populate_sae_clamp_table(
         module: the layer module with SAE buffers attached.
         hook_point: which hook this site sits at.
         module_name: name of the SAE module that owns this site;
-            specs from other modules are zeroed at this site.
+            specs from other modules are skipped at this site.
         clampable_features: ordered tuple of feature indices that
             define the (feature_idx → row position) mapping for this
             module.
-        worker_phase: ``"prefill"`` or ``"decode"`` — used together
-            with ``spec.phase`` to gate row content.
         layer_idx: layer index this site sits at; when ``None`` (e.g.
             for tests that don't care about layer specificity), the
             populator scans all layers in the spec under
             ``hook_point``.
+        worker_phase: optional phase filter — when set, only rows with
+            matching ``row_phase`` are touched.
     """
     if not sae_buffers_attached(module, hook_point):
         return
-    if worker_phase not in ("prefill", "decode"):
+    if worker_phase is not None and worker_phase not in ("prefill", "decode"):
         raise ValueError(
-            f"worker_phase must be 'prefill' or 'decode'; got {worker_phase!r}."
+            f"worker_phase must be 'prefill' or 'decode' or None; got {worker_phase!r}."
         )
     kind_table = getattr(module, HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point])
     value_table = getattr(module, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point])
@@ -568,60 +577,54 @@ def populate_sae_clamp_table(
     value_table[0].zero_()
     only_table[0].zero_()
     hook_name = hook_point.value
-    for row, _config_hash, row_phase, spec in manager.active_rows():
-        # Default: zero this row at this site.  Then overwrite where
-        # the spec actually applies.
+    for row, _config_hash, row_phase, specs in manager.active_rows():
+        if worker_phase is not None and row_phase != worker_phase:
+            continue
+        # Default: zero this row at this site.  Then accumulate from
+        # whichever specs in the request's tuple actually target this
+        # site's owning module + phase + (layer, hook).
         kind_table[row].zero_()
         value_table[row].zero_()
         only_table[row].zero_()
-        if spec.module_name != module_name:
-            continue
-        if not _phase_applies(spec.phase, worker_phase, row_phase):
-            continue
-        layer_map = spec.clamps.get(hook_name)
-        if layer_map is None:
-            continue
-        layer_entries: list = []
-        if layer_idx is None:
-            for entries in layer_map.values():
-                layer_entries.extend(entries)
-        else:
-            layer_entries = list(layer_map.get(layer_idx, ()))
-        for entry in layer_entries:
-            pos = feature_to_pos.get(entry.feature_idx)
-            if pos is None:
-                raise ValueError(
-                    f"SAEClampSpec entry feature_idx={entry.feature_idx} for "
-                    f"module {module_name!r} is not in clampable_features "
-                    f"{list(clampable_features)} for site (layer={layer_idx}, "
-                    f"hook={hook_name})."
+        for spec in specs:
+            if spec.module_name != module_name:
+                continue
+            if spec.phase != "both" and spec.phase != row_phase:
+                continue
+            layer_map = spec.clamps.get(hook_name)
+            if layer_map is None:
+                continue
+            layer_entries: list = []
+            if layer_idx is None:
+                for entries in layer_map.values():
+                    layer_entries.extend(entries)
+            else:
+                layer_entries = list(layer_map.get(layer_idx, ()))
+            for entry in layer_entries:
+                pos = feature_to_pos.get(entry.feature_idx)
+                if pos is None:
+                    raise ValueError(
+                        f"SAEClampSpec entry feature_idx={entry.feature_idx} for "
+                        f"module {module_name!r} is not in clampable_features "
+                        f"{list(clampable_features)} for site "
+                        f"(layer={layer_idx}, hook={hook_name})."
+                    )
+                kind_table[row, pos] = (
+                    CLAMP_KIND_ABSOLUTE
+                    if entry.kind == "absolute"
+                    else CLAMP_KIND_ADDITIVE
                 )
-            kind_table[row, pos] = (
-                CLAMP_KIND_ABSOLUTE if entry.kind == "absolute" else CLAMP_KIND_ADDITIVE
-            )
-            value_table[row, pos] = float(entry.value)
-            only_table[row, pos] = bool(entry.only_if_active)
+                value_table[row, pos] = float(entry.value)
+                only_table[row, pos] = bool(entry.only_if_active)
 
 
-def _phase_applies(spec_phase: str, worker_phase: str, row_phase: str) -> bool:
-    """Decide whether ``spec.phase`` admits ``worker_phase`` for this row.
-
-    The row's ``row_phase`` is which worker phase the spec was
-    *registered for* (the hash domain).  ``spec_phase`` is the
-    spec-level phase tag — ``"both"`` (apply in both worker phases),
-    ``"prefill"``, or ``"decode"``.
-
-    Both must match.  The row_phase check is what makes the engine's
-    ``prefill_steering_config_hash`` / ``decode_steering_config_hash``
-    split correct: a spec with ``phase="decode"`` should land under
-    the decode hash (and only that hash), so a row whose ``row_phase``
-    is ``"prefill"`` carrying a ``phase="decode"`` spec is a hash-
-    routing bug — but rather than crash, the populator zeros the row
-    so the runtime stays correct even if upstream hashing drifts.
-    """
-    if spec_phase != "both" and spec_phase != worker_phase:
-        return False
-    return row_phase == worker_phase
+# Note: an earlier draft had a ``_phase_applies(spec_phase, worker_phase,
+# row_phase)`` helper that gated content on a *worker_phase* argument.
+# That broke when the populator was called twice (once per worker phase)
+# because the second call zeroed rows the first call had populated.  The
+# populator now writes each row under its own ``row_phase`` in a single
+# pass; the residual phase check ``spec.phase == "both" or
+# spec.phase == row_phase`` lives inline above.
 
 
 # Forward-reference import is resolved at call time; importing at module
