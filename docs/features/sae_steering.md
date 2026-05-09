@@ -352,29 +352,49 @@ encoder/decoder row sets are equal.
    - Tests: registration, broadcast determinism across mock TP ranks,
      hash-folding for prefix-cache keys, SamplingParams round-trip.
 
-2. **Phase 1 — Eager reference op.**
-   - Implement `apply_layer_sae_delta` with a plain PyTorch eager
-     path (no Triton kernel). Wired into the same hook sites as the
-     additive op.
-   - Tests: numeric equivalence against a hand-rolled
-     `for clamp in clamps: h += (target - encode(h)[i]) * W_dec[i]`
-     reference. End-to-end tiny-model fixture tests for prefill and
-     decode.
+2. **Phase 1A — Eager reference op (math primitive). _Shipped._**
+   - `vllm/model_executor/layers/sae_steering.py` exposes
+     `apply_sae_delta` and `sae_encode`, a vectorized PyTorch eager
+     path that takes per-token clamp tensors directly.  No Triton
+     kernel; no layer-hook wiring yet.  Same input shape and dtype
+     contract that the Phase-2 Triton kernel will adopt.
+   - Activations: ReLU, JumpReLU (`activation_params['threshold']`),
+     TopK (`activation_params['k']`).  TopK is "TopK among encoder
+     rows passed in" — partial encoders give "TopK in the clampable
+     subset"; full-d_sae TopK semantics require loading the full
+     encoder.
+   - Numeric dtype: encoder/decoder GEMMs in compute dtype; the
+     `(n_tokens, n_clamp)` activation tensor promoted to fp32 for
+     activation + `delta = clamp(f, target) − f`, cast back before
+     the decoder GEMM.
+   - Tests: `tests/model_executor/layers/test_sae_steering_op.py` —
+     hand-rolled per-(token, feature) reference, all activations
+     and clamp variants, dtype contract, shape validation.
 
-3. **Phase 2 — Triton kernel + CUDA-graph integration.**
+3. **Phase 1B — Layer-hook integration.**
+   - Per-layer SAE buffers, `SAEClampManager` (parallel to
+     `SteeringManager`), worker-side weight registry that loads
+     encoder/decoder rows, `apply_layer_sae_delta` shim that wraps
+     `apply_sae_delta` and is registered as
+     `torch.ops.vllm.apply_sae_delta`.
+   - End-to-end tiny-model fixture tests for prefill and decode.
+   - Replaces the Phase-0 admission-time `NotImplementedError` with
+     real dispatch.
+
+4. **Phase 2 — Triton kernel + CUDA-graph integration.**
    - Replace the eager body with a Triton kernel under the same
      custom-op shim, mirroring `steering_kernel.py`'s shape.
    - CUDA graph replay test (steering already exercises this; extend
      the suite to cover SAE clamps).
 
-4. **Phase 3 — Real SAE checkpoint integration test.**
+5. **Phase 3 — Real SAE checkpoint integration test.**
    - Add a Gemma-Scope-driven end-to-end test alongside the existing
      `*_real_weights` Gemma 3 tests. Verify "Golden-Gate-style"
      behavior reproduces qualitatively (i.e., a feature known to fire
      on a topic actually drives outputs toward that topic when
      clamped high).
 
-5. **Phase 4 (deferred) — Full-reconstruction variant.**
+6. **Phase 4 (deferred) — Full-reconstruction variant.**
    - If/when needed, add `SteeringModuleKind.SAE_FULL_RECONSTRUCTION`
      as a separate op. Does not require touching the delta path. Most
      likely needs admission-tier changes because the operation is no
