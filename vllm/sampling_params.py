@@ -17,11 +17,13 @@ from pydantic.dataclasses import dataclass
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
 from vllm.config.steering_types import (
+    CompressedSteeringArray,
     SteeringLayerEntry,
     SteeringVectorSpec,
     hash_steering_config,
     normalize_layer_entry,
     resolve_effective_vectors,
+    unwrap_steering_array,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -33,6 +35,26 @@ from vllm.v1.serial_utils import PydanticMsgspecMixin
 logger = init_logger(__name__)
 
 _SAMPLING_EPS = 1e-5
+
+
+def _unwrap_packed_dict(
+    packed: dict[str, dict[int, np.ndarray | CompressedSteeringArray]],
+) -> dict[str, dict[int, np.ndarray]]:
+    """Strip :class:`CompressedSteeringArray` wrappers from a packed dict.
+
+    Sender-side packing wraps large entries in ``CompressedSteeringArray``
+    so the IPC encoder can dispatch on the type and apply zstd.  Worker-
+    side consumers (and the hashing path) only care about the underlying
+    ``ndarray``; this helper materializes the unwrapped view without
+    copying the array data.
+    """
+    return {
+        hook: {
+            layer_idx: unwrap_steering_array(entry)
+            for layer_idx, entry in layer_dict.items()
+        }
+        for hook, layer_dict in packed.items()
+    }
 _MAX_TEMP = 1e-2
 
 MAX_LOGPROB_TOKEN_IDS = 128
@@ -343,6 +365,15 @@ class SamplingParams(
     ``steering_vectors`` / ``prefill_steering_vectors`` in
     :meth:`SteeringModelRunnerMixin._resolve_request_steering` and short-
     circuits the merge + resolve numpy work on the worker.
+
+    Element values may be either bare ``np.ndarray`` or
+    :class:`CompressedSteeringArray` on the sender side; the latter is a
+    sentinel signalling that the IPC encoder should pipe the bytes
+    through zstd.  After msgspec round-trip on the worker, all values
+    are bare ``np.ndarray`` again (the dec_hook unwraps transparently).
+    The msgspec field annotation stays as ``np.ndarray`` because msgspec
+    rejects unions of two custom types; the runtime widening is
+    encoder-side only.
 
     Underscore-prefixed so :class:`PydanticMsgspecMixin` excludes the
     field from JSON / OpenAPI schema generation (``np.ndarray`` is not a
@@ -850,9 +881,13 @@ class SamplingParams(
         hash is stable within a deployment (cross-pipeline reuse — i.e.,
         switching a workload between packed and unpacked — is a one-time
         cache miss).
+
+        Sender-side, packed values may be wrapped in
+        :class:`CompressedSteeringArray`; this property unwraps them so
+        downstream consumers always see bare ``ndarray``.
         """
         if self._effective_prefill_steering_packed is not None:
-            return self._effective_prefill_steering_packed
+            return _unwrap_packed_dict(self._effective_prefill_steering_packed)
         return resolve_effective_vectors(
             self.steering_vectors, self.prefill_steering_vectors
         )
@@ -863,7 +898,7 @@ class SamplingParams(
     ) -> dict[str, dict[int, np.ndarray]] | None:
         """Resolved decode steering: base + decode-specific, pre-scaled."""
         if self._effective_decode_steering_packed is not None:
-            return self._effective_decode_steering_packed
+            return _unwrap_packed_dict(self._effective_decode_steering_packed)
         return resolve_effective_vectors(
             self.steering_vectors, self.decode_steering_vectors
         )

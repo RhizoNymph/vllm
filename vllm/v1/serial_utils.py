@@ -16,11 +16,13 @@ import msgspec
 import numpy as np
 import torch
 import zmq
+import zstandard as zstd
 from msgspec import msgpack
 from pydantic import GetCoreSchemaHandler
 from pydantic_core import core_schema
 
 from vllm import envs
+from vllm.config.steering_types import CompressedSteeringArray
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import (
     BaseMultiModalField,
@@ -41,6 +43,16 @@ logger = init_logger(__name__)
 CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_RAW_VIEW = 3
+CUSTOM_TYPE_ZSTD_NDARRAY = 4
+
+# zstd compressors are cheap to construct but cheaper to reuse: amortize the
+# allocation across the encoder/decoder lifetime.  Level 1 is the fast end of
+# the standard range; for smooth float distributions like steering vectors
+# this still yields ~2-3x compression with sub-millisecond cost on typical
+# (2560-dim, 34-layer) payloads.
+_ZSTD_LEVEL = 1
+_ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=_ZSTD_LEVEL)
+_ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
 
 # MultiModalField class serialization type map.
 # These need to list all possible field types and match them
@@ -52,6 +64,61 @@ MMF_CLASS_TO_FACTORY: dict[type[BaseMultiModalField], str] = {
 }
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
+
+
+def _pack_zstd_ndarray(
+    dtype_str: str, shape: tuple[int, ...], compressed: bytes
+) -> bytes:
+    """Serialize ``(dtype, shape, compressed_payload)`` into a single byte
+    string for the ``CUSTOM_TYPE_ZSTD_NDARRAY`` ext-type body.
+
+    Layout:
+
+    - 2-byte big-endian length of ``dtype_str`` (UTF-8 encoded)
+    - dtype bytes
+    - 1-byte ndim
+    - ``ndim`` × 8-byte big-endian unsigned dimensions
+    - remaining bytes: zstd-compressed array payload
+
+    Hand-rolled rather than nested-msgpack because the body lives inside a
+    msgpack Ext that is itself nested inside a msgpack-serialized request;
+    spawning a second encoder/decoder pair per call would dwarf the
+    compression savings.
+    """
+    dtype_bytes = dtype_str.encode("utf-8")
+    ndim = len(shape)
+    header = bytearray()
+    header += len(dtype_bytes).to_bytes(2, "big")
+    header += dtype_bytes
+    header += ndim.to_bytes(1, "big")
+    for dim in shape:
+        header += int(dim).to_bytes(8, "big")
+    return bytes(header) + compressed
+
+
+def _unpack_zstd_ndarray(
+    payload: bytes | bytearray | memoryview,
+) -> tuple[str, tuple[int, ...], bytes]:
+    """Inverse of :func:`_pack_zstd_ndarray`.
+
+    Returns ``(dtype_str, shape, decompressed_bytes)`` so the caller can
+    cheaply rebuild the ndarray with ``np.frombuffer`` + ``reshape``.
+    """
+    mv = payload if isinstance(payload, memoryview) else memoryview(payload)
+    cursor = 0
+    dtype_len = int.from_bytes(bytes(mv[cursor : cursor + 2]), "big")
+    cursor += 2
+    dtype_str = bytes(mv[cursor : cursor + dtype_len]).decode("utf-8")
+    cursor += dtype_len
+    ndim = int.from_bytes(bytes(mv[cursor : cursor + 1]), "big")
+    cursor += 1
+    shape: list[int] = []
+    for _ in range(ndim):
+        shape.append(int.from_bytes(bytes(mv[cursor : cursor + 8]), "big"))
+        cursor += 8
+    compressed = bytes(mv[cursor:])
+    decompressed = _ZSTD_DECOMPRESSOR.decompress(compressed)
+    return dtype_str, tuple(shape), decompressed
 
 
 class OOBTensorConsumer(ABC):
@@ -192,6 +259,14 @@ class MsgpackEncoder:
         if isinstance(obj, torch.Tensor):
             return self._encode_tensor(obj)
 
+        # CompressedSteeringArray is a sentinel wrapper signalling that the
+        # underlying ndarray should be zstd-compressed before serialization.
+        # Only steering payloads are wrapped — other ndarrays go through the
+        # normal raw-view path so we don't pay compression cost on KV cache /
+        # weight transfers / etc.
+        if isinstance(obj, CompressedSteeringArray):
+            return self._encode_zstd_ndarray(obj.array)
+
         # Fall back to pickle for object or void kind ndarrays.
         if isinstance(obj, np.ndarray) and obj.dtype.kind not in ("O", "V"):
             return self._encode_ndarray(obj)
@@ -253,6 +328,29 @@ class MsgpackEncoder:
         # The data is either inlined if small, or an index into a list of
         # backing buffers that we've stashed in `aux_buffers`.
         return obj.dtype.str, obj.shape, data
+
+    def _encode_zstd_ndarray(self, obj: np.ndarray) -> msgpack.Ext:
+        """Encode an ndarray with zstd-compressed payload.
+
+        Used for the steering-vector inline IPC path: smooth float
+        distributions compress ~2-3× with level-1 zstd, which roughly
+        halves the bytes shipped over the engine-client multiprocessing
+        boundary in research workloads where every request carries unique
+        vectors.
+
+        The whole (dtype_str, shape, compressed_bytes) tuple is wrapped in
+        a dedicated msgpack ext type (``CUSTOM_TYPE_ZSTD_NDARRAY``) so that
+        the decoder's ``ext_hook`` materializes it directly into a
+        :class:`CompressedSteeringArray` without going through the regular
+        ndarray ``dec_hook`` path.
+        """
+        # Non-contiguous arrays must be copied before compression because
+        # zstd reads a flat byte buffer; tobytes() handles both layout fix
+        # and stride collapse in one shot.
+        raw = obj.data if obj.flags.c_contiguous else obj.tobytes()
+        compressed = _ZSTD_COMPRESSOR.compress(bytes(raw))
+        payload = _pack_zstd_ndarray(obj.dtype.str, obj.shape, compressed)
+        return msgpack.Ext(CUSTOM_TYPE_ZSTD_NDARRAY, payload)
 
     def _encode_tensor(
         self, obj: torch.Tensor
@@ -351,6 +449,14 @@ class MsgpackDecoder:
         # Given native types in `obj`, convert to type `t`.
         if isclass(t):
             if issubclass(t, np.ndarray):
+                # Steering's compressed wrapper is unwrapped here so the
+                # field's declared ``np.ndarray`` annotation stays
+                # untouched on the worker side.  msgspec rejects unions
+                # of two custom types, so the wrapper exists only between
+                # the packer and the encoder; once a payload comes back
+                # off the wire we hand the plain ndarray to the consumer.
+                if isinstance(obj, CompressedSteeringArray):
+                    return obj.array
                 return self._decode_ndarray(obj)
             if issubclass(t, torch.Tensor):
                 return self._decode_tensor(obj)
@@ -473,6 +579,12 @@ class MsgpackDecoder:
     def ext_hook(self, code: int, data: memoryview) -> Any:
         if code == CUSTOM_TYPE_RAW_VIEW:
             return data
+
+        if code == CUSTOM_TYPE_ZSTD_NDARRAY:
+            dtype_str, shape, decompressed = _unpack_zstd_ndarray(data)
+            arr = np.frombuffer(decompressed, dtype=np.dtype(dtype_str))
+            arr = arr.reshape(shape)
+            return CompressedSteeringArray(arr)
 
         if envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
             if code == CUSTOM_TYPE_PICKLE:

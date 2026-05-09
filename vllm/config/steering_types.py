@@ -26,6 +26,59 @@ import numpy as np
 if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
 
+
+# Steering vector ndarrays larger than this byte threshold get wrapped in
+# :class:`CompressedSteeringArray` so the IPC encoder pipes them through
+# zstd before serialization.  zstd has a fixed setup cost (~5-20us per
+# call); for tiny vectors that overhead can outweigh the bytes saved, so we
+# leave sub-threshold arrays as plain ``np.ndarray`` and ship them through
+# the existing raw-view path.  4 KB lets bf16 vectors of dim 2048+ get
+# compressed; smaller ones bypass.
+ZSTD_THRESHOLD = 4096
+
+
+class CompressedSteeringArray:
+    """Sentinel wrapper signalling that *array* should be zstd-compressed
+    when serialized over IPC.
+
+    Steering vectors have smooth float distributions — observed compression
+    ratios are 2-3× at zstd level 1.  Wrapping them in this dedicated type
+    lets the msgspec encoder dispatch on the wrapper alone without
+    compressing every ``np.ndarray`` (which would touch model weights, KV
+    cache transfers, multi-modal tensors, etc.).
+
+    Constructed by :func:`pack_effective_steering` /
+    :func:`pack_steering_for_dtype` only when the underlying array's byte
+    size exceeds :data:`ZSTD_THRESHOLD`; smaller arrays remain bare
+    ``ndarray`` and ship through the existing raw-view ext type.
+
+    On the worker side after msgspec decode, the field's values are plain
+    ``ndarray`` again (the decoder unwraps transparently), so worker-side
+    consumers don't have to know about this type.  The wrapper exists only
+    on the sender side, between packing and serialization.
+
+    Implemented as a plain class with ``__slots__`` (rather than a
+    dataclass) because msgspec's encoder has built-in dataclass handling
+    that would walk into ``array`` and re-dispatch to the ndarray
+    encoder, defeating the point of the wrapper.
+    """
+
+    __slots__ = ("array",)
+
+    def __init__(self, array: np.ndarray):
+        self.array = array
+
+    def __repr__(self) -> str:
+        return (
+            f"CompressedSteeringArray(shape={self.array.shape}, "
+            f"dtype={self.array.dtype})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, CompressedSteeringArray):
+            return NotImplemented
+        return np.array_equal(self.array, other.array)
+
 # Per-layer entry: bare list (scale=1.0) or {"vector": [...], "scale": float}.
 # This is the public, user-facing shape — the type alias is exposed as a
 # pydantic field type by request/response models in ``vllm.entrypoints``,
@@ -183,11 +236,37 @@ def _torch_dtype_to_pack_dtype(torch_dtype: object) -> np.dtype:
     return np.dtype(np.float32)
 
 
+def _maybe_compress(arr: np.ndarray) -> np.ndarray | CompressedSteeringArray:
+    """Wrap *arr* in :class:`CompressedSteeringArray` iff its byte size
+    crosses :data:`ZSTD_THRESHOLD`; otherwise return it unchanged.
+
+    Centralizing the threshold check here keeps the policy in one place
+    and lets the packing helpers stay agnostic about IPC concerns.
+    """
+    if arr.nbytes >= ZSTD_THRESHOLD:
+        return CompressedSteeringArray(arr)
+    return arr
+
+
+def unwrap_steering_array(
+    entry: np.ndarray | CompressedSteeringArray,
+) -> np.ndarray:
+    """Return the bare ``ndarray`` from a wrapped or unwrapped entry.
+
+    Steering-aware consumers (the ``effective_*_steering`` cached_property
+    fallback, ``hash_steering_config``) should call this to be agnostic
+    about whether the upstream packer chose to compress.
+    """
+    if isinstance(entry, CompressedSteeringArray):
+        return entry.array
+    return entry
+
+
 def pack_effective_steering(
     spec_base: SteeringVectorSpec | None,
     spec_phase: SteeringVectorSpec | None,
     dtype: np.dtype | str,
-) -> dict[str, dict[int, np.ndarray]] | None:
+) -> dict[str, dict[int, np.ndarray | CompressedSteeringArray]] | None:
     """Resolve and pack inline steering specs in one shot.
 
     Equivalent to ``resolve_effective_vectors(spec_base, spec_phase)``
@@ -205,10 +284,10 @@ def pack_effective_steering(
     resolved = resolve_effective_vectors(spec_base, spec_phase)
     if resolved is None:
         return None
-    out: dict[str, dict[int, np.ndarray]] = {}
+    out: dict[str, dict[int, np.ndarray | CompressedSteeringArray]] = {}
     for hook, layer_dict in resolved.items():
         out[hook] = {
-            layer_idx: arr.astype(np_dtype, copy=False)
+            layer_idx: _maybe_compress(arr.astype(np_dtype, copy=False))
             for layer_idx, arr in layer_dict.items()
         }
     return out
@@ -217,7 +296,7 @@ def pack_effective_steering(
 def pack_steering_for_dtype(
     spec: SteeringVectorSpec | None,
     dtype: np.dtype | str,
-) -> dict[str, dict[int, np.ndarray]] | None:
+) -> dict[str, dict[int, np.ndarray | CompressedSteeringArray]] | None:
     """Pre-bake a :class:`SteeringVectorSpec` into model-dtype ``ndarray`` form.
 
     Converts every per-layer entry — bare-list or ``{"vector", "scale"}``
@@ -240,11 +319,11 @@ def pack_steering_for_dtype(
     if not spec:
         return None
     np_dtype = np.dtype(dtype)
-    result: dict[str, dict[int, np.ndarray]] = {}
+    result: dict[str, dict[int, np.ndarray | CompressedSteeringArray]] = {}
     for hook, layer_dict in spec.items():
         if not layer_dict:
             continue
-        packed: dict[int, np.ndarray] = {}
+        packed: dict[int, np.ndarray | CompressedSteeringArray] = {}
         for layer_idx, entry in layer_dict.items():
             vec, scale = normalize_layer_entry(entry)
             arr = np.asarray(vec, dtype=np_dtype)
@@ -257,7 +336,7 @@ def pack_steering_for_dtype(
                 # returns a higher-precision result; force it back.
                 if arr.dtype != np_dtype:
                     arr = arr.astype(np_dtype, copy=False)
-            packed[layer_idx] = arr
+            packed[layer_idx] = _maybe_compress(arr)
         if packed:
             result[hook] = packed
     return result if result else None
@@ -361,7 +440,13 @@ def merge_steering_specs(
 
 
 def hash_steering_config(
-    effective_vectors: dict[str, dict[int, list[float] | np.ndarray]] | None,
+    effective_vectors: (
+        dict[
+            str,
+            dict[int, list[float] | np.ndarray | CompressedSteeringArray],
+        ]
+        | None
+    ),
     module_ref: tuple[str, float] | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
@@ -393,11 +478,15 @@ def hash_steering_config(
             layer_dict = effective_vectors[hook]
             for layer_idx in sorted(layer_dict.keys()):
                 entry = layer_dict[layer_idx]
-                # An entry is either a list/ndarray of floats or a dict
+                # An entry is either a list/ndarray of floats, a
+                # CompressedSteeringArray wrapper, or a dict
                 # ``{"vector": [...], "scale": float}``. By the time we get here
                 # the resolver has flattened the dict form into a plain
-                # array — but handle both for safety.
-                if isinstance(entry, dict):
+                # array — but handle all forms for safety.
+                if isinstance(entry, CompressedSteeringArray):
+                    vec = entry.array
+                    scale = 1.0
+                elif isinstance(entry, dict):
                     vec = entry.get("vector", entry)
                     scale = float(entry.get("scale", 1.0))
                 else:
@@ -419,6 +508,26 @@ def hash_steering_config(
         h.update(name.encode("utf-8"))
         h.update(np.float64(scale).tobytes())
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+
+
+def _unwrap_packed(
+    packed: dict[str, dict[int, np.ndarray | CompressedSteeringArray]] | None,
+) -> dict[str, dict[int, np.ndarray]] | None:
+    """Strip :class:`CompressedSteeringArray` wrappers from a packed dict.
+
+    Used by :func:`maybe_pack_inline_steering_for_request` to seed the
+    ``effective_*_steering`` cached_property cache with bare ndarrays —
+    the wrapper is an IPC-serialization-only concern.
+    """
+    if packed is None:
+        return None
+    return {
+        hook: {
+            layer_idx: unwrap_steering_array(entry)
+            for layer_idx, entry in layer_dict.items()
+        }
+        for hook, layer_dict in packed.items()
+    }
 
 
 def maybe_pack_inline_steering_for_request(
@@ -481,5 +590,12 @@ def maybe_pack_inline_steering_for_request(
     sp.steering_vectors = None
     sp.prefill_steering_vectors = None
     sp.decode_steering_vectors = None
-    sp.__dict__["effective_prefill_steering"] = sp._effective_prefill_steering_packed
-    sp.__dict__["effective_decode_steering"] = sp._effective_decode_steering_packed
+    # Stash unwrapped views so ``effective_*_steering`` cached_property
+    # reads return bare ndarrays even when the packer wrapped large
+    # entries in ``CompressedSteeringArray`` for the IPC path.
+    sp.__dict__["effective_prefill_steering"] = (
+        _unwrap_packed(sp._effective_prefill_steering_packed)
+    )
+    sp.__dict__["effective_decode_steering"] = (
+        _unwrap_packed(sp._effective_decode_steering_packed)
+    )
