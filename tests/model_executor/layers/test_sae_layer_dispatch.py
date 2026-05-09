@@ -1,0 +1,446 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tests for ``apply_layer_sae_delta`` (the layer-hook dispatch shim)
+and the per-layer SAE clamp-table populator.
+
+The shim is the lifecycle bridge between buffer state and the math
+primitive: pull per-token clamps from the table via ``sae_index``,
+hand them to ``apply_sae_delta``.  The populator is the inverse:
+project ``SAEClampSpec`` row content into the per-(layer, hook)
+buffers so the shim can read them on the next forward.
+
+These tests exercise both in isolation, without a worker mixin or a
+real model.  Buffers are constructed directly so the data flow is
+visible end-to-end.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+from vllm.config.sae_steering_types import (
+    SAEActivation,
+    SAEClampEntry,
+    SAEClampSpec,
+)
+from vllm.model_executor.layers.sae_steering import (
+    CLAMP_KIND_ABSOLUTE,
+    CLAMP_KIND_ADDITIVE,
+    CLAMP_KIND_NONE,
+    HOOK_POINT_SAE_CLAMP_KIND_ATTR,
+    HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR,
+    HOOK_POINT_SAE_CLAMP_VALUE_ATTR,
+    HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
+    HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
+    HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
+    apply_layer_sae_delta,
+    populate_sae_clamp_table,
+    register_sae_buffers,
+    register_sae_index_buffer,
+)
+from vllm.model_executor.layers.steering import SteeringHookPoint
+from vllm.v1.worker.sae_clamp_manager import SAEClampManager
+
+
+def _layer_with_sae(
+    *,
+    hook: SteeringHookPoint,
+    module_name: str = "g",
+    n_clamp: int = 2,
+    hidden_size: int = 4,
+    max_sae_configs: int = 2,
+    max_tokens: int = 16,
+    activation: SAEActivation = SAEActivation.RELU,
+    activation_params: dict | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> nn.Module:
+    m = nn.Module()
+    register_sae_buffers(
+        m,
+        hook_point=hook,
+        module_name=module_name,
+        activation=activation,
+        activation_params=activation_params or {},
+        n_clamp=n_clamp,
+        hidden_size=hidden_size,
+        max_sae_configs=max_sae_configs,
+        dtype=dtype,
+    )
+    register_sae_index_buffer(m, max_tokens=max_tokens)
+    return m
+
+
+class TestApplyLayerSaeDeltaShortCircuits:
+    """Disabled / no-op paths short-circuit without changing the residual."""
+
+    def test_no_buffers_returns_input_unchanged(self):
+        m = nn.Module()
+        h = torch.randn(3, 4)
+        out = apply_layer_sae_delta(m, h, SteeringHookPoint.POST_MLP)
+        # ``is`` would be too strict (custom op semantics may clone);
+        # equality with no copy is the contract.
+        assert torch.equal(out, h)
+
+    def test_all_tokens_at_row_zero_returns_input_unchanged(self):
+        m = _layer_with_sae(hook=SteeringHookPoint.POST_MLP)
+        # sae_index already zeros — every token reads row 0 (no-op).
+        h = torch.randn(3, 4)
+        out = apply_layer_sae_delta(m, h, SteeringHookPoint.POST_MLP)
+        # Encoder weights are zeros (default), clamp_kind row 0 is NONE,
+        # so delta is exactly zero.
+        assert torch.allclose(out, h)
+
+    def test_other_hook_point_buffers_unaffected(self):
+        m = _layer_with_sae(hook=SteeringHookPoint.POST_MLP)
+        h = torch.randn(2, 4)
+        # POST_ATTN has no SAE buffers; shim must short-circuit.
+        out = apply_layer_sae_delta(m, h, SteeringHookPoint.POST_ATTN)
+        assert torch.equal(out, h)
+
+
+class TestApplyLayerSaeDeltaDispatch:
+    """End-to-end: buffer state → math primitive → updated residual."""
+
+    def test_absolute_clamp_via_buffers(self):
+        # n_clamp=1, hidden=2, two rows (no-op + one active).
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=1,
+            hidden_size=2,
+            max_sae_configs=1,
+            max_tokens=4,
+        )
+        # Encoder picks h[0]; decoder writes into h[1].
+        getattr(
+            m, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+        ).copy_(torch.tensor([[1.0, 0.0]]))
+        getattr(
+            m, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+        ).copy_(torch.tensor([[0.0, 1.0]]))
+        getattr(m, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]).zero_()
+        # Row 1: feature 0 absolute-clamped to 7.0.
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
+        only = getattr(
+            m, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
+        )
+        kind[1] = torch.tensor([CLAMP_KIND_ABSOLUTE], dtype=torch.int8)
+        value[1] = torch.tensor([7.0])
+        only[1] = torch.tensor([False])
+        # Token 0: routed to row 1 (clamp active); token 1: row 0 (no-op).
+        m.sae_index[0] = 1
+        m.sae_index[1] = 0
+
+        h = torch.tensor([[2.0, 0.0], [3.0, 0.0]])
+        out = apply_layer_sae_delta(m, h, SteeringHookPoint.POST_MLP)
+        # Token 0: f = ReLU(2.0)=2.0; delta = 7.0-2.0=5.0 along [0,1].
+        # Token 1: row 0 → no clamp, residual unchanged.
+        expected = torch.tensor([[2.0, 5.0], [3.0, 0.0]])
+        assert torch.allclose(out, expected)
+
+    def test_per_token_routing_independent(self):
+        # Two rows clamping different feature indices.
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=2,
+            hidden_size=3,
+            max_sae_configs=2,
+            max_tokens=4,
+        )
+        # Encoder picks h[0] for feature 0, h[1] for feature 1.
+        getattr(
+            m, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+        ).copy_(torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
+        # Decoder writes to h[2] for feature 0 (additive=+1), to h[2] for
+        # feature 1 (additive=+10).
+        getattr(
+            m, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+        ).copy_(torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]))
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
+        # Row 1: feature 0 additive +1 (independent of f).
+        kind[1] = torch.tensor([CLAMP_KIND_ADDITIVE, CLAMP_KIND_NONE], dtype=torch.int8)
+        value[1] = torch.tensor([1.0, 0.0])
+        # Row 2: feature 1 additive +10 (independent of f).
+        kind[2] = torch.tensor([CLAMP_KIND_NONE, CLAMP_KIND_ADDITIVE], dtype=torch.int8)
+        value[2] = torch.tensor([0.0, 10.0])
+
+        m.sae_index[0] = 1  # token 0 -> row 1 (delta +1 in h[2])
+        m.sae_index[1] = 2  # token 1 -> row 2 (delta +10 in h[2])
+        m.sae_index[2] = 0  # token 2 -> row 0 (no delta)
+
+        h = torch.zeros(3, 3)
+        out = apply_layer_sae_delta(m, h, SteeringHookPoint.POST_MLP)
+        expected = torch.tensor(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 10.0],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+        assert torch.allclose(out, expected)
+
+
+class TestPopulateSaeClampTable:
+    """Manager rows projected into per-(layer, hook) buffers."""
+
+    def test_row_zero_remains_zero(self):
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=2,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        # No registered configs — populate must leave row 0 zero.
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(0, 1),
+            worker_phase="prefill",
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        assert torch.equal(kind[0], torch.zeros(2, dtype=torch.int8))
+
+    def test_active_row_writes_clamp_for_matching_module(self):
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=2,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=5, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        manager.register_clamp_spec(123, (spec,), "prefill")
+        # clampable_features=(2, 5) means feature_idx=5 maps to position 1.
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(2, 5),
+            worker_phase="prefill",
+            layer_idx=20,
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
+        # Row 1, position 1 (feature_idx 5) gets the clamp.
+        assert kind[1, 1].item() == CLAMP_KIND_ABSOLUTE
+        assert value[1, 1].item() == 7.0
+        # Row 1, position 0 (feature_idx 2) stays NONE.
+        assert kind[1, 0].item() == CLAMP_KIND_NONE
+
+    def test_active_row_zeroed_for_non_matching_module(self):
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=2,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="other_module",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        spec = SAEClampSpec(
+            module_name="g",  # spec targets module 'g'
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=5, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        manager.register_clamp_spec(123, (spec,), "prefill")
+        # This buffer site belongs to module 'other_module' — spec
+        # targets 'g'; row 1 must be zeroed at this site.
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="other_module",
+            clampable_features=(0, 5),
+            worker_phase="prefill",
+            layer_idx=20,
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        assert torch.equal(kind[1], torch.zeros(2, dtype=torch.int8))
+
+    def test_phase_filter_decode_only(self):
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=1,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        # spec.phase = "decode"; registered into worker prefill row.
+        # During worker prefill, the spec must NOT apply.
+        spec = SAEClampSpec(
+            module_name="g",
+            phase="decode",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=9.0),)
+                }
+            },
+        )
+        manager.register_clamp_spec(123, (spec,), "prefill")
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(0,),
+            worker_phase="prefill",
+            layer_idx=20,
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        # Phase mismatch — clamp is gated off; row content must be zero.
+        assert torch.equal(kind[1], torch.zeros(1, dtype=torch.int8))
+
+    def test_phase_both_applies_in_either_worker_phase(self):
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=1,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        spec = SAEClampSpec(
+            module_name="g",
+            phase="both",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=9.0),)
+                }
+            },
+        )
+        manager.register_clamp_spec(123, (spec,), "decode")
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(0,),
+            worker_phase="decode",
+            layer_idx=20,
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
+        assert kind[1, 0].item() == CLAMP_KIND_ABSOLUTE
+        assert value[1, 0].item() == 9.0
+
+    def test_layer_with_no_clamps_in_spec_zeroed(self):
+        # Spec covers layer 20; site is layer 21 — row 1 must be zero
+        # at the layer-21 site.
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=1,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=9.0),)
+                }
+            },
+        )
+        manager.register_clamp_spec(123, (spec,), "prefill")
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(0,),
+            worker_phase="prefill",
+            layer_idx=21,  # spec targets 20, this site is 21
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        assert torch.equal(kind[1], torch.zeros(1, dtype=torch.int8))
+
+    def test_only_if_active_flag_propagates(self):
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=1,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (
+                        SAEClampEntry(
+                            feature_idx=0,
+                            kind="additive",
+                            value=2.0,
+                            only_if_active=True,
+                        ),
+                    )
+                }
+            },
+        )
+        manager.register_clamp_spec(123, (spec,), "prefill")
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(0,),
+            worker_phase="prefill",
+            layer_idx=20,
+        )
+        only = getattr(
+            m, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
+        )
+        assert bool(only[1, 0].item()) is True
+
+    def test_unknown_feature_idx_in_spec_raises(self):
+        # spec references feature 99 but clampable_features only has (0,)
+        # — admission-time bug should fail loud.
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=1,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=99, kind="absolute", value=1.0),)
+                }
+            },
+        )
+        manager.register_clamp_spec(123, (spec,), "prefill")
+        import pytest
+
+        with pytest.raises(ValueError, match="not in clampable_features"):
+            populate_sae_clamp_table(
+                manager=manager,
+                module=m,
+                hook_point=SteeringHookPoint.POST_MLP,
+                module_name="g",
+                clampable_features=(0,),
+                worker_phase="prefill",
+                layer_idx=20,
+            )

@@ -1,0 +1,636 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Eager reference op for SAE feature-surgery (delta) steering.
+
+The op math, per token ``t`` with clamp set ``I``:
+
+    pre_act_i  = W_enc[i, :] · h_t + b_enc[i]
+    f_i        = activation(pre_act_i)
+    new_f_i    = clamp_kind == ABSOLUTE  ? clamp_value
+                 clamp_kind == ADDITIVE  ? f_i + clamp_value
+                 (kind == NONE)         : f_i
+    delta_i    = (new_f_i - f_i) gated by only_if_active when set
+    h_t_new    = h_t + Σ_{i ∈ I} delta_i · W_dec[i, :]
+
+This is the **eager reference implementation** for Phase 1 of the SAE
+steering rollout: a vectorized PyTorch path with the same input shape
+and dtype contract that the Phase-2 Triton kernel will adopt.  Layer-
+hook integration (per-layer buffers, custom-op registration with
+``torch.ops.vllm.apply_sae_delta``, and the model_runner_mixin wires)
+arrives in a follow-up so this op stays standalone, unit-testable, and
+reusable in tests that assemble inputs directly.
+
+Numeric dtype contract (matches ``docs/features/sae_steering.md``):
+
+* Encoder GEMM and decoder GEMM run in the model's compute dtype.
+* The ``(n_tokens, n_clamp)`` activation tensor is promoted to fp32
+  for the activation function and the ``delta = clamp(f, target) − f``
+  subtraction; results are cast back to compute dtype before the
+  decoder GEMM.
+
+Phase-1 supports ``ReLU``, ``JumpReLU`` (``activation_params['threshold']``),
+and ``TopK`` (``activation_params['k']``).  TopK selects k largest
+pre-activations across the **encoder rows passed in** — for a partial
+encoder this is "TopK among the clampable subset".  Operators who
+need full-d_sae TopK semantics must load the full encoder.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+import torch
+from torch import nn
+
+from vllm.config.sae_steering_types import SAEActivation
+from vllm.model_executor.layers.steering import SteeringHookPoint
+
+# Integer codes for ``clamp_kind`` tensors.  Kept explicit so the
+# Triton kernel (Phase 2) and any other consumer can use the same
+# values without a Python enum lookup.
+CLAMP_KIND_NONE = 0
+CLAMP_KIND_ABSOLUTE = 1
+CLAMP_KIND_ADDITIVE = 2
+
+
+# Per-(layer, hook) buffer attribute names.  Using flat per-hook
+# attributes (rather than e.g. a sub-Module wrapper) means
+# ``torch.compile`` traces them as concrete buffer references rather
+# than introspecting a Python container, mirroring how the additive
+# steering buffers are attached.
+HOOK_POINT_SAE_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_clamp_kind_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_clamp_kind_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_clamp_kind_post_mlp",
+}
+HOOK_POINT_SAE_CLAMP_VALUE_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_clamp_value_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_clamp_value_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_clamp_value_post_mlp",
+}
+HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_clamp_only_if_active_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_clamp_only_if_active_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_clamp_only_if_active_post_mlp",
+}
+HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_encoder_weight_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_encoder_weight_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_encoder_weight_post_mlp",
+}
+HOOK_POINT_SAE_ENCODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_encoder_bias_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_encoder_bias_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_encoder_bias_post_mlp",
+}
+HOOK_POINT_SAE_DECODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_decoder_weight_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_decoder_weight_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_decoder_weight_post_mlp",
+}
+HOOK_POINT_SAE_MODULE_NAME_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_module_name_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_module_name_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_module_name_post_mlp",
+}
+HOOK_POINT_SAE_ACTIVATION_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_activation_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_activation_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_activation_post_mlp",
+}
+HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_activation_params_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_activation_params_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_activation_params_post_mlp",
+}
+
+# Per-hook buffer attribute names that need to be cleaned up on
+# unregister.  Module name / activation / activation-params live as
+# Python attributes (not buffers) and have their own cleanup path.
+_SAE_BUFFER_ATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
+    HOOK_POINT_SAE_CLAMP_KIND_ATTR,
+    HOOK_POINT_SAE_CLAMP_VALUE_ATTR,
+    HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR,
+    HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
+    HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
+    HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
+)
+_SAE_PYATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
+    HOOK_POINT_SAE_MODULE_NAME_ATTR,
+    HOOK_POINT_SAE_ACTIVATION_ATTR,
+    HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR,
+)
+
+
+def register_sae_buffers(
+    module: nn.Module,
+    *,
+    hook_point: SteeringHookPoint,
+    module_name: str,
+    activation: SAEActivation,
+    activation_params: Mapping[str, float],
+    n_clamp: int,
+    hidden_size: int,
+    max_sae_configs: int,
+    dtype: torch.dtype,
+) -> None:
+    """Attach SAE buffers for one ``(layer, hook)`` site to ``module``.
+
+    Phase-1B constrains at most one SAE module per ``(layer, hook)``
+    site.  Calling this twice for the same ``hook_point`` on the same
+    module raises ``ValueError``.
+
+    Args:
+        module: the decoder-layer module to attach buffers to.
+        hook_point: which hook point this site sits at.
+        module_name: name of the SAE module that owns this site.
+        activation: encoder activation function.
+        activation_params: parameters for ``activation`` (see
+            :func:`sae_encode`).  Stored as a Python attribute so the
+            kernel reads them as constants per-site.
+        n_clamp: number of clampable encoder/decoder rows.
+        hidden_size: model's hidden size (``d_model``).
+        max_sae_configs: total clamp-table rows minus the no-op
+            sentinel (row 0).  When ``0``, registration is a no-op
+            (SAE disabled engine-wide), mirroring
+            ``register_steering_buffers``.
+        dtype: compute dtype for the encoder/decoder weight tensors.
+    """
+    if max_sae_configs == 0:
+        return
+    kind_attr = HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point]
+    if hasattr(module, kind_attr):
+        existing = getattr(
+            module, HOOK_POINT_SAE_MODULE_NAME_ATTR[hook_point], "<unknown>"
+        )
+        raise ValueError(
+            f"Layer module already has SAE buffers for hook "
+            f"{hook_point.value!r} (owning module={existing!r}).  "
+            "Phase-1B constrains at most one SAE module per "
+            "(layer, hook) site; unregister the existing module first."
+        )
+    n_rows = max_sae_configs + 1
+    # Clamp tables: per-(row, feature) clamp state.
+    module.register_buffer(
+        kind_attr,
+        torch.zeros(n_rows, n_clamp, dtype=torch.int8),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point],
+        torch.zeros(n_rows, n_clamp, dtype=torch.float32),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point],
+        torch.zeros(n_rows, n_clamp, dtype=torch.bool),
+        persistent=False,
+    )
+    # Encoder / decoder weights for the clampable subset.  Worker code
+    # writes the actual values via ``copy_`` after manifest-driven
+    # weight loading; defaulting to zeros means an unloaded site
+    # produces zero delta (safe default, fail-quiet).
+    module.register_buffer(
+        HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[hook_point],
+        torch.zeros(n_clamp, hidden_size, dtype=dtype),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_SAE_ENCODER_BIAS_ATTR[hook_point],
+        torch.zeros(n_clamp, dtype=dtype),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[hook_point],
+        torch.zeros(n_clamp, hidden_size, dtype=dtype),
+        persistent=False,
+    )
+    # Python attributes — read as per-site constants by the kernel.
+    setattr(module, HOOK_POINT_SAE_MODULE_NAME_ATTR[hook_point], module_name)
+    setattr(module, HOOK_POINT_SAE_ACTIVATION_ATTR[hook_point], activation)
+    setattr(
+        module,
+        HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR[hook_point],
+        dict(activation_params),
+    )
+
+
+def unregister_sae_buffers(
+    module: nn.Module,
+    *,
+    hook_point: SteeringHookPoint,
+) -> None:
+    """Detach SAE buffers from ``module`` for ``hook_point``.
+
+    Idempotent: no-op when buffers aren't attached.  Called when the
+    owning SAE module is unregistered from the worker.
+    """
+    for table in _SAE_BUFFER_ATTR_TABLES:
+        attr = table[hook_point]
+        if hasattr(module, attr):
+            # ``register_buffer`` puts the entry into ``_buffers`` *and*
+            # makes it accessible via the descriptor; ``delattr`` removes
+            # both consistently.
+            delattr(module, attr)
+    for pytable in _SAE_PYATTR_TABLES:
+        attr = pytable[hook_point]
+        if hasattr(module, attr):
+            delattr(module, attr)
+
+
+def sae_buffers_attached(module: nn.Module, hook_point: SteeringHookPoint) -> bool:
+    """Constant-time check used by the layer-hook dispatch shim.
+
+    ``torch.compile`` traces ``hasattr`` as a static branch (decided
+    once at module instantiation), so the disabled path emits zero
+    SAE kernel code.
+    """
+    return hasattr(module, HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point])
+
+
+def register_sae_index_buffer(module: nn.Module, max_tokens: int) -> None:
+    """Attach the shared per-token ``sae_index`` buffer to ``module``.
+
+    Mirrors the additive ``steering_index`` buffer: a single
+    ``(max_tokens,)`` int64 tensor, expected to be
+    :func:`share_sae_index_across_layers` so all SAE-covered layers
+    point at the same physical tensor.  When ``max_tokens == 0`` (no
+    SAE-bearing batches expected), registration is a no-op.
+    """
+    if max_tokens == 0:
+        return
+    module.register_buffer(
+        "sae_index",
+        torch.zeros(max_tokens, dtype=torch.long),
+        persistent=False,
+    )
+
+
+def share_sae_index_across_layers(layers: list[nn.Module]) -> None:
+    """Reuse one ``sae_index`` tensor across all SAE-covered layers."""
+    shared: torch.Tensor | None = None
+    for layer in layers:
+        if not hasattr(layer, "sae_index"):
+            continue
+        if shared is None:
+            shared = layer.sae_index
+            continue
+        layer.sae_index = shared
+
+
+def sae_encode(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    activation: SAEActivation,
+    activation_params: Mapping[str, float],
+) -> torch.Tensor:
+    """Project ``hidden_states`` through the (partial) encoder and apply activation.
+
+    Args:
+        hidden_states: ``(n_tokens, d_model)``, compute dtype.
+        encoder_weight: ``(n_clamp, d_model)``.  These are the encoder
+            rows for the clampable feature subset.
+        encoder_bias: ``(n_clamp,)``.
+        activation: encoder activation function.
+        activation_params: ``{"threshold": float}`` for JumpReLU,
+            ``{"k": float}`` for TopK (cast to int internally), ignored
+            for ReLU.
+
+    Returns:
+        ``(n_tokens, n_clamp)`` activation tensor in fp32.  Callers
+        cast back to compute dtype after applying clamps.
+    """
+    h_fp32 = hidden_states.to(torch.float32)
+    enc_w_fp32 = encoder_weight.to(torch.float32)
+    enc_b_fp32 = encoder_bias.to(torch.float32)
+    pre_act = h_fp32 @ enc_w_fp32.t() + enc_b_fp32
+    if activation is SAEActivation.RELU:
+        return torch.clamp(pre_act, min=0.0)
+    if activation is SAEActivation.JUMPRELU:
+        threshold = float(activation_params["threshold"])
+        return torch.where(pre_act > threshold, pre_act, torch.zeros_like(pre_act))
+    if activation is SAEActivation.TOPK:
+        k = int(activation_params["k"])
+        n_clamp = pre_act.shape[1]
+        if k >= n_clamp:
+            return pre_act
+        # Per-row TopK mask.
+        _, top_idx = torch.topk(pre_act, k=k, dim=1, largest=True)
+        mask = torch.zeros_like(pre_act, dtype=torch.bool)
+        mask.scatter_(1, top_idx, True)
+        return torch.where(mask, pre_act, torch.zeros_like(pre_act))
+    raise ValueError(f"Unsupported SAE activation: {activation!r}")
+
+
+def apply_sae_delta(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    activation: SAEActivation,
+    activation_params: Mapping[str, float],
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+) -> torch.Tensor:
+    """Eager reference for the SAE feature-surgery delta op.
+
+    Args:
+        hidden_states: ``(n_tokens, d_model)``, compute dtype.  Output
+            is the same shape and dtype.
+        encoder_weight: ``(n_clamp, d_model)`` encoder rows for the
+            clampable feature subset.
+        encoder_bias: ``(n_clamp,)``.
+        decoder_weight: ``(n_clamp, d_model)`` decoder rows aligned
+            with ``encoder_weight``: row ``i`` is the decoder direction
+            for the same feature whose encoder row is at index ``i``.
+        activation: encoder activation function.
+        activation_params: parameters for ``activation`` (see
+            :func:`sae_encode`).
+        clamp_kind: ``(n_tokens, n_clamp)`` int8.  Per-token, per-
+            feature clamp kind: ``CLAMP_KIND_NONE`` (skip),
+            ``CLAMP_KIND_ABSOLUTE`` (set ``f := value``), or
+            ``CLAMP_KIND_ADDITIVE`` (set ``f := f + value``).
+        clamp_value: ``(n_tokens, n_clamp)`` float.  Target value for
+            absolute clamps; offset for additive clamps.  Ignored where
+            ``clamp_kind == CLAMP_KIND_NONE``.
+        clamp_only_if_active: ``(n_tokens, n_clamp)`` bool.  When True,
+            the clamp is suppressed at positions where ``f <= 0`` in
+            the live encoder pass — "amplify when present" semantics.
+
+    Returns:
+        ``hidden_states + Σ_i delta_i · W_dec[i]`` in the same dtype
+        as ``hidden_states``.
+
+    Notes:
+        Always runs the encoder pass.  The "skip encoder when no clamp
+        needs it" optimization (a kernel-level concern; cf.
+        ``SAEClampEntry.requires_encoder_pass``) is reserved for the
+        Phase-2 fused kernel where it pays off.
+    """
+    n_tokens, d_model = hidden_states.shape
+    n_clamp = encoder_weight.shape[0]
+
+    if encoder_weight.shape != (n_clamp, d_model):
+        raise ValueError(
+            "encoder_weight must be (n_clamp, d_model) matching hidden_states; "
+            f"got {tuple(encoder_weight.shape)} vs d_model={d_model}."
+        )
+    if encoder_bias.shape != (n_clamp,):
+        raise ValueError(
+            "encoder_bias must be (n_clamp,); "
+            f"got {tuple(encoder_bias.shape)} vs n_clamp={n_clamp}."
+        )
+    if decoder_weight.shape != (n_clamp, d_model):
+        raise ValueError(
+            "decoder_weight must be (n_clamp, d_model) aligned with encoder; "
+            f"got {tuple(decoder_weight.shape)} vs (n_clamp={n_clamp}, "
+            f"d_model={d_model})."
+        )
+    expected_clamp_shape = (n_tokens, n_clamp)
+    for name, t in (
+        ("clamp_kind", clamp_kind),
+        ("clamp_value", clamp_value),
+        ("clamp_only_if_active", clamp_only_if_active),
+    ):
+        if tuple(t.shape) != expected_clamp_shape:
+            raise ValueError(
+                f"{name} must be {expected_clamp_shape}; got {tuple(t.shape)}."
+            )
+
+    # n_clamp == 0 short-circuit: no features to clamp, no work to do.
+    if n_clamp == 0:
+        return hidden_states.clone()
+
+    # (n_tokens, n_clamp) fp32 — encoder pass.
+    f = sae_encode(
+        hidden_states, encoder_weight, encoder_bias, activation, activation_params
+    )
+
+    kind = clamp_kind.to(torch.int8)
+    value = clamp_value.to(torch.float32)
+    gated = clamp_only_if_active.to(torch.bool)
+    active = f > 0.0
+
+    # Per-(token, feature) new-f computation.  Branchless via where().
+    new_f_absolute = value
+    new_f_additive = f + value
+    new_f = torch.where(
+        kind == CLAMP_KIND_ABSOLUTE,
+        new_f_absolute,
+        torch.where(kind == CLAMP_KIND_ADDITIVE, new_f_additive, f),
+    )
+    # only_if_active gates everything: when gated and not active, the
+    # clamp is suppressed (delta = 0).
+    apply_clamp = (kind != CLAMP_KIND_NONE) & (~gated | active)
+    delta = torch.where(apply_clamp, new_f - f, torch.zeros_like(f))
+
+    # Cast tiny (n_tokens, n_clamp) tensor back to compute dtype before
+    # the d_model GEMM, per the dtype contract.
+    delta_compute = delta.to(hidden_states.dtype)
+    decoder_compute = decoder_weight.to(hidden_states.dtype)
+    # (n_tokens, n_clamp) @ (n_clamp, d_model) → (n_tokens, d_model)
+    residual_delta = delta_compute @ decoder_compute
+    return hidden_states + residual_delta
+
+
+def apply_layer_sae_delta(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    hook_point: SteeringHookPoint,
+) -> torch.Tensor:
+    """Layer-hook dispatch: pull buffer state, hand it to the math primitive.
+
+    When the layer has no SAE buffers attached for ``hook_point``
+    (engine started with SAE disabled or the site isn't covered by
+    any registered module), this short-circuits and returns
+    ``hidden_states`` unchanged.  The ``hasattr`` check is decided
+    once at module instantiation and is constant for the rest of the
+    layer's lifetime, so ``torch.compile`` traces it as a static
+    branch and the disabled path emits no SAE kernel at all —
+    mirroring :func:`apply_layer_steering`.
+
+    The shim performs a per-token gather from the row table to build
+    the ``(n_tokens, n_clamp)`` clamp tensors, then dispatches to
+    :func:`apply_sae_delta`.  Phase 2 will replace the gather + math
+    with a fused Triton kernel under the same surface.
+    """
+    if not sae_buffers_attached(module, hook_point):
+        return hidden_states
+    n_tokens = hidden_states.shape[0]
+    sae_index = module.sae_index[:n_tokens]  # type: ignore[union-attr]
+    kind_table = getattr(module, HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point])
+    value_table = getattr(module, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point])
+    only_table = getattr(module, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
+    enc_w = getattr(module, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[hook_point])
+    enc_b = getattr(module, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[hook_point])
+    dec_w = getattr(module, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[hook_point])
+    activation: SAEActivation = getattr(
+        module, HOOK_POINT_SAE_ACTIVATION_ATTR[hook_point]
+    )
+    activation_params: dict[str, float] = getattr(
+        module, HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR[hook_point]
+    )
+
+    # Per-token gather: (max_rows, n_clamp) → (n_tokens, n_clamp).
+    clamp_kind = kind_table[sae_index]
+    clamp_value = value_table[sae_index]
+    clamp_only_if_active = only_table[sae_index]
+
+    return apply_sae_delta(
+        hidden_states=hidden_states,
+        encoder_weight=enc_w,
+        encoder_bias=enc_b,
+        decoder_weight=dec_w,
+        activation=activation,
+        activation_params=activation_params,
+        clamp_kind=clamp_kind,
+        clamp_value=clamp_value,
+        clamp_only_if_active=clamp_only_if_active,
+    )
+
+
+def populate_sae_clamp_table(
+    *,
+    manager: SAEClampManager,  # noqa: F821 — forward ref to avoid import cycle
+    module: nn.Module,
+    hook_point: SteeringHookPoint,
+    module_name: str,
+    clampable_features: tuple[int, ...],
+    layer_idx: int | None = None,
+    worker_phase: str | None = None,
+) -> None:
+    """Project active manager rows into the per-(layer, hook) clamp tables.
+
+    Walks every active row in ``manager`` and writes its clamp content
+    into the corresponding row of ``module``'s clamp tables for this
+    ``hook_point``, gated by:
+
+    * **Module match** — the spec's ``module_name`` must equal this
+      site's ``module_name``.  Specs from other modules are skipped
+      at this site.
+    * **Phase match** — the spec's ``phase`` field (``"both"`` /
+      ``"prefill"`` / ``"decode"``) must be compatible with the
+      row's ``row_phase`` (the worker phase the row was admitted
+      under, recorded by
+      :meth:`SAEClampManager.register_clamp_spec`).  Each row is
+      written under its own phase in a single pass so prefill and
+      decode rows coexist without overwriting each other.
+    * **Layer/hook match** — when ``layer_idx`` is given, only entries
+      under ``spec.clamps[hook_point.value][layer_idx]`` are projected.
+
+    Feature indices are resolved against ``clampable_features`` (the
+    module's clampable-set order); a feature in the spec that is not
+    in ``clampable_features`` raises ``ValueError``.
+
+    Row 0 (the no-op sentinel) is always reset to all-zero so it stays
+    a true no-op.
+
+    The optional ``worker_phase`` argument is retained for tests that
+    want to assert phase-gating behaviour explicitly: when given, the
+    populator only writes rows whose ``row_phase`` matches it, leaving
+    other rows' existing buffer content untouched.  Production
+    callers omit it so every row is populated under its own phase.
+
+    Phase 1B uses this populator as a Python-eager reference; Phase 2
+    will replace it with a batched index_copy_ that mirrors the
+    additive populator.
+
+    Args:
+        manager: the :class:`SAEClampManager` holding active rows.
+        module: the layer module with SAE buffers attached.
+        hook_point: which hook this site sits at.
+        module_name: name of the SAE module that owns this site;
+            specs from other modules are skipped at this site.
+        clampable_features: ordered tuple of feature indices that
+            define the (feature_idx → row position) mapping for this
+            module.
+        layer_idx: layer index this site sits at; when ``None`` (e.g.
+            for tests that don't care about layer specificity), the
+            populator scans all layers in the spec under
+            ``hook_point``.
+        worker_phase: optional phase filter — when set, only rows with
+            matching ``row_phase`` are touched.
+    """
+    if not sae_buffers_attached(module, hook_point):
+        return
+    if worker_phase is not None and worker_phase not in ("prefill", "decode"):
+        raise ValueError(
+            f"worker_phase must be 'prefill' or 'decode' or None; got {worker_phase!r}."
+        )
+    kind_table = getattr(module, HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point])
+    value_table = getattr(module, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point])
+    only_table = getattr(module, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
+    n_clamp = kind_table.shape[1]
+    if len(clampable_features) != n_clamp:
+        raise ValueError(
+            "clampable_features length must equal n_clamp; got "
+            f"{len(clampable_features)} vs {n_clamp}."
+        )
+    feature_to_pos: dict[int, int] = {f: i for i, f in enumerate(clampable_features)}
+    # Row 0: no-op sentinel.  Re-zero defensively in case a previous
+    # populate left stale state (shouldn't happen with refcount > 0,
+    # but the cost is one zero_-per-table and it removes a class of
+    # bugs).
+    kind_table[0].zero_()
+    value_table[0].zero_()
+    only_table[0].zero_()
+    hook_name = hook_point.value
+    for row, _config_hash, row_phase, specs in manager.active_rows():
+        if worker_phase is not None and row_phase != worker_phase:
+            continue
+        # Default: zero this row at this site.  Then accumulate from
+        # whichever specs in the request's tuple actually target this
+        # site's owning module + phase + (layer, hook).
+        kind_table[row].zero_()
+        value_table[row].zero_()
+        only_table[row].zero_()
+        for spec in specs:
+            if spec.module_name != module_name:
+                continue
+            if spec.phase != "both" and spec.phase != row_phase:
+                continue
+            layer_map = spec.clamps.get(hook_name)
+            if layer_map is None:
+                continue
+            layer_entries: list = []
+            if layer_idx is None:
+                for entries in layer_map.values():
+                    layer_entries.extend(entries)
+            else:
+                layer_entries = list(layer_map.get(layer_idx, ()))
+            for entry in layer_entries:
+                pos = feature_to_pos.get(entry.feature_idx)
+                if pos is None:
+                    raise ValueError(
+                        f"SAEClampSpec entry feature_idx={entry.feature_idx} for "
+                        f"module {module_name!r} is not in clampable_features "
+                        f"{list(clampable_features)} for site "
+                        f"(layer={layer_idx}, hook={hook_name})."
+                    )
+                kind_table[row, pos] = (
+                    CLAMP_KIND_ABSOLUTE
+                    if entry.kind == "absolute"
+                    else CLAMP_KIND_ADDITIVE
+                )
+                value_table[row, pos] = float(entry.value)
+                only_table[row, pos] = bool(entry.only_if_active)
+
+
+# Note: an earlier draft had a ``_phase_applies(spec_phase, worker_phase,
+# row_phase)`` helper that gated content on a *worker_phase* argument.
+# That broke when the populator was called twice (once per worker phase)
+# because the second call zeroed rows the first call had populated.  The
+# populator now writes each row under its own ``row_phase`` in a single
+# pass; the residual phase check ``spec.phase == "both" or
+# spec.phase == row_phase`` lives inline above.
+
+
+# Forward-reference import is resolved at call time; importing at module
+# level would create a cycle (sae_clamp_manager imports
+# SAEClampSpec from vllm.config.sae_steering_types, which is fine, but
+# importing SAEClampManager here from a worker module would tie this
+# layer module to the worker hierarchy).  This local import lifts the
+# type into scope without taking the cycle.
+from vllm.v1.worker.sae_clamp_manager import SAEClampManager  # noqa: E402,F401
