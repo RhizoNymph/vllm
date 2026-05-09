@@ -34,6 +34,9 @@ class _MixinHarness(SteeringModelRunnerMixin):
     def __init__(self):
         self._steering_module_registry = {}
         self._sae_module_registry = {}
+        self._sae_steerable_sites = {}
+        self._req_sae_phase = {}
+        self._sae_clamp_manager = None
 
 
 def _sae_payload(
@@ -151,10 +154,10 @@ class TestSAEClampAdmissionGuard:
         with pytest.raises(SteeringVectorError, match="unknown module 'missing'"):
             h._assert_sae_clamps_can_be_applied(sp)
 
-    def test_known_module_still_raises_not_implemented(self):
-        """Phase-0 is plumbing only — even with a registered module,
-        attempting to apply must raise NotImplementedError so silent
-        ignoring of SAE state cannot happen."""
+    def test_known_module_with_valid_spec_admits(self):
+        """Stage 2 replaces the Phase-0 NotImplementedError with real
+        validation: a spec naming a registered module, a covered
+        (layer, hook), and a clampable feature must pass admission."""
         h = _MixinHarness()
         h.register_steering_modules({"g": _sae_payload()})
         sp = SamplingParams(
@@ -165,5 +168,35 @@ class TestSAEClampAdmissionGuard:
                 ),
             ),
         )
-        with pytest.raises(NotImplementedError, match="Phase-0"):
+        # Must not raise.
+        h._assert_sae_clamps_can_be_applied(sp)
+
+    def test_uncovered_layer_hook_raises(self):
+        h = _MixinHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+        sp = SamplingParams(
+            sae_clamp_specs=(
+                SAEClampSpec(
+                    module_name="g",
+                    # layer 21 is not in the manifest's coverage (only 20).
+                    clamps={"post_mlp": {21: (SAEClampEntry(34, "absolute", 5.0),)}},
+                ),
+            ),
+        )
+        with pytest.raises(SteeringVectorError, match="not declared"):
+            h._assert_sae_clamps_can_be_applied(sp)
+
+    def test_unclampable_feature_raises(self):
+        h = _MixinHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+        sp = SamplingParams(
+            sae_clamp_specs=(
+                SAEClampSpec(
+                    module_name="g",
+                    # feature_idx=999 not in clampable_features=(0, 1, 2, 34)
+                    clamps={"post_mlp": {20: (SAEClampEntry(999, "absolute", 5.0),)}},
+                ),
+            ),
+        )
+        with pytest.raises(SteeringVectorError, match="clampable_features"):
             h._assert_sae_clamps_can_be_applied(sp)

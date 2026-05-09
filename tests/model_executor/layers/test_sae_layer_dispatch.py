@@ -223,7 +223,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, spec, "prefill")
+        manager.register_clamp_spec(123, (spec,), "prefill")
         # clampable_features=(2, 5) means feature_idx=5 maps to position 1.
         populate_sae_clamp_table(
             manager=manager,
@@ -259,7 +259,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, spec, "prefill")
+        manager.register_clamp_spec(123, (spec,), "prefill")
         # This buffer site belongs to module 'other_module' — spec
         # targets 'g'; row 1 must be zeroed at this site.
         populate_sae_clamp_table(
@@ -294,7 +294,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, spec, "prefill")
+        manager.register_clamp_spec(123, (spec,), "prefill")
         populate_sae_clamp_table(
             manager=manager,
             module=m,
@@ -326,7 +326,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, spec, "decode")
+        manager.register_clamp_spec(123, (spec,), "decode")
         populate_sae_clamp_table(
             manager=manager,
             module=m,
@@ -360,7 +360,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, spec, "prefill")
+        manager.register_clamp_spec(123, (spec,), "prefill")
         populate_sae_clamp_table(
             manager=manager,
             module=m,
@@ -397,7 +397,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, spec, "prefill")
+        manager.register_clamp_spec(123, (spec,), "prefill")
         populate_sae_clamp_table(
             manager=manager,
             module=m,
@@ -431,7 +431,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, spec, "prefill")
+        manager.register_clamp_spec(123, (spec,), "prefill")
         import pytest
 
         with pytest.raises(ValueError, match="not in clampable_features"):

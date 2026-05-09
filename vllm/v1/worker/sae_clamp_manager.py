@@ -66,9 +66,12 @@ class SAEClampManager:
         self.max_sae_configs = max_sae_configs
         # (config_hash, phase) -> assigned row in [1, max_sae_configs].
         self.config_to_row: dict[tuple[int, str], int] = {}
-        # (config_hash, phase) -> spec, retained so the buffer populator
-        # can re-derive row content per-(layer, hook) site.
-        self.config_specs: dict[tuple[int, str], SAEClampSpec] = {}
+        # (config_hash, phase) -> tuple of specs, retained so the buffer
+        # populator can re-derive row content per-(layer, hook) site.
+        # A request's ``SamplingParams.sae_clamp_specs`` is a tuple
+        # (one entry per referenced SAE module); the whole tuple shares
+        # one row because the admission hash already covers all of them.
+        self.config_specs: dict[tuple[int, str], tuple[SAEClampSpec, ...]] = {}
         # (config_hash, phase) -> active reference count.
         self.config_refcounts: dict[tuple[int, str], int] = defaultdict(int)
         # Reversed so pop() returns the lowest free row — symmetric and
@@ -84,10 +87,10 @@ class SAEClampManager:
     def register_clamp_spec(
         self,
         config_hash: int,
-        spec: SAEClampSpec,
+        specs: tuple[SAEClampSpec, ...],
         phase: str,
     ) -> int:
-        """Register a clamp spec, return its row index.
+        """Register a request's full SAE clamp tuple, return its row index.
 
         If ``(config_hash, phase)`` is already registered, increments
         the refcount and returns the existing row.  Otherwise assigns
@@ -99,20 +102,23 @@ class SAEClampManager:
                 :func:`hash_sae_clamp_specs` for the SAE state of a
                 request in this phase.  Hash 0 is reserved for "no SAE
                 clamps in this phase" and must not be passed here.
-            spec: the :class:`SAEClampSpec` itself; retained so the
+            specs: the request's ``sae_clamp_specs`` tuple — one entry
+                per referenced SAE module.  Stored verbatim so the
                 buffer populator can resolve (feature_idx → position)
-                against the module's ``clampable_features`` and write
-                clamp values into the row.
+                per module against each module's
+                ``clampable_features`` and write clamp values into
+                the row.  An empty tuple is rejected; callers must
+                short-circuit before calling.
             phase: ``"prefill"`` or ``"decode"`` — the worker's phase,
-                not the spec's ``phase`` field (which gates whether the
-                spec applies in a given worker phase).
+                not the specs' ``phase`` field (which gates whether a
+                given spec applies in a given worker phase).
 
         Returns:
             Row index in ``[1, max_sae_configs]``.
 
         Raises:
-            ValueError: if ``config_hash == 0`` or ``phase`` is
-                invalid.
+            ValueError: if ``config_hash == 0``, ``phase`` is invalid,
+                or ``specs`` is empty.
             RuntimeError: if no free rows are available.  The scheduler
                 is expected to reserve capacity before dispatch; this
                 branch indicates a scheduler bug.
@@ -125,6 +131,11 @@ class SAEClampManager:
             )
         if phase not in ("prefill", "decode"):
             raise ValueError(f"phase must be 'prefill' or 'decode'; got {phase!r}.")
+        if not specs:
+            raise ValueError(
+                "register_clamp_spec called with empty specs tuple; the "
+                "caller must short-circuit on the no-clamps case."
+            )
         key = (config_hash, phase)
         if key in self.config_to_row:
             self.config_refcounts[key] += 1
@@ -140,7 +151,7 @@ class SAEClampManager:
 
         row = self.free_rows.pop()
         self.config_to_row[key] = row
-        self.config_specs[key] = spec
+        self.config_specs[key] = tuple(specs)
         self.config_refcounts[key] = 1
         self._tables_dirty = True
         return row
@@ -187,8 +198,10 @@ class SAEClampManager:
             "reaching this branch is a scheduler bug."
         )
 
-    def active_rows(self) -> Iterator[tuple[int, int, str, SAEClampSpec]]:
-        """Yield ``(row, config_hash, phase, spec)`` for every active row.
+    def active_rows(
+        self,
+    ) -> Iterator[tuple[int, int, str, tuple[SAEClampSpec, ...]]]:
+        """Yield ``(row, config_hash, phase, specs)`` for every active row.
 
         Ordered by row index so the populator writes rows in a
         deterministic order.  Used by the per-layer buffer populator

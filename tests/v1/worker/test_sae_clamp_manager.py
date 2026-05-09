@@ -62,28 +62,28 @@ class TestRowAllocation:
 
     def test_register_returns_row_one_first(self):
         m = SAEClampManager(max_sae_configs=4)
-        row = m.register_clamp_spec(123, _make_spec(), "prefill")
+        row = m.register_clamp_spec(123, (_make_spec(),), "prefill")
         assert row == 1
         assert m.config_to_row == {(123, "prefill"): 1}
 
     def test_register_consecutive_rows(self):
         m = SAEClampManager(max_sae_configs=4)
-        r1 = m.register_clamp_spec(1, _make_spec(), "prefill")
-        r2 = m.register_clamp_spec(2, _make_spec(), "prefill")
-        r3 = m.register_clamp_spec(3, _make_spec(), "prefill")
+        r1 = m.register_clamp_spec(1, (_make_spec(),), "prefill")
+        r2 = m.register_clamp_spec(2, (_make_spec(),), "prefill")
+        r3 = m.register_clamp_spec(3, (_make_spec(),), "prefill")
         assert (r1, r2, r3) == (1, 2, 3)
 
     def test_same_hash_same_phase_returns_existing_row_and_increments_refcount(self):
         m = SAEClampManager(max_sae_configs=4)
-        r1 = m.register_clamp_spec(1, _make_spec(), "prefill")
-        r2 = m.register_clamp_spec(1, _make_spec(), "prefill")
+        r1 = m.register_clamp_spec(1, (_make_spec(),), "prefill")
+        r2 = m.register_clamp_spec(1, (_make_spec(),), "prefill")
         assert r1 == r2 == 1
         assert m.config_refcounts[(1, "prefill")] == 2
 
     def test_same_hash_different_phase_gets_new_row(self):
         m = SAEClampManager(max_sae_configs=4)
-        r_prefill = m.register_clamp_spec(1, _make_spec(), "prefill")
-        r_decode = m.register_clamp_spec(1, _make_spec(), "decode")
+        r_prefill = m.register_clamp_spec(1, (_make_spec(),), "prefill")
+        r_decode = m.register_clamp_spec(1, (_make_spec(),), "decode")
         assert r_prefill != r_decode
         assert {r_prefill, r_decode} == {1, 2}
 
@@ -93,24 +93,24 @@ class TestCapacityContract:
 
     def test_register_at_capacity_raises(self):
         m = SAEClampManager(max_sae_configs=2)
-        m.register_clamp_spec(1, _make_spec(), "prefill")
-        m.register_clamp_spec(2, _make_spec(), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
+        m.register_clamp_spec(2, (_make_spec(),), "prefill")
         with pytest.raises(RuntimeError, match="No free SAE clamp"):
-            m.register_clamp_spec(3, _make_spec(), "prefill")
+            m.register_clamp_spec(3, (_make_spec(),), "prefill")
 
     def test_release_then_register_reuses_freed_row(self):
         m = SAEClampManager(max_sae_configs=2)
-        r1 = m.register_clamp_spec(1, _make_spec(), "prefill")
-        m.register_clamp_spec(2, _make_spec(), "prefill")
+        r1 = m.register_clamp_spec(1, (_make_spec(),), "prefill")
+        m.register_clamp_spec(2, (_make_spec(),), "prefill")
         m.release_clamp_spec(1, "prefill")
         # Lowest free row gets reused — deterministic across ranks.
-        r3 = m.register_clamp_spec(3, _make_spec(), "prefill")
+        r3 = m.register_clamp_spec(3, (_make_spec(),), "prefill")
         assert r3 == r1
 
     def test_max_zero_raises_on_first_register(self):
         m = SAEClampManager(max_sae_configs=0)
         with pytest.raises(RuntimeError):
-            m.register_clamp_spec(1, _make_spec(), "prefill")
+            m.register_clamp_spec(1, (_make_spec(),), "prefill")
 
 
 class TestRefcounting:
@@ -118,15 +118,15 @@ class TestRefcounting:
 
     def test_release_decrements_refcount_keeps_row_when_positive(self):
         m = SAEClampManager(max_sae_configs=4)
-        m.register_clamp_spec(1, _make_spec(), "prefill")
-        m.register_clamp_spec(1, _make_spec(), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
         m.release_clamp_spec(1, "prefill")
         assert m.config_refcounts[(1, "prefill")] == 1
         assert (1, "prefill") in m.config_to_row
 
     def test_release_to_zero_frees_row(self):
         m = SAEClampManager(max_sae_configs=4)
-        m.register_clamp_spec(1, _make_spec(), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
         m.release_clamp_spec(1, "prefill")
         assert (1, "prefill") not in m.config_to_row
         assert (1, "prefill") not in m.config_refcounts
@@ -148,8 +148,8 @@ class TestGetRowForConfig:
 
     def test_registered_hash_returns_assigned_row(self):
         m = SAEClampManager(max_sae_configs=4)
-        row_p = m.register_clamp_spec(7, _make_spec(), "prefill")
-        row_d = m.register_clamp_spec(7, _make_spec(), "decode")
+        row_p = m.register_clamp_spec(7, (_make_spec(),), "prefill")
+        row_d = m.register_clamp_spec(7, (_make_spec(),), "decode")
         assert m.get_row_for_config(7, is_prefill=True) == row_p
         assert m.get_row_for_config(7, is_prefill=False) == row_d
 
@@ -161,7 +161,7 @@ class TestGetRowForConfig:
     def test_phase_mismatch_raises(self):
         # Registered for prefill only — decode lookup must fail loud.
         m = SAEClampManager(max_sae_configs=4)
-        m.register_clamp_spec(7, _make_spec(), "prefill")
+        m.register_clamp_spec(7, (_make_spec(),), "prefill")
         with pytest.raises(RuntimeError, match="not registered"):
             m.get_row_for_config(7, is_prefill=False)
 
@@ -171,11 +171,11 @@ class TestActiveRowsEnumeration:
 
     def test_iterates_in_row_order(self):
         m = SAEClampManager(max_sae_configs=4)
-        m.register_clamp_spec(10, _make_spec(module_name="a"), "prefill")
-        m.register_clamp_spec(20, _make_spec(module_name="b"), "decode")
-        m.register_clamp_spec(30, _make_spec(module_name="c"), "prefill")
+        m.register_clamp_spec(10, (_make_spec(module_name="a"),), "prefill")
+        m.register_clamp_spec(20, (_make_spec(module_name="b"),), "decode")
+        m.register_clamp_spec(30, (_make_spec(module_name="c"),), "prefill")
         rows = list(m.active_rows())
-        # (row, hash, phase, spec) tuples; sorted by row index.
+        # (row, hash, phase, specs) tuples; sorted by row index.
         assert [r[0] for r in rows] == [1, 2, 3]
         assert [(r[1], r[2]) for r in rows] == [
             (10, "prefill"),
@@ -183,19 +183,34 @@ class TestActiveRowsEnumeration:
             (30, "prefill"),
         ]
 
-    def test_yields_spec_for_repopulation(self):
+    def test_yields_specs_tuple_for_repopulation(self):
         m = SAEClampManager(max_sae_configs=4)
         spec = _make_spec(value=99.0)
-        m.register_clamp_spec(7, spec, "prefill")
+        m.register_clamp_spec(7, (spec,), "prefill")
         rows = list(m.active_rows())
         assert len(rows) == 1
-        _, _, _, returned_spec = rows[0]
-        assert returned_spec is spec
+        _, _, _, returned_specs = rows[0]
+        assert returned_specs == (spec,)
+
+    def test_yields_full_specs_tuple(self):
+        m = SAEClampManager(max_sae_configs=4)
+        s_a = _make_spec(module_name="a")
+        s_b = _make_spec(module_name="b")
+        m.register_clamp_spec(7, (s_a, s_b), "prefill")
+        rows = list(m.active_rows())
+        _, _, _, returned_specs = rows[0]
+        # Both modules' specs share one row — populator iterates per-spec.
+        assert returned_specs == (s_a, s_b)
+
+    def test_empty_specs_tuple_rejected(self):
+        m = SAEClampManager(max_sae_configs=4)
+        with pytest.raises(ValueError, match="empty specs"):
+            m.register_clamp_spec(7, (), "prefill")
 
     def test_freed_row_is_not_yielded(self):
         m = SAEClampManager(max_sae_configs=4)
-        m.register_clamp_spec(10, _make_spec(), "prefill")
-        m.register_clamp_spec(20, _make_spec(), "decode")
+        m.register_clamp_spec(10, (_make_spec(),), "prefill")
+        m.register_clamp_spec(20, (_make_spec(),), "decode")
         m.release_clamp_spec(10, "prefill")
         rows = list(m.active_rows())
         assert [r[1] for r in rows] == [20]
@@ -212,28 +227,28 @@ class TestDirtyFlag:
     def test_register_sets_dirty(self):
         m = SAEClampManager(max_sae_configs=4)
         m.mark_tables_clean()
-        m.register_clamp_spec(1, _make_spec(), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
         assert m._tables_dirty is True
 
     def test_register_refcount_hit_does_not_set_dirty(self):
         m = SAEClampManager(max_sae_configs=4)
-        m.register_clamp_spec(1, _make_spec(), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
         m.mark_tables_clean()
         # Same (hash, phase) — refcount bump only, no row content change.
-        m.register_clamp_spec(1, _make_spec(), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
         assert m._tables_dirty is False
 
     def test_release_to_zero_sets_dirty(self):
         m = SAEClampManager(max_sae_configs=4)
-        m.register_clamp_spec(1, _make_spec(), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
         m.mark_tables_clean()
         m.release_clamp_spec(1, "prefill")
         assert m._tables_dirty is True
 
     def test_release_decrement_only_does_not_set_dirty(self):
         m = SAEClampManager(max_sae_configs=4)
-        m.register_clamp_spec(1, _make_spec(), "prefill")
-        m.register_clamp_spec(1, _make_spec(), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
+        m.register_clamp_spec(1, (_make_spec(),), "prefill")
         m.mark_tables_clean()
         m.release_clamp_spec(1, "prefill")
         # Refcount went 2 -> 1; row still occupied; no row content change.
