@@ -758,6 +758,56 @@ class SteeringModelRunnerMixin:
             attached_layers.append(layer)
         if attached_layers:
             share_sae_index_across_layers(attached_layers)
+            self._warmup_sae_kernel_for_module(
+                manifest=manifest,
+                attached_layers=attached_layers,
+                ref_dtype=ref_dtype,
+            )
+
+    def _warmup_sae_kernel_for_module(
+        self,
+        *,
+        manifest: SAEModuleManifest,
+        attached_layers: list[nn.Module],
+        ref_dtype: torch.dtype,
+    ) -> None:
+        """JIT-warm the SAE Triton kernel for the activation this module uses.
+
+        Mirrors the additive ``warmup_apply_steering_kernel`` call in
+        :meth:`_init_steering_state`: pays the Triton first-call JIT
+        cost outside any captured forward pass so subsequent CUDA-graph
+        capture won't trigger a compile mid-capture.
+
+        Each (activation_code, BLOCK_H, BLOCK_C) triple specialises to
+        its own JIT artifact, so we warm once per attached SAE module.
+        Multiple modules with identical specialisation share the
+        cached binary on subsequent attach calls.
+        """
+        if not attached_layers:
+            return
+        device = attached_layers[0].sae_index.device  # type: ignore[union-attr]
+        if device.type != "cuda":
+            return
+        from vllm.model_executor.layers.sae_steering import (
+            _ACTIVATION_TO_CODE,
+            _activation_to_scalar,
+        )
+        from vllm.model_executor.layers.sae_steering_kernel import (
+            warmup_apply_sae_delta_kernel,
+        )
+
+        compute_dtype = getattr(self.vllm_config.model_config, "dtype", ref_dtype)
+        warmup_apply_sae_delta_kernel(
+            hidden_size=manifest.d_model,
+            n_clamp=len(manifest.clampable_features),
+            table_dtype=ref_dtype,
+            compute_dtype=compute_dtype,
+            device=device,
+            activation_code=_ACTIVATION_TO_CODE[manifest.activation],
+            activation_param=_activation_to_scalar(
+                manifest.activation, manifest.activation_params
+            ),
+        )
 
     def _detach_sae_buffers(self, module_name: str) -> None:
         """Detach all per-(layer, hook) buffers attached for ``module_name``."""
