@@ -537,18 +537,31 @@ encoder/decoder row sets are equal.
      custom-op-fence behaviour.  Until Stage 4 lands, the registered
      op routes both CPU and CUDA through the eager body so the
      surface is stable for callers (no kernel-vs-op-func skew).
-   - **Stage 3 (planned).** Worker mixin integration — a parallel
-     `SAEFullReconstructionManager` + admission /
-     transition / release paths, the strict-capacity contract
-     mirrored from the delta path, and `_attach_sae_full_recon_buffers`
-     / `attach_sae_full_recon_weights` for register / inject.  A
-     new per-request `SAEFullReconstructionSpec` (allowing empty
-     clamp lists, since pure reconstruction is a meaningful op)
-     lands in this stage with hash plumbing folded into
-     `hash_steering_config`.  Prefix-cache invariants are revisited
-     here — full-reconstruction is a residual *replacement* not a
-     perturbation, so even baseline-clamp-set requests differ
-     from no-SAE baselines and the cache key must reflect that.
+   - **Stage 3 (shipped — type system + manager + populator).**
+     `SteeringModuleKind.SAE_FULL_RECONSTRUCTION` enum value,
+     `SAEFullReconstructionSpec` per-request type (allows empty
+     `clamps`, since pure reconstruction is a meaningful op),
+     `coerce_sae_full_reconstruction_specs` / `hash_sae_full_reconstruction_specs`
+     helpers.  `SamplingParams.sae_full_reconstruction_specs`
+     field with phase-filtered hash plumbing folded into both
+     `prefill_steering_config_hash` and `decode_steering_config_hash`
+     via `hash_steering_config` — using a distinct domain
+     separator from the delta block so a delta and a
+     full-reconstruction request with identical clamp content
+     never collide on prefix-cache keys.  New
+     `SAEFullReconstructionManager` (parallel to `SAEClampManager`):
+     strict capacity, refcount, deterministic-replay across ranks,
+     no global tier, row 0 = no-reconstruction sentinel.  New
+     `populate_sae_full_recon_clamp_table` projector parallel to
+     the delta populator with the same module-match / phase-match
+     / layer-match gating; specs with empty `clamps` correctly
+     allocate a row (so the dispatch shim's `recon_index != 0`
+     gate fires) but leave the clamp tables zeroed.  Registry
+     accepts `kind=SAE_FULL_RECONSTRUCTION` modules with the same
+     manifest validation as `SAE_DELTA`.  Worker mixin integration
+     (admission / transition / release / per-step buffer update,
+     `_attach_sae_full_recon_buffers` / `attach_sae_full_recon_weights`)
+     lands in Stage 3b.
    - **Stage 4 (planned).** Fused Triton kernel and CUDA-graph
      warmup, mirroring `sae_steering_kernel.py`'s shape but
      branching on the per-token `recon_mask` so unmasked tokens
