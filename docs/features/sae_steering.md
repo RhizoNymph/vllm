@@ -489,7 +489,7 @@ encoder/decoder row sets are equal.
      qualitative-shift assertion is robust to it.  Per-feature
      thresholds remain a kernel-level follow-up.
 
-6. **Phase 4 — Full-reconstruction variant (in progress).**
+6. **Phase 4 — Full-reconstruction variant (shipped).**
    - **Stage 1 (shipped).** Eager math primitive in
      `vllm/model_executor/layers/sae_full_reconstruction.py`:
      `apply_sae_full_reconstruction` projects each masked token
@@ -612,11 +612,27 @@ encoder/decoder row sets are equal.
      `test_sae_full_reconstruction_kernel.py` confirm the
      compaction path matches the eager body bit-for-bit on shared
      inputs.
-   - **Stage 5 (planned).** Real-weights e2e against Gemma Scope,
-     parallel to `test_sae_steering_real_weights.py`; verifies
-     residual *replacement* (rather than delta) on a known
-     feature actually drives outputs in the qualitative
-     direction.
+   - **Stage 5 (shipped — Gemma Scope real-weights e2e).**
+     `tests/models/language/generation/test_sae_full_reconstruction_real_weights.py`
+     is the parallel of the delta path's
+     `test_sae_steering_real_weights.py`, against the same
+     Gemma 2-2B + `gemma-scope-2b-pt-res/layer_12/width_16k/average_l0_82`
+     SAE.  A new loader helper
+     `load_gemma_scope_sae_full_recon` in
+     `vllm/entrypoints/openai/steering/sae_loader.py` returns the
+     full-`d_sae` × `d_model` encoder / decoder weights plus the
+     `decoder_bias` (the delta loader subsets to the clampable
+     features and drops the decoder bias because the delta math
+     doesn't need it; replacement does).  Three tests guard the
+     replacement variant against silent regressions: pure
+     reconstruction (no clamps) shifts output via reconstruction
+     error vs no-spec baseline, a clamp shifts output beyond the
+     pure-recon baseline, and clamp magnitude is monotone in the
+     output divergence.  All three are gated on real Gemma weights
+     (HF-token + CUDA), so they skip cleanly in CI and on dev
+     boxes without GPUs while still running in environments that
+     have the artefacts.  Phase 4 is feature-complete with this
+     stage.
 
 ## Resolved Design Decisions
 
