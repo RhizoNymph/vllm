@@ -513,14 +513,30 @@ encoder/decoder row sets are equal.
      paths.  This stage matches the Phase-1A scope shape: math
      primitive only, no buffers / custom-op / kernel / worker
      plumbing.
-   - **Stage 2 (planned).** Per-(layer, hook) buffers for the
-     full encoder / decoder, layer-hook dispatch shim mirroring
-     `apply_layer_sae_delta`, and `direct_register_custom_op`
-     registration as `torch.ops.vllm.apply_sae_full_reconstruction`
-     so `torch.compile` treats the op as an opaque splitting
-     point.  At-most-one-SAE-module-per-(layer, hook) extends to
-     cover full-reconstruction-kind sites — the kind discriminator
-     comes from the manifest the worker stashes.
+   - **Stage 2 (shipped).** Per-(layer, hook) buffers for the
+     full encoder / decoder + per-row clamp tables (sized
+     `(max_recon_configs + 1, n_clamp)` with row 0 reserved as the
+     no-reconstruction sentinel), shared `sae_recon_index`
+     per-token routing buffer, and a layer-hook dispatch shim
+     `apply_layer_sae_full_reconstruction` that gathers per-token
+     clamp tensors and derives `recon_mask = (recon_index != 0)`.
+     The compute path is registered as
+     `torch.ops.vllm.apply_sae_full_reconstruction` (tensor-only
+     schema with int activation code + float scalar param) so
+     `torch.compile` treats the call as an opaque splitting point,
+     mirroring the additive `apply_steering` and the delta
+     `apply_sae_delta`.  The public Python API
+     `apply_sae_full_reconstruction(activation, activation_params,
+     ...)` keeps its enum signature and bypasses `torch.ops` so
+     CPU-only test environments aren't subject to dispatch-key
+     mismatches.  At-most-one-SAE-module-per-(layer, hook) extends
+     to cover full-reconstruction-kind sites; double-registration
+     raises `ValueError`.  Stage-2 tests cover buffer shapes /
+     dtypes / unregistration, recon-index sharing across layers,
+     and the dispatch shim's row-0-passthrough / row-N-routing /
+     custom-op-fence behaviour.  Until Stage 4 lands, the registered
+     op routes both CPU and CUDA through the eager body so the
+     surface is stable for callers (no kernel-vs-op-func skew).
    - **Stage 3 (planned).** Worker mixin integration — a parallel
      `SAEFullReconstructionManager` + admission /
      transition / release paths, the strict-capacity contract
