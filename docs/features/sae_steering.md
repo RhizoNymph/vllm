@@ -489,12 +489,59 @@ encoder/decoder row sets are equal.
      qualitative-shift assertion is robust to it.  Per-feature
      thresholds remain a kernel-level follow-up.
 
-6. **Phase 4 (deferred) — Full-reconstruction variant.**
-   - If/when needed, add `SteeringModuleKind.SAE_FULL_RECONSTRUCTION`
-     as a separate op. Does not require touching the delta path. Most
-     likely needs admission-tier changes because the operation is no
-     longer a small additive perturbation and prefix-cache invariants
-     differ.
+6. **Phase 4 — Full-reconstruction variant (in progress).**
+   - **Stage 1 (shipped).** Eager math primitive in
+     `vllm/model_executor/layers/sae_full_reconstruction.py`:
+     `apply_sae_full_reconstruction` projects each masked token
+     through the full SAE encoder, applies optional per-(token,
+     clampable-feature) clamps to the activation, decodes via the
+     full decoder + decoder bias, and replaces the residual.
+     Per-token opt-in is via a `recon_mask` bool tensor — tokens
+     with `recon_mask=False` pass through bit-identically, which
+     keeps a request without a full-reconstruction spec free of
+     reconstruction error.  Activations supported: `ReLU`,
+     `JumpReLU` (scalar threshold), and `TopK` over the *full*
+     `d_sae` (true Golden-Gate-style semantics, unlike the delta
+     path's clampable-subset TopK).  CPU parity tests in
+     `tests/model_executor/layers/test_sae_full_reconstruction_op.py`
+     check the vectorised path against a hand-rolled per-(token,
+     feature) reference, exercise activations / clamp variants /
+     `only_if_active` gating / fp16 / bf16 / shape contracts /
+     empty-batch and zero-clamp edge cases.  Reuses
+     `SAEClampEntry` / `CLAMP_KIND_*` constants from
+     `sae_steering.py` so a single source of truth governs both
+     paths.  This stage matches the Phase-1A scope shape: math
+     primitive only, no buffers / custom-op / kernel / worker
+     plumbing.
+   - **Stage 2 (planned).** Per-(layer, hook) buffers for the
+     full encoder / decoder, layer-hook dispatch shim mirroring
+     `apply_layer_sae_delta`, and `direct_register_custom_op`
+     registration as `torch.ops.vllm.apply_sae_full_reconstruction`
+     so `torch.compile` treats the op as an opaque splitting
+     point.  At-most-one-SAE-module-per-(layer, hook) extends to
+     cover full-reconstruction-kind sites — the kind discriminator
+     comes from the manifest the worker stashes.
+   - **Stage 3 (planned).** Worker mixin integration — a parallel
+     `SAEFullReconstructionManager` + admission /
+     transition / release paths, the strict-capacity contract
+     mirrored from the delta path, and `_attach_sae_full_recon_buffers`
+     / `attach_sae_full_recon_weights` for register / inject.  A
+     new per-request `SAEFullReconstructionSpec` (allowing empty
+     clamp lists, since pure reconstruction is a meaningful op)
+     lands in this stage with hash plumbing folded into
+     `hash_steering_config`.  Prefix-cache invariants are revisited
+     here — full-reconstruction is a residual *replacement* not a
+     perturbation, so even baseline-clamp-set requests differ
+     from no-SAE baselines and the cache key must reflect that.
+   - **Stage 4 (planned).** Fused Triton kernel and CUDA-graph
+     warmup, mirroring `sae_steering_kernel.py`'s shape but
+     branching on the per-token `recon_mask` so unmasked tokens
+     short-circuit the encoder / decoder GEMMs.
+   - **Stage 5 (planned).** Real-weights e2e against Gemma Scope,
+     parallel to `test_sae_steering_real_weights.py`; verifies
+     residual *replacement* (rather than delta) on a known
+     feature actually drives outputs in the qualitative
+     direction.
 
 ## Resolved Design Decisions
 
