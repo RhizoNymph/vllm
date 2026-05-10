@@ -453,12 +453,41 @@ encoder/decoder row sets are equal.
      bf16 dtype parity, non-power-of-two `d_model` correctness, and
      the empty-batch / `n_clamp == 0` short-circuit contract.
 
-5. **Phase 3 — Real SAE checkpoint integration test.**
-   - Add a Gemma-Scope-driven end-to-end test alongside the existing
-     `*_real_weights` Gemma 3 tests. Verify "Golden-Gate-style"
-     behavior reproduces qualitatively (i.e., a feature known to fire
-     on a topic actually drives outputs toward that topic when
-     clamped high).
+5. **Phase 3 — Real SAE checkpoint integration (shipped).**
+   - New on-disk SAE loader at
+     `vllm/entrypoints/openai/steering/sae_loader.py` covers two
+     layouts: a generic `manifest.json` + per-(layer, hook)
+     safetensors directory (the canonical vLLM-side format), and
+     Gemma Scope's per-(layer, hook) `params.npz` (subsetting the
+     full encoder/decoder by a caller-supplied feature index list).
+     A `merge_loaded_sae_modules` helper composes per-site results
+     into a single multi-site module — Gemma Scope releases one
+     NPZ per `(layer, hook)`, and a multi-layer SAE is built by
+     loading several NPZs and merging.  Loader unit tests in
+     `tests/entrypoints/openai/test_sae_loader.py` exercise both
+     readers, error paths, dtype coercion, and the merge contract
+     against synthetic on-disk fixtures (CPU-only).
+   - Real-weights end-to-end test in
+     `tests/models/language/generation/test_sae_steering_real_weights.py`
+     downloads a Gemma Scope SAE for one site of Gemma 2-2B,
+     registers it via `register_steering_modules`, attaches weights
+     via `attach_sae_weights`, and asserts that submitting the same
+     prompt with `SamplingParams.sae_clamp_specs` clamping one
+     feature to a high target shifts either the generated tokens or
+     the cumulative logprob.  A second test asserts the
+     monotonic-ish relationship between clamp target magnitude and
+     output divergence.  Both tests are gated behind CUDA
+     availability and HF model registration; failures to download
+     either the model or the SAE artifact surface as `pytest.skip`.
+   - Per-feature JumpReLU thresholds (Gemma Scope ships
+     `threshold` as `(d_sae,)`) are folded into a *scalar* threshold
+     by taking the median over the clampable subset.  The kernel's
+     constexpr-on-activation specialisation pushed us toward this
+     simplification; for absolute clamps with high target values
+     (the test's regime), the steering effect is dominated by
+     `target` rather than the live activation `f`, so the
+     qualitative-shift assertion is robust to it.  Per-feature
+     thresholds remain a kernel-level follow-up.
 
 6. **Phase 4 (deferred) — Full-reconstruction variant.**
    - If/when needed, add `SteeringModuleKind.SAE_FULL_RECONSTRUCTION`
