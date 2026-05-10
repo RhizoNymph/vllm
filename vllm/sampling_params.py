@@ -353,6 +353,39 @@ class SamplingParams(
     _effective_decode_steering_packed: dict[str, dict[int, np.ndarray]] | None = None
     """Decode-phase counterpart of ``_effective_prefill_steering_packed``."""
 
+    _effective_prefill_steering_shm: (
+        dict[str, dict[int, tuple[int, int, str, tuple[int, ...]]]] | None
+    ) = None
+    """Per-(hook, layer) descriptor tuples ``(offset, length, dtype_str,
+    shape)`` pointing into a :class:`vllm.v1.engine.steering_shm.SteeringShmRegion`
+    on the host where the engine is running.  When set, takes precedence
+    over ``_effective_prefill_steering_packed``: the worker materializes
+    each ndarray on demand via :meth:`SteeringShmRegion.read_packed`,
+    so the ZMQ payload only carries the descriptor tuples (~32 bytes
+    per layer) instead of the packed bytes themselves.
+
+    Underscore-prefixed so :class:`PydanticMsgspecMixin` excludes the
+    field from JSON / OpenAPI schema (the descriptor tuple isn't a
+    user-visible concept).  Internal field — populated only by
+    :func:`vllm.config.steering_types.maybe_pack_inline_steering_for_request`
+    when an :class:`SteeringShmRegion` is wired through; absent on
+    non-Linux deployments or when the shm region is unavailable, in
+    which case the existing inline-packed wire path applies."""
+
+    _effective_decode_steering_shm: (
+        dict[str, dict[int, tuple[int, int, str, tuple[int, ...]]]] | None
+    ) = None
+    """Decode-phase counterpart of ``_effective_prefill_steering_shm``."""
+
+    _steering_shm_path: str | None = None
+    """Filesystem path of the :class:`vllm.v1.engine.steering_shm.SteeringShmRegion`
+    that the descriptor tuples in ``_effective_*_steering_shm`` index into.
+
+    Set when the client routes packed bytes through shared memory; the
+    worker uses this path to lazily ``open_readonly`` its end of the
+    mmap on first use.  Underscore-prefixed → excluded from JSON schema
+    and only carried internally."""
+
     steering_module_ref: tuple[str, float] | None = None
     """Optional ``(module_name, scale)`` reference to a worker-side
     named steering module.  When set, the worker resolves the named
@@ -841,16 +874,35 @@ class SamplingParams(
     ) -> dict[str, dict[int, np.ndarray]] | None:
         """Resolved prefill steering: base + prefill-specific, pre-scaled.
 
-        Returns 1-D ``np.ndarray`` per (hook, layer).  When the request
-        was packed by the client (``_effective_prefill_steering_packed``
-        is set) those arrays are already in the model's compute dtype;
-        otherwise a fresh resolve over the original list-of-floats
-        fields produces ``np.float64`` arrays.  ``hash_steering_config``
-        casts to ``float32`` at the SHA boundary in either case, so the
-        hash is stable within a deployment (cross-pipeline reuse — i.e.,
-        switching a workload between packed and unpacked — is a one-time
-        cache miss).
+        Returns 1-D ``np.ndarray`` per (hook, layer).  Resolution order:
+
+        1. If ``_effective_prefill_steering_shm`` is set, materialize
+           via the process-local
+           :class:`vllm.v1.engine.steering_shm.SteeringShmRegion` —
+           descriptor tuples survive the IPC boundary; the bytes live
+           in shared memory.  Falls through to (2) on the client side
+           if no region is registered yet (e.g. between engine startup
+           and the first ``set_*_region`` call).
+        2. If ``_effective_prefill_steering_packed`` is set, return it
+           directly (model-dtype ``ndarray`` form, packed before IPC).
+        3. Otherwise resolve fresh from the list-of-floats fields,
+           producing ``np.float64`` arrays.
+
+        ``hash_steering_config`` casts to ``float32`` at the SHA
+        boundary in every case, so the hash is stable within a
+        deployment regardless of which path materialized the values.
         """
+        if self._effective_prefill_steering_shm is not None:
+            from vllm.v1.engine.steering_shm import (
+                get_any_region,
+                materialize_shm_dict,
+            )
+
+            region = get_any_region()
+            if region is not None:
+                return materialize_shm_dict(
+                    self._effective_prefill_steering_shm, region
+                )
         if self._effective_prefill_steering_packed is not None:
             return self._effective_prefill_steering_packed
         return resolve_effective_vectors(
@@ -861,7 +913,21 @@ class SamplingParams(
     def effective_decode_steering(
         self,
     ) -> dict[str, dict[int, np.ndarray]] | None:
-        """Resolved decode steering: base + decode-specific, pre-scaled."""
+        """Resolved decode steering: base + decode-specific, pre-scaled.
+
+        See :meth:`effective_prefill_steering` for the resolution order.
+        """
+        if self._effective_decode_steering_shm is not None:
+            from vllm.v1.engine.steering_shm import (
+                get_any_region,
+                materialize_shm_dict,
+            )
+
+            region = get_any_region()
+            if region is not None:
+                return materialize_shm_dict(
+                    self._effective_decode_steering_shm, region
+                )
         if self._effective_decode_steering_packed is not None:
             return self._effective_decode_steering_packed
         return resolve_effective_vectors(

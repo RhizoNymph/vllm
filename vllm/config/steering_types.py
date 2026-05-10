@@ -25,6 +25,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.steering_shm import SteeringShmRegion
 
 # Per-layer entry: bare list (scale=1.0) or {"vector": [...], "scale": float}.
 # This is the public, user-facing shape — the type alias is exposed as a
@@ -421,9 +422,31 @@ def hash_steering_config(
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
 
+def _shm_pack_dict(
+    packed: dict[str, dict[int, np.ndarray]] | None,
+    shm_region: SteeringShmRegion,
+) -> dict[str, dict[int, tuple[int, int, str, tuple[int, ...]]]] | None:
+    """Write every per-(hook, layer) ndarray to *shm_region*.
+
+    Returns the parallel descriptor dict (or ``None`` when *packed*
+    is ``None``).
+    """
+    if packed is None:
+        return None
+    out: dict[str, dict[int, tuple[int, int, str, tuple[int, ...]]]] = {}
+    for hook, layer_dict in packed.items():
+        descriptors: dict[int, tuple[int, int, str, tuple[int, ...]]] = {}
+        for layer_idx, arr in layer_dict.items():
+            descriptors[layer_idx] = shm_region.write_packed(arr)
+        if descriptors:
+            out[hook] = descriptors
+    return out or None
+
+
 def maybe_pack_inline_steering_for_request(
     sp: SamplingParams,
     torch_dtype: object,
+    shm_region: SteeringShmRegion | None = None,
 ) -> None:
     """Pre-resolve + pack inline steering vectors on *sp* in-place.
 
@@ -433,24 +456,35 @@ def maybe_pack_inline_steering_for_request(
     :meth:`SamplingParams._effective_prefill_steering_packed` for the
     contract.
 
+    When *shm_region* is provided, the packed bytes are copied into
+    the shared-memory region and only ``(offset, length, dtype, shape)``
+    descriptors are stashed onto *sp* — driving the IPC payload to ~32
+    bytes per (hook, layer) entry regardless of vector size.  When
+    *shm_region* is ``None``, behaviour is unchanged: full packed
+    ndarrays land on ``_effective_*_steering_packed`` and ride the
+    msgpack wire path as before.
+
     No-ops when:
 
     - all inline tier fields are ``None`` (named-only or no-steering);
-    - packed fields are already set (idempotency for callers that
-      pre-packed).
+    - packed-or-shm fields are already set (idempotency for callers
+      that pre-packed).
 
     Mutates *sp* by:
     1. Reading ``prefill_steering_config_hash`` and
        ``decode_steering_config_hash`` to fix the hash against the
        original fp64-resolved values (preserves prefix-cache reuse).
-    2. Setting ``effective_*_steering_packed`` to the model-dtype
-       ``ndarray`` form of the resolved per-phase specs.
+    2. Setting ``_effective_*_steering_shm`` (shm path) or
+       ``_effective_*_steering_packed`` (msgpack path) to the
+       model-dtype form of the resolved per-phase specs.
     3. Clearing ``steering_vectors`` / ``prefill_steering_vectors`` /
        ``decode_steering_vectors`` so the wire payload doesn't carry
        both forms.
-    4. Stashing the packed dicts as the cached values for the
-       ``effective_*_steering`` cached_properties so worker-side reads
-       return them directly without re-resolving.
+    4. Stashing the materialized dicts as the cached values for the
+       ``effective_*_steering`` cached_properties on the msgpack path
+       so worker-side reads return them directly without re-resolving.
+       (The shm path can't pre-cache because the process-local region
+       is needed to materialize.)
     """
     if (
         sp.steering_vectors is None
@@ -461,6 +495,8 @@ def maybe_pack_inline_steering_for_request(
     if (
         sp._effective_prefill_steering_packed is not None
         or sp._effective_decode_steering_packed is not None
+        or sp._effective_prefill_steering_shm is not None
+        or sp._effective_decode_steering_shm is not None
     ):
         return
 
@@ -472,14 +508,43 @@ def maybe_pack_inline_steering_for_request(
     _ = sp.prefill_steering_config_hash
     _ = sp.decode_steering_config_hash
 
-    sp._effective_prefill_steering_packed = pack_effective_steering(
+    prefill_packed = pack_effective_steering(
         sp.steering_vectors, sp.prefill_steering_vectors, np_dtype
     )
-    sp._effective_decode_steering_packed = pack_effective_steering(
+    decode_packed = pack_effective_steering(
         sp.steering_vectors, sp.decode_steering_vectors, np_dtype
     )
+
     sp.steering_vectors = None
     sp.prefill_steering_vectors = None
     sp.decode_steering_vectors = None
+
+    if shm_region is not None:
+        sp._effective_prefill_steering_shm = _shm_pack_dict(
+            prefill_packed, shm_region
+        )
+        sp._effective_decode_steering_shm = _shm_pack_dict(
+            decode_packed, shm_region
+        )
+        # Tag the request with the region path so the worker can
+        # ``open_readonly`` lazily without a separate config-broadcast
+        # round trip.  Stored on every shm-routed request — the worker
+        # keys its mmap cache by path so repeated requests reuse the
+        # same handle.
+        if (
+            sp._effective_prefill_steering_shm is not None
+            or sp._effective_decode_steering_shm is not None
+        ):
+            sp._steering_shm_path = shm_region.mmap_path
+        # Pre-cache the resolved arrays so this process (the writer)
+        # doesn't have to bounce through shm to read them back.
+        if prefill_packed is not None:
+            sp.__dict__["effective_prefill_steering"] = prefill_packed
+        if decode_packed is not None:
+            sp.__dict__["effective_decode_steering"] = decode_packed
+        return
+
+    sp._effective_prefill_steering_packed = prefill_packed
+    sp._effective_decode_steering_packed = decode_packed
     sp.__dict__["effective_prefill_steering"] = sp._effective_prefill_steering_packed
     sp.__dict__["effective_decode_steering"] = sp._effective_decode_steering_packed
