@@ -1883,7 +1883,30 @@ class LLM:
             torch_dtype = self.llm_engine.model_config.dtype
         except AttributeError:
             return  # Engine not fully initialised — let the slow path handle it.
-        maybe_pack_inline_steering_for_request(sp, torch_dtype)
+        shm_region = self._get_steering_shm_region()
+        maybe_pack_inline_steering_for_request(sp, torch_dtype, shm_region=shm_region)
+
+    def _get_steering_shm_region(self):
+        """Lazily create + register the steering shm region for this process.
+
+        Returns the cached region (or ``None`` on non-Linux platforms).
+        Created on first use so we only pay the 512 MiB ftruncate when
+        an inline-steering request is actually submitted — engines that
+        never see steering requests don't need the file.
+        """
+        cached = getattr(self, "_steering_shm_region", "unset")
+        if cached != "unset":
+            return cached
+        from vllm.v1.engine.steering_shm import (
+            SteeringShmRegion,
+            set_client_region,
+        )
+
+        region = SteeringShmRegion.maybe_create()
+        if region is not None:
+            set_client_region(region)
+        self._steering_shm_region = region
+        return region
 
     def _add_request(
         self,

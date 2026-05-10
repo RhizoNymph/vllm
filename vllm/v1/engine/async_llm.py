@@ -253,6 +253,27 @@ class AsyncLLM(EngineClient):
             stat_loggers=stat_loggers,
         )
 
+    def _get_steering_shm_region(self):
+        """Lazily create + register the steering shm region for this process.
+
+        Returns the cached region (or ``None`` on non-Linux platforms).
+        Created on first use so engines that never see steering requests
+        don't pay the 512 MiB ftruncate on startup.
+        """
+        cached = getattr(self, "_steering_shm_region", "unset")
+        if cached != "unset":
+            return cached
+        from vllm.v1.engine.steering_shm import (
+            SteeringShmRegion,
+            set_client_region,
+        )
+
+        region = SteeringShmRegion.maybe_create()
+        if region is not None:
+            set_client_region(region)
+        self._steering_shm_region = region
+        return region
+
     def __del__(self):
         self.shutdown()
 
@@ -303,11 +324,13 @@ class AsyncLLM(EngineClient):
         is_pooling = isinstance(params, PoolingParams)
 
         # Pack inline steering vectors in the model dtype before the
-        # request crosses the IPC boundary.  Cuts msgpack-encoded
-        # float-list payloads to dtype-tagged raw bytes (~4.5× smaller
-        # at fp16, ~2.25× at fp32; bf16 falls back to fp32 because
-        # numpy lacks a native bf16 without ml_dtypes).  No-op for
-        # named-only requests and pooling params.
+        # request crosses the IPC boundary.  When a shared-memory
+        # region is available the packed bytes go into shm and only
+        # ``(offset, length, dtype, shape)`` descriptors ride the wire
+        # (~32 B per (hook, layer)).  Otherwise we fall back to the
+        # msgpack-encoded packed-ndarray path (~4.5× smaller than the
+        # raw float-list path at fp16).  No-op for named-only requests
+        # and pooling params.
         if not is_pooling:
             from vllm.config.steering_types import (
                 maybe_pack_inline_steering_for_request,
@@ -318,7 +341,10 @@ class AsyncLLM(EngineClient):
             except AttributeError:
                 torch_dtype = None
             if torch_dtype is not None:
-                maybe_pack_inline_steering_for_request(params, torch_dtype)
+                shm_region = self._get_steering_shm_region()
+                maybe_pack_inline_steering_for_request(
+                    params, torch_dtype, shm_region=shm_region
+                )
 
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill

@@ -107,6 +107,13 @@ class SteeringModelRunnerMixin:
             dict[str, dict[int, "np.ndarray"]] | None,
         ],
     ]
+    # Path-keyed cache of read-only :class:`SteeringShmRegion` handles.
+    # Populated lazily on the first request that arrives carrying a
+    # ``_steering_shm_path``: the worker mmaps the same path the client
+    # wrote and registers it as the process-local "worker region" so
+    # ``SamplingParams.effective_*_steering`` can resolve descriptor
+    # tuples in-place.  Per-process; survives across requests.
+    _steering_shm_regions: dict[str, object]
     # Set of layer indices physically owned by this worker.  Under PP,
     # this is a contiguous subset of ``[0, num_layers)``; under single-
     # worker and under TP (which replicates all layers per rank), it
@@ -171,6 +178,7 @@ class SteeringModelRunnerMixin:
         self._steering_index_dirty = False
         self._steering_module_registry = {}
         self._steering_module_resolved_cache = {}
+        self._steering_shm_regions = {}
 
         steering_config = getattr(self.vllm_config, "steering_config", None)
         if steering_config is None or not steerable:
@@ -603,6 +611,39 @@ class SteeringModelRunnerMixin:
                 len(names),
             )
 
+    def _ensure_steering_shm_region(self, path: str) -> None:
+        """Open *path* read-only and register it as the worker region.
+
+        Cached by path so repeated requests against the same engine
+        reuse the same mmap.  Idempotent: subsequent calls with the
+        same path are no-ops.  We set the worker-side process-local
+        slot so that ``SamplingParams.effective_*_steering`` materializes
+        descriptor tuples without needing the path threaded through
+        every call site.
+        """
+        if path in self._steering_shm_regions:
+            return
+        from vllm.v1.engine.steering_shm import (
+            SteeringShmRegion,
+            set_worker_region,
+        )
+
+        try:
+            region = SteeringShmRegion.open_readonly(path)
+        except (OSError, FileNotFoundError) as exc:
+            logger.warning(
+                "Failed to open steering shm path %s read-only: %s",
+                path,
+                exc,
+            )
+            # Cache the failure as ``None`` so repeated lookups don't
+            # re-stat a missing file.
+            self._steering_shm_regions[path] = None
+            return
+        self._steering_shm_regions[path] = region
+        set_worker_region(region)
+        logger.debug("Worker mmapped steering shm region %s read-only", path)
+
     def _resolve_request_steering(
         self,
         sp: SamplingParams,
@@ -634,6 +675,17 @@ class SteeringModelRunnerMixin:
         """
         if phase not in ("prefill", "decode"):
             raise ValueError(f"phase must be 'prefill' or 'decode', got {phase!r}")
+
+        # Lazily mmap the shm region the client wrote into so the
+        # ``effective_*_steering`` cached_properties below can resolve
+        # descriptor tuples.  Only fires for shm-routed requests; the
+        # legacy packed and unpacked paths skip this entirely.
+        shm_path = sp._steering_shm_path
+        if shm_path is not None and (
+            sp._effective_prefill_steering_shm is not None
+            or sp._effective_decode_steering_shm is not None
+        ):
+            self._ensure_steering_shm_region(shm_path)
 
         ref = sp.steering_module_ref
         if ref is None:
