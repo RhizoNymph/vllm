@@ -1092,6 +1092,52 @@ class SteeringModelRunnerMixin:
             attached_layers.append(layer)
         if attached_layers:
             share_sae_recon_index_across_layers(attached_layers)
+            self._warmup_sae_full_recon_for_module(
+                manifest=manifest,
+                attached_layers=attached_layers,
+                ref_dtype=ref_dtype,
+            )
+
+    def _warmup_sae_full_recon_for_module(
+        self,
+        *,
+        manifest: SAEModuleManifest,
+        attached_layers: list[nn.Module],
+        ref_dtype: torch.dtype,
+    ) -> None:
+        """Pre-warm the full-reconstruction CUDA path for ``manifest``.
+
+        Mirrors :meth:`_warmup_sae_kernel_for_module` for the
+        full-reconstruction path.  No-op on CPU; under CUDA it pays
+        the first-call cuBLAS handle / autotune costs outside any
+        captured forward pass.
+        """
+        if not attached_layers:
+            return
+        device = attached_layers[0].sae_recon_index.device  # type: ignore[union-attr]
+        if device.type != "cuda":
+            return
+        from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
+            warmup_apply_sae_full_recon_kernel,
+        )
+        from vllm.model_executor.layers.sae_steering import (
+            _ACTIVATION_TO_CODE,
+            _activation_to_scalar,
+        )
+
+        compute_dtype = getattr(self.vllm_config.model_config, "dtype", ref_dtype)
+        warmup_apply_sae_full_recon_kernel(
+            hidden_size=manifest.d_model,
+            d_sae=manifest.d_sae,
+            n_clamp=len(manifest.clampable_features),
+            table_dtype=ref_dtype,
+            compute_dtype=compute_dtype,
+            device=device,
+            activation_code=_ACTIVATION_TO_CODE[manifest.activation],
+            activation_param=_activation_to_scalar(
+                manifest.activation, manifest.activation_params
+            ),
+        )
 
     def _detach_sae_full_recon_buffers(self, module_name: str) -> None:
         """Detach per-(layer, hook) full-reconstruction buffers for the module."""

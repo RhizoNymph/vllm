@@ -498,11 +498,13 @@ def apply_sae_full_reconstruction_op(
     without bespoke type adapters, mirroring the delta path.
     """
     if hidden_states.is_cuda:
-        # Stage 4 will swap in the Triton kernel here.  Until then
-        # the CUDA path runs the eager body so the surface is stable
-        # and CUDA-graph capture / torch.compile fences already work
-        # against the registered op.
-        return _apply_sae_full_reconstruction_eager(
+        # Stage-4 CUDA path: compaction-based per-token short-circuit.
+        # See :mod:`sae_full_reconstruction_kernel` for the rationale.
+        from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
+            apply_sae_full_recon_triton,
+        )
+
+        return apply_sae_full_recon_triton(
             hidden_states,
             encoder_weight,
             encoder_bias,

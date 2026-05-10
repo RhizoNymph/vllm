@@ -583,10 +583,35 @@ encoder/decoder row sets are equal.
      The new state is `getattr`-guarded throughout so existing
      test harnesses that don't initialise the full-reconstruction
      surface continue to work unchanged.
-   - **Stage 4 (planned).** Fused Triton kernel and CUDA-graph
-     warmup, mirroring `sae_steering_kernel.py`'s shape but
-     branching on the per-token `recon_mask` so unmasked tokens
-     short-circuit the encoder / decoder GEMMs.
+   - **Stage 4 (shipped — compaction-based per-token short-circuit).**
+     The full-reconstruction CUDA path now lives in
+     `vllm/model_executor/layers/sae_full_reconstruction_kernel.py`
+     as `apply_sae_full_recon_triton`.  It compacts active tokens
+     (where `recon_mask=True`) into a dense subset, runs the
+     encoder / clamp / decoder math on that subset only, and
+     scatters the reconstructed rows back into the output —
+     unmasked positions retain the original residual via an
+     `out.copy_(hidden_states)` initialisation.  The two large
+     GEMMs (encoder `(n_active, d_sae)` and decoder
+     `(n_active, d_model)`) dispatch to PyTorch matmul, which
+     calls into cuBLAS — already near-optimal at the typical
+     Gemma-Scope shape (`d_sae=16384`, `d_model=2304`).  A custom
+     Triton kernel was deliberately not written: at these sizes
+     it doesn't beat cuBLAS, and the per-token short-circuit is
+     what the design doc identifies as the actual win.  The
+     surface (`apply_sae_full_recon_triton`) is the swap point if
+     a future Triton-kernel optimisation lands.  The
+     `apply_sae_full_reconstruction_op` body now dispatches to
+     this CUDA path on `is_cuda` tensors; the eager body remains
+     the CPU fallback and the test ground truth.
+     `warmup_apply_sae_full_recon_kernel` mirrors
+     `warmup_apply_steering_kernel` for cuBLAS handle / autotune
+     warmup; it's wired into `_attach_sae_full_recon_buffers` so
+     module registration pays the warmup cost outside any captured
+     forward.  CPU + CUDA-gated parity tests in
+     `test_sae_full_reconstruction_kernel.py` confirm the
+     compaction path matches the eager body bit-for-bit on shared
+     inputs.
    - **Stage 5 (planned).** Real-weights e2e against Gemma Scope,
      parallel to `test_sae_steering_real_weights.py`; verifies
      residual *replacement* (rather than delta) on a known
