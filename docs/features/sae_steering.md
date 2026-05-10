@@ -489,7 +489,7 @@ encoder/decoder row sets are equal.
      qualitative-shift assertion is robust to it.  Per-feature
      thresholds remain a kernel-level follow-up.
 
-6. **Phase 4 — Full-reconstruction variant (in progress).**
+6. **Phase 4 — Full-reconstruction variant (shipped).**
    - **Stage 1 (shipped).** Eager math primitive in
      `vllm/model_executor/layers/sae_full_reconstruction.py`:
      `apply_sae_full_reconstruction` projects each masked token
@@ -537,27 +537,102 @@ encoder/decoder row sets are equal.
      custom-op-fence behaviour.  Until Stage 4 lands, the registered
      op routes both CPU and CUDA through the eager body so the
      surface is stable for callers (no kernel-vs-op-func skew).
-   - **Stage 3 (planned).** Worker mixin integration — a parallel
-     `SAEFullReconstructionManager` + admission /
-     transition / release paths, the strict-capacity contract
-     mirrored from the delta path, and `_attach_sae_full_recon_buffers`
-     / `attach_sae_full_recon_weights` for register / inject.  A
-     new per-request `SAEFullReconstructionSpec` (allowing empty
-     clamp lists, since pure reconstruction is a meaningful op)
-     lands in this stage with hash plumbing folded into
-     `hash_steering_config`.  Prefix-cache invariants are revisited
-     here — full-reconstruction is a residual *replacement* not a
-     perturbation, so even baseline-clamp-set requests differ
-     from no-SAE baselines and the cache key must reflect that.
-   - **Stage 4 (planned).** Fused Triton kernel and CUDA-graph
-     warmup, mirroring `sae_steering_kernel.py`'s shape but
-     branching on the per-token `recon_mask` so unmasked tokens
-     short-circuit the encoder / decoder GEMMs.
-   - **Stage 5 (planned).** Real-weights e2e against Gemma Scope,
-     parallel to `test_sae_steering_real_weights.py`; verifies
-     residual *replacement* (rather than delta) on a known
-     feature actually drives outputs in the qualitative
-     direction.
+   - **Stage 3 (shipped — type system + manager + populator).**
+     `SteeringModuleKind.SAE_FULL_RECONSTRUCTION` enum value,
+     `SAEFullReconstructionSpec` per-request type (allows empty
+     `clamps`, since pure reconstruction is a meaningful op),
+     `coerce_sae_full_reconstruction_specs` / `hash_sae_full_reconstruction_specs`
+     helpers.  `SamplingParams.sae_full_reconstruction_specs`
+     field with phase-filtered hash plumbing folded into both
+     `prefill_steering_config_hash` and `decode_steering_config_hash`
+     via `hash_steering_config` — using a distinct domain
+     separator from the delta block so a delta and a
+     full-reconstruction request with identical clamp content
+     never collide on prefix-cache keys.  New
+     `SAEFullReconstructionManager` (parallel to `SAEClampManager`):
+     strict capacity, refcount, deterministic-replay across ranks,
+     no global tier, row 0 = no-reconstruction sentinel.  New
+     `populate_sae_full_recon_clamp_table` projector parallel to
+     the delta populator with the same module-match / phase-match
+     / layer-match gating; specs with empty `clamps` correctly
+     allocate a row (so the dispatch shim's `recon_index != 0`
+     gate fires) but leave the clamp tables zeroed.  Registry
+     accepts `kind=SAE_FULL_RECONSTRUCTION` modules with the same
+     manifest validation as `SAE_DELTA`.  Worker mixin integration
+     (admission / transition / release / per-step buffer update,
+     `_attach_sae_full_recon_buffers` / `attach_sae_full_recon_weights`)
+     lands in Stage 3b.
+   - **Stage 3b (shipped — worker mixin lifecycle).**  The worker
+     mixin now branches on `kind="sae_full_reconstruction"` to
+     attach the full-reconstruction buffers + per-row clamp tables
+     + the shared `sae_recon_index` to every owned (layer, hook)
+     site, and detaches symmetrically on unregister or kind-swap.
+     A new `_sae_fr_clamp_manager` runs in parallel to the delta
+     manager with the same admission / release contract; the
+     existing lifecycle hooks
+     (`_register_initial_steering_config`,
+     `_release_finished_steering_configs`,
+     `_assert_sae_clamps_can_be_applied`'s sibling
+     `_assert_sae_full_recon_specs_can_be_applied`) thread the new
+     spec through.  `attach_sae_full_recon_weights` copies encoder
+     / decoder weights and biases into the per-(layer, hook)
+     buffers — the test-injection / future-loader entry point.
+     A new `_update_sae_full_recon_buffers` per-step pass populates
+     the clamp tables and builds `sae_recon_index` via the same
+     `np.repeat` + non-blocking H2D pipeline the delta path uses.
+     The new state is `getattr`-guarded throughout so existing
+     test harnesses that don't initialise the full-reconstruction
+     surface continue to work unchanged.
+   - **Stage 4 (shipped — compaction-based per-token short-circuit).**
+     The full-reconstruction CUDA path now lives in
+     `vllm/model_executor/layers/sae_full_reconstruction_kernel.py`
+     as `apply_sae_full_recon_triton`.  It compacts active tokens
+     (where `recon_mask=True`) into a dense subset, runs the
+     encoder / clamp / decoder math on that subset only, and
+     scatters the reconstructed rows back into the output —
+     unmasked positions retain the original residual via an
+     `out.copy_(hidden_states)` initialisation.  The two large
+     GEMMs (encoder `(n_active, d_sae)` and decoder
+     `(n_active, d_model)`) dispatch to PyTorch matmul, which
+     calls into cuBLAS — already near-optimal at the typical
+     Gemma-Scope shape (`d_sae=16384`, `d_model=2304`).  A custom
+     Triton kernel was deliberately not written: at these sizes
+     it doesn't beat cuBLAS, and the per-token short-circuit is
+     what the design doc identifies as the actual win.  The
+     surface (`apply_sae_full_recon_triton`) is the swap point if
+     a future Triton-kernel optimisation lands.  The
+     `apply_sae_full_reconstruction_op` body now dispatches to
+     this CUDA path on `is_cuda` tensors; the eager body remains
+     the CPU fallback and the test ground truth.
+     `warmup_apply_sae_full_recon_kernel` mirrors
+     `warmup_apply_steering_kernel` for cuBLAS handle / autotune
+     warmup; it's wired into `_attach_sae_full_recon_buffers` so
+     module registration pays the warmup cost outside any captured
+     forward.  CPU + CUDA-gated parity tests in
+     `test_sae_full_reconstruction_kernel.py` confirm the
+     compaction path matches the eager body bit-for-bit on shared
+     inputs.
+   - **Stage 5 (shipped — Gemma Scope real-weights e2e).**
+     `tests/models/language/generation/test_sae_full_reconstruction_real_weights.py`
+     is the parallel of the delta path's
+     `test_sae_steering_real_weights.py`, against the same
+     Gemma 2-2B + `gemma-scope-2b-pt-res/layer_12/width_16k/average_l0_82`
+     SAE.  A new loader helper
+     `load_gemma_scope_sae_full_recon` in
+     `vllm/entrypoints/openai/steering/sae_loader.py` returns the
+     full-`d_sae` × `d_model` encoder / decoder weights plus the
+     `decoder_bias` (the delta loader subsets to the clampable
+     features and drops the decoder bias because the delta math
+     doesn't need it; replacement does).  Three tests guard the
+     replacement variant against silent regressions: pure
+     reconstruction (no clamps) shifts output via reconstruction
+     error vs no-spec baseline, a clamp shifts output beyond the
+     pure-recon baseline, and clamp magnitude is monotone in the
+     output divergence.  All three are gated on real Gemma weights
+     (HF-token + CUDA), so they skip cleanly in CI and on dev
+     boxes without GPUs while still running in environments that
+     have the artefacts.  Phase 4 is feature-complete with this
+     stage.
 
 ## Resolved Design Decisions
 

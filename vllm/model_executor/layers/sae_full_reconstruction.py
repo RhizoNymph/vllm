@@ -498,11 +498,13 @@ def apply_sae_full_reconstruction_op(
     without bespoke type adapters, mirroring the delta path.
     """
     if hidden_states.is_cuda:
-        # Stage 4 will swap in the Triton kernel here.  Until then
-        # the CUDA path runs the eager body so the surface is stable
-        # and CUDA-graph capture / torch.compile fences already work
-        # against the registered op.
-        return _apply_sae_full_reconstruction_eager(
+        # Stage-4 CUDA path: compaction-based per-token short-circuit.
+        # See :mod:`sae_full_reconstruction_kernel` for the rationale.
+        from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
+            apply_sae_full_recon_triton,
+        )
+
+        return apply_sae_full_recon_triton(
             hidden_states,
             encoder_weight,
             encoder_bias,
@@ -771,6 +773,129 @@ def apply_layer_sae_full_reconstruction(
     )
 
 
+def populate_sae_full_recon_clamp_table(
+    *,
+    manager: SAEFullReconstructionManager,  # noqa: F821 — forward ref
+    module: nn.Module,
+    hook_point: SteeringHookPoint,
+    module_name: str,
+    clampable_features: tuple[int, ...],
+    layer_idx: int | None = None,
+    worker_phase: str | None = None,
+) -> None:
+    """Project active manager rows into per-(layer, hook) clamp tables.
+
+    Mirrors :func:`vllm.model_executor.layers.sae_steering.populate_sae_clamp_table`
+    for the full-reconstruction path.  Walks every active row in the
+    :class:`SAEFullReconstructionManager` and writes its clamp content
+    into the corresponding row of ``module``'s clamp tables for this
+    ``hook_point``, gated by:
+
+    * **Module match** — only specs whose ``module_name`` equals this
+      site's owning module are written.
+    * **Phase match** — each row's ``row_phase`` (the worker phase the
+      row was admitted under) gates spec content; ``spec.phase ==
+      "both" or spec.phase == row_phase``.  The optional
+      ``worker_phase`` filter is provided for tests.
+    * **Layer/hook match** — when ``layer_idx`` is given, only entries
+      under ``spec.clamps[hook_point.value][layer_idx]`` are projected.
+
+    Row 0 (the no-reconstruction sentinel) is always re-zeroed so
+    accidental routing to it is a true passthrough.
+
+    Specs with empty ``clamps`` (pure reconstruction) are recorded by
+    *zeroing* the row at this site — the reconstruction still happens
+    via the dispatch shim's ``recon_mask = (recon_index != 0)`` because
+    the row index is non-zero.  The clamp tables only carry feature-
+    activation modifications.
+
+    Args:
+        manager: the :class:`SAEFullReconstructionManager` holding active rows.
+        module: the layer module with full-reconstruction buffers attached.
+        hook_point: which hook this site sits at.
+        module_name: name of the SAE module that owns this site;
+            specs from other modules are skipped.
+        clampable_features: ordered tuple of feature indices that
+            define the ``feature_idx → row position`` mapping for this
+            module.  A spec entry referencing a feature outside this
+            tuple raises :class:`ValueError`.
+        layer_idx: layer index this site sits at; when ``None`` (e.g.
+            for tests that don't care about layer specificity), the
+            populator scans all layers in the spec under ``hook_point``.
+        worker_phase: optional phase filter — when set, only rows with
+            matching ``row_phase`` are touched.
+    """
+    if not sae_full_recon_buffers_attached(module, hook_point):
+        return
+    if worker_phase is not None and worker_phase not in ("prefill", "decode"):
+        raise ValueError(
+            f"worker_phase must be 'prefill' or 'decode' or None; got {worker_phase!r}."
+        )
+    kind_table = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
+    value_table = getattr(module, HOOK_POINT_FR_CLAMP_VALUE_ATTR[hook_point])
+    only_table = getattr(module, HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
+    n_clamp = kind_table.shape[1]
+    if len(clampable_features) != n_clamp:
+        raise ValueError(
+            "clampable_features length must equal n_clamp; got "
+            f"{len(clampable_features)} vs {n_clamp}."
+        )
+    feature_to_pos: dict[int, int] = {f: i for i, f in enumerate(clampable_features)}
+    # Row 0: no-reconstruction sentinel.  Always all-zero; defensively
+    # re-zeroed in case a previous populate left stale state.
+    kind_table[0].zero_()
+    value_table[0].zero_()
+    only_table[0].zero_()
+    hook_name = hook_point.value
+    for row, _config_hash, row_phase, specs in manager.active_rows():
+        if worker_phase is not None and row_phase != worker_phase:
+            continue
+        kind_table[row].zero_()
+        value_table[row].zero_()
+        only_table[row].zero_()
+        for spec in specs:
+            if spec.module_name != module_name:
+                continue
+            if spec.phase != "both" and spec.phase != row_phase:
+                continue
+            layer_map = spec.clamps.get(hook_name)
+            if layer_map is None:
+                # Empty clamps for this hook — row stays zeroed; the
+                # reconstruction still triggers because the row index
+                # is non-zero (recon_mask = recon_index != 0).
+                continue
+            layer_entries: list = []
+            if layer_idx is None:
+                for entries in layer_map.values():
+                    layer_entries.extend(entries)
+            else:
+                layer_entries = list(layer_map.get(layer_idx, ()))
+            for entry in layer_entries:
+                pos = feature_to_pos.get(entry.feature_idx)
+                if pos is None:
+                    raise ValueError(
+                        f"SAEFullReconstructionSpec entry feature_idx="
+                        f"{entry.feature_idx} for module {module_name!r} "
+                        f"is not in clampable_features "
+                        f"{list(clampable_features)} for site "
+                        f"(layer={layer_idx}, hook={hook_name})."
+                    )
+                kind_table[row, pos] = (
+                    CLAMP_KIND_ABSOLUTE
+                    if entry.kind == "absolute"
+                    else CLAMP_KIND_ADDITIVE
+                )
+                value_table[row, pos] = float(entry.value)
+                only_table[row, pos] = bool(entry.only_if_active)
+
+
+# Forward reference resolved at call time to avoid an import cycle:
+# ``sae_full_reconstruction_manager`` lives in the worker hierarchy and
+# imports this module's spec types only transitively.
+from vllm.v1.worker.sae_full_reconstruction_manager import (  # noqa: E402
+    SAEFullReconstructionManager,
+)
+
 # ``ACTIVATION_CODE_RELU`` re-exported so callers (tests, future
 # kernel module) have a single import surface for the activation
 # encoding without touching :mod:`sae_steering` directly.
@@ -790,10 +915,12 @@ __all__ = [
     "HOOK_POINT_FR_ENCODER_BIAS_ATTR",
     "HOOK_POINT_FR_ENCODER_WEIGHT_ATTR",
     "HOOK_POINT_FR_MODULE_NAME_ATTR",
+    "SAEFullReconstructionManager",
     "apply_layer_sae_full_reconstruction",
     "apply_sae_full_reconstruction",
     "apply_sae_full_reconstruction_op",
     "apply_sae_full_reconstruction_op_fake",
+    "populate_sae_full_recon_clamp_table",
     "register_sae_full_recon_buffers",
     "register_sae_recon_index_buffer",
     "sae_encode_full",
