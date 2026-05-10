@@ -562,6 +562,27 @@ encoder/decoder row sets are equal.
      (admission / transition / release / per-step buffer update,
      `_attach_sae_full_recon_buffers` / `attach_sae_full_recon_weights`)
      lands in Stage 3b.
+   - **Stage 3b (shipped — worker mixin lifecycle).**  The worker
+     mixin now branches on `kind="sae_full_reconstruction"` to
+     attach the full-reconstruction buffers + per-row clamp tables
+     + the shared `sae_recon_index` to every owned (layer, hook)
+     site, and detaches symmetrically on unregister or kind-swap.
+     A new `_sae_fr_clamp_manager` runs in parallel to the delta
+     manager with the same admission / release contract; the
+     existing lifecycle hooks
+     (`_register_initial_steering_config`,
+     `_release_finished_steering_configs`,
+     `_assert_sae_clamps_can_be_applied`'s sibling
+     `_assert_sae_full_recon_specs_can_be_applied`) thread the new
+     spec through.  `attach_sae_full_recon_weights` copies encoder
+     / decoder weights and biases into the per-(layer, hook)
+     buffers — the test-injection / future-loader entry point.
+     A new `_update_sae_full_recon_buffers` per-step pass populates
+     the clamp tables and builds `sae_recon_index` via the same
+     `np.repeat` + non-blocking H2D pipeline the delta path uses.
+     The new state is `getattr`-guarded throughout so existing
+     test harnesses that don't initialise the full-reconstruction
+     surface continue to work unchanged.
    - **Stage 4 (planned).** Fused Triton kernel and CUDA-graph
      warmup, mirroring `sae_steering_kernel.py`'s shape but
      branching on the per-token `recon_mask` so unmasked tokens
