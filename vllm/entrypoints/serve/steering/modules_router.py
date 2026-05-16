@@ -44,11 +44,25 @@ async def _broadcast_module_to_workers(
     resolve the name without crossing the multiprocessing boundary
     with the full vector spec.
 
-    *payload* of ``None`` removes the module on workers.
+    *payload* of ``None`` removes the module on workers; the
+    matching pinned refcount taken at register time (see
+    :func:`_pre_materialize_module_on_workers`) is dropped first so the
+    manager's row table can GC the row once the last in-flight request
+    finishes.
+
+    On the register path, this only mirrors the registry update.  The
+    eager row materialization is a separate RPC issued by
+    :func:`_pre_materialize_module_on_workers` so the registry state
+    is consistent across workers before any per-row materialization
+    (which depends on it) runs.
     """
     if engine is None:
         return
     if payload is None:
+        await engine.collective_rpc(
+            "release_pre_materialized_steering_module",
+            kwargs=dict(name=name),
+        )
         await engine.collective_rpc(
             "unregister_steering_modules",
             kwargs=dict(names=[name]),
@@ -58,6 +72,29 @@ async def _broadcast_module_to_workers(
             "register_steering_modules",
             kwargs=dict(modules={name: payload}, replace=False),
         )
+
+
+async def _pre_materialize_module_on_workers(
+    engine: EngineClient | None,
+    name: str,
+) -> None:
+    """Tell every worker to materialize the named module's rows now.
+
+    Issued after the registry-update RPC so the worker has the resolved
+    spec available.  The pre-materialize call adds ``+1`` to the
+    manager's refcount for each ``(hash, phase)`` it materializes,
+    pinning the row until ``unregister_steering_modules`` releases
+    it.  Per-request register_config calls subsequently bump the
+    refcount further, so the request hot path becomes a refcount-hit
+    (~5 µs) instead of paying the cold-path materialize cost
+    (~15 ms on gemma-3-4b-it/3090 in named_shared mode).
+    """
+    if engine is None:
+        return
+    await engine.collective_rpc(
+        "pre_materialize_steering_module",
+        kwargs=dict(name=name),
+    )
 
 
 @router.post("/v1/steering/modules/register")
@@ -87,8 +124,9 @@ async def register_steering_module(
         # carrying ``SamplingParams.steering_module_ref`` resolve it
         # locally instead of forcing the API server to materialize the
         # full vector spec into the multiprocessing payload.
+        engine = _engine_client(raw_request)
         await _broadcast_module_to_workers(
-            _engine_client(raw_request),
+            engine,
             request.name,
             {
                 "vectors": request.vectors,
@@ -96,6 +134,14 @@ async def register_steering_module(
                 "decode_vectors": request.decode_vectors,
             },
         )
+        # Eagerly upload the module's vectors to the manager so the
+        # first request resolving to this name finds the (hash, phase)
+        # row already in the refcount table — turning a ~15 ms
+        # cold-path materialize (synchronous bf16 H2D for every layer)
+        # into a ~5 µs refcount bump on its TTFT.  Strictly ordered
+        # after the registry-update broadcast: pre-materialize reads
+        # the resolved cache populated by ``register_steering_modules``.
+        await _pre_materialize_module_on_workers(engine, request.name)
         return JSONResponse(
             content={
                 "status": "ok",

@@ -416,6 +416,18 @@ async def init_app_state(
                 "register_steering_modules",
                 kwargs=dict(modules=broadcast_payload, replace=True),
             )
+            # Eagerly materialize each named module's rows now so the
+            # first request resolving to one finds a refcount-hit
+            # instead of paying the ~15 ms cold-path materialize cost
+            # in :meth:`SteeringManager.register_config` (the
+            # synchronous bf16 H2D upload of every layer).  Issued
+            # after the registry-update RPC because pre-materialize
+            # reads the resolved cache populated by it.
+            for module_name in broadcast_payload:
+                await engine_client.collective_rpc(
+                    "pre_materialize_steering_module",
+                    kwargs=dict(name=module_name),
+                )
     elif hasattr(state, "steering_module_registry"):
         delattr(state, "steering_module_registry")
 
