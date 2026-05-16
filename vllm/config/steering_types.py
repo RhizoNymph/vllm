@@ -514,25 +514,43 @@ class SteeringAutoPromoteLRU:
 
     Entry states:
 
-    - present with ``name=None``: seen once (no broadcast yet)
-    - present with ``name="_auto_..."``: registered worker-side; subsequent
-      requests should ship a ``steering_module_ref``
+    - present with value ``None``: seen once (no broadcast yet)
+    - present with value ``(name, "pending")``: a name has been allocated
+      and the ``register_steering_modules`` broadcast has been dispatched
+      but not yet confirmed against the worker.  Callers must NOT rewrite
+      the request to use ``module_ref`` in this state — the named module
+      may not be installed on the worker yet, and shipping the ref races
+      the broadcast through different IPC channels (``collective_rpc`` vs
+      the request submit FIFO).  The trigger request and any other
+      request observed while pending fall through to the inline path.
+    - present with value ``(name, "registered")``: the broadcast has been
+      confirmed (or the sync RPC has returned) — subsequent requests with
+      this hash are safe to rewrite to use ``steering_module_ref``.
 
     Eviction returns ``(key, name_or_None)`` so callers can issue a
     paired ``unregister_steering_modules`` against the worker — but only
-    when the evicted entry was actually registered (``name is not None``).
+    when the evicted entry was actually registered with a name
+    (``name is not None``).  Both ``"pending"`` and ``"registered"``
+    entries carry a name; ``"pending"`` evictions still need an
+    unregister so the worker drops any partial state it received.
 
     Capacity caps the worker-side memory footprint of cached resolved
     specs.  Default 512 entries × ~520 KB of bf16 vectors = ~260 MB
     per worker.
     """
 
+    # Per-entry value: ``None`` for first-sight, ``(name, status)`` once a
+    # name has been allocated.  The status discriminates between in-flight
+    # broadcast ("pending") and confirmed ("registered").
+    _Entry = tuple[str, str] | None
+
     def __init__(self, capacity: int = 512) -> None:
         if capacity < 1:
             raise ValueError(f"LRU capacity must be >= 1, got {capacity}")
         self._capacity = capacity
-        # Value: name once registered, None on first sight.
-        self._items: OrderedDict[tuple[int, int], str | None] = OrderedDict()
+        self._items: OrderedDict[
+            tuple[int, int], tuple[str, str] | None
+        ] = OrderedDict()
 
     def observe(
         self, key: tuple[int, int]
@@ -545,11 +563,19 @@ class SteeringAutoPromoteLRU:
           inline-pack and skip the broadcast.  ``name`` is always
           ``None``.  ``evicted`` may carry the LRU's overflow.
         - ``"second"``: seen once previously without registration; this
-          is the trigger to register a named module.  ``name`` is
-          ``None`` (the caller picks the name and records it via
-          :meth:`mark_registered`).  ``evicted`` is ``None``.
-        - ``"registered"``: previously registered.  ``name`` is the
-          stored module name.  ``evicted`` is ``None``.
+          is the trigger to allocate a name and dispatch the register
+          broadcast.  ``name`` is ``None`` (the caller picks the name and
+          records it via :meth:`mark_pending`).  ``evicted`` is ``None``.
+          The triggering request must NOT be rewritten — the broadcast
+          has not landed on the worker yet.
+        - ``"pending"``: a previous observation has dispatched the
+          register broadcast but it has not yet been confirmed.  ``name``
+          is the allocated name; the caller must NOT rewrite the request
+          to use ``module_ref`` (the worker may not have processed the
+          register RPC yet).  ``evicted`` is ``None``.
+        - ``"registered"``: the broadcast has been confirmed.  ``name``
+          is the stored module name; the caller MAY rewrite the request
+          to use ``module_ref``.  ``evicted`` is ``None``.
         """
         existing = self._items.get(key, ...)
         if existing is ...:
@@ -559,38 +585,90 @@ class SteeringAutoPromoteLRU:
         self._items.move_to_end(key)
         if existing is None:
             return "second", None, None
-        return "registered", existing, None
+        name, status = existing
+        return status, name, None
 
-    def mark_registered(self, key: tuple[int, int], name: str) -> None:
-        """Promote the existing entry from "seen" to "registered"."""
+    def mark_pending(self, key: tuple[int, int], name: str) -> None:
+        """Promote the existing entry from "seen" to "pending".
+
+        Called by the auto-promote helper at the moment of dispatching
+        the register broadcast.  The entry carries the allocated name
+        but ``observe`` will return ``status="pending"`` until
+        :meth:`mark_registered` is called from the broadcast's
+        done-callback.
+        """
         if key not in self._items:
             raise KeyError(key)
-        self._items[key] = name
+        self._items[key] = (name, "pending")
+        self._items.move_to_end(key)
+
+    def mark_registered(self, key: tuple[int, int], name: str) -> None:
+        """Promote the existing entry to "registered".
+
+        Two callers:
+
+        - Sync auto-promote (after ``collective_rpc`` returns
+          successfully): goes directly from "seen" to "registered" since
+          there is no broadcast-in-flight window.
+        - Async auto-promote (from the broadcast done-callback): flips
+          a previously "pending" entry to "registered".
+        """
+        if key not in self._items:
+            raise KeyError(key)
+        self._items[key] = (name, "registered")
         self._items.move_to_end(key)
 
     def _put_new(
-        self, key: tuple[int, int], name: str | None
+        self,
+        key: tuple[int, int],
+        value: tuple[str, str] | None,
     ) -> tuple[tuple[int, int], str | None] | None:
         evicted: tuple[tuple[int, int], str | None] | None = None
         if len(self._items) >= self._capacity:
-            evicted_key, evicted_name = self._items.popitem(last=False)
+            evicted_key, evicted_value = self._items.popitem(last=False)
+            evicted_name = evicted_value[0] if evicted_value is not None else None
             evicted = (evicted_key, evicted_name)
-        self._items[key] = name
+        self._items[key] = value
         return evicted
 
     def get(self, key: tuple[int, int]) -> str | None:
-        """Read-only lookup of a registered name (returns ``None`` for
-        unregistered or absent entries).  Used by tests."""
+        """Read-only lookup of a *registered* name.
+
+        Returns the name only when the entry is in ``"registered"``
+        status — first-sight and pending entries return ``None`` so
+        callers using ``get`` as a cache lookup don't accidentally
+        promote a request against an unconfirmed broadcast.  Used by
+        tests; production callers go through :meth:`observe`.
+        """
         existing = self._items.get(key)
         if existing is None:
             return None
         self._items.move_to_end(key)
-        return existing
+        name, status = existing
+        if status != "registered":
+            return None
+        return name
+
+    def get_status(self, key: tuple[int, int]) -> str | None:
+        """Return the entry's status or ``None`` when absent.
+
+        Status values mirror :meth:`observe`'s ``status`` field but
+        without mutating recency: ``"first"`` for a first-sight entry,
+        ``"pending"`` or ``"registered"`` for an entry with an allocated
+        name.  Used by tests to assert the broadcast lifecycle without
+        side effects.
+        """
+        existing = self._items.get(key, ...)
+        if existing is ...:
+            return None
+        if existing is None:
+            return "first"
+        return existing[1]
 
     def forget(self, key: tuple[int, int]) -> None:
         """Drop *key* from the LRU if present.
 
-        Used by the async broadcast path to roll back a registered entry
+        Used by the async broadcast path to roll back a pending entry
         when ``register_steering_modules`` fails — the next request with
         the same hash will then observe ``"first"`` status and fall back
         to the inline-pack path instead of shipping a ``module_ref`` to
@@ -693,11 +771,14 @@ def auto_promote_hashes_from_module_ref(
 def _auto_promote_prep(
     sp: SamplingParams,
     registry_lru: SteeringAutoPromoteLRU,
+    *,
+    mark_status: str = "pending",
 ) -> (
     tuple[
         str | None,
         dict[str, dict[str, dict[int, list[float]]]] | None,
         tuple[tuple[int, int], str | None] | None,
+        tuple[int, int] | None,
     ]
     | None
 ):
@@ -706,20 +787,37 @@ def _auto_promote_prep(
     Returns ``None`` when:
     - *sp* is ineligible (already named, no inline vectors, already packed); or
     - this is a first sight with no eviction that needs cleanup — fall through
-      to inline-pack so unique-per-request workloads don't pay a wasted RPC.
+      to inline-pack so unique-per-request workloads don't pay a wasted RPC; or
+    - this is a "pending" sight: a broadcast is in flight for the same hash
+      but has not yet been confirmed, so we cannot promote *sp* yet.  The
+      request flows through inline-pack until the broadcast lands.
 
-    Otherwise returns ``(name_or_None, payload, evicted)`` where:
+    Otherwise returns ``(name_or_None, payload, evicted, lru_key)`` where:
 
-    - ``name_or_None``: ``None`` when the only action is to issue an
-      ``unregister_steering_modules`` for an evicted registered entry
-      (first-sight observation that displaced a registered LRU tail).  When
-      not ``None``, this is the module name the caller installs on *sp*.
+    - ``name_or_None``: ``None`` at "second" sight (the trigger does NOT
+      rewrite — broadcast races request submission on the async path).
+      ``None`` also when the only action is to issue an
+      ``unregister_steering_modules`` for an evicted registered entry.
+      A string name on a "registered" cache hit — the caller installs
+      this on *sp*.
     - ``payload``: the broadcast payload for ``register_steering_modules`` —
-      ``None`` on a registered cache hit and on first-sight-with-eviction.
+      non-``None`` only at second-sight (the trigger to register).
     - ``evicted``: an LRU eviction tuple ``(key, prior_name)`` where
       ``prior_name`` may be ``None`` for evictions of unregistered
       first-sight entries.  Caller skips the unregister RPC when
       ``prior_name`` is ``None``.
+    - ``lru_key``: the ``(prefill_hash, decode_hash)`` key for the
+      registered entry; ``None`` when no register broadcast is being
+      dispatched.  The async caller uses this in the broadcast
+      done-callback to flip the LRU from "pending" → "registered" on
+      success or to ``forget`` it on failure.
+
+    *mark_status* controls how the LRU is marked at second-sight:
+    ``"pending"`` (default, async path) records the name but holds back
+    SP rewrite until the broadcast confirms; ``"registered"`` (sync
+    path) marks immediately because the sync caller awaits the
+    ``collective_rpc`` before returning, so by request-submit time the
+    worker has the module installed.
 
     Pure / sync — does no IO.  Caller issues the broadcast(s) and
     optionally mutates *sp* via :func:`_auto_promote_apply`.
@@ -750,21 +848,49 @@ def _auto_promote_prep(
     status, name, evicted = registry_lru.observe(key)
 
     if status == "first":
-        # Don't promote *sp*, but if we evicted a *registered* entry from
-        # the LRU tail we still need to tell the worker to drop it.
+        # Don't promote *sp*, but if we evicted a *registered* (or pending)
+        # entry from the LRU tail we still need to tell the worker to drop it.
         if evicted is not None and evicted[1] is not None:
-            return None, None, evicted
+            return None, None, evicted, None
         return None
     if status == "registered":
         assert name is not None
-        return name, None, None
-    # status == "second": this is the moment to register.
+        return name, None, None, None
+    if status == "pending":
+        # A previous observation's broadcast is in flight for this hash.
+        # The trigger request that fired the broadcast already fell
+        # through to inline (see "second" branch below); this current
+        # request must also fall through to inline rather than ship a
+        # ``module_ref`` to a name the worker may not have processed yet.
+        # ``observe`` already refreshed recency.  No RPC to issue here.
+        return None
+    # status == "second": this is the moment to register.  Behavior at
+    # the trigger differs between sync and async callers:
+    #
+    # - Async (mark_status="pending"): the broadcast races the request
+    #   through different IPC channels (collective_rpc vs the request
+    #   submit FIFO).  Rewriting the trigger SP now and shipping the ref
+    #   would land the request on a worker that has not yet seen the
+    #   register RPC, so the trigger does NOT get rewritten.  The
+    #   ``"pending"`` LRU marker holds back subsequent requests too,
+    #   until the broadcast done-callback flips status to "registered".
+    # - Sync (mark_status="registered"): the caller awaits
+    #   collective_rpc before returning, so by the time the trigger
+    #   request hits the wire the worker has the module.  The trigger
+    #   IS safely rewritten.
     name = AUTO_PROMOTE_NAME_PREFIX + f"{h_prefill:016x}_{h_decode:016x}"
     payload = _build_named_payload_from_resolved(sp)
     if not payload:
         return None
-    registry_lru.mark_registered(key, name)
-    return name, payload, evicted
+    if mark_status == "registered":
+        registry_lru.mark_registered(key, name)
+        # Returning the name signals the sync caller to apply the SP
+        # rewrite after the inline broadcast succeeds.
+        return name, payload, evicted, key
+    registry_lru.mark_pending(key, name)
+    # Async caller: do NOT rewrite the trigger SP (name=None).  The
+    # payload is still returned so the broadcast goes out.
+    return None, payload, evicted, key
 
 
 def _auto_promote_apply(sp: SamplingParams, name: str) -> None:
@@ -820,10 +946,10 @@ def maybe_auto_promote_steering_modules(
     times.  Genuinely-unique-per-request workloads pay one extra
     synchronous RPC per request — bench gates this case.
     """
-    prep = _auto_promote_prep(sp, registry_lru)
+    prep = _auto_promote_prep(sp, registry_lru, mark_status="registered")
     if prep is None:
         return
-    name, payload, evicted = prep
+    name, payload, evicted, _lru_key = prep
     if payload is not None:
         assert name is not None
         rpc_fn(
@@ -859,38 +985,44 @@ async def maybe_auto_promote_steering_modules_async(
     promotion is the single biggest avoidable stall in inline-mode
     traces.
 
-    Ordering invariant: the broadcast and the per-request submit both
-    flow over the same ZMQ ``input_socket`` FIFO from
-    ``add_request_async``.  ``asyncio.ensure_future`` enqueues the
-    broadcast coroutine first; CPython's asyncio scheduler then runs it
-    on the next event-loop tick — before the caller's subsequent
-    ``await self.engine_core.add_request_async(...)`` sends the request.
-    Engine-core processes both messages in arrival order, so the
-    triggering request reaches the worker after the registry update.
+    Ordering correctness: the broadcast and the per-request submit
+    flow over *different* IPC channels (``collective_rpc`` to the
+    worker vs the request-submit FIFO to engine-core), so we cannot
+    rely on socket ordering to guarantee the broadcast lands before
+    the request.  Instead the LRU carries a ``"pending"``/``"registered"``
+    status: the triggering request is NOT rewritten to use
+    ``module_ref`` while the broadcast is in flight; subsequent
+    requests with the same hash also fall through to inline until
+    the broadcast's done-callback flips the LRU to ``"registered"``.
+    From that point on, requests are promoted as designed.  This
+    trades a small (one-request) loss of optimization for correctness
+    — the alternative (the previous fire-and-forget behavior) raced
+    the broadcast against the request submit and produced
+    ``Steering module is not registered on this worker`` errors at
+    concurrency ≥ 2 with a fresh spec.
 
     Failure handling: if the broadcast errors, the LRU entry is
     rolled back so the *next* request observing the same hash falls
     back to the inline-pack path (its ``observe`` returns ``"first"``).
-    The triggering request is not retried — it has already been
-    submitted with ``module_ref`` set and will surface the failure if
-    the worker rejects the unregistered name.  This is acceptable per
-    the perf design: graceful degradation for subsequent requests, not
-    transparent retry for the trigger.
+    No in-flight request was ever rewritten to use ``module_ref`` —
+    "pending" gates that — so there is nothing to recover on the
+    request side.
 
     Returns the dispatched broadcast ``asyncio.Task`` (or ``None`` when
     no RPC is needed).  Production callers ignore the return value;
     tests can ``await`` it to observe the broadcast's effect on the
-    spy ``rpc_fn``.
+    spy ``rpc_fn`` and the LRU status flip.
     """
-    prep = _auto_promote_prep(sp, registry_lru)
+    prep = _auto_promote_prep(sp, registry_lru, mark_status="pending")
     if prep is None:
         return None
-    name, payload, evicted = prep
+    name, payload, evicted, lru_key = prep
 
-    # Apply the SP mutation synchronously so the engine sees the
-    # promoted form on the very next ``add_request_async`` send.  The
-    # broadcast then goes out as a background task that races the
-    # request through the same FIFO socket.
+    # The async path never rewrites the trigger SP: ``_auto_promote_prep``
+    # returns ``name=None`` at second-sight under mark_status="pending"
+    # precisely so the trigger falls through to inline.  On a "registered"
+    # cache hit ``name`` is non-None — the broadcast has already landed
+    # on the worker, so it's safe to rewrite.
     if name is not None:
         _auto_promote_apply(sp, name)
 
@@ -899,34 +1031,45 @@ async def maybe_auto_promote_steering_modules_async(
     if not has_register and not has_unregister:
         return None
 
-    # Recover the LRU key for rollback from the name itself when we
-    # registered.  Auto-promoted names embed (prefill_hash, decode_hash)
-    # in their suffix, so the helper round-trips the LRU key without
-    # threading it through ``_auto_promote_prep``'s return tuple.
-    rollback_key: tuple[int, int] | None = None
+    # The LRU key for the entry we just put into "pending" status (when
+    # we dispatched a register).  Used in the done-callback to flip the
+    # entry to "registered" on success or ``forget`` it on failure.
+    pending_key: tuple[int, int] | None = lru_key if has_register else None
+    pending_name: str | None = None
     if has_register:
-        assert name is not None
-        rollback_key = auto_promote_hashes_from_module_ref((name, 1.0))
+        # Recover the allocated name from the LRU key — auto-promoted
+        # names embed ``(prefill_hash, decode_hash)`` in their suffix.
+        assert pending_key is not None
+        pending_name = AUTO_PROMOTE_NAME_PREFIX + (
+            f"{pending_key[0]:016x}_{pending_key[1]:016x}"
+        )
 
     evicted_name = evicted[1] if evicted is not None else None
 
     async def _broadcast() -> None:
         if has_register:
-            assert name is not None and payload is not None
+            assert pending_name is not None and payload is not None
             try:
                 await rpc_fn(
                     "register_steering_modules",
-                    kwargs={"modules": {name: payload}, "replace": False},
+                    kwargs={"modules": {pending_name: payload}, "replace": False},
                 )
             except Exception:
                 # Roll back so subsequent requests fall back to inline-pack
-                # rather than shipping ``module_ref`` to a name the worker
-                # never received.  The ``forget`` is best-effort: if the
-                # entry has already been evicted by a concurrent observer
-                # the no-op pop is fine.
-                if rollback_key is not None:
-                    registry_lru.forget(rollback_key)
+                # rather than wait forever on a "pending" entry that will
+                # never flip to "registered".  The ``forget`` is best-effort:
+                # if the entry has already been evicted by a concurrent
+                # observer the no-op pop is fine.
+                if pending_key is not None:
+                    registry_lru.forget(pending_key)
                 raise
+            # Broadcast confirmed.  Flip LRU "pending" → "registered" so
+            # subsequent requests with this hash get promoted.  Guard
+            # against the entry having been evicted by intervening
+            # observations: if it's gone, there's nothing to mark and
+            # the next request will simply re-observe as "first".
+            if pending_key is not None and pending_key in registry_lru:
+                registry_lru.mark_registered(pending_key, pending_name)
         if has_unregister:
             assert evicted_name is not None
             await rpc_fn(

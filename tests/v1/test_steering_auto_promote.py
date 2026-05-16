@@ -411,6 +411,13 @@ class TestAsyncAutoPromote:
         assert sp.steering_module_ref is None
 
     def test_async_second_sight_promotes_and_dedups(self):
+        # Async path: second-sight is the broadcast trigger, but the
+        # broadcast races request submit through a different IPC
+        # channel — so the trigger request (sp_b) does NOT get
+        # rewritten.  It falls through to inline, the broadcast
+        # completes (via _drive's await), the LRU flips
+        # "pending" → "registered", and the next observation (sp_c)
+        # IS promoted to the registered module.
         async def go():
             rpc = _AsyncRpcSpy()
             lru = SteeringAutoPromoteLRU(capacity=4)
@@ -419,15 +426,21 @@ class TestAsyncAutoPromote:
             sp_c = _fresh_sp()
             await _drive(
                 (sp_a, rpc, lru),  # first
-                (sp_b, rpc, lru),  # second
-                (sp_c, rpc, lru),  # cached
+                (sp_b, rpc, lru),  # second → broadcast dispatched, sp_b NOT rewritten
+                (sp_c, rpc, lru),  # cached hit (broadcast confirmed by now)
             )
             return sp_a, sp_b, sp_c, rpc
 
         sp_a, sp_b, sp_c, rpc = asyncio.run(go())
         assert sp_a.steering_module_ref is None  # first sight: not promoted
-        assert sp_b.steering_module_ref is not None
-        assert sp_b.steering_module_ref == sp_c.steering_module_ref
+        # sp_b (trigger) falls through to inline — gating SP rewrite on
+        # broadcast completion is the fix for the
+        # "Steering module is not registered on this worker" race.
+        assert sp_b.steering_module_ref is None
+        assert sp_b.steering_vectors is not None
+        # sp_c hits the registered cache and is promoted.
+        assert sp_c.steering_module_ref is not None
+        assert sp_c.steering_module_ref[0].startswith("_auto_")
         assert sum(1 for m, _ in rpc.calls if m == "register_steering_modules") == 1
 
     def test_async_registered_eviction_calls_unregister(self):
@@ -464,18 +477,25 @@ class TestAsyncBroadcastIsFireAndForget:
     block the request that triggered the promotion.  Trace evidence on
     gemma-3-4b-it (3090, NUM_PROMPTS=8 CONCURRENCY=4) shows the inline
     ``register_steering_modules`` collective_rpc costs 32–44 ms per
-    call and maps ~1:1 to a GPU idle gap on the engine thread.  The
-    fix returns the broadcast task to the caller for fire-and-forget
-    dispatch, applies the SP mutation + LRU update synchronously, and
-    rolls back the LRU on broadcast failure so subsequent requests
-    fall back to inline-pack (graceful degradation)."""
+    call and maps ~1:1 to a GPU idle gap on the engine thread.
+
+    Correctness invariant: the broadcast and the per-request submit
+    flow over *different* IPC channels (``collective_rpc`` vs the
+    request-submit FIFO), so socket ordering does NOT guarantee the
+    broadcast lands first.  The fix gates the SP rewrite on a
+    ``"pending"``/``"registered"`` status carried in the LRU entry:
+    the trigger request (and any other request observed while the
+    broadcast is in flight) fall through to inline; only once the
+    broadcast's done-callback flips the LRU to ``"registered"`` do
+    subsequent requests with the same hash get rewritten.
+    """
 
     def test_helper_returns_task_without_awaiting_rpc(self):
         # Use a spy whose ``__call__`` never resolves until the test
         # explicitly releases it.  If the helper awaits the broadcast
         # inline, the helper itself would hang; if it dispatches as a
-        # task, the helper returns immediately and the LRU + SP
-        # mutations are observable while the task is still pending.
+        # task, the helper returns immediately while the task is still
+        # pending.
         async def go():
             release = asyncio.Event()
             calls: list[tuple[str, dict]] = []
@@ -507,28 +527,51 @@ class TestAsyncBroadcastIsFireAndForget:
                 ),
                 timeout=1.0,
             )
-            # SP was promoted synchronously...
-            assert sp_target.steering_module_ref is not None
-            promoted_name = sp_target.steering_module_ref[0]
-            assert promoted_name.startswith("_auto_")
-            # ...and the broadcast task is still pending (awaiting release).
+            # Trigger SP is NOT rewritten — the broadcast is still in
+            # flight and shipping a ref to an unregistered name would
+            # race the request through the submit FIFO.
+            assert sp_target.steering_module_ref is None
+            assert sp_target.steering_vectors is not None
+            # ...and the broadcast task is dispatched and still pending
+            # (awaiting release).
             assert task is not None
             # Yield once so the task starts and reaches the slow_rpc await.
             await asyncio.sleep(0)
             assert len(calls) == 1
             assert calls[0][0] == "register_steering_modules"
-            assert promoted_name in calls[0][1]["modules"]
+            broadcast_modules = calls[0][1]["modules"]
+            assert len(broadcast_modules) == 1
+            promoted_name = next(iter(broadcast_modules))
+            assert promoted_name.startswith("_auto_")
             assert not task.done()
+            # LRU entry should be in "pending" status while broadcast
+            # is in flight.  This is the regression guard: gated SP
+            # rewrite depends on a visible "pending" state.
+            key = (
+                sp_target.prefill_steering_config_hash,
+                sp_target.decode_steering_config_hash,
+            )
+            assert lru.get_status(key) == "pending"
             release.set()
             await task
+            # After broadcast resolves, LRU flips to "registered".
+            assert lru.get_status(key) == "registered"
 
         asyncio.run(go())
 
-    def test_lru_state_visible_before_broadcast_resolves(self):
-        # The LRU must be updated synchronously: a "next request"
-        # observing the same hash before the broadcast resolves must
-        # see ``"registered"`` and ship a ``module_ref`` instead of
-        # going through inline-pack.
+    def test_pending_status_gates_subsequent_request_rewrite(self):
+        # The regression that motivated this design: a request observed
+        # AFTER the broadcast was dispatched but BEFORE it resolved
+        # must NOT be rewritten to use ``module_ref``.  The worker has
+        # not yet processed the register RPC, so shipping the ref would
+        # produce
+        #
+        #     RuntimeError: Steering module '_auto_<hash>_<hash>' is not
+        #     registered on this worker.
+        #
+        # at engine-core.  Only after the broadcast's done-callback
+        # flips the LRU to "registered" do subsequent requests get
+        # promoted.
         async def go():
             release = asyncio.Event()
             calls: list[tuple[str, dict]] = []
@@ -541,6 +584,7 @@ class TestAsyncBroadcastIsFireAndForget:
             sp_first = _fresh_sp()
             sp_second = _fresh_sp()
             sp_third = _fresh_sp()
+            sp_fourth = _fresh_sp()
 
             # First sighting: no broadcast.
             t = await maybe_auto_promote_steering_modules_async(
@@ -549,38 +593,60 @@ class TestAsyncBroadcastIsFireAndForget:
             assert t is None
             assert sp_first.steering_module_ref is None
 
-            # Second sighting: broadcast dispatched, SP promoted, LRU
-            # registered — all synchronously.
+            # Second sighting: broadcast dispatched, but the trigger
+            # SP is NOT rewritten (pending).
             register_task = await maybe_auto_promote_steering_modules_async(
                 sp_second, slow_rpc, lru
             )
             assert register_task is not None
             assert not register_task.done()  # broadcast still pending
-            assert sp_second.steering_module_ref is not None
-            promoted_name = sp_second.steering_module_ref[0]
+            assert sp_second.steering_module_ref is None  # trigger NOT rewritten
+            assert sp_second.steering_vectors is not None
 
-            # Third request — observed BEFORE the broadcast resolves —
-            # must be promoted to the same module ref.  This is the
-            # invariant: LRU is updated sync, so subsequent requests
-            # see the registration immediately.
+            # Yield once so the broadcast coroutine actually starts and
+            # records its call on the spy (it then blocks on release).
+            await asyncio.sleep(0)
+            assert calls[0][0] == "register_steering_modules"
+            promoted_name = next(iter(calls[0][1]["modules"]))
+
+            # Third request observed BEFORE the broadcast resolves —
+            # the LRU is in "pending" status, so it must NOT be
+            # rewritten.  This is the bug fix: the previous design
+            # promoted this request and shipped it to a worker that
+            # had not yet seen the register RPC, producing the
+            # "Steering module is not registered" error from the bench
+            # bug report.
             third_task = await maybe_auto_promote_steering_modules_async(
                 sp_third, slow_rpc, lru
             )
-            # Cache hit: no broadcast spawned.
-            assert third_task is None
-            assert sp_third.steering_module_ref == (promoted_name, 1.0)
+            assert third_task is None  # no new broadcast — entry exists
+            assert sp_third.steering_module_ref is None  # gated rewrite
+            assert sp_third.steering_vectors is not None
 
+            # Release the broadcast — done-callback flips LRU to
+            # "registered".
             release.set()
             await register_task
+
+            # Fourth request observed AFTER the broadcast resolved —
+            # the LRU is now "registered", so it IS promoted.
+            fourth_task = await maybe_auto_promote_steering_modules_async(
+                sp_fourth, slow_rpc, lru
+            )
+            assert fourth_task is None  # cache hit, no new broadcast
+            assert sp_fourth.steering_module_ref == (promoted_name, 1.0)
+            assert sp_fourth.steering_vectors is None
 
         asyncio.run(go())
 
     def test_failed_broadcast_rolls_back_lru_for_inline_fallback(self):
-        # If the broadcast errors, the next request observing the same
-        # hash MUST fall back to inline-pack rather than ship a
-        # ``module_ref`` to a name the worker never received.  The
-        # helper signals this by removing the LRU entry before the
-        # task surfaces the exception.
+        # If the broadcast errors, the LRU entry is removed so the
+        # *next* request observing the same hash falls back to
+        # inline-pack rather than waiting forever on a "pending"
+        # entry that will never flip to "registered".  No in-flight
+        # request was ever rewritten (the "pending" gate held back
+        # both the trigger and any concurrent observer), so there is
+        # nothing to recover on the request side.
         async def go():
             calls: list[str] = []
 
@@ -597,15 +663,14 @@ class TestAsyncBroadcastIsFireAndForget:
             # Warm to "second sight".
             await _drive((sp_seed, failing_rpc, lru))
 
-            # Trigger the failing broadcast.  The helper still applies
-            # the SP mutation synchronously (the trigger request is
-            # already in flight); the rollback only protects future
-            # observations.
+            # Trigger the failing broadcast.  The trigger SP is NOT
+            # rewritten (pending), so the request flows through inline.
             task = await maybe_auto_promote_steering_modules_async(
                 sp_trigger, failing_rpc, lru
             )
             assert task is not None
-            assert sp_trigger.steering_module_ref is not None
+            assert sp_trigger.steering_module_ref is None  # gated rewrite
+            assert sp_trigger.steering_vectors is not None
 
             # Drive the broadcast to completion; it should raise
             # internally and remove the LRU entry.  We swallow the
