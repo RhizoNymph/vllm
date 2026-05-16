@@ -687,6 +687,14 @@ class SteeringModelRunnerMixin:
         if cached is None:
             return []
         prefill_resolved, decode_resolved = cached
+        # DIAGNOSTIC: measure wall-clock cost of pre-materialize.  Helps
+        # localize any TTFT regression on the FIRST inline-mode request
+        # that runs after a /v1/steering/modules/register call (the
+        # pinned rows persist in the manager and slightly enlarge every
+        # subsequent populate_steering_tables run).  Logged at INFO so
+        # bench logs surface it without VLLM_LOGGING_LEVEL=DEBUG.
+        import time as _t
+        _premat_t0 = _t.perf_counter()
         # The hash format MUST match the one a request carrying
         # ``steering_module_ref=(name, 1.0)`` will compute (see
         # :meth:`SamplingParams.prefill_steering_config_hash` and
@@ -723,10 +731,14 @@ class SteeringModelRunnerMixin:
             pinned.append((named_only_hash, phase))
         self._steering_module_pinned_rows[name] = pinned
         if pinned:
-            logger.debug(
-                "Pre-materialized steering module '%s' (%d phase(s))",
+            _premat_elapsed_ms = (_t.perf_counter() - _premat_t0) * 1000.0
+            logger.info(
+                "[steering-premat-debug] pre_materialize name=%s phases=%d "
+                "active_configs_after=%d elapsed_ms=%.3f",
                 name,
                 len(pinned),
+                mgr.num_active_configs,
+                _premat_elapsed_ms,
             )
         return pinned
 
@@ -748,8 +760,22 @@ class SteeringModelRunnerMixin:
         pinned = self._steering_module_pinned_rows.pop(name, None)
         if pinned is None or mgr is None:
             return
+        # DIAGNOSTIC: measure wall-clock cost of release_pre_materialized.
+        # Companion to the pre_materialize timer; quantifies the
+        # refcount-drop cost (always cheap; logged for symmetry only).
+        import time as _t
+        _rel_t0 = _t.perf_counter()
         for config_hash, phase in pinned:
             mgr.release_config(config_hash, phase)
+        _rel_elapsed_ms = (_t.perf_counter() - _rel_t0) * 1000.0
+        logger.info(
+            "[steering-premat-debug] release_pre_materialized name=%s "
+            "phases=%d active_configs_after=%d elapsed_ms=%.3f",
+            name,
+            len(pinned),
+            mgr.num_active_configs,
+            _rel_elapsed_ms,
+        )
 
     def _resolve_request_steering(
         self,

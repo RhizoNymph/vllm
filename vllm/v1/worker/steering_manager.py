@@ -160,6 +160,16 @@ class SteeringManager:
         key = (config_hash, phase)
         if key in self.config_to_row:
             self.config_refcounts[key] += 1
+            # DIAGNOSTIC: refcount-hit logged at DEBUG to keep the
+            # bench log readable; flip to INFO temporarily if the
+            # hot-path count itself becomes suspect.
+            logger.debug(
+                "[steering-premat-debug] register_config HIT "
+                "hash=%d phase=%s refcount=%d",
+                config_hash,
+                phase,
+                self.config_refcounts[key],
+            )
             return self.config_to_row[key]
 
         if not self.free_rows:
@@ -168,6 +178,14 @@ class SteeringManager:
                 f"{self.max_steering_configs}, active configs="
                 f"{len(self.config_to_row)}"
             )
+
+        # DIAGNOSTIC: COLD-path register_config — this is the ~15 ms
+        # H2D-bound case the PR set out to move off the hot path.  Time
+        # the full stack/copy work below to verify pre-materialize
+        # actually pays it at register-time and the inline first
+        # request only pays the refcount-hit branch.
+        import time as _premat_time
+        _premat_t0 = _premat_time.perf_counter()
 
         row = self.free_rows.pop()
         self.config_to_row[key] = row
@@ -211,6 +229,16 @@ class SteeringManager:
         # config_to_row changed; the cached indices/ordered_configs scratch
         # is now stale and must be rebuilt on the next populate.
         self._indices_dirty = True
+        _premat_elapsed_ms = (_premat_time.perf_counter() - _premat_t0) * 1000.0
+        logger.info(
+            "[steering-premat-debug] register_config COLD hash=%d "
+            "phase=%s row=%d active_configs_after=%d elapsed_ms=%.3f",
+            config_hash,
+            phase,
+            row,
+            len(self.config_to_row),
+            _premat_elapsed_ms,
+        )
         return row
 
     def release_config(self, config_hash: int, phase: str) -> None:
@@ -377,6 +405,17 @@ class SteeringManager:
     def populate_steering_tables(
         self, steerable_layers: dict[int, "torch.nn.Module"]
     ) -> None:
+        # DIAGNOSTIC (premat regression hunt): time every populate so we
+        # can attribute any first-batch TTFT cost to either the
+        # active-config count (pinned-row hypothesis) or to per-config
+        # work.  Returns early below if no active tables; the early
+        # return path still logs so absent populates surface as a clear
+        # zero in the log.  ``num_active_configs`` excludes the 3 global
+        # rows (row 0/1/2) and counts only per-request rows.
+        import time as _premat_time
+        _premat_t0 = _premat_time.perf_counter()
+        _premat_num_active = len(self.config_to_row)
+        _premat_indices_dirty_before = self._indices_dirty
         """Write current state into each layer's per-hook steering_table
         buffers.
 
@@ -579,6 +618,22 @@ class SteeringManager:
         # All per-layer table buffers now reflect current state. Subsequent
         # calls can be skipped by the caller until a mutator sets dirty again.
         self._tables_dirty = False
+        # DIAGNOSTIC: emit per-populate timing.  ``num_active`` reflects
+        # the state EXCLUDING global rows 0/1/2 and matches whatever the
+        # mixin sees via ``num_active_configs``.  The pinned-row
+        # hypothesis predicts ``num_active`` is >= 1 (the
+        # ``bench_named_shared`` pin) on the first inline-mode populate
+        # under PR vs 0 under base.
+        _premat_elapsed_ms = (_premat_time.perf_counter() - _premat_t0) * 1000.0
+        logger.info(
+            "[steering-premat-debug] populate_steering_tables "
+            "num_active=%d num_active_tables=%d indices_rebuilt=%s "
+            "elapsed_ms=%.3f",
+            _premat_num_active,
+            len(active_tables),
+            _premat_indices_dirty_before,
+            _premat_elapsed_ms,
+        )
 
     @property
     def num_active_configs(self) -> int:
