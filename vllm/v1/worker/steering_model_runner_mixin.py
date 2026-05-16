@@ -199,6 +199,19 @@ class SteeringModelRunnerMixin:
             device=table_device,
         )
 
+        # Eagerly build the per-(hook, dtype) fused backings and rebind
+        # each layer's ``steering_table_<hp>`` buffer to its backing
+        # slice BEFORE the cudagraph capture / ``torch.compile`` step
+        # that follows in ``GPUModelRunner.load_model``. Doing this
+        # lazily (inside the first ``populate_steering_tables`` call)
+        # would call ``Tensor.set_`` on buffers whose original
+        # ``data_ptr()`` is already baked into the captured CUDA graph
+        # nodes, leaving the apply-steering kernel reading from
+        # orphaned storage on every replay — the visible symptom is
+        # empty token output for every request that exercises the
+        # rebound path.
+        self._steering_manager.ensure_fused_backings(steerable)
+
         # Pre-allocate CPU scratch buffers for the vectorized
         # steering_index build in ``_update_steering_buffers``.  The
         # per-request numpy buffers hold one entry per request in the

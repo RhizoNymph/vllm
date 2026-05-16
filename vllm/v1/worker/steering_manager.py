@@ -401,6 +401,77 @@ class SteeringManager:
             return cpu_t.to(self.device, non_blocking=True)
         return cpu_t.to(self.device)
 
+    def ensure_fused_backings(
+        self, steerable_layers: dict[int, "torch.nn.Module"]
+    ) -> None:
+        """Eagerly build fused backings and rebind per-layer buffers.
+
+        Must be called BEFORE CUDA graph capture / ``torch.compile``.
+        After capture, ``Tensor.set_`` cannot safely swap a buffer's
+        storage: the captured graph nodes hold the pre-capture
+        ``data_ptr()``; replaying the graph reads from the now-orphaned
+        original storage and the fused-backing writes never reach the
+        apply-steering kernel — the symptom is empty token output
+        because every gather hits stale (uninitialised) memory.
+
+        This walks ``steerable_layers`` once per ``(hook_point, dtype)``
+        group, allocates one ``[L, R, H]`` backing tensor, and rebinds
+        every per-layer ``steering_table_<hp>`` buffer to its slice via
+        :py:meth:`torch.Tensor.set_`. The capture that runs afterwards
+        records the rebound ``data_ptr()`` directly into the graph
+        nodes, so subsequent ``backing.index_copy_(1, indices, casted)``
+        writes are visible to every replay.
+
+        Idempotent: a second call with the same layer set is a no-op
+        (the cache hit path in :py:meth:`_ensure_fused_backing` verifies
+        the existing aliasing and returns the cached backing).
+
+        No-op when ``steerable_layers`` is empty (steering disabled or
+        no buffers registered). Heterogeneous-shape / heterogeneous-
+        device groups are skipped (left for the unfused fallback in
+        :py:meth:`populate_steering_tables`), matching the
+        ``_ensure_fused_backing`` contract.
+        """
+        if not steerable_layers:
+            return
+
+        # Build the same ``active_tables`` list shape that
+        # ``populate_steering_tables`` uses, then group by (hp, dtype)
+        # and delegate to ``_ensure_fused_backing`` so the lazy and
+        # eager paths share one implementation.
+        active_tables: list[
+            tuple[torch.Tensor, str, int, "torch.nn.Module"]
+        ] = []
+        for hook_point, table_attr in HOOK_POINT_TABLE_ATTR.items():
+            hp_str = hook_point.value
+            for layer_idx, mod in steerable_layers.items():
+                if not hasattr(mod, table_attr):
+                    continue
+                table = getattr(mod, table_attr)
+                active_tables.append((table, hp_str, layer_idx, mod))
+
+        if not active_tables:
+            return
+
+        group_to_positions: dict[FusedBackingKey, list[int]] = defaultdict(list)
+        for i, (table, hp_str, _layer_idx, _mod) in enumerate(active_tables):
+            group_to_positions[(hp_str, table.dtype)].append(i)
+
+        for (hp_str, dtype), active_positions in group_to_positions.items():
+            first = active_tables[active_positions[0]][0]
+            table_rows = first.shape[0]
+            hidden_size = first.shape[1]
+            device = first.device
+            self._ensure_fused_backing(
+                hp_str=hp_str,
+                dtype=dtype,
+                active_positions=active_positions,
+                active_tables=active_tables,
+                table_rows=table_rows,
+                hidden_size=hidden_size,
+                device=device,
+            )
+
     def _ensure_fused_backing(
         self,
         *,
