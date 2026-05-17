@@ -33,6 +33,14 @@ class _StubMixin(SteeringModelRunnerMixin):
     def __init__(self):
         self._steering_module_registry = {}
         self._steering_module_resolved_cache = {}
+        # Pre-materialization is exercised in dedicated tests; here we
+        # only need the dict to exist so the registry-update path's
+        # idempotent pin-release branch (in
+        # ``register_steering_modules``) doesn't trip on a missing
+        # attribute.  ``_steering_manager`` defaults to ``None`` at
+        # the class level so :meth:`release_pre_materialized_steering_module`
+        # short-circuits without touching the manager.
+        self._steering_module_pinned_rows = {}
 
 
 def _spec(hook: str, layer_to_vec: dict[int, list[float]]):

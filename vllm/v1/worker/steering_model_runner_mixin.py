@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from vllm.config.steering_types import (
     SteeringVectorSpec,
+    hash_steering_config,
     merge_steering_specs,
     resolve_effective_vectors,
     scale_steering_spec,
@@ -107,6 +108,17 @@ class SteeringModelRunnerMixin:
             dict[str, dict[int, "np.ndarray"]] | None,
         ],
     ]
+    # Tracks (config_hash, phase) pairs the worker pinned at named-module
+    # register time via :meth:`pre_materialize_steering_module`.  Each entry
+    # is a hold of ``+1`` on the manager's refcount table for the matching
+    # row, on top of any per-request refcounts the hot path adds.  The
+    # pin keeps the row materialized between registration and the first
+    # request that resolves to the module, eliminating the cold-path
+    # ``register_config.materialize`` cost (~15 ms on gemma-3-4b-it/3090
+    # in named_shared mode) from the request's TTFT.  Released on
+    # :meth:`release_pre_materialized_steering_module` (called by
+    # ``unregister_steering_modules`` from the API layer).
+    _steering_module_pinned_rows: dict[str, list[tuple[int, str]]]
     # Set of layer indices physically owned by this worker.  Under PP,
     # this is a contiguous subset of ``[0, num_layers)``; under single-
     # worker and under TP (which replicates all layers per rank), it
@@ -171,6 +183,7 @@ class SteeringModelRunnerMixin:
         self._steering_index_dirty = False
         self._steering_module_registry = {}
         self._steering_module_resolved_cache = {}
+        self._steering_module_pinned_rows = {}
 
         steering_config = getattr(self.vllm_config, "steering_config", None)
         if steering_config is None or not steerable:
@@ -568,6 +581,13 @@ class SteeringModelRunnerMixin:
         rather than silently falling back to inline-only behaviour.
         """
         if replace:
+            # Releasing pre-materialized pins before clearing the
+            # registry preserves the refcount invariant: every pin taken
+            # by a previous register has a matching release.  Without
+            # this, a startup ``replace=True`` push that drops a name
+            # would leak the row until process exit.
+            for prior_name in list(self._steering_module_pinned_rows.keys()):
+                self.release_pre_materialized_steering_module(prior_name)
             self._steering_module_registry.clear()
             self._steering_module_resolved_cache.clear()
         for name, payload in modules.items():
@@ -575,6 +595,13 @@ class SteeringModelRunnerMixin:
                 raise SteeringVectorError(
                     f"Steering module '{name}' broadcast payload is not a dict"
                 )
+            # Re-registering an existing name replaces its vectors, which
+            # changes the (hash, phase) the named module resolves to.  Drop
+            # the stale pin first so the next pre-materialize call can
+            # install a fresh pin against the new hashes; without this
+            # the old row leaks until ``unregister_steering_modules``.
+            if name in self._steering_module_pinned_rows:
+                self.release_pre_materialized_steering_module(name)
             specs = self._module_payload_to_specs(payload)
             self._steering_module_registry[name] = specs
             # Pre-resolve once at registration so the per-request hot path
@@ -593,8 +620,17 @@ class SteeringModelRunnerMixin:
             )
 
     def unregister_steering_modules(self, names: list[str]) -> None:
-        """Drop the listed names from the worker-side registry."""
+        """Drop the listed names from the worker-side registry.
+
+        The pinned refcount the worker held via
+        :meth:`pre_materialize_steering_module` is released first so the
+        manager's row table can GC the row once the last in-flight
+        request that referenced it finishes.  Doing the release before
+        dropping the registry entry preserves the invariant that every
+        ``(hash, phase)`` pair the worker pinned has a matching release.
+        """
         for name in names:
+            self.release_pre_materialized_steering_module(name)
             self._steering_module_registry.pop(name, None)
             self._steering_module_resolved_cache.pop(name, None)
         if names:
@@ -602,6 +638,118 @@ class SteeringModelRunnerMixin:
                 "Worker unregistered %d steering module(s)",
                 len(names),
             )
+
+    def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
+        """Eagerly materialize a named module's rows on the manager.
+
+        Called by the API layer immediately after
+        ``register_steering_modules`` succeeds, so the ``(hash, phase)``
+        rows that requests carrying ``steering_module_ref=(name, 1.0)``
+        will resolve to are already populated by the time the first
+        such request arrives.  This eliminates the cold-path
+        ``register_config.materialize`` cost from the request's TTFT —
+        on gemma-3-4b-it/3090 in named_shared mode the first
+        request previously paid ~15 ms (almost all of it the
+        synchronous bf16 H2D upload of 34 layers × hidden_size in
+        :meth:`SteeringManager._stack_vectors_to_device`).
+
+        Refcount semantics:
+
+        * Each pre-materialize call adds ``+1`` to the manager's
+          refcount for every ``(hash, phase)`` it materializes — the
+          "pinned" reference.
+        * Each request that resolves to the same ``(hash, phase)`` adds
+          another ``+1`` via the existing per-request register path.
+        * Request completion drops by ``+1`` (existing release path).
+        * :meth:`release_pre_materialized_steering_module` (called by
+          ``unregister_steering_modules``) drops the pinned ``+1``,
+          allowing GC once the last in-flight request finishes.
+
+        Idempotent: a second call on the same name is a no-op (the
+        first pin remains, no extra refcount is added) so concurrent
+        register + first-request paths never double-pin.
+
+        Returns the list of ``(hash, phase)`` pairs pinned by this
+        call (empty if the manager is uninitialised, the module has no
+        resolved vectors, or the pin was already in place).  The return
+        value is consumed by the test surface — production callers
+        only care that the row is materialized.
+        """
+        mgr = self._steering_manager
+        if mgr is None:
+            return []
+        if self._steering_module_pinned_rows.get(name):
+            # Already pinned — preserve idempotency. The pin guarantees
+            # the row is still there even if every request that
+            # transiently bumped the refcount has finished.
+            return []
+        cached = self._steering_module_resolved_cache.get(name)
+        if cached is None:
+            return []
+        prefill_resolved, decode_resolved = cached
+        # The hash format MUST match the one a request carrying
+        # ``steering_module_ref=(name, 1.0)`` will compute (see
+        # :meth:`SamplingParams.prefill_steering_config_hash` and
+        # :func:`hash_steering_config`).  For a named-only request
+        # (no inline vectors), the request's
+        # ``effective_*_steering`` cached property returns ``None``
+        # — only ``module_ref`` enters the digest.  Pre-materialization
+        # mirrors that exactly: ``hash_steering_config(None,
+        # module_ref=(name, 1.0))``.  Requests carrying inline overrides
+        # produce a different (content-derived) hash and fall through to
+        # the existing lazy register path.  ``scale=1.0`` is the natural
+        # default and the only scale auto-promote ever issues.
+        module_ref = (name, 1.0)
+        pinned: list[tuple[int, str]] = []
+        locally_owned = self._locally_owned_layers
+        # Compute the named-only hash once; both phases share the same
+        # request hash because ``effective_prefill_steering`` and
+        # ``effective_decode_steering`` are both ``None`` for a named-
+        # only request.  The (hash, phase) tuple still distinguishes
+        # them because ``register_config`` keys on (hash, phase).
+        named_only_hash = hash_steering_config(None, module_ref=module_ref)
+        for phase, resolved in (
+            ("prefill", prefill_resolved),
+            ("decode", decode_resolved),
+        ):
+            if not resolved:
+                continue
+            mgr.register_config(
+                named_only_hash,
+                resolved,
+                phase=phase,
+                locally_owned_layers=locally_owned,
+            )
+            pinned.append((named_only_hash, phase))
+        self._steering_module_pinned_rows[name] = pinned
+        if pinned:
+            logger.debug(
+                "Pre-materialized steering module '%s' (%d phase(s))",
+                name,
+                len(pinned),
+            )
+        return pinned
+
+    def release_pre_materialized_steering_module(self, name: str) -> None:
+        """Release the pinned refcount taken by pre-materialization.
+
+        Drops one ``release_config`` per ``(hash, phase)`` pair that
+        :meth:`pre_materialize_steering_module` registered.  If
+        in-flight requests still reference the row their per-request
+        refcounts keep it alive; the row is GC'd by the existing
+        release path when the last request finishes.
+
+        Safe to call when no pin exists — used by
+        :meth:`unregister_steering_modules` so the unregister path
+        is a single uniform step regardless of whether
+        pre-materialization ran.
+        """
+        mgr = self._steering_manager
+        pinned = self._steering_module_pinned_rows.pop(name, None)
+        if pinned is None or mgr is None:
+            return
+        for config_hash, phase in pinned:
+            mgr.release_config(config_hash, phase)
 
     def _resolve_request_steering(
         self,

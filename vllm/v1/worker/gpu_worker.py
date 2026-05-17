@@ -967,6 +967,12 @@ class Worker(WorkerBase):
     def unregister_steering_modules(self, names: list[str]) -> None:
         return self.model_runner.unregister_steering_modules(names)
 
+    def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
+        return self.model_runner.pre_materialize_steering_module(name)
+
+    def release_pre_materialized_steering_module(self, name: str) -> None:
+        return self.model_runner.release_pre_materialized_steering_module(name)
+
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return

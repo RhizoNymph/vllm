@@ -195,6 +195,12 @@ class WorkerBase:
     def unregister_steering_modules(self, names: list[str]) -> None:
         raise NotImplementedError
 
+    def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
+        raise NotImplementedError
+
+    def release_pre_materialized_steering_module(self, name: str) -> None:
+        raise NotImplementedError
+
     @property
     def vocab_size(self) -> int:
         """Get vocabulary size from model configuration."""
