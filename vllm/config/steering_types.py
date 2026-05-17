@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
 
@@ -39,6 +39,67 @@ SteeringLayerEntry = list[float] | dict[str, Any]
 
 # Full spec: {hook_point_name: {layer_idx: SteeringLayerEntry}}
 SteeringVectorSpec = dict[str, dict[int, SteeringLayerEntry]]
+
+
+# Binary wire format: one packed blob per hook.  ``data`` is a base64-encoded
+# contiguous byte string of length ``prod(shape) * dtype.itemsize``.  The
+# matching ``layer_indices`` lists the layer each row of the stacked array
+# corresponds to.  Allows clients to skip JSON parse + ``np.asarray(list)``
+# conversion of the ~350 KB per-layer-floats payload that dominates inline
+# request preprocessing — typically ~10-15 ms saved per request on
+# gemma-3-4b.
+class SteeringHookPacked(TypedDict):
+    dtype: str  # "float32" | "float16" | "bfloat16"
+    shape: list[int]  # [num_layers_in_blob, hidden_size]
+    layer_indices: list[int]  # which layer each row corresponds to
+    data: str  # base64-encoded contiguous bytes
+
+
+# Packed full spec: {hook_point_name: SteeringHookPacked}
+SteeringVectorSpecPacked = dict[str, SteeringHookPacked]
+
+
+def unpack_steering_vectors(
+    packed: SteeringVectorSpecPacked | None,
+) -> dict[str, dict[int, np.ndarray]] | None:
+    """Decode a binary-wire packed steering spec to the legacy ndarray dict.
+
+    Each hook's bytes blob is base64-decoded then wrapped via
+    ``np.frombuffer`` (zero-copy view) and reshaped to ``(num_layers,
+    hidden_size)``.  Rows are split into a ``{layer_idx: ndarray}`` map
+    keyed by ``layer_indices``.
+
+    Returns ``None`` if *packed* is ``None`` or empty.
+    """
+    if not packed:
+        return None
+    import base64
+
+    result: dict[str, dict[int, np.ndarray]] = {}
+    for hook, blob in packed.items():
+        dtype = np.dtype(blob["dtype"])
+        shape = tuple(blob["shape"])
+        layer_indices = blob["layer_indices"]
+        if len(shape) != 2:
+            raise ValueError(
+                f"SteeringHookPacked.shape must be 2-D [num_layers, hidden_size]; "
+                f"got {shape}"
+            )
+        if shape[0] != len(layer_indices):
+            raise ValueError(
+                f"SteeringHookPacked.layer_indices length ({len(layer_indices)}) "
+                f"must equal shape[0] ({shape[0]})"
+            )
+        raw = base64.b64decode(blob["data"])
+        expected = int(np.prod(shape)) * dtype.itemsize
+        if len(raw) != expected:
+            raise ValueError(
+                f"SteeringHookPacked.data length {len(raw)} != expected "
+                f"{expected} (shape={shape}, dtype={dtype})"
+            )
+        stacked = np.frombuffer(raw, dtype=dtype).reshape(shape)
+        result[hook] = {int(idx): stacked[i] for i, idx in enumerate(layer_indices)}
+    return result
 
 
 def normalize_layer_entry(
