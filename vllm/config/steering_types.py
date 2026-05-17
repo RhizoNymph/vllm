@@ -23,6 +23,8 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypedDict
 
+from typing_extensions import NotRequired
+
 import numpy as np
 
 if TYPE_CHECKING:
@@ -53,6 +55,15 @@ class SteeringHookPacked(TypedDict):
     shape: list[int]  # [num_layers_in_blob, hidden_size]
     layer_indices: list[int]  # which layer each row corresponds to
     data: str  # base64-encoded contiguous bytes
+    # Optional per-row scales matching ``layer_indices``.  When set,
+    # each row is multiplied by its scale at decode.  Mirrors the
+    # ``{"vector": [...], "scale": float}`` form of the legacy
+    # ``SteeringLayerEntry`` so binary-wire clients can express the
+    # same per-layer scale knob without baking the multiplier into
+    # the bytes (useful when the same vector is reused at different
+    # scales across requests or when scales are runtime knobs the
+    # client doesn't want to re-encode each time).
+    scales: NotRequired[list[float]]
 
 
 # Packed full spec: {hook_point_name: SteeringHookPacked}
@@ -68,6 +79,11 @@ def unpack_steering_vectors(
     ``np.frombuffer`` (zero-copy view) and reshaped to ``(num_layers,
     hidden_size)``.  Rows are split into a ``{layer_idx: ndarray}`` map
     keyed by ``layer_indices``.
+
+    When the optional ``scales`` field is present, each row is multiplied
+    by its matching scale before being placed in the result.  Rows with
+    scale ``1.0`` keep the zero-copy view; other rows pay one
+    ``ndarray * scalar`` (microseconds, dtype-preserving).
 
     Returns ``None`` if *packed* is ``None`` or empty.
     """
@@ -98,7 +114,28 @@ def unpack_steering_vectors(
                 f"{expected} (shape={shape}, dtype={dtype})"
             )
         stacked = np.frombuffer(raw, dtype=dtype).reshape(shape)
-        result[hook] = {int(idx): stacked[i] for i, idx in enumerate(layer_indices)}
+        scales = blob.get("scales")
+        if scales is None:
+            result[hook] = {
+                int(idx): stacked[i] for i, idx in enumerate(layer_indices)
+            }
+            continue
+        if len(scales) != len(layer_indices):
+            raise ValueError(
+                f"SteeringHookPacked.scales length ({len(scales)}) must equal "
+                f"layer_indices length ({len(layer_indices)})"
+            )
+        rows: dict[int, np.ndarray] = {}
+        for i, idx in enumerate(layer_indices):
+            s = float(scales[i])
+            if s == 1.0:
+                rows[int(idx)] = stacked[i]
+            else:
+                # ``stacked[i] * dtype.type(s)`` keeps the result in
+                # the source dtype (Python float scalar would promote
+                # to float64).
+                rows[int(idx)] = stacked[i] * dtype.type(s)
+        result[hook] = rows
     return result
 
 
