@@ -815,6 +815,23 @@ class SamplingParams(
         elif isinstance(entry, list):
             self._validate_float_list(prefix, entry)
         else:
+            # ndarray entries arrive from the binary-wire decode path
+            # (``unpack_steering_vectors``).  The downstream resolver
+            # already accepts ndarrays — ``np.asarray`` is a no-op on
+            # them — so we just sanity-check shape/dtype here rather
+            # than rejecting outright.
+            import numpy as _np
+            if isinstance(entry, _np.ndarray):
+                if entry.ndim != 1:
+                    raise ValueError(
+                        f"{prefix} ndarray must be 1-D, got shape {entry.shape}."
+                    )
+                if entry.dtype.kind != "f":
+                    raise ValueError(
+                        f"{prefix} ndarray must be a floating dtype, "
+                        f"got {entry.dtype}."
+                    )
+                return
             raise ValueError(
                 f"{prefix} must be a list of floats or a dict with "
                 f"'vector' and 'scale' keys, got "
