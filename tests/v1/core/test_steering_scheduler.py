@@ -1,14 +1,303 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for steering config single-phase admission control logic.
+"""Tests for steering config admission control logic.
 
-The scheduler tracks the union of active steering config (hash, phase)
-pairs -- matching the worker's SteeringManager which allocates separate
-table rows per (hash, phase) key.  Running requests contribute their
-currently-active pair.  New WAITING requests only need capacity for their
-starting phase (prefill), because the prefill row is released before the
-decode row is registered in _handle_steering_transition.
+The scheduler tracks active steering config ``(hash, phase)`` pairs.
+Within a row pool, new WAITING requests only need capacity for their
+starting phase because the prefill row is released before the decode row
+is registered in _handle_steering_transition.  Additive steering and SAE
+clamps use independent worker row pools, so tests cover both the legacy
+single-pool arithmetic and the SAE split-pool admission case.
 """
+
+from types import SimpleNamespace
+
+from vllm import SamplingParams
+from vllm.config.sae_steering_types import (
+    SAEClampEntry,
+    SAEClampSpec,
+    hash_sae_clamp_specs_for_phase,
+)
+from vllm.config.steering_types import hash_steering_config
+from vllm.v1.core.sched.scheduler import Scheduler
+
+
+def _sae_spec(phase: str = "both", value: float = 1.0) -> SAEClampSpec:
+    return SAEClampSpec(
+        module_name="g",
+        phase=phase,  # type: ignore[arg-type]
+        clamps={
+            "post_mlp": {
+                0: (SAEClampEntry(feature_idx=0, kind="absolute", value=value),)
+            }
+        },
+    )
+
+
+class TestSeparateAdditiveAndSaeCapacity:
+    """SAE clamps and additive vectors use independent worker row pools."""
+
+    @staticmethod
+    def _scheduler(max_configs: int = 1) -> Scheduler:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.steering_config = SimpleNamespace(max_steering_configs=max_configs)
+        return scheduler
+
+    @staticmethod
+    def _request(
+        *,
+        sampling_params: SamplingParams,
+        prefill_hash: int,
+        decode_hash: int = 0,
+    ):
+        return SimpleNamespace(
+            sampling_params=sampling_params,
+            prefill_steering_config_hash=prefill_hash,
+            decode_steering_config_hash=decode_hash,
+        )
+
+    def test_additive_capacity_does_not_block_sae_only_request(self):
+        scheduler = self._scheduler(max_configs=1)
+        request = self._request(
+            sampling_params=SamplingParams(sae_clamp_specs=(_sae_spec(),)),
+            prefill_hash=222,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        sae_hash = hash_sae_clamp_specs_for_phase((_sae_spec(),), "prefill")
+
+        assert additive_pairs == set()
+        assert sae_pairs == {(sae_hash, "prefill")}
+        assert not scheduler._steering_pool_would_overflow(
+            additive_pairs, {(111, "prefill")}
+        )
+        assert not scheduler._steering_pool_would_overflow(sae_pairs, set())
+
+    def test_sae_capacity_does_not_block_additive_only_request(self):
+        scheduler = self._scheduler(max_configs=1)
+        request = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_mlp": {0: [1.0]}}
+            ),
+            prefill_hash=222,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+
+        additive_hash = hash_steering_config({"post_mlp": {0: [1.0]}})
+        assert additive_pairs == {(additive_hash, "prefill")}
+        assert sae_pairs == set()
+        assert not scheduler._steering_pool_would_overflow(additive_pairs, set())
+        assert not scheduler._steering_pool_would_overflow(
+            sae_pairs, {(111, "prefill")}
+        )
+
+    def test_additive_only_request_skips_sae_hashing(self, monkeypatch):
+        import vllm.sampling_params as sampling_params_mod
+
+        scheduler = self._scheduler(max_configs=1)
+        request = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_mlp": {0: [1.0]}}
+            ),
+            prefill_hash=222,
+        )
+
+        def fail_hash(*_args, **_kwargs):
+            raise AssertionError("additive-only requests must not hash SAE specs")
+
+        monkeypatch.setattr(
+            sampling_params_mod,
+            "hash_sae_clamp_specs_for_phase",
+            fail_hash,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+
+        additive_hash = hash_steering_config({"post_mlp": {0: [1.0]}})
+        assert additive_pairs == {(additive_hash, "prefill")}
+        assert sae_pairs == set()
+
+    def test_request_using_both_paths_needs_capacity_in_both_pools(self):
+        scheduler = self._scheduler(max_configs=1)
+        request = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_mlp": {0: [1.0]}},
+                sae_clamp_specs=(_sae_spec(),),
+            ),
+            prefill_hash=222,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        sae_hash = hash_sae_clamp_specs_for_phase((_sae_spec(),), "prefill")
+
+        additive_hash = hash_steering_config({"post_mlp": {0: [1.0]}})
+        assert additive_pairs == {(additive_hash, "prefill")}
+        assert sae_pairs == {(sae_hash, "prefill")}
+        assert not scheduler._steering_pool_would_overflow(additive_pairs, set())
+        assert scheduler._steering_pool_would_overflow(
+            sae_pairs, {(111, "prefill")}
+        )
+
+    def test_sae_phase_filtering_affects_scheduler_pool(self):
+        scheduler = self._scheduler(max_configs=1)
+        spec = _sae_spec("decode")
+        request = self._request(
+            sampling_params=SamplingParams(sae_clamp_specs=(spec,)),
+            prefill_hash=0,
+            decode_hash=333,
+        )
+
+        prefill_additive, prefill_sae = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        decode_additive, decode_sae = scheduler._request_steering_config_pairs(
+            request, "decode"
+        )
+
+        assert prefill_additive == set()
+        assert prefill_sae == set()
+        assert decode_additive == set()
+        assert decode_sae == {
+            (hash_sae_clamp_specs_for_phase((spec,), "decode"), "decode")
+        }
+
+    def test_sae_phase_hash_is_cached_for_scheduler(self, monkeypatch):
+        import vllm.sampling_params as sampling_params_mod
+
+        scheduler = self._scheduler(max_configs=1)
+        sp = SamplingParams(sae_clamp_specs=(_sae_spec(),))
+        request = self._request(sampling_params=sp, prefill_hash=222)
+        calls = {"n": 0}
+        original_hash = sampling_params_mod.hash_sae_clamp_specs_for_phase
+
+        def counting_hash(*args, **kwargs):
+            calls["n"] += 1
+            return original_hash(*args, **kwargs)
+
+        monkeypatch.setattr(
+            sampling_params_mod,
+            "hash_sae_clamp_specs_for_phase",
+            counting_hash,
+        )
+
+        first = scheduler._request_steering_config_pairs(request, "prefill")
+        second = scheduler._request_steering_config_pairs(request, "prefill")
+
+        assert first == second
+        assert calls["n"] == 1
+
+    def test_named_decode_only_hash_override_skips_prefill_additive_capacity(self):
+        scheduler = self._scheduler(max_configs=1)
+        decode_hash = 333
+        sp = SamplingParams(steering_module_ref=("decode_only", 1.0))
+        sp.__dict__["prefill_steering_config_hash"] = 0
+        sp.__dict__["prefill_additive_steering_config_hash"] = 0
+        sp.__dict__["decode_steering_config_hash"] = decode_hash
+        sp.__dict__["decode_additive_steering_config_hash"] = decode_hash
+        request = self._request(
+            sampling_params=sp,
+            prefill_hash=0,
+            decode_hash=decode_hash,
+        )
+
+        prefill_additive, prefill_sae = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        decode_additive, decode_sae = scheduler._request_steering_config_pairs(
+            request, "decode"
+        )
+
+        assert prefill_additive == set()
+        assert prefill_sae == set()
+        assert decode_additive == {(decode_hash, "decode")}
+        assert decode_sae == set()
+
+    def test_sae_capacity_deduplicates_across_different_additive_hashes(self):
+        scheduler = self._scheduler(max_configs=1)
+        spec = _sae_spec()
+        request_a = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_mlp": {0: [1.0]}},
+                sae_clamp_specs=(spec,),
+            ),
+            prefill_hash=111,
+        )
+        request_b = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_mlp": {0: [2.0]}},
+                sae_clamp_specs=(spec,),
+            ),
+            prefill_hash=222,
+        )
+
+        _additive_a, sae_a = scheduler._request_steering_config_pairs(
+            request_a, "prefill"
+        )
+        additive_b, sae_b = scheduler._request_steering_config_pairs(
+            request_b, "prefill"
+        )
+
+        assert sae_a == sae_b
+        additive_hash_b = hash_steering_config({"post_mlp": {0: [2.0]}})
+        assert additive_b == {(additive_hash_b, "prefill")}
+        assert not scheduler._steering_pool_would_overflow(sae_b, sae_a)
+
+    def test_additive_capacity_deduplicates_across_different_sae_hashes(self):
+        scheduler = self._scheduler(max_configs=1)
+        request_a = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_mlp": {0: [1.0]}},
+                sae_clamp_specs=(_sae_spec(value=1.0),),
+            ),
+            prefill_hash=111,
+        )
+        request_b = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_mlp": {0: [1.0]}},
+                sae_clamp_specs=(_sae_spec(value=2.0),),
+            ),
+            prefill_hash=222,
+        )
+
+        additive_a, _sae_a = scheduler._request_steering_config_pairs(
+            request_a, "prefill"
+        )
+        additive_b, _sae_b = scheduler._request_steering_config_pairs(
+            request_b, "prefill"
+        )
+
+        assert additive_a == additive_b
+        assert not scheduler._steering_pool_would_overflow(additive_b, additive_a)
+
+    def test_sae_capacity_deduplicates_both_and_prefill_for_prefill_rows(self):
+        scheduler = self._scheduler(max_configs=1)
+        request_both = self._request(
+            sampling_params=SamplingParams(sae_clamp_specs=(_sae_spec("both"),)),
+            prefill_hash=111,
+        )
+        request_prefill = self._request(
+            sampling_params=SamplingParams(sae_clamp_specs=(_sae_spec("prefill"),)),
+            prefill_hash=222,
+        )
+
+        _additive_both, sae_both = scheduler._request_steering_config_pairs(
+            request_both, "prefill"
+        )
+        _additive_prefill, sae_prefill = scheduler._request_steering_config_pairs(
+            request_prefill, "prefill"
+        )
+
+        assert sae_both == sae_prefill
+        assert not scheduler._steering_pool_would_overflow(sae_prefill, sae_both)
 
 
 class TestSinglePhaseAdmission:
@@ -288,32 +577,36 @@ class TestTransitionAwareCapacity:
     """
 
     @staticmethod
-    def _build_running_set_transition_aware(
+    def _build_running_sets_transition_aware(
         running_reqs: list[dict],
-    ) -> set[tuple[int, str]]:
+    ) -> tuple[set[tuple[int, str]], set[tuple[int, str]]]:
         """Reproduce the scheduler's transition-aware running-request
         hash collection.
 
         Each req dict: {prefill_hash, decode_hash, num_computed_tokens,
                         num_prompt_tokens, num_scheduled_tokens}.
         """
-        configs: set[tuple[int, str]] = set()
+        current_configs: set[tuple[int, str]] = set()
+        post_transition_configs: set[tuple[int, str]] = set()
         for req in running_reqs:
             currently_prefilling = req["num_computed_tokens"] < req["num_prompt_tokens"]
             if currently_prefilling:
-                if req["prefill_hash"] != 0:
-                    configs.add((req["prefill_hash"], "prefill"))
                 will_complete = (
                     req["num_computed_tokens"] + req["num_scheduled_tokens"]
                     >= req["num_prompt_tokens"]
                 )
                 needs_decode_reservation = will_complete or req["prefill_hash"] == 0
+                if req["prefill_hash"] != 0:
+                    current_configs.add((req["prefill_hash"], "prefill"))
                 if needs_decode_reservation and req["decode_hash"] != 0:
-                    configs.add((req["decode_hash"], "decode"))
+                    post_transition_configs.add((req["decode_hash"], "decode"))
+                elif not needs_decode_reservation and req["prefill_hash"] != 0:
+                    post_transition_configs.add((req["prefill_hash"], "prefill"))
             else:
                 if req["decode_hash"] != 0:
-                    configs.add((req["decode_hash"], "decode"))
-        return configs
+                    current_configs.add((req["decode_hash"], "decode"))
+                    post_transition_configs.add((req["decode_hash"], "decode"))
+        return current_configs, post_transition_configs
 
     @staticmethod
     def _should_skip_decode_start(
@@ -338,12 +631,39 @@ class TestTransitionAwareCapacity:
             and len(scheduled_configs) >= max_configs
         )
 
+    @staticmethod
+    def _should_skip_prefill_completion_decode_reservation(
+        scheduled_configs: set[tuple[int, str]],
+        decode_hash: int,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        num_prompt_tokens: int,
+        max_configs: int,
+    ) -> bool:
+        """Reproduce the WAITING prefill-completion decode reservation.
+
+        A newly admitted request that completes prefill in this step will
+        register decode steering in the worker before the next scheduler
+        pass, so decode capacity must be checked before admission.
+        """
+        if num_computed_tokens >= num_prompt_tokens:
+            return False
+        if num_computed_tokens + num_new_tokens < num_prompt_tokens:
+            return False
+        if decode_hash == 0:
+            return False
+        decode_pair = (decode_hash, "decode")
+        return (
+            decode_pair not in scheduled_configs
+            and len(scheduled_configs) >= max_configs
+        )
+
     # --- Fix A: Transition prediction for running requests ---
 
     def test_transition_prediction_reserves_decode_row(self):
         """A running request that will complete prefill this step
-        contributes BOTH its prefill and decode pairs."""
-        configs = self._build_running_set_transition_aware(
+        contributes prefill now and decode after transition."""
+        current, post_transition = self._build_running_sets_transition_aware(
             [
                 {
                     "prefill_hash": 111,
@@ -354,14 +674,13 @@ class TestTransitionAwareCapacity:
                 },
             ]
         )
-        assert (111, "prefill") in configs
-        assert (222, "decode") in configs
-        assert len(configs) == 2
+        assert current == {(111, "prefill")}
+        assert post_transition == {(222, "decode")}
 
     def test_transition_prediction_no_false_positive(self):
         """A running request that will NOT complete prefill this step
         contributes only its prefill pair."""
-        configs = self._build_running_set_transition_aware(
+        current, post_transition = self._build_running_sets_transition_aware(
             [
                 {
                     "prefill_hash": 111,
@@ -372,12 +691,13 @@ class TestTransitionAwareCapacity:
                 },
             ]
         )
-        assert configs == {(111, "prefill")}
+        assert current == {(111, "prefill")}
+        assert post_transition == {(111, "prefill")}
 
     def test_transition_prediction_exact_boundary(self):
         """Transition fires at the exact boundary
         (num_computed + num_scheduled == num_prompt)."""
-        configs = self._build_running_set_transition_aware(
+        current, post_transition = self._build_running_sets_transition_aware(
             [
                 {
                     "prefill_hash": 111,
@@ -388,12 +708,12 @@ class TestTransitionAwareCapacity:
                 },
             ]
         )
-        assert (111, "prefill") in configs
-        assert (222, "decode") in configs
+        assert current == {(111, "prefill")}
+        assert post_transition == {(222, "decode")}
 
     def test_transition_prediction_zero_decode_hash(self):
         """Transition prediction does not add a zero decode hash."""
-        configs = self._build_running_set_transition_aware(
+        current, post_transition = self._build_running_sets_transition_aware(
             [
                 {
                     "prefill_hash": 111,
@@ -404,12 +724,13 @@ class TestTransitionAwareCapacity:
                 },
             ]
         )
-        assert configs == {(111, "prefill")}
+        assert current == {(111, "prefill")}
+        assert post_transition == set()
 
     def test_transition_prediction_decode_req_unchanged(self):
         """A running request already in decode is unchanged by the
         transition-aware logic."""
-        configs = self._build_running_set_transition_aware(
+        current, post_transition = self._build_running_sets_transition_aware(
             [
                 {
                     "prefill_hash": 111,
@@ -420,7 +741,8 @@ class TestTransitionAwareCapacity:
                 },
             ]
         )
-        assert configs == {(222, "decode")}
+        assert current == {(222, "decode")}
+        assert post_transition == {(222, "decode")}
 
     # --- Fix B: Decode-start capacity check for WAITING requests ---
 
@@ -486,41 +808,106 @@ class TestTransitionAwareCapacity:
             max_configs=2,
         )
 
+    # --- Fix C: Waiting prefill-completion decode reservation ---
+
+    def test_waiting_prefill_completion_checks_decode_capacity(self):
+        scheduled = {(111, "decode")}
+        assert self._should_skip_prefill_completion_decode_reservation(
+            scheduled,
+            decode_hash=222,
+            num_computed_tokens=9,
+            num_new_tokens=1,
+            num_prompt_tokens=10,
+            max_configs=1,
+        )
+
+    def test_waiting_partial_prefill_does_not_check_decode_capacity(self):
+        scheduled = {(111, "decode")}
+        assert not self._should_skip_prefill_completion_decode_reservation(
+            scheduled,
+            decode_hash=222,
+            num_computed_tokens=5,
+            num_new_tokens=1,
+            num_prompt_tokens=10,
+            max_configs=1,
+        )
+
+    def test_waiting_prefill_completion_uses_final_scheduled_tokens(self):
+        scheduled = {(111, "decode")}
+        # Initial token budget might have allowed finishing the prompt, but
+        # encoder scheduling or Mamba alignment can later reduce the final
+        # scheduled token count.  The decode reservation must use the final
+        # count so this partial chunk is admitted.
+        assert not self._should_skip_prefill_completion_decode_reservation(
+            scheduled,
+            decode_hash=222,
+            num_computed_tokens=8,
+            num_new_tokens=1,
+            num_prompt_tokens=10,
+            max_configs=1,
+        )
+
+    def test_waiting_prefill_completion_existing_decode_hash_fits(self):
+        scheduled = {(222, "decode")}
+        assert not self._should_skip_prefill_completion_decode_reservation(
+            scheduled,
+            decode_hash=222,
+            num_computed_tokens=9,
+            num_new_tokens=1,
+            num_prompt_tokens=10,
+            max_configs=1,
+        )
+
+    def test_waiting_prefill_completion_zero_decode_releases_prefill(self):
+        current = {(111, "prefill")}
+        post_transition: set[tuple[int, str]] = set()
+        new_request_current = {(222, "prefill")}
+        new_request_post: set[tuple[int, str]] = set()
+
+        current_unique = new_request_current - current
+        post_unique = new_request_post - post_transition
+
+        assert len(current) + len(current_unique) == 2
+        assert len(post_transition) + len(post_unique) == 0
+
     # --- Combined scenario ---
 
-    def test_transition_blocks_new_admission(self):
-        """A transitioning running request that reserves a decode row
-        should cause a new waiting request to be skipped if capacity
-        is full."""
+    def test_transition_replacement_does_not_overcount_capacity(self):
+        """A finishing prefill row and its decode replacement are not
+        simultaneously resident after the model-runner transition."""
         max_configs = 2
-        # Running request completing prefill -> reserves both rows.
-        configs = self._build_running_set_transition_aware(
-            [
-                {
-                    "prefill_hash": 111,
-                    "decode_hash": 222,
-                    "num_computed_tokens": 95,
-                    "num_prompt_tokens": 100,
-                    "num_scheduled_tokens": 10,
-                },
-            ]
+        current_configs, post_transition_configs = (
+            self._build_running_sets_transition_aware(
+                [
+                    {
+                        "prefill_hash": 111,
+                        "decode_hash": 222,
+                        "num_computed_tokens": 95,
+                        "num_prompt_tokens": 100,
+                        "num_scheduled_tokens": 10,
+                    },
+                ]
+            )
         )
-        assert len(configs) == 2  # (111, "prefill") + (222, "decode")
+        new_prefill = {(333, "prefill")}
 
-        # New waiting request with a new prefill hash -> would need a
-        # 3rd slot but max is 2.
-        new_hashes: set[tuple[int, str]] = {(333, "prefill")}
-        new_unique = new_hashes - configs
-        assert len(configs) + len(new_unique) > max_configs
+        current_unique = new_prefill - current_configs
+        post_unique = new_prefill - post_transition_configs
+
+        assert len(current_configs) + len(current_unique) <= max_configs
+        assert (
+            len(post_transition_configs) + len(post_unique)
+            <= max_configs
+        )
 
 
 class TestDecodeOnlyCapacityCheck:
     """Test that decode-only steering (prefill_hash=0, decode_hash!=0)
-    IS capacity-checked at the WAITING admission gate.
+    is capacity-checked at the WAITING admission gate.
 
-    Decode-only requests need a decode row from the start and never
-    occupy a prefill row.  The admission gate checks the decode hash
-    via the `elif` branch when prefill_hash == 0.
+    Decode-only requests do not occupy a prefill row.  They reserve
+    post-transition decode capacity unless prefix-cache resolution
+    later proves they start directly in decode.
     """
 
     @staticmethod
@@ -604,190 +991,168 @@ class TestDecodeOnlyCapacityCheck:
 
 class TestWaitingTransitionPrediction:
     """Test that WAITING requests that will complete prefill this step
-    have their decode row reserved in scheduled_steering_configs.
+    have their decode row reserved in post-transition capacity.
 
     Bug: The post-admission hash tracking for WAITING requests only added
     the starting phase (prefill).  But if a WAITING request has
     num_computed + num_new >= num_prompt, it will complete prefill this
     step and _handle_steering_transition will register its decode config.
-    The scheduler didn't reserve that decode row, so subsequent WAITING
-    requests saw undercounted capacity.
+    The scheduler didn't reserve that future decode row, so subsequent
+    WAITING requests saw undercounted post-transition capacity.
 
-    Fix: After adding the prefill config, check whether the request will
-    complete prefill this step and, if so, also add the decode config.
+    Fix: Track current-step and post-transition capacity separately.
     """
 
     @staticmethod
     def _admit_transition_aware(
-        scheduled_configs: set[tuple[int, str]],
         prefill_hash: int,
         decode_hash: int,
         num_computed_tokens: int,
         num_prompt_tokens: int,
         num_new_tokens: int,
-    ) -> None:
+    ) -> tuple[set[tuple[int, str]], set[tuple[int, str]]]:
         """Reproduce the fixed scheduler post-admission hash update."""
+        current_configs: set[tuple[int, str]] = set()
+        post_transition_configs: set[tuple[int, str]] = set()
         if num_computed_tokens < num_prompt_tokens:
-            if prefill_hash != 0:
-                scheduled_configs.add((prefill_hash, "prefill"))
             will_complete = num_computed_tokens + num_new_tokens >= num_prompt_tokens
             needs_decode_reservation = will_complete or prefill_hash == 0
+            if prefill_hash != 0:
+                current_configs.add((prefill_hash, "prefill"))
             if needs_decode_reservation and decode_hash != 0:
-                scheduled_configs.add((decode_hash, "decode"))
+                post_transition_configs.add((decode_hash, "decode"))
+            elif not needs_decode_reservation and prefill_hash != 0:
+                post_transition_configs.add((prefill_hash, "prefill"))
         else:
             if decode_hash != 0:
-                scheduled_configs.add((decode_hash, "decode"))
+                current_configs.add((decode_hash, "decode"))
+                post_transition_configs.add((decode_hash, "decode"))
+                post_transition_configs.add((decode_hash, "decode"))
+        return current_configs, post_transition_configs
 
     def test_transition_reserves_decode_row(self):
-        """A WAITING request completing prefill this step reserves
-        both prefill and decode rows."""
-        configs: set[tuple[int, str]] = set()
-        self._admit_transition_aware(
-            configs,
+        """A WAITING request completing prefill uses prefill now and
+        decode after transition."""
+        current, post_transition = self._admit_transition_aware(
             prefill_hash=111,
             decode_hash=222,
             num_computed_tokens=90,
             num_prompt_tokens=100,
             num_new_tokens=20,  # 90+20=110 >= 100
         )
-        assert (111, "prefill") in configs
-        assert (222, "decode") in configs
-        assert len(configs) == 2
+        assert current == {(111, "prefill")}
+        assert post_transition == {(222, "decode")}
 
     def test_no_transition_only_prefill(self):
         """A WAITING request NOT completing prefill this step only
         reserves the prefill row."""
-        configs: set[tuple[int, str]] = set()
-        self._admit_transition_aware(
-            configs,
+        current, post_transition = self._admit_transition_aware(
             prefill_hash=111,
             decode_hash=222,
             num_computed_tokens=50,
             num_prompt_tokens=100,
             num_new_tokens=10,  # 50+10=60 < 100
         )
-        assert configs == {(111, "prefill")}
+        assert current == {(111, "prefill")}
+        assert post_transition == {(111, "prefill")}
 
     def test_transition_exact_boundary(self):
         """Transition fires at exact boundary
         (num_computed + num_new == num_prompt)."""
-        configs: set[tuple[int, str]] = set()
-        self._admit_transition_aware(
-            configs,
+        current, post_transition = self._admit_transition_aware(
             prefill_hash=111,
             decode_hash=222,
             num_computed_tokens=80,
             num_prompt_tokens=100,
             num_new_tokens=20,  # 80+20=100 == 100
         )
-        assert (111, "prefill") in configs
-        assert (222, "decode") in configs
+        assert current == {(111, "prefill")}
+        assert post_transition == {(222, "decode")}
 
     def test_transition_zero_decode_hash(self):
         """Transition prediction with decode_hash=0 does not add a
         zero hash."""
-        configs: set[tuple[int, str]] = set()
-        self._admit_transition_aware(
-            configs,
+        current, post_transition = self._admit_transition_aware(
             prefill_hash=111,
             decode_hash=0,
             num_computed_tokens=90,
             num_prompt_tokens=100,
             num_new_tokens=20,
         )
-        assert configs == {(111, "prefill")}
+        assert current == {(111, "prefill")}
+        assert post_transition == set()
 
     def test_transition_zero_prefill_hash(self):
         """Transition prediction with prefill_hash=0 only adds the
         decode row."""
-        configs: set[tuple[int, str]] = set()
-        self._admit_transition_aware(
-            configs,
+        current, post_transition = self._admit_transition_aware(
             prefill_hash=0,
             decode_hash=222,
             num_computed_tokens=90,
             num_prompt_tokens=100,
             num_new_tokens=20,
         )
-        assert (222, "decode") in configs
-        assert (0, "prefill") not in configs
+        assert current == set()
+        assert post_transition == {(222, "decode")}
 
     def test_full_cache_hit_only_decode(self):
         """Full prefix-cache hit -> only decode row, no transition
         prediction needed."""
-        configs: set[tuple[int, str]] = set()
-        self._admit_transition_aware(
-            configs,
+        current, post_transition = self._admit_transition_aware(
             prefill_hash=111,
             decode_hash=222,
             num_computed_tokens=100,
             num_prompt_tokens=100,
             num_new_tokens=1,
         )
-        assert configs == {(222, "decode")}
+        assert current == {(222, "decode")}
+        assert post_transition == {(222, "decode")}
 
-    def test_transition_blocks_subsequent_admission(self):
-        """A WAITING request's transition prediction that reserves a
-        decode row blocks a subsequent WAITING request from admission."""
+    def test_transition_replacement_does_not_block_subsequent_admission(self):
+        """A completing WAITING request's decode row replaces its
+        prefill row instead of adding permanent union pressure."""
         max_configs = 2
-        configs: set[tuple[int, str]] = set()
+        current_configs = {(111, "prefill")}
+        post_transition_configs = {(222, "decode")}
+        new_prefill = {(333, "prefill")}
 
-        # First request: will complete prefill, reserves both rows.
-        self._admit_transition_aware(
-            configs,
-            prefill_hash=111,
-            decode_hash=222,
-            num_computed_tokens=90,
-            num_prompt_tokens=100,
-            num_new_tokens=20,
-        )
-        assert len(configs) == 2
-
-        # Second request: new prefill hash -> would need a 3rd slot
-        # but max is 2.
-        new_hashes: set[tuple[int, str]] = {(333, "prefill")}
-        new_unique = new_hashes - configs
-        assert len(configs) + len(new_unique) > max_configs
+        assert len(current_configs | new_prefill) <= max_configs
+        assert len(post_transition_configs | new_prefill) <= max_configs
 
     def test_decode_only_chunked_reserves_decode_row(self):
         """A decode-only request (prefill_hash=0) NOT completing prefill
         this step still reserves its decode row because
         needs_decode_reservation is True when prefill_hash == 0."""
-        configs: set[tuple[int, str]] = set()
-        self._admit_transition_aware(
-            configs,
+        current, post_transition = self._admit_transition_aware(
             prefill_hash=0,
             decode_hash=222,
             num_computed_tokens=50,
             num_prompt_tokens=100,
             num_new_tokens=10,  # 50+10=60 < 100, NOT completing prefill
         )
-        assert (222, "decode") in configs
-        assert (0, "prefill") not in configs
+        assert current == set()
+        assert post_transition == {(222, "decode")}
 
     def test_decode_only_chunked_blocks_subsequent(self):
         """A decode-only request's decode reservation during chunked
         prefill blocks a subsequent WAITING request from admission at
         capacity."""
         max_configs = 1
-        configs: set[tuple[int, str]] = set()
-
         # First request: decode-only, chunked prefill, reserves decode row.
-        self._admit_transition_aware(
-            configs,
+        _current_configs, post_transition_configs = self._admit_transition_aware(
             prefill_hash=0,
             decode_hash=222,
             num_computed_tokens=50,
             num_prompt_tokens=100,
             num_new_tokens=10,
         )
-        assert configs == {(222, "decode")}
+        assert post_transition_configs == {(222, "decode")}
 
         # Second request: new prefill hash -> would need a 2nd slot
         # but max is 1.
         new_hashes: set[tuple[int, str]] = {(333, "prefill")}
-        new_unique = new_hashes - configs
-        assert len(configs) + len(new_unique) > max_configs
+        new_unique = new_hashes - post_transition_configs
+        assert len(post_transition_configs) + len(new_unique) > max_configs
 
 
 class TestSteeringAdmissionLogicLegacy:
