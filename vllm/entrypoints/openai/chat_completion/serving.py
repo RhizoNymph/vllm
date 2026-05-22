@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from fastapi import Request
 
@@ -77,6 +77,7 @@ from vllm.tool_parsers.streaming import (
 )
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.capture import (
     CaptureConsumer,
     CaptureContext,
@@ -314,6 +315,20 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        has_steering = (
+            request.steering_name is not None
+            or request.steering_vectors is not None
+            or request.prefill_steering_vectors is not None
+            or request.decode_steering_vectors is not None
+            or bool(request.sae_clamp_specs)
+        )
+        if request.use_beam_search and has_steering:
+            return self.create_error_response(
+                "Beam search does not support steering. Disable "
+                "use_beam_search or remove steering fields from the request.",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -348,6 +363,7 @@ class OpenAIServingChat(OpenAIServing):
         # the activation-steering plan).  Inline overrides ride along
         # unmodified on ``request.steering_vectors`` etc.
         steering_module_ref: tuple[str, float] | None = None
+        named_steering_registry = None
         if request.steering_name is not None:
             steering_registry = (
                 None
@@ -366,6 +382,7 @@ class OpenAIServingChat(OpenAIServing):
                     err, status_code=HTTPStatus.BAD_REQUEST
                 )
             steering_module_ref = (request.steering_name, 1.0)
+            named_steering_registry = steering_registry
 
         # Validate sae_clamp_specs at the API server symmetrically with
         # steering_name, so the response distinguishes "steering disabled"
@@ -433,6 +450,18 @@ class OpenAIServingChat(OpenAIServing):
                 # vectors over multiprocessing.
                 if steering_module_ref is not None:
                     sampling_params.steering_module_ref = steering_module_ref
+                    assert named_steering_registry is not None
+                    err = (
+                        named_steering_registry.apply_sampling_params_hash_overrides(
+                            sampling_params,
+                            steering_module_ref[0],
+                            scale=steering_module_ref[1],
+                        )
+                    )
+                    if err is not None:
+                        return self.create_error_response(
+                            err, status_code=HTTPStatus.BAD_REQUEST
+                        )
 
             # Per-request capture-consumer admission validation. Runs
             # AFTER sampling-params construction (we need the tokenized
@@ -567,9 +596,7 @@ class OpenAIServingChat(OpenAIServing):
             dt = model_config.dtype
             element_size_bytes = getattr(dt, "itemsize", None)
             if element_size_bytes is None:
-                import torch
-
-                element_size_bytes = torch.tensor([], dtype=dt).element_size()
+                element_size_bytes = get_dtype_size(cast(Any, dt))
         except Exception as exc:  # pragma: no cover - defensive
             return self.create_error_response(
                 f"capture: failed to read model shape: {exc}",
@@ -1440,7 +1467,7 @@ class OpenAIServingChat(OpenAIServing):
                             "Tokenizer not available when `skip_tokenizer_init=True`"
                         )
 
-                    tool_parser = self.tool_parser(tokenizer, request.tools)
+                    tool_parser = self.tool_parser(tokenizer, cast(Any, request.tools))
                     # NOTE: We use token_ids for openai tool parser
                     tool_call_info = tool_parser.extract_tool_calls(
                         "",

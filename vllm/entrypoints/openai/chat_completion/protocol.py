@@ -466,9 +466,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "POST /v1/steering/modules/register with kind='sae_delta') "
             "and declares which feature activations to clamp on which "
             "(hook, layer) pairs.  See docs/features/sae_steering.md "
-            "for the schema.  Phase-0 plumbs clamps through the request "
-            "and rejects any application attempt with a clear error; "
-            "the kernel lands in Phase-1."
+            "for the schema."
         ),
     )
 
@@ -1023,6 +1021,11 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
     guided_decoding_backend: str | None = None
     echo: bool = False
     return_token_ids: bool = False
+    steering_vectors: SteeringVectorSpec | None = None
+    prefill_steering_vectors: SteeringVectorSpec | None = None
+    decode_steering_vectors: SteeringVectorSpec | None = None
+    steering_name: str | None = None
+    sae_clamp_specs: list[dict[str, Any]] | None = None
 
     @model_validator(mode="before")
     @classmethod

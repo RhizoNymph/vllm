@@ -112,12 +112,48 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         returns one choice per conversation indexed 0, 1, ..., N-1.
         Streaming, tool use, and beam search are not supported.
         """
-        tokenizer = self.renderer.tokenizer
-        assert tokenizer is not None
         single_requests = [
             request.to_chat_completion_request(messages)
             for messages in request.messages
         ]
+        steering_module_ref: tuple[str, float] | None = None
+        steering_registry_for_request = None
+        steering_registry = (
+            None
+            if raw_request is None
+            else getattr(raw_request.app.state, "steering_module_registry", None)
+        )
+        if request.steering_name is not None:
+            if steering_registry is None:
+                return self.create_error_response(
+                    "Named steering modules are not available. "
+                    "Ensure the server was started with steering enabled.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            err = steering_registry.validate_additive_lookup(request.steering_name)
+            if err is not None:
+                return self.create_error_response(
+                    err, status_code=HTTPStatus.BAD_REQUEST
+                )
+            steering_module_ref = (request.steering_name, 1.0)
+            steering_registry_for_request = steering_registry
+        if request.sae_clamp_specs:
+            if steering_registry is None:
+                return self.create_error_response(
+                    "sae_clamp_specs requires steering to be enabled. "
+                    "Start the server with --enable-steering.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            err = steering_registry.validate_sae_clamp_specs(request.sae_clamp_specs)
+            if err is not None:
+                return self.create_error_response(
+                    err, status_code=HTTPStatus.BAD_REQUEST
+                )
+        steering_module_refs = [steering_module_ref] * len(single_requests)
+        steering_registries = [steering_registry_for_request] * len(single_requests)
+
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
 
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
@@ -162,6 +198,20 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             sampling_params = single_request.to_sampling_params(
                 max_tokens, self.default_sampling_params
             )
+            steering_module_ref = steering_module_refs[i]
+            if steering_module_ref is not None:
+                sampling_params.steering_module_ref = steering_module_ref
+                named_steering_registry = steering_registries[i]
+                assert named_steering_registry is not None
+                err = named_steering_registry.apply_sampling_params_hash_overrides(
+                    sampling_params,
+                    steering_module_ref[0],
+                    scale=steering_module_ref[1],
+                )
+                if err is not None:
+                    return self.create_error_response(
+                        err, status_code=HTTPStatus.BAD_REQUEST
+                    )
             self._log_inputs(
                 sub_request_id,
                 engine_prompt,

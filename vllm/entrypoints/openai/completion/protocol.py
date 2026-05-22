@@ -217,9 +217,7 @@ class CompletionRequest(OpenAIBaseModel):
             "POST /v1/steering/modules/register with kind='sae_delta') "
             "and declares which feature activations to clamp on which "
             "(hook, layer) pairs.  See docs/features/sae_steering.md "
-            "for the schema.  Phase-0 plumbs clamps through the request "
-            "and rejects any application attempt with a clear error; "
-            "the kernel lands in Phase-1."
+            "for the schema."
         ),
     )
 
