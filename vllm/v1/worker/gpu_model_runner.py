@@ -1850,6 +1850,7 @@ class GPUModelRunner(
         """
         self.input_batch.remove_request(req_id)
         req_state = self.requests[req_id]
+        old_sampling_params = req_state.sampling_params
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features
@@ -1885,6 +1886,7 @@ class GPUModelRunner(
             old_decode_hash,
             new_prefill_hash,
             new_decode_hash,
+            old_sampling_params=old_sampling_params,
         )
 
         if self.uses_mrope:

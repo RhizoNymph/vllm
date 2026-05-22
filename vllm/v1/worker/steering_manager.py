@@ -41,12 +41,18 @@ effective vectors for each phase.
 """
 
 from collections import defaultdict
+from collections.abc import Mapping
 
 import numpy as np
 import torch
 
+from vllm.config.steering_types import hash_steering_config
 from vllm.logger import init_logger
-from vllm.model_executor.layers.steering import HOOK_POINT_TABLE_ATTR
+from vllm.model_executor.layers.steering import (
+    HOOK_POINT_ANY_ACTIVE_ATTR,
+    HOOK_POINT_TABLE_ATTR,
+    SteeringHookPoint,
+)
 
 logger = init_logger(__name__)
 
@@ -83,6 +89,15 @@ class SteeringManager:
         ] = {}
         # (config_hash, phase) -> number of active requests using this config
         self.config_refcounts: dict[tuple[int, str], int] = defaultdict(int)
+        # Logical request hashes include SAE clamp state so prefix-cache keys
+        # stay isolated.  Physical additive table rows only depend on the
+        # additive vector content, so multiple logical hashes may alias one row.
+        self._config_to_content: dict[tuple[int, str], tuple[int, str]] = {}
+        self._content_to_row: dict[tuple[int, str], int] = {}
+        self._content_vectors: dict[
+            tuple[int, str], dict[str, dict[int, torch.Tensor]]
+        ] = {}
+        self._content_refcounts: dict[tuple[int, str], int] = defaultdict(int)
         # Available row indices (rows 3 through max_steering_configs + 2)
         # Reversed so pop() gives lowest
         self.free_rows: list[int] = list(range(max_steering_configs + 2, 2, -1))
@@ -124,9 +139,10 @@ class SteeringManager:
     def register_config(
         self,
         config_hash: int,
-        vectors: dict[str, dict[int, list[float] | np.ndarray]],
+        vectors: Mapping[str, Mapping[int, list[float] | np.ndarray]],
         phase: str = "prefill",
         *,
+        content_hash: int | None = None,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> int:
         """Register a steering config, return its table row index.
@@ -138,6 +154,10 @@ class SteeringManager:
                 (the float64 arrays produced by
                 :func:`resolve_effective_vectors`).
             phase: ``"prefill"`` or ``"decode"``
+            content_hash: Optional additive-only identity used for physical
+                row sharing.  Scheduler capacity accounting uses the same
+                value, while ``config_hash`` remains the logical request hash
+                used for lookup and prefix-cache isolation.
             locally_owned_layers: If provided, only layers in this set
                 have tensors materialized on this worker.  Layers
                 outside the set are skipped at tensor-construction time
@@ -156,18 +176,34 @@ class SteeringManager:
         key = (config_hash, phase)
         if key in self.config_to_row:
             self.config_refcounts[key] += 1
+            content_key = self._config_to_content[key]
+            self._content_refcounts[content_key] += 1
             return self.config_to_row[key]
+
+        row_hash = content_hash if content_hash is not None else hash_steering_config(
+            vectors
+        )
+        content_key = (row_hash, phase)
+        if content_key in self._content_to_row:
+            row = self._content_to_row[content_key]
+            self.config_to_row[key] = row
+            self.config_vectors[key] = self._content_vectors[content_key]
+            self.config_refcounts[key] = 1
+            self._config_to_content[key] = content_key
+            self._content_refcounts[content_key] += 1
+            return row
 
         if not self.free_rows:
             raise RuntimeError(
                 f"No free steering table rows. max_steering_configs="
-                f"{self.max_steering_configs}, active configs="
-                f"{len(self.config_to_row)}"
+                f"{self.max_steering_configs}, active physical configs="
+                f"{len(self._content_to_row)}"
             )
 
         row = self.free_rows.pop()
         self.config_to_row[key] = row
         self.config_refcounts[key] = 1
+        self._config_to_content[key] = content_key
         # Store per-request vectors as tensors, keyed by hook point.
         # Under PP, each rank only owns a subset of decoder layers, so
         # materializing tensors for non-local layers is pure waste.
@@ -200,6 +236,9 @@ class SteeringManager:
                 layer_idx: stacked[i : i + 1] for i, layer_idx in enumerate(layer_idxs)
             }
         self.config_vectors[key] = stored
+        self._content_to_row[content_key] = row
+        self._content_vectors[content_key] = stored
+        self._content_refcounts[content_key] = 1
         # New row content needs to be written into the per-layer tables on
         # the next populate call. (Refcount-hit path doesn't set this flag
         # because the row's contents are already in the table.)
@@ -218,10 +257,17 @@ class SteeringManager:
         if key not in self.config_to_row:
             return
         self.config_refcounts[key] -= 1
+        content_key = self._config_to_content[key]
+        self._content_refcounts[content_key] -= 1
         if self.config_refcounts[key] <= 0:
-            row = self.config_to_row.pop(key)
+            self.config_to_row.pop(key)
             self.config_vectors.pop(key, None)
             del self.config_refcounts[key]
+            self._config_to_content.pop(key, None)
+        if self._content_refcounts[content_key] <= 0:
+            row = self._content_to_row.pop(content_key)
+            self._content_vectors.pop(content_key, None)
+            del self._content_refcounts[content_key]
             self.free_rows.append(row)
             # The row is now stale (no one references it), but mark dirty so
             # if another config gets assigned to this row before the next
@@ -395,19 +441,22 @@ class SteeringManager:
             independent ``stacked.to(dtype=...)`` casts on Gemma-3-4B
             (3 hooks * 28 layers) into one.
         """
-        # Build a flat list of (table_buffer, hp_str, layer_idx) for every
-        # (hook, layer) pair that actually has a table buffer registered.
-        # Layers may register a SUBSET of hook tables (the
-        # ``hasattr(mod, table_attr)`` check), so this drives the batched
-        # scatter on the active set rather than assuming a dense layout.
-        active_tables: list[tuple[torch.Tensor, str, int]] = []
+        # Build a flat list of (table_buffer, hp_str, layer_idx, mod) for
+        # every (hook, layer) pair that actually has a table buffer
+        # registered.  ``mod`` is carried through so the per-hook
+        # ``_any_active`` flag buffer can be written alongside the table
+        # body once the rows are assembled below.  Layers may register a
+        # SUBSET of hook tables (the ``hasattr(mod, table_attr)`` check),
+        # so this drives the batched scatter on the active set rather
+        # than assuming a dense layout.
+        active_tables: list[tuple[torch.Tensor, str, int, torch.nn.Module]] = []
         for hook_point, table_attr in HOOK_POINT_TABLE_ATTR.items():
             hp_str = hook_point.value
             for layer_idx, mod in steerable_layers.items():
                 if not hasattr(mod, table_attr):
                     continue
                 table = getattr(mod, table_attr)
-                active_tables.append((table, hp_str, layer_idx))
+                active_tables.append((table, hp_str, layer_idx, mod))
 
         if not active_tables:
             self._tables_dirty = False
@@ -420,6 +469,15 @@ class SteeringManager:
         device = first_table.device
         hidden_size = first_table.shape[1]
 
+        # Per-(hook, layer) "any non-zero row" tracking.  Filled in during
+        # row assembly below and written into each layer's ``_any_active``
+        # flag tensor at the end.  A layer's flag is True iff any row
+        # >= 1 carries a non-zero contribution — i.e. at least one of the
+        # global prefill / global decode / per-request rows is not the
+        # zero sentinel.  When the flag is False, the apply_steering
+        # kernel skips the gather + add and just emits hidden_states.
+        per_table_any_active: list[bool] = []
+
         # Snapshot config_to_row ordering. This is ALWAYS needed for the
         # row-assembly loop below, but ``indices`` only needs rebuilding
         # when this ordering changed (register/release).
@@ -430,7 +488,7 @@ class SteeringManager:
             or self._cached_ordered_configs is None
         ):
             new_ordered_configs: list[tuple[tuple[int, str], int]] = list(
-                self.config_to_row.items()
+                self._content_to_row.items()
             )
             target_indices_list = [0, 1, 2] + [row for _, row in new_ordered_configs]
             self._cached_indices = torch.tensor(
@@ -453,7 +511,7 @@ class SteeringManager:
         # per-(hook, layer), then index_copy_ each layer's slice.
         num_rows = 3 + len(ordered_configs)
         per_table_rows: list[list[torch.Tensor]] = []
-        for _table, hp_str, layer_idx in active_tables:
+        for _table, hp_str, layer_idx, _mod in active_tables:
             base_vec = self._get_global_vec(hp_str, layer_idx, self.global_base_vectors)
             prefill_vec = self._get_global_vec(
                 hp_str, layer_idx, self.global_prefill_vectors
@@ -465,13 +523,27 @@ class SteeringManager:
             global_prefill = self._add_vecs(base_vec, prefill_vec)
             global_decode = self._add_vecs(base_vec, decode_vec)
 
-            rows: list[torch.Tensor] = [zero_row]  # row 0: always zero
-            rows.append(global_prefill if global_prefill is not None else zero_row)
-            rows.append(global_decode if global_decode is not None else zero_row)
+            # ``any_active`` is True iff at least one row >= 1 carries a
+            # non-zero contribution — equivalent to "not every row >= 1 is
+            # the ``zero_row`` sentinel".  Tracked as we append rows.
+            any_active = False
 
-            for (config_hash, phase), _row_idx in ordered_configs:
+            rows: list[torch.Tensor] = [zero_row]  # row 0: always zero
+            if global_prefill is not None:
+                rows.append(global_prefill)
+                any_active = True
+            else:
+                rows.append(zero_row)
+            if global_decode is not None:
+                rows.append(global_decode)
+                any_active = True
+            else:
+                rows.append(zero_row)
+
+            for content_key, _row_idx in ordered_configs:
+                _content_hash, phase = content_key
                 per_req = (
-                    self.config_vectors.get((config_hash, phase), {})
+                    self._content_vectors.get(content_key, {})
                     .get(hp_str, {})
                     .get(layer_idx)
                 )
@@ -491,16 +563,20 @@ class SteeringManager:
                     # CPU/CUDA mix doesn't raise.
                     per_req_aligned = per_req.squeeze(0).to(phase_global.device)
                     row_content = phase_global + per_req_aligned
+                    any_active = True
                 elif phase_global is not None:
                     row_content = phase_global
+                    any_active = True
                 elif per_req is not None:
                     row_content = per_req.squeeze(0)
+                    any_active = True
                 else:
                     row_content = zero_row
                 rows.append(row_content)
 
             assert len(rows) == num_rows
             per_table_rows.append(rows)
+            per_table_any_active.append(any_active)
 
         # Stack all rows into one fp32 tensor of shape
         # ``(num_active_tables, num_rows, hidden)`` and split by dtype.
@@ -515,7 +591,7 @@ class SteeringManager:
 
         # Group by dtype so we can do one cast per dtype.
         dtype_to_indices: dict[torch.dtype, list[int]] = defaultdict(list)
-        for i, (table, _hp, _layer) in enumerate(active_tables):
+        for i, (table, _hp, _layer, _mod) in enumerate(active_tables):
             dtype_to_indices[table.dtype].append(i)
 
         for dtype, table_indices_in_active in dtype_to_indices.items():
@@ -524,6 +600,24 @@ class SteeringManager:
             for casted_pos, active_pos in enumerate(table_indices_in_active):
                 table = active_tables[active_pos][0]
                 table.index_copy_(0, indices, casted[casted_pos])
+
+        # Write the per-(hook, layer) any-active flags into each layer's
+        # bool buffer so the apply_steering kernel can short-circuit when
+        # its hook point has no non-zero rows for the current state.
+        # Layers built outside ``register_steering_buffers`` (e.g. unit-
+        # test fakes) may not register the flag attribute — skip them
+        # gracefully so the manager remains decoupled from the buffer
+        # registration pathway.
+        for active_pos, (_table, hp_str, _layer_idx, mod) in enumerate(active_tables):
+            try:
+                hp_enum = SteeringHookPoint(hp_str)
+            except ValueError:
+                continue
+            flag_attr = HOOK_POINT_ANY_ACTIVE_ATTR[hp_enum]
+            flag_buf = getattr(mod, flag_attr, None)
+            if flag_buf is None:
+                continue
+            flag_buf.fill_(per_table_any_active[active_pos])
 
         # All per-layer table buffers now reflect current state. Subsequent
         # calls can be skipped by the caller until a mutator sets dirty again.

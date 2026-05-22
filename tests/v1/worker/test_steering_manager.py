@@ -96,6 +96,40 @@ class TestRegisterRelease:
         row_b = mgr.register_config(config_hash=200, vectors=vectors_b, phase="decode")
         assert row_a != row_b
 
+    def test_different_hashes_same_vectors_alias_row(self):
+        """Logical hashes may differ due to SAE state, but additive table
+        rows are keyed by additive vector content."""
+        mgr = _make_manager(max_configs=1)
+        vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        row_a = mgr.register_config(config_hash=100, vectors=vectors, phase="prefill")
+        row_b = mgr.register_config(config_hash=200, vectors=vectors, phase="prefill")
+
+        assert row_a == row_b
+        assert mgr.config_to_row[(100, "prefill")] == row_a
+        assert mgr.config_to_row[(200, "prefill")] == row_a
+        assert mgr.num_active_configs == 2
+
+    def test_explicit_content_hash_controls_row_aliasing(self):
+        """Scheduler and worker must agree on physical additive row keys."""
+        mgr = _make_manager(max_configs=2)
+        vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        row_a = mgr.register_config(
+            config_hash=100,
+            vectors=vectors,
+            phase="prefill",
+            content_hash=10,
+        )
+        row_b = mgr.register_config(
+            config_hash=200,
+            vectors=vectors,
+            phase="prefill",
+            content_hash=20,
+        )
+
+        assert row_a != row_b
+        assert mgr.config_to_row[(100, "prefill")] == row_a
+        assert mgr.config_to_row[(200, "prefill")] == row_b
+
     def test_release_decrements_refcount_still_active(self):
         """Releasing once with refcount > 1 keeps the config active."""
         mgr = _make_manager()
@@ -512,19 +546,23 @@ class TestPopulateTables:
         assert torch.allclose(table[row_d], base_vec + decode_global + per_req)
 
     def test_invalid_phase_in_populate_raises(self):
-        """Invalid phase string in config_to_row raises ValueError."""
+        """Invalid phase string in physical row state raises ValueError."""
         mgr = _make_manager()
         per_req = torch.ones(HIDDEN_SIZE) * 5.0
         vectors = {_HP: {0: per_req.tolist()}}
         # Register normally so state is otherwise valid.
         row = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
         # Corrupt the phase tracking state by injecting an invalid phase
-        # into the dict populate_steering_tables iterates over. Mirror the
-        # per-request vectors under the same invalid key so the iteration
-        # reaches the phase branch.
-        mgr.config_to_row.pop((42, "prefill"))
-        mgr.config_to_row[(42, "invalid")] = row
-        mgr.config_vectors[(42, "invalid")] = mgr.config_vectors.pop((42, "prefill"))
+        # into the physical-content dict populate_steering_tables iterates
+        # over. Mirror the per-request vectors under the same invalid key
+        # so the iteration reaches the phase branch.
+        content_key = next(iter(mgr._content_to_row))
+        vectors_for_content = mgr._content_vectors.pop(content_key)
+        mgr._content_to_row.pop(content_key)
+        invalid_key = (content_key[0], "invalid")
+        mgr._content_to_row[invalid_key] = row
+        mgr._content_vectors[invalid_key] = vectors_for_content
+        mgr._indices_dirty = True
 
         layers = _make_layers(mgr, layer_indices=[0])
         try:
@@ -1529,4 +1567,3 @@ class TestDevicePlacement:
         table = getattr(layers[0], _TABLE_ATTR)
         expected = per_req_vec.to(cuda_device)
         assert torch.allclose(table[row], expected)
-

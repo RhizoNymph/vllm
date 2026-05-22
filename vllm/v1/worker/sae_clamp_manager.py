@@ -34,7 +34,11 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterator
 
-from vllm.config.sae_steering_types import SAEClampSpec
+from vllm.config.sae_steering_types import (
+    SAEClampSpec,
+    hash_sae_clamp_specs_for_phase,
+    validate_sae_clamp_specs_no_overlap,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -64,16 +68,22 @@ class SAEClampManager:
                 f"max_sae_configs must be non-negative; got {max_sae_configs!r}."
             )
         self.max_sae_configs = max_sae_configs
-        # (config_hash, phase) -> assigned row in [1, max_sae_configs].
+        # (sae_config_hash, phase) -> assigned row in [1, max_sae_configs].
+        # Worker code passes the phase-specific SAE-only content hash, so
+        # identical clamp tables share capacity even when additive steering
+        # differs.
         self.config_to_row: dict[tuple[int, str], int] = {}
-        # (config_hash, phase) -> tuple of specs, retained so the buffer
-        # populator can re-derive row content per-(layer, hook) site.
-        # A request's ``SamplingParams.sae_clamp_specs`` is a tuple
-        # (one entry per referenced SAE module); the whole tuple shares
-        # one row because the admission hash already covers all of them.
+        # (sae_config_hash, phase) -> tuple of specs for diagnostics/tests.
         self.config_specs: dict[tuple[int, str], tuple[SAEClampSpec, ...]] = {}
-        # (config_hash, phase) -> active reference count.
+        # (sae_config_hash, phase) -> active reference count.
         self.config_refcounts: dict[tuple[int, str], int] = defaultdict(int)
+        # Alias from external config hash to content hash.  In production
+        # these hashes are the same; tests may pass arbitrary config hashes
+        # and still exercise content-based row sharing.
+        self._config_to_content: dict[tuple[int, str], tuple[int, str]] = {}
+        self._content_to_row: dict[tuple[int, str], int] = {}
+        self._content_specs: dict[tuple[int, str], tuple[SAEClampSpec, ...]] = {}
+        self._content_refcounts: dict[tuple[int, str], int] = defaultdict(int)
         # Reversed so pop() returns the lowest free row — symmetric and
         # deterministic across ranks.
         self.free_rows: list[int] = list(range(max_sae_configs, 0, -1))
@@ -98,10 +108,9 @@ class SAEClampManager:
         independent row, mirroring the additive manager.
 
         Args:
-            config_hash: deterministic hash from
-                :func:`hash_sae_clamp_specs` for the SAE state of a
-                request in this phase.  Hash 0 is reserved for "no SAE
-                clamps in this phase" and must not be passed here.
+            config_hash: deterministic SAE-only hash for the request in
+                this phase.  Hash 0 is reserved for "no SAE clamps in
+                this phase" and must not be passed here.
             specs: the request's ``sae_clamp_specs`` tuple — one entry
                 per referenced SAE module.  Stored verbatim so the
                 buffer populator can resolve (feature_idx → position)
@@ -136,10 +145,30 @@ class SAEClampManager:
                 "register_clamp_spec called with empty specs tuple; the "
                 "caller must short-circuit on the no-clamps case."
             )
+        specs = tuple(specs)
+        validate_sae_clamp_specs_no_overlap(specs)
         key = (config_hash, phase)
         if key in self.config_to_row:
             self.config_refcounts[key] += 1
+            content_key = self._config_to_content[key]
+            self._content_refcounts[content_key] += 1
             return self.config_to_row[key]
+
+        content_hash = hash_sae_clamp_specs_for_phase(specs, phase)  # type: ignore[arg-type]
+        if content_hash == 0:
+            raise ValueError(
+                "register_clamp_spec called with specs that do not apply "
+                f"to phase {phase!r}."
+            )
+        content_key = (content_hash, phase)
+        if content_key in self._content_to_row:
+            row = self._content_to_row[content_key]
+            self.config_to_row[key] = row
+            self.config_specs[key] = specs
+            self.config_refcounts[key] = 1
+            self._config_to_content[key] = content_key
+            self._content_refcounts[content_key] += 1
+            return row
 
         if not self.free_rows:
             raise RuntimeError(
@@ -151,8 +180,12 @@ class SAEClampManager:
 
         row = self.free_rows.pop()
         self.config_to_row[key] = row
-        self.config_specs[key] = tuple(specs)
+        self.config_specs[key] = specs
         self.config_refcounts[key] = 1
+        self._config_to_content[key] = content_key
+        self._content_to_row[content_key] = row
+        self._content_specs[content_key] = specs
+        self._content_refcounts[content_key] = 1
         self._tables_dirty = True
         return row
 
@@ -168,10 +201,17 @@ class SAEClampManager:
         if key not in self.config_to_row:
             return
         self.config_refcounts[key] -= 1
+        content_key = self._config_to_content[key]
+        self._content_refcounts[content_key] -= 1
         if self.config_refcounts[key] <= 0:
-            row = self.config_to_row.pop(key)
+            self.config_to_row.pop(key)
             self.config_specs.pop(key, None)
             del self.config_refcounts[key]
+            self._config_to_content.pop(key, None)
+        if self._content_refcounts[content_key] <= 0:
+            row = self._content_to_row.pop(content_key)
+            self._content_specs.pop(content_key, None)
+            del self._content_refcounts[content_key]
             self.free_rows.append(row)
             # Stale row content; mark dirty so the next populate
             # overwrites it before any subsequent request lands here.
@@ -207,9 +247,9 @@ class SAEClampManager:
         deterministic order.  Used by the per-layer buffer populator
         to re-derive clamp content per-(layer, hook) site.
         """
-        ordered = sorted(self.config_to_row.items(), key=lambda kv: kv[1])
+        ordered = sorted(self._content_to_row.items(), key=lambda kv: kv[1])
         for (config_hash, phase), row in ordered:
-            yield row, config_hash, phase, self.config_specs[(config_hash, phase)]
+            yield row, config_hash, phase, self._content_specs[(config_hash, phase)]
 
     def mark_tables_clean(self) -> None:
         """Clear the dirty flag.  Called by the populator after flushing."""

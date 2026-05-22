@@ -11,11 +11,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.config.sae_steering_types import SAEActivation
 from vllm.config.steering_types import (
+    ResolvedSteeringVectorSpec,
     SteeringVectorSpec,
     merge_steering_specs,
     resolve_effective_vectors,
     scale_steering_spec,
+    validate_steering_index,
 )
 from vllm.entrypoints.openai.steering.registry import (
     SAEModuleManifest,
@@ -24,6 +27,7 @@ from vllm.entrypoints.openai.steering.registry import (
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sae_steering import (
+    HOOK_POINT_SAE_ANY_ACTIVE_ATTR,
     HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
     HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
     HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
@@ -35,6 +39,7 @@ from vllm.model_executor.layers.sae_steering import (
     unregister_sae_buffers,
 )
 from vllm.model_executor.layers.steering import (
+    HOOK_POINT_ANY_ACTIVE_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
@@ -105,11 +110,26 @@ class SteeringModelRunnerMixin:
             SteeringVectorSpec | None,
         ],
     ]
-    # Worker-side mirror of registered SAE-kind modules.  Phase-0
-    # stores the manifest only — the runtime accepts requests that
-    # carry ``SamplingParams.sae_clamp_specs`` referencing these
-    # names but the application path raises ``NotImplementedError``
-    # because the kernel does not yet exist.  Disjoint from
+    # Pre-resolved spec cache for the named-module fast path.  Each entry
+    # stores ``(resolved_prefill, resolved_decode)``: the output of
+    # :func:`resolve_effective_vectors` applied to the module's
+    # ``(base, phase)`` specs at registration time.  The hot path in
+    # :meth:`_resolve_request_steering` skips the per-request merge +
+    # resolve work when a request references a name with no inline
+    # overrides; ``scale!=1.0`` is handled by multiplying the cached arrays.
+    # Populated alongside ``_steering_module_registry`` and invalidated
+    # together.
+    _steering_module_resolved_cache: dict[
+        str,
+        tuple[
+            ResolvedSteeringVectorSpec | None,
+            ResolvedSteeringVectorSpec | None,
+        ],
+    ]
+    # Worker-side mirror of registered SAE-kind modules.  The manifest
+    # drives buffer attachment, request admission, and per-layer clamp
+    # table population for requests carrying
+    # ``SamplingParams.sae_clamp_specs``.  Disjoint from
     # ``_steering_module_registry``; the broadcast payload's ``kind``
     # field discriminates which dict an incoming module lands in.
     _sae_module_registry: dict[str, "SAEModuleManifest"]
@@ -134,14 +154,16 @@ class SteeringModelRunnerMixin:
     _steering_index_pinned: torch.Tensor | None = None
     # Parallel structures for the SAE feature-surgery path.  The SAE
     # manager owns row allocation for ``sae_clamp_specs`` admissions;
-    # ``_req_sae_phase`` tracks the worker phase a request was last
-    # admitted under so completion/transition can release the right
-    # row.  ``_sae_steerable_sites`` is populated as SAE modules
+    # ``_req_sae_phase`` / ``_req_sae_hash`` track the worker phase and
+    # SAE-only row hash a request was last admitted under so
+    # completion/transition can release the right row.
+    # ``_sae_steerable_sites`` is populated as SAE modules
     # register and is the iteration target for both buffer attachment
     # / detachment and per-step clamp-table population.  ``None``
     # when SAE is disabled or no SAE module has registered yet.
     _sae_clamp_manager: SAEClampManager | None = None
     _req_sae_phase: dict[str, str]
+    _req_sae_hash: dict[str, int]
     # (module_name, layer_idx, hook_str) -> module reference of the
     # attached layer.  Populated by ``register_steering_modules`` for
     # SAE-kind modules and consumed by the per-step populator + the
@@ -149,6 +171,8 @@ class SteeringModelRunnerMixin:
     _sae_steerable_sites: dict[tuple[str, int, str], nn.Module]
     _sae_rows_scratch: np.ndarray | None = None
     _sae_index_pinned: torch.Tensor | None = None
+    _sae_index_dirty: bool = False
+    _req_transition_scan_candidates: set[str]
 
     # Attributes provided by the concrete model runner that mixes this
     # class in.  Declared here purely so static type checking can see
@@ -193,9 +217,13 @@ class SteeringModelRunnerMixin:
         self._req_steering_phase = {}
         self._steering_index_dirty = False
         self._steering_module_registry = {}
+        self._steering_module_resolved_cache = {}
         self._sae_module_registry = {}
         self._req_sae_phase = {}
+        self._req_sae_hash = {}
         self._sae_steerable_sites = {}
+        self._sae_index_dirty = False
+        self._req_transition_scan_candidates = set()
 
         steering_config = getattr(self.vllm_config, "steering_config", None)
         if steering_config is None or not steerable:
@@ -575,7 +603,34 @@ class SteeringModelRunnerMixin:
             for hook, layer_dict in spec.items():
                 converted: dict[int, object] = {}
                 for layer_key, entry in layer_dict.items():
-                    converted[int(layer_key)] = entry
+                    if type(layer_key) is int:
+                        layer_idx = layer_key
+                    elif isinstance(layer_key, str):
+                        try:
+                            layer_idx = int(layer_key)
+                        except ValueError as exc:
+                            raise SteeringVectorError(
+                                f"Steering module payload hook {hook!r} has "
+                                f"invalid layer key {layer_key!r}; expected "
+                                "an integer."
+                            ) from exc
+                    else:
+                        raise SteeringVectorError(
+                            f"Steering module payload hook {hook!r} has "
+                            f"invalid layer key {layer_key!r}; expected "
+                            "an integer."
+                        )
+                    layer_idx = validate_steering_index(
+                        layer_idx,
+                        f"Steering module payload hook {hook!r} layer key",
+                    )
+                    if layer_idx in converted:
+                        raise SteeringVectorError(
+                            f"Steering module payload hook {hook!r} contains "
+                            f"duplicate layer key {layer_idx!r} after "
+                            "integer normalization."
+                        )
+                    converted[layer_idx] = entry
                 if converted:
                     coerced[hook] = converted  # type: ignore[assignment]
             return coerced or None
@@ -598,8 +653,8 @@ class SteeringModelRunnerMixin:
         carries a ``kind`` discriminator: ``"additive"`` (the default
         for legacy payloads without the field) routes the module into
         the additive ``_steering_module_registry``;  ``"sae_delta"``
-        routes it into ``_sae_module_registry`` (Phase-0 stores the
-        manifest only).
+        routes it into ``_sae_module_registry`` and attaches the
+        manifest's SAE buffers.
 
         When *replace* is ``True`` both worker-side registries are
         cleared before the new entries are stored — used during
@@ -611,13 +666,17 @@ class SteeringModelRunnerMixin:
         :meth:`_resolve_request_steering` rather than silently falling
         back to inline-only behaviour.
         """
+        if not hasattr(self, "_steering_module_registry"):
+            self._steering_module_registry = {}
+        if not hasattr(self, "_steering_module_resolved_cache"):
+            self._steering_module_resolved_cache = {}
+        if not hasattr(self, "_sae_module_registry"):
+            self._sae_module_registry = {}
+        if not hasattr(self, "_sae_steerable_sites"):
+            self._sae_steerable_sites = {}
         if replace:
-            # Detach buffers for any SAE modules being dropped so the
-            # layer state is consistent with the empty registry.
-            for sae_name in list(self._sae_module_registry):
-                self._detach_sae_buffers(sae_name)
-            self._steering_module_registry.clear()
-            self._sae_module_registry.clear()
+            self._replace_steering_modules_atomically(modules)
+            return
         for name, payload in modules.items():
             if not isinstance(payload, dict):
                 raise SteeringVectorError(
@@ -625,9 +684,18 @@ class SteeringModelRunnerMixin:
                 )
             kind = payload.get("kind", "additive")
             if kind == "additive":
+                if payload.get("sae_manifest") is not None:
+                    raise SteeringVectorError(
+                        f"Steering module '{name}': sae_manifest is not valid "
+                        "for kind='additive'."
+                    )
                 # Legacy paths and additive registrations both flow here.
-                self._steering_module_registry[name] = self._module_payload_to_specs(
-                    payload
+                specs = self._module_payload_to_specs(payload)
+                self._steering_module_registry[name] = specs
+                base_spec, prefill_spec, decode_spec = specs
+                self._steering_module_resolved_cache[name] = (
+                    resolve_effective_vectors(base_spec, prefill_spec),
+                    resolve_effective_vectors(base_spec, decode_spec),
                 )
                 # If a name is being re-registered as additive, drop any
                 # stale SAE entry (and its buffers) so the registries
@@ -636,21 +704,96 @@ class SteeringModelRunnerMixin:
                     self._detach_sae_buffers(name)
                     self._sae_module_registry.pop(name, None)
             elif kind == "sae_delta":
+                if (
+                    payload.get("vectors") is not None
+                    or payload.get("prefill_vectors") is not None
+                    or payload.get("decode_vectors") is not None
+                ):
+                    raise SteeringVectorError(
+                        f"Steering module '{name}': additive vector fields "
+                        "are not valid for kind='sae_delta'."
+                    )
                 manifest_payload = payload.get("sae_manifest")
                 if not isinstance(manifest_payload, dict):
                     raise SteeringVectorError(
                         f"Steering module '{name}': kind='sae_delta' "
                         "requires 'sae_manifest' dict in broadcast payload."
                     )
-                manifest = sae_manifest_from_dict(manifest_payload)
-                # Replacing an existing SAE module: detach the old
-                # buffers before attaching new ones so the layer state
-                # never holds two SAE modules at the same site.
-                if name in self._sae_module_registry:
+                try:
+                    manifest = sae_manifest_from_dict(manifest_payload)
+                    self._validate_worker_sae_manifest(name, manifest)
+                    self._validate_worker_sae_site_ownership(name, manifest)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise SteeringVectorError(
+                        f"Steering module '{name}': invalid sae_manifest "
+                        f"in broadcast payload: {exc}"
+                    ) from exc
+                # Replacement snapshot: capture both the prior SAE
+                # state *and* any prior additive entry under this name
+                # so a failed replacement can restore whichever one
+                # existed.  Without the additive snapshot, an
+                # additive-to-SAE replacement that fails at attach
+                # would leave the worker with no entry at all —
+                # diverging from the server registry's rollback that
+                # restored the additive module.
+                prev_manifest = self._sae_module_registry.get(name)
+                prev_additive = self._steering_module_registry.get(name)
+                prev_additive_cache = self._steering_module_resolved_cache.get(name)
+                prev_weights: dict[tuple[int, str], dict[str, torch.Tensor]] | None = (
+                    None
+                )
+                if prev_manifest is not None:
+                    prev_weights = self._snapshot_sae_weights(name)
                     self._detach_sae_buffers(name)
                 self._sae_module_registry[name] = manifest
                 self._steering_module_registry.pop(name, None)
-                self._attach_sae_buffers(name, manifest)
+                self._steering_module_resolved_cache.pop(name, None)
+                # Atomic register-and-attach: when the payload carries
+                # ``sae_weights``, the buffers are attached *and* the
+                # weights copied in one indivisible step on the worker.
+                # If either half raises, the registry entry and any
+                # half-attached buffers are rolled back; when a prior
+                # module existed at this name (either kind), its state
+                # is reattached so a failed replacement does not
+                # destroy the previously-working module.
+                sae_weights = payload.get("sae_weights")
+                try:
+                    self._attach_sae_buffers(name, manifest)
+                    if sae_weights is not None:
+                        self.attach_sae_weights(name, sae_weights)
+                except Exception:
+                    self._detach_sae_buffers(name)
+                    self._sae_module_registry.pop(name, None)
+                    if prev_manifest is not None:
+                        # Best-effort restore.  Reattach uses the same
+                        # code path as a fresh registration; the
+                        # cloned tensors are the source of truth for
+                        # the rolled-back weights.
+                        self._sae_module_registry[name] = prev_manifest
+                        try:
+                            self._attach_sae_buffers(name, prev_manifest)
+                            if prev_weights is not None:
+                                self.attach_sae_weights(name, prev_weights)
+                        except Exception:
+                            # Restoration itself failed (e.g. OOM at
+                            # reattach).  Drop the entry rather than
+                            # leaving a registered name with no
+                            # buffers.
+                            self._detach_sae_buffers(name)
+                            self._sae_module_registry.pop(name, None)
+                            raise
+                    elif prev_additive is not None:
+                        # additive-to-SAE replacement: the additive
+                        # entry was popped before attach so the worker
+                        # state wouldn't hold two kinds under one name.
+                        # Restore it now so the failed replacement
+                        # doesn't silently delete a working module.
+                        self._steering_module_registry[name] = prev_additive
+                        if prev_additive_cache is not None:
+                            self._steering_module_resolved_cache[name] = (
+                                prev_additive_cache
+                            )
+                    raise
             else:
                 raise SteeringVectorError(
                     f"Steering module '{name}': unknown kind {kind!r} in "
@@ -663,6 +806,144 @@ class SteeringModelRunnerMixin:
                 replace,
             )
 
+    def _replace_steering_modules_atomically(self, modules: dict[str, dict]) -> None:
+        """Replace worker registries while preserving prior state on failure."""
+        prev_additive = dict(self._steering_module_registry)
+        prev_cache = dict(self._steering_module_resolved_cache)
+        prev_sae = dict(self._sae_module_registry)
+        prev_weights = {name: self._snapshot_sae_weights(name) for name in prev_sae}
+
+        try:
+            for sae_name in list(self._sae_module_registry):
+                self._detach_sae_buffers(sae_name)
+            self._steering_module_registry.clear()
+            self._steering_module_resolved_cache.clear()
+            self._sae_module_registry.clear()
+            self.register_steering_modules(modules, replace=False)
+        except Exception:
+            for sae_name in list(self._sae_module_registry):
+                self._detach_sae_buffers(sae_name)
+            self._steering_module_registry.clear()
+            self._steering_module_resolved_cache.clear()
+            self._sae_module_registry.clear()
+
+            self._steering_module_registry.update(prev_additive)
+            self._steering_module_resolved_cache.update(prev_cache)
+            for name, manifest in prev_sae.items():
+                self._sae_module_registry[name] = manifest
+                try:
+                    self._attach_sae_buffers(name, manifest)
+                    weights = prev_weights.get(name)
+                    if weights is not None:
+                        self.attach_sae_weights(name, weights)
+                except Exception:
+                    self._detach_sae_buffers(name)
+                    self._sae_module_registry.pop(name, None)
+                    raise
+            raise
+
+    @staticmethod
+    def _validate_worker_sae_manifest(
+        name: str,
+        manifest: SAEModuleManifest,
+    ) -> None:
+        """Validate SAE manifests received over worker RPC.
+
+        API-side registration validates the same invariants before
+        broadcast, but worker RPC handlers are also reachable from
+        startup state sync and direct tests.  Validate here so malformed
+        payloads fail before mutating registries or attaching buffers.
+        """
+        prefix = f"SAE module {name!r}"
+        if type(manifest.d_model) is not int or manifest.d_model <= 0:
+            raise ValueError(f"{prefix}: d_model must be positive.")
+        if type(manifest.d_sae) is not int or manifest.d_sae <= 0:
+            raise ValueError(f"{prefix}: d_sae must be positive.")
+        if manifest.activation is SAEActivation.RELU:
+            if manifest.activation_params:
+                raise ValueError(
+                    f"{prefix}: activation_params must be empty for relu."
+                )
+        elif manifest.activation is SAEActivation.JUMPRELU:
+            threshold = manifest.activation_params.get("threshold")
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or not math.isfinite(float(threshold))
+            ):
+                raise ValueError(
+                    f"{prefix}: jumprelu activation_params requires a finite "
+                    "'threshold'."
+                )
+        elif manifest.activation is SAEActivation.TOPK:
+            k = manifest.activation_params.get("k")
+            if (
+                isinstance(k, bool)
+                or not isinstance(k, (int, float))
+                or not math.isfinite(float(k))
+                or float(k) < 1.0
+                or float(k) != float(int(k))
+            ):
+                raise ValueError(
+                    f"{prefix}: topk activation_params requires a positive "
+                    "integer-valued 'k'."
+                )
+        else:
+            raise ValueError(
+                f"{prefix}: unsupported activation {manifest.activation!r}."
+            )
+        if not manifest.layers:
+            raise ValueError(f"{prefix}: layers must not be empty.")
+        seen_sites: set[tuple[int, str]] = set()
+        for layer_idx, hook_str in manifest.layers:
+            validate_steering_index(layer_idx, f"{prefix}: layer index")
+            if hook_str not in {hp.value for hp in SteeringHookPoint}:
+                raise ValueError(
+                    f"{prefix}: unknown hook point {hook_str!r} in layers."
+                )
+            site = (layer_idx, hook_str)
+            if site in seen_sites:
+                raise ValueError(
+                    f"{prefix}: layers must not contain duplicate "
+                    f"(layer_idx, hook_point) sites; got {site!r} more than once."
+                )
+            seen_sites.add(site)
+        if not manifest.clampable_features:
+            raise ValueError(f"{prefix}: clampable_features must not be empty.")
+        seen_features: set[int] = set()
+        for feat in manifest.clampable_features:
+            validate_steering_index(feat, f"{prefix}: clampable_features entry")
+            if feat >= manifest.d_sae:
+                raise ValueError(
+                    f"{prefix}: clampable_features entry {feat!r} is out "
+                    f"of range [0, d_sae={manifest.d_sae})."
+                )
+            if feat in seen_features:
+                raise ValueError(
+                    f"{prefix}: clampable_features must not contain "
+                    f"duplicates; got feature {feat!r} more than once."
+                )
+            seen_features.add(feat)
+
+    def _validate_worker_sae_site_ownership(
+        self,
+        name: str,
+        manifest: SAEModuleManifest,
+    ) -> None:
+        """Reject SAE site overlap before attaching per-layer buffers."""
+        new_sites = set(manifest.layers)
+        for other_name, other_manifest in self._sae_module_registry.items():
+            if other_name == name:
+                continue
+            overlap = new_sites & set(other_manifest.layers)
+            if overlap:
+                raise ValueError(
+                    f"SAE module {name!r}: layers overlap existing SAE "
+                    f"module {other_name!r} at site(s) {sorted(overlap)!r}.  "
+                    "At most one SAE module may own a (layer_idx, "
+                    "hook_point) site on a worker."
+                )
+
     def unregister_steering_modules(self, names: list[str]) -> None:
         """Drop the listed names from the worker-side registries.
 
@@ -673,6 +954,7 @@ class SteeringModelRunnerMixin:
         """
         for name in names:
             self._steering_module_registry.pop(name, None)
+            self._steering_module_resolved_cache.pop(name, None)
             if name in self._sae_module_registry:
                 self._detach_sae_buffers(name)
                 self._sae_module_registry.pop(name, None)
@@ -717,10 +999,13 @@ class SteeringModelRunnerMixin:
         ref_dtype: torch.dtype | None = None
         for attr in HOOK_POINT_TABLE_ATTR.values():
             if hasattr(any_layer, attr):
-                ref_dtype = getattr(any_layer, attr).dtype
+                ref_buffer = getattr(any_layer, attr)
+                ref_dtype = ref_buffer.dtype
+                table_device = ref_buffer.device
                 break
         if ref_dtype is None:
             ref_dtype = getattr(self.vllm_config.model_config, "dtype", torch.float32)
+            table_device = torch.device("cpu")
         scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
         max_tokens = (
             int(scheduler_config.max_num_batched_tokens)
@@ -752,12 +1037,24 @@ class SteeringModelRunnerMixin:
                 hidden_size=manifest.d_model,
                 max_sae_configs=max_sae_configs,
                 dtype=ref_dtype,
+                device=table_device,
             )
-            register_sae_index_buffer(layer, max_tokens=max_tokens)
             self._sae_steerable_sites[(module_name, layer_idx, hook_str)] = layer
+            register_sae_index_buffer(
+                layer, max_tokens=max_tokens, device=table_device
+            )
             attached_layers.append(layer)
         if attached_layers:
-            share_sae_index_across_layers(attached_layers)
+            # Share ``sae_index`` across every SAE-covered layer on this
+            # worker — not just the layers attached for *this* module.
+            # ``_update_sae_buffers`` writes through a single tensor
+            # picked from ``_sae_steerable_sites``; layers from a
+            # previously-registered SAE module whose ``sae_index`` was
+            # not rebound would gather row 0 and silently no-op.
+            unique_layers: dict[int, nn.Module] = {}
+            for layer in self._sae_steerable_sites.values():
+                unique_layers.setdefault(id(layer), layer)
+            share_sae_index_across_layers(list(unique_layers.values()))
             self._warmup_sae_kernel_for_module(
                 manifest=manifest,
                 attached_layers=attached_layers,
@@ -821,6 +1118,38 @@ class SteeringModelRunnerMixin:
                 continue
             unregister_sae_buffers(layer, hook_point=hook_point)
 
+    def _snapshot_sae_weights(
+        self, module_name: str
+    ) -> dict[tuple[int, str], dict[str, torch.Tensor]]:
+        """Clone the currently-attached SAE weights for ``module_name``.
+
+        Used by the rollback path: the encoder/decoder/encoder_bias
+        buffers are about to be destroyed by ``_detach_sae_buffers``
+        for a replacement registration, and we need a copy so the
+        prior weights can be restored if the new attach fails.
+        """
+        snapshot: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
+        for (name, layer_idx, hook_str), site in self._sae_steerable_sites.items():
+            if name != module_name:
+                continue
+            try:
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError:
+                continue
+            tensors: dict[str, torch.Tensor] = {}
+            for tensor_key, attr_table in (
+                ("encoder_weight", HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR),
+                ("encoder_bias", HOOK_POINT_SAE_ENCODER_BIAS_ATTR),
+                ("decoder_weight", HOOK_POINT_SAE_DECODER_WEIGHT_ATTR),
+            ):
+                buf = getattr(site, attr_table[hook_point], None)
+                if buf is None:
+                    continue
+                tensors[tensor_key] = buf.detach().clone()
+            if tensors:
+                snapshot[(layer_idx, hook_str)] = tensors
+        return snapshot
+
     def attach_sae_weights(
         self,
         module_name: str,
@@ -834,15 +1163,28 @@ class SteeringModelRunnerMixin:
         corresponding zero-initialised buffer in place; shape and
         dtype must match what ``_attach_sae_buffers`` allocated.
 
-        This is the test-injection / future-loader entry point.  A
-        manifest-driven on-disk loader (Phase 1B follow-up or Phase
-        1C) will call into this method once it has materialised
-        tensors per (layer, hook) site.
+        This is the injection point used by tests, runtime registration,
+        and startup/full-registry broadcasts after the on-disk loader has
+        materialised tensors per (layer, hook) site.
         """
         if module_name not in self._sae_module_registry:
             raise SteeringVectorError(
                 f"attach_sae_weights: SAE module {module_name!r} is not registered."
             )
+        expected_sites = {
+            (layer_idx, hook_str)
+            for name, layer_idx, hook_str in self._sae_steerable_sites
+            if name == module_name
+        }
+        provided_owned_sites = set(weights) & expected_sites
+        missing_sites = sorted(expected_sites - provided_owned_sites)
+        if missing_sites:
+            raise SteeringVectorError(
+                f"attach_sae_weights({module_name!r}): missing weights for "
+                f"owned SAE site(s): {missing_sites}."
+            )
+
+        copy_plan: list[tuple[torch.Tensor, torch.Tensor]] = []
         for (layer_idx, hook_str), tensors in weights.items():
             site = self._sae_steerable_sites.get((module_name, layer_idx, hook_str))
             if site is None:
@@ -864,9 +1206,28 @@ class SteeringModelRunnerMixin:
                         f"attach_sae_weights({module_name!r}): missing "
                         f"{tensor_key!r} for site (layer={layer_idx}, "
                         f"hook={hook_str!r})."
-                    )
+                )
                 buf = getattr(site, attr_table[hook_point])
-                src = tensors[tensor_key].to(dtype=buf.dtype, device=buf.device)
+                raw = tensors[tensor_key]
+                if not isinstance(raw, torch.Tensor):
+                    raise SteeringVectorError(
+                        f"attach_sae_weights({module_name!r}): {tensor_key} "
+                        f"must be a torch.Tensor, got {type(raw).__name__} at "
+                        f"site (layer={layer_idx}, hook={hook_str!r})."
+                    )
+                if not torch.is_floating_point(raw):
+                    raise SteeringVectorError(
+                        f"attach_sae_weights({module_name!r}): {tensor_key} "
+                        f"must have a floating dtype, got {raw.dtype} at "
+                        f"site (layer={layer_idx}, hook={hook_str!r})."
+                    )
+                if not bool(torch.isfinite(raw).all().item()):
+                    raise SteeringVectorError(
+                        f"attach_sae_weights({module_name!r}): {tensor_key} "
+                        "must contain only finite values at "
+                        f"site (layer={layer_idx}, hook={hook_str!r})."
+                    )
+                src = raw.to(dtype=buf.dtype, device=buf.device)
                 if src.shape != buf.shape:
                     raise SteeringVectorError(
                         f"attach_sae_weights({module_name!r}): {tensor_key} "
@@ -874,18 +1235,18 @@ class SteeringModelRunnerMixin:
                         f"shape {tuple(buf.shape)} at site "
                         f"(layer={layer_idx}, hook={hook_str!r})."
                     )
-                buf.copy_(src)
+                copy_plan.append((buf, src))
+        for buf, src in copy_plan:
+            buf.copy_(src)
 
     def _assert_sae_clamps_can_be_applied(self, sp: SamplingParams) -> None:
         """Validate ``sp.sae_clamp_specs`` against the worker SAE registry.
 
-        Phase-1B Stage 2 replaces the Phase-0 ``NotImplementedError``
-        with real validation that mirrors the strict-capacity contract
-        of the additive path: a request that names a missing SAE
-        module, references an unsupported ``(layer, hook)`` site, or
-        clamps a feature outside the module's
-        ``clampable_features`` set fails admission immediately rather
-        than silently running with stale buffers.
+        Mirrors the strict-capacity contract of the additive path: a
+        request that names a missing SAE module, references an
+        unsupported ``(layer, hook)`` site, or clamps a feature outside
+        the module's ``clampable_features`` set fails admission
+        immediately rather than silently running with stale buffers.
 
         Admission row allocation (registering the spec with the SAE
         manager) is done separately by
@@ -929,6 +1290,30 @@ class SteeringModelRunnerMixin:
                                 "clampable_features set."
                             )
 
+    def _req_sae_hash_map(self) -> dict[str, int]:
+        """Return request -> SAE row hash state, creating it for old tests."""
+        if not hasattr(self, "_req_sae_hash"):
+            self._req_sae_hash = {}
+        return self._req_sae_hash
+
+    def _set_req_sae_row(self, req_id: str, sae_hash: int, phase: str) -> None:
+        self._req_sae_phase[req_id] = phase
+        self._req_sae_hash_map()[req_id] = sae_hash
+
+    def _pop_req_sae_row(self, req_id: str) -> tuple[int, str] | None:
+        phase = self._req_sae_phase.pop(req_id, None)
+        sae_hash = self._req_sae_hash_map().pop(req_id, 0)
+        if phase is None:
+            return None
+        return sae_hash, phase
+
+    def _get_req_sae_row(self, req_id: str) -> tuple[int, str] | None:
+        phase = self._req_sae_phase.get(req_id)
+        sae_hash = self._req_sae_hash_map().get(req_id, 0)
+        if phase is None:
+            return None
+        return sae_hash, phase
+
     def _register_initial_sae_clamps(
         self,
         req_id: str,
@@ -943,21 +1328,25 @@ class SteeringModelRunnerMixin:
         admission flow: the scheduler reserves capacity at admission
         time, so registration is expected to succeed.  When the
         request is being admitted directly into decode (full prefix-
-        cache hit), uses ``decode_hash``; otherwise uses
-        ``prefill_hash`` and the prefill→decode transition path
-        registers the decode row.
+        cache hit), admits the decode-active SAE-only hash; otherwise
+        admits the prefill-active SAE-only hash and the prefill→decode
+        transition path registers the decode row.
         """
         mgr = self._sae_clamp_manager
         if mgr is None or not sp.sae_clamp_specs:
             return
+        prefill_specs = sp._phase_filtered_sae_specs("prefill")
+        decode_specs = sp._phase_filtered_sae_specs("decode")
+        prefill_sae_hash = sp.prefill_sae_clamp_config_hash
+        decode_sae_hash = sp.decode_sae_clamp_config_hash
         if is_prefilling:
-            if prefill_hash != 0:
-                mgr.register_clamp_spec(prefill_hash, sp.sae_clamp_specs, "prefill")
-                self._req_sae_phase[req_id] = "prefill"
+            if prefill_hash != 0 and prefill_sae_hash != 0 and prefill_specs:
+                mgr.register_clamp_spec(prefill_sae_hash, prefill_specs, "prefill")
+                self._set_req_sae_row(req_id, prefill_sae_hash, "prefill")
         else:
-            if decode_hash != 0:
-                mgr.register_clamp_spec(decode_hash, sp.sae_clamp_specs, "decode")
-                self._req_sae_phase[req_id] = "decode"
+            if decode_hash != 0 and decode_sae_hash != 0 and decode_specs:
+                mgr.register_clamp_spec(decode_sae_hash, decode_specs, "decode")
+                self._set_req_sae_row(req_id, decode_sae_hash, "decode")
 
     def _release_sae_for_request(
         self,
@@ -969,19 +1358,18 @@ class SteeringModelRunnerMixin:
         mgr = self._sae_clamp_manager
         if mgr is None:
             return
-        phase = self._req_sae_phase.pop(req_id, None)
-        if phase is None:
+        row = self._pop_req_sae_row(req_id)
+        if row is None:
             return
-        if phase == "prefill" and prefill_hash != 0:
-            mgr.release_clamp_spec(prefill_hash, "prefill")
-        elif phase == "decode" and decode_hash != 0:
-            mgr.release_clamp_spec(decode_hash, "decode")
+        sae_hash, phase = row
+        if sae_hash != 0:
+            mgr.release_clamp_spec(sae_hash, phase)
 
     def _resolve_request_steering(
         self,
         sp: SamplingParams,
         phase: str,
-    ) -> dict[str, dict[int, list[float]]] | None:
+    ) -> ResolvedSteeringVectorSpec | None:
         """Resolve the effective steering for a request in the given *phase*.
 
         Encapsulates the two cases:
@@ -1028,6 +1416,29 @@ class SteeringModelRunnerMixin:
                 "module was unregistered after the request was scheduled."
             )
 
+        inline_phase_spec = (
+            sp.prefill_steering_vectors
+            if phase == "prefill"
+            else sp.decode_steering_vectors
+        )
+
+        # Fast path: no inline overrides on either tier.  Use the
+        # pre-resolved cache populated at registration time and skip the
+        # per-request merge + resolve numpy work inherited from
+        # ``feat/steering``.
+        if sp.steering_vectors is None and inline_phase_spec is None:
+            cached = getattr(self, "_steering_module_resolved_cache", {}).get(name)
+            if cached is not None:
+                resolved = cached[0] if phase == "prefill" else cached[1]
+                if resolved is None:
+                    return None
+                if scale == 1.0:
+                    return resolved
+                return {
+                    hook: {layer: arr * scale for layer, arr in layer_dict.items()}
+                    for hook, layer_dict in resolved.items()
+                }
+
         base_spec, prefill_spec, decode_spec = module_specs
         scaled_base = scale_steering_spec(base_spec, scale)
         phase_module_spec = (
@@ -1035,12 +1446,6 @@ class SteeringModelRunnerMixin:
             if phase == "prefill"
             else scale_steering_spec(decode_spec, scale)
         )
-        inline_phase_spec = (
-            sp.prefill_steering_vectors
-            if phase == "prefill"
-            else sp.decode_steering_vectors
-        )
-
         merged_base = merge_steering_specs(scaled_base, sp.steering_vectors)
         merged_phase = merge_steering_specs(phase_module_spec, inline_phase_spec)
         return resolve_effective_vectors(merged_base, merged_phase)
@@ -1048,6 +1453,13 @@ class SteeringModelRunnerMixin:
     # -----------------------------------------------------------------------
     # Per-step buffer / index maintenance
     # -----------------------------------------------------------------------
+
+    def _transition_scan_candidates(self) -> set[str]:
+        candidates = self.__dict__.get("_req_transition_scan_candidates")
+        if not isinstance(candidates, set):
+            candidates = set()
+            self.__dict__["_req_transition_scan_candidates"] = candidates
+        return candidates
 
     def _update_steering_buffers(self, scheduler_output: "SchedulerOutput") -> None:
         """Update per-layer steering tables and the shared steering index.
@@ -1079,13 +1491,8 @@ class SteeringModelRunnerMixin:
         # We must zero it before returning to ensure all gathers point to
         # row 0. We only do this on the transition; in the steady "nothing
         # ever active" case the index is already zero from initialization.
-        sae_active = bool(
-            self._sae_clamp_manager is not None
-            and self._sae_clamp_manager.config_to_row
-        )
         if (
-            not sae_active
-            and not self._steering_manager.config_to_row
+            not self._steering_manager.config_to_row
             and not self._steering_manager.global_base_vectors
             and not self._steering_manager.global_prefill_vectors
             and not self._steering_manager.global_decode_vectors
@@ -1094,7 +1501,30 @@ class SteeringModelRunnerMixin:
                 any_layer = next(iter(self._steerable_layers_cache.values()))
                 steering_index = cast(torch.Tensor, any_layer.steering_index)
                 steering_index.zero_()
+                # Nothing-active transition: clear every per-layer
+                # ``_any_active`` flag so apply_steering short-circuits on
+                # this and subsequent steps.  Mirrors the index zero-out
+                # above — only paid on the active->inactive transition;
+                # steady-state inactive runs skip this branch entirely
+                # (``_steering_index_dirty`` stays False).
+                for mod in self._steerable_layers_cache.values():
+                    for hp in SteeringHookPoint:
+                        flag_buf = getattr(mod, HOOK_POINT_ANY_ACTIVE_ATTR[hp], None)
+                        if flag_buf is not None:
+                            flag_buf.zero_()
                 self._steering_index_dirty = False
+            # SAE buffers can remain attached after the last SAE row is
+            # released.  Keep their shared index in sync even when the
+            # additive path has no active work; otherwise stale nonzero
+            # row IDs from the previous steered step would keep applying
+            # released clamps.  Run SAE transitions after building the
+            # current step's SAE index so the final prefill token still
+            # sees the prefill row before it is released.
+            self._update_sae_buffers(scheduler_output)
+            if self._may_need_prefill_completion_transition_scan():
+                self._handle_sae_transitions_for_scheduled_prefill_completions(
+                    scheduler_output
+                )
             return
 
         # 1. Populate steering tables — but only if state has changed since
@@ -1134,13 +1564,15 @@ class SteeringModelRunnerMixin:
         # Grow per-request scratches if the batch ever exceeds the
         # initial sizing.  This is defensive — ``max_num_seqs`` should
         # bound ``num_reqs`` — but cheap to handle.
-        if rows_scratch.shape[0] < num_reqs:
+        if rows_scratch.shape[0] < num_reqs or n_tokens_scratch.shape[0] < num_reqs:
             rows_scratch = np.zeros(num_reqs, dtype=np.int64)
             n_tokens_scratch = np.zeros(num_reqs, dtype=np.int64)
             self._steering_rows_scratch = rows_scratch
             self._steering_n_tokens_scratch = n_tokens_scratch
 
         active_count = 0
+        steering_transitions: list[tuple[str, int, int, SamplingParams | None]] = []
+        sae_transitions: list[tuple[str, int, int, SamplingParams | None]] = []
         for i in range(num_reqs):
             req_id = req_ids[i]
             n_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
@@ -1166,26 +1598,58 @@ class SteeringModelRunnerMixin:
                 prefill_hash = int(
                     self.input_batch.request_prefill_steering_hash[req_index]
                 )
+                # A request that carries only SAE clamps has a nonzero
+                # combined request hash but no additive entry.  Gate the
+                # additive lookup on this manager's row map and fall back
+                # to the global no-op row (hash==0 semantics).
+                if (
+                    prefill_hash != 0
+                    and (prefill_hash, "prefill")
+                    not in self._steering_manager.config_to_row
+                ):
+                    additive_hash = 0
+                else:
+                    additive_hash = prefill_hash
                 row = self._steering_manager.get_row_for_config(
-                    prefill_hash, is_prefill=True
+                    additive_hash, is_prefill=True
                 )
                 rows_scratch[active_count] = row
                 n_tokens_scratch[active_count] = n_tokens
 
                 # Check if this request will transition to decode after
                 # this step's tokens are processed. Must happen in this
-                # same pass — the registration / refcount semantics are
-                # externally observable.
+                # same pass, after the current step's prefill index has
+                # been built.  Collect transitions and apply them in a
+                # release-all/register-all order after the loop: if two
+                # requests share the same prefill row and finish together,
+                # the first decode registration must not see the shared
+                # prefill row as still occupied by the second request.
                 num_computed_after = num_computed + n_tokens
                 if num_computed_after >= num_prompt:
-                    self._handle_steering_transition(req_id, req_index, prefill_hash)
+                    decode_hash = int(
+                        self.input_batch.request_decode_steering_hash[req_index]
+                    )
+                    req_state = self.requests.get(req_id)
+                    sp = req_state.sampling_params if req_state is not None else None
+                    steering_transitions.append(
+                        (req_id, prefill_hash, decode_hash, sp)
+                    )
+                    sae_transitions.append((req_id, prefill_hash, decode_hash, sp))
             else:
                 # Decode: use decode steering hash
                 decode_hash = int(
                     self.input_batch.request_decode_steering_hash[req_index]
                 )
+                if (
+                    decode_hash != 0
+                    and (decode_hash, "decode")
+                    not in self._steering_manager.config_to_row
+                ):
+                    additive_hash = 0
+                else:
+                    additive_hash = decode_hash
                 row = self._steering_manager.get_row_for_config(
-                    decode_hash, is_prefill=False
+                    additive_hash, is_prefill=False
                 )
                 rows_scratch[active_count] = row
                 n_tokens_scratch[active_count] = n_tokens
@@ -1225,11 +1689,167 @@ class SteeringModelRunnerMixin:
         # if needed when transitioning back to "nothing active".
         self._steering_index_dirty = True
 
+        self._apply_batched_steering_transitions(steering_transitions)
+
         # Parallel SAE pass: populate per-(layer, hook) SAE clamp
         # tables and build the shared sae_index.  Independent of the
         # additive flow above — a request may carry only additive,
         # only SAE, or both.
         self._update_sae_buffers(scheduler_output)
+        self._apply_batched_sae_transitions(sae_transitions)
+
+    def _apply_batched_steering_transitions(
+        self,
+        transitions: list[tuple[str, int, int, SamplingParams | None]],
+    ) -> None:
+        """Apply prefill->decode additive transitions for one scheduler step.
+
+        The current step's ``steering_index`` is already built against
+        prefill rows.  Release all completed prefill references before
+        registering any decode rows so requests sharing the same prefill row
+        can free it before the first decode allocation is attempted.
+        """
+        if not transitions:
+            return
+        mgr = self._steering_manager
+        assert mgr is not None, (
+            "_apply_batched_steering_transitions called without an "
+            "initialised manager"
+        )
+        for _req_id, prefill_hash, _decode_hash, _sp in transitions:
+            if prefill_hash != 0:
+                mgr.release_config(prefill_hash, "prefill")
+
+        for req_id, _prefill_hash, decode_hash, sp in transitions:
+            if decode_hash != 0 and sp is not None:
+                effective_decode = self._resolve_request_steering(sp, "decode")
+                if effective_decode:
+                    mgr.register_config(
+                        decode_hash,
+                        effective_decode,
+                        phase="decode",
+                        content_hash=sp.decode_additive_steering_config_hash,
+                        locally_owned_layers=self._locally_owned_layers,
+                    )
+            self._req_steering_phase[req_id] = "decode"
+            self._transition_scan_candidates().discard(req_id)
+
+    def _apply_batched_sae_transitions(
+        self,
+        transitions: list[tuple[str, int, int, SamplingParams | None]],
+    ) -> None:
+        """Apply prefill->decode SAE transitions for one scheduler step."""
+        if not transitions:
+            return
+        sae_mgr = self._sae_clamp_manager
+        if sae_mgr is None:
+            return
+
+        for req_id, _prefill_hash, _decode_hash, _sp in transitions:
+            old_row = self._get_req_sae_row(req_id)
+            if old_row is not None and old_row[1] == "prefill" and old_row[0] != 0:
+                sae_mgr.release_clamp_spec(old_row[0], "prefill")
+                self._pop_req_sae_row(req_id)
+
+        for req_id, _prefill_hash, decode_hash, sp in transitions:
+            decode_specs = (
+                sp._phase_filtered_sae_specs("decode")
+                if sp is not None and sp.sae_clamp_specs
+                else None
+            )
+            decode_sae_hash = (
+                sp.decode_sae_clamp_config_hash
+                if sp is not None and sp.sae_clamp_specs
+                else 0
+            )
+            if decode_hash != 0 and decode_sae_hash != 0 and decode_specs:
+                sae_mgr.register_clamp_spec(decode_sae_hash, decode_specs, "decode")
+                self._set_req_sae_row(req_id, decode_sae_hash, "decode")
+            else:
+                self._pop_req_sae_row(req_id)
+            self._transition_scan_candidates().discard(req_id)
+
+    def _handle_sae_transitions_for_scheduled_prefill_completions(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Run prefill->decode transitions when additive work is inactive.
+
+        ``_update_steering_buffers`` has a fast path for the common case
+        where additive steering has no active rows or globals.  SAE-only
+        and decode-only-additive requests can still need a transition on
+        the final prefill token, so this mirrors the transition detection
+        from the main loop without rebuilding the additive index.
+        """
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids
+        transitions: list[tuple[str, int, int, SamplingParams | None]] = []
+        for i in range(num_reqs):
+            req_id = req_ids[i]
+            n_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if n_tokens == 0:
+                continue
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+            if num_computed >= num_prompt or num_computed + n_tokens < num_prompt:
+                continue
+            prefill_hash = int(
+                self.input_batch.request_prefill_steering_hash[req_index]
+            )
+            decode_hash = int(self.input_batch.request_decode_steering_hash[req_index])
+            if (
+                prefill_hash == 0
+                and decode_hash == 0
+                and req_id not in self._req_sae_phase
+                and req_id not in self._transition_scan_candidates()
+            ):
+                continue
+            req_state = self.requests.get(req_id)
+            sp = req_state.sampling_params if req_state is not None else None
+            transitions.append((req_id, prefill_hash, decode_hash, sp))
+        self._apply_batched_steering_transitions(transitions)
+        self._apply_batched_sae_transitions(transitions)
+
+    def _may_need_prefill_completion_transition_scan(self) -> bool:
+        """Return whether no-active shortcut must scan for phase transitions."""
+        # The additive no-active shortcut is only reached when the additive
+        # manager has no active rows or globals.  Decode-only additive rows
+        # would keep the additive manager active, so the remaining transition
+        # work here is for SAE-only requests whose prefill row must stay live
+        # through the final prefill token, plus decode-only requests that have
+        # no prefill row to keep the additive manager active.
+        return (
+            any(phase == "prefill" for phase in self._req_sae_phase.values())
+            or bool(self._transition_scan_candidates())
+        )
+
+    def _handle_sae_transition(
+        self,
+        req_id: str,
+        prefill_hash: int,
+        decode_hash: int,
+        sp: SamplingParams | None,
+    ) -> None:
+        """Release prefill SAE row and register decode SAE row."""
+        sae_mgr = self._sae_clamp_manager
+        if sae_mgr is None or sp is None or not sp.sae_clamp_specs:
+            return
+        old_row = self._get_req_sae_row(req_id)
+        if old_row is not None and old_row[1] == "prefill" and old_row[0] != 0:
+            sae_mgr.release_clamp_spec(old_row[0], "prefill")
+            self._pop_req_sae_row(req_id)
+        decode_specs = sp._phase_filtered_sae_specs("decode")
+        decode_sae_hash = sp.decode_sae_clamp_config_hash
+        if decode_hash != 0 and decode_sae_hash != 0 and decode_specs:
+            sae_mgr.register_clamp_spec(decode_sae_hash, decode_specs, "decode")
+            self._set_req_sae_row(req_id, decode_sae_hash, "decode")
+        else:
+            # Decode hash is 0 → no SAE state in decode (e.g.
+            # spec.phase == "prefill").  Drop the tracking entry.
+            self._pop_req_sae_row(req_id)
 
     def _update_sae_buffers(self, scheduler_output: "SchedulerOutput") -> None:
         """Populate SAE per-layer clamp tables and the shared ``sae_index``.
@@ -1244,6 +1864,40 @@ class SteeringModelRunnerMixin:
         """
         sae_mgr = self._sae_clamp_manager
         if sae_mgr is None or not self._sae_steerable_sites:
+            return
+
+        def clear_sae_any_active_flags() -> None:
+            for (_module_name, _layer_idx, hook_str), site in (
+                self._sae_steerable_sites.items()
+            ):
+                try:
+                    hook_point = SteeringHookPoint(hook_str)
+                except ValueError:
+                    continue
+                flag_buf = getattr(
+                    site,
+                    HOOK_POINT_SAE_ANY_ACTIVE_ATTR[hook_point],
+                    None,
+                )
+                if flag_buf is not None:
+                    flag_buf.zero_()
+
+        # Fast no-active path: if every SAE row has been released, the
+        # only required work is clearing a previously nonzero shared
+        # index.  Stale nonzero table rows are harmless once no token
+        # points at them.  Clear each site's ``any_active`` flag on the
+        # active->inactive transition so layer hooks skip the SAE op
+        # entirely until a later row reuse repopulates tables.
+        if not sae_mgr.config_to_row:
+            if sae_mgr._tables_dirty:
+                clear_sae_any_active_flags()
+                sae_mgr.mark_tables_clean()
+            if self._sae_index_dirty:
+                any_layer = next(iter(self._sae_steerable_sites.values()))
+                if hasattr(any_layer, "sae_index"):
+                    sae_index = cast(torch.Tensor, any_layer.sae_index)
+                    sae_index.zero_()
+                self._sae_index_dirty = False
             return
 
         # 1. Flush manager rows into per-(layer, hook) clamp tables.
@@ -1297,9 +1951,11 @@ class SteeringModelRunnerMixin:
         index_pinned = self._sae_index_pinned
         if rows_scratch is None or n_tokens_scratch is None or index_pinned is None:
             return
-        if rows_scratch.shape[0] < num_reqs:
+        if rows_scratch.shape[0] < num_reqs or n_tokens_scratch.shape[0] < num_reqs:
             rows_scratch = np.zeros(num_reqs, dtype=np.int64)
+            n_tokens_scratch = np.zeros(num_reqs, dtype=np.int64)
             self._sae_rows_scratch = rows_scratch
+            self._steering_n_tokens_scratch = n_tokens_scratch
 
         active_count = 0
         for i in range(num_reqs):
@@ -1318,15 +1974,36 @@ class SteeringModelRunnerMixin:
             num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
             num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
             is_prefilling = num_computed < num_prompt
+            tracked_sae_row = self._get_req_sae_row(req_id)
 
             if is_prefilling:
-                hash_val = int(
+                combined_hash = int(
                     self.input_batch.request_prefill_steering_hash[req_index]
                 )
-                row = sae_mgr.get_row_for_config(hash_val, is_prefill=True)
+                sae_hash = tracked_sae_row[0] if tracked_sae_row is not None else 0
+                if (
+                    combined_hash == 0
+                    or sae_hash == 0
+                    or tracked_sae_row is None
+                    or tracked_sae_row[1] != "prefill"
+                    or (sae_hash, "prefill") not in sae_mgr.config_to_row
+                ):
+                    sae_hash = 0
+                row = sae_mgr.get_row_for_config(sae_hash, is_prefill=True)
             else:
-                hash_val = int(self.input_batch.request_decode_steering_hash[req_index])
-                row = sae_mgr.get_row_for_config(hash_val, is_prefill=False)
+                combined_hash = int(
+                    self.input_batch.request_decode_steering_hash[req_index]
+                )
+                sae_hash = tracked_sae_row[0] if tracked_sae_row is not None else 0
+                if (
+                    combined_hash == 0
+                    or sae_hash == 0
+                    or tracked_sae_row is None
+                    or tracked_sae_row[1] != "decode"
+                    or (sae_hash, "decode") not in sae_mgr.config_to_row
+                ):
+                    sae_hash = 0
+                row = sae_mgr.get_row_for_config(sae_hash, is_prefill=False)
             rows_scratch[active_count] = row
             n_tokens_scratch[active_count] = n_tokens
             active_count += 1
@@ -1345,12 +2022,15 @@ class SteeringModelRunnerMixin:
 
         if n_expanded < sae_index.shape[0]:
             sae_index[n_expanded:].zero_()
+        self._sae_index_dirty = True
 
     def _handle_steering_transition(
         self,
         req_id: str,
         req_index: int,
         prefill_hash: int,
+        *,
+        handle_sae: bool = True,
     ) -> None:
         """Handle prefill->decode steering config transition.
 
@@ -1373,7 +2053,6 @@ class SteeringModelRunnerMixin:
             mgr.release_config(prefill_hash, "prefill")
 
         decode_hash = int(self.input_batch.request_decode_steering_hash[req_index])
-        sae_mgr = self._sae_clamp_manager
         req_state = self.requests.get(req_id)
         sp = req_state.sampling_params if req_state is not None else None
         if decode_hash != 0 and sp is not None:
@@ -1383,24 +2062,19 @@ class SteeringModelRunnerMixin:
                     decode_hash,
                     effective_decode,
                     phase="decode",
+                    content_hash=sp.decode_additive_steering_config_hash,
                     locally_owned_layers=self._locally_owned_layers,
                 )
 
         self._req_steering_phase[req_id] = "decode"
 
-        # SAE-side transition: release prefill row, register decode row
-        # if the request carried any clamps.
-        if sae_mgr is not None and sp is not None and sp.sae_clamp_specs:
-            old_phase = self._req_sae_phase.get(req_id)
-            if old_phase == "prefill" and prefill_hash != 0:
-                sae_mgr.release_clamp_spec(prefill_hash, "prefill")
-            if decode_hash != 0:
-                sae_mgr.register_clamp_spec(decode_hash, sp.sae_clamp_specs, "decode")
-                self._req_sae_phase[req_id] = "decode"
-            else:
-                # Decode hash is 0 → no SAE state in decode (e.g.
-                # spec.phase == "prefill").  Drop the tracking entry.
-                self._req_sae_phase.pop(req_id, None)
+        # SAE-side transition must happen after the current step's
+        # ``sae_index`` is populated.  The main update loop passes
+        # ``handle_sae=False`` and calls this separately after
+        # ``_update_sae_buffers``; direct callers keep the historical
+        # one-shot behavior.
+        if handle_sae:
+            self._handle_sae_transition(req_id, prefill_hash, decode_hash, sp)
 
     def _reset_steering_for_resumption(
         self,
@@ -1428,6 +2102,8 @@ class SteeringModelRunnerMixin:
         if new_num_computed_tokens >= req_state.num_prompt_tokens:
             return  # still in decode, nothing to reset
 
+        self._transition_scan_candidates().discard(req_id)
+
         # Release the stale decode config.
         if req_state.decode_steering_config_hash != 0:
             mgr.release_config(req_state.decode_steering_config_hash, "decode")
@@ -1437,6 +2113,7 @@ class SteeringModelRunnerMixin:
         sp = req_state.sampling_params
         prefill_hash = req_state.prefill_steering_config_hash
         decode_hash = req_state.decode_steering_config_hash
+        additive_registered: tuple[int, str] | None = None
         if sp is not None and prefill_hash != 0:
             effective_prefill = self._resolve_request_steering(sp, "prefill")
             if effective_prefill:
@@ -1444,22 +2121,45 @@ class SteeringModelRunnerMixin:
                     prefill_hash,
                     effective_prefill,
                     phase="prefill",
+                    content_hash=sp.prefill_additive_steering_config_hash,
                     locally_owned_layers=self._locally_owned_layers,
                 )
+                additive_registered = (prefill_hash, "prefill")
+            elif decode_hash != 0:
+                self._transition_scan_candidates().add(req_id)
+        elif decode_hash != 0:
+            self._transition_scan_candidates().add(req_id)
 
         # SAE-side reset: a request being resumed back into prefill
         # also needs its SAE row reset.  Release any decode-phase row
         # we admitted, then register the prefill row.
         sae_mgr = self._sae_clamp_manager
         if sae_mgr is not None and sp is not None and sp.sae_clamp_specs:
-            old_phase = self._req_sae_phase.get(req_id)
-            if old_phase == "decode" and decode_hash != 0:
-                sae_mgr.release_clamp_spec(decode_hash, "decode")
-            if prefill_hash != 0:
-                sae_mgr.register_clamp_spec(prefill_hash, sp.sae_clamp_specs, "prefill")
-                self._req_sae_phase[req_id] = "prefill"
-            else:
-                self._req_sae_phase.pop(req_id, None)
+            try:
+                old_row = self._get_req_sae_row(req_id)
+                if (
+                    old_row is not None
+                    and old_row[1] == "decode"
+                    and old_row[0] != 0
+                ):
+                    sae_mgr.release_clamp_spec(old_row[0], "decode")
+                    self._pop_req_sae_row(req_id)
+                prefill_specs = sp._phase_filtered_sae_specs("prefill")
+                prefill_sae_hash = sp.prefill_sae_clamp_config_hash
+                if prefill_hash != 0 and prefill_sae_hash != 0 and prefill_specs:
+                    sae_mgr.register_clamp_spec(
+                        prefill_sae_hash, prefill_specs, "prefill"
+                    )
+                    self._set_req_sae_row(req_id, prefill_sae_hash, "prefill")
+                else:
+                    self._pop_req_sae_row(req_id)
+            except Exception:
+                if additive_registered is not None:
+                    mgr.release_config(*additive_registered)
+                self._req_steering_phase.pop(req_id, None)
+                self._pop_req_sae_row(req_id)
+                self._transition_scan_candidates().discard(req_id)
+                raise
 
     # -----------------------------------------------------------------------
     # Hooks called from _update_states() / _update_streaming_request()
@@ -1475,13 +2175,12 @@ class SteeringModelRunnerMixin:
         ``decode_steering_config_hash`` are still accessible.
         """
         mgr = self._steering_manager
-        if mgr is None:
-            return
 
         for req_id in finished_req_ids:
+            self._transition_scan_candidates().discard(req_id)
             phase = self._req_steering_phase.pop(req_id, None)
             req_state = self.requests.get(req_id)
-            if phase is not None and req_state is not None:
+            if mgr is not None and phase is not None and req_state is not None:
                 if phase == "prefill":
                     h = req_state.prefill_steering_config_hash
                 else:
@@ -1525,6 +2224,8 @@ class SteeringModelRunnerMixin:
         prefill_hash = new_req_data.prefill_steering_config_hash
         decode_hash = new_req_data.decode_steering_config_hash
         is_prefilling = new_req_data.num_computed_tokens < req_state.num_prompt_tokens
+        prefill_registered = False
+        additive_registered: tuple[int, str] | None = None
         if not is_prefilling:
             # Already past prefill — register decode config.
             effective_decode = self._resolve_request_steering(sp, "decode")
@@ -1533,8 +2234,10 @@ class SteeringModelRunnerMixin:
                     decode_hash,
                     effective_decode,
                     phase="decode",
+                    content_hash=sp.decode_additive_steering_config_hash,
                     locally_owned_layers=self._locally_owned_layers,
                 )
+                additive_registered = (decode_hash, "decode")
             self._req_steering_phase[req_id] = "decode"
         else:
             # Normal: start in prefill; decode registered
@@ -1545,15 +2248,37 @@ class SteeringModelRunnerMixin:
                     prefill_hash,
                     effective_prefill,
                     phase="prefill",
+                    content_hash=sp.prefill_additive_steering_config_hash,
                     locally_owned_layers=self._locally_owned_layers,
                 )
+                prefill_registered = True
+                additive_registered = (prefill_hash, "prefill")
             self._req_steering_phase[req_id] = "prefill"
-        # SAE-side admission runs in parallel: the prefill / decode
-        # config hash already encodes both additive and SAE state, so
-        # the same hash drives both managers' row allocation.
-        self._register_initial_sae_clamps(
-            req_id, sp, prefill_hash, decode_hash, is_prefilling
-        )
+        # SAE-side admission runs in parallel using SAE-only row hashes;
+        # additive and SAE managers deduplicate independently.
+        try:
+            self._register_initial_sae_clamps(
+                req_id, sp, prefill_hash, decode_hash, is_prefilling
+            )
+        except Exception:
+            if additive_registered is not None:
+                mgr.release_config(*additive_registered)
+            self._req_steering_phase.pop(req_id, None)
+            self._pop_req_sae_row(req_id)
+            self._transition_scan_candidates().discard(req_id)
+            raise
+        if is_prefilling:
+            prefill_sae_specs = (
+                sp._phase_filtered_sae_specs("prefill")
+                if sp.sae_clamp_specs
+                else None
+            )
+            if (
+                decode_hash != 0
+                and not prefill_registered
+                and not prefill_sae_specs
+            ):
+                self._transition_scan_candidates().add(req_id)
 
     def _refresh_streaming_steering(
         self,
@@ -1563,6 +2288,7 @@ class SteeringModelRunnerMixin:
         old_decode_hash: int,
         new_prefill_hash: int,
         new_decode_hash: int,
+        old_sampling_params: "SamplingParams | None" = None,
     ) -> None:
         """Refresh steering state for a streaming re-added request.
 
@@ -1580,53 +2306,153 @@ class SteeringModelRunnerMixin:
         if mgr is None:
             return
 
-        # Release the old phase config.
-        old_phase = self._req_steering_phase.get(req_id)
-        if old_phase is not None:
-            if old_phase == "prefill" and old_prefill_hash != 0:
-                mgr.release_config(old_prefill_hash, "prefill")
-            elif old_phase == "decode" and old_decode_hash != 0:
-                mgr.release_config(old_decode_hash, "decode")
-
-        # Register new prefill config (streaming re-adds start
-        # in prefill).
         sp = new_req_data.sampling_params
-        effective_prefill = (
-            self._resolve_request_steering(sp, "prefill") if sp is not None else None
-        )
-        if new_prefill_hash != 0 and sp is not None and effective_prefill:
-            mgr.register_config(
-                new_prefill_hash,
-                effective_prefill,
-                phase="prefill",
-                locally_owned_layers=self._locally_owned_layers,
-            )
-            self._req_steering_phase[req_id] = "prefill"
-        elif new_prefill_hash == 0 and new_decode_hash == 0:
-            # No steering for this request anymore.
-            self._req_steering_phase.pop(req_id, None)
-        else:
-            # Has hashes but no effective prefill vectors (e.g.,
-            # decode-only steering).  Mark as prefill since the
-            # request re-enters prefill; transition to decode
-            # will handle decode registration.
-            self._req_steering_phase[req_id] = "prefill"
+        if sp is not None:
+            self._assert_sae_clamps_can_be_applied(sp)
 
-        # SAE-side refresh: same release/register dance against the
-        # SAE manager.  A streaming re-add always re-enters prefill,
-        # so register the new prefill SAE clamps if the request
-        # carries any.
+        old_phase = self._req_steering_phase.get(req_id)
+        old_sp: SamplingParams | None
+        if old_sampling_params is not None:
+            old_sp = old_sampling_params
+        else:
+            old_req_state = self.requests.get(req_id)
+            old_sp = (
+                old_req_state.sampling_params
+                if old_req_state is not None
+                and getattr(old_req_state, "sampling_params", None) is not None
+                else None
+            )
+        old_additive_restore: tuple[int, str, dict, int] | None = None
+        if old_phase is not None and old_sp is not None:
+            old_hash = old_prefill_hash if old_phase == "prefill" else old_decode_hash
+            if old_hash != 0:
+                old_effective = self._resolve_request_steering(old_sp, old_phase)
+                if old_effective:
+                    old_content_hash = (
+                        old_sp.prefill_additive_steering_config_hash
+                        if old_phase == "prefill"
+                        else old_sp.decode_additive_steering_config_hash
+                    )
+                    old_additive_restore = (
+                        old_hash,
+                        old_phase,
+                        old_effective,
+                        old_content_hash,
+                    )
+
         sae_mgr = self._sae_clamp_manager
+        old_sae_restore: tuple[int, str, tuple] | None = None
         if sae_mgr is not None:
-            old_sae_phase = self._req_sae_phase.get(req_id)
-            if old_sae_phase == "prefill" and old_prefill_hash != 0:
-                sae_mgr.release_clamp_spec(old_prefill_hash, "prefill")
-            elif old_sae_phase == "decode" and old_decode_hash != 0:
-                sae_mgr.release_clamp_spec(old_decode_hash, "decode")
-            if sp is not None and sp.sae_clamp_specs and new_prefill_hash != 0:
-                sae_mgr.register_clamp_spec(
-                    new_prefill_hash, sp.sae_clamp_specs, "prefill"
+            old_sae_row = self._get_req_sae_row(req_id)
+            if old_sae_row is not None and old_sae_row[0] != 0:
+                old_sae_specs = sae_mgr.config_specs.get(old_sae_row)
+                if old_sae_specs is not None:
+                    old_sae_restore = (old_sae_row[0], old_sae_row[1], old_sae_specs)
+
+        transition_candidates = self.__dict__.get("_req_transition_scan_candidates")
+        if not isinstance(transition_candidates, set):
+            transition_candidates = set()
+            self.__dict__["_req_transition_scan_candidates"] = transition_candidates
+        was_transition_candidate = req_id in transition_candidates
+
+        def restore_old_state() -> None:
+            if old_additive_restore is not None:
+                old_hash, phase, old_effective, old_content_hash = (
+                    old_additive_restore
                 )
-                self._req_sae_phase[req_id] = "prefill"
+                mgr.register_config(
+                    old_hash,
+                    old_effective,
+                    phase=phase,
+                    content_hash=old_content_hash,
+                    locally_owned_layers=self._locally_owned_layers,
+                )
+            if old_phase is not None:
+                self._req_steering_phase[req_id] = old_phase
+            else:
+                self._req_steering_phase.pop(req_id, None)
+            if sae_mgr is not None and old_sae_restore is not None:
+                old_sae_hash, old_sae_phase, old_sae_specs = old_sae_restore
+                sae_mgr.register_clamp_spec(
+                    old_sae_hash, old_sae_specs, old_sae_phase
+                )
+                self._set_req_sae_row(req_id, old_sae_hash, old_sae_phase)
+            elif sae_mgr is not None:
+                self._pop_req_sae_row(req_id)
+            if was_transition_candidate:
+                transition_candidates.add(req_id)
+            else:
+                transition_candidates.discard(req_id)
+
+        # Release the old phase config.
+        transition_candidates.discard(req_id)
+        additive_registered: tuple[int, str] | None = None
+        try:
+            if old_phase is not None:
+                if old_phase == "prefill" and old_prefill_hash != 0:
+                    mgr.release_config(old_prefill_hash, "prefill")
+                elif old_phase == "decode" and old_decode_hash != 0:
+                    mgr.release_config(old_decode_hash, "decode")
+
+            # Register new prefill config (streaming re-adds start
+            # in prefill).
+            effective_prefill = (
+                self._resolve_request_steering(sp, "prefill")
+                if sp is not None
+                else None
+            )
+            if new_prefill_hash != 0 and sp is not None and effective_prefill:
+                mgr.register_config(
+                    new_prefill_hash,
+                    effective_prefill,
+                    phase="prefill",
+                    content_hash=sp.prefill_additive_steering_config_hash,
+                    locally_owned_layers=self._locally_owned_layers,
+                )
+                additive_registered = (new_prefill_hash, "prefill")
+                self._req_steering_phase[req_id] = "prefill"
             elif new_prefill_hash == 0 and new_decode_hash == 0:
-                self._req_sae_phase.pop(req_id, None)
+                # No steering for this request anymore.
+                self._req_steering_phase.pop(req_id, None)
+            else:
+                # Has hashes but no effective prefill vectors (e.g.,
+                # decode-only steering).  Mark as prefill since the
+                # request re-enters prefill; transition to decode
+                # will handle decode registration.
+                self._req_steering_phase[req_id] = "prefill"
+                if new_decode_hash != 0:
+                    transition_candidates.add(req_id)
+
+            # SAE-side refresh: same release/register dance against the
+            # SAE manager.  A streaming re-add always re-enters prefill,
+            # so register the new prefill SAE clamps if the request
+            # carries any.
+            if sae_mgr is not None:
+                old_row = self._get_req_sae_row(req_id)
+                if old_row is not None and old_row[0] != 0:
+                    sae_mgr.release_clamp_spec(old_row[0], old_row[1])
+                    self._pop_req_sae_row(req_id)
+                prefill_specs = (
+                    sp._phase_filtered_sae_specs("prefill")
+                    if sp is not None and sp.sae_clamp_specs
+                    else None
+                )
+                prefill_sae_hash = (
+                    sp.prefill_sae_clamp_config_hash
+                    if sp is not None and sp.sae_clamp_specs
+                    else 0
+                )
+                if new_prefill_hash != 0 and prefill_sae_hash != 0 and prefill_specs:
+                    sae_mgr.register_clamp_spec(
+                        prefill_sae_hash, prefill_specs, "prefill"
+                    )
+                    self._set_req_sae_row(req_id, prefill_sae_hash, "prefill")
+                else:
+                    self._pop_req_sae_row(req_id)
+        except Exception:
+            if additive_registered is not None:
+                mgr.release_config(*additive_registered)
+            self._req_steering_phase.pop(req_id, None)
+            self._pop_req_sae_row(req_id)
+            restore_old_state()
+            raise

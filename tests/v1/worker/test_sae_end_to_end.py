@@ -30,8 +30,10 @@ What's covered:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
 
@@ -40,16 +42,19 @@ from vllm.config.sae_steering_types import (
     SAEClampEntry,
     SAEClampSpec,
 )
+from vllm.exceptions import SteeringVectorError
 from vllm.model_executor.layers.sae_steering import (
+    HOOK_POINT_SAE_ANY_ACTIVE_ATTR,
     HOOK_POINT_SAE_CLAMP_KIND_ATTR,
     sae_buffers_attached,
 )
 from vllm.model_executor.layers.steering import (
-    HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
     apply_layer_steering,
+    register_steering_buffers,
 )
 from vllm.v1.worker.sae_clamp_manager import SAEClampManager
+from vllm.v1.worker.steering_manager import SteeringManager
 from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 
 
@@ -105,14 +110,12 @@ class _StubSchedulerOutput:
 def _make_decoder_layer(layer_idx: int, hidden_size: int = 4) -> nn.Module:
     m = nn.Module()
     m.layer_idx = layer_idx  # type: ignore[attr-defined]
-    for hp in SteeringHookPoint:
-        m.register_buffer(
-            HOOK_POINT_TABLE_ATTR[hp],
-            torch.zeros(7, hidden_size, dtype=torch.float32),
-            persistent=False,
-        )
-    m.register_buffer(
-        "steering_index", torch.zeros(16, dtype=torch.long), persistent=False
+    register_steering_buffers(
+        m,
+        hidden_size,
+        max_steering_tokens=16,
+        max_steering_configs=4,
+        dtype=torch.float32,
     )
     return m
 
@@ -142,6 +145,7 @@ class _E2EHarness(SteeringModelRunnerMixin):
         self._sae_steerable_sites: dict = {}
         self._req_sae_phase: dict = {}
         self._req_steering_phase: dict = {}
+        self._req_transition_scan_candidates: set[str] = set()
         self._steering_index_dirty = False
         self._sae_clamp_manager = SAEClampManager(max_sae_configs)
         self._steering_manager = None  # SAE-only path for these tests
@@ -358,21 +362,20 @@ class TestPrefillToDecodeTransition:
         h._register_initial_sae_clamps(
             "req-1", sp, prefill_hash=100, decode_hash=200, is_prefilling=True
         )
+        prefill_sae_hash = sp.prefill_sae_clamp_config_hash
+        decode_sae_hash = sp.decode_sae_clamp_config_hash
         # Pre-transition: prefill row registered.
-        assert (100, "prefill") in h._sae_clamp_manager.config_to_row
-        assert (200, "decode") not in h._sae_clamp_manager.config_to_row
+        assert (prefill_sae_hash, "prefill") in h._sae_clamp_manager.config_to_row
+        assert (decode_sae_hash, "decode") not in h._sae_clamp_manager.config_to_row
 
         # Drive a transition manually (the additive path normally does
         # this from _update_steering_buffers; we exercise the SAE half
         # directly because the additive path is None in this harness).
-        # Mirror what _handle_steering_transition's SAE block does.
-        h._sae_clamp_manager.release_clamp_spec(100, "prefill")
-        h._sae_clamp_manager.register_clamp_spec(200, sp.sae_clamp_specs, "decode")
-        h._req_sae_phase["req-1"] = "decode"
+        h._handle_sae_transition("req-1", prefill_hash=100, decode_hash=200, sp=sp)
 
         # Post-transition: decode row replaces prefill row.
-        assert (100, "prefill") not in h._sae_clamp_manager.config_to_row
-        assert (200, "decode") in h._sae_clamp_manager.config_to_row
+        assert (prefill_sae_hash, "prefill") not in h._sae_clamp_manager.config_to_row
+        assert (decode_sae_hash, "decode") in h._sae_clamp_manager.config_to_row
 
         # Decode step: request is past prefill, hash 200 is the decode hash.
         h.input_batch.num_reqs = 1
@@ -390,6 +393,148 @@ class TestPrefillToDecodeTransition:
         out = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
         # Feature 0 clamped to 5: out[0,0] = 5.
         assert out[0, 0].item() == 5.0
+
+    def test_update_steering_buffers_keeps_sae_on_final_prefill_token(self):
+        from vllm.v1.worker.steering_manager import SteeringManager
+
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        sp = SamplingParams(sae_clamp_specs=(spec,))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=100, decode_hash=200, is_prefilling=True
+        )
+        h.requests["req-1"] = SimpleNamespace(sampling_params=sp)
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 3
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 100
+        h.input_batch.request_decode_steering_hash[0] = 200
+
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        )
+
+        site = h._steerable_layers_cache[20]
+        assert int(site.sae_index[0].item()) == 1
+        prefill_sae_hash = sp.prefill_sae_clamp_config_hash
+        decode_sae_hash = sp.decode_sae_clamp_config_hash
+        assert (prefill_sae_hash, "prefill") not in h._sae_clamp_manager.config_to_row
+        assert (decode_sae_hash, "decode") in h._sae_clamp_manager.config_to_row
+
+        residual = torch.tensor([[2.0, 0.0, 0.0, 0.0]])
+        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        assert out[0, 0].item() == 5.0
+
+    def test_final_prefill_uses_prefill_content_then_decode_repopulates(self):
+        from vllm.v1.worker.steering_manager import SteeringManager
+
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+
+        prefill_spec = SAEClampSpec(
+            module_name="g",
+            phase="prefill",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        decode_spec = SAEClampSpec(
+            module_name="g",
+            phase="decode",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=9.0),)
+                }
+            },
+        )
+        sp = SamplingParams(sae_clamp_specs=(prefill_spec, decode_spec))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=100, decode_hash=200, is_prefilling=True
+        )
+        h.requests["req-1"] = SimpleNamespace(sampling_params=sp)
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 3
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 100
+        h.input_batch.request_decode_steering_hash[0] = 200
+
+        site = h._steerable_layers_cache[20]
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        )
+
+        residual = torch.tensor([[2.0, 0.0, 0.0, 0.0]])
+        final_prefill = apply_layer_steering(
+            site, residual, SteeringHookPoint.POST_MLP
+        )
+        assert final_prefill[0, 0].item() == 5.0
+
+        h.input_batch.num_computed_tokens_cpu[0] = 4
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        )
+        decode = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        assert decode[0, 0].item() == 9.0
+
+    def test_sae_only_no_active_additive_shortcut_registers_decode_row(self):
+        from vllm.v1.worker.steering_manager import SteeringManager
+
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        sp = SamplingParams(sae_clamp_specs=(spec,))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=100, decode_hash=200, is_prefilling=True
+        )
+        h.requests["req-1"] = SimpleNamespace(sampling_params=sp)
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 3
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 100
+        h.input_batch.request_decode_steering_hash[0] = 200
+
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        )
+
+        site = h._steerable_layers_cache[20]
+        assert int(site.steering_index[0].item()) == 0
+        assert int(site.sae_index[0].item()) == 1
+        prefill_sae_hash = sp.prefill_sae_clamp_config_hash
+        decode_sae_hash = sp.decode_sae_clamp_config_hash
+        assert (prefill_sae_hash, "prefill") not in h._sae_clamp_manager.config_to_row
+        assert (decode_sae_hash, "decode") in h._sae_clamp_manager.config_to_row
 
 
 class TestPopulatorWritesIntoBuffers:
@@ -443,3 +588,769 @@ class TestNoActiveStateShortCircuit:
         site = h._steerable_layers_cache[20]
         # No SAE buffers should ever have been allocated.
         assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+
+    def test_active_to_inactive_clears_any_active_flag(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        sp = SamplingParams(sae_clamp_specs=(spec,))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=111, decode_hash=222, is_prefilling=True
+        )
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 0
+        h.input_batch.num_prompt_tokens[0] = 2
+        h.input_batch.request_prefill_steering_hash[0] = 111
+        scheduler_output = _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        h._update_sae_buffers(scheduler_output)
+
+        site = h._steerable_layers_cache[20]
+        any_active = getattr(
+            site, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
+        )
+        assert any_active.item()
+
+        h._release_sae_for_request("req-1", prefill_hash=111, decode_hash=222)
+        h._update_sae_buffers(_StubSchedulerOutput())
+
+        assert not any_active.item()
+        assert int(site.sae_index[0].item()) == 0
+
+
+class TestCrossManagerHashIsolation:
+    """The combined ``prefill_steering_config_hash`` is shared between
+    the additive and SAE managers.  A request that only carries SAE
+    clamps still produces a nonzero hash, but the additive manager has
+    no row for it — and vice versa.  Both ``_update_steering_buffers``
+    and ``_update_sae_buffers`` must gate their lookups on
+    ``config_to_row`` membership rather than raising."""
+
+    def test_additive_only_request_does_not_raise_in_sae_lookup(self):
+        """An additive-only request still hits ``_update_sae_buffers``
+        once SAE buffers are attached; its nonzero hash is absent from
+        the SAE manager's row map.  The lookup must fall back to
+        row 0 (no-op) instead of raising."""
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        # Attach SAE buffers via registration, but admit a request with
+        # no SAE clamps — only an additive hash.
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 0
+        h.input_batch.num_prompt_tokens[0] = 4
+        # Nonzero hash (request carries additive state) but never
+        # registered with the SAE manager.
+        h.input_batch.request_prefill_steering_hash[0] = 999
+        scheduler_output = _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        # Must not raise.
+        h._update_sae_buffers(scheduler_output)
+        # And the per-token SAE index must point to the no-op row (0).
+        site = h._steerable_layers_cache[20]
+        assert int(site.sae_index[0].item()) == 0
+
+    def test_sae_only_request_does_not_raise_in_additive_lookup(self):
+        """An SAE-only request reaches ``_update_steering_buffers``
+        with a nonzero hash but no additive row registered.  Must fall
+        back to global rows (hash==0 semantics) instead of raising."""
+        from vllm.v1.worker.steering_manager import SteeringManager
+
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        # Real additive manager so the additive path executes; SAE
+        # manager already exists from the harness ctor.
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        # Register an SAE module and admit an SAE-only request.
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=3.0),)
+                }
+            },
+        )
+        h._register_initial_sae_clamps(
+            "req-1",
+            SamplingParams(sae_clamp_specs=(spec,)),
+            prefill_hash=777,
+            decode_hash=0,
+            is_prefilling=True,
+        )
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 0
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 777
+        scheduler_output = _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        # Must not raise on the additive lookup; the request has no
+        # additive state and no global vectors, so the additive index
+        # remains on row 0 while the SAE side still updates.
+        h._update_steering_buffers(scheduler_output)
+        site = h._steerable_layers_cache[20]
+        assert int(site.steering_index[0].item()) == 0
+        # SAE side still routes to the request's row (row 1 in the SAE
+        # manager, which is *its* first per-request row).
+        assert int(site.sae_index[0].item()) == 1
+
+    def test_released_sae_row_clears_index_on_additive_no_active_shortcut(self):
+        """After the last SAE row is released, the additive no-active
+        shortcut still has to clear ``sae_index``.  Otherwise future
+        unsteered tokens can keep gathering a stale nonzero SAE row."""
+        from vllm.v1.worker.steering_manager import SteeringManager
+
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=3.0),)
+                }
+            },
+        )
+        h._register_initial_sae_clamps(
+            "req-1",
+            SamplingParams(sae_clamp_specs=(spec,)),
+            prefill_hash=777,
+            decode_hash=0,
+            is_prefilling=True,
+        )
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 0
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 777
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        )
+        site = h._steerable_layers_cache[20]
+        assert int(site.sae_index[0].item()) == 1
+
+        h._release_sae_for_request("req-1", prefill_hash=777, decode_hash=0)
+        h.input_batch.req_ids = ["req-2"]
+        h.input_batch.req_id_to_index = {"req-2": 0}
+        h.input_batch.request_prefill_steering_hash[0] = 0
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-2": 1})
+        )
+        assert int(site.sae_index[0].item()) == 0
+
+    def test_sae_index_build_grows_token_count_scratch(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4, max_tokens=4)
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=3.0),)
+                }
+            },
+        )
+        sp = SamplingParams(sae_clamp_specs=(spec,))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=777, decode_hash=0, is_prefilling=True
+        )
+        h._register_initial_sae_clamps(
+            "req-2", sp, prefill_hash=777, decode_hash=0, is_prefilling=True
+        )
+        h._sae_rows_scratch = np.zeros(8, dtype=np.int64)
+        h._steering_n_tokens_scratch = np.zeros(1, dtype=np.int64)
+        h.input_batch = _StubInputBatch(
+            num_reqs=2,
+            req_ids=["req-1", "req-2"],
+            req_id_to_index={"req-1": 0, "req-2": 1},
+            num_computed_tokens_cpu=np.array([0, 0, 0, 0, 0, 0, 0, 0]),
+            num_prompt_tokens=np.array([4, 4, 0, 0, 0, 0, 0, 0]),
+            request_prefill_steering_hash=np.array([777, 777, 0, 0, 0, 0, 0, 0]),
+            request_decode_steering_hash=np.array([0, 0, 0, 0, 0, 0, 0, 0]),
+        )
+
+        h._update_sae_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1, "req-2": 1})
+        )
+
+        site = h._steerable_layers_cache[20]
+        assert site.sae_index[:2].tolist() == [1, 1]
+        assert h._sae_rows_scratch.shape[0] == 2
+        assert h._steering_n_tokens_scratch is not None
+        assert h._steering_n_tokens_scratch.shape[0] == 2
+
+    def test_no_active_shortcut_skips_unsteered_transition_scan(self):
+        from vllm.v1.worker.steering_manager import SteeringManager
+
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["plain"]
+        h.input_batch.req_id_to_index = {"plain": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 3
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 0
+        h.input_batch.request_decode_steering_hash[0] = 0
+
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"plain": 1})
+        )
+
+        assert h._req_steering_phase == {}
+        assert h._req_sae_phase == {}
+
+    def test_no_active_shortcut_ignores_stale_decode_hash_tail(self):
+        from vllm.v1.worker.steering_manager import SteeringManager
+
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["plain"]
+        h.input_batch.req_id_to_index = {"plain": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 3
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 0
+        h.input_batch.request_decode_steering_hash[0] = 0
+        h.input_batch.request_decode_steering_hash[7] = 999
+
+        assert not h._may_need_prefill_completion_transition_scan()
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"plain": 1})
+        )
+
+        assert h._req_steering_phase == {}
+        assert h._req_sae_phase == {}
+
+    def test_no_active_shortcut_skips_decode_hash_scan_without_sae_rows(
+        self, monkeypatch
+    ):
+        from vllm.v1.worker.steering_manager import SteeringManager
+
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["plain"]
+        h.input_batch.req_id_to_index = {"plain": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 3
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 0
+        h.input_batch.request_decode_steering_hash[0] = 123
+
+        def fail_transition_scan(_scheduler_output):
+            raise AssertionError("inactive path should not scan decode hashes")
+
+        monkeypatch.setattr(
+            h,
+            "_handle_sae_transitions_for_scheduled_prefill_completions",
+            fail_transition_scan,
+        )
+
+        assert not h._may_need_prefill_completion_transition_scan()
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"plain": 1})
+        )
+
+        assert h._req_steering_phase == {}
+        assert h._req_sae_phase == {}
+
+    def test_no_active_shortcut_skips_transition_scan_for_decode_sae_row(
+        self, monkeypatch
+    ):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+        spec = SAEClampSpec(
+            module_name="g",
+            phase="decode",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        sp = SamplingParams(sae_clamp_specs=(spec,))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=0, decode_hash=200, is_prefilling=False
+        )
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 4
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 0
+        h.input_batch.request_decode_steering_hash[0] = 200
+
+        def fail_transition_scan(_scheduler_output):
+            raise AssertionError("decode SAE rows should not scan transitions")
+
+        monkeypatch.setattr(
+            h,
+            "_handle_sae_transitions_for_scheduled_prefill_completions",
+            fail_transition_scan,
+        )
+
+        assert not h._may_need_prefill_completion_transition_scan()
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        )
+
+        site = h._steerable_layers_cache[20]
+        assert int(site.sae_index[0].item()) == 1
+        assert h._req_sae_phase == {"req-1": "decode"}
+
+
+class TestBatchedAdditiveTransitions:
+    """Additive prefill->decode transitions are applied batch-wise."""
+
+    def test_shared_prefill_row_frees_before_decode_registration(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4, max_sae_configs=1)
+        h._steering_manager = SteeringManager(
+            max_steering_configs=1,
+            device=torch.device("cpu"),
+        )
+        prefill_vectors = {"post_mlp": {20: [0.0, 0.0, 0.0, 0.0]}}
+        h._steering_manager.register_config(
+            100,
+            prefill_vectors,
+            phase="prefill",
+            locally_owned_layers=h._locally_owned_layers,
+        )
+        h._steering_manager.register_config(
+            100,
+            prefill_vectors,
+            phase="prefill",
+            locally_owned_layers=h._locally_owned_layers,
+        )
+
+        sp = SamplingParams(
+            decode_steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}}
+        )
+        h.requests = {
+            "req-1": SimpleNamespace(sampling_params=sp),
+            "req-2": SimpleNamespace(sampling_params=sp),
+        }
+        h.input_batch = _StubInputBatch(
+            num_reqs=2,
+            req_ids=["req-1", "req-2"],
+            req_id_to_index={"req-1": 0, "req-2": 1},
+            num_computed_tokens_cpu=np.array([9, 9, 0, 0, 0, 0, 0, 0]),
+            num_prompt_tokens=np.array([10, 10, 0, 0, 0, 0, 0, 0]),
+            request_prefill_steering_hash=np.array([100, 100, 0, 0, 0, 0, 0, 0]),
+            request_decode_steering_hash=np.array([200, 200, 0, 0, 0, 0, 0, 0]),
+        )
+
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1, "req-2": 1})
+        )
+
+        mgr = h._steering_manager
+        assert mgr is not None
+        assert (100, "prefill") not in mgr.config_to_row
+        assert mgr.config_to_row[(200, "decode")] == 3
+        assert mgr.config_refcounts[(200, "decode")] == 2
+        assert h._req_steering_phase == {"req-1": "decode", "req-2": "decode"}
+
+    def test_shared_sae_prefill_row_frees_before_decode_registration(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4, max_sae_configs=1)
+        h._steering_manager = SteeringManager(
+            max_steering_configs=1,
+            device=torch.device("cpu"),
+        )
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        sp = SamplingParams(sae_clamp_specs=(spec,))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=100, decode_hash=200, is_prefilling=True
+        )
+        h._register_initial_sae_clamps(
+            "req-2", sp, prefill_hash=100, decode_hash=200, is_prefilling=True
+        )
+        h.requests = {
+            "req-1": SimpleNamespace(sampling_params=sp),
+            "req-2": SimpleNamespace(sampling_params=sp),
+        }
+        h.input_batch = _StubInputBatch(
+            num_reqs=2,
+            req_ids=["req-1", "req-2"],
+            req_id_to_index={"req-1": 0, "req-2": 1},
+            num_computed_tokens_cpu=np.array([9, 9, 0, 0, 0, 0, 0, 0]),
+            num_prompt_tokens=np.array([10, 10, 0, 0, 0, 0, 0, 0]),
+            request_prefill_steering_hash=np.array([100, 100, 0, 0, 0, 0, 0, 0]),
+            request_decode_steering_hash=np.array([200, 200, 0, 0, 0, 0, 0, 0]),
+        )
+
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1, "req-2": 1})
+        )
+
+        mgr = h._sae_clamp_manager
+        assert mgr is not None
+        prefill_sae_hash = sp.prefill_sae_clamp_config_hash
+        decode_sae_hash = sp.decode_sae_clamp_config_hash
+        assert (prefill_sae_hash, "prefill") not in mgr.config_to_row
+        assert mgr.config_to_row[(decode_sae_hash, "decode")] == 1
+        assert mgr.config_refcounts[(decode_sae_hash, "decode")] == 2
+        assert h._req_sae_phase == {"req-1": "decode", "req-2": "decode"}
+
+    def test_decode_only_additive_transitions_from_no_active_shortcut(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4, max_sae_configs=1)
+        h._steering_manager = SteeringManager(
+            max_steering_configs=1,
+            device=torch.device("cpu"),
+        )
+        sp = SamplingParams(
+            decode_steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}}
+        )
+        h.requests = {"req-1": SimpleNamespace(sampling_params=sp)}
+        h._req_steering_phase["req-1"] = "prefill"
+        h._req_transition_scan_candidates.add("req-1")
+        h.input_batch = _StubInputBatch(
+            num_reqs=1,
+            req_ids=["req-1"],
+            req_id_to_index={"req-1": 0},
+            num_computed_tokens_cpu=np.array([9, 0, 0, 0, 0, 0, 0, 0]),
+            num_prompt_tokens=np.array([10, 0, 0, 0, 0, 0, 0, 0]),
+            request_prefill_steering_hash=np.array([0, 0, 0, 0, 0, 0, 0, 0]),
+            request_decode_steering_hash=np.array([200, 0, 0, 0, 0, 0, 0, 0]),
+        )
+
+        h._update_steering_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        )
+
+        mgr = h._steering_manager
+        assert mgr is not None
+        assert mgr.config_to_row[(200, "decode")] == 3
+        assert h._req_steering_phase == {"req-1": "decode"}
+        assert h._req_transition_scan_candidates == set()
+
+    def test_initial_sae_admission_failure_rolls_back_additive_row(
+        self, monkeypatch
+    ):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4, max_sae_configs=1)
+        h._steering_manager = SteeringManager(
+            max_steering_configs=1,
+            device=torch.device("cpu"),
+        )
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        sp = SamplingParams(
+            steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}},
+            sae_clamp_specs=(spec,),
+        )
+        new_req_data = SimpleNamespace(
+            sampling_params=sp,
+            prefill_steering_config_hash=100,
+            decode_steering_config_hash=200,
+            num_computed_tokens=0,
+        )
+        req_state = SimpleNamespace(num_prompt_tokens=10)
+
+        def fail_sae_admission(*_args, **_kwargs):
+            raise RuntimeError("sae capacity full")
+
+        monkeypatch.setattr(h, "_register_initial_sae_clamps", fail_sae_admission)
+
+        with pytest.raises(RuntimeError, match="sae capacity full"):
+            h._register_initial_steering_config("req-1", new_req_data, req_state)
+
+        mgr = h._steering_manager
+        assert mgr is not None
+        assert mgr.config_to_row == {}
+        assert h._req_steering_phase == {}
+        assert h._req_sae_phase == {}
+
+    def test_streaming_sae_refresh_failure_rolls_back_new_additive_row(
+        self, monkeypatch
+    ):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4, max_sae_configs=1)
+        h._steering_manager = SteeringManager(
+            max_steering_configs=1,
+            device=torch.device("cpu"),
+        )
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        sp = SamplingParams(
+            steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}},
+            sae_clamp_specs=(spec,),
+        )
+        new_req_data = SimpleNamespace(sampling_params=sp)
+
+        def fail_sae_register(*_args, **_kwargs):
+            raise RuntimeError("sae refresh capacity full")
+
+        assert h._sae_clamp_manager is not None
+        monkeypatch.setattr(
+            h._sae_clamp_manager, "register_clamp_spec", fail_sae_register
+        )
+
+        with pytest.raises(RuntimeError, match="sae refresh capacity full"):
+            h._refresh_streaming_steering(
+                "req-1",
+                new_req_data,
+                old_prefill_hash=0,
+                old_decode_hash=0,
+                new_prefill_hash=100,
+                new_decode_hash=200,
+            )
+
+        mgr = h._steering_manager
+        assert mgr is not None
+        assert mgr.config_to_row == {}
+        assert h._req_steering_phase == {}
+        assert h._req_sae_phase == {}
+
+    def test_streaming_sae_refresh_validates_before_releasing_old_row(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4, max_sae_configs=1)
+        h._steering_manager = SteeringManager(
+            max_steering_configs=1,
+            device=torch.device("cpu"),
+        )
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        old_spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        old_sp = SamplingParams(sae_clamp_specs=(old_spec,))
+        h._register_initial_sae_clamps(
+            "req-1",
+            old_sp,
+            prefill_hash=old_sp.prefill_steering_config_hash,
+            decode_hash=old_sp.decode_steering_config_hash,
+            is_prefilling=True,
+        )
+        old_sae_hash = old_sp.prefill_sae_clamp_config_hash
+        assert h._sae_clamp_manager is not None
+        assert h._sae_clamp_manager.config_to_row == {(old_sae_hash, "prefill"): 1}
+
+        new_spec = SAEClampSpec(
+            module_name="missing",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        new_sp = SamplingParams(sae_clamp_specs=(new_spec,))
+
+        with pytest.raises(SteeringVectorError, match="unknown module 'missing'"):
+            h._refresh_streaming_steering(
+                "req-1",
+                SimpleNamespace(sampling_params=new_sp),
+                old_prefill_hash=old_sp.prefill_steering_config_hash,
+                old_decode_hash=old_sp.decode_steering_config_hash,
+                new_prefill_hash=new_sp.prefill_steering_config_hash,
+                new_decode_hash=new_sp.decode_steering_config_hash,
+            )
+
+        assert h._sae_clamp_manager.config_to_row == {(old_sae_hash, "prefill"): 1}
+        assert h._req_sae_phase == {"req-1": "prefill"}
+
+    def test_streaming_sae_refresh_failure_restores_old_rows(self, monkeypatch):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4, max_sae_configs=2)
+        h._steering_manager = SteeringManager(
+            max_steering_configs=2,
+            device=torch.device("cpu"),
+        )
+        h.register_steering_modules({"g": _sae_payload(clampable=(0, 1))})
+        old_spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        old_sp = SamplingParams(
+            steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}},
+            sae_clamp_specs=(old_spec,),
+        )
+        old_prefill_hash = old_sp.prefill_steering_config_hash
+        old_decode_hash = old_sp.decode_steering_config_hash
+        old_effective = h._resolve_request_steering(old_sp, "prefill")
+        assert old_effective is not None
+        assert h._steering_manager is not None
+        h._steering_manager.register_config(
+            old_prefill_hash,
+            old_effective,
+            phase="prefill",
+            content_hash=old_sp.prefill_additive_steering_config_hash,
+            locally_owned_layers=h._locally_owned_layers,
+        )
+        h._req_steering_phase["req-1"] = "prefill"
+        h._register_initial_sae_clamps(
+            "req-1",
+            old_sp,
+            prefill_hash=old_prefill_hash,
+            decode_hash=old_decode_hash,
+            is_prefilling=True,
+        )
+        h.requests["req-1"] = SimpleNamespace(sampling_params=old_sp)
+
+        new_spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=1, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        new_sp = SamplingParams(
+            steering_vectors={"post_mlp": {20: [0.0, 1.0, 0.0, 0.0]}},
+            sae_clamp_specs=(new_spec,),
+        )
+        new_prefill_hash = new_sp.prefill_steering_config_hash
+        new_decode_hash = new_sp.decode_steering_config_hash
+        new_sae_hash = new_sp.prefill_sae_clamp_config_hash
+
+        assert h._sae_clamp_manager is not None
+        original_register = h._sae_clamp_manager.register_clamp_spec
+
+        def fail_new_sae_register(config_hash, *_args, **_kwargs):
+            if config_hash == new_sae_hash:
+                raise RuntimeError("new sae row rejected")
+            return original_register(config_hash, *_args, **_kwargs)
+
+        monkeypatch.setattr(
+            h._sae_clamp_manager, "register_clamp_spec", fail_new_sae_register
+        )
+
+        with pytest.raises(RuntimeError, match="new sae row rejected"):
+            h._refresh_streaming_steering(
+                "req-1",
+                SimpleNamespace(sampling_params=new_sp),
+                old_prefill_hash=old_prefill_hash,
+                old_decode_hash=old_decode_hash,
+                new_prefill_hash=new_prefill_hash,
+                new_decode_hash=new_decode_hash,
+            )
+
+        old_sae_hash = old_sp.prefill_sae_clamp_config_hash
+        assert h._steering_manager.config_to_row == {
+            (old_prefill_hash, "prefill"): 3
+        }
+        assert (new_prefill_hash, "prefill") not in h._steering_manager.config_to_row
+        assert h._sae_clamp_manager.config_to_row == {(old_sae_hash, "prefill"): 1}
+        assert (new_sae_hash, "prefill") not in h._sae_clamp_manager.config_to_row
+        assert h._req_steering_phase == {"req-1": "prefill"}
+        assert h._req_sae_phase == {"req-1": "prefill"}
+
+    def test_resumption_sae_failure_rolls_back_new_additive_row(
+        self, monkeypatch
+    ):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4, max_sae_configs=1)
+        h._steering_manager = SteeringManager(
+            max_steering_configs=1,
+            device=torch.device("cpu"),
+        )
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        sp = SamplingParams(
+            steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}},
+            sae_clamp_specs=(spec,),
+        )
+        req_state = SimpleNamespace(
+            sampling_params=sp,
+            num_prompt_tokens=10,
+            prefill_steering_config_hash=100,
+            decode_steering_config_hash=200,
+        )
+        h._req_steering_phase["req-1"] = "decode"
+
+        def fail_sae_register(*_args, **_kwargs):
+            raise RuntimeError("sae resumption capacity full")
+
+        assert h._sae_clamp_manager is not None
+        monkeypatch.setattr(
+            h._sae_clamp_manager, "register_clamp_spec", fail_sae_register
+        )
+
+        with pytest.raises(RuntimeError, match="sae resumption capacity full"):
+            h._reset_steering_for_resumption(
+                "req-1", req_state, new_num_computed_tokens=0
+            )
+
+        mgr = h._steering_manager
+        assert mgr is not None
+        assert mgr.config_to_row == {}
+        assert h._req_steering_phase == {}
+        assert h._req_sae_phase == {}
+
+
+class TestMultiHookSaeRegistration:
+    """A manifest covering more than one hook on the same layer must
+    register without raising.  ``sae_index`` is one shared buffer per
+    layer, so attaching the second hook needs the helper to no-op."""
+
+    def test_two_hooks_on_one_layer_attach_cleanly(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h.register_steering_modules(
+            {
+                "g": _sae_payload(
+                    layers=((20, "pre_attn"), (20, "post_mlp")),
+                    clampable=(0, 1),
+                )
+            },
+        )
+        site = h._steerable_layers_cache[20]
+        assert sae_buffers_attached(site, SteeringHookPoint.PRE_ATTN)
+        assert sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        # Only one sae_index buffer materialised on the layer.
+        assert hasattr(site, "sae_index")
+
+    def test_overlapping_sae_modules_rejected_worker_side(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h.register_steering_modules({"a": _sae_payload(clampable=(0,))})
+
+        with pytest.raises(SteeringVectorError, match="overlap"):
+            h.register_steering_modules({"b": _sae_payload(clampable=(1,))})
+
+        assert "a" in h._sae_module_registry
+        assert "b" not in h._sae_module_registry
