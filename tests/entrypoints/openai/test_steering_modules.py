@@ -12,11 +12,20 @@ from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
+import torch
 from starlette.datastructures import State
 
+import vllm.entrypoints.openai.steering.registry as registry_mod
+from vllm.config.sae_steering_types import (
+    SAEClampEntry,
+    SAEClampSpec,
+    hash_sae_clamp_specs_for_phase,
+)
 from vllm.config.steering_types import (
     SteeringVectorSpec,
+    hash_steering_config,
     merge_steering_specs,
 )
 from vllm.entrypoints.openai.api_server import init_app_state
@@ -24,10 +33,16 @@ from vllm.entrypoints.openai.steering.registry import (
     SteeringModuleRegistry,
     _convert_layer_keys,
 )
+from vllm.entrypoints.openai.steering.sae_loader import _site_filename
+from vllm.sampling_params import SamplingParams
 
 # ---------------------------------------------------------------------------
 # merge_steering_specs tests
 # ---------------------------------------------------------------------------
+
+
+def _assert_vector_close(actual, expected):
+    assert np.allclose(np.asarray(actual, dtype=np.float64), expected)
 
 
 class TestMergeSteeringSpecs:
@@ -46,7 +61,7 @@ class TestMergeSteeringSpecs:
         result = merge_steering_specs(None, spec)
         assert result is not None
         # Values should be pre-scaled (scale=1.0 for bare list)
-        assert result["post_mlp"][14] == [1.0, 2.0, 3.0]
+        _assert_vector_close(result["post_mlp"][14], [1.0, 2.0, 3.0])
 
     def test_first_has_data_second_none(self):
         spec: SteeringVectorSpec = {
@@ -54,30 +69,30 @@ class TestMergeSteeringSpecs:
         }
         result = merge_steering_specs(spec, None)
         assert result is not None
-        assert result["pre_attn"][5] == [0.5, 0.6]
+        _assert_vector_close(result["pre_attn"][5], [0.5, 0.6])
 
     def test_non_overlapping_hooks_both_preserved(self):
         a: SteeringVectorSpec = {"post_mlp": {14: [1.0, 2.0]}}
         b: SteeringVectorSpec = {"pre_attn": {10: [3.0, 4.0]}}
         result = merge_steering_specs(a, b)
         assert result is not None
-        assert result["post_mlp"][14] == [1.0, 2.0]
-        assert result["pre_attn"][10] == [3.0, 4.0]
+        _assert_vector_close(result["post_mlp"][14], [1.0, 2.0])
+        _assert_vector_close(result["pre_attn"][10], [3.0, 4.0])
 
     def test_non_overlapping_layers_same_hook(self):
         a: SteeringVectorSpec = {"post_mlp": {14: [1.0, 2.0]}}
         b: SteeringVectorSpec = {"post_mlp": {15: [3.0, 4.0]}}
         result = merge_steering_specs(a, b)
         assert result is not None
-        assert result["post_mlp"][14] == [1.0, 2.0]
-        assert result["post_mlp"][15] == [3.0, 4.0]
+        _assert_vector_close(result["post_mlp"][14], [1.0, 2.0])
+        _assert_vector_close(result["post_mlp"][15], [3.0, 4.0])
 
     def test_overlapping_hook_layer_added(self):
         a: SteeringVectorSpec = {"post_mlp": {14: [1.0, 2.0, 3.0]}}
         b: SteeringVectorSpec = {"post_mlp": {14: [0.5, 0.5, 0.5]}}
         result = merge_steering_specs(a, b)
         assert result is not None
-        assert result["post_mlp"][14] == [1.5, 2.5, 3.5]
+        _assert_vector_close(result["post_mlp"][14], [1.5, 2.5, 3.5])
 
     def test_overlapping_with_scaled_entries(self):
         a: SteeringVectorSpec = {
@@ -93,7 +108,7 @@ class TestMergeSteeringSpecs:
         result = merge_steering_specs(a, b)
         assert result is not None
         # a scaled: [2.0, 4.0], b scaled: [1.5, 2.0], sum: [3.5, 6.0]
-        assert result["post_mlp"][14] == [3.5, 6.0]
+        _assert_vector_close(result["post_mlp"][14], [3.5, 6.0])
 
     def test_one_scaled_one_bare(self):
         a: SteeringVectorSpec = {
@@ -109,7 +124,7 @@ class TestMergeSteeringSpecs:
         result = merge_steering_specs(a, b)
         assert result is not None
         # a scaled: [3.0, 6.0], b scaled: [0.5, 0.5], sum: [3.5, 6.5]
-        assert result["post_mlp"][14] == [3.5, 6.5]
+        _assert_vector_close(result["post_mlp"][14], [3.5, 6.5])
 
     def test_passthrough_entry_is_prescaled(self):
         """Non-overlapping scaled entry should still be pre-scaled."""
@@ -120,7 +135,7 @@ class TestMergeSteeringSpecs:
         }
         result = merge_steering_specs(spec, None)
         assert result is not None
-        assert result["post_mlp"][14] == [0.5, 1.0]
+        _assert_vector_close(result["post_mlp"][14], [0.5, 1.0])
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +168,21 @@ class TestConvertLayerKeys:
     def test_rejects_non_dict_spec(self):
         with pytest.raises(ValueError, match="field 'vectors' must be a JSON object"):
             _convert_layer_keys(["not", "a", "dict"], field_name="vectors")
+
+    def test_rejects_bool_layer_key(self):
+        spec = {"post_mlp": {True: [1.0]}}
+        with pytest.raises(ValueError, match="invalid layer index"):
+            _convert_layer_keys(spec, field_name="vectors")
+
+    def test_rejects_oversized_layer_key(self):
+        spec = {"post_mlp": {str(2**31): [1.0]}}
+        with pytest.raises(ValueError, match="2147483647"):
+            _convert_layer_keys(spec, field_name="vectors")
+
+    def test_rejects_duplicate_normalized_layer_keys(self):
+        spec = {"post_mlp": {"1": [1.0], "01": [2.0]}}
+        with pytest.raises(ValueError, match="duplicate layer key"):
+            _convert_layer_keys(spec, field_name="vectors")
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +311,25 @@ class TestSteeringModuleRegistry:
                         0: {
                             "vector": [1.0, 2.0],
                             "scale": math.nan,
+                        }
+                    }
+                },
+            )
+
+        with pytest.raises(ValueError, match="must be a finite float"):
+            await registry.register(
+                name="bad_bool_value",
+                vectors={"post_mlp": {0: [True]}},
+            )
+
+        with pytest.raises(ValueError, match="must be a finite float"):
+            await registry.register(
+                name="bad_bool_scale",
+                vectors={
+                    "post_mlp": {
+                        0: {
+                            "vector": [1.0, 2.0],
+                            "scale": False,
                         }
                     }
                 },
@@ -422,6 +471,7 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
         enable_auto_tool_choice=False,
         exclude_tools_when_tool_choice_none=False,
         tool_call_parser=None,
+        structured_outputs_config=SimpleNamespace(reasoning_parser=None),
         default_chat_template_kwargs=None,
         log_error_stack=False,
         enable_server_load_tracking=False,
@@ -487,6 +537,107 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
     engine_client.collective_rpc.assert_awaited_once_with("list_steerable_layers")
 
 
+@pytest.mark.asyncio
+async def test_init_app_state_preloads_sae_directory_and_broadcasts_weights(
+    tmp_path,
+):
+    manifest_payload = {
+        "d_model": 8,
+        "d_sae": 16,
+        "activation": "relu",
+        "layers": [[0, "post_mlp"]],
+        "clampable_features": [0, 1],
+        "activation_params": {},
+        "weights_uri": None,
+    }
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(manifest_payload), encoding="utf-8"
+    )
+    from safetensors.torch import save_file
+
+    save_file(
+        {
+            "encoder_weight": torch.ones(2, 8),
+            "encoder_bias": torch.zeros(2),
+            "decoder_weight": torch.full((2, 8), 2.0),
+        },
+        str(tmp_path / _site_filename(0, "post_mlp")),
+    )
+
+    engine_client = MagicMock()
+    engine_client.vllm_config = SimpleNamespace(lora_config=None)
+    engine_client.model_config = MagicMock()
+    engine_client.renderer = MagicMock()
+    engine_client.io_processor = MagicMock()
+    engine_client.collective_rpc = AsyncMock(
+        side_effect=[
+            [{0: ["post_mlp"]}],
+            None,
+        ]
+    )
+
+    args = Namespace(
+        served_model_name=None,
+        model="test-model",
+        enable_log_requests=False,
+        max_log_len=None,
+        disable_log_stats=False,
+        chat_template=None,
+        lora_modules=None,
+        enable_steering=True,
+        steering_modules=[SimpleNamespace(name="g", path=str(tmp_path))],
+        chat_template_content_format="auto",
+        trust_request_chat_template=False,
+        enable_auto_tool_choice=False,
+        exclude_tools_when_tool_choice_none=False,
+        tool_call_parser=None,
+        structured_outputs_config=SimpleNamespace(reasoning_parser=None),
+        default_chat_template_kwargs=None,
+        log_error_stack=False,
+        enable_server_load_tracking=False,
+    )
+    models = MagicMock()
+    models.registry = MagicMock()
+    models.init_static_loras = AsyncMock()
+    state = State()
+
+    with (
+        patch(
+            "vllm.entrypoints.openai.api_server.load_chat_template",
+            return_value=None,
+        ),
+        patch(
+            "vllm.entrypoints.openai.api_server.process_lora_modules",
+            return_value=[],
+        ),
+        patch(
+            "vllm.entrypoints.openai.api_server.OpenAIServingModels",
+            return_value=models,
+        ),
+        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
+        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+    ):
+        await init_app_state(
+            engine_client,
+            state,
+            args,
+            supported_tasks=(),
+        )
+
+    assert hasattr(state, "steering_module_registry")
+    first, second = engine_client.collective_rpc.await_args_list
+    assert first.args == ("list_steerable_layers",)
+    assert second.args == ("register_steering_modules",)
+    modules = second.kwargs["kwargs"]["modules"]
+    assert modules["g"]["kind"] == "sae_delta"
+    assert modules["g"]["sae_manifest"]["weights_uri"] == str(tmp_path)
+    assert torch.equal(
+        modules["g"]["sae_weights"][(0, "post_mlp")]["decoder_weight"],
+        torch.full((2, 8), 2.0),
+    )
+    assert second.kwargs["kwargs"]["replace"] is True
+
+
 # ---------------------------------------------------------------------------
 # resolve_for_request tests
 # ---------------------------------------------------------------------------
@@ -517,9 +668,9 @@ class TestResolveForRequest:
         assert err is None
         # Vectors are pre-scaled (scale=1.0 bare lists)
         assert v is not None
-        assert v["post_mlp"][14] == [1.0, 2.0]
+        _assert_vector_close(v["post_mlp"][14], [1.0, 2.0])
         assert p is not None
-        assert p["pre_attn"][5] == [0.5, 0.6]
+        _assert_vector_close(p["pre_attn"][5], [0.5, 0.6])
         assert d is None
 
     @pytest.mark.asyncio
@@ -533,7 +684,7 @@ class TestResolveForRequest:
         v, p, d, err = registry.resolve_for_request("base", inline, None, None)
         assert err is None
         assert v is not None
-        assert v["post_mlp"][14] == [1.5, 2.5]
+        _assert_vector_close(v["post_mlp"][14], [1.5, 2.5])
 
     @pytest.mark.asyncio
     async def test_named_one_tier_inline_different_tier(self):
@@ -547,10 +698,10 @@ class TestResolveForRequest:
         assert err is None
         # Named vectors tier
         assert v is not None
-        assert v["post_mlp"][14] == [1.0, 2.0]
+        _assert_vector_close(v["post_mlp"][14], [1.0, 2.0])
         # Inline prefill tier
         assert p is not None
-        assert p["pre_attn"][5] == [0.3, 0.4]
+        _assert_vector_close(p["pre_attn"][5], [0.3, 0.4])
         # Decode tier untouched
         assert d is None
 
@@ -580,3 +731,111 @@ class TestResolveForRequest:
         assert err is not None
         assert "Invalid steering composition for module 'named'" in err
         assert "different lengths: 2 vs 1" in err
+
+
+class TestSamplingParamsHashOverrides:
+    """Tests for named-module phase-effective SamplingParams hashes."""
+
+    @staticmethod
+    def _sae_spec(*, phase: str = "both") -> SAEClampSpec:
+        return SAEClampSpec(
+            module_name="g",
+            phase=phase,  # type: ignore[arg-type]
+            clamps={
+                "post_mlp": {
+                    0: (
+                        SAEClampEntry(
+                            feature_idx=1,
+                            kind="absolute",
+                            value=2.0,
+                        ),
+                    )
+                }
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_inline_hash_override_uses_registration_time_cache(
+        self, monkeypatch
+    ):
+        registry = SteeringModuleRegistry()
+        base: SteeringVectorSpec = {"post_mlp": {0: [1.0, 2.0]}}
+        await registry.register("m", vectors=base)
+        sp = SamplingParams(steering_module_ref=("m", 1.0))
+
+        def fail_resolve(*_args, **_kwargs):
+            raise AssertionError("no-inline named hash override should be cached")
+
+        monkeypatch.setattr(registry_mod, "resolve_effective_vectors", fail_resolve)
+
+        err = registry.apply_sampling_params_hash_overrides(sp, "m")
+
+        assert err is None
+        expected = hash_steering_config(base)
+        assert sp.prefill_steering_config_hash == expected
+        assert sp.decode_steering_config_hash == expected
+        assert sp.prefill_additive_steering_config_hash == expected
+        assert sp.decode_additive_steering_config_hash == expected
+
+    @pytest.mark.asyncio
+    async def test_named_additive_with_sae_primes_sae_phase_hashes(self):
+        registry = SteeringModuleRegistry()
+        base: SteeringVectorSpec = {"post_mlp": {0: [1.0, 2.0]}}
+        sae_spec = self._sae_spec(phase="decode")
+        await registry.register("m", vectors=base)
+        sp = SamplingParams(
+            steering_module_ref=("m", 1.0),
+            sae_clamp_specs=(sae_spec,),
+        )
+
+        err = registry.apply_sampling_params_hash_overrides(sp, "m")
+
+        assert err is None
+        assert sp.__dict__["prefill_sae_clamp_config_hash"] == 0
+        expected_sae_hash = hash_sae_clamp_specs_for_phase((sae_spec,), "decode")
+        assert sp.__dict__["decode_sae_clamp_config_hash"] == expected_sae_hash
+        additive_hash = hash_steering_config(base)
+        assert sp.prefill_additive_steering_config_hash == additive_hash
+        assert sp.decode_additive_steering_config_hash == additive_hash
+        assert sp.prefill_steering_config_hash == additive_hash
+        assert sp.decode_steering_config_hash == hash_steering_config(
+            base,
+            sae_clamp_specs=(sae_spec,),
+        )
+
+    @pytest.mark.asyncio
+    async def test_decode_only_module_clears_prefill_hashes(self):
+        registry = SteeringModuleRegistry()
+        decode: SteeringVectorSpec = {"post_mlp": {0: [1.0, 2.0]}}
+        await registry.register("decode_only", decode_vectors=decode)
+        sp = SamplingParams(steering_module_ref=("decode_only", 1.0))
+
+        err = registry.apply_sampling_params_hash_overrides(sp, "decode_only")
+
+        assert err is None
+        assert sp.prefill_steering_config_hash == 0
+        assert sp.prefill_additive_steering_config_hash == 0
+        expected_decode = hash_steering_config(decode)
+        assert sp.decode_steering_config_hash == expected_decode
+        assert sp.decode_additive_steering_config_hash == expected_decode
+
+    @pytest.mark.asyncio
+    async def test_inline_prefill_override_keeps_prefill_active(self):
+        registry = SteeringModuleRegistry()
+        decode: SteeringVectorSpec = {"post_mlp": {0: [1.0, 2.0]}}
+        inline_prefill: SteeringVectorSpec = {"pre_attn": {1: [0.5, 0.25]}}
+        await registry.register("decode_only", decode_vectors=decode)
+        sp = SamplingParams(
+            steering_module_ref=("decode_only", 1.0),
+            prefill_steering_vectors=inline_prefill,
+        )
+
+        err = registry.apply_sampling_params_hash_overrides(sp, "decode_only")
+
+        assert err is None
+        expected_prefill = hash_steering_config(inline_prefill)
+        expected_decode = hash_steering_config(decode)
+        assert sp.prefill_steering_config_hash == expected_prefill
+        assert sp.prefill_additive_steering_config_hash == expected_prefill
+        assert sp.decode_steering_config_hash == expected_decode
+        assert sp.decode_additive_steering_config_hash == expected_decode

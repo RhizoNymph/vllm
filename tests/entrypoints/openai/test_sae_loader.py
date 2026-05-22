@@ -227,6 +227,34 @@ class TestLoadSAEModuleFromDir:
         with pytest.raises(ValueError):
             load_sae_module_from_dir(tmp_path)
 
+    def test_bool_integer_fields_in_manifest_raise_value_error(self, tmp_path: Path):
+        _write_manifest(
+            tmp_path,
+            d_model=True,  # type: ignore[arg-type]
+            d_sae=8,
+            activation="relu",
+            layers=[(0, "post_mlp")],
+            clampable_features=[0],
+        )
+        with pytest.raises(ValueError, match="d_model"):
+            load_sae_module_from_dir(tmp_path)
+
+    def test_invalid_activation_params_in_manifest_raise_value_error(
+        self,
+        tmp_path: Path,
+    ):
+        _write_manifest(
+            tmp_path,
+            d_model=4,
+            d_sae=8,
+            activation="topk",
+            layers=[(0, "post_mlp")],
+            clampable_features=[0],
+            activation_params={"k": 0.0},
+        )
+        with pytest.raises(ValueError, match="activation_params"):
+            load_sae_module_from_dir(tmp_path)
+
     def test_shape_mismatch_raises_value_error(self, tmp_path: Path):
         # Manifest claims n_clamp=2, but the safetensors file has 3 rows.
         _write_manifest(
@@ -268,6 +296,46 @@ class TestLoadSAEModuleFromDir:
             str(tmp_path / _site_filename(0, "post_mlp")),
         )
         with pytest.raises(ValueError, match="encoder_bias"):
+            load_sae_module_from_dir(tmp_path)
+
+    def test_non_floating_site_tensor_raises_value_error(self, tmp_path: Path):
+        _write_manifest(
+            tmp_path,
+            d_model=4,
+            d_sae=8,
+            activation="relu",
+            layers=[(0, "post_mlp")],
+            clampable_features=[0],
+        )
+        _write_site(
+            tmp_path,
+            layer_idx=0,
+            hook_str="post_mlp",
+            encoder_weight=torch.zeros(1, 4, dtype=torch.int64),
+            encoder_bias=torch.zeros(1),
+            decoder_weight=torch.zeros(1, 4),
+        )
+        with pytest.raises(ValueError, match="floating dtype"):
+            load_sae_module_from_dir(tmp_path)
+
+    def test_non_finite_site_tensor_raises_value_error(self, tmp_path: Path):
+        _write_manifest(
+            tmp_path,
+            d_model=4,
+            d_sae=8,
+            activation="relu",
+            layers=[(0, "post_mlp")],
+            clampable_features=[0],
+        )
+        _write_site(
+            tmp_path,
+            layer_idx=0,
+            hook_str="post_mlp",
+            encoder_weight=torch.tensor([[float("nan"), 0.0, 0.0, 0.0]]),
+            encoder_bias=torch.zeros(1),
+            decoder_weight=torch.zeros(1, 4),
+        )
+        with pytest.raises(ValueError, match="finite values"):
             load_sae_module_from_dir(tmp_path)
 
 
@@ -313,6 +381,24 @@ class TestLoadGemmaScopeSAE:
             site["encoder_bias"], torch.from_numpy(expected_b).float()
         )
 
+    def test_npz_file_handle_is_closed(self, tmp_path: Path, monkeypatch):
+        path = tmp_path / "params.npz"
+        _make_gemma_scope_npz(path)
+
+        npz = np.load(str(path))
+
+        def tracking_load(*args, **kwargs):
+            return npz
+
+        monkeypatch.setattr(np, "load", tracking_load)
+        load_gemma_scope_sae(
+            path,
+            layer_idx=20,
+            hook_str="post_mlp",
+            clampable_features=[0, 1],
+        )
+        assert npz.zip is None
+
     def test_default_threshold_is_median_of_subset(self, tmp_path: Path):
         d_model, d_sae = 4, 8
         path = tmp_path / "params.npz"
@@ -340,6 +426,47 @@ class TestLoadGemmaScopeSAE:
             activation_params={"threshold": 0.123},
         )
         assert loaded.manifest.activation_params == {"threshold": 0.123}
+
+    def test_invalid_explicit_activation_params_raise(self, tmp_path: Path):
+        path = tmp_path / "params.npz"
+        _make_gemma_scope_npz(path)
+
+        with pytest.raises(ValueError, match="activation_params"):
+            load_gemma_scope_sae(
+                path,
+                layer_idx=0,
+                hook_str="post_mlp",
+                clampable_features=[0, 1],
+                activation_params={"threshold": True},
+            )
+
+    def test_non_floating_npz_array_raises_value_error(self, tmp_path: Path):
+        path = tmp_path / "params.npz"
+        arrs = _make_gemma_scope_npz(path)
+        arrs["W_dec"] = arrs["W_dec"].astype(np.int64)
+        np.savez(str(path), **arrs)
+
+        with pytest.raises(ValueError, match="W_dec.*floating dtype"):
+            load_gemma_scope_sae(
+                path,
+                layer_idx=20,
+                hook_str="post_mlp",
+                clampable_features=[0],
+            )
+
+    def test_non_finite_npz_array_raises_value_error(self, tmp_path: Path):
+        path = tmp_path / "params.npz"
+        arrs = _make_gemma_scope_npz(path)
+        arrs["W_enc"][0, 0] = np.inf
+        np.savez(str(path), **arrs)
+
+        with pytest.raises(ValueError, match="finite values"):
+            load_gemma_scope_sae(
+                path,
+                layer_idx=20,
+                hook_str="post_mlp",
+                clampable_features=[0],
+            )
 
     def test_relu_activation_drops_threshold(self, tmp_path: Path):
         path = tmp_path / "params.npz"
@@ -381,6 +508,31 @@ class TestLoadGemmaScopeSAE:
                 path, layer_idx=0, hook_str="nonsense", clampable_features=[0]
             )
 
+    def test_negative_layer_idx_raises(self, tmp_path: Path):
+        path = tmp_path / "params.npz"
+        _make_gemma_scope_npz(path)
+
+        with pytest.raises(ValueError, match="non-negative"):
+            load_gemma_scope_sae(
+                path,
+                layer_idx=-1,
+                hook_str="post_mlp",
+                clampable_features=[0],
+            )
+
+    def test_non_floating_weights_dtype_raises(self, tmp_path: Path):
+        path = tmp_path / "params.npz"
+        _make_gemma_scope_npz(path)
+
+        with pytest.raises(ValueError, match="weights_dtype"):
+            load_gemma_scope_sae(
+                path,
+                layer_idx=0,
+                hook_str="post_mlp",
+                clampable_features=[0],
+                weights_dtype=torch.int64,
+            )
+
     def test_empty_clampable_features_raises(self, tmp_path: Path):
         path = tmp_path / "params.npz"
         _make_gemma_scope_npz(path)
@@ -398,6 +550,31 @@ class TestLoadGemmaScopeSAE:
                 layer_idx=0,
                 hook_str="post_mlp",
                 clampable_features=[0, 1, 0],
+            )
+
+    @pytest.mark.parametrize(
+        ("layer_idx", "clampable_features", "match"),
+        [
+            (True, [0], "layer_idx"),
+            (0, [True], "clampable_features"),
+            (0, ["1"], "clampable_features"),
+        ],
+    )
+    def test_non_integer_indices_raise(
+        self,
+        tmp_path: Path,
+        layer_idx,
+        clampable_features,
+        match: str,
+    ):
+        path = tmp_path / "params.npz"
+        _make_gemma_scope_npz(path)
+        with pytest.raises(ValueError, match=match):
+            load_gemma_scope_sae(
+                path,
+                layer_idx=layer_idx,
+                hook_str="post_mlp",
+                clampable_features=clampable_features,
             )
 
     def test_out_of_range_clampable_features_raises(self, tmp_path: Path):

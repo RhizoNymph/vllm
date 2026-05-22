@@ -16,11 +16,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from vllm.config.sae_steering_types import SAEActivation, SteeringModuleKind
+from vllm.config.sae_steering_types import (
+    SAEActivation,
+    SAEClampSpec,
+    SteeringModuleKind,
+    coerce_sae_clamp_specs,
+)
 from vllm.config.steering_types import (
+    ResolvedSteeringVectorSpec,
     SteeringVectorSpec,
+    hash_steering_config,
     merge_steering_specs,
     normalize_layer_entry,
+    resolve_effective_vectors,
+    scale_steering_spec,
+    validate_steering_index,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
@@ -32,16 +42,11 @@ logger = init_logger(__name__)
 class SAEModuleManifest:
     """Shape description for an SAE-kind named steering module.
 
-    Phase-0 stores the manifest only — the runtime accepts requests
-    that reference SAE modules but the worker raises
-    ``NotImplementedError`` if asked to apply them.  The full loader
-    (weights, encoder/decoder GEMMs, kernel) lands in Phase-1+.
-
     The manifest is the authoritative description of the SAE that
-    the kernel will need: model and dictionary dimensions, activation
-    function, the set of (layer, hook) sites it covers, and the set
-    of feature indices that may be clamped at runtime (so encoder
-    rows can be restricted to that set).
+    registration and worker execution need: model and dictionary
+    dimensions, activation function, the set of (layer, hook) sites
+    it covers, and the ordered set of feature indices that may be
+    clamped at runtime.
     """
 
     d_model: int
@@ -78,6 +83,8 @@ class SteeringModule:
     prefill_vectors: SteeringVectorSpec | None = None
     decode_vectors: SteeringVectorSpec | None = None
     sae_manifest: SAEModuleManifest | None = None
+    prefill_additive_hash: int = 0
+    decode_additive_hash: int = 0
 
 
 class SteeringModuleRegistry:
@@ -142,8 +149,18 @@ class SteeringModuleRegistry:
                 prefill_vectors=prefill_vectors,
                 decode_vectors=decode_vectors,
             )
+            module.prefill_additive_hash = hash_steering_config(
+                resolve_effective_vectors(vectors, prefill_vectors)
+            )
+            module.decode_additive_hash = hash_steering_config(
+                resolve_effective_vectors(vectors, decode_vectors)
+            )
         elif kind is SteeringModuleKind.SAE_DELTA:
-            if vectors or prefill_vectors or decode_vectors:
+            if (
+                vectors is not None
+                or prefill_vectors is not None
+                or decode_vectors is not None
+            ):
                 raise ValueError(
                     f"Steering module '{name}': additive vector fields are "
                     "not valid for kind=SAE_DELTA."
@@ -174,6 +191,20 @@ class SteeringModuleRegistry:
             logger.info("Unregistered steering module '%s'", name)
         return removed is not None
 
+    async def restore_or_remove(self, name: str, prev: SteeringModule | None) -> None:
+        """Rollback helper used after a failed ``register`` + broadcast.
+
+        When *prev* is ``None`` the name was newly created by the
+        failed call, so remove it; otherwise restore the prior module
+        in place so a re-registration that fails mid-broadcast does
+        not destroy a previously-working entry.
+        """
+        async with self._lock:
+            if prev is None:
+                self._modules.pop(name, None)
+            else:
+                self._modules[name] = prev
+
     def get(self, name: str) -> SteeringModule | None:
         """Look up a module by name. Thread-safe for reads."""
         return self._modules.get(name)
@@ -195,20 +226,21 @@ class SteeringModuleRegistry:
         disabled, the worker mixin's admission guard never fires).
         ``specs`` may be a tuple of :class:`SAEClampSpec` (typed
         ``SamplingParams`` form) or a list of dicts (raw OpenAI
-        payload before coercion); only the ``module_name`` field is
-        read so both shapes work.
+        payload before coercion).  Raw payloads are coerced here, so
+        malformed clamp shapes fail at API admission instead of later
+        during ``to_sampling_params`` construction.
         """
         if not specs:
             return None
-        for i, spec in enumerate(specs):
-            if isinstance(spec, dict):
-                module_name = spec.get("module_name")
-            else:
-                module_name = getattr(spec, "module_name", None)
-            if not isinstance(module_name, str) or not module_name:
-                return (
-                    f"sae_clamp_specs[{i}] is missing a non-empty 'module_name' field."
-                )
+        try:
+            coerced_specs = coerce_sae_clamp_specs(specs)
+        except ValueError as exc:
+            return str(exc)
+        if not coerced_specs:
+            return None
+        for i, spec in enumerate(coerced_specs):
+            assert isinstance(spec, SAEClampSpec)
+            module_name = spec.module_name
             module = self._modules.get(module_name)
             if module is None:
                 return (
@@ -224,6 +256,33 @@ class SteeringModuleRegistry:
                     "from sae_clamp_specs.  Use 'steering_name' for "
                     "additive modules."
                 )
+            manifest = module.sae_manifest
+            if manifest is None:
+                return (
+                    f"sae_clamp_specs[{i}] references SAE module "
+                    f"{module_name!r}, but the registry entry has no "
+                    "sae_manifest."
+                )
+            covered = set(manifest.layers)
+            clampable = set(manifest.clampable_features)
+            for hook_name, layer_map in spec.clamps.items():
+                for layer_idx, entries in layer_map.items():
+                    if (layer_idx, hook_name) not in covered:
+                        return (
+                            f"sae_clamp_specs[{i}] for module {module_name!r} "
+                            f"targets site (layer={layer_idx}, "
+                            f"hook={hook_name!r}) which is not declared in "
+                            "the module's sae_manifest.layers."
+                        )
+                    for entry in entries:
+                        if entry.feature_idx not in clampable:
+                            return (
+                                f"sae_clamp_specs[{i}] for module "
+                                f"{module_name!r} clamps "
+                                f"feature_idx={entry.feature_idx}, which is "
+                                "not in the module's sae_manifest."
+                                "clampable_features."
+                            )
         return None
 
     def validate_additive_lookup(self, name: str) -> str | None:
@@ -252,12 +311,120 @@ class SteeringModuleRegistry:
             )
         return None
 
+    def apply_sampling_params_hash_overrides(
+        self,
+        sampling_params: Any,
+        steering_name: str,
+        *,
+        scale: float = 1.0,
+    ) -> str | None:
+        """Align named-module request hashes with phase-effective vectors.
+
+        ``SamplingParams`` only carries a compact ``(name, scale)`` reference
+        to the worker, but the API server registry knows whether that module is
+        active in prefill, decode, both, or neither after inline overrides are
+        merged.  Populate the cached hash properties from those resolved
+        per-phase vectors so scheduler capacity accounting and prefix-cache
+        keys do not reserve rows for a phase that resolves to no additive
+        steering.
+        """
+        module = self.get(steering_name)
+        if module is None:
+            return (
+                f"Unknown steering module '{steering_name}'. "
+                f"Available: {self.list_modules() or 'none'}"
+            )
+        if module.kind is not SteeringModuleKind.ADDITIVE:
+            return (
+                f"Steering module '{steering_name}' is "
+                f"kind={module.kind.value!r}; hash overrides only support "
+                "additive modules."
+            )
+
+        def _resolve_phase(phase: str) -> dict[str, dict[int, Any]] | None:
+            inline_phase = (
+                sampling_params.prefill_steering_vectors
+                if phase == "prefill"
+                else sampling_params.decode_steering_vectors
+            )
+            phase_module = (
+                scale_steering_spec(module.prefill_vectors, scale)
+                if phase == "prefill"
+                else scale_steering_spec(module.decode_vectors, scale)
+            )
+            merged_base = merge_steering_specs(
+                scale_steering_spec(module.vectors, scale),
+                sampling_params.steering_vectors,
+            )
+            merged_phase = merge_steering_specs(phase_module, inline_phase)
+            return resolve_effective_vectors(merged_base, merged_phase)
+
+        has_inline_overrides = (
+            sampling_params.steering_vectors is not None
+            or sampling_params.prefill_steering_vectors is not None
+            or sampling_params.decode_steering_vectors is not None
+        )
+        if (
+            not has_inline_overrides
+            and scale == 1.0
+            and not sampling_params.sae_clamp_specs
+        ):
+            sampling_params.__dict__["prefill_additive_steering_config_hash"] = (
+                module.prefill_additive_hash
+            )
+            sampling_params.__dict__["decode_additive_steering_config_hash"] = (
+                module.decode_additive_hash
+            )
+            sampling_params.__dict__["prefill_steering_config_hash"] = (
+                module.prefill_additive_hash
+            )
+            sampling_params.__dict__["decode_steering_config_hash"] = (
+                module.decode_additive_hash
+            )
+            return None
+
+        try:
+            prefill = _resolve_phase("prefill")
+            decode = _resolve_phase("decode")
+        except ValueError as exc:
+            return (
+                f"Invalid steering composition for module '{steering_name}': {exc}"
+            )
+
+        prefill_additive_hash = hash_steering_config(prefill)
+        decode_additive_hash = hash_steering_config(decode)
+        _ = sampling_params.prefill_sae_clamp_config_hash
+        _ = sampling_params.decode_sae_clamp_config_hash
+        sampling_params.__dict__["prefill_additive_steering_config_hash"] = (
+            prefill_additive_hash
+        )
+        sampling_params.__dict__["decode_additive_steering_config_hash"] = (
+            decode_additive_hash
+        )
+        sampling_params.__dict__["prefill_steering_config_hash"] = (
+            hash_steering_config(
+                prefill,
+                sae_clamp_specs=sampling_params._phase_filtered_sae_specs("prefill"),
+            )
+        )
+        sampling_params.__dict__["decode_steering_config_hash"] = (
+            hash_steering_config(
+                decode,
+                sae_clamp_specs=sampling_params._phase_filtered_sae_specs("decode"),
+            )
+        )
+        return None
+
     def list_modules(self) -> list[str]:
         """Return sorted list of registered module names."""
         return sorted(self._modules.keys())
 
-    def dump_for_broadcast(self) -> dict[str, dict[str, Any]]:
-        """Return a JSON-safe view of every registered module.
+    def dump_for_broadcast(
+        self,
+        *,
+        include_sae_weights: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Return a broadcastable view of every registered module.
 
         Used by the API server to broadcast the full registry to workers
         via ``collective_rpc`` so every worker holds an identical
@@ -266,11 +433,14 @@ class SteeringModuleRegistry:
         discriminator plus the kind-specific payload:
 
         * Additive: ``vectors``, ``prefill_vectors``, ``decode_vectors``
-        * SAE delta: ``sae_manifest`` (a JSON-safe dict)
+        * SAE delta: ``sae_manifest`` (a JSON-safe dict), plus
+          ``sae_weights`` when *include_sae_weights* is true.
 
-        All structures are plain Python collections suitable for
-        cloudpickle serialization across the engine multiprocess
-        boundary.
+        The default form is JSON-safe.  When *include_sae_weights* is
+        true, SAE tensors are loaded from each manifest's
+        ``weights_uri`` and included in the payload so workers do not
+        register zero-filled SAE buffers during startup/full-sync
+        broadcasts.
 
         Note: the additive form returns *unresolved*
         :class:`SteeringVectorSpec` entries — per-layer values may
@@ -286,14 +456,30 @@ class SteeringModuleRegistry:
                 payload["prefill_vectors"] = module.prefill_vectors
                 payload["decode_vectors"] = module.decode_vectors
             else:
-                payload["sae_manifest"] = _sae_manifest_to_dict(module.sae_manifest)
+                assert module.sae_manifest is not None
+                manifest = module.sae_manifest
+                payload["sae_manifest"] = _sae_manifest_to_dict(manifest)
+                if include_sae_weights:
+                    if not manifest.weights_uri:
+                        raise ValueError(
+                            f"Cannot broadcast SAE module {name!r}: "
+                            "manifest has no 'weights_uri' to load weights from."
+                        )
+                    from vllm.entrypoints.openai.steering.sae_loader import (
+                        _load_weights_for_manifest,
+                    )
+
+                    payload["sae_weights"] = _load_weights_for_manifest(
+                        manifest,
+                        Path(manifest.weights_uri),
+                    )
             out[name] = payload
         return out
 
     async def load_from_file(self, name: str, path: str) -> None:
-        """Load a steering module from a JSON file and register it.
+        """Load a steering module from disk and register it.
 
-        Expected JSON format::
+        Additive modules are loaded from a JSON file with this format::
 
             {
                 "vectors": {"post_mlp": {"14": [0.1, ...]}},
@@ -302,10 +488,29 @@ class SteeringModuleRegistry:
             }
 
         JSON uses string keys for layer indices; they are converted to int.
+        SAE delta modules are loaded from a directory containing the
+        generic ``manifest.json`` + per-site safetensors layout accepted by
+        :func:`vllm.entrypoints.openai.steering.sae_loader.load_sae_module_from_dir`.
         """
         file_path = Path(path)
         if not file_path.exists():
             raise FileNotFoundError(f"Steering module file not found: {path}")
+
+        if file_path.is_dir():
+            from vllm.entrypoints.openai.steering.sae_loader import (
+                load_sae_module_from_dir,
+            )
+
+            loaded = load_sae_module_from_dir(file_path)
+            # Startup/full-sync broadcasts can include SAE weights only if the
+            # manifest has a stable local path to reload from.
+            loaded.manifest.weights_uri = str(file_path)
+            await self.register(
+                name=name,
+                kind=SteeringModuleKind.SAE_DELTA,
+                sae_manifest=loaded.manifest,
+            )
+            return
 
         with open(file_path) as f:
             data = json.load(f)
@@ -339,9 +544,9 @@ class SteeringModuleRegistry:
         inline_prefill: SteeringVectorSpec | None,
         inline_decode: SteeringVectorSpec | None,
     ) -> tuple[
-        SteeringVectorSpec | None,
-        SteeringVectorSpec | None,
-        SteeringVectorSpec | None,
+        ResolvedSteeringVectorSpec | None,
+        ResolvedSteeringVectorSpec | None,
+        ResolvedSteeringVectorSpec | None,
         str | None,
     ]:
         """Resolve a named module and merge with inline vectors.
@@ -359,6 +564,18 @@ class SteeringModuleRegistry:
                 (
                     f"Unknown steering module '{steering_name}'. "
                     f"Available: {self.list_modules() or 'none'}"
+                ),
+            )
+        if module.kind is not SteeringModuleKind.ADDITIVE:
+            return (
+                None,
+                None,
+                None,
+                (
+                    f"Steering module '{steering_name}' is "
+                    f"kind={module.kind.value!r}; resolve_for_request only "
+                    "supports additive modules. Use sae_clamp_specs to "
+                    "drive SAE feature surgery."
                 ),
             )
 
@@ -390,7 +607,9 @@ class SteeringModuleRegistry:
         vector: Any
         if isinstance(entry, dict):
             vector, scale = normalize_layer_entry(entry)
-            if not isinstance(entry["scale"], (int, float)):
+            if isinstance(entry["scale"], bool) or not isinstance(
+                entry["scale"], (int, float)
+            ):
                 raise ValueError(
                     f"{prefix}['scale'] must be a finite float, "
                     f"got {type(entry['scale']).__name__}."
@@ -408,7 +627,7 @@ class SteeringModuleRegistry:
 
         value_prefix = prefix if isinstance(entry, list) else f"{prefix}['vector']"
         for i, value in enumerate(vector):
-            if not isinstance(value, (int, float)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(
                     f"{value_prefix}[{i}] must be a finite float, "
                     f"got {type(value).__name__}."
@@ -418,6 +637,9 @@ class SteeringModuleRegistry:
 
     def _validate_layer_index(self, name: str, layer_idx: int) -> None:
         """Validate layer indices against the loaded model when available."""
+        validate_steering_index(
+            layer_idx, f"Steering module {name!r} layer_idx"
+        )
         if self._valid_layer_indices is None:
             return
         if layer_idx not in self._valid_layer_indices:
@@ -430,15 +652,15 @@ class SteeringModuleRegistry:
     def _validate_sae_manifest(self, *, name: str, manifest: SAEModuleManifest) -> None:
         """Structural validation for an SAE manifest.
 
-        Phase-0 only stores the manifest, but we still want bad shapes to
-        fail loudly at registration time rather than at request time.
+        Bad shapes should fail loudly at registration time rather than
+        at request time or during worker buffer attachment.
         """
         prefix = f"SAE module {name!r}"
-        if not isinstance(manifest.d_model, int) or manifest.d_model <= 0:
+        if type(manifest.d_model) is not int or manifest.d_model <= 0:
             raise ValueError(
                 f"{prefix}: d_model must be a positive int, got {manifest.d_model!r}."
             )
-        if not isinstance(manifest.d_sae, int) or manifest.d_sae <= 0:
+        if type(manifest.d_sae) is not int or manifest.d_sae <= 0:
             raise ValueError(
                 f"{prefix}: d_sae must be a positive int, got {manifest.d_sae!r}."
             )
@@ -447,39 +669,130 @@ class SteeringModuleRegistry:
                 f"{prefix}: activation must be an SAEActivation enum, "
                 f"got {type(manifest.activation).__name__}."
             )
+        if manifest.weights_uri is not None and not isinstance(
+            manifest.weights_uri, str
+        ):
+            raise ValueError(
+                f"{prefix}: weights_uri must be a string or None, "
+                f"got {manifest.weights_uri!r}."
+            )
+        self._validate_sae_activation_params(
+            prefix=prefix,
+            activation=manifest.activation,
+            activation_params=manifest.activation_params,
+        )
         if not isinstance(manifest.layers, tuple) or not manifest.layers:
             raise ValueError(
                 f"{prefix}: layers must be a non-empty tuple of "
                 "(layer_idx, hook_point) pairs."
             )
+        seen_sites: set[tuple[int, str]] = set()
         for entry in manifest.layers:
             if (
                 not isinstance(entry, tuple)
                 or len(entry) != 2
-                or not isinstance(entry[0], int)
                 or not isinstance(entry[1], str)
             ):
                 raise ValueError(
                     f"{prefix}: layer entries must be (int, str) tuples, got {entry!r}."
                 )
             layer_idx, hook_point = entry
+            validate_steering_index(layer_idx, f"{prefix}: layer index")
             self._validate_layer_index(name=name, layer_idx=layer_idx)
             if hook_point not in VALID_HOOK_POINT_NAMES:
                 raise ValueError(
                     f"{prefix}: unknown hook point {hook_point!r}.  "
                     f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}."
                 )
+            site = (layer_idx, hook_point)
+            if site in seen_sites:
+                raise ValueError(
+                    f"{prefix}: layers must not contain duplicate "
+                    f"(layer_idx, hook_point) sites; got {site!r} more than once."
+                )
+            seen_sites.add(site)
+        for other_name, other_module in self._modules.items():
+            if (
+                other_name == name
+                or other_module.kind is not SteeringModuleKind.SAE_DELTA
+            ):
+                continue
+            other_manifest = other_module.sae_manifest
+            if other_manifest is None:
+                continue
+            overlap = seen_sites & set(other_manifest.layers)
+            if overlap:
+                raise ValueError(
+                    f"{prefix}: layers overlap existing SAE module "
+                    f"{other_name!r} at site(s) {sorted(overlap)!r}.  "
+                    "At most one SAE module may own a (layer_idx, "
+                    "hook_point) site; unregister the existing module first."
+                )
         if not isinstance(manifest.clampable_features, tuple):
             raise ValueError(
                 f"{prefix}: clampable_features must be a tuple of "
                 "non-negative integers."
             )
+        if not manifest.clampable_features:
+            raise ValueError(f"{prefix}: clampable_features must not be empty.")
+        seen_features: set[int] = set()
         for feat in manifest.clampable_features:
-            if not isinstance(feat, int) or feat < 0 or feat >= manifest.d_sae:
+            validate_steering_index(feat, f"{prefix}: clampable_features entry")
+            if feat >= manifest.d_sae:
                 raise ValueError(
                     f"{prefix}: clampable_features entry {feat!r} is out "
                     f"of range [0, d_sae={manifest.d_sae})."
                 )
+            if feat in seen_features:
+                raise ValueError(
+                    f"{prefix}: clampable_features must not contain "
+                    f"duplicates; got feature {feat!r} more than once."
+                )
+            seen_features.add(feat)
+
+    @staticmethod
+    def _validate_sae_activation_params(
+        *,
+        prefix: str,
+        activation: SAEActivation,
+        activation_params: dict[str, float],
+    ) -> None:
+        if not isinstance(activation_params, dict):
+            raise ValueError(f"{prefix}: activation_params must be a dict.")
+        if activation is SAEActivation.RELU:
+            if activation_params:
+                raise ValueError(
+                    f"{prefix}: activation_params must be empty for relu, "
+                    f"got {activation_params!r}."
+                )
+            return
+        if activation is SAEActivation.JUMPRELU:
+            threshold = activation_params.get("threshold")
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or not math.isfinite(float(threshold))
+            ):
+                raise ValueError(
+                    f"{prefix}: jumprelu activation_params requires a finite "
+                    f"'threshold', got {threshold!r}."
+                )
+            return
+        if activation is SAEActivation.TOPK:
+            k = activation_params.get("k")
+            if (
+                isinstance(k, bool)
+                or not isinstance(k, (int, float))
+                or not math.isfinite(float(k))
+                or float(k) < 1.0
+                or float(k) != float(int(k))
+            ):
+                raise ValueError(
+                    f"{prefix}: topk activation_params requires a positive "
+                    f"integer-valued 'k', got {k!r}."
+                )
+            return
+        raise ValueError(f"{prefix}: unsupported activation {activation!r}.")
 
 
 def _sae_manifest_to_dict(manifest: SAEModuleManifest | None) -> dict[str, Any]:
@@ -502,6 +815,12 @@ def _sae_manifest_to_dict(manifest: SAEModuleManifest | None) -> dict[str, Any]:
     }
 
 
+def _require_int_field(value: Any, *, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an int, got {value!r}.")
+    return value
+
+
 def sae_manifest_from_dict(payload: dict[str, Any]) -> SAEModuleManifest:
     """Reconstruct an :class:`SAEModuleManifest` from a broadcast dict.
 
@@ -510,12 +829,29 @@ def sae_manifest_from_dict(payload: dict[str, Any]) -> SAEModuleManifest:
     :meth:`SteeringModuleRegistry._validate_sae_manifest` — the worker
     calls the registry validator after reconstruction.
     """
+    layers: list[tuple[int, str]] = []
+    for i, entry in enumerate(payload["layers"]):
+        try:
+            layer_idx, hook_point = entry
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"layers[{i}] must be a (layer_idx, hook_point) pair."
+            ) from exc
+        layers.append(
+            (
+                _require_int_field(layer_idx, field_name=f"layers[{i}][0]"),
+                str(hook_point),
+            )
+        )
     return SAEModuleManifest(
-        d_model=int(payload["d_model"]),
-        d_sae=int(payload["d_sae"]),
+        d_model=_require_int_field(payload["d_model"], field_name="d_model"),
+        d_sae=_require_int_field(payload["d_sae"], field_name="d_sae"),
         activation=SAEActivation(payload["activation"]),
-        layers=tuple((int(li), str(hp)) for li, hp in payload["layers"]),
-        clampable_features=tuple(int(f) for f in payload["clampable_features"]),
+        layers=tuple(layers),
+        clampable_features=tuple(
+            _require_int_field(f, field_name=f"clampable_features[{i}]")
+            for i, f in enumerate(payload["clampable_features"])
+        ),
         activation_params=dict(payload.get("activation_params") or {}),
         weights_uri=payload.get("weights_uri"),
     )
@@ -546,13 +882,32 @@ def _convert_layer_keys(
             )
         converted: dict[int, Any] = {}
         for layer_key, entry in layers.items():
-            try:
-                converted[int(layer_key)] = entry
-            except (TypeError, ValueError) as exc:
+            if type(layer_key) is int:
+                layer_idx = layer_key
+            elif isinstance(layer_key, str):
+                try:
+                    layer_idx = int(layer_key)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Steering module field '{field_name}'[{hook_name!r}] has "
+                        f"invalid layer index {layer_key!r}; expected an integer"
+                    ) from exc
+            else:
                 raise ValueError(
                     f"Steering module field '{field_name}'[{hook_name!r}] has "
                     f"invalid layer index {layer_key!r}; expected an integer"
-                ) from exc
+                )
+            layer_idx = validate_steering_index(
+                layer_idx,
+                f"Steering module field '{field_name}'[{hook_name!r}] layer key",
+            )
+            if layer_idx in converted:
+                raise ValueError(
+                    f"Steering module field '{field_name}'[{hook_name!r}] "
+                    f"contains duplicate layer key {layer_idx!r} after "
+                    "integer normalization."
+                )
+            converted[layer_idx] = entry
         if converted:
             result[hook_name] = converted
     return result if result else None

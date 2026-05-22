@@ -119,10 +119,12 @@ class BaseFrontendArgs:
     \"base_model_name\": \"id\"}`"""
     steering_modules: list[SteeringModulePath] | None = None
     """Named steering module configurations in either 'name=path' format or
-    JSON format. Each module is a JSON file containing steering vector
-    specifications. Example (simple): `'creativity=/path/to/creativity.json'`
-    Example (JSON): `{\"name\": \"creativity\",
-    \"path\": \"/path/to/creativity.json\"}`"""
+    JSON format. Additive modules point to JSON files containing steering
+    vector specifications; SAE delta modules point to directories containing
+    a manifest.json plus per-site safetensors. Example (additive):
+    `'creativity=/path/to/creativity.json'` Example (SAE):
+    `'golden_gate=/path/to/sae_dir'` Example (JSON):
+    `{\"name\": \"creativity\", \"path\": \"/path/to/creativity.json\"}`"""
     chat_template: str | None = None
     """The file path to the chat template, or the template in single-line form
     for the specified model."""

@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,7 @@ import torch
 from vllm.config.sae_steering_types import SAEActivation
 from vllm.entrypoints.openai.steering.registry import (
     SAEModuleManifest,
+    SteeringModuleRegistry,
     sae_manifest_from_dict,
 )
 from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
@@ -93,6 +95,13 @@ def _site_filename(layer_idx: int, hook_str: str) -> str:
     return f"layer_{layer_idx}_{hook_str}.safetensors"
 
 
+def _coerce_loader_int(value: object, *, field_name: str) -> int:
+    """Accept real integer scalars while rejecting bool and strings."""
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{field_name} must be an integer, got {value!r}.")
+    return int(value)
+
+
 def load_sae_module_from_dir(path: str | Path) -> LoadedSAEModule:
     """Load an SAE module from a ``manifest.json`` + safetensors layout.
 
@@ -127,7 +136,20 @@ def load_sae_module_from_dir(path: str | Path) -> LoadedSAEModule:
         manifest_payload = json.load(fh)
     if not isinstance(manifest_payload, dict):
         raise ValueError(f"SAE manifest at {manifest_path!r} must be a JSON object.")
-    manifest = sae_manifest_from_dict(manifest_payload)
+    try:
+        manifest = sae_manifest_from_dict(manifest_payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"SAE manifest at {manifest_path!r} is invalid: {exc}"
+        ) from exc
+    try:
+        SteeringModuleRegistry()._validate_sae_manifest(
+            name=str(manifest_path), manifest=manifest
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"SAE manifest at {manifest_path!r} is invalid: {exc}"
+        ) from exc
     weights = _load_weights_for_manifest(manifest, base)
     return LoadedSAEModule(manifest=manifest, weights=weights)
 
@@ -192,6 +214,16 @@ def _validate_site_tensors(
             raise ValueError(
                 f"SAE site {site!r}: tensor {key!r} has shape "
                 f"{tuple(tensor.shape)}; expected {expected}."
+            )
+        if not torch.is_floating_point(tensor):
+            raise ValueError(
+                f"SAE site {site!r}: tensor {key!r} must have a floating "
+                f"dtype, got {tensor.dtype}."
+            )
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise ValueError(
+                f"SAE site {site!r}: tensor {key!r} must contain only "
+                "finite values."
             )
         out[key] = tensor
     return out
@@ -276,7 +308,15 @@ def load_gemma_scope_sae(
             f"hook_str {hook_str!r} is not a valid hook point.  "
             f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}."
         )
-    feature_list = list(clampable_features)
+    layer_idx = _coerce_loader_int(layer_idx, field_name="layer_idx")
+    if layer_idx < 0:
+        raise ValueError(f"layer_idx must be non-negative, got {layer_idx}.")
+    if not torch.empty((), dtype=weights_dtype).is_floating_point():
+        raise ValueError(f"weights_dtype must be floating point, got {weights_dtype}.")
+    feature_list = [
+        _coerce_loader_int(f, field_name=f"clampable_features[{i}]")
+        for i, f in enumerate(clampable_features)
+    ]
     if not feature_list:
         raise ValueError(
             "clampable_features must be a non-empty sequence of feature indices."
@@ -286,17 +326,34 @@ def load_gemma_scope_sae(
             f"clampable_features must be unique; got duplicates in {feature_list}."
         )
 
-    npz = np.load(str(npz_path))
-    missing = [k for k in _GEMMA_SCOPE_KEYS if k not in npz.files]
-    if missing:
-        raise ValueError(
-            f"Gemma Scope NPZ at {npz_path!r} is missing required keys: "
-            f"{missing}.  Found: {sorted(npz.files)}."
-        )
-    W_enc = npz["W_enc"]  # (d_model, d_sae)
-    W_dec = npz["W_dec"]  # (d_sae, d_model)
-    b_enc = npz["b_enc"]  # (d_sae,)
-    thresholds = npz["threshold"]  # (d_sae,)
+    with np.load(str(npz_path)) as npz:
+        missing = [k for k in _GEMMA_SCOPE_KEYS if k not in npz.files]
+        if missing:
+            raise ValueError(
+                f"Gemma Scope NPZ at {npz_path!r} is missing required keys: "
+                f"{missing}.  Found: {sorted(npz.files)}."
+            )
+        W_enc = npz["W_enc"]  # (d_model, d_sae)
+        W_dec = npz["W_dec"]  # (d_sae, d_model)
+        b_enc = npz["b_enc"]  # (d_sae,)
+        thresholds = npz["threshold"]  # (d_sae,)
+
+    for key, arr in (
+        ("W_enc", W_enc),
+        ("W_dec", W_dec),
+        ("b_enc", b_enc),
+        ("threshold", thresholds),
+    ):
+        if not np.issubdtype(arr.dtype, np.floating):
+            raise ValueError(
+                f"Gemma Scope NPZ at {npz_path!r}: {key} must have a "
+                f"floating dtype, got {arr.dtype}."
+            )
+        if not np.isfinite(arr).all():
+            raise ValueError(
+                f"Gemma Scope NPZ at {npz_path!r}: {key} must contain only "
+                "finite values."
+            )
 
     if W_enc.ndim != 2 or W_dec.ndim != 2:
         raise ValueError(
@@ -355,14 +412,18 @@ def load_gemma_scope_sae(
         d_model=int(d_model),
         d_sae=int(d_sae),
         activation=activation,
-        layers=((int(layer_idx), str(hook_str)),),
-        clampable_features=tuple(int(f) for f in feature_list),
+        layers=((layer_idx, str(hook_str)),),
+        clampable_features=tuple(feature_list),
         activation_params=resolved_params,
+    )
+    SteeringModuleRegistry()._validate_sae_manifest(
+        name=str(npz_path),
+        manifest=manifest,
     )
     return LoadedSAEModule(
         manifest=manifest,
         weights={
-            (int(layer_idx), str(hook_str)): {
+            (layer_idx, str(hook_str)): {
                 "encoder_weight": enc_w_t,
                 "encoder_bias": enc_b_t,
                 "decoder_weight": dec_w_t,
@@ -449,7 +510,12 @@ def merge_loaded_sae_modules(
             idx,
         )
         for layer_idx, hook_str in m.layers:
-            key = (int(layer_idx), str(hook_str))
+            key = (
+                _coerce_loader_int(
+                    layer_idx, field_name=f"parts[{idx}].manifest.layers[][0]"
+                ),
+                str(hook_str),
+            )
             if key in layers_seen:
                 tag = f" [{name!r}]" if name else ""
                 raise ValueError(

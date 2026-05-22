@@ -410,7 +410,9 @@ async def init_app_state(
         # resolve named-module references locally (eliminating per-request
         # serialization of large vector blobs across the multiprocessing
         # boundary). Mirrors the pattern used by /v1/steering/set.
-        broadcast_payload = steering_registry.dump_for_broadcast()
+        broadcast_payload = steering_registry.dump_for_broadcast(
+            include_sae_weights=True
+        )
         if broadcast_payload:
             await engine_client.collective_rpc(
                 "register_steering_modules",
