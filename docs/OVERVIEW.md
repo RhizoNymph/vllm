@@ -12,7 +12,7 @@ Goal: serve large language models with the standard vLLM stack
 (continuous batching, prefix caching, `torch.compile`, CUDA graphs,
 TP/PP) **and** allow injection of activation steering — both
 precomputed additive vectors (today) and SAE-based feature surgery
-(planned, see [`features/sae_steering.md`](features/sae_steering.md))
+(see [`features/sae_steering.md`](features/sae_steering.md))
 — into the residual stream of decoder layers, with phase-aware
 per-request and global tiers.
 
@@ -61,7 +61,8 @@ Across one inference step:
 Engine receives request
    ├── SamplingParams.steering_* validated and hashed
    │     -> prefill_steering_config_hash, decode_steering_config_hash
-   └── Scheduler reserves SteeringManager row(s) before dispatch
+   └── Scheduler reserves additive and/or SAE steering row capacity
+       before dispatch
 
 Worker receives SchedulerOutput
    ├── Mixin: register/release rows for new+finished requests
@@ -77,8 +78,8 @@ Model forward (under torch.compile / CUDA graph):
        residual = apply_layer_steering(residual, POST_ATTN)
        ... mlp ...
        residual = apply_layer_steering(residual, POST_MLP)
-   # apply_layer_steering = gather row from steering_table by
-   # steering_index, add into residual; row 0 is the no-op sentinel.
+   # apply_layer_steering = additive gather/add by steering_index,
+   # followed by SAE delta when SAE buffers are attached.
 
 Engine collects outputs
    └── On request finish: SteeringManager.release_config drops refcounts
@@ -107,7 +108,7 @@ folded into the standard cache hash.
 - doc: [`features/steering.md`](features/steering.md)
 - design: [`design/steering_runtime.md`](design/steering_runtime.md)
 
-### SAE-Based Steering (delta / feature surgery) — planned
+### SAE-Based Steering (delta / feature surgery)
 
 - description: Per-(layer, hook) SAE feature surgery — encode the
   live residual, replace a small set of feature activations with
@@ -117,15 +118,17 @@ folded into the standard cache hash.
   prefix-cache machinery. Adopts the "delta intervention" variant
   (most follow-up SAE-steering work) rather than the
   reconstruction-replacement variant from Anthropic's Scaling
-  Monosemanticity, which is parked as a future module kind.
-- entry_points (planned):
+  Monosemanticity, whose runtime integration remains follow-up work.
+- entry_points:
     - `vllm.model_executor.layers.sae_steering.apply_layer_sae_delta`
     - `vllm.v1.worker.sae_clamp_manager.SAEClampManager`
     - `POST /v1/steering/modules/register` with
       `kind: "sae_delta"`
     - `SamplingParams.sae_clamp_specs`
-- depends_on: Activation Steering (shares the manager, runner mixin,
-  named-module registry, custom-op shim, prefix-cache key folding).
+- depends_on: Activation Steering runtime patterns (runner mixin,
+  named-module registry, custom-op shim, scheduler admission, and
+  prefix-cache key folding). SAE rows are owned by a parallel
+  `SAEClampManager`.
 - doc: [`features/sae_steering.md`](features/sae_steering.md)
 
 ## Where to Read Next
