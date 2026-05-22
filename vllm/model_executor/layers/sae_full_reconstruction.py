@@ -69,6 +69,8 @@ from vllm.model_executor.layers.sae_steering import (
     CLAMP_KIND_ABSOLUTE,
     CLAMP_KIND_ADDITIVE,
     CLAMP_KIND_NONE,
+    _topk_mask_lowest_indices,
+    _validate_clamp_kind_values,
 )
 
 
@@ -114,9 +116,7 @@ def sae_encode_full(
         d_sae = pre_act.shape[1]
         if k >= d_sae:
             return pre_act
-        _, top_idx = torch.topk(pre_act, k=k, dim=1, largest=True)
-        mask = torch.zeros_like(pre_act, dtype=torch.bool)
-        mask.scatter_(1, top_idx, True)
+        mask = _topk_mask_lowest_indices(pre_act, k)
         return torch.where(mask, pre_act, torch.zeros_like(pre_act))
     raise ValueError(f"Unsupported SAE activation: {activation!r}")
 
@@ -229,9 +229,38 @@ def apply_sae_full_reconstruction(
             raise ValueError(
                 f"{name} must be {expected_clamp_shape}; got {tuple(t.shape)}."
             )
+    if clamp_kind.dtype != torch.int8:
+        raise ValueError(f"clamp_kind must be torch.int8; got {clamp_kind.dtype}.")
+    _validate_clamp_kind_values(clamp_kind)
+    if not clamp_value.dtype.is_floating_point:
+        raise ValueError(
+            f"clamp_value must be a floating dtype; got {clamp_value.dtype}."
+        )
+    if clamp_only_if_active.dtype != torch.bool:
+        raise ValueError(
+            "clamp_only_if_active must be torch.bool; "
+            f"got {clamp_only_if_active.dtype}."
+        )
+
+    if n_clamp > 0 and not clampable_features.is_cuda:
+        min_feature = int(clampable_features.min().item())
+        max_feature = int(clampable_features.max().item())
+        if min_feature < 0 or max_feature >= d_sae:
+            raise ValueError(
+                f"clampable_features must lie in [0, d_sae={d_sae}); "
+                f"got min={min_feature}, max={max_feature}."
+            )
+        if torch.unique(clampable_features).numel() != n_clamp:
+            raise ValueError("clampable_features must not contain duplicates.")
 
     # Empty token batch short-circuit.
     if n_tokens == 0:
+        return hidden_states.clone()
+    # No token opted into full reconstruction: preserve value semantics
+    # without paying the full encoder/decoder cost that will be discarded by
+    # the final mask.  Keep this CPU-only; on CUDA, ``.item()`` would
+    # synchronize the stream and regress the common active-mask path.
+    if not recon_mask.is_cuda and not bool(torch.any(recon_mask).item()):
         return hidden_states.clone()
 
     # Encode every token (we mask via ``recon_mask`` at the end).
@@ -246,17 +275,6 @@ def apply_sae_full_reconstruction(
     # numeric contract the eventual Triton kernel will adopt.
 
     if n_clamp > 0:
-        # Validate clampable feature indices.  This catches caller
-        # bugs early; the kernel can assume valid indices.
-        if (
-            int(clampable_features.min().item()) < 0
-            or int(clampable_features.max().item()) >= d_sae
-        ):
-            raise ValueError(
-                f"clampable_features must lie in [0, d_sae={d_sae}); "
-                f"got min={int(clampable_features.min().item())}, "
-                f"max={int(clampable_features.max().item())}."
-            )
         # Gather the (n_tokens, n_clamp) subset of ``f`` keyed by the
         # clampable feature indices, apply clamp logic, then scatter
         # the modified values back into ``f``.
@@ -266,7 +284,7 @@ def apply_sae_full_reconstruction(
         kind = clamp_kind.to(torch.int8)
         value = clamp_value.to(torch.float32)
         gated = clamp_only_if_active.to(torch.bool)
-        active = f_subset > 0.0
+        active = f_subset != 0.0 if activation is SAEActivation.TOPK else f_subset > 0.0
 
         new_f_absolute = value
         new_f_additive = f_subset + value

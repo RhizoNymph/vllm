@@ -28,6 +28,8 @@ transparent definition.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -89,7 +91,9 @@ def _ref_apply_full_reconstruction(
             if k >= d_sae:
                 f = pre_act.clone()
             else:
-                _, top_idx = torch.topk(pre_act, k=k, largest=True)
+                top_idx = sorted(
+                    range(d_sae), key=lambda j: (-float(pre_act[j]), j)
+                )[:k]
                 mask = torch.zeros_like(pre_act, dtype=torch.bool)
                 mask[top_idx] = True
                 f = torch.where(mask, pre_act, torch.zeros_like(pre_act))
@@ -103,7 +107,7 @@ def _ref_apply_full_reconstruction(
             v = float(clamp_value[t, c])
             gated = bool(clamp_only_if_active[t, c])
             f_val = float(f[feat_idx])
-            active = f_val > 0.0
+            active = f_val != 0.0 if activation is SAEActivation.TOPK else f_val > 0.0
             if gated and not active:
                 continue
             if kind == CLAMP_KIND_ABSOLUTE:
@@ -186,6 +190,19 @@ class TestSaeEncodeFull:
         expected = torch.tensor([[3.0, 0.0, 2.0, 0.0]])
         assert torch.allclose(f, expected)
 
+    def test_topk_ties_use_lowest_feature_indices(self):
+        h = torch.zeros(1, 4)
+        W_enc = torch.zeros(4, 4)
+        b_enc = torch.zeros(4)
+        f = sae_encode_full(h, W_enc, b_enc, SAEActivation.TOPK, {"k": 2})
+        expected = torch.tensor([[0.0, 0.0, 0.0, 0.0]])
+        assert torch.allclose(f, expected)
+
+        b_enc = torch.ones(4)
+        f = sae_encode_full(h, W_enc, b_enc, SAEActivation.TOPK, {"k": 2})
+        expected = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        assert torch.allclose(f, expected)
+
     def test_topk_k_equals_d_sae_keeps_all(self):
         h = torch.randn(2, 3)
         W_enc = torch.randn(3, 3)
@@ -227,6 +244,23 @@ class TestReconMaskGate:
             **clamps,
             recon_mask=recon_mask,
         )
+        assert torch.equal(out, inputs["hidden_states"])
+
+    def test_all_false_skips_encoder_work(self):
+        inputs = _make_random_inputs()
+        clamps = _zero_clamps(4, 3)
+        recon_mask = torch.zeros(4, dtype=torch.bool)
+        with patch(
+            "vllm.model_executor.layers.sae_full_reconstruction.sae_encode_full",
+            side_effect=AssertionError("encoder should be skipped"),
+        ):
+            out = apply_sae_full_reconstruction(
+                **inputs,
+                activation=SAEActivation.RELU,
+                activation_params={},
+                **clamps,
+                recon_mask=recon_mask,
+            )
         assert torch.equal(out, inputs["hidden_states"])
 
     def test_partial_mask_only_modifies_masked_rows(self):
@@ -408,6 +442,37 @@ class TestApplyFullReconAdditiveClamp:
         # f = [0, 0] (ReLU of [-1, 0]); only_if_active suppresses clamp;
         # decoder identity → [0, 0].
         assert torch.allclose(out, torch.zeros(1, 2))
+
+    def test_topk_only_if_active_allows_selected_negative_feature(self):
+        d_model, d_sae = 2, 2
+        h = torch.tensor([[-2.0, -1.0]])
+        W_enc = torch.eye(d_sae)
+        b_enc = torch.zeros(d_sae)
+        W_dec = torch.eye(d_sae)
+        b_dec = torch.zeros(d_model)
+        feats = torch.tensor([0], dtype=torch.int64)
+        clamp_kind = torch.tensor([[CLAMP_KIND_ADDITIVE]], dtype=torch.int8)
+        clamp_value = torch.tensor([[3.0]])
+        only = torch.tensor([[True]])
+
+        out = apply_sae_full_reconstruction(
+            hidden_states=h,
+            encoder_weight=W_enc,
+            encoder_bias=b_enc,
+            decoder_weight=W_dec,
+            decoder_bias=b_dec,
+            activation=SAEActivation.TOPK,
+            activation_params={"k": 2},
+            clampable_features=feats,
+            clamp_kind=clamp_kind,
+            clamp_value=clamp_value,
+            clamp_only_if_active=only,
+            recon_mask=_all_recon_mask(1),
+        )
+
+        # TopK keeps both negative pre-activations; feature 0 is selected,
+        # so the gated additive clamp applies before full reconstruction.
+        assert torch.allclose(out, torch.tensor([[1.0, -1.0]]))
 
 
 # ---------------------------------------------------------------------------
@@ -645,9 +710,6 @@ class TestApplyFullReconShapes:
         inputs = _make_random_inputs(d_sae=8, n_clamp=2)
         bad_feats = torch.tensor([0, 99], dtype=torch.int64)
         clamps = _zero_clamps(4, 2)
-        # Need at least one token with recon_mask=True so the validator runs.
-        # Force a non-NONE clamp so the bounds-check path executes.
-        clamps["clamp_kind"][0, 1] = CLAMP_KIND_ABSOLUTE
         with pytest.raises(ValueError, match=r"\[0, d_sae"):
             apply_sae_full_reconstruction(
                 hidden_states=inputs["hidden_states"],
@@ -658,6 +720,61 @@ class TestApplyFullReconShapes:
                 activation=SAEActivation.RELU,
                 activation_params={},
                 clampable_features=bad_feats,
+                **clamps,
+                recon_mask=torch.zeros(4, dtype=torch.bool),
+            )
+
+    def test_rejects_duplicate_clampable_features(self):
+        inputs = _make_random_inputs(d_sae=8, n_clamp=2)
+        bad_feats = torch.tensor([1, 1], dtype=torch.int64)
+        clamps = _zero_clamps(4, 2)
+        with pytest.raises(ValueError, match="duplicates"):
+            apply_sae_full_reconstruction(
+                hidden_states=inputs["hidden_states"],
+                encoder_weight=inputs["encoder_weight"],
+                encoder_bias=inputs["encoder_bias"],
+                decoder_weight=inputs["decoder_weight"],
+                decoder_bias=inputs["decoder_bias"],
+                activation=SAEActivation.RELU,
+                activation_params={},
+                clampable_features=bad_feats,
+                **clamps,
+                recon_mask=torch.zeros(4, dtype=torch.bool),
+            )
+
+    def test_rejects_wrong_clamp_dtypes(self):
+        inputs = _make_random_inputs(n_tokens=4, n_clamp=3)
+        clamps = _zero_clamps(4, 3)
+        cases = [
+            ("clamp_kind", clamps["clamp_kind"].to(torch.int16), "int8"),
+            ("clamp_value", clamps["clamp_value"].to(torch.int32), "floating"),
+            (
+                "clamp_only_if_active",
+                clamps["clamp_only_if_active"].to(torch.int8),
+                "bool",
+            ),
+        ]
+        for field_name, bad_tensor, match in cases:
+            bad_clamps = dict(clamps)
+            bad_clamps[field_name] = bad_tensor
+            with pytest.raises(ValueError, match=match):
+                apply_sae_full_reconstruction(
+                    **inputs,
+                    activation=SAEActivation.RELU,
+                    activation_params={},
+                    **bad_clamps,
+                    recon_mask=_all_recon_mask(4),
+                )
+
+    def test_rejects_unknown_clamp_kind_value(self):
+        inputs = _make_random_inputs(n_tokens=4, n_clamp=3)
+        clamps = _zero_clamps(4, 3)
+        clamps["clamp_kind"][0, 0] = 99
+        with pytest.raises(ValueError, match="clamp_kind entries"):
+            apply_sae_full_reconstruction(
+                **inputs,
+                activation=SAEActivation.RELU,
+                activation_params={},
                 **clamps,
                 recon_mask=_all_recon_mask(4),
             )

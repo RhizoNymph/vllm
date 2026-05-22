@@ -20,7 +20,18 @@ rather than going through the registered custom op (which requires the
 full vllm build).
 """
 
+import builtins
+
 import torch
+from torch import nn
+
+from vllm.model_executor.layers.steering import (
+    HOOK_POINT_ANY_ACTIVE_ATTR,
+    SteeringHookPoint,
+    apply_layer_steering,
+    apply_steering,
+    register_steering_buffers,
+)
 
 
 def _apply_steering(
@@ -181,3 +192,81 @@ class TestIndexedGatherSteering:
         assert torch.allclose(result2[1], torch.ones(hidden_size) * 20.0)
         assert torch.allclose(result2[2], torch.zeros(hidden_size))
         assert torch.allclose(result2[3], torch.ones(hidden_size) * 20.0)
+
+    def test_inactive_flag_skips_gather_and_returns_clone(self):
+        hidden = torch.randn(4, 8, dtype=torch.float32)
+        table = torch.full((6, 8), float("nan"), dtype=torch.float32)
+        index = torch.full((4,), 5, dtype=torch.long)
+        any_active = torch.zeros(1, dtype=torch.bool)
+
+        result = apply_steering(hidden, table, index, any_active)
+
+        torch.testing.assert_close(result, hidden)
+        assert result.data_ptr() != hidden.data_ptr()
+
+    def test_active_flag_matches_indexed_gather(self):
+        hidden = torch.randn(3, 4, dtype=torch.float32)
+        table = torch.randn(6, 4, dtype=torch.float32)
+        index = torch.tensor([0, 2, 5], dtype=torch.long)
+        any_active = torch.ones(1, dtype=torch.bool)
+
+        result = apply_steering(hidden, table, index, any_active)
+
+        torch.testing.assert_close(result, hidden + table[index])
+
+    def test_register_steering_buffers_adds_any_active_flags(self):
+        module = nn.Module()
+
+        register_steering_buffers(
+            module,
+            hidden_size=4,
+            max_steering_tokens=8,
+            max_steering_configs=1,
+            dtype=torch.float32,
+        )
+
+        for hp in SteeringHookPoint:
+            flag = getattr(module, HOOK_POINT_ANY_ACTIVE_ATTR[hp])
+            assert flag.dtype == torch.bool
+            assert flag.shape == (1,)
+            assert not bool(flag.item())
+
+
+class TestApplyLayerSteeringHotPath:
+    def test_no_buffers_does_not_import_sae_steering(self, monkeypatch):
+        module = nn.Module()
+        module.layer_idx = 0
+        hidden = torch.randn(2, 4)
+
+        self._forbid_sae_import(monkeypatch)
+
+        out = apply_layer_steering(module, hidden, SteeringHookPoint.POST_MLP)
+        assert out is hidden
+
+    def test_additive_only_does_not_import_sae_steering(self, monkeypatch):
+        module = nn.Module()
+        module.layer_idx = 0
+        register_steering_buffers(
+            module,
+            hidden_size=4,
+            max_steering_tokens=8,
+            max_steering_configs=1,
+            dtype=torch.float32,
+        )
+        hidden = torch.randn(2, 4)
+
+        self._forbid_sae_import(monkeypatch)
+
+        out = apply_layer_steering(module, hidden, SteeringHookPoint.POST_MLP)
+        assert torch.allclose(out, hidden)
+
+    @staticmethod
+    def _forbid_sae_import(monkeypatch):
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "vllm.model_executor.layers.sae_steering":
+                raise AssertionError("no-SAE hot path imported sae_steering")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)

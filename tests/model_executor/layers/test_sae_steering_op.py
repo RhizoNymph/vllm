@@ -24,6 +24,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import vllm.model_executor.layers.sae_steering as sae_steering
 from vllm.config.sae_steering_types import SAEActivation
 from vllm.model_executor.layers.sae_steering import (
     CLAMP_KIND_ABSOLUTE,
@@ -86,7 +87,7 @@ def _ref_apply_sae_delta(
                 continue
             v = float(clamp_value[t, i])
             gated = bool(clamp_only_if_active[t, i])
-            active = f > 0.0
+            active = f != 0.0 if activation is SAEActivation.TOPK else f > 0.0
             if gated and not active:
                 continue
             if kind == CLAMP_KIND_ABSOLUTE:
@@ -162,6 +163,14 @@ class TestSaeEncode:
         expected = torch.tensor([[3.0, 0.0, 2.0, 0.0], [0.0, 4.0, 0.0, 5.0]])
         assert torch.allclose(f, expected)
 
+    def test_topk_ties_use_lowest_feature_indices(self):
+        h = torch.zeros(1, 4)
+        W_enc = torch.zeros(4, 4)
+        b_enc = torch.ones(4)
+        f = sae_encode(h, W_enc, b_enc, SAEActivation.TOPK, {"k": 2.0})
+        expected = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        assert torch.allclose(f, expected)
+
     def test_topk_k_equals_n_clamp_keeps_all(self):
         h = torch.randn(2, 3)
         W_enc = torch.randn(3, 3)
@@ -203,6 +212,45 @@ class TestApplySaeDeltaNoOp:
         )
         assert torch.equal(out, inputs["hidden_states"])
 
+    def test_any_active_false_returns_input(self):
+        inputs = _make_random_inputs(n_tokens=4, d_model=6, n_clamp=3, seed=12)
+        clamp_kind = torch.full((4, 3), CLAMP_KIND_ABSOLUTE, dtype=torch.int8)
+        clamp_value = torch.full((4, 3), 7.0)
+        only_if_active = torch.zeros(4, 3, dtype=torch.bool)
+
+        out = apply_sae_delta(
+            **inputs,
+            activation=SAEActivation.RELU,
+            activation_params={},
+            clamp_kind=clamp_kind,
+            clamp_value=clamp_value,
+            clamp_only_if_active=only_if_active,
+            any_active=torch.zeros(1, dtype=torch.bool),
+        )
+
+        assert torch.equal(out, inputs["hidden_states"])
+
+    def test_all_kind_none_skips_encoder(self, monkeypatch):
+        inputs = _make_random_inputs()
+        clamps = _zero_clamps(n_tokens=4, n_clamp=3)
+        calls = {"n": 0}
+        original = sae_steering.sae_encode
+
+        def counting_encode(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(sae_steering, "sae_encode", counting_encode)
+
+        out = apply_sae_delta(
+            **inputs,
+            activation=SAEActivation.RELU,
+            activation_params={},
+            **clamps,
+        )
+        assert torch.equal(out, inputs["hidden_states"])
+        assert calls["n"] == 0
+
     def test_only_if_active_with_dead_feature_is_no_op(self):
         # Construct an h that drives every clampable pre_act below zero,
         # so ReLU yields f=0 and only_if_active gates everything off.
@@ -228,6 +276,34 @@ class TestApplySaeDeltaNoOp:
             clamp_only_if_active=only_if_active,
         )
         assert torch.equal(out, h)
+
+    def test_topk_only_if_active_allows_selected_negative_feature(self):
+        h = torch.tensor([[-2.0, -1.0]])
+        W_enc = torch.eye(2)
+        b_enc = torch.zeros(2)
+        W_dec = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+        clamp_kind = torch.tensor(
+            [[CLAMP_KIND_ADDITIVE, CLAMP_KIND_NONE]], dtype=torch.int8
+        )
+        clamp_value = torch.tensor([[3.0, 0.0]])
+        only_if_active = torch.tensor([[True, False]])
+
+        out = apply_sae_delta(
+            hidden_states=h,
+            encoder_weight=W_enc,
+            encoder_bias=b_enc,
+            decoder_weight=W_dec,
+            activation=SAEActivation.TOPK,
+            activation_params={"k": 2},
+            clamp_kind=clamp_kind,
+            clamp_value=clamp_value,
+            clamp_only_if_active=only_if_active,
+        )
+
+        # TopK keeps both negative pre-activations. Feature 0 is active
+        # because it was selected, so the gated additive clamp applies.
+        expected = torch.tensor([[-2.0, 2.0]])
+        torch.testing.assert_close(out, expected)
 
 
 class TestApplySaeDeltaAbsolute:
@@ -523,6 +599,41 @@ class TestApplySaeDeltaShapes:
                 encoder_weight=W_enc,
                 encoder_bias=b_enc,
                 decoder_weight=W_dec,
+                activation=SAEActivation.RELU,
+                activation_params={},
+                **clamps,
+            )
+
+    def test_rejects_wrong_clamp_dtypes(self):
+        inputs = _make_random_inputs(n_tokens=4, n_clamp=3)
+        clamps = _zero_clamps(4, 3)
+        cases = [
+            ("clamp_kind", clamps["clamp_kind"].to(torch.int16), "int8"),
+            ("clamp_value", clamps["clamp_value"].to(torch.int32), "floating"),
+            (
+                "clamp_only_if_active",
+                clamps["clamp_only_if_active"].to(torch.int8),
+                "bool",
+            ),
+        ]
+        for field_name, bad_tensor, match in cases:
+            bad_clamps = dict(clamps)
+            bad_clamps[field_name] = bad_tensor
+            with pytest.raises(ValueError, match=match):
+                apply_sae_delta(
+                    **inputs,
+                    activation=SAEActivation.RELU,
+                    activation_params={},
+                    **bad_clamps,
+                )
+
+    def test_rejects_unknown_clamp_kind_value(self):
+        inputs = _make_random_inputs(n_tokens=4, n_clamp=3)
+        clamps = _zero_clamps(4, 3)
+        clamps["clamp_kind"][0, 0] = 99
+        with pytest.raises(ValueError, match="clamp_kind entries"):
+            apply_sae_delta(
+                **inputs,
                 activation=SAEActivation.RELU,
                 activation_params={},
                 **clamps,

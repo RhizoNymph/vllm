@@ -47,6 +47,23 @@ HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.POST_MLP: "steering_table_post_mlp",
 }
 
+# Per-hook ``any-active`` flag attribute names. The flag is a single-element
+# bool tensor co-located with each hook point's table buffer; the apply
+# kernel reads it at launch and short-circuits the gather + add when no row
+# is currently active for that hook point. The attribute name is derived
+# from the table attribute so the two are always discoverable together.
+HOOK_POINT_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
+    hp: f"{table_attr}_any_active" for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
+}
+
+# Kept as plain strings here so the no-SAE hot path can short-circuit
+# without importing ``sae_steering`` on every decoder-layer hook call.
+HOOK_POINT_SAE_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_clamp_kind_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_clamp_kind_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_clamp_kind_post_mlp",
+}
+
 # Valid hook point string values for validation.
 VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHookPoint)
 
@@ -84,6 +101,18 @@ def register_steering_buffers(
         module.register_buffer(
             HOOK_POINT_TABLE_ATTR[hp],
             torch.zeros(max_steering_configs + 3, hidden_size, dtype=table_dtype),
+            persistent=False,
+        )
+        # Per-hook activity flag.  A single-element bool tensor that the
+        # ``apply_steering`` kernel reads at launch and uses to skip the
+        # gather + add when no rows are currently active for this hook
+        # point.  The flag is a tensor (not a Python bool) so the
+        # ``torch.compile`` graph topology stays stable across batches
+        # with different active-hook sets — only the data in the tensor
+        # changes between forward passes.
+        module.register_buffer(
+            HOOK_POINT_ANY_ACTIVE_ATTR[hp],
+            torch.zeros(1, dtype=torch.bool),
             persistent=False,
         )
 
@@ -150,17 +179,24 @@ def apply_layer_steering(
     """
     maybe_capture_residual(hidden_states, module.layer_idx, hook_point.value)
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
-    if hasattr(module, table_attr):
+    buffers = module._buffers
+    steering_table = buffers.get(table_attr)
+    if steering_table is not None:
         hidden_states = torch.ops.vllm.apply_steering(
             hidden_states,
-            getattr(module, table_attr),
+            steering_table,
             module.steering_index,
+            buffers[HOOK_POINT_ANY_ACTIVE_ATTR[hook_point]],
         )
-    # SAE feature-surgery delta runs after the additive op on the
-    # same hook.  Local import keeps ``steering.py`` free of any
-    # dependency on ``sae_steering.py`` at module load time
-    # (``sae_steering.py`` imports ``SteeringHookPoint`` from here, so
-    # a top-level import would form a cycle).
+    if HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point] not in buffers:
+        return hidden_states
+
+    # SAE feature-surgery delta runs after the additive op on the same
+    # hook.  Local import keeps ``steering.py`` free of any dependency
+    # on ``sae_steering.py`` at module load time (``sae_steering.py``
+    # imports ``SteeringHookPoint`` from here, so a top-level import
+    # would form a cycle).  The guard above keeps disabled/no-SAE
+    # forwards on the additive-only path.
     from vllm.model_executor.layers.sae_steering import apply_layer_sae_delta
 
     return apply_layer_sae_delta(module, hidden_states, hook_point)
@@ -170,6 +206,7 @@ def apply_steering(
     hidden_states: torch.Tensor,
     steering_table: torch.Tensor,
     steering_index: torch.Tensor,
+    any_active: torch.Tensor,
 ) -> torch.Tensor:
     """Apply per-request activation steering via indexed gather.
 
@@ -182,6 +219,16 @@ def apply_steering(
     ``steering_index`` is a shared buffer of shape ``(max_tokens,)``
     mapping each token position to its steering table row.  Updated
     in-place by the model runner before each forward pass.
+
+    ``any_active`` is a single-element bool tensor co-located with the
+    ``steering_table`` buffer that the model runner sets to ``True``
+    whenever at least one non-zero row exists for this hook point in
+    the current batch and ``False`` otherwise.  When ``False``, the
+    kernel skips the gather + add and emits a copy of
+    ``hidden_states`` so the output value is unchanged.  The flag is a
+    tensor (not a Python bool) so the ``torch.compile`` graph topology
+    stays stable across batches whose active-hook set differs — only
+    the data in the tensor changes between forward passes.
 
     The compute path dispatches to a fused Triton kernel on CUDA which
     folds the gather and add into a single pass over ``hidden_states``.
@@ -197,7 +244,17 @@ def apply_steering(
             apply_steering_triton,
         )
 
-        return apply_steering_triton(hidden_states, steering_table, steering_index)
+        return apply_steering_triton(
+            hidden_states, steering_table, steering_index, any_active
+        )
+    # CPU eager: short-circuit on the host so we don't even materialize
+    # the gather. ``.item()`` synchronizes against the device producer
+    # for the flag tensor — irrelevant for the CPU path (the flag is
+    # always written from the same thread before this op runs).
+    if not bool(any_active.item()):
+        # Match the freshly-allocated-output contract of the CUDA path so
+        # callers never see an alias of ``hidden_states``.
+        return hidden_states.clone()
     return hidden_states + steering_table[steering_index[: hidden_states.shape[0]]]
 
 
@@ -205,6 +262,7 @@ def apply_steering_fake(
     hidden_states: torch.Tensor,
     steering_table: torch.Tensor,
     steering_index: torch.Tensor,
+    any_active: torch.Tensor,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)
