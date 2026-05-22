@@ -74,6 +74,28 @@ class TestSamplingParamsSAEField:
                 ],
             )
 
+    def test_clone_reuses_immutable_sae_specs(self):
+        s = _spec()
+        sp = SamplingParams(sae_clamp_specs=(s,))
+        clone = sp.clone()
+        assert clone is not sp
+        assert clone.sae_clamp_specs is sp.sae_clamp_specs
+
+    def test_clone_carries_cached_sae_phase_hashes(self):
+        s = _spec()
+        sp = SamplingParams(sae_clamp_specs=(s,))
+        prefill_hash = sp.prefill_sae_clamp_config_hash
+        decode_hash = sp.decode_sae_clamp_config_hash
+
+        clone = sp.clone()
+
+        assert clone.__dict__["prefill_sae_clamp_config_hash"] == prefill_hash
+        assert clone.__dict__["decode_sae_clamp_config_hash"] == decode_hash
+
+    def test_steering_module_ref_rejects_bool_scale(self):
+        with pytest.raises(ValueError, match="steering_module_ref"):
+            SamplingParams(steering_module_ref=("m", True))
+
 
 class TestPhaseFilteredHashing:
     def test_no_sae_hash_unchanged(self):

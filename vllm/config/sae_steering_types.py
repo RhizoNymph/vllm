@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import hashlib
 import math
+import struct
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
+from vllm.config.steering_types import validate_steering_index
 from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
 
 SAEClampKind = Literal["absolute", "additive"]
@@ -59,8 +61,8 @@ class SteeringModuleKind(str, Enum):
 class SAEActivation(str, Enum):
     """SAE encoder activation function.
 
-    Phase-0 scope is fixed to these three; gated and batch-TopK are
-    out of scope until the kernel exists.
+    The delta runtime supports these three activation families; gated
+    and batch-TopK variants are intentionally out of scope.
     """
 
     RELU = "relu"
@@ -95,18 +97,16 @@ class SAEClampEntry:
     only_if_active: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.feature_idx, int) or self.feature_idx < 0:
-            raise ValueError(
-                "SAEClampEntry.feature_idx must be a non-negative int, "
-                f"got {self.feature_idx!r}."
-            )
+        validate_steering_index(self.feature_idx, "SAEClampEntry.feature_idx")
         if self.kind not in ("absolute", "additive"):
             raise ValueError(
                 "SAEClampEntry.kind must be 'absolute' or 'additive', "
                 f"got {self.kind!r}."
             )
-        if not isinstance(self.value, (int, float)) or not math.isfinite(
-            float(self.value)
+        if (
+            isinstance(self.value, bool)
+            or not isinstance(self.value, (int, float))
+            or not math.isfinite(float(self.value))
         ):
             raise ValueError(
                 f"SAEClampEntry.value must be a finite float, got {self.value!r}."
@@ -184,11 +184,9 @@ class SAEClampSpec:
                 )
             coerced_layer: SAEClampLayerMap = {}
             for layer_idx, entries in layer_map.items():
-                if not isinstance(layer_idx, int) or layer_idx < 0:
-                    raise ValueError(
-                        f"SAEClampSpec.clamps[{hook_name!r}] keys must be "
-                        f"non-negative integers, got {layer_idx!r}."
-                    )
+                validate_steering_index(
+                    layer_idx, f"SAEClampSpec.clamps[{hook_name!r}] layer key"
+                )
                 if not isinstance(entries, (list, tuple)) or not entries:
                     raise ValueError(
                         f"SAEClampSpec.clamps[{hook_name!r}][{layer_idx}] "
@@ -291,25 +289,82 @@ def coerce_sae_clamp_specs(
                 )
             layer_map: SAEClampLayerMap = {}
             for layer_key, entries_raw in layer_map_raw.items():
-                try:
-                    layer_idx = int(layer_key)
-                except (TypeError, ValueError) as exc:
+                if type(layer_key) is int:
+                    layer_idx = layer_key
+                elif isinstance(layer_key, str):
+                    try:
+                        layer_idx = int(layer_key)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"sae_clamp_specs[{i}]['clamps'][{hook_name!r}] "
+                            f"has invalid layer key {layer_key!r}; expected "
+                            "an integer."
+                        ) from exc
+                else:
                     raise ValueError(
                         f"sae_clamp_specs[{i}]['clamps'][{hook_name!r}] "
                         f"has invalid layer key {layer_key!r}; expected "
                         "an integer."
-                    ) from exc
+                    )
                 if not isinstance(entries_raw, (list, tuple)):
                     raise ValueError(
                         f"sae_clamp_specs[{i}]['clamps'][{hook_name!r}]"
                         f"[{layer_idx}] must be a list of clamp entries, "
                         f"got {type(entries_raw).__name__}."
                     )
+                validate_steering_index(
+                    layer_idx,
+                    f"sae_clamp_specs[{i}]['clamps'][{hook_name!r}] layer key",
+                )
+                if layer_idx in layer_map:
+                    raise ValueError(
+                        f"sae_clamp_specs[{i}]['clamps'][{hook_name!r}] "
+                        f"contains duplicate layer key {layer_idx!r} after "
+                        "integer normalization."
+                    )
                 entries = tuple(_coerce_clamp_entry(e) for e in entries_raw)
                 layer_map[layer_idx] = entries
             clamps[hook_name] = layer_map
         out.append(SAEClampSpec(module_name=module_name, phase=phase, clamps=clamps))
+    validate_sae_clamp_specs_no_overlap(tuple(out))
     return tuple(out)
+
+
+def validate_sae_clamp_specs_no_overlap(specs: tuple[SAEClampSpec, ...]) -> None:
+    """Reject overlapping clamps for the same module/site/feature.
+
+    Multiple specs may reference the same SAE module, for example to
+    express different prefill and decode clamps.  What must not happen
+    is two phase-overlapping specs writing the same
+    ``(module, hook, layer, feature)`` cell: the clamp-table populator
+    has a single row slot for that cell, so accepting both would make
+    the later spec silently overwrite the earlier one.
+    """
+    phase_mask = {"prefill": 0b01, "decode": 0b10, "both": 0b11}
+    seen: dict[tuple[str, str, int, int], tuple[int, str]] = {}
+    for spec_idx, spec in enumerate(specs):
+        mask = phase_mask[spec.phase]
+        for hook_name, layer_map in spec.clamps.items():
+            for layer_idx, entries in layer_map.items():
+                for entry in entries:
+                    key = (
+                        spec.module_name,
+                        hook_name,
+                        layer_idx,
+                        entry.feature_idx,
+                    )
+                    prev = seen.get(key)
+                    if prev is not None and prev[0] & mask:
+                        raise ValueError(
+                            "sae_clamp_specs contains overlapping clamps for "
+                            f"module={spec.module_name!r}, hook={hook_name!r}, "
+                            f"layer={layer_idx}, feature_idx={entry.feature_idx}. "
+                            f"Spec {spec_idx} phase {spec.phase!r} overlaps "
+                            f"an earlier spec with phase {prev[1]!r}; combine "
+                            "the entries into one spec or use disjoint phases."
+                        )
+                    merged_mask = prev[0] | mask if prev is not None else mask
+                    seen[key] = (merged_mask, spec.phase)
 
 
 def _coerce_clamp_entry(raw: object) -> SAEClampEntry:
@@ -321,11 +376,17 @@ def _coerce_clamp_entry(raw: object) -> SAEClampEntry:
             f"SAE clamp entry must be a dict or SAEClampEntry, got "
             f"{type(raw).__name__}."
         )
+    missing = [key for key in ("feature_idx", "kind", "value") if key not in raw]
+    if missing:
+        raise ValueError(
+            "SAE clamp entry is missing required field(s): "
+            f"{', '.join(repr(key) for key in missing)}."
+        )
     return SAEClampEntry(
         feature_idx=raw["feature_idx"],
         kind=raw["kind"],
-        value=float(raw["value"]),
-        only_if_active=bool(raw.get("only_if_active", False)),
+        value=raw["value"],
+        only_if_active=raw.get("only_if_active", False),
     )
 
 
@@ -352,30 +413,111 @@ def hash_sae_clamp_specs(specs: tuple[SAEClampSpec, ...] | None) -> int:
     """
     if not specs:
         return 0
+    return _hash_sae_clamp_specs_with_phase(specs)
+
+
+def _hash_sae_clamp_specs_with_phase(
+    specs: tuple[SAEClampSpec, ...],
+    *,
+    phase_override: Literal["prefill", "decode"] | None = None,
+) -> int:
+    """Hash *specs*, optionally replacing each spec phase in the digest."""
     h = hashlib.sha256()
     h.update(b"\x00sae_clamps\x00")
-    for spec in sorted(specs, key=lambda s: (s.module_name, s.phase)):
+    sort_key = (
+        (lambda s: _sae_spec_sort_key(s, phase_override=phase_override))
+        if phase_override is not None
+        else _sae_spec_sort_key
+    )
+    for spec in sorted(specs, key=sort_key):
         h.update(b"\x01module\x01")
         h.update(spec.module_name.encode("utf-8"))
-        h.update(spec.phase.encode("utf-8"))
+        h.update((phase_override or spec.phase).encode("utf-8"))
         for hook_name in sorted(spec.clamps.keys()):
             h.update(b"\x02hook\x02")
             h.update(hook_name.encode("utf-8"))
             layer_map = spec.clamps[hook_name]
             for layer_idx in sorted(layer_map.keys()):
                 h.update(b"\x03layer\x03")
-                h.update(layer_idx.to_bytes(4, "little", signed=True))
+                h.update(
+                    validate_steering_index(layer_idx, "SAEClampSpec layer_idx")
+                    .to_bytes(4, "little", signed=True)
+                )
                 entries = sorted(layer_map[layer_idx], key=lambda e: e.feature_idx)
                 for entry in entries:
                     h.update(b"\x04entry\x04")
-                    h.update(entry.feature_idx.to_bytes(4, "little", signed=True))
+                    h.update(
+                        validate_steering_index(
+                            entry.feature_idx, "SAEClampEntry.feature_idx"
+                        ).to_bytes(4, "little", signed=True)
+                    )
                     # 1 byte discriminator for the kind so additive vs
                     # absolute can never collide on the same numerical
                     # value.
                     h.update(b"a" if entry.kind == "absolute" else b"r")
                     # Promote to fp64 for hash-stable bit pattern.
-                    import numpy as np  # local to keep module import light
-
-                    h.update(np.float64(entry.value).tobytes())
+                    h.update(struct.pack("<d", float(entry.value)))
                     h.update(b"\x01" if entry.only_if_active else b"\x00")
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+
+
+def hash_sae_clamp_specs_for_phase(
+    specs: tuple[SAEClampSpec, ...] | None,
+    phase: Literal["prefill", "decode"],
+) -> int:
+    """Hash SAE clamp table content for one worker phase.
+
+    Request/APC hashes use :func:`hash_sae_clamp_specs` and include each
+    spec's declared phase, because ``phase="both"`` and ``phase="prefill"``
+    differ in decode semantics.  Worker SAE table rows, however, are already
+    keyed by the active worker phase.  Within a prefill row, a ``both`` spec
+    and an otherwise-identical ``prefill`` spec produce identical clamp-table
+    content, so this helper normalizes applicable specs to *phase* before
+    hashing.  That lets the scheduler and worker share rows by actual table
+    content without weakening prefix-cache isolation.
+    """
+    if phase not in ("prefill", "decode"):
+        raise ValueError(f"phase must be 'prefill' or 'decode', got {phase!r}.")
+    if not specs:
+        return 0
+    phase_specs = tuple(spec for spec in specs if spec.phase in ("both", phase))
+    if not phase_specs:
+        return 0
+    return _hash_sae_clamp_specs_with_phase(phase_specs, phase_override=phase)
+
+
+def _sae_spec_sort_key(
+    spec: SAEClampSpec,
+    *,
+    phase_override: Literal["prefill", "decode"] | None = None,
+) -> tuple[str, str, tuple[Any, ...]]:
+    """Canonical ordering key for SAE specs.
+
+    Requests may carry multiple non-overlapping specs for the same
+    module and phase.  Sorting only by ``(module_name, phase)`` would
+    leave those equal-key specs in caller order and make the digest
+    depend on request-list ordering.  Include the canonical clamp
+    content in the sort key so semantically identical sets hash the
+    same regardless of outer tuple order.
+    """
+    hook_items = []
+    for hook_name in sorted(spec.clamps):
+        layer_items = []
+        for layer_idx in sorted(spec.clamps[hook_name]):
+            entries = tuple(
+                sorted(
+                    (
+                        (
+                            entry.feature_idx,
+                            entry.kind,
+                            float(entry.value),
+                            entry.only_if_active,
+                        )
+                        for entry in spec.clamps[hook_name][layer_idx]
+                    ),
+                    key=lambda item: item[0],
+                )
+            )
+            layer_items.append((layer_idx, entries))
+        hook_items.append((hook_name, tuple(layer_items)))
+    return (spec.module_name, phase_override or spec.phase, tuple(hook_items))

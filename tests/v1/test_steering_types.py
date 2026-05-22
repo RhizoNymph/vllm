@@ -9,12 +9,15 @@ Covers:
 - Co-located scale application
 """
 
+import numpy as np
 import pytest
 
 from vllm.config.steering_types import (
     hash_steering_config,
+    merge_steering_specs,
     normalize_layer_entry,
     resolve_effective_vectors,
+    scale_steering_spec,
 )
 
 # -----------------------------------------------------------------------
@@ -86,6 +89,13 @@ class TestNormalizeLayerEntry:
     def test_invalid_type_raises(self):
         with pytest.raises(TypeError, match="SteeringLayerEntry must be"):
             normalize_layer_entry("not a list or dict")  # type: ignore[arg-type]
+
+    def test_ndarray_returns_scale_one(self):
+        arr = np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
+        result_vec, result_scale = normalize_layer_entry(arr)
+        assert isinstance(result_vec, np.ndarray)
+        assert np.array_equal(result_vec, arr)
+        assert result_scale == 1.0
 
 
 # -----------------------------------------------------------------------
@@ -190,6 +200,62 @@ class TestResolveEffectiveVectors:
         with pytest.raises(ValueError, match="different lengths"):
             resolve_effective_vectors(base, phase)
 
+    def test_accepts_merge_specs_output(self):
+        merged_base = merge_steering_specs({"hp": {0: [1.0, 2.0, 3.0]}}, None)
+        merged_phase = merge_steering_specs({"hp": {0: [10.0, 20.0, 30.0]}}, None)
+        assert isinstance(merged_base["hp"][0], np.ndarray)
+        assert isinstance(merged_phase["hp"][0], np.ndarray)
+        result = resolve_effective_vectors(merged_base, merged_phase)
+        assert result is not None
+        assert result["hp"][0].tolist() == [11.0, 22.0, 33.0]
+
+
+# -----------------------------------------------------------------------
+# merge_steering_specs
+# -----------------------------------------------------------------------
+
+
+class TestMergeSteeringSpecs:
+    def test_both_none_returns_none(self):
+        assert merge_steering_specs(None, None) is None
+
+    def test_only_a_pass_through(self):
+        result = merge_steering_specs({"hp": {0: [1.0, 2.0]}}, None)
+        assert result is not None
+        assert result["hp"][0].tolist() == [1.0, 2.0]
+
+    def test_only_b_pass_through(self):
+        result = merge_steering_specs(None, {"hp": {0: [3.0, 4.0]}})
+        assert result is not None
+        assert result["hp"][0].tolist() == [3.0, 4.0]
+
+    def test_overlapping_entries_sum(self):
+        result = merge_steering_specs(
+            {"hp": {0: [1.0, 2.0]}},
+            {"hp": {0: [10.0, 20.0]}},
+        )
+        assert result is not None
+        assert result["hp"][0].tolist() == [11.0, 22.0]
+
+    def test_chained_merge_resolve(self):
+        merged_base = merge_steering_specs(
+            {"hp": {0: [1.0, 2.0]}},
+            {"hp": {1: [5.0, 6.0]}},
+        )
+        result = resolve_effective_vectors(merged_base, None)
+        assert result is not None
+        assert result["hp"][0].tolist() == [1.0, 2.0]
+        assert result["hp"][1].tolist() == [5.0, 6.0]
+
+    def test_chained_merge_scale_spec(self):
+        merged = merge_steering_specs({"hp": {0: [1.0, 2.0]}}, None)
+        scaled = scale_steering_spec(merged, 3.0)
+        assert scaled is not None
+        entry = scaled["hp"][0]
+        assert isinstance(entry, dict)
+        assert np.array_equal(np.asarray(entry["vector"]), np.asarray([1.0, 2.0]))
+        assert entry["scale"] == 3.0
+
 
 # -----------------------------------------------------------------------
 # hash_steering_config
@@ -226,6 +292,14 @@ class TestHashSteeringConfig:
         vecs_a = {"hp_b": {1: [2.0]}, "hp_a": {0: [1.0]}}
         vecs_b = {"hp_a": {0: [1.0]}, "hp_b": {1: [2.0]}}
         assert hash_steering_config(vecs_a) == hash_steering_config(vecs_b)
+
+    def test_max_int32_layer_hashes(self):
+        h = hash_steering_config({"post_mlp": {2**31 - 1: [1.0]}})
+        assert h > 0
+
+    def test_oversized_layer_rejected(self):
+        with pytest.raises(ValueError, match="2147483647"):
+            hash_steering_config({"post_mlp": {2**31: [1.0]}})
 
 
 # -----------------------------------------------------------------------
@@ -453,3 +527,45 @@ class TestSamplingParamsExtraKeyRejection:
                     },
                 },
             )
+
+
+class TestSamplingParamsBoolFloatRejection:
+    def test_bool_vector_value_rejected(self):
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(ValueError, match="finite float"):
+            SamplingParams(steering_vectors={"post_mlp": {0: [True]}})
+
+    def test_bool_scaled_entry_value_rejected(self):
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(ValueError, match="finite float"):
+            SamplingParams(
+                steering_vectors={
+                    "post_mlp": {0: {"vector": [False], "scale": 1.0}},
+                },
+            )
+
+    def test_bool_scaled_entry_scale_rejected(self):
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(ValueError, match="finite float"):
+            SamplingParams(
+                steering_vectors={
+                    "post_mlp": {0: {"vector": [1.0], "scale": True}},
+                },
+            )
+
+
+class TestSamplingParamsLayerIndexValidation:
+    def test_bool_layer_index_rejected(self):
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(ValueError, match="non-negative integer"):
+            SamplingParams(steering_vectors={"post_mlp": {True: [1.0]}})
+
+    def test_oversized_layer_index_rejected(self):
+        from vllm.sampling_params import SamplingParams
+
+        with pytest.raises(ValueError, match="2147483647"):
+            SamplingParams(steering_vectors={"post_mlp": {2**31: [1.0]}})
