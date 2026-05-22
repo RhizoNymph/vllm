@@ -111,6 +111,13 @@ class AsyncLLM(EngineClient):
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
 
+        # Per-engine LRU mapping (prefill_hash, decode_hash) -> auto-named
+        # steering module name. See LLM._maybe_auto_promote_steering for
+        # the synchronous path's matching contract.
+        from vllm.config.steering_types import SteeringAutoPromoteLRU
+
+        self._steering_auto_promote_lru = SteeringAutoPromoteLRU(capacity=512)
+
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
             init_tracer("vllm.llm_engine", tracing_endpoint)
@@ -301,6 +308,28 @@ class AsyncLLM(EngineClient):
             raise EngineDeadError()
 
         is_pooling = isinstance(params, PoolingParams)
+
+        if (
+            not is_pooling
+            and getattr(self.vllm_config, "steering_config", None) is not None
+        ):
+            from vllm.config.steering_types import (
+                maybe_auto_promote_steering_modules_async,
+                maybe_pack_inline_steering_for_request,
+            )
+
+            await maybe_auto_promote_steering_modules_async(
+                params,
+                rpc_fn=self.collective_rpc,
+                registry_lru=self._steering_auto_promote_lru,
+            )
+
+            try:
+                torch_dtype = self.vllm_config.model_config.dtype
+            except AttributeError:
+                torch_dtype = None
+            if torch_dtype is not None:
+                maybe_pack_inline_steering_for_request(params, torch_dtype)
 
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill
