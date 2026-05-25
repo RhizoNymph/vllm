@@ -53,6 +53,14 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    get_steering_buffer_dtype,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -546,6 +554,9 @@ class Gemma4DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
+        steering_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -555,6 +566,14 @@ class Gemma4DecoderLayer(nn.Module):
 
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
+
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+            dtype=steering_dtype,
+        )
 
         # Gemma4 uses different head dimensions for sliding vs full attention
         layer_type = config.layer_types[layer_idx]
@@ -705,6 +724,7 @@ class Gemma4DecoderLayer(nn.Module):
         # 1. input_norm(x) → attn → post_attn_norm → ADD residual
         # 2. pre_ff_norm → mlp → post_ff_norm → ADD residual
         residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         hidden_states = self.input_layernorm(residual)
 
@@ -716,6 +736,11 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        # POST_ATTN steers the combined tensor before it is split into the
+        # MLP-input path and the residual carried to the final add.
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_ATTN
+        )
         residual = hidden_states
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
@@ -737,6 +762,9 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
 
         # Apply PLE (Per-Layer Embedding) if configured
         if per_layer_input is not None and self.per_layer_input_gate is not None:
@@ -1038,6 +1066,10 @@ class Gemma4Model(nn.Module, EagleModelMixin):
             self.per_layer_input_scale = None
             self.per_layer_projection_scale = None
 
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        steering_dtype = get_steering_buffer_dtype(vllm_config)
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Gemma4DecoderLayer(
@@ -1045,9 +1077,13 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
+                steering_dtype=steering_dtype,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         # Final norm: output = norm(x) * weight
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
