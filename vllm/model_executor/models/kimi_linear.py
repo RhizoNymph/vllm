@@ -37,6 +37,14 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    get_steering_buffer_dtype,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -290,12 +298,23 @@ class KimiDecoderLayer(nn.Module):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
+        steering_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
 
         self.is_moe = config.is_moe
         layer_idx = int(prefix.rsplit(".", 1)[1])
+        self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+            dtype=steering_dtype,
+        )
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
@@ -363,6 +382,8 @@ class KimiDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
+
         attn_output = torch.empty_like(hidden_states)
         self.self_attn(
             hidden_states=hidden_states,
@@ -371,9 +392,13 @@ class KimiDecoderLayer(nn.Module):
         )
         hidden_states = attn_output
 
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 
 
@@ -396,11 +421,19 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        steering_dtype = get_steering_buffer_dtype(vllm_config)
+
         def get_layer(prefix: str):
             return KimiDecoderLayer(
                 config,
                 vllm_config,
                 prefix,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
+                steering_dtype=steering_dtype,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -408,6 +441,7 @@ class KimiLinearModel(nn.Module):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
