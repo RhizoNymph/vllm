@@ -313,6 +313,23 @@ class SamplingParams(
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
 
+    capture: dict[str, Any] | None = None
+    """Per-request opt-in for capture consumers, keyed by consumer name.
+
+    The value at each key is the consumer-specific spec (consumers define
+    their own schemas). Only consumers with ``reads_client_spec = True`` accept
+    per-request specs.
+
+    Validation at ``SamplingParams`` construction is strictly structural:
+    the field must be either ``None`` or a ``dict[str, Any]`` (with
+    string keys). Per-consumer validation — shape, layer-in-range,
+    byte-budget, prefix-cache positions — runs at the OpenAI entrypoint
+    against the active consumer registry and is *not* performed here.
+
+    The entrypoint mutates this dict in place after validation, replacing
+    each raw value with the consumer-produced :class:`CaptureSpec`. The
+    runner tolerates both shapes."""
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -352,6 +369,7 @@ class SamplingParams(
         extra_args: dict[str, Any] | None = None,
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
+        capture: dict[str, Any] | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -393,6 +411,7 @@ class SamplingParams(
             extra_args=extra_args,
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
+            capture=capture,
         )
 
     def __post_init__(self) -> None:
@@ -432,6 +451,7 @@ class SamplingParams(
             self.output_text_buffer_length = max(len(s) for s in self.stop) - 1
 
         self._verify_args()
+        self._validate_capture()
 
         if self.temperature < _SAMPLING_EPS:
             # Zero temperature means greedy sampling.
@@ -448,6 +468,31 @@ class SamplingParams(
             # the output of prompt logprobs may less than n_prompt_tokens,
             # we need to skip reading cache at this request.
             self.skip_reading_prefix_cache = self.prompt_logprobs is not None
+
+    def _validate_capture(self) -> None:
+        """Structural check on ``capture``.
+
+        Only verifies the shape at construction time (``dict[str, Any]``
+        with string keys). Per-consumer validation — against the active
+        consumer registry, with access to the request context — happens
+        in the OpenAI entrypoint (``_admit_capture``). Leaving full
+        validation out of ``SamplingParams`` keeps the module free of
+        any capture-framework imports.
+        """
+        capture = self.capture
+        if capture is None:
+            return
+        if not isinstance(capture, dict):
+            raise ValueError(
+                "capture must be a dict keyed by consumer name, got "
+                f"{type(capture).__name__}"
+            )
+        for key in capture:
+            if not isinstance(key, str):
+                raise ValueError(
+                    "capture keys must be strings (consumer names), got "
+                    f"{type(key).__name__} ({key!r})"
+                )
 
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):
