@@ -26,6 +26,18 @@ from vllm.entrypoints.openai.steering.registry import (
 )
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
+from vllm.model_executor.layers.sae_full_reconstruction import (
+    HOOK_POINT_FR_DECODER_BIAS_ATTR,
+    HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
+    HOOK_POINT_FR_ENCODER_BIAS_ATTR,
+    HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
+    populate_sae_full_recon_clamp_table,
+    register_sae_full_recon_buffers,
+    register_sae_recon_index_buffer,
+    sae_full_recon_buffers_attached,
+    share_sae_recon_index_across_layers,
+    unregister_sae_full_recon_buffers,
+)
 from vllm.model_executor.layers.sae_steering import (
     HOOK_POINT_SAE_ANY_ACTIVE_ATTR,
     HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
@@ -45,6 +57,9 @@ from vllm.model_executor.layers.steering import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.sae_clamp_manager import SAEClampManager
+from vllm.v1.worker.sae_full_reconstruction_manager import (
+    SAEFullReconstructionManager,
+)
 from vllm.v1.worker.steering_manager import SteeringManager
 
 
@@ -173,6 +188,17 @@ class SteeringModelRunnerMixin:
     _sae_index_pinned: torch.Tensor | None = None
     _sae_index_dirty: bool = False
     _req_transition_scan_candidates: set[str]
+    # Phase-4 full-reconstruction state — parallel to the delta path
+    # above.  Disjoint from ``_sae_module_registry`` so the kind
+    # discriminator routes a registered name to exactly one path.
+    _sae_fr_module_registry: dict[str, "SAEModuleManifest"]
+    _sae_fr_clamp_manager: "SAEFullReconstructionManager | None" = None
+    _req_sae_fr_phase: dict[str, str]
+    _req_sae_fr_hash: dict[str, int]
+    _sae_fr_steerable_sites: dict[tuple[str, int, str], nn.Module]
+    _sae_fr_rows_scratch: np.ndarray | None = None
+    _sae_fr_index_pinned: torch.Tensor | None = None
+    _sae_fr_index_dirty: bool = False
 
     # Attributes provided by the concrete model runner that mixes this
     # class in.  Declared here purely so static type checking can see
@@ -224,11 +250,17 @@ class SteeringModelRunnerMixin:
         self._sae_steerable_sites = {}
         self._sae_index_dirty = False
         self._req_transition_scan_candidates = set()
+        self._sae_fr_module_registry = {}
+        self._req_sae_fr_phase = {}
+        self._req_sae_fr_hash = {}
+        self._sae_fr_steerable_sites = {}
+        self._sae_fr_index_dirty = False
 
         steering_config = getattr(self.vllm_config, "steering_config", None)
         if steering_config is None or not steerable:
             self._steering_manager = None
             self._sae_clamp_manager = None
+            self._sae_fr_clamp_manager = None
             return
 
         # Resolve device from the first steerable layer's table buffer
@@ -259,6 +291,14 @@ class SteeringModelRunnerMixin:
         self._sae_clamp_manager = SAEClampManager(
             steering_config.max_steering_configs,
         )
+        # Phase-4: full-reconstruction manager shares the
+        # ``max_steering_configs`` admission budget with the additive
+        # and delta paths.  Per the design doc, a request that uses
+        # delta + full-reconstruction simultaneously consumes one row
+        # from each manager and the scheduler reserves all of them.
+        self._sae_fr_clamp_manager = SAEFullReconstructionManager(
+            steering_config.max_steering_configs,
+        )
 
         # Pre-allocate CPU scratch buffers for the vectorized
         # steering_index build in ``_update_steering_buffers``.  The
@@ -275,6 +315,7 @@ class SteeringModelRunnerMixin:
             self._steering_rows_scratch = np.zeros(max_seqs, dtype=np.int64)
             self._steering_n_tokens_scratch = np.zeros(max_seqs, dtype=np.int64)
             self._sae_rows_scratch = np.zeros(max_seqs, dtype=np.int64)
+            self._sae_fr_rows_scratch = np.zeros(max_seqs, dtype=np.int64)
             try:
                 self._steering_index_pinned = torch.zeros(
                     max_tokens, dtype=torch.long, pin_memory=True
@@ -282,11 +323,15 @@ class SteeringModelRunnerMixin:
                 self._sae_index_pinned = torch.zeros(
                     max_tokens, dtype=torch.long, pin_memory=True
                 )
+                self._sae_fr_index_pinned = torch.zeros(
+                    max_tokens, dtype=torch.long, pin_memory=True
+                )
             except RuntimeError:
                 # Pinned memory unavailable (e.g. CPU-only test
                 # environment); fall back to a regular CPU tensor.
                 self._steering_index_pinned = torch.zeros(max_tokens, dtype=torch.long)
                 self._sae_index_pinned = torch.zeros(max_tokens, dtype=torch.long)
+                self._sae_fr_index_pinned = torch.zeros(max_tokens, dtype=torch.long)
 
         # Warm the fused-apply Triton kernel so first-call JIT cost
         # happens before any captured forward pass. Without this, the
@@ -745,6 +790,15 @@ class SteeringModelRunnerMixin:
                 if prev_manifest is not None:
                     prev_weights = self._snapshot_sae_weights(name)
                     self._detach_sae_buffers(name)
+                # If a name is being re-registered with a different
+                # kind, drop the full-reconstruction entry (and its
+                # buffers) so the registries stay disjoint.  Use
+                # ``getattr`` so harnesses that don't initialise the
+                # full-reconstruction state still work.
+                fr_registry = getattr(self, "_sae_fr_module_registry", None)
+                if fr_registry is not None and name in fr_registry:
+                    self._detach_sae_full_recon_buffers(name)
+                    fr_registry.pop(name, None)
                 self._sae_module_registry[name] = manifest
                 self._steering_module_registry.pop(name, None)
                 self._steering_module_resolved_cache.pop(name, None)
@@ -794,6 +848,58 @@ class SteeringModelRunnerMixin:
                                 prev_additive_cache
                             )
                     raise
+            elif kind == "sae_full_reconstruction":
+                if (
+                    payload.get("vectors") is not None
+                    or payload.get("prefill_vectors") is not None
+                    or payload.get("decode_vectors") is not None
+                ):
+                    raise SteeringVectorError(
+                        f"Steering module '{name}': additive vector fields "
+                        "are not valid for kind='sae_full_reconstruction'."
+                    )
+                manifest_payload = payload.get("sae_manifest")
+                if not isinstance(manifest_payload, dict):
+                    raise SteeringVectorError(
+                        f"Steering module '{name}': kind='sae_full_"
+                        "reconstruction' requires 'sae_manifest' dict in "
+                        "broadcast payload."
+                    )
+                try:
+                    manifest = sae_manifest_from_dict(manifest_payload)
+                    self._validate_worker_sae_manifest(name, manifest)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise SteeringVectorError(
+                        f"Steering module '{name}': invalid sae_manifest "
+                        f"in broadcast payload: {exc}"
+                    ) from exc
+                fr_registry = getattr(self, "_sae_fr_module_registry", None)
+                if fr_registry is None:
+                    raise SteeringVectorError(
+                        f"Steering module '{name}': kind='sae_full_"
+                        "reconstruction' requires the worker mixin to be "
+                        "initialised via _init_steering_state before "
+                        "registration."
+                    )
+                if name in fr_registry:
+                    self._detach_sae_full_recon_buffers(name)
+                # Re-registering as a different kind drops the stale
+                # entry so the registries stay disjoint.
+                if name in self._sae_module_registry:
+                    self._detach_sae_buffers(name)
+                    self._sae_module_registry.pop(name, None)
+                fr_registry[name] = manifest
+                self._steering_module_registry.pop(name, None)
+                self._steering_module_resolved_cache.pop(name, None)
+                sae_weights = payload.get("sae_weights")
+                try:
+                    self._attach_sae_full_recon_buffers(name, manifest)
+                    if sae_weights is not None:
+                        self.attach_sae_full_recon_weights(name, sae_weights)
+                except Exception:
+                    self._detach_sae_full_recon_buffers(name)
+                    fr_registry.pop(name, None)
+                    raise
             else:
                 raise SteeringVectorError(
                     f"Steering module '{name}': unknown kind {kind!r} in "
@@ -812,10 +918,19 @@ class SteeringModelRunnerMixin:
         prev_cache = dict(self._steering_module_resolved_cache)
         prev_sae = dict(self._sae_module_registry)
         prev_weights = {name: self._snapshot_sae_weights(name) for name in prev_sae}
+        prev_fr_registry = getattr(self, "_sae_fr_module_registry", None)
+        prev_fr = dict(prev_fr_registry) if prev_fr_registry is not None else {}
+        prev_fr_weights = {
+            name: self._snapshot_sae_full_recon_weights(name) for name in prev_fr
+        }
 
         try:
             for sae_name in list(self._sae_module_registry):
                 self._detach_sae_buffers(sae_name)
+            if prev_fr_registry is not None:
+                for fr_name in list(prev_fr_registry):
+                    self._detach_sae_full_recon_buffers(fr_name)
+                prev_fr_registry.clear()
             self._steering_module_registry.clear()
             self._steering_module_resolved_cache.clear()
             self._sae_module_registry.clear()
@@ -823,6 +938,10 @@ class SteeringModelRunnerMixin:
         except Exception:
             for sae_name in list(self._sae_module_registry):
                 self._detach_sae_buffers(sae_name)
+            if prev_fr_registry is not None:
+                for fr_name in list(prev_fr_registry):
+                    self._detach_sae_full_recon_buffers(fr_name)
+                prev_fr_registry.clear()
             self._steering_module_registry.clear()
             self._steering_module_resolved_cache.clear()
             self._sae_module_registry.clear()
@@ -840,6 +959,18 @@ class SteeringModelRunnerMixin:
                     self._detach_sae_buffers(name)
                     self._sae_module_registry.pop(name, None)
                     raise
+            if prev_fr_registry is not None:
+                for name, manifest in prev_fr.items():
+                    prev_fr_registry[name] = manifest
+                    try:
+                        self._attach_sae_full_recon_buffers(name, manifest)
+                        weights = prev_fr_weights.get(name)
+                        if weights is not None:
+                            self.attach_sae_full_recon_weights(name, weights)
+                    except Exception:
+                        self._detach_sae_full_recon_buffers(name)
+                        prev_fr_registry.pop(name, None)
+                        raise
             raise
 
     @staticmethod
@@ -958,6 +1089,10 @@ class SteeringModelRunnerMixin:
             if name in self._sae_module_registry:
                 self._detach_sae_buffers(name)
                 self._sae_module_registry.pop(name, None)
+            fr_registry = getattr(self, "_sae_fr_module_registry", None)
+            if fr_registry is not None and name in fr_registry:
+                self._detach_sae_full_recon_buffers(name)
+                fr_registry.pop(name, None)
         if names:
             logger.debug(
                 "Worker unregistered %d steering module(s)",
@@ -1313,6 +1448,537 @@ class SteeringModelRunnerMixin:
         if phase is None:
             return None
         return sae_hash, phase
+
+    def _req_sae_fr_phase_map(self) -> dict[str, str]:
+        """Return request -> SAE full-recon phase state."""
+        if not hasattr(self, "_req_sae_fr_phase"):
+            self._req_sae_fr_phase = {}
+        return self._req_sae_fr_phase
+
+    def _req_sae_fr_hash_map(self) -> dict[str, int]:
+        """Return request -> SAE full-recon row hash state."""
+        if not hasattr(self, "_req_sae_fr_hash"):
+            self._req_sae_fr_hash = {}
+        return self._req_sae_fr_hash
+
+    def _set_req_sae_fr_row(self, req_id: str, recon_hash: int, phase: str) -> None:
+        self._req_sae_fr_phase_map()[req_id] = phase
+        self._req_sae_fr_hash_map()[req_id] = recon_hash
+
+    def _pop_req_sae_fr_row(self, req_id: str) -> tuple[int, str] | None:
+        phase = self._req_sae_fr_phase_map().pop(req_id, None)
+        recon_hash = self._req_sae_fr_hash_map().pop(req_id, 0)
+        if phase is None:
+            return None
+        return recon_hash, phase
+
+    def _get_req_sae_fr_row(self, req_id: str) -> tuple[int, str] | None:
+        phase = self._req_sae_fr_phase_map().get(req_id)
+        recon_hash = self._req_sae_fr_hash_map().get(req_id, 0)
+        if phase is None:
+            return None
+        return recon_hash, phase
+
+    # -----------------------------------------------------------------------
+    # Phase-4: SAE full-reconstruction buffer / weight / admission lifecycle
+    # -----------------------------------------------------------------------
+
+    def _attach_sae_full_recon_buffers(
+        self,
+        module_name: str,
+        manifest: SAEModuleManifest,
+    ) -> None:
+        """Attach per-(layer, hook) full-reconstruction buffers.
+
+        Walks ``manifest.layers``, filters to layers this rank owns,
+        and attaches the full encoder / decoder weight buffers + per-
+        row clamp tables + the shared ``sae_recon_index`` to each
+        owning layer module.  Buffers default to zero; weights are
+        populated separately via :meth:`attach_sae_full_recon_weights`.
+        """
+        steerable = self._steerable_layers_cache or {}
+        vllm_config = getattr(self, "vllm_config", None)
+        steering_config = (
+            getattr(vllm_config, "steering_config", None)
+            if vllm_config is not None
+            else None
+        )
+        if steering_config is None or not steerable:
+            return
+        max_recon_configs = int(steering_config.max_steering_configs)
+        any_layer = next(iter(steerable.values()))
+        ref_dtype: torch.dtype | None = None
+        table_device: torch.device | None = None
+        for attr in HOOK_POINT_TABLE_ATTR.values():
+            if hasattr(any_layer, attr):
+                ref_buffer = getattr(any_layer, attr)
+                ref_dtype = ref_buffer.dtype
+                table_device = ref_buffer.device
+                break
+        if ref_dtype is None:
+            ref_dtype = getattr(self.vllm_config.model_config, "dtype", torch.float32)
+            table_device = torch.device("cpu")
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        max_tokens = (
+            int(scheduler_config.max_num_batched_tokens)
+            if scheduler_config is not None
+            else 0
+        )
+        n_clamp = len(manifest.clampable_features)
+        clampable_features = torch.tensor(
+            list(manifest.clampable_features), dtype=torch.int64, device=table_device
+        )
+        attached_layers: list[nn.Module] = []
+        for layer_idx, hook_str in manifest.layers:
+            if layer_idx not in self._locally_owned_layers:
+                continue
+            layer = steerable.get(layer_idx)
+            if layer is None:
+                continue
+            try:
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError as exc:
+                raise SteeringVectorError(
+                    f"SAE full-reconstruction module {module_name!r} declares "
+                    f"unsupported hook point {hook_str!r}."
+                ) from exc
+            register_sae_full_recon_buffers(
+                layer,
+                hook_point=hook_point,
+                module_name=module_name,
+                activation=manifest.activation,
+                activation_params=manifest.activation_params,
+                d_sae=manifest.d_sae,
+                n_clamp=n_clamp,
+                hidden_size=manifest.d_model,
+                max_recon_configs=max_recon_configs,
+                clampable_features=clampable_features,
+                dtype=ref_dtype,
+                device=table_device,
+            )
+            register_sae_recon_index_buffer(
+                layer, max_tokens=max_tokens, device=table_device
+            )
+            self._sae_fr_steerable_sites[(module_name, layer_idx, hook_str)] = layer
+            attached_layers.append(layer)
+        if attached_layers:
+            unique_layers: dict[int, nn.Module] = {}
+            for layer in self._sae_fr_steerable_sites.values():
+                unique_layers.setdefault(id(layer), layer)
+            share_sae_recon_index_across_layers(list(unique_layers.values()))
+            self._warmup_sae_full_recon_for_module(
+                manifest=manifest,
+                attached_layers=attached_layers,
+                ref_dtype=ref_dtype,
+            )
+
+    def _warmup_sae_full_recon_for_module(
+        self,
+        *,
+        manifest: SAEModuleManifest,
+        attached_layers: list[nn.Module],
+        ref_dtype: torch.dtype,
+    ) -> None:
+        """Pre-warm the full-reconstruction CUDA path for ``manifest``."""
+        if not attached_layers:
+            return
+        device = attached_layers[0].sae_recon_index.device  # type: ignore[union-attr]
+        if device.type != "cuda":
+            return
+        from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
+            warmup_apply_sae_full_recon_kernel,
+        )
+        from vllm.model_executor.layers.sae_steering import (
+            _ACTIVATION_TO_CODE,
+            _activation_to_scalar,
+        )
+
+        compute_dtype = getattr(self.vllm_config.model_config, "dtype", ref_dtype)
+        warmup_apply_sae_full_recon_kernel(
+            hidden_size=manifest.d_model,
+            d_sae=manifest.d_sae,
+            n_clamp=len(manifest.clampable_features),
+            table_dtype=ref_dtype,
+            compute_dtype=compute_dtype,
+            device=device,
+            activation_code=_ACTIVATION_TO_CODE[manifest.activation],
+            activation_param=_activation_to_scalar(
+                manifest.activation, manifest.activation_params
+            ),
+        )
+
+    def _detach_sae_full_recon_buffers(self, module_name: str) -> None:
+        """Detach per-(layer, hook) full-reconstruction buffers for the module."""
+        sites = getattr(self, "_sae_fr_steerable_sites", None)
+        if sites is None:
+            return
+        keys = [k for k in sites if k[0] == module_name]
+        for key in keys:
+            _, _layer_idx, hook_str = key
+            layer = sites.pop(key)
+            try:
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError:
+                continue
+            unregister_sae_full_recon_buffers(layer, hook_point=hook_point)
+
+    def _snapshot_sae_full_recon_weights(
+        self, module_name: str
+    ) -> dict[tuple[int, str], dict[str, torch.Tensor]]:
+        """Clone the currently-attached full-recon weights for rollback."""
+        snapshot: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
+        sites = getattr(self, "_sae_fr_steerable_sites", None)
+        if sites is None:
+            return snapshot
+        for (name, layer_idx, hook_str), site in sites.items():
+            if name != module_name:
+                continue
+            try:
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError:
+                continue
+            tensors: dict[str, torch.Tensor] = {}
+            for tensor_key, attr_table in (
+                ("encoder_weight", HOOK_POINT_FR_ENCODER_WEIGHT_ATTR),
+                ("encoder_bias", HOOK_POINT_FR_ENCODER_BIAS_ATTR),
+                ("decoder_weight", HOOK_POINT_FR_DECODER_WEIGHT_ATTR),
+                ("decoder_bias", HOOK_POINT_FR_DECODER_BIAS_ATTR),
+            ):
+                buf = getattr(site, attr_table[hook_point], None)
+                if buf is None:
+                    continue
+                tensors[tensor_key] = buf.detach().clone()
+            if tensors:
+                snapshot[(layer_idx, hook_str)] = tensors
+        return snapshot
+
+    def attach_sae_full_recon_weights(
+        self,
+        module_name: str,
+        weights: dict[tuple[int, str], dict[str, torch.Tensor]],
+    ) -> None:
+        """Inject encoder / decoder weight + bias tensors into full-recon buffers.
+
+        ``weights`` maps ``(layer_idx, hook_str)`` to a dict with keys
+        ``"encoder_weight"``, ``"encoder_bias"``,
+        ``"decoder_weight"``, and ``"decoder_bias"``.  Each tensor is
+        copied into the corresponding zero-initialised buffer in
+        place; shape and dtype must match what
+        :meth:`_attach_sae_full_recon_buffers` allocated.
+        """
+        if module_name not in self._sae_fr_module_registry:
+            raise SteeringVectorError(
+                f"attach_sae_full_recon_weights: SAE full-reconstruction "
+                f"module {module_name!r} is not registered."
+            )
+        for (layer_idx, hook_str), tensors in weights.items():
+            site = self._sae_fr_steerable_sites.get((module_name, layer_idx, hook_str))
+            if site is None:
+                continue
+            try:
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError as exc:
+                raise SteeringVectorError(
+                    f"attach_sae_full_recon_weights: unsupported hook point "
+                    f"{hook_str!r}."
+                ) from exc
+            for tensor_key, attr_table in (
+                ("encoder_weight", HOOK_POINT_FR_ENCODER_WEIGHT_ATTR),
+                ("encoder_bias", HOOK_POINT_FR_ENCODER_BIAS_ATTR),
+                ("decoder_weight", HOOK_POINT_FR_DECODER_WEIGHT_ATTR),
+                ("decoder_bias", HOOK_POINT_FR_DECODER_BIAS_ATTR),
+            ):
+                if tensor_key not in tensors:
+                    raise SteeringVectorError(
+                        f"attach_sae_full_recon_weights({module_name!r}): "
+                        f"missing {tensor_key!r} for site (layer="
+                        f"{layer_idx}, hook={hook_str!r})."
+                    )
+                buf = getattr(site, attr_table[hook_point])
+                src = tensors[tensor_key].to(dtype=buf.dtype, device=buf.device)
+                if src.shape != buf.shape:
+                    raise SteeringVectorError(
+                        f"attach_sae_full_recon_weights({module_name!r}): "
+                        f"{tensor_key} shape {tuple(src.shape)} does not "
+                        f"match buffer shape {tuple(buf.shape)} at site "
+                        f"(layer={layer_idx}, hook={hook_str!r})."
+                    )
+                buf.copy_(src)
+
+    def _assert_sae_full_recon_specs_can_be_applied(self, sp: SamplingParams) -> None:
+        """Validate ``sp.sae_full_reconstruction_specs`` against the registry."""
+        specs = getattr(sp, "sae_full_reconstruction_specs", None)
+        if not specs:
+            return
+        for spec in specs:
+            manifest = self._sae_fr_module_registry.get(spec.module_name)
+            if manifest is None:
+                available = sorted(self._sae_fr_module_registry.keys())
+                raise SteeringVectorError(
+                    f"SAE full-reconstruction spec references unknown module "
+                    f"{spec.module_name!r}.  Available full-reconstruction "
+                    f"modules on this worker: {available or 'none'}.  "
+                    "Register the module via "
+                    "POST /v1/steering/modules/register with "
+                    "kind='sae_full_reconstruction' before submitting a spec."
+                )
+            covered = set(manifest.layers)
+            clampable = set(manifest.clampable_features)
+            for hook_name, layer_map in spec.clamps.items():
+                for layer_idx, entries in layer_map.items():
+                    if (layer_idx, hook_name) not in covered:
+                        raise SteeringVectorError(
+                            f"SAE full-reconstruction spec for module "
+                            f"{spec.module_name!r} targets site "
+                            f"(layer={layer_idx}, hook={hook_name!r}) "
+                            "which is not declared in the module's "
+                            "manifest.layers."
+                        )
+                    for entry in entries:
+                        if entry.feature_idx not in clampable:
+                            raise SteeringVectorError(
+                                f"SAE full-reconstruction spec for module "
+                                f"{spec.module_name!r} clamps feature_idx="
+                                f"{entry.feature_idx}, which is not in the "
+                                "module's clampable_features set."
+                            )
+
+    def _register_initial_sae_full_recon(
+        self,
+        req_id: str,
+        sp: SamplingParams,
+        prefill_hash: int,
+        decode_hash: int,
+        is_prefilling: bool,
+    ) -> None:
+        """Admit ``sp.sae_full_reconstruction_specs`` against the manager.
+
+        Uses the combined ``prefill_hash`` / ``decode_hash`` from the
+        scheduler so admission accounting and row addressing stay
+        aligned with the scheduler's capacity reservations.  The full
+        spec tuple is stored verbatim so the populator can re-derive
+        per-(layer, hook) clamp content at flush time.
+        """
+        mgr = self._sae_fr_clamp_manager
+        specs = getattr(sp, "sae_full_reconstruction_specs", None)
+        if mgr is None or not specs:
+            return
+        if is_prefilling:
+            if prefill_hash != 0:
+                mgr.register_recon_spec(prefill_hash, specs, "prefill")
+                self._set_req_sae_fr_row(req_id, prefill_hash, "prefill")
+        else:
+            if decode_hash != 0:
+                mgr.register_recon_spec(decode_hash, specs, "decode")
+                self._set_req_sae_fr_row(req_id, decode_hash, "decode")
+
+    def _release_sae_full_recon_for_request(
+        self,
+        req_id: str,
+        prefill_hash: int,
+        decode_hash: int,
+    ) -> None:
+        """Release any rows allocated for ``req_id``.  Idempotent."""
+        mgr = self._sae_fr_clamp_manager
+        if mgr is None:
+            return
+        row = self._pop_req_sae_fr_row(req_id)
+        if row is None:
+            return
+        recon_hash, phase = row
+        if recon_hash != 0:
+            mgr.release_recon_spec(recon_hash, phase)
+    # -----------------------------------------------------------------------
+    # Phase-4: SAE full-reconstruction buffer / weight / admission lifecycle
+    # -----------------------------------------------------------------------
+
+    def _attach_sae_full_recon_buffers(
+        self,
+        module_name: str,
+        manifest: SAEModuleManifest,
+    ) -> None:
+        """Attach per-(layer, hook) full-reconstruction buffers.
+
+        Walks ``manifest.layers``, filters to layers this rank owns,
+        and attaches the full encoder / decoder weight buffers + per-
+        row clamp tables + the shared ``sae_recon_index`` to each
+        owning layer module.  Buffers default to zero; weights are
+        populated separately via :meth:`attach_sae_full_recon_weights`.
+        """
+        steerable = self._steerable_layers_cache or {}
+        vllm_config = getattr(self, "vllm_config", None)
+        steering_config = (
+            getattr(vllm_config, "steering_config", None)
+            if vllm_config is not None
+            else None
+        )
+        if steering_config is None or not steerable:
+            return
+        max_recon_configs = int(steering_config.max_steering_configs)
+        any_layer = next(iter(steerable.values()))
+        ref_dtype: torch.dtype | None = None
+        for attr in HOOK_POINT_TABLE_ATTR.values():
+            if hasattr(any_layer, attr):
+                ref_dtype = getattr(any_layer, attr).dtype
+                break
+        if ref_dtype is None:
+            ref_dtype = getattr(self.vllm_config.model_config, "dtype", torch.float32)
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        max_tokens = (
+            int(scheduler_config.max_num_batched_tokens)
+            if scheduler_config is not None
+            else 0
+        )
+        n_clamp = len(manifest.clampable_features)
+        clampable_features = torch.tensor(
+            list(manifest.clampable_features), dtype=torch.int64
+        )
+        attached_layers: list[nn.Module] = []
+        for layer_idx, hook_str in manifest.layers:
+            if layer_idx not in self._locally_owned_layers:
+                continue
+            layer = steerable.get(layer_idx)
+            if layer is None:
+                continue
+            try:
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError as exc:
+                raise SteeringVectorError(
+                    f"SAE full-reconstruction module {module_name!r} declares "
+                    f"unsupported hook point {hook_str!r}."
+                ) from exc
+            register_sae_full_recon_buffers(
+                layer,
+                hook_point=hook_point,
+                module_name=module_name,
+                activation=manifest.activation,
+                activation_params=manifest.activation_params,
+                d_sae=manifest.d_sae,
+                n_clamp=n_clamp,
+                hidden_size=manifest.d_model,
+                max_recon_configs=max_recon_configs,
+                clampable_features=clampable_features,
+                dtype=ref_dtype,
+            )
+            register_sae_recon_index_buffer(layer, max_tokens=max_tokens)
+            self._sae_fr_steerable_sites[(module_name, layer_idx, hook_str)] = layer
+            attached_layers.append(layer)
+        if attached_layers:
+            share_sae_recon_index_across_layers(attached_layers)
+            self._warmup_sae_full_recon_for_module(
+                manifest=manifest,
+                attached_layers=attached_layers,
+                ref_dtype=ref_dtype,
+            )
+
+    def _warmup_sae_full_recon_for_module(
+        self,
+        *,
+        manifest: SAEModuleManifest,
+        attached_layers: list[nn.Module],
+        ref_dtype: torch.dtype,
+    ) -> None:
+        """Pre-warm the full-reconstruction CUDA path for ``manifest``.
+
+        Mirrors :meth:`_warmup_sae_kernel_for_module` for the
+        full-reconstruction path.  No-op on CPU; under CUDA it pays
+        the first-call cuBLAS handle / autotune costs outside any
+        captured forward pass.
+        """
+        if not attached_layers:
+            return
+        device = attached_layers[0].sae_recon_index.device  # type: ignore[union-attr]
+        if device.type != "cuda":
+            return
+        from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
+            warmup_apply_sae_full_recon_kernel,
+        )
+        from vllm.model_executor.layers.sae_steering import (
+            _ACTIVATION_TO_CODE,
+            _activation_to_scalar,
+        )
+
+        compute_dtype = getattr(self.vllm_config.model_config, "dtype", ref_dtype)
+        warmup_apply_sae_full_recon_kernel(
+            hidden_size=manifest.d_model,
+            d_sae=manifest.d_sae,
+            n_clamp=len(manifest.clampable_features),
+            table_dtype=ref_dtype,
+            compute_dtype=compute_dtype,
+            device=device,
+            activation_code=_ACTIVATION_TO_CODE[manifest.activation],
+            activation_param=_activation_to_scalar(
+                manifest.activation, manifest.activation_params
+            ),
+        )
+
+    def _detach_sae_full_recon_buffers(self, module_name: str) -> None:
+        """Detach per-(layer, hook) full-reconstruction buffers for the module."""
+        sites = getattr(self, "_sae_fr_steerable_sites", None)
+        if sites is None:
+            return
+        keys = [k for k in sites if k[0] == module_name]
+        for key in keys:
+            _, _layer_idx, hook_str = key
+            layer = sites.pop(key)
+            try:
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError:
+                continue
+            unregister_sae_full_recon_buffers(layer, hook_point=hook_point)
+
+    def attach_sae_full_recon_weights(
+        self,
+        module_name: str,
+        weights: dict[tuple[int, str], dict[str, torch.Tensor]],
+    ) -> None:
+        """Inject encoder / decoder weight + bias tensors into full-recon buffers.
+
+        ``weights`` maps ``(layer_idx, hook_str)`` to a dict with keys
+        ``"encoder_weight"``, ``"encoder_bias"``,
+        ``"decoder_weight"``, and ``"decoder_bias"``.  Each tensor is
+        copied into the corresponding zero-initialised buffer in
+        place; shape and dtype must match what
+        :meth:`_attach_sae_full_recon_buffers` allocated.
+        """
+        if module_name not in self._sae_fr_module_registry:
+            raise SteeringVectorError(
+                f"attach_sae_full_recon_weights: SAE full-reconstruction "
+                f"module {module_name!r} is not registered."
+            )
+        for (layer_idx, hook_str), tensors in weights.items():
+            site = self._sae_fr_steerable_sites.get((module_name, layer_idx, hook_str))
+            if site is None:
+                continue
+            try:
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError as exc:
+                raise SteeringVectorError(
+                    f"attach_sae_full_recon_weights: unsupported hook point "
+                    f"{hook_str!r}."
+                ) from exc
+            for tensor_key, attr_table in (
+                ("encoder_weight", HOOK_POINT_FR_ENCODER_WEIGHT_ATTR),
+                ("encoder_bias", HOOK_POINT_FR_ENCODER_BIAS_ATTR),
+                ("decoder_weight", HOOK_POINT_FR_DECODER_WEIGHT_ATTR),
+                ("decoder_bias", HOOK_POINT_FR_DECODER_BIAS_ATTR),
+            ):
+                if tensor_key not in tensors:
+                    raise SteeringVectorError(
+                        f"attach_sae_full_recon_weights({module_name!r}): "
+                        f"missing {tensor_key!r} for site (layer="
+                        f"{layer_idx}, hook={hook_str!r})."
+                    )
+                buf = getattr(site, attr_table[hook_point])
+                src = tensors[tensor_key].to(dtype=buf.dtype, device=buf.device)
+                if src.shape != buf.shape:
+                    raise SteeringVectorError(
+                        f"attach_sae_full_recon_weights({module_name!r}): "
+                        f"{tensor_key} shape {tuple(src.shape)} does not "
+                        f"match buffer shape {tuple(buf.shape)} at site "
+                        f"(layer={layer_idx}, hook={hook_str!r})."
+                    )
+                buf.copy_(src)
 
     def _register_initial_sae_clamps(
         self,
@@ -1697,6 +2363,14 @@ class SteeringModelRunnerMixin:
         # only SAE, or both.
         self._update_sae_buffers(scheduler_output)
         self._apply_batched_sae_transitions(sae_transitions)
+        # Phase-4 full-reconstruction pass: structurally identical to
+        # the delta pass above, with its own manager, registry, sites,
+        # and shared per-token routing tensor (``sae_recon_index``).
+        # Guarded so harnesses that don't initialise the new state
+        # (e.g. delta-only test runners) skip cleanly.
+        if getattr(self, "_sae_fr_clamp_manager", None) is not None:
+            self._update_sae_full_recon_buffers(scheduler_output)
+            self._apply_batched_sae_full_recon_transitions(sae_transitions)
 
     def _apply_batched_steering_transitions(
         self,
@@ -1850,6 +2524,42 @@ class SteeringModelRunnerMixin:
             # Decode hash is 0 → no SAE state in decode (e.g.
             # spec.phase == "prefill").  Drop the tracking entry.
             self._pop_req_sae_row(req_id)
+
+    def _apply_batched_sae_full_recon_transitions(
+        self,
+        transitions: list[tuple[str, int, int, SamplingParams | None]],
+    ) -> None:
+        """Apply prefill->decode full-reconstruction transitions for one step.
+
+        Releases all completed prefill references first, then registers
+        any decode rows so requests sharing the same prefill row can free
+        it before the first decode allocation is attempted.  Uses the
+        combined per-request hash for row addressing (same key the
+        scheduler reserves capacity against).
+        """
+        if not transitions:
+            return
+        fr_mgr = self._sae_fr_clamp_manager
+        if fr_mgr is None:
+            return
+
+        for req_id, _prefill_hash, _decode_hash, _sp in transitions:
+            old_row = self._get_req_sae_fr_row(req_id)
+            if old_row is not None and old_row[1] == "prefill" and old_row[0] != 0:
+                fr_mgr.release_recon_spec(old_row[0], "prefill")
+                self._pop_req_sae_fr_row(req_id)
+
+        for req_id, _prefill_hash, decode_hash, sp in transitions:
+            specs = (
+                getattr(sp, "sae_full_reconstruction_specs", None)
+                if sp is not None
+                else None
+            )
+            if decode_hash != 0 and specs:
+                fr_mgr.register_recon_spec(decode_hash, specs, "decode")
+                self._set_req_sae_fr_row(req_id, decode_hash, "decode")
+            else:
+                self._pop_req_sae_fr_row(req_id)
 
     def _update_sae_buffers(self, scheduler_output: "SchedulerOutput") -> None:
         """Populate SAE per-layer clamp tables and the shared ``sae_index``.
@@ -2024,6 +2734,128 @@ class SteeringModelRunnerMixin:
             sae_index[n_expanded:].zero_()
         self._sae_index_dirty = True
 
+    def _update_sae_full_recon_buffers(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Populate full-reconstruction clamp tables + ``sae_recon_index``.
+
+        Mirrors :meth:`_update_sae_buffers` for the full-reconstruction
+        path: per-request lookup against the
+        :class:`SAEFullReconstructionManager`, accumulate into the
+        full-recon scratch row-per-request array, then a single
+        non-blocking H2D copy into the shared ``sae_recon_index``
+        tensor.  Tokens whose request has no active full-
+        reconstruction row are routed to row 0 (the no-reconstruction
+        sentinel) so the dispatch shim's ``recon_mask =
+        (recon_index != 0)`` short-circuits them.
+        """
+        fr_mgr = self._sae_fr_clamp_manager
+        if fr_mgr is None or not self._sae_fr_steerable_sites:
+            return
+
+        if fr_mgr._tables_dirty:
+            for (
+                module_name,
+                layer_idx,
+                hook_str,
+            ), site in self._sae_fr_steerable_sites.items():
+                manifest = self._sae_fr_module_registry.get(module_name)
+                if manifest is None:
+                    continue
+                try:
+                    hook_point = SteeringHookPoint(hook_str)
+                except ValueError:
+                    continue
+                populate_sae_full_recon_clamp_table(
+                    manager=fr_mgr,
+                    module=site,
+                    hook_point=hook_point,
+                    module_name=module_name,
+                    clampable_features=manifest.clampable_features,
+                    layer_idx=layer_idx,
+                )
+            fr_mgr.mark_tables_clean()
+
+        any_layer = next(iter(self._sae_fr_steerable_sites.values()))
+        if (
+            not sae_full_recon_buffers_attached(any_layer, SteeringHookPoint.PRE_ATTN)
+            and not sae_full_recon_buffers_attached(
+                any_layer, SteeringHookPoint.POST_ATTN
+            )
+            and not sae_full_recon_buffers_attached(
+                any_layer, SteeringHookPoint.POST_MLP
+            )
+        ):
+            return
+        recon_index = cast(torch.Tensor, any_layer.sae_recon_index)
+
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids
+        rows_scratch = self._sae_fr_rows_scratch
+        n_tokens_scratch = self._steering_n_tokens_scratch
+        index_pinned = self._sae_fr_index_pinned
+        if rows_scratch is None or n_tokens_scratch is None or index_pinned is None:
+            return
+        if rows_scratch.shape[0] < num_reqs:
+            rows_scratch = np.zeros(num_reqs, dtype=np.int64)
+            self._sae_fr_rows_scratch = rows_scratch
+
+        active_count = 0
+        for i in range(num_reqs):
+            req_id = req_ids[i]
+            n_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if n_tokens == 0:
+                continue
+
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                rows_scratch[active_count] = 0
+                n_tokens_scratch[active_count] = n_tokens
+                active_count += 1
+                continue
+
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+            is_prefilling = num_computed < num_prompt
+
+            if is_prefilling:
+                combined_hash = int(
+                    self.input_batch.request_prefill_steering_hash[req_index]
+                )
+                if (combined_hash, "prefill") in fr_mgr.config_to_row:
+                    hash_val = combined_hash
+                else:
+                    hash_val = 0
+                row = fr_mgr.get_row_for_config(hash_val, is_prefill=True)
+            else:
+                combined_hash = int(
+                    self.input_batch.request_decode_steering_hash[req_index]
+                )
+                if (combined_hash, "decode") in fr_mgr.config_to_row:
+                    hash_val = combined_hash
+                else:
+                    hash_val = 0
+                row = fr_mgr.get_row_for_config(hash_val, is_prefill=False)
+            rows_scratch[active_count] = row
+            n_tokens_scratch[active_count] = n_tokens
+            active_count += 1
+
+        if active_count > 0:
+            expanded = np.repeat(
+                rows_scratch[:active_count],
+                n_tokens_scratch[:active_count],
+            )
+            n_expanded = int(expanded.shape[0])
+            n_expanded = min(n_expanded, index_pinned.shape[0], recon_index.shape[0])
+            index_pinned[:n_expanded].copy_(torch.from_numpy(expanded[:n_expanded]))
+            recon_index[:n_expanded].copy_(index_pinned[:n_expanded], non_blocking=True)
+        else:
+            n_expanded = 0
+
+        if n_expanded < recon_index.shape[0]:
+            recon_index[n_expanded:].zero_()
+        self._sae_fr_index_dirty = True
+
     def _handle_steering_transition(
         self,
         req_id: str,
@@ -2197,6 +3029,12 @@ class SteeringModelRunnerMixin:
                     req_state.prefill_steering_config_hash,
                     req_state.decode_steering_config_hash,
                 )
+                if getattr(self, "_sae_fr_clamp_manager", None) is not None:
+                    self._release_sae_full_recon_for_request(
+                        req_id,
+                        req_state.prefill_steering_config_hash,
+                        req_state.decode_steering_config_hash,
+                    )
 
     def _register_initial_steering_config(
         self,
@@ -2221,6 +3059,8 @@ class SteeringModelRunnerMixin:
         # before admitting (kernel feasibility check).  Stage 2 also
         # admits the spec into the SAE manager below.
         self._assert_sae_clamps_can_be_applied(sp)
+        if getattr(self, "_sae_fr_module_registry", None) is not None:
+            self._assert_sae_full_recon_specs_can_be_applied(sp)
         prefill_hash = new_req_data.prefill_steering_config_hash
         decode_hash = new_req_data.decode_steering_config_hash
         is_prefilling = new_req_data.num_computed_tokens < req_state.num_prompt_tokens
@@ -2260,11 +3100,16 @@ class SteeringModelRunnerMixin:
             self._register_initial_sae_clamps(
                 req_id, sp, prefill_hash, decode_hash, is_prefilling
             )
+            if getattr(self, "_sae_fr_clamp_manager", None) is not None:
+                self._register_initial_sae_full_recon(
+                    req_id, sp, prefill_hash, decode_hash, is_prefilling
+                )
         except Exception:
             if additive_registered is not None:
                 mgr.release_config(*additive_registered)
             self._req_steering_phase.pop(req_id, None)
             self._pop_req_sae_row(req_id)
+            self._pop_req_sae_fr_row(req_id)
             self._transition_scan_candidates().discard(req_id)
             raise
         if is_prefilling:
@@ -2273,10 +3118,16 @@ class SteeringModelRunnerMixin:
                 if sp.sae_clamp_specs
                 else None
             )
+            prefill_fr_specs = (
+                sp._phase_filtered_sae_full_recon_specs("prefill")
+                if getattr(sp, "sae_full_reconstruction_specs", None)
+                else None
+            )
             if (
                 decode_hash != 0
                 and not prefill_registered
                 and not prefill_sae_specs
+                and not prefill_fr_specs
             ):
                 self._transition_scan_candidates().add(req_id)
 

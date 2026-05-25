@@ -176,6 +176,23 @@ class SteeringModuleRegistry:
                 kind=kind,
                 sae_manifest=sae_manifest,
             )
+        elif kind is SteeringModuleKind.SAE_FULL_RECONSTRUCTION:
+            if vectors or prefill_vectors or decode_vectors:
+                raise ValueError(
+                    f"Steering module '{name}': additive vector fields are "
+                    "not valid for kind=SAE_FULL_RECONSTRUCTION."
+                )
+            if sae_manifest is None:
+                raise ValueError(
+                    f"Steering module '{name}': sae_manifest is required "
+                    "for kind=SAE_FULL_RECONSTRUCTION."
+                )
+            self._validate_sae_manifest(name=name, manifest=sae_manifest)
+            module = SteeringModule(
+                name=name,
+                kind=kind,
+                sae_manifest=sae_manifest,
+            )
         else:
             raise ValueError(f"Steering module '{name}': unsupported kind {kind!r}")
 

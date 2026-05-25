@@ -64,6 +64,15 @@ HOOK_POINT_SAE_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.POST_MLP: "sae_clamp_kind_post_mlp",
 }
 
+# Full-reconstruction (Phase 4) site marker.  Same pattern as the delta
+# marker above — kept as plain strings so the no-FR hot path doesn't
+# import ``sae_full_reconstruction`` on every decoder-layer hook call.
+HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_kind_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_fr_clamp_kind_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_fr_clamp_kind_post_mlp",
+}
+
 # Valid hook point string values for validation.
 VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHookPoint)
 
@@ -166,12 +175,18 @@ def apply_layer_steering(
     2. SAE feature-surgery delta (encode → clamp → decoder-direction
        add).  Runs on the additively-steered residual so the additive
        behaviour is unchanged when SAE is added on top.
+    3. SAE full reconstruction (replacement) — replaces the residual
+       at tokens whose ``sae_recon_index != 0``.  Runs last so any
+       additive / delta perturbations *upstream* of the replacement
+       are still observable on tokens that don't opt into
+       reconstruction; tokens that *do* opt in have their residual
+       replaced wholesale, discarding the upstream perturbations
+       (which matches the design-doc replacement semantics).
 
-    Both stages short-circuit independently — a layer without
-    additive buffers skips step 1, a layer without SAE buffers skips
-    step 2.  Both ``hasattr`` checks resolve to a static branch under
-    ``torch.compile`` (decided once at module instantiation), so a
-    disabled-mode forward emits zero steering kernels.
+    Each stage short-circuits independently via a static ``hasattr``
+    check; ``torch.compile`` decides the branch once at module
+    instantiation, so a disabled-mode forward emits zero steering
+    kernels.
 
     Capture consumers (when configured) see the pre-steering residual
     via :func:`maybe_capture_residual`, which runs unconditionally —
@@ -188,7 +203,9 @@ def apply_layer_steering(
             module.steering_index,
             buffers[HOOK_POINT_ANY_ACTIVE_ATTR[hook_point]],
         )
-    if HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point] not in buffers:
+    has_sae_delta = HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point] in buffers
+    has_sae_fr = HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR[hook_point] in buffers
+    if not has_sae_delta and not has_sae_fr:
         return hidden_states
 
     # SAE feature-surgery delta runs after the additive op on the same
@@ -197,9 +214,19 @@ def apply_layer_steering(
     # imports ``SteeringHookPoint`` from here, so a top-level import
     # would form a cycle).  The guard above keeps disabled/no-SAE
     # forwards on the additive-only path.
-    from vllm.model_executor.layers.sae_steering import apply_layer_sae_delta
+    if has_sae_delta:
+        from vllm.model_executor.layers.sae_steering import apply_layer_sae_delta
 
-    return apply_layer_sae_delta(module, hidden_states, hook_point)
+        hidden_states = apply_layer_sae_delta(module, hidden_states, hook_point)
+    if has_sae_fr:
+        from vllm.model_executor.layers.sae_full_reconstruction import (
+            apply_layer_sae_full_reconstruction,
+        )
+
+        hidden_states = apply_layer_sae_full_reconstruction(
+            module, hidden_states, hook_point
+        )
+    return hidden_states
 
 
 def apply_steering(

@@ -343,6 +343,7 @@ def hash_steering_config(
     effective_vectors: SteeringVectorSpecLike | None,
     module_ref: tuple[str, float] | None = None,
     sae_clamp_specs: tuple[Any, ...] | None = None,
+    sae_full_reconstruction_specs: tuple[Any, ...] | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 
@@ -372,7 +373,12 @@ def hash_steering_config(
     cast happens exactly once at the ``tobytes`` boundary, so hashes are
     bit-for-bit identical regardless of the input container.
     """
-    if not effective_vectors and module_ref is None and not sae_clamp_specs:
+    if (
+        not effective_vectors
+        and module_ref is None
+        and not sae_clamp_specs
+        and not sae_full_reconstruction_specs
+    ):
         return 0
     h = hashlib.sha256()
     if effective_vectors:
@@ -419,6 +425,19 @@ def hash_steering_config(
         sae_hash = hash_sae_clamp_specs(sae_clamp_specs)
         h.update(b"\x00sae_block\x00")
         h.update(sae_hash.to_bytes(8, "little", signed=False))
+    if sae_full_reconstruction_specs:
+        # Distinct domain separator from the delta block above so a
+        # delta and a full-reconstruction request with identical clamp
+        # content can never collide on prefix-cache keys: the two paths
+        # produce different residual streams (perturbation vs
+        # replacement) and must not share prefill cache.
+        from vllm.config.sae_steering_types import (
+            hash_sae_full_reconstruction_specs,
+        )
+
+        recon_hash = hash_sae_full_reconstruction_specs(sae_full_reconstruction_specs)
+        h.update(b"\x00sae_full_recon_block\x00")
+        h.update(recon_hash.to_bytes(8, "little", signed=False))
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
 

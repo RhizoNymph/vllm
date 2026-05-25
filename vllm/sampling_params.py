@@ -18,8 +18,12 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
 from vllm.config.sae_steering_types import (
     SAEClampSpec,
+    SAEFullReconstructionSpec,
     coerce_sae_clamp_specs,
+    coerce_sae_full_reconstruction_specs,
     hash_sae_clamp_specs_for_phase,
+    hash_sae_full_reconstruction_specs,
+    hash_sae_full_reconstruction_specs_for_phase,
 )
 from vllm.config.steering_types import (
     SteeringLayerEntry,
@@ -380,6 +384,28 @@ class SamplingParams(
     This is a dataclass field, not only a cached_property value, so it
     survives pickle/cloudpickle handoff to engine workers."""
 
+    sae_full_reconstruction_specs: tuple[SAEFullReconstructionSpec, ...] | None = None
+    """Optional SAE full-reconstruction directives (residual replacement).
+
+    Each entry references a named SAE module (registered via the
+    standard module-registration API with
+    ``kind="sae_full_reconstruction"``) and optionally declares
+    per-(hook, layer) clamps to apply to the SAE's activations
+    before the decoder pass.  When ``clamps`` is empty the SAE
+    reconstruction replaces the residual without modifications —
+    pure ``decode(activate(encode(h))) + b_dec``.
+
+    Hash determinism: the full-reconstruction state is folded into
+    :pyattr:`prefill_steering_config_hash` /
+    :pyattr:`decode_steering_config_hash` via
+    :func:`hash_steering_config`'s
+    ``sae_full_reconstruction_specs`` argument with a distinct
+    domain separator from the delta block, so a delta-clamp request
+    and a full-reconstruction request with identical clamp content
+    do not collide on prefix-cache keys.  Replacement and
+    perturbation produce different residual streams and must not
+    share prefill cache."""
+
     sae_clamp_specs: tuple[SAEClampSpec, ...] | None = None
     """Optional SAE feature-surgery clamps (delta intervention).
 
@@ -462,6 +488,7 @@ class SamplingParams(
         decode_steering_vectors: SteeringVectorSpec | None = None,
         steering_module_ref: tuple[str, float] | None = None,
         sae_clamp_specs: object = None,
+        sae_full_reconstruction_specs: object = None,
         capture: dict[str, Any] | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
@@ -509,6 +536,9 @@ class SamplingParams(
             decode_steering_vectors=decode_steering_vectors,
             steering_module_ref=steering_module_ref,
             sae_clamp_specs=coerce_sae_clamp_specs(sae_clamp_specs),
+            sae_full_reconstruction_specs=coerce_sae_full_reconstruction_specs(
+                sae_full_reconstruction_specs
+            ),
             capture=capture,
         )
 
@@ -763,6 +793,10 @@ class SamplingParams(
         # tuple of SAEClampSpec).
         if self.sae_clamp_specs is not None:
             self.sae_clamp_specs = coerce_sae_clamp_specs(self.sae_clamp_specs)
+        if self.sae_full_reconstruction_specs is not None:
+            self.sae_full_reconstruction_specs = coerce_sae_full_reconstruction_specs(
+                self.sae_full_reconstruction_specs
+            )
 
         # Cross-validate overlapping dimensions between prefill and decode
         # phase specs (caught even when no base ``steering_vectors`` is set).
@@ -921,6 +955,25 @@ class SamplingParams(
         )
         return filtered if filtered else None
 
+    def _phase_filtered_sae_full_recon_specs(
+        self, want_phase: str
+    ) -> tuple[SAEFullReconstructionSpec, ...] | None:
+        """Filter ``sae_full_reconstruction_specs`` to those active in *want_phase*.
+
+        Same shape as :meth:`_phase_filtered_sae_specs`: ``"both"``
+        always matches; ``"prefill"`` / ``"decode"`` match only their
+        own phase.  Returns ``None`` when no spec applies so
+        :func:`hash_steering_config` can skip the full-recon block.
+        """
+        if not self.sae_full_reconstruction_specs:
+            return None
+        filtered = tuple(
+            s
+            for s in self.sae_full_reconstruction_specs
+            if s.phase in ("both", want_phase)
+        )
+        return filtered if filtered else None
+
     @cached_property
     def prefill_steering_config_hash(self) -> int:
         """Cached hash of ``effective_prefill_steering`` plus
@@ -946,6 +999,9 @@ class SamplingParams(
             self.effective_prefill_steering,
             module_ref=self.steering_module_ref,
             sae_clamp_specs=self._phase_filtered_sae_specs("prefill"),
+            sae_full_reconstruction_specs=(
+                self._phase_filtered_sae_full_recon_specs("prefill")
+            ),
         )
 
     @cached_property
@@ -959,6 +1015,9 @@ class SamplingParams(
             self.effective_decode_steering,
             module_ref=self.steering_module_ref,
             sae_clamp_specs=self._phase_filtered_sae_specs("decode"),
+            sae_full_reconstruction_specs=(
+                self._phase_filtered_sae_full_recon_specs("decode")
+            ),
         )
 
     @cached_property
@@ -990,6 +1049,22 @@ class SamplingParams(
         """Cached hash of only the decode-active SAE clamp identity."""
         return hash_sae_clamp_specs_for_phase(
             self._phase_filtered_sae_specs("decode"),
+            "decode",
+        )
+
+    @cached_property
+    def prefill_sae_full_recon_config_hash(self) -> int:
+        """Cached hash of only the prefill-active SAE full-reconstruction identity."""
+        return hash_sae_full_reconstruction_specs_for_phase(
+            self._phase_filtered_sae_full_recon_specs("prefill"),
+            "prefill",
+        )
+
+    @cached_property
+    def decode_sae_full_recon_config_hash(self) -> int:
+        """Cached hash of only the decode-active SAE full-reconstruction identity."""
+        return hash_sae_full_reconstruction_specs_for_phase(
+            self._phase_filtered_sae_full_recon_specs("decode"),
             "decode",
         )
 
