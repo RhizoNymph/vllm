@@ -31,6 +31,7 @@ from vllm.utils.hashing import safe_hash
 
 from .attention import AttentionConfig
 from .cache import CacheConfig
+from .capture_consumers import CaptureConsumersConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
 from .ec_transfer import ECTransferConfig
@@ -310,6 +311,10 @@ class VllmConfig:
     """Kernel configuration."""
     lora_config: LoRAConfig | None = None
     """LoRA configuration."""
+    capture_consumers_config: CaptureConsumersConfig | None = None
+    """Capture-consumer framework configuration. ``None`` means no
+    consumers are registered. Set via ``--capture-consumers`` CLI flag
+    or programmatically via ``LLM(capture_consumers=...)``."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
     structured_outputs_config: StructuredOutputsConfig = Field(
@@ -431,6 +436,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.lora_config:
             vllm_factors.append(self.lora_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.capture_consumers_config:
+            vllm_factors.append(self.capture_consumers_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.speculative_config:
