@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "vllm-sum-consumer"
+version = "0.1.0"
+dependencies = ["vllm"]
+
+[project.entry-points."vllm.capture_consumers"]
+sum = "my_plugin:SumConsumer"
