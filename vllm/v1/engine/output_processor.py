@@ -5,12 +5,15 @@ import asyncio
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
+
+if TYPE_CHECKING:
+    from vllm.v1.capture.types import CaptureResult
 from vllm.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
@@ -276,6 +279,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -314,6 +318,7 @@ class RequestState:
                 external_req_id,
                 [self._new_pooling_output(pooling_output)],
                 finished,
+                capture_results=capture_results,
             )
 
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
@@ -327,7 +332,11 @@ class RequestState:
             external_req_id = self.parent_req.external_req_id
 
         return self._new_request_output(
-            external_req_id, outputs, finished, kv_transfer_params
+            external_req_id,
+            outputs,
+            finished,
+            kv_transfer_params,
+            capture_results=capture_results,
         )
 
     def _new_request_output(
@@ -336,6 +345,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -371,6 +381,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            capture_results=dict(capture_results) if capture_results else {},
         )
 
     def _new_completion_output(
@@ -654,6 +665,7 @@ class OutputProcessor:
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                capture_results=engine_core_output.capture_results,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False
