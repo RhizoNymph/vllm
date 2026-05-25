@@ -1755,9 +1755,7 @@ class GPUModelRunner(
             return
         self._capture_manager.dispatch_step_captures(plan)
 
-    def _build_capture_batch_view(
-        self, scheduler_output: "SchedulerOutput"
-    ):
+    def _build_capture_batch_view(self, scheduler_output: "SchedulerOutput"):
         """Project ``input_batch`` into a :class:`CaptureBatchView`."""
         from vllm.v1.capture.plan import CaptureBatchView
 

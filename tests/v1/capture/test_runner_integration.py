@@ -209,14 +209,14 @@ def test_filesystem_consumer_byte_for_byte_matches_writer(
     guarantee the design doc makes: scripts reading the Phase-2 output
     layout keep working across the refactor.
     """
-    from vllm.v1.capture.types import (
-        CaptureChunk,
-        CaptureFinalize,
-    )
     from vllm.v1.capture.consumers.filesystem.writer import (
         ActivationWriter,
         FinalizeTask,
         WriteTask,
+    )
+    from vllm.v1.capture.types import (
+        CaptureChunk,
+        CaptureFinalize,
     )
 
     # Path 1: filesystem consumer.

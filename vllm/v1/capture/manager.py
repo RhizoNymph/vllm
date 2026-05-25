@@ -113,9 +113,7 @@ class _DispatchPacket:
     """
 
     entries: list[CapturePositionEntry]
-    scratch_pinned: dict[
-        tuple[int, str], tuple[torch.Tensor | None, torch.Tensor]
-    ]
+    scratch_pinned: dict[tuple[int, str], tuple[torch.Tensor | None, torch.Tensor]]
     cuda_event: torch.cuda.Event | None
 
 
@@ -581,9 +579,7 @@ class CaptureManager:
                 for key, scratch in plan.scratch_gpu.items():
                     if scratch.is_cuda:
                         rows, hidden = scratch.shape
-                        pinned = self._acquire_pinned(
-                            key, rows, hidden, scratch.dtype
-                        )
+                        pinned = self._acquire_pinned(key, rows, hidden, scratch.dtype)
                         view = pinned.narrow(0, 0, rows)
                         # ``record_stream`` keeps the caching allocator
                         # from recycling ``scratch`` until this stream

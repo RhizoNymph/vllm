@@ -30,7 +30,7 @@ this module's job.
 
 from __future__ import annotations
 
-import re
+import regex as re
 from typing import TYPE_CHECKING, Any
 
 from vllm.v1.capture.errors import CaptureValidationError
@@ -81,17 +81,12 @@ def _slug(name: str, *, field: str) -> str:
         raise CaptureValidationError(f"{field} must be non-empty")
     if len(name) > _SLUG_MAX_LEN:
         raise CaptureValidationError(
-            f"{field} must be at most {_SLUG_MAX_LEN} characters, "
-            f"got {len(name)}"
+            f"{field} must be at most {_SLUG_MAX_LEN} characters, got {len(name)}"
         )
     if ".." in name:
-        raise CaptureValidationError(
-            f"{field} must not contain '..': {name!r}"
-        )
+        raise CaptureValidationError(f"{field} must not contain '..': {name!r}")
     if name.startswith("/"):
-        raise CaptureValidationError(
-            f"{field} must not start with '/': {name!r}"
-        )
+        raise CaptureValidationError(f"{field} must not start with '/': {name!r}")
     return _SLUG_REGEX.sub("_", name)
 
 
@@ -118,15 +113,12 @@ def _expand_layer_list(
     return result
 
 
-def _expand_ranges(
-    raw: list[Any], *, num_hidden_layers: int, where: str
-) -> list[int]:
+def _expand_ranges(raw: list[Any], *, num_hidden_layers: int, where: str) -> list[int]:
     result: list[int] = []
     for i, pair in enumerate(raw):
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             raise CaptureValidationError(
-                f"{where}[{i}] must be a 2-element [start, end] pair, "
-                f"got {pair!r}"
+                f"{where}[{i}] must be a 2-element [start, end] pair, got {pair!r}"
             )
         start, end = pair
         if (
@@ -302,8 +294,7 @@ def _structural_validate(raw: FilesystemCaptureRequest) -> None:
     """Structural validation of the raw request before resolving."""
     if not isinstance(raw.request_id, str) or not raw.request_id:
         raise CaptureValidationError(
-            f"capture.request_id must be a non-empty string, "
-            f"got {raw.request_id!r}"
+            f"capture.request_id must be a non-empty string, got {raw.request_id!r}"
         )
     if not isinstance(raw.tag, str) or not raw.tag:
         raise CaptureValidationError(
@@ -317,8 +308,7 @@ def _structural_validate(raw: FilesystemCaptureRequest) -> None:
     for hook_name in raw.hooks:
         if not isinstance(hook_name, str):
             raise CaptureValidationError(
-                f"capture.hooks key must be a string, "
-                f"got {type(hook_name).__name__}"
+                f"capture.hooks key must be a string, got {type(hook_name).__name__}"
             )
         if hook_name not in _VALID_HOOK_NAMES:
             raise CaptureValidationError(
@@ -339,8 +329,7 @@ def _structural_validate(raw: FilesystemCaptureRequest) -> None:
         for i, value in enumerate(raw.positions):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise CaptureValidationError(
-                    f"capture.positions[{i}] must be an int, "
-                    f"got {type(value).__name__}"
+                    f"capture.positions[{i}] must be an int, got {type(value).__name__}"
                 )
             if value < 0:
                 raise CaptureValidationError(
@@ -404,8 +393,7 @@ def validate_filesystem_request(
         )
         if not resolved:
             raise CaptureValidationError(
-                f"capture.hooks[{hook_name!r}] expanded to an empty "
-                "layer list"
+                f"capture.hooks[{hook_name!r}] expanded to an empty layer list"
             )
         # hook_name already validated as one of _VALID_HOOK_NAMES.
         resolved_hooks[hook_name] = resolved  # type: ignore[literal-required]

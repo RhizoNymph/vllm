@@ -189,8 +189,8 @@ responding to obvious in-distribution / out-of-distribution inputs.
 ### 2. Reward hacking via the direction itself
 
 Cosine-as-reward creates a direct gradient incentive to produce
-high-cosine activations. The policy learns to *occupy the reward axis*
-rather than *produce the underlying behavior* the reference vector was
+high-cosine activations. The policy learns to _occupy the reward axis_
+rather than _produce the underlying behavior_ the reference vector was
 a proxy for.
 
 **Symptom**: reward climbs monotonically while rollouts look degenerate
@@ -211,8 +211,8 @@ Use the diagnostic payload the consumer returns:
 
 ## Frozen-scorer deployment (recommended for production)
 
-Both failure modes come from the *policy's activation space changing
-under training*. The fix is to decouple scoring from the policy:
+Both failure modes come from the _policy's activation space changing
+under training_. The fix is to decouple scoring from the policy:
 
 - **Policy engine** — the vLLM instance that takes weight updates every
   RL iteration. Serves `generate` for rollouts. **Does not run

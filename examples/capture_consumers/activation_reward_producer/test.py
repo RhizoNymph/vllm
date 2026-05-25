@@ -16,8 +16,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import torch
-
 from activation_reward_producer import ActivationRewardProducer
+
 from vllm.v1.capture.errors import CaptureValidationError
 from vllm.v1.capture.types import (
     CaptureChunk,
@@ -25,7 +25,6 @@ from vllm.v1.capture.types import (
     CaptureFinalize,
     VllmInternalRequestId,
 )
-
 
 HIDDEN = 128
 NUM_LAYERS = 32
@@ -208,8 +207,7 @@ def test_bad_layer_rejected(tmp: Path) -> None:
     try:
         ActivationRewardProducer(
             _mock_config(),
-            {"layer": NUM_LAYERS + 5, "hook": "post_mlp",
-             "vector_path": str(vec_path)},
+            {"layer": NUM_LAYERS + 5, "hook": "post_mlp", "vector_path": str(vec_path)},
         )
     except ValueError as e:
         assert "out of range" in str(e)

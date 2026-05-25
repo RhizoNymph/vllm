@@ -35,9 +35,7 @@ if TYPE_CHECKING:
     from vllm.v1.capture.types import CaptureContext
 
 
-_HOOK_NAMES = frozenset(
-    {"pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"}
-)
+_HOOK_NAMES = frozenset({"pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"})
 _NONLIN = {
     "tanh": math.tanh,
     "sigmoid": lambda x: 1.0 / (1.0 + math.exp(-x)),
@@ -70,14 +68,12 @@ class ActivationRewardProducer:
 
     def __init__(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
         params: dict[str, Any],
     ) -> None:
         model_config = getattr(vllm_config, "model_config", None)
         hidden_size = (
-            model_config.get_hidden_size()
-            if model_config is not None
-            else None
+            model_config.get_hidden_size() if model_config is not None else None
         )
         num_hidden_layers = (
             int(model_config.hf_config.num_hidden_layers)
@@ -86,9 +82,7 @@ class ActivationRewardProducer:
         )
 
         layer = int(params["layer"])
-        if num_hidden_layers is not None and not (
-            0 <= layer < num_hidden_layers
-        ):
+        if num_hidden_layers is not None and not (0 <= layer < num_hidden_layers):
             raise ValueError(
                 f"ActivationRewardProducer: layer={layer} out of range "
                 f"[0, {num_hidden_layers})."
@@ -126,9 +120,7 @@ class ActivationRewardProducer:
             )
 
         vector_path = pathlib.Path(str(params["vector_path"]))
-        vector = torch.load(
-            vector_path, map_location="cpu", weights_only=True
-        )
+        vector = torch.load(vector_path, map_location="cpu", weights_only=True)
         if not isinstance(vector, torch.Tensor):
             raise TypeError(
                 f"ActivationRewardProducer: vector_path={vector_path} "
@@ -177,7 +169,7 @@ class ActivationRewardProducer:
     def validate_client_spec(
         self,
         raw_spec: Any,
-        ctx: "CaptureContext",
+        ctx: CaptureContext,
     ) -> CaptureSpec:
         if ctx.tensor_parallel_size != 1 or ctx.pipeline_parallel_size != 1:
             raise CaptureValidationError(
@@ -238,9 +230,7 @@ class ActivationRewardProducer:
             return
 
         with self._lock:
-            self._results[key] = CaptureResult(
-                key=key, status="ok", payload=payload
-            )
+            self._results[key] = CaptureResult(key=key, status="ok", payload=payload)
 
     def get_result(self, key: CaptureKey) -> CaptureResult | None:
         with self._lock:

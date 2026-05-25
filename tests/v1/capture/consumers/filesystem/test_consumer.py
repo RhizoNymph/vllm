@@ -22,6 +22,12 @@ from vllm.v1.capture.consumers.filesystem.consumer import FilesystemConsumer
 from vllm.v1.capture.consumers.filesystem.types import (
     FilesystemCaptureRequest,
 )
+from vllm.v1.capture.consumers.filesystem.writer import (
+    ActivationWriter,
+    FinalizeTask,
+    WriteResult,
+    WriteTask,
+)
 from vllm.v1.capture.types import (
     CaptureChunk,
     CaptureContext,
@@ -30,12 +36,6 @@ from vllm.v1.capture.types import (
     CaptureResult,
     CaptureSpec,
     VllmInternalRequestId,
-)
-from vllm.v1.capture.consumers.filesystem.writer import (
-    ActivationWriter,
-    FinalizeTask,
-    WriteResult,
-    WriteTask,
 )
 
 # Validation tests require pydantic (pulled in by vllm.config). Skip

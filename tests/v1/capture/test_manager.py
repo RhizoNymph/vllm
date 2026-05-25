@@ -516,21 +516,23 @@ class TestAggregateCaptureResults:
         key_partial = (VllmInternalRequestId("r1"), 1, "post_mlp")
         key_error = (VllmInternalRequestId("r1"), 2, "post_mlp")
 
-        result = _aggregate_capture_results([
-            CaptureResult(key=key_ok, status="ok", payload="ok"),
-            CaptureResult(
-                key=key_partial,
-                status="partial_error",
-                error="partial",
-                payload="partial",
-            ),
-            CaptureResult(
-                key=key_error,
-                status="error",
-                error="fatal",
-                payload="error",
-            ),
-        ])
+        result = _aggregate_capture_results(
+            [
+                CaptureResult(key=key_ok, status="ok", payload="ok"),
+                CaptureResult(
+                    key=key_partial,
+                    status="partial_error",
+                    error="partial",
+                    payload="partial",
+                ),
+                CaptureResult(
+                    key=key_error,
+                    status="error",
+                    error="fatal",
+                    payload="error",
+                ),
+            ]
+        )
 
         assert result.status == "error"
         assert result.key == key_error
@@ -545,9 +547,9 @@ class TestAggregateCaptureResults:
         key = (VllmInternalRequestId("r1"), 0, "post_mlp")
         payload = ["/tmp/capture.bin"]
 
-        result = _aggregate_capture_results([
-            CaptureResult(key=key, status="ok", payload=payload)
-        ])
+        result = _aggregate_capture_results(
+            [CaptureResult(key=key, status="ok", payload=payload)]
+        )
 
         assert result.status == "ok"
         assert result.key == key

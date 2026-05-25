@@ -289,7 +289,7 @@ entry point. It returns `(sinks, validators, name_to_index)`:
 `_wrap_consumer` decides:
 
 - `location == "driver"` → `install_driver_consumer` (builds the shim
-  + receiver).
+    - receiver).
 - `location == "worker"` and instance is a `CaptureConsumer` → wrap
   in `_BatchedAdapter`.
 - `location == "worker"` and already a `CaptureSink` → install as-is.
