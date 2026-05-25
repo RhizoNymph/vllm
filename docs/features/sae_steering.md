@@ -221,6 +221,42 @@ and decode can carry different clamp specs in flight, and so a request
 that prefills under one config and decodes under another (the existing
 streaming-continuation case) is handled by the same admission machinery.
 
+### Global SAE Clamp Tier
+
+Symmetric to the additive `POST /v1/steering/set` global tier,
+operators can install SAE clamps that apply to *every* token without
+each request having to declare its own clamp spec.  Stored on the
+`SAEClampManager` as `global_prefill_specs` / `global_decode_specs`,
+two phase-keyed tuples of `SAEClampSpec`.  Performance contract:
+
+- **Zero per-request hashing overhead.**  A request with no
+  per-request `sae_clamp_specs` still routes to row 0; the populator
+  has already written the global content into that row at flush time,
+  so the per-token gather picks them up via the existing dispatch
+  shim without any per-request bookkeeping.
+- **Stacks with per-request clamps.**  When a request *does* carry
+  per-request clamps, the populator merges the globals into the
+  request's own row.  Feature-index collisions between a global and
+  a per-request clamp would be silently overwritten by the
+  per-request entry, so they're rejected at admission time by
+  `validate_sae_clamp_specs_no_overlap`.
+- **Disabled-mode parity.**  When no globals are configured, row 0
+  stays at zero — bit-for-bit identical to the no-globals path.
+
+Worker-side API surface (mirrors the additive global API; the HTTP
+endpoint wrapper lives in `entrypoints/serve/steering/`):
+
+| Call | Effect |
+|---|---|
+| `SteeringModelRunnerMixin.set_sae_global_clamps` | Validate against registry, push into manager |
+| `SteeringModelRunnerMixin.clear_sae_global_clamps` | Drop both phase tiers |
+| `SteeringModelRunnerMixin.get_sae_global_clamps_status` | JSON-safe view for status endpoints |
+
+The clamp specs validate against the registered SAE modules in
+exactly the same way per-request clamps do
+(`_assert_sae_clamps_can_be_applied`), so a malformed global spec
+fails loud at install time, not silently at the first request.
+
 ## Files
 
 New files:

@@ -296,3 +296,105 @@ class TestDirtyFlag:
         m.release_clamp_spec(1, "prefill")
         # Refcount went 2 -> 1; row still occupied; no row content change.
         assert m._tables_dirty is False
+
+
+class TestGlobalClampTier:
+    """Global SAE clamps stored on the manager apply to every token in a phase.
+
+    The dispatch shim doesn't know about the tier directly; the
+    populator merges global specs into row 0 (the shared sentinel-or-
+    global row) and into every per-request row so a request that opts
+    into per-request clamps still picks up the globals.  These tests
+    cover only the manager-side state machine (set/clear/query); the
+    populator-side merge contract is covered alongside the other
+    populator tests in ``test_sae_layer_dispatch.py``.
+    """
+
+    def test_initial_state_has_no_globals(self):
+        m = SAEClampManager(max_sae_configs=4)
+        assert m.has_global_clamps() is False
+        assert m.global_prefill_specs == ()
+        assert m.global_decode_specs == ()
+
+    def test_set_global_prefill_only_leaves_decode_empty(self):
+        m = SAEClampManager(max_sae_configs=4)
+        spec = _make_spec(phase="both", feature_idx=7)
+        m.set_global_clamps(prefill_specs=(spec,))
+        assert m.global_prefill_specs == (spec,)
+        assert m.global_decode_specs == ()
+        assert m.has_global_clamps() is True
+
+    def test_set_global_decode_only_leaves_prefill_empty(self):
+        m = SAEClampManager(max_sae_configs=4)
+        spec = _make_spec(phase="both", feature_idx=7)
+        m.set_global_clamps(decode_specs=(spec,))
+        assert m.global_prefill_specs == ()
+        assert m.global_decode_specs == (spec,)
+
+    def test_set_globals_marks_dirty(self):
+        m = SAEClampManager(max_sae_configs=4)
+        m.mark_tables_clean()
+        m.set_global_clamps(prefill_specs=(_make_spec(feature_idx=7),))
+        assert m._tables_dirty is True
+
+    def test_global_set_appends_when_replace_false(self):
+        m = SAEClampManager(max_sae_configs=4)
+        s1 = _make_spec(feature_idx=7)
+        s2 = _make_spec(feature_idx=11)
+        m.set_global_clamps(prefill_specs=(s1,))
+        m.set_global_clamps(prefill_specs=(s2,))
+        assert m.global_prefill_specs == (s1, s2)
+
+    def test_global_set_replaces_when_replace_true(self):
+        m = SAEClampManager(max_sae_configs=4)
+        s1 = _make_spec(feature_idx=7)
+        s2 = _make_spec(feature_idx=11)
+        m.set_global_clamps(prefill_specs=(s1,), decode_specs=(s1,))
+        m.set_global_clamps(prefill_specs=(s2,), replace=True)
+        assert m.global_prefill_specs == (s2,)
+        # ``replace=True`` clears every phase before applying.
+        assert m.global_decode_specs == ()
+
+    def test_global_append_validates_no_overlap(self):
+        m = SAEClampManager(max_sae_configs=4)
+        s1 = _make_spec(feature_idx=7)
+        m.set_global_clamps(prefill_specs=(s1,))
+        # Same (module, hook, layer, feature_idx) with overlapping phase
+        # — must raise even though it's a separate set_global_clamps call.
+        with pytest.raises(ValueError, match="overlapping"):
+            m.set_global_clamps(prefill_specs=(_make_spec(feature_idx=7),))
+
+    def test_clear_globals_zeros_both_tiers_and_marks_dirty(self):
+        m = SAEClampManager(max_sae_configs=4)
+        m.set_global_clamps(
+            prefill_specs=(_make_spec(feature_idx=7),),
+            decode_specs=(_make_spec(feature_idx=11),),
+        )
+        m.mark_tables_clean()
+        m.clear_global_clamps()
+        assert m.global_prefill_specs == ()
+        assert m.global_decode_specs == ()
+        assert m.has_global_clamps() is False
+        assert m._tables_dirty is True
+
+    def test_global_specs_for_phase_returns_correct_tier(self):
+        m = SAEClampManager(max_sae_configs=4)
+        p = _make_spec(feature_idx=7)
+        d = _make_spec(feature_idx=11)
+        m.set_global_clamps(prefill_specs=(p,), decode_specs=(d,))
+        assert m.global_specs_for_phase("prefill") == (p,)
+        assert m.global_specs_for_phase("decode") == (d,)
+
+    def test_global_specs_rejects_unknown_phase(self):
+        m = SAEClampManager(max_sae_configs=4)
+        with pytest.raises(ValueError, match="prefill"):
+            m.global_specs_for_phase("base")
+
+    def test_get_row_for_hash_zero_returns_row_zero_even_with_globals(self):
+        # Row 0 is still the row for hash=0; the populator just writes
+        # the global content into row 0 instead of leaving it zeroed.
+        # The dispatch shim doesn't need to change.
+        m = SAEClampManager(max_sae_configs=4)
+        m.set_global_clamps(prefill_specs=(_make_spec(feature_idx=7),))
+        assert m.get_row_for_config(0, is_prefill=True) == 0
+        assert m.get_row_for_config(0, is_prefill=False) == 0

@@ -557,6 +557,147 @@ class TestPopulateSaeClampTable:
         )
         assert bool(only[1, 0].item()) is True
 
+    def test_global_clamp_lands_on_row_zero(self):
+        # Global clamp at the manager level → populator writes it
+        # into row 0 so tokens with no per-request SAE clamps gather
+        # the global state from the no-op-or-global sentinel row.
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=2,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        global_spec = SAEClampSpec(
+            module_name="g",
+            phase="both",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=5, kind="absolute", value=3.5),)
+                }
+            },
+        )
+        manager.set_global_clamps(
+            prefill_specs=(global_spec,),
+            decode_specs=(global_spec,),
+        )
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(2, 5),
+            layer_idx=20,
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
+        any_active = getattr(
+            m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
+        )
+        # Position 1 corresponds to feature_idx=5 in clampable_features.
+        assert int(kind[0, 1].item()) == 1  # CLAMP_KIND_ABSOLUTE
+        assert float(value[0, 1].item()) == 3.5
+        assert int(kind[0, 0].item()) == 0  # other features untouched
+        assert bool(any_active.item()) is True
+
+    def test_global_clamp_merges_into_per_request_row(self):
+        # A request with its own SAE clamp on a *different* feature
+        # gets the global stacked on top — same row, both clamps active.
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=2,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        global_spec = SAEClampSpec(
+            module_name="g",
+            phase="both",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=2, kind="absolute", value=1.0),)
+                }
+            },
+        )
+        req_spec = SAEClampSpec(
+            module_name="g",
+            phase="both",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=5, kind="additive", value=2.0),)
+                }
+            },
+        )
+        manager.set_global_clamps(
+            prefill_specs=(global_spec,), decode_specs=(global_spec,)
+        )
+        row = manager.register_clamp_spec(0xCAFE, (req_spec,), "prefill")
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(2, 5),
+            layer_idx=20,
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
+        # Row 0 still carries the global clamp.
+        assert int(kind[0, 0].item()) == 1
+        assert float(value[0, 0].item()) == 1.0
+        # Per-request row carries BOTH the global (position 0) AND the
+        # request's own clamp (position 1).
+        assert int(kind[row, 0].item()) == 1  # global applied here too
+        assert float(value[row, 0].item()) == 1.0
+        assert int(kind[row, 1].item()) == 2  # CLAMP_KIND_ADDITIVE
+        assert float(value[row, 1].item()) == 2.0
+
+    def test_clearing_globals_re_zeros_row_zero(self):
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=2,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        global_spec = SAEClampSpec(
+            module_name="g",
+            phase="both",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=5, kind="absolute", value=3.5),)
+                }
+            },
+        )
+        manager.set_global_clamps(
+            prefill_specs=(global_spec,), decode_specs=(global_spec,)
+        )
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(2, 5),
+            layer_idx=20,
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        # Global active.
+        assert int(kind[0, 1].item()) == 1
+        manager.clear_global_clamps()
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(2, 5),
+            layer_idx=20,
+        )
+        # Row 0 re-zeroed.
+        assert int(kind[0, 1].item()) == 0
+
     def test_unknown_feature_idx_in_spec_raises(self):
         # spec references feature 99 but clampable_features only has (0,)
         # — admission-time bug should fail loud.
