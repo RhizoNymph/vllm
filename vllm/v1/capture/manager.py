@@ -45,12 +45,12 @@ from vllm.v1.capture.plan import (
 )
 from vllm.v1.capture.sink import CaptureSink
 from vllm.v1.capture.types import (
-    CaptureKey,
     CaptureChunk,
     CaptureFinalize,
+    CaptureKey,
     CaptureResult,
-    CaptureStatus,
     CaptureSpec,
+    CaptureStatus,
     VllmInternalRequestId,
 )
 
