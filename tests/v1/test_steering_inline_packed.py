@@ -112,7 +112,10 @@ class TestMaybePack:
             1.0,
             2.0,
         ]
-        assert sp._effective_decode_steering_packed["post_mlp"][0].tolist() == [1.0, 2.0]
+        assert sp._effective_decode_steering_packed["post_mlp"][0].tolist() == [
+            1.0,
+            2.0,
+        ]
 
     def test_phase_specific_resolves_per_phase(self):
         sp = SamplingParams(

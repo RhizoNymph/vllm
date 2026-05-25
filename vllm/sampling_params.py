@@ -337,9 +337,7 @@ class SamplingParams(
     """Phase-specific steering vectors added to base during decode only.
     Same format as ``steering_vectors``."""
 
-    _effective_prefill_steering_packed: (
-        dict[str, dict[int, np.ndarray]] | None
-    ) = None
+    _effective_prefill_steering_packed: dict[str, dict[int, np.ndarray]] | None = None
     """In-process pre-resolved + packed prefill-phase steering, in the
     model's compute dtype.  Equivalent to
     ``effective_prefill_steering`` cast to model dtype, but produced on
@@ -786,6 +784,7 @@ class SamplingParams(
             # them — so we just sanity-check shape/dtype here rather
             # than rejecting outright.
             import numpy as _np
+
             if isinstance(entry, _np.ndarray):
                 if entry.ndim != 1:
                     raise ValueError(
@@ -793,8 +792,7 @@ class SamplingParams(
                     )
                 if entry.dtype.kind != "f":
                     raise ValueError(
-                        f"{prefix} ndarray must be a floating dtype, "
-                        f"got {entry.dtype}."
+                        f"{prefix} ndarray must be a floating dtype, got {entry.dtype}."
                     )
                 return
             raise ValueError(

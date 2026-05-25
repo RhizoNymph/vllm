@@ -1565,7 +1565,7 @@ class TestStackVectorsAsyncH2D:
         assert out.device == cuda_device
         assert out.shape == (n, hidden)
 
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         # ``host_arr`` was float32 → numpy float32 → device tensor; the
         # round-trip is exact at fp32.
         assert torch.allclose(out.cpu(), host_arr, atol=0, rtol=0)
@@ -1589,11 +1589,10 @@ class TestStackVectorsAsyncH2D:
             out = mgr._stack_vectors_to_device(vecs)
             results.append(out)
 
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         for k, (got, want) in enumerate(zip(results, expected)):
             assert torch.allclose(got.cpu(), want, atol=0, rtol=0), (
-                f"call {k} produced wrong contents — possible host-buffer "
-                f"reuse race"
+                f"call {k} produced wrong contents — possible host-buffer reuse race"
             )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1623,9 +1622,9 @@ class TestStackVectorsAsyncH2D:
         # Warm up the ring so the first-call pinned-alloc cost doesn't
         # skew the measurement.
         _ = mgr._stack_vectors_to_device(vecs)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         t0 = time.perf_counter()
         out = mgr._stack_vectors_to_device(vecs)
         t_call = time.perf_counter() - t0
@@ -1633,7 +1632,7 @@ class TestStackVectorsAsyncH2D:
         # Now wait on the stream — this should still have meaningful work
         # left if the call returned early.
         t1 = time.perf_counter()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         t_sync = time.perf_counter() - t1
 
         # Sanity: the device tensor exists and is on the right device.
@@ -1672,7 +1671,7 @@ class TestStackVectorsAsyncH2D:
         vecs = [host_arr[i].tolist() for i in range(n)]
 
         out = mgr._stack_vectors_to_device(vecs)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert out.device == cuda_device
         assert torch.allclose(out.cpu(), host_arr, atol=0, rtol=0)
 

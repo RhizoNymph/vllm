@@ -24,15 +24,12 @@ Refcount invariants exercised here:
 
 from __future__ import annotations
 
-import pytest
-
 from vllm.config.steering_types import hash_steering_config
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.steering_manager import SteeringManager
 from vllm.v1.worker.steering_model_runner_mixin import (
     SteeringModelRunnerMixin,
 )
-
 
 HIDDEN = 4
 
@@ -51,9 +48,9 @@ class _PrematerializeStub(SteeringModelRunnerMixin):
             max_steering_configs=max_configs,
             device=None,
         )
-        self._steering_module_registry = {}
-        self._steering_module_resolved_cache = {}
-        self._steering_module_pinned_rows = {}
+        self._steering_module_registry: dict = {}
+        self._steering_module_resolved_cache: dict = {}
+        self._steering_module_pinned_rows: dict = {}
         self._locally_owned_layers = frozenset({0, 1})
 
 
@@ -91,9 +88,7 @@ class TestPreMaterializeMaterializesRows:
         """
         stub = _PrematerializeStub()
         base = _spec({0: [1.0, 2.0, 3.0, 4.0]})
-        stub.register_steering_modules(
-            {"m": _module_payload(base=base)}, replace=True
-        )
+        stub.register_steering_modules({"m": _module_payload(base=base)}, replace=True)
 
         # No request has arrived yet.
         assert stub._steering_manager.num_active_configs == 0
@@ -117,9 +112,7 @@ class TestPreMaterializeMaterializesRows:
         """
         stub = _PrematerializeStub()
         base = _spec({0: [1.0, 2.0, 3.0, 4.0]})
-        stub.register_steering_modules(
-            {"m": _module_payload(base=base)}, replace=True
-        )
+        stub.register_steering_modules({"m": _module_payload(base=base)}, replace=True)
         stub.pre_materialize_steering_module("m")
 
         sp = SamplingParams(steering_module_ref=("m", 1.0))
@@ -129,9 +122,7 @@ class TestPreMaterializeMaterializesRows:
         assert (request_prefill_hash, "prefill") in (
             stub._steering_manager.config_to_row
         )
-        assert (request_decode_hash, "decode") in (
-            stub._steering_manager.config_to_row
-        )
+        assert (request_decode_hash, "decode") in (stub._steering_manager.config_to_row)
 
     def test_decode_only_module_pins_decode_only(self):
         stub = _PrematerializeStub()
@@ -161,9 +152,7 @@ class TestRefcountAfterPreMaterialize:
         """
         stub = _PrematerializeStub()
         base = _spec({0: [1.0, 2.0, 3.0, 4.0]})
-        stub.register_steering_modules(
-            {"m": _module_payload(base=base)}, replace=True
-        )
+        stub.register_steering_modules({"m": _module_payload(base=base)}, replace=True)
         stub.pre_materialize_steering_module("m")
 
         # Snapshot the pre-request state.
@@ -203,9 +192,7 @@ class TestRefcountAfterPreMaterialize:
         """
         stub = _PrematerializeStub()
         base = _spec({0: [1.0, 2.0, 3.0, 4.0]})
-        stub.register_steering_modules(
-            {"m": _module_payload(base=base)}, replace=True
-        )
+        stub.register_steering_modules({"m": _module_payload(base=base)}, replace=True)
         stub.pre_materialize_steering_module("m")
 
         sp = SamplingParams(steering_module_ref=("m", 1.0))
@@ -238,9 +225,7 @@ class TestUnregisterReleasesPin:
         """
         stub = _PrematerializeStub()
         base = _spec({0: [1.0, 2.0, 3.0, 4.0]})
-        stub.register_steering_modules(
-            {"m": _module_payload(base=base)}, replace=True
-        )
+        stub.register_steering_modules({"m": _module_payload(base=base)}, replace=True)
         stub.pre_materialize_steering_module("m")
         assert stub._steering_manager.num_active_configs == 2
 
@@ -255,9 +240,7 @@ class TestUnregisterReleasesPin:
         """
         stub = _PrematerializeStub()
         base = _spec({0: [1.0, 2.0, 3.0, 4.0]})
-        stub.register_steering_modules(
-            {"m": _module_payload(base=base)}, replace=True
-        )
+        stub.register_steering_modules({"m": _module_payload(base=base)}, replace=True)
         stub.pre_materialize_steering_module("m")
 
         sp = SamplingParams(steering_module_ref=("m", 1.0))
@@ -306,9 +289,7 @@ class TestConcurrentRegisterAndRequest:
         """
         stub = _PrematerializeStub()
         base = _spec({0: [1.0, 2.0, 3.0, 4.0]})
-        stub.register_steering_modules(
-            {"m": _module_payload(base=base)}, replace=True
-        )
+        stub.register_steering_modules({"m": _module_payload(base=base)}, replace=True)
 
         # Request lands first (raced past the pre-materialize RPC).
         sp = SamplingParams(steering_module_ref=("m", 1.0))
@@ -343,9 +324,7 @@ class TestConcurrentRegisterAndRequest:
         """
         stub = _PrematerializeStub()
         base = _spec({0: [1.0, 2.0, 3.0, 4.0]})
-        stub.register_steering_modules(
-            {"m": _module_payload(base=base)}, replace=True
-        )
+        stub.register_steering_modules({"m": _module_payload(base=base)}, replace=True)
         stub.pre_materialize_steering_module("m")
         # Snapshot refcounts.
         before = dict(stub._steering_manager.config_refcounts)
@@ -392,9 +371,7 @@ class TestReRegisterRefreshesPin:
         named_only_h = hash_steering_config(None, module_ref=("m", 1.0))
         assert (named_only_h, "prefill") in stub._steering_manager.config_to_row
         # Refcount=1 (just the pin).
-        assert (
-            stub._steering_manager.config_refcounts[(named_only_h, "prefill")] == 1
-        )
+        assert stub._steering_manager.config_refcounts[(named_only_h, "prefill")] == 1
 
         # Re-register with new vectors.  The stale pin is released
         # before the new spec is stored — leaves refcount at 0 so the

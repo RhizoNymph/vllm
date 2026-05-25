@@ -1234,9 +1234,7 @@ class GPUModelRunner(
                 prefill_steering_config_hash=(
                     new_req_data.prefill_steering_config_hash
                 ),
-                decode_steering_config_hash=(
-                    new_req_data.decode_steering_config_hash
-                ),
+                decode_steering_config_hash=(new_req_data.decode_steering_config_hash),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)

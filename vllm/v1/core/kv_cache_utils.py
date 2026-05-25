@@ -501,7 +501,7 @@ def _gen_prompt_embeds_extra_hash_keys(
 
 
 def _gen_steering_extra_hash_keys(
-    request: "Request", start_token_idx: int
+    request: "Request", start_token_idx: int, end_token_idx: int
 ) -> list[int]:
     """Generate extra keys for steering-aware prefix caching.
 
@@ -588,7 +588,7 @@ def generate_block_hash_extra_keys(
         request, start_token_idx, end_token_idx
     )
     steering_extra_keys: list[int] = _gen_steering_extra_hash_keys(
-        request, start_token_idx
+        request, start_token_idx, end_token_idx
     )
 
     extra_keys: list[Any] = (

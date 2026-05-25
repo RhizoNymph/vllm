@@ -19,9 +19,8 @@ Covers:
 - ``steering_name`` field is unaffected
 """
 
-import base64
-
 import numpy as np
+import pybase64 as base64
 import pytest
 from pydantic import ValidationError
 
@@ -37,10 +36,13 @@ from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 _HIDDEN = 8
 
 
+_DEFAULT_PACK_DTYPE = np.dtype(np.float32)
+
+
 def _pack(
     layer_vectors: dict[int, list[float]],
     *,
-    dtype: np.dtype = np.dtype(np.float32),
+    dtype: np.dtype = _DEFAULT_PACK_DTYPE,
     scales: list[float] | None = None,
 ) -> dict:
     """Build one ``SteeringHookPacked`` blob from per-layer Python lists."""

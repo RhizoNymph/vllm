@@ -389,7 +389,7 @@ async def init_app_state(
 
         steering_registry = SteeringModuleRegistry()
         if getattr(args, "steering_modules", None):
-            for module in (getattr(args, "steering_modules", None) or []):
+            for module in getattr(args, "steering_modules", None) or []:
                 await steering_registry.load_from_file(module.name, module.path)
             logger.info(
                 "Loaded %d steering module(s): %s",

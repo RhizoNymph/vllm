@@ -145,7 +145,7 @@ class TestWarmupCUDA:
             active = torch.ones(1, dtype=torch.bool, device=device)
             torch.ops.vllm.apply_steering(hidden, table, index, active)
 
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize()
         assert _kernel_cache_size() == baseline, (
             "Runtime calls at warmed shapes must reuse cached variants; "
             f"cache grew from {baseline} to {_kernel_cache_size()}."

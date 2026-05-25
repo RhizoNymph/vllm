@@ -293,7 +293,7 @@ def warmup_apply_steering_kernel(
         torch.ops.vllm.apply_steering(hidden_view, table_buf, index_view, active_flag)
     # Block until every JIT compile (and cuLibraryLoadData) has retired so
     # the wall-clock measurement and cache-size readback reflect reality.
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     cache_after = _kernel_cache_size()

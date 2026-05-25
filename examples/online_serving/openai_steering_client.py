@@ -20,9 +20,8 @@ Then run this script:
     python examples/online_serving/openai_steering_client.py
 """
 
-import base64
-
 import numpy as np
+import pybase64 as base64
 from openai import OpenAI
 
 MODEL = "google/gemma-3-4b-it"
@@ -34,10 +33,13 @@ HIDDEN_SIZE = 2560  # gemma-3-4b-it residual width
 PACK_DTYPE = np.float16
 
 
+_DEFAULT_PACK_DTYPE = np.dtype(PACK_DTYPE)
+
+
 def pack_hook(
     layer_vectors: dict[int, np.ndarray],
     *,
-    dtype: np.dtype = np.dtype(PACK_DTYPE),
+    dtype: np.dtype = _DEFAULT_PACK_DTYPE,
     scales: dict[int, float] | None = None,
 ) -> dict:
     """Pack one hook's per-layer vectors into a ``SteeringHookPacked`` dict.

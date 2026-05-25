@@ -21,9 +21,8 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING, Any, TypedDict
 
-from typing_extensions import NotRequired
-
 import numpy as np
+from typing_extensions import NotRequired
 
 if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
@@ -87,7 +86,7 @@ def unpack_steering_vectors(
     """
     if not packed:
         return None
-    import base64
+    import pybase64 as base64
 
     result: dict[str, dict[int, np.ndarray]] = {}
     for hook, blob in packed.items():
@@ -114,9 +113,7 @@ def unpack_steering_vectors(
         stacked = np.frombuffer(raw, dtype=dtype).reshape(shape)
         scales = blob.get("scales")
         if scales is None:
-            result[hook] = {
-                int(idx): stacked[i] for i, idx in enumerate(layer_indices)
-            }
+            result[hook] = {int(idx): stacked[i] for i, idx in enumerate(layer_indices)}
             continue
         if len(scales) != len(layer_indices):
             raise ValueError(
