@@ -11,6 +11,9 @@ from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
 from vllm.config.utils import replace
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    CaptureResultResponse,
+)
 from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
     LegacyStructuralTagResponseFormat,
@@ -193,6 +196,15 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    capture: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Per-request opt-in for capture consumers, keyed by consumer "
+            "instance name. See "
+            "``ChatCompletionRequest.capture`` for the full schema."
+        ),
+    )
+
     # --8<-- [end:completion-extra-params]
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
@@ -310,7 +322,7 @@ class CompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        return SamplingParams.from_optional(
+        sampling_params = SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
@@ -341,6 +353,9 @@ class CompletionRequest(OpenAIBaseModel):
             repetition_detection=self.repetition_detection,
             thinking_token_budget=self.thinking_token_budget,
         )
+        if self.capture is not None:
+            sampling_params.capture = dict(self.capture)
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
@@ -511,6 +526,14 @@ class CompletionResponse(OpenAIBaseModel):
     # vLLM-specific fields that are not in OpenAI spec
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
+    )
+    capture_results: dict[str, CaptureResultResponse] | None = Field(
+        default=None,
+        description=(
+            "Per-consumer capture results from the capture-consumer "
+            "framework. Keyed by consumer instance name. Omitted when no "
+            "consumer produced a result for this request."
+        ),
     )
 
 
