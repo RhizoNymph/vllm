@@ -77,6 +77,7 @@ class Scheduler(SchedulerInterface):
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
+        self.steering_config = vllm_config.steering_config
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
@@ -326,6 +327,40 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _set_request_block_hash_steering_overrides(
+        self,
+        request: Request,
+        scheduled_steering_configs: set[tuple[int, str]],
+    ) -> None:
+        """Keep APC steering keys aligned with the effective steering rows."""
+        prefill_hash = request.prefill_steering_config_hash
+        decode_hash = request.decode_steering_config_hash
+
+        if self.steering_config:
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                prefill_pair = (prefill_hash, "prefill")
+                if (
+                    prefill_hash != 0
+                    and prefill_pair not in scheduled_steering_configs
+                    and len(scheduled_steering_configs)
+                    >= self.steering_config.max_steering_configs
+                ):
+                    prefill_hash = 0
+            else:
+                decode_pair = (decode_hash, "decode")
+                if (
+                    decode_hash != 0
+                    and decode_pair not in scheduled_steering_configs
+                    and len(scheduled_steering_configs)
+                    >= self.steering_config.max_steering_configs
+                ):
+                    decode_hash = 0
+
+        request.set_block_hash_steering_overrides(
+            prefill_hash=prefill_hash,
+            decode_hash=decode_hash,
+        )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -541,6 +576,45 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        # Record steering configs in scheduled_running_reqs.
+        # Track the union of currently-active (hash, phase) pairs so that
+        # capacity counting matches the worker's SteeringManager which
+        # allocates separate rows per (hash, phase) key.
+        #
+        # Decode reservation: a running request needs its decode row
+        # reserved when (a) it will complete prefill this step, or
+        # (b) it is decode-only (prefill_hash == 0) and its decode
+        # row must be continuously tracked through all prefill chunks.
+        scheduled_steering_configs: set[tuple[int, str]] = set()
+        if self.steering_config:
+            for req in scheduled_running_reqs:
+                n_sched = num_scheduled_tokens.get(req.request_id, 0)
+                currently_prefilling = req.num_computed_tokens < req.num_prompt_tokens
+
+                if currently_prefilling:
+                    if req.prefill_steering_config_hash != 0:
+                        scheduled_steering_configs.add(
+                            (req.prefill_steering_config_hash, "prefill")
+                        )
+                    will_complete = (
+                        req.num_computed_tokens + n_sched >= req.num_prompt_tokens
+                    )
+                    needs_decode_reservation = (
+                        will_complete or req.prefill_steering_config_hash == 0
+                    )
+                    if (
+                        needs_decode_reservation
+                        and req.decode_steering_config_hash != 0
+                    ):
+                        scheduled_steering_configs.add(
+                            (req.decode_steering_config_hash, "decode")
+                        )
+                else:
+                    if req.decode_steering_config_hash != 0:
+                        scheduled_steering_configs.add(
+                            (req.decode_steering_config_hash, "decode")
+                        )
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
@@ -582,6 +656,42 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                self._set_request_block_hash_steering_overrides(
+                    request, scheduled_steering_configs
+                )
+
+                # Check steering config capacity.  A new request only
+                # occupies one steering row at a time — the prefill
+                # row is released before the decode row is registered
+                # in _handle_steering_transition.  So we only count
+                # the prefill hash for requests that have one.
+                #
+                # Decode-only requests (prefill_hash == 0, decode_hash
+                # != 0) have their decode hash checked instead — they
+                # need a decode row from the start but never occupy a
+                # prefill row.  The `elif` ensures we never double-
+                # count a request that has both hashes.
+                if self.steering_config:
+                    new_hashes: set[tuple[int, str]] = set()
+                    if request.prefill_steering_config_hash != 0:
+                        new_hashes.add(
+                            (request.prefill_steering_config_hash, "prefill")
+                        )
+                    elif request.decode_steering_config_hash != 0:
+                        new_hashes.add((request.decode_steering_config_hash, "decode"))
+                    if new_hashes:
+                        new_unique = new_hashes - scheduled_steering_configs
+                        if (
+                            len(scheduled_steering_configs) + len(new_unique)
+                            > self.steering_config.max_steering_configs
+                        ):
+                            request.set_block_hash_steering_overrides(
+                                prefill_hash=0, decode_hash=0
+                            )
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
@@ -637,6 +747,28 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                # Decode-start steering capacity check for full
+                # prefix-cache hits.  The earlier admission check (above)
+                # only verified the prefill hash because it runs before
+                # prefix-cache resolution.  If the request turns out to
+                # have a full cache hit it will start directly in decode
+                # and needs a decode row instead.
+                if (
+                    self.steering_config
+                    and num_computed_tokens >= request.num_prompt_tokens
+                    and request.decode_steering_config_hash != 0
+                ):
+                    decode_pair = (request.decode_steering_config_hash, "decode")
+                    if (
+                        decode_pair not in scheduled_steering_configs
+                        and len(scheduled_steering_configs)
+                        >= self.steering_config.max_steering_configs
+                    ):
+                        request.set_block_hash_steering_overrides(decode_hash=0)
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -795,6 +927,35 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
+                if self.steering_config:
+                    # Only add the starting phase — the request
+                    # occupies one row at a time (see admission
+                    # check above).
+                    if num_computed_tokens < request.num_prompt_tokens:
+                        if request.prefill_steering_config_hash != 0:
+                            scheduled_steering_configs.add(
+                                (request.prefill_steering_config_hash, "prefill")
+                            )
+                        will_complete = (
+                            num_computed_tokens + num_new_tokens
+                            >= request.num_prompt_tokens
+                        )
+                        needs_decode_reservation = (
+                            will_complete or request.prefill_steering_config_hash == 0
+                        )
+                        if (
+                            needs_decode_reservation
+                            and request.decode_steering_config_hash != 0
+                        ):
+                            scheduled_steering_configs.add(
+                                (request.decode_steering_config_hash, "decode")
+                            )
+                    else:
+                        # Full prefix-cache hit — starting in decode.
+                        if request.decode_steering_config_hash != 0:
+                            scheduled_steering_configs.add(
+                                (request.decode_steering_config_hash, "decode")
+                            )
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
@@ -1021,11 +1182,15 @@ class Scheduler(SchedulerInterface):
 
         session._all_token_ids.extend(update.prompt_token_ids or ())
         session.prompt_token_ids.extend(update.prompt_token_ids or ())
+        # Swap sampling_params *before* recomputing block hashes so that
+        # steering-config hashes embedded in block keys reflect the new
+        # steering configuration, not the stale cached values.
+        session.sampling_params = update.sampling_params
+        session.invalidate_steering_hashes()
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
-        session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
