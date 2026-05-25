@@ -172,6 +172,7 @@ def test_manager_admission_error_yields_error_result() -> None:
     sink.submit_chunk = MagicMock()
     sink.submit_finalize = MagicMock()
     sink.get_result = MagicMock(return_value=None)
+    sink.wait_for_result = MagicMock(return_value=None)
 
     mgr = CaptureManager(
         consumers=(sink,),
