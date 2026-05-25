@@ -17,6 +17,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+)
 from vllm.model_executor.models.llama import (
     LlamaAttention,
     LlamaDecoderLayer,
@@ -190,16 +194,19 @@ class MistralDecoderLayer(LlamaDecoderLayer):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
 
         if self.ada_rms_norm_t_cond is not None:
             assert t_cond is not None
             hidden_states = hidden_states * (1 + self.ada_rms_norm_t_cond(t_cond))
 
         hidden_states = self.mlp(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
         return hidden_states, residual
 
 

@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
@@ -44,6 +45,14 @@ from vllm.model_executor.layers.mamba.ops.ssd_combined import (
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import selective_state_update
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    get_steering_buffer_dtype,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -72,7 +81,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 # Only used for type hinting.
 if TYPE_CHECKING:
@@ -479,8 +487,8 @@ class Plamo2MambaMixer(MambaBase, PluggableLayer):
         )
 
     @property
-    def mamba_type(self) -> MambaAttentionBackendEnum:
-        return MambaAttentionBackendEnum.MAMBA2
+    def mamba_type(self) -> str:
+        return "mamba2"
 
 
 def plamo2_mamba_mixer(
@@ -654,6 +662,17 @@ class Plamo2DecoderLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+            dtype=get_steering_buffer_dtype(vllm_config),
+        )
 
         self.is_mamba = is_mamba(config, layer_idx)
         if self.is_mamba:
@@ -685,6 +704,7 @@ class Plamo2DecoderLayer(nn.Module):
             hidden_states = self.pre_mixer_norm(hidden_states)
         else:
             hidden_states, residual = self.pre_mixer_norm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         if self.is_mamba:
             # Plamo2MambaMixer writes output to this tensor
@@ -703,10 +723,16 @@ class Plamo2DecoderLayer(nn.Module):
         if self.is_mamba:
             hidden_states = output
         hidden_states = self.post_mixer_norm(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_ATTN
+        )
         # Fully Connected
         hidden_states, residual = self.pre_mlp_norm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_mlp_norm(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_MLP
+        )
         return hidden_states, residual
 
 
@@ -728,6 +754,7 @@ class Plamo2Decoder(torch.nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        share_steering_index_across_layers(self.layers)
 
     def forward(
         self,
@@ -797,83 +824,6 @@ class Plamo2Model(torch.nn.Module):
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            # Update the weight names to be compatible with the vllm version
-            # of the model.
-            # Do not change the order of the replacements.
-            replacements = {
-                # Rename incompatible weight names.
-                ".A_log": ".A",
-                ".B_norm_weight": ".B_norm.weight",
-                ".C_norm_weight": ".C_norm.weight",
-                ".dt_norm_weight": ".dt_norm.weight",
-                ".q_weight": ".q_norm.weight",
-                ".k_weight": ".k_norm.weight",
-            }
-            # Apply replacements based on the defined mappings
-            for old, new in replacements.items():
-                if old in name:
-                    name = name.replace(old, new)
-
-            # Reshape the in_proj weights to match the shape expected
-            # by MergedColumnParallelLinear.
-            # This works both for unquantized weights and
-            # for quantized weights.
-            # In the quantized case, the weights are already transposed.
-            # Also, in addition to the quantized weights,
-            # the zero points and scales have to be reshaped as well.
-            # Packing should not be affected by this.
-            if (
-                ".mixer.in_proj.weight" in name
-                or "mixer.in_proj.qweight" in name
-                or "mixer.in_proj.scales" in name
-                or "mixer.in_proj.qzeros" in name
-            ):
-                if "mixer.in_proj.weight" in name:
-                    loaded_weight = loaded_weight.transpose(0, 1)
-                # for weight:
-                # loaded_weight.shape[0] == self.config.hidden_size
-                # for qweight:
-                # loaded_weight.shape[0] == self.config.hidden_size // param.pack_factor  # noqa
-                # for scales and qzeros:
-                # loaded_weight.shape[0] == self.config.hidden_size // self.vllm_config.quant_config.group_size  # noqa
-                loaded_weight = loaded_weight.reshape(
-                    loaded_weight.shape[0], self.config.mamba_num_heads, -1
-                )
-                gate_weight, hidden_states_weight = loaded_weight.chunk(2, dim=-1)
-                gate_weight = gate_weight.reshape(loaded_weight.shape[0], -1)
-                hidden_states_weight = hidden_states_weight.reshape(
-                    loaded_weight.shape[0], -1
-                )
-                loaded_weight = torch.cat([gate_weight, hidden_states_weight], dim=-1)
-                if "mixer.in_proj.weight" in name:
-                    loaded_weight = loaded_weight.transpose(0, 1)
-
-            # Offset parameter with vllm's RMSNorm haven't been supported yet.
-            if ".pre_mixer_norm" in name:
-                loaded_weight += 1.0
-            elif ".post_mixer_norm" in name:
-                loaded_weight += 1.0 / 5
-            elif ".pre_mlp_norm" in name:
-                loaded_weight += 1.0
-            elif ".post_mlp_norm" in name:
-                loaded_weight += 1.0 / (5**1.5)
-            elif name == "norm.weight":
-                loaded_weight += 1.0
-
-            # Skip layers on other devices.
-            if is_pp_missing_parameter(name, self):
-                continue
-
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
 
 class Plamo2ForCausalLM(
@@ -984,9 +934,88 @@ class Plamo2ForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
-        return loader.load_weights(weights)
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            # Both tie_word_embeddings=True and lm_head.weight in the safetensor
+            # at the same time causes dict key access error.
+            if name == "lm_head.weight" and self.config.tie_word_embeddings:
+                assert "lm_head.weight" not in params_dict
+                continue
+            # Same workaround as AutoWeightsLoader for GPTQModel
+            if any(
+                substr in name
+                for substr in AutoWeightsLoader.ROTARY_EMBEDS_UNUSED_WEIGHTS
+            ):
+                continue
+
+            # Update the weight names to be compatible with the vllm version
+            # of the model.
+            # Do not change the order of the replacements.
+            replacements = {
+                # Rename incompatible weight names.
+                ".A_log": ".A",
+                ".B_norm_weight": ".B_norm.weight",
+                ".C_norm_weight": ".C_norm.weight",
+                ".dt_norm_weight": ".dt_norm.weight",
+                ".q_weight": ".q_norm.weight",
+                ".k_weight": ".k_norm.weight",
+            }
+            # Apply replacements based on the defined mappings
+            for old, new in replacements.items():
+                if old in name:
+                    name = name.replace(old, new)
+
+            # Reshape the in_proj weights to match the shape expected
+            # by MergedColumnParallelLinear.
+            # This works both for unquantized weights and
+            # for quantized weights.
+            # In the quantized case, the weights are already transposed.
+            # Also, in addition to the quantized weights,
+            # the zero points and scales have to be reshaped as well.
+            # Packing should not be affected by this.
+            if (
+                ".mixer.in_proj.weight" in name
+                or "mixer.in_proj.qweight" in name
+                or "mixer.in_proj.scales" in name
+                or "mixer.in_proj.qzeros" in name
+            ):
+                if "mixer.in_proj.weight" in name:
+                    loaded_weight = loaded_weight.transpose(0, 1)
+                # for weight:
+                # loaded_weight.shape[0] == self.config.hidden_size
+                # for qweight:
+                # loaded_weight.shape[0] == self.config.hidden_size // param.pack_factor  # noqa
+                # for scales and qzeros:
+                # loaded_weight.shape[0] == self.config.hidden_size // self.vllm_config.quant_config.group_size  # noqa
+                loaded_weight = loaded_weight.reshape(
+                    loaded_weight.shape[0], self.config.mamba_num_heads, -1
+                )
+                gate_weight, hidden_states_weight = loaded_weight.chunk(2, dim=-1)
+                gate_weight = gate_weight.reshape(loaded_weight.shape[0], -1)
+                hidden_states_weight = hidden_states_weight.reshape(
+                    loaded_weight.shape[0], -1
+                )
+                loaded_weight = torch.cat([gate_weight, hidden_states_weight], dim=-1)
+                if "mixer.in_proj.weight" in name:
+                    loaded_weight = loaded_weight.transpose(0, 1)
+
+            # Offset parameter with vllm's RMSNorm haven't been supported yet.
+            if ".pre_mixer_norm" in name:
+                loaded_weight += 1.0
+            elif ".post_mixer_norm" in name:
+                loaded_weight += 1.0 / 5
+            elif ".pre_mlp_norm" in name:
+                loaded_weight += 1.0
+            elif ".post_mlp_norm" in name:
+                loaded_weight += 1.0 / (5**1.5)
+            elif "model.norm.weight" in name:
+                loaded_weight += 1.0
+
+            # Skip layers on other devices.
+            if is_pp_missing_parameter(name, self):
+                continue
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
