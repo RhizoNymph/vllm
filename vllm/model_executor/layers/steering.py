@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
@@ -151,6 +152,9 @@ def apply_layer_steering(
 ) -> torch.Tensor:
     """Apply the steering table for ``hook_point`` to ``hidden_states``.
 
+    Capture consumers (when configured) see the pre-steering residual via
+    :func:`maybe_capture_residual`.
+
     When the layer has no steering table buffer registered (engine
     started with ``enable_steering=False``, so
     :func:`register_steering_buffers` was a no-op), this short-circuits
@@ -159,6 +163,7 @@ def apply_layer_steering(
     of the layer's lifetime, so ``torch.compile`` traces it as a static
     branch and the disabled path emits no steering kernel at all.
     """
+    maybe_capture_residual(hidden_states, module.layer_idx, hook_point.value)
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
     if not hasattr(module, table_attr):
         return hidden_states
