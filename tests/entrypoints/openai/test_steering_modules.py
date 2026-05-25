@@ -46,7 +46,7 @@ class TestMergeSteeringSpecs:
         result = merge_steering_specs(None, spec)
         assert result is not None
         # Values should be pre-scaled (scale=1.0 for bare list)
-        assert result["post_mlp"][14] == [1.0, 2.0, 3.0]
+        assert result["post_mlp"][14].tolist() == [1.0, 2.0, 3.0]
 
     def test_first_has_data_second_none(self):
         spec: SteeringVectorSpec = {
@@ -54,30 +54,30 @@ class TestMergeSteeringSpecs:
         }
         result = merge_steering_specs(spec, None)
         assert result is not None
-        assert result["pre_attn"][5] == [0.5, 0.6]
+        assert result["pre_attn"][5].tolist() == [0.5, 0.6]
 
     def test_non_overlapping_hooks_both_preserved(self):
         a: SteeringVectorSpec = {"post_mlp": {14: [1.0, 2.0]}}
         b: SteeringVectorSpec = {"pre_attn": {10: [3.0, 4.0]}}
         result = merge_steering_specs(a, b)
         assert result is not None
-        assert result["post_mlp"][14] == [1.0, 2.0]
-        assert result["pre_attn"][10] == [3.0, 4.0]
+        assert result["post_mlp"][14].tolist() == [1.0, 2.0]
+        assert result["pre_attn"][10].tolist() == [3.0, 4.0]
 
     def test_non_overlapping_layers_same_hook(self):
         a: SteeringVectorSpec = {"post_mlp": {14: [1.0, 2.0]}}
         b: SteeringVectorSpec = {"post_mlp": {15: [3.0, 4.0]}}
         result = merge_steering_specs(a, b)
         assert result is not None
-        assert result["post_mlp"][14] == [1.0, 2.0]
-        assert result["post_mlp"][15] == [3.0, 4.0]
+        assert result["post_mlp"][14].tolist() == [1.0, 2.0]
+        assert result["post_mlp"][15].tolist() == [3.0, 4.0]
 
     def test_overlapping_hook_layer_added(self):
         a: SteeringVectorSpec = {"post_mlp": {14: [1.0, 2.0, 3.0]}}
         b: SteeringVectorSpec = {"post_mlp": {14: [0.5, 0.5, 0.5]}}
         result = merge_steering_specs(a, b)
         assert result is not None
-        assert result["post_mlp"][14] == [1.5, 2.5, 3.5]
+        assert result["post_mlp"][14].tolist() == [1.5, 2.5, 3.5]
 
     def test_overlapping_with_scaled_entries(self):
         a: SteeringVectorSpec = {
@@ -93,7 +93,7 @@ class TestMergeSteeringSpecs:
         result = merge_steering_specs(a, b)
         assert result is not None
         # a scaled: [2.0, 4.0], b scaled: [1.5, 2.0], sum: [3.5, 6.0]
-        assert result["post_mlp"][14] == [3.5, 6.0]
+        assert result["post_mlp"][14].tolist() == [3.5, 6.0]
 
     def test_one_scaled_one_bare(self):
         a: SteeringVectorSpec = {
@@ -109,7 +109,7 @@ class TestMergeSteeringSpecs:
         result = merge_steering_specs(a, b)
         assert result is not None
         # a scaled: [3.0, 6.0], b scaled: [0.5, 0.5], sum: [3.5, 6.5]
-        assert result["post_mlp"][14] == [3.5, 6.5]
+        assert result["post_mlp"][14].tolist() == [3.5, 6.5]
 
     def test_passthrough_entry_is_prescaled(self):
         """Non-overlapping scaled entry should still be pre-scaled."""
@@ -120,7 +120,7 @@ class TestMergeSteeringSpecs:
         }
         result = merge_steering_specs(spec, None)
         assert result is not None
-        assert result["post_mlp"][14] == [0.5, 1.0]
+        assert result["post_mlp"][14].tolist() == [0.5, 1.0]
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +399,10 @@ class TestSteeringModuleRegistry:
 @pytest.mark.asyncio
 async def test_init_app_state_only_sets_registry_when_steering_enabled():
     engine_client = MagicMock()
-    engine_client.vllm_config = SimpleNamespace(lora_config=None)
+    engine_client.vllm_config = SimpleNamespace(
+        lora_config=None,
+        structured_outputs_config=SimpleNamespace(enable_in_reasoning=False),
+    )
     engine_client.model_config = MagicMock()
     engine_client.renderer = MagicMock()
     engine_client.io_processor = MagicMock()
@@ -417,6 +420,7 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
         lora_modules=None,
         enable_steering=False,
         steering_modules=None,
+        structured_outputs_config=SimpleNamespace(reasoning_parser=None),
         chat_template_content_format="auto",
         trust_request_chat_template=False,
         enable_auto_tool_choice=False,
@@ -484,7 +488,11 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
         )
 
     assert hasattr(state, "steering_module_registry")
-    engine_client.collective_rpc.assert_awaited_once_with("list_steerable_layers")
+    # No --steering-modules flag was passed, so no broadcast RPC fires.
+    # The registry is still created (so /v1/steering/set has somewhere
+    # to register into); the worker-side RPCs only fire when there's a
+    # non-empty initial registry to broadcast.
+    engine_client.collective_rpc.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -517,9 +525,9 @@ class TestResolveForRequest:
         assert err is None
         # Vectors are pre-scaled (scale=1.0 bare lists)
         assert v is not None
-        assert v["post_mlp"][14] == [1.0, 2.0]
+        assert v["post_mlp"][14].tolist() == [1.0, 2.0]
         assert p is not None
-        assert p["pre_attn"][5] == [0.5, 0.6]
+        assert p["pre_attn"][5].tolist() == [0.5, 0.6]
         assert d is None
 
     @pytest.mark.asyncio
@@ -533,7 +541,7 @@ class TestResolveForRequest:
         v, p, d, err = registry.resolve_for_request("base", inline, None, None)
         assert err is None
         assert v is not None
-        assert v["post_mlp"][14] == [1.5, 2.5]
+        assert v["post_mlp"][14].tolist() == [1.5, 2.5]
 
     @pytest.mark.asyncio
     async def test_named_one_tier_inline_different_tier(self):
@@ -547,10 +555,10 @@ class TestResolveForRequest:
         assert err is None
         # Named vectors tier
         assert v is not None
-        assert v["post_mlp"][14] == [1.0, 2.0]
+        assert v["post_mlp"][14].tolist() == [1.0, 2.0]
         # Inline prefill tier
         assert p is not None
-        assert p["pre_attn"][5] == [0.3, 0.4]
+        assert p["pre_attn"][5].tolist() == [0.3, 0.4]
         # Decode tier untouched
         assert d is None
 
