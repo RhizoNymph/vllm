@@ -10,7 +10,7 @@ group.
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 
 import torch
 
@@ -31,7 +31,7 @@ class LoggingConsumer(CaptureConsumer):
         level: logging level name (default "INFO")
     """
 
-    location: ClassVar[Literal["worker", "driver"]] = "worker"
+    location: Literal["worker", "driver"] = "worker"
 
     def __init__(self, vllm_config: Any, params: dict[str, Any]) -> None:
         self._hooks: dict[HookName, list[int]] = params["hooks"]

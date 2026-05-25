@@ -581,8 +581,13 @@ class ActivationWriter:
                 ) from exc
 
         # Flush and close the .bin.tmp fd.
-        fd = partition.fd_cache.pop(task.key, None)
-        if fd is not None:
+        cached_fd: int | None
+        try:
+            cached_fd = partition.fd_cache.pop(task.key)
+        except KeyError:
+            cached_fd = None
+        if cached_fd is not None:
+            fd = cached_fd
             try:
                 os.fsync(fd)
             except OSError as exc:

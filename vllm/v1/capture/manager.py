@@ -34,7 +34,7 @@ import queue
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -51,6 +51,7 @@ from vllm.v1.capture.types import (
     CaptureResult,
     CaptureSpec,
     CaptureStatus,
+    HookName,
     VllmInternalRequestId,
 )
 
@@ -426,7 +427,7 @@ class CaptureManager:
 
                 for hook_name, layers in spec.hooks.items():
                     for layer_idx in layers:
-                        key = (layer_idx, hook_name)
+                        key: tuple[int, str] = (layer_idx, hook_name)
                         pos_map = consumer_positions[key]
                         for pos in in_step:
                             pos_map[pos] = pos_map.get(pos, 0) | bit
@@ -445,7 +446,7 @@ class CaptureManager:
             # Now build gather rows and entries from the union.
             for key in sorted(consumer_positions.keys()):
                 pos_map = consumer_positions[key]
-                layer_idx, hook_name = key
+                entry_layer, entry_hook = key
                 rows_list = gather_rows.setdefault(key, [])
                 for logical_pos in sorted(pos_map.keys()):
                     mask = pos_map[logical_pos]
@@ -455,8 +456,8 @@ class CaptureManager:
                     entries.append(
                         CapturePositionEntry(
                             request_id=req_id,
-                            layer=layer_idx,
-                            hook=hook_name,
+                            layer=entry_layer,
+                            hook=cast(HookName, entry_hook),
                             logical_pos=logical_pos,
                             scratch_row=scratch_row,
                             step_index=step_index,
@@ -528,7 +529,7 @@ class CaptureManager:
         plan = self._step_plan
         if plan is None:
             return
-        key = (layer_idx, hook_name)
+        key: tuple[int, str] = (layer_idx, hook_name)
         idx = plan.gather_indices.get(key)
         if idx is None:
             return
@@ -813,7 +814,7 @@ class CaptureManager:
             capture_keys: list[CaptureKey] = []
             for hook_name, layers in spec.hooks.items():
                 for layer_idx in layers:
-                    capture_key = (
+                    capture_key: CaptureKey = (
                         VllmInternalRequestId(req_id),
                         layer_idx,
                         hook_name,

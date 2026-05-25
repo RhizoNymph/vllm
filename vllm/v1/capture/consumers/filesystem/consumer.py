@@ -73,7 +73,7 @@ class FilesystemConsumer:
     Path layout: ``{root}/{tag_slug}/{request_id_slug}/{layer}_{hook}.bin``
     """
 
-    location: ClassVar[Literal["worker"]] = "worker"
+    location: Literal["worker", "driver"] = "worker"
     reads_client_spec: ClassVar[bool] = True
 
     def __init__(

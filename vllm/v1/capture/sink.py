@@ -20,7 +20,7 @@ See ``docs/design/capture_consumers.md`` § "Sinks and Consumers".
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from vllm.v1.capture.types import (
     CaptureChunk,
@@ -47,7 +47,7 @@ class CaptureSink(Protocol):
     call ``get_result`` concurrently from the engine-core thread.
     """
 
-    location: ClassVar[Literal["worker", "driver"]]
+    location: Literal["worker", "driver"]
 
     def submit_chunk(self, chunk: CaptureChunk) -> None:
         """Non-blocking enqueue of a chunk of captured rows."""

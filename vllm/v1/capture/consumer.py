@@ -73,7 +73,7 @@ class CaptureConsumer(ABC):
       ``pass``.
     """
 
-    location: ClassVar[Literal["worker", "driver"]] = "worker"
+    location: Literal["worker", "driver"] = "worker"
     required_sidecar_fields: ClassVar[frozenset[str]] = frozenset()
     reads_client_spec: ClassVar[bool] = False
 

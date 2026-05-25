@@ -30,11 +30,17 @@ this module's job.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any, cast
+
 import regex as re
-from typing import TYPE_CHECKING, Any
 
 from vllm.v1.capture.errors import CaptureValidationError
-from vllm.v1.capture.types import CaptureContext, CaptureSpec, HookName
+from vllm.v1.capture.types import (
+    CaptureContext,
+    CaptureSpec,
+    HookName,
+    PositionSelector,
+)
 
 from .types import FilesystemCaptureRequest
 
@@ -396,14 +402,14 @@ def validate_filesystem_request(
                 f"capture.hooks[{hook_name!r}] expanded to an empty layer list"
             )
         # hook_name already validated as one of _VALID_HOOK_NAMES.
-        resolved_hooks[hook_name] = resolved  # type: ignore[literal-required]
+        resolved_hooks[cast(HookName, hook_name)] = resolved
 
     # 5. Resolve positions.
     # "last_prompt", "all_prompt", and explicit lists resolve at
     # admission time. "all_generated" and "all" stay symbolic — the
     # runner materializes them per-step once the generated token
     # count is known.
-    resolved_positions: list[int] | str
+    resolved_positions: PositionSelector
     if isinstance(raw.positions, str):
         if raw.positions in ("last_prompt", "all_prompt"):
             resolved_positions = _resolve_positions(
@@ -413,8 +419,9 @@ def validate_filesystem_request(
                 where="capture.positions",
             )
         else:
-            # "all_generated" / "all" — defer to the runner.
-            resolved_positions = raw.positions
+            # "all_generated" / "all" — defer to the runner. Already
+            # validated against _VALID_POSITION_KINDS above.
+            resolved_positions = cast(PositionSelector, raw.positions)
     elif isinstance(raw.positions, list):
         resolved_positions = _resolve_positions(
             raw.positions,
