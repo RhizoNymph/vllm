@@ -53,7 +53,7 @@ Implemented at `vllm.v1.capture.consumers.filesystem.FilesystemConsumer`.
 Python API):
 
 | Field | Type | Default | Purpose |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `root` | `str` | required | Root directory for all captures. |
 | `writer_threads` | `int` | `4` | Writer thread pool size. |
 | `queue_size` | `int` | `1024` | Per-thread bounded queue capacity. |
@@ -79,7 +79,7 @@ Client `hooks` values may be a list of ints, the literal string
 
 **On-disk layout**:
 
-```
+```text
 {root}/{tag_slug}/{request_id_slug}/{layer_idx}_{hook_name}.bin
 {root}/{tag_slug}/{request_id_slug}/{layer_idx}_{hook_name}.json
 ```
@@ -108,7 +108,7 @@ Implemented at `vllm.v1.capture.consumers.logging.LoggingConsumer`.
 **Parameters**:
 
 | Field | Type | Default | Purpose |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `hooks` | `dict[str, list[int]]` | required | Hook name to layer indices. |
 | `positions` | position selector | `"last_prompt"` | Which positions to capture. |
 | `level` | `str` | `"INFO"` | Python logging level. |

@@ -5,7 +5,7 @@ scalar reward for online RL. The reward is the cosine similarity between
 a mean-pooled slice of the generated span and a pre-derived reference
 direction, scaled and passed through a nonlinearity:
 
-```
+```text
 reward = nonlinearity(scale * cos(mean(activations[slice]), reference_vector))
 ```
 
@@ -70,7 +70,7 @@ vllm serve meta-llama/Llama-3-8B \
 ### Parameters
 
 | Field | Type | Default | Purpose |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `layer` | `int` | required | Layer index to capture at. |
 | `hook` | `str` | required | One of `pre_attn`, `post_attn`, `post_mlp`, `mlp_in`, `mlp_out`. |
 | `vector_path` | `str` | required | Path to a `.pt` file holding a 1-D tensor of shape `(hidden_size,)`. L2-normalized at load. |

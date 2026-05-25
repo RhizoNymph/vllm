@@ -26,7 +26,7 @@ The framework has three responsibilities:
 
 Three layers, cleanly separated:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                Decoder-layer forward code                   │
 │  (model files call apply_layer_steering, which already      │
@@ -70,7 +70,7 @@ consumer does this.
 
 ## Module Layout
 
-```
+```text
 vllm/v1/capture/
 ├── __init__.py                 # Public re-exports
 ├── types.py                    # Core types (torch-aware)
