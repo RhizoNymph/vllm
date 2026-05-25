@@ -357,6 +357,13 @@ async def init_app_state(
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
     state.args = args
+    # Resolve steering mutation API tokens.  --steering-api-key on the
+    # CLI takes precedence over VLLM_STEERING_API_KEY, mirroring how the
+    # server-wide --api-key / VLLM_API_KEY pair is resolved above.
+    steering_api_key_source = getattr(args, "steering_api_key", None) or [
+        envs.VLLM_STEERING_API_KEY
+    ]
+    state.steering_api_tokens = [key for key in steering_api_key_source if key]
     resolved_chat_template = load_chat_template(args.chat_template)
 
     # Merge default_mm_loras into the static lora_modules
@@ -373,6 +380,48 @@ async def init_app_state(
         lora_modules=lora_modules,
     )
     await state.openai_serving_models.init_static_loras()
+
+    if getattr(args, "enable_steering", False):
+        # Initialize steering module registry for named steering vectors.
+        from vllm.entrypoints.openai.steering.registry import (
+            SteeringModuleRegistry,
+        )
+
+        steering_registry = SteeringModuleRegistry()
+        if getattr(args, "steering_modules", None):
+            for module in (getattr(args, "steering_modules", None) or []):
+                await steering_registry.load_from_file(module.name, module.path)
+            logger.info(
+                "Loaded %d steering module(s): %s",
+                len(getattr(args, "steering_modules", None) or []),
+                steering_registry.list_modules(),
+            )
+        state.steering_module_registry = steering_registry
+
+        # Broadcast the initial registry to every worker so they can
+        # resolve named-module references locally (eliminating per-request
+        # serialization of large vector blobs across the multiprocessing
+        # boundary). Mirrors the pattern used by /v1/steering/set.
+        broadcast_payload = steering_registry.dump_for_broadcast()
+        if broadcast_payload:
+            await engine_client.collective_rpc(
+                "register_steering_modules",
+                kwargs=dict(modules=broadcast_payload, replace=True),
+            )
+            # Eagerly materialize each named module's rows now so the
+            # first request resolving to one finds a refcount-hit
+            # instead of paying the ~15 ms cold-path materialize cost
+            # in :meth:`SteeringManager.register_config` (the
+            # synchronous bf16 H2D upload of every layer).  Issued
+            # after the registry-update RPC because pre-materialize
+            # reads the resolved cache populated by it.
+            for module_name in broadcast_payload:
+                await engine_client.collective_rpc(
+                    "pre_materialize_steering_module",
+                    kwargs=dict(name=module_name),
+                )
+    elif hasattr(state, "steering_module_registry"):
+        delattr(state, "steering_module_registry")
 
     state.openai_serving_render = OpenAIServingRender(
         model_config=engine_client.model_config,

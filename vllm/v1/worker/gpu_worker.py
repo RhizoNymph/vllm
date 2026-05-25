@@ -940,6 +940,47 @@ class Worker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_runner.pin_lora(lora_id)
 
+    def set_steering_vectors(
+        self,
+        vectors: dict[str, dict[int, list[float]]] | None = None,
+        prefill_vectors: dict[str, dict[int, list[float]]] | None = None,
+        decode_vectors: dict[str, dict[int, list[float]]] | None = None,
+        replace: bool = False,
+        validate_only: bool = False,
+    ) -> tuple[int, int, list[int]]:
+        return self.model_runner.set_steering_vectors(
+            vectors=vectors,
+            prefill_vectors=prefill_vectors,
+            decode_vectors=decode_vectors,
+            replace=replace,
+            validate_only=validate_only,
+        )
+
+    def clear_steering_vectors(self) -> None:
+        return self.model_runner.clear_steering_vectors()
+
+    def list_steerable_layers(self) -> dict[int, list[str]]:
+        return self.model_runner.list_steerable_layers()
+
+    def get_steering_status(self) -> dict:
+        return self.model_runner.get_steering_status()
+
+    def register_steering_modules(
+        self,
+        modules: dict[str, dict],
+        replace: bool = False,
+    ) -> None:
+        return self.model_runner.register_steering_modules(modules, replace=replace)
+
+    def unregister_steering_modules(self, names: list[str]) -> None:
+        return self.model_runner.unregister_steering_modules(names)
+
+    def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
+        return self.model_runner.pre_materialize_steering_module(name)
+
+    def release_pre_materialized_steering_module(self, name: str) -> None:
+        return self.model_runner.release_pre_materialized_steering_module(name)
+
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return
