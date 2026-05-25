@@ -302,6 +302,21 @@ class AsyncLLM(EngineClient):
 
         is_pooling = isinstance(params, PoolingParams)
 
+        # Steering preprocessing: pack inline vectors in the model dtype
+        # so the worker side doesn't have to recompute resolved values
+        # per forward pass.  No-op when the request has no inline steering.
+        if not is_pooling:
+            from vllm.config.steering_types import (
+                maybe_pack_inline_steering_for_request,
+            )
+
+            try:
+                torch_dtype = self.vllm_config.model_config.dtype
+            except AttributeError:
+                torch_dtype = None
+            if torch_dtype is not None:
+                maybe_pack_inline_steering_for_request(params, torch_dtype)
+
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill
             and not is_pooling

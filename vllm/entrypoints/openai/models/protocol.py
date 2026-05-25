@@ -17,3 +17,9 @@ class LoRAModulePath:
     path: str
     base_model_name: str | None = None
     is_3d_lora_weight: bool = False
+
+
+@dataclass
+class SteeringModulePath:
+    name: str
+    path: str

@@ -203,6 +203,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -414,7 +415,10 @@ class ExecuteModelState(NamedTuple):
 
 
 class GPUModelRunner(
-    LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+    LoRAModelRunnerMixin,
+    SteeringModelRunnerMixin,
+    KVConnectorModelRunnerMixin,
+    ECConnectorModelRunnerMixin,
 ):
     def __init__(
         self,
@@ -1194,6 +1198,10 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # Release the currently-active steering config for finished
+        # requests before popping state so hashes remain accessible.
+        self._release_finished_steering_configs(scheduler_output.finished_req_ids)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1305,6 +1313,10 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                prefill_steering_config_hash=(
+                    new_req_data.prefill_steering_config_hash
+                ),
+                decode_steering_config_hash=(new_req_data.decode_steering_config_hash),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1317,6 +1329,11 @@ class GPUModelRunner(
             # text generation (spec invariant 7).
             if self._capture_manager is not None and sampling_params is not None:
                 self._register_capture_request(new_req_data, req_state)
+
+            # Register the initial-phase steering config for this new
+            # request.  Handles the direct-to-decode case (full prefix
+            # cache hit) and capacity-exhaustion deferral.
+            self._register_initial_steering_config(req_id, new_req_data, req_state)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1413,6 +1430,10 @@ class GPUModelRunner(
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
+            if resumed_from_preemption:
+                self._reset_steering_for_resumption(
+                    req_id, req_state, num_computed_tokens
+                )
 
             if not is_last_rank:
                 if not req_data.new_token_ids:
@@ -1909,6 +1930,27 @@ class GPUModelRunner(
         # Clear `output_token_ids` as previous output tokens are now part of
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
+
+        # Refresh steering config hashes for the re-added request.
+        # Streaming re-adds go back through prefill, so we must release
+        # the old phase config, update the hashes on CachedRequestState,
+        # and re-register the new prefill config.
+        old_prefill_hash = req_state.prefill_steering_config_hash
+        old_decode_hash = req_state.decode_steering_config_hash
+        new_prefill_hash = new_req_data.prefill_steering_config_hash
+        new_decode_hash = new_req_data.decode_steering_config_hash
+
+        req_state.prefill_steering_config_hash = new_prefill_hash
+        req_state.decode_steering_config_hash = new_decode_hash
+
+        self._refresh_streaming_steering(
+            req_id,
+            new_req_data,
+            old_prefill_hash,
+            old_decode_hash,
+            new_prefill_hash,
+            new_decode_hash,
+        )
 
         if self.uses_mrope:
             self._init_mrope_positions(req_state)
@@ -4549,6 +4591,9 @@ class GPUModelRunner(
         if self._capture_manager is not None:
             self._prepare_capture_step(scheduler_output)
 
+        # Update per-request steering tables and index before forward.
+        self._update_steering_buffers(scheduler_output)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -5520,6 +5565,12 @@ class GPUModelRunner(
             and self.eplb_state.is_async
         ):
             self.eplb_state.start_async_loop()
+
+        # Initialise steering state once the model is fully loaded.
+        # Done before torch.compile / cudagraph wrapping but after
+        # comm-buffer setup; the manager only needs access to the
+        # registered steering buffers on each decoder layer.
+        self._init_steering_state()
 
         if (
             self.vllm_config.compilation_config.mode

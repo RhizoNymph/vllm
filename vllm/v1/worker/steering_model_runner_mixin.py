@@ -1,0 +1,1259 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Define activation steering functionality mixin for model runners.
+"""
+
+import math
+from typing import TYPE_CHECKING, cast
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from vllm.config.steering_types import (
+    SteeringVectorSpec,
+    hash_steering_config,
+    merge_steering_specs,
+    resolve_effective_vectors,
+    scale_steering_spec,
+)
+from vllm.exceptions import SteeringVectorError
+from vllm.logger import init_logger
+from vllm.model_executor.layers.steering import (
+    HOOK_POINT_ANY_ACTIVE_ATTR,
+    HOOK_POINT_TABLE_ATTR,
+    SteeringHookPoint,
+)
+from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.steering_manager import SteeringManager
+
+
+def _get_steering_ranks() -> tuple[int, int]:
+    """Return ``(tp_rank, pp_rank)`` for the current worker.
+
+    Used to tag steering RPC results so the router can detect TP
+    divergence (a server-side invariant violation). Guarded so that
+    tests / single-rank setups that haven't initialized the
+    distributed groups still work.
+    """
+    try:
+        from vllm.distributed.parallel_state import (
+            get_pp_group,
+            get_tp_group,
+        )
+
+        return (get_tp_group().rank_in_group, get_pp_group().rank_in_group)
+    except Exception:
+        return (0, 0)
+
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+
+logger = init_logger(__name__)
+
+
+# Defined as a mixin for GPUModelRunner
+class SteeringModelRunnerMixin:
+    """Consolidates all activation-steering state and logic on the model runner.
+
+    Mirrors the ``LoRAModelRunnerMixin`` pattern: the mixin owns every
+    piece of steering-related state and exposes the public API
+    (``set_steering_vectors``, ``clear_steering_vectors``,
+    ``list_steerable_layers``, ``get_steering_status``) that
+    ``WorkerBase`` and its concrete subclasses delegate to via thin
+    passthroughs.
+    """
+
+    # --- class-level attribute declarations --------------------------------
+    # All steering state is initialised eagerly by ``_init_steering_state``
+    # at the end of ``GPUModelRunner.load_model``.  The class-level
+    # defaults below cover the pre-init window (e.g. unit tests that
+    # construct the mixin without going through load_model) so plain
+    # attribute access is safe without ``hasattr`` guards.
+    _steering_manager: SteeringManager | None = None
+    _steerable_layers_cache: dict[int, nn.Module] | None = None
+    _req_steering_phase: dict[str, str]
+    _steering_index_dirty: bool
+    # Worker-side mirror of the API server's named steering module
+    # registry.  Populated via ``register_steering_modules`` RPC during
+    # API server bootstrap and on every /v1/steering/modules/{register,
+    # unregister} call.  Per-process, per-worker — collective_rpc
+    # guarantees identical state across TP × PP ranks.
+    _steering_module_registry: dict[
+        str,
+        tuple[
+            SteeringVectorSpec | None,
+            SteeringVectorSpec | None,
+            SteeringVectorSpec | None,
+        ],
+    ]
+    # Pre-resolved spec cache for the named-module fast path.  Each entry
+    # stores ``(resolved_prefill, resolved_decode)``: the output of
+    # :func:`resolve_effective_vectors` applied to the module's
+    # ``(base, phase)`` specs at registration time.  The hot path in
+    # :meth:`_resolve_request_steering` skips the per-request merge +
+    # resolve work (~37 ms/generate at 3 hooks on gemma-3-4b-it) when a
+    # request references a name with no inline overrides; ``scale!=1.0``
+    # is handled by an in-place ``arr * scale`` over the cached arrays.
+    # Populated alongside ``_steering_module_registry`` and invalidated
+    # together.
+    _steering_module_resolved_cache: dict[
+        str,
+        tuple[
+            dict[str, dict[int, "np.ndarray"]] | None,
+            dict[str, dict[int, "np.ndarray"]] | None,
+        ],
+    ]
+    # Tracks (config_hash, phase) pairs the worker pinned at named-module
+    # register time via :meth:`pre_materialize_steering_module`.  Each entry
+    # is a hold of ``+1`` on the manager's refcount table for the matching
+    # row, on top of any per-request refcounts the hot path adds.  The
+    # pin keeps the row materialized between registration and the first
+    # request that resolves to the module, eliminating the cold-path
+    # ``register_config.materialize`` cost (~15 ms on gemma-3-4b-it/3090
+    # in named_shared mode) from the request's TTFT.  Released on
+    # :meth:`release_pre_materialized_steering_module` (called by
+    # ``unregister_steering_modules`` from the API layer).
+    _steering_module_pinned_rows: dict[str, list[tuple[int, str]]]
+    # Set of layer indices physically owned by this worker.  Under PP,
+    # this is a contiguous subset of ``[0, num_layers)``; under single-
+    # worker and under TP (which replicates all layers per rank), it
+    # equals the full model's layer set.  Threaded into
+    # ``SteeringManager`` calls so non-local tensors are never
+    # materialized on this rank.
+    _locally_owned_layers: frozenset[int]
+    # CPU scratch arrays used by ``_update_steering_buffers`` to build
+    # the per-token row mapping in a single ``np.repeat`` + non-blocking
+    # H2D copy, replacing the per-request slice-assign loop.  The
+    # per-request scratches are sized to ``max_num_seqs``; the
+    # row-per-token scratch is a pinned-memory torch tensor sized to
+    # ``max_num_batched_tokens`` so the H2D copy can actually overlap
+    # compute (``non_blocking=True`` on a non-pinned source silently
+    # falls back to a synchronous copy).  ``None`` when steering is
+    # inactive.
+    _steering_rows_scratch: np.ndarray | None = None
+    _steering_n_tokens_scratch: np.ndarray | None = None
+    _steering_index_pinned: torch.Tensor | None = None
+
+    # Attributes provided by the concrete model runner that mixes this
+    # class in.  Declared here purely so static type checking can see
+    # them — there is no runtime assignment.
+    if TYPE_CHECKING:
+        vllm_config: VllmConfig
+        input_batch: InputBatch
+        requests: dict[str, CachedRequestState]
+
+        def get_model(self) -> nn.Module: ...
+
+    # -----------------------------------------------------------------------
+    # Eager initialisation
+    # -----------------------------------------------------------------------
+
+    def _init_steering_state(self) -> None:
+        """Initialise steering state at the end of model load.
+
+        Walks the loaded model for layers that registered steering
+        buffers, captures the buffer device, and constructs the
+        ``SteeringManager``.  Must be called exactly once — typically
+        from ``GPUModelRunner.load_model`` after the model is fully
+        loaded.
+
+        When steering is disabled (no ``SteeringConfig``) or the model
+        has no steerable layers, ``_steering_manager`` stays ``None``
+        so per-step ``_update_steering_buffers`` and the public API
+        methods can short-circuit cheaply.
+        """
+        steerable: dict = {}
+        if hasattr(self, "get_model"):
+            for mod in self.get_model().modules():
+                if not hasattr(mod, "layer_idx"):
+                    continue
+                has_any_table = any(
+                    hasattr(mod, attr) for attr in HOOK_POINT_TABLE_ATTR.values()
+                )
+                if has_any_table:
+                    steerable[mod.layer_idx] = mod
+        self._steerable_layers_cache = steerable
+        self._locally_owned_layers = frozenset(steerable.keys())
+        self._req_steering_phase = {}
+        self._steering_index_dirty = False
+        self._steering_module_registry = {}
+        self._steering_module_resolved_cache = {}
+        self._steering_module_pinned_rows = {}
+
+        steering_config = getattr(self.vllm_config, "steering_config", None)
+        if steering_config is None or not steerable:
+            self._steering_manager = None
+            return
+
+        # Resolve device from the first steerable layer's table buffer
+        # so per-request vectors are allocated on the same device,
+        # avoiding CPU->GPU copies each step.
+        table_device: torch.device | None = None
+        table_dtype: torch.dtype | None = None
+        hidden_size: int | None = None
+        for mod in steerable.values():
+            for attr in HOOK_POINT_TABLE_ATTR.values():
+                if hasattr(mod, attr):
+                    table_buf = getattr(mod, attr)
+                    table_device = table_buf.device
+                    table_dtype = table_buf.dtype
+                    hidden_size = table_buf.shape[1]
+                    break
+            if table_device is not None:
+                break
+
+        self._steering_manager = SteeringManager(
+            steering_config.max_steering_configs,
+            device=table_device,
+        )
+
+        # Pre-allocate CPU scratch buffers for the vectorized
+        # steering_index build in ``_update_steering_buffers``.  The
+        # per-request numpy buffers hold one entry per request in the
+        # batch (bounded by ``max_num_seqs``); the pinned torch tensor
+        # holds the expanded per-token row array (bounded by
+        # ``max_num_batched_tokens``) and is the source of the single
+        # H2D copy each step.  Pinning lets ``non_blocking=True`` on
+        # the copy actually overlap with model compute.
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        if scheduler_config is not None:
+            max_tokens = int(scheduler_config.max_num_batched_tokens)
+            max_seqs = int(getattr(scheduler_config, "max_num_seqs", max_tokens))
+            self._steering_rows_scratch = np.zeros(max_seqs, dtype=np.int64)
+            self._steering_n_tokens_scratch = np.zeros(max_seqs, dtype=np.int64)
+            try:
+                self._steering_index_pinned = torch.zeros(
+                    max_tokens, dtype=torch.long, pin_memory=True
+                )
+            except RuntimeError:
+                # Pinned memory unavailable (e.g. CPU-only test
+                # environment); fall back to a regular CPU tensor.
+                self._steering_index_pinned = torch.zeros(max_tokens, dtype=torch.long)
+
+        # Warm the fused-apply Triton kernel so first-call JIT cost
+        # happens before any captured forward pass. Without this, the
+        # initial CUDA-graph capture step could trigger a Triton compile
+        # and fail capture, and — as observed on a 3090 with
+        # gemma-3-4b-it — every served-window also pays ~18-25 ms of
+        # ``cuLibraryLoadData`` events for shape variants that only show
+        # up at runtime. Driving the warmup over every captured batch
+        # size eliminates those compiles from the served window.
+        if (
+            table_device is not None
+            and table_device.type == "cuda"
+            and table_dtype is not None
+            and hidden_size is not None
+        ):
+            from vllm.model_executor.layers.steering_kernel import (
+                warmup_apply_steering_kernel,
+            )
+
+            compute_dtype = getattr(self.vllm_config.model_config, "dtype", table_dtype)
+            compilation_config = getattr(self.vllm_config, "compilation_config", None)
+            capture_sizes = (
+                getattr(compilation_config, "cudagraph_capture_sizes", None)
+                if compilation_config is not None
+                else None
+            )
+            warmup_apply_steering_kernel(
+                hidden_size=hidden_size,
+                table_rows=steering_config.max_steering_configs + 3,
+                table_dtype=table_dtype,
+                compute_dtype=compute_dtype,
+                device=table_device,
+                capture_sizes=list(capture_sizes) if capture_sizes else None,
+            )
+
+    # -----------------------------------------------------------------------
+    # Steerable-layer discovery and vector-spec validation
+    # -----------------------------------------------------------------------
+
+    def _steerable_layers(self) -> dict:
+        """Return ``{layer_idx: module}`` for layers with steering buffers.
+
+        Works with any model runner that exposes ``get_model()``,
+        including the V2 runner.  Result is cached after first
+        successful discovery.
+
+        A layer is considered steerable if it has ``layer_idx`` and at
+        least one ``steering_table_*`` buffer for any hook point.
+        """
+        cache = self._steerable_layers_cache
+        if cache is not None:
+            return cache
+
+        if not hasattr(self, "get_model"):
+            return {}
+        layers: dict = {}
+        for mod in self.get_model().modules():
+            if not hasattr(mod, "layer_idx"):
+                continue
+            has_any_table = any(
+                hasattr(mod, attr) for attr in HOOK_POINT_TABLE_ATTR.values()
+            )
+            if has_any_table:
+                layers[mod.layer_idx] = mod
+
+        if layers:
+            self._steerable_layers_cache = layers
+
+        return layers
+
+    def _validate_vectors_spec(
+        self,
+        vectors_data: dict[str, dict[int, list[float]]],
+        steerable: dict,
+    ) -> set[int]:
+        """Validate hook-point / layer / vector combinations.
+
+        Returns the set of valid layer indices on this worker.
+        Raises ``SteeringVectorError`` on invalid hook points,
+        mismatched sizes, or non-finite values.
+        """
+        valid_indices: set[int] = set()
+        for hook_point_str, layer_vecs in vectors_data.items():
+            try:
+                hp_enum = SteeringHookPoint(hook_point_str)
+            except ValueError as exc:
+                raise SteeringVectorError(
+                    f"Invalid hook point: {hook_point_str!r}"
+                ) from exc
+            table_attr = HOOK_POINT_TABLE_ATTR[hp_enum]
+
+            for idx, vec_values in layer_vecs.items():
+                if idx not in steerable:
+                    continue
+                mod = steerable[idx]
+                if not hasattr(mod, table_attr):
+                    raise SteeringVectorError(
+                        f"Hook point {hook_point_str!r} not active on layer {idx}"
+                    )
+                buf = getattr(mod, table_attr)
+                expected_size = buf.shape[1]
+                if len(vec_values) != expected_size:
+                    raise SteeringVectorError(
+                        f"Layer {idx} ({hook_point_str}): expected "
+                        f"vector of size {expected_size}, "
+                        f"got {len(vec_values)}"
+                    )
+                if not all(math.isfinite(v) for v in vec_values):
+                    raise SteeringVectorError(
+                        f"Layer {idx} ({hook_point_str}): steering "
+                        f"vector contains non-finite values "
+                        f"(NaN or Infinity)"
+                    )
+                valid_indices.add(idx)
+        return valid_indices
+
+    def list_steerable_layers(self) -> dict[int, list[str]]:
+        """Return steerable layers on this worker with their hook points.
+
+        Returns ``{layer_idx: [hook_point_name, ...]}`` for every
+        layer owned by this worker that has at least one steering
+        table buffer registered. Hook-point names are sorted for
+        determinism.
+        """
+        result: dict[int, list[str]] = {}
+        for idx, mod in self._steerable_layers().items():
+            hooks = sorted(
+                hp.value
+                for hp, attr in HOOK_POINT_TABLE_ATTR.items()
+                if hasattr(mod, attr)
+            )
+            result[idx] = hooks
+        return result
+
+    def _notify_manager_vectors(
+        self,
+        vectors_data: dict[str, dict[int, list[float]]],
+        steerable: dict,
+        valid_indices: set[int],
+        phase: str,
+    ) -> None:
+        """Notify SteeringManager of global vector changes for a given
+        phase (``"base"``, ``"prefill"``, or ``"decode"``).
+
+        Converts the raw ``list[float]`` values from *vectors_data*
+        into tensors matching the layer buffer dtype/device, then passes
+        them to the manager.  This avoids reading from shared buffers,
+        which would silently use stale or overwritten data for
+        phase-specific tiers.
+        """
+        mgr = self._steering_manager
+        if mgr is None:
+            return
+        locally_owned = getattr(self, "_locally_owned_layers", None)
+        for hook_point_str, layer_vecs in vectors_data.items():
+            table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_point_str)]
+            for idx, vec_values in layer_vecs.items():
+                if idx not in valid_indices or idx not in steerable:
+                    continue
+                mod = steerable[idx]
+                if hasattr(mod, table_attr):
+                    buf = getattr(mod, table_attr)
+                    t = torch.tensor(vec_values, dtype=buf.dtype, device=buf.device)
+                    mgr.update_global_vectors(
+                        hook_point_str,
+                        idx,
+                        t,
+                        phase=phase,
+                        locally_owned_layers=locally_owned,
+                    )
+
+    # -----------------------------------------------------------------------
+    # Public steering API (mirrored by thin passthroughs on the worker)
+    # -----------------------------------------------------------------------
+
+    def set_steering_vectors(
+        self,
+        vectors: dict[str, dict[int, list[float]]] | None = None,
+        prefill_vectors: dict[str, dict[int, list[float]]] | None = None,
+        decode_vectors: dict[str, dict[int, list[float]]] | None = None,
+        replace: bool = False,
+        validate_only: bool = False,
+    ) -> tuple[int, int, list[int]]:
+        """Set activation steering vectors from plain Python data.
+
+        Supports three-tier steering:
+
+        - *vectors*: base vectors applied to both prefill and decode.
+          Notified to SteeringManager with ``phase="base"``.
+        - *prefill_vectors*: phase-specific vectors for prefill only.
+          Notified to SteeringManager with ``phase="prefill"``.
+        - *decode_vectors*: phase-specific vectors for decode only.
+          Notified to SteeringManager with ``phase="decode"``.
+
+        All vectors should already be in pre-scaled flat-list form
+        (the API router normalizes co-located scales before calling
+        this method).
+
+        When *replace* is ``True``, all existing vectors across all
+        tiers are cleared before applying.
+
+        When *validate_only* is ``True``, vectors are validated
+        without being applied.
+
+        Returns:
+            ``(tp_rank, pp_rank, sorted_valid_layers)``. The rank info
+            lets the router detect TP-divergence (a server-side
+            invariant violation — TP ranks within the same PP stage
+            must own identical layer sets). The sorted layer list is
+            the set of layer indices actually updated (or *would* be
+            updated when *validate_only*) on this worker. The router
+            unions these across workers.
+        """
+        tp_rank, pp_rank = _get_steering_ranks()
+        steerable = self._steerable_layers()
+        if not steerable:
+            return (tp_rank, pp_rank, [])
+
+        # Collect all tiers with data.
+        all_tiers: list[tuple[str, dict[str, dict[int, list[float]]]]] = []
+        if vectors:
+            all_tiers.append(("base", vectors))
+        if prefill_vectors:
+            all_tiers.append(("prefill", prefill_vectors))
+        if decode_vectors:
+            all_tiers.append(("decode", decode_vectors))
+
+        if not all_tiers:
+            if replace:
+                self.clear_steering_vectors()
+            return (tp_rank, pp_rank, [])
+
+        # Validate all tiers.
+        valid_indices: set[int] = set()
+        for _phase, tier_data in all_tiers:
+            valid_indices.update(self._validate_vectors_spec(tier_data, steerable))
+
+        if not valid_indices:
+            return (tp_rank, pp_rank, [])
+
+        if validate_only:
+            return (tp_rank, pp_rank, sorted(valid_indices))
+
+        # Clear if replacing.
+        if replace:
+            self.clear_steering_vectors()
+
+        # Notify manager with base vectors.
+        if vectors:
+            self._notify_manager_vectors(vectors, steerable, valid_indices, "base")
+
+        # Phase-specific vectors go only to the manager, not the shared
+        # buffers — writing them would overwrite base values and cause
+        # get_steering_status() to report the wrong tier.
+        if prefill_vectors:
+            self._notify_manager_vectors(
+                prefill_vectors, steerable, valid_indices, "prefill"
+            )
+
+        if decode_vectors:
+            self._notify_manager_vectors(
+                decode_vectors, steerable, valid_indices, "decode"
+            )
+
+        return (tp_rank, pp_rank, sorted(valid_indices))
+
+    def clear_steering_vectors(self) -> None:
+        """Clear all tiers (base, prefill, decode) in the SteeringManager."""
+        mgr = self._steering_manager
+        if mgr is not None:
+            mgr.clear_global_vectors()
+
+    def get_steering_status(self) -> dict:
+        """Return per-hook-point status for active layers.
+
+        Returns ``{layer_idx: {hook_point: {"norm": float,
+        "prefill_norm"?: float, "decode_norm"?: float}}}`` for
+        layers/hook-points that have a non-zero steering vector.
+        """
+        result: dict = {}
+        mgr = self._steering_manager
+        if mgr is None:
+            return result
+        for phase_name, phase_dict in [
+            ("base", mgr.global_base_vectors),
+            ("prefill", mgr.global_prefill_vectors),
+            ("decode", mgr.global_decode_vectors),
+        ]:
+            norm_key = "norm" if phase_name == "base" else f"{phase_name}_norm"
+            for hp_str, layer_vecs in phase_dict.items():
+                for layer_idx, vec in layer_vecs.items():
+                    norm = vec.norm().item()
+                    if norm > 0.0:
+                        if layer_idx not in result:
+                            result[layer_idx] = {}
+                        if hp_str not in result[layer_idx]:
+                            result[layer_idx][hp_str] = {}
+                        result[layer_idx][hp_str][norm_key] = round(norm, 6)
+        return result
+
+    # -----------------------------------------------------------------------
+    # Worker-side named steering module registry
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _module_payload_to_specs(
+        payload: dict,
+    ) -> tuple[
+        SteeringVectorSpec | None,
+        SteeringVectorSpec | None,
+        SteeringVectorSpec | None,
+    ]:
+        """Normalize a broadcast payload entry into three tier specs.
+
+        Layer keys may arrive as strings (when the payload round-tripped
+        through JSON) or ints (when it was constructed in-process).  We
+        coerce to int here so subsequent comparisons against the worker's
+        layer-owned set are consistent.
+        """
+
+        def _coerce(spec):
+            if spec is None:
+                return None
+            coerced: SteeringVectorSpec = {}
+            for hook, layer_dict in spec.items():
+                converted: dict[int, object] = {}
+                for layer_key, entry in layer_dict.items():
+                    converted[int(layer_key)] = entry
+                if converted:
+                    coerced[hook] = converted  # type: ignore[assignment]
+            return coerced or None
+
+        return (
+            _coerce(payload.get("vectors")),
+            _coerce(payload.get("prefill_vectors")),
+            _coerce(payload.get("decode_vectors")),
+        )
+
+    def register_steering_modules(
+        self,
+        modules: dict[str, dict],
+        replace: bool = False,
+    ) -> None:
+        """Worker-side handler for the named-module broadcast.
+
+        *modules* maps module name to a dict with optional ``vectors``,
+        ``prefill_vectors`` and ``decode_vectors`` (the same shape that
+        :class:`SteeringModuleRegistry.dump_for_broadcast` emits).  When
+        *replace* is ``True`` the worker's registry is cleared before the
+        new entries are stored — used during API-server startup to push
+        the initial registry state.
+
+        Mirrors the strict-capacity contract of the rest of the steering
+        runtime: requests referencing a name that has not yet been
+        broadcast raise loudly in :meth:`_resolve_request_steering`
+        rather than silently falling back to inline-only behaviour.
+        """
+        if replace:
+            # Releasing pre-materialized pins before clearing the
+            # registry preserves the refcount invariant: every pin taken
+            # by a previous register has a matching release.  Without
+            # this, a startup ``replace=True`` push that drops a name
+            # would leak the row until process exit.
+            for prior_name in list(self._steering_module_pinned_rows.keys()):
+                self.release_pre_materialized_steering_module(prior_name)
+            self._steering_module_registry.clear()
+            self._steering_module_resolved_cache.clear()
+        for name, payload in modules.items():
+            if not isinstance(payload, dict):
+                raise SteeringVectorError(
+                    f"Steering module '{name}' broadcast payload is not a dict"
+                )
+            # Re-registering an existing name replaces its vectors, which
+            # changes the (hash, phase) the named module resolves to.  Drop
+            # the stale pin first so the next pre-materialize call can
+            # install a fresh pin against the new hashes; without this
+            # the old row leaks until ``unregister_steering_modules``.
+            if name in self._steering_module_pinned_rows:
+                self.release_pre_materialized_steering_module(name)
+            specs = self._module_payload_to_specs(payload)
+            self._steering_module_registry[name] = specs
+            # Pre-resolve once at registration so the per-request hot path
+            # in ``_resolve_request_steering`` can skip the merge + resolve
+            # numpy work entirely when there are no inline overrides.
+            base_spec, prefill_spec, decode_spec = specs
+            self._steering_module_resolved_cache[name] = (
+                resolve_effective_vectors(base_spec, prefill_spec),
+                resolve_effective_vectors(base_spec, decode_spec),
+            )
+        if modules:
+            logger.debug(
+                "Worker received %d steering module(s) (replace=%s)",
+                len(modules),
+                replace,
+            )
+
+    def unregister_steering_modules(self, names: list[str]) -> None:
+        """Drop the listed names from the worker-side registry.
+
+        The pinned refcount the worker held via
+        :meth:`pre_materialize_steering_module` is released first so the
+        manager's row table can GC the row once the last in-flight
+        request that referenced it finishes.  Doing the release before
+        dropping the registry entry preserves the invariant that every
+        ``(hash, phase)`` pair the worker pinned has a matching release.
+        """
+        for name in names:
+            self.release_pre_materialized_steering_module(name)
+            self._steering_module_registry.pop(name, None)
+            self._steering_module_resolved_cache.pop(name, None)
+        if names:
+            logger.debug(
+                "Worker unregistered %d steering module(s)",
+                len(names),
+            )
+
+    def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
+        """Eagerly materialize a named module's rows on the manager.
+
+        Called by the API layer immediately after
+        ``register_steering_modules`` succeeds, so the ``(hash, phase)``
+        rows that requests carrying ``steering_module_ref=(name, 1.0)``
+        will resolve to are already populated by the time the first
+        such request arrives.  This eliminates the cold-path
+        ``register_config.materialize`` cost from the request's TTFT —
+        on gemma-3-4b-it/3090 in named_shared mode the first
+        request previously paid ~15 ms (almost all of it the
+        synchronous bf16 H2D upload of 34 layers × hidden_size in
+        :meth:`SteeringManager._stack_vectors_to_device`).
+
+        Refcount semantics:
+
+        * Each pre-materialize call adds ``+1`` to the manager's
+          refcount for every ``(hash, phase)`` it materializes — the
+          "pinned" reference.
+        * Each request that resolves to the same ``(hash, phase)`` adds
+          another ``+1`` via the existing per-request register path.
+        * Request completion drops by ``+1`` (existing release path).
+        * :meth:`release_pre_materialized_steering_module` (called by
+          ``unregister_steering_modules``) drops the pinned ``+1``,
+          allowing GC once the last in-flight request finishes.
+
+        Idempotent: a second call on the same name is a no-op (the
+        first pin remains, no extra refcount is added) so concurrent
+        register + first-request paths never double-pin.
+
+        Returns the list of ``(hash, phase)`` pairs pinned by this
+        call (empty if the manager is uninitialised, the module has no
+        resolved vectors, or the pin was already in place).  The return
+        value is consumed by the test surface — production callers
+        only care that the row is materialized.
+        """
+        mgr = self._steering_manager
+        if mgr is None:
+            return []
+        if self._steering_module_pinned_rows.get(name):
+            # Already pinned — preserve idempotency. The pin guarantees
+            # the row is still there even if every request that
+            # transiently bumped the refcount has finished.
+            return []
+        cached = self._steering_module_resolved_cache.get(name)
+        if cached is None:
+            return []
+        prefill_resolved, decode_resolved = cached
+        # The hash format MUST match the one a request carrying
+        # ``steering_module_ref=(name, 1.0)`` will compute (see
+        # :meth:`SamplingParams.prefill_steering_config_hash` and
+        # :func:`hash_steering_config`).  For a named-only request
+        # (no inline vectors), the request's
+        # ``effective_*_steering`` cached property returns ``None``
+        # — only ``module_ref`` enters the digest.  Pre-materialization
+        # mirrors that exactly: ``hash_steering_config(None,
+        # module_ref=(name, 1.0))``.  Requests carrying inline overrides
+        # produce a different (content-derived) hash and fall through to
+        # the existing lazy register path.  ``scale=1.0`` is the natural
+        # default and the only scale auto-promote ever issues.
+        module_ref = (name, 1.0)
+        pinned: list[tuple[int, str]] = []
+        locally_owned = self._locally_owned_layers
+        # Compute the named-only hash once; both phases share the same
+        # request hash because ``effective_prefill_steering`` and
+        # ``effective_decode_steering`` are both ``None`` for a named-
+        # only request.  The (hash, phase) tuple still distinguishes
+        # them because ``register_config`` keys on (hash, phase).
+        named_only_hash = hash_steering_config(None, module_ref=module_ref)
+        for phase, resolved in (
+            ("prefill", prefill_resolved),
+            ("decode", decode_resolved),
+        ):
+            if not resolved:
+                continue
+            mgr.register_config(
+                named_only_hash,
+                resolved,
+                phase=phase,
+                locally_owned_layers=locally_owned,
+            )
+            pinned.append((named_only_hash, phase))
+        self._steering_module_pinned_rows[name] = pinned
+        if pinned:
+            logger.debug(
+                "Pre-materialized steering module '%s' (%d phase(s))",
+                name,
+                len(pinned),
+            )
+        return pinned
+
+    def release_pre_materialized_steering_module(self, name: str) -> None:
+        """Release the pinned refcount taken by pre-materialization.
+
+        Drops one ``release_config`` per ``(hash, phase)`` pair that
+        :meth:`pre_materialize_steering_module` registered.  If
+        in-flight requests still reference the row their per-request
+        refcounts keep it alive; the row is GC'd by the existing
+        release path when the last request finishes.
+
+        Safe to call when no pin exists — used by
+        :meth:`unregister_steering_modules` so the unregister path
+        is a single uniform step regardless of whether
+        pre-materialization ran.
+        """
+        mgr = self._steering_manager
+        pinned = self._steering_module_pinned_rows.pop(name, None)
+        if pinned is None or mgr is None:
+            return
+        for config_hash, phase in pinned:
+            mgr.release_config(config_hash, phase)
+
+    def _resolve_request_steering(
+        self,
+        sp: SamplingParams,
+        phase: str,
+    ) -> dict[str, dict[int, list[float]]] | None:
+        """Resolve the effective steering for a request in the given *phase*.
+
+        Encapsulates the two cases:
+
+        - **Inline-only** (``sp.steering_module_ref`` is ``None``):
+          returns the existing ``effective_prefill_steering`` /
+          ``effective_decode_steering`` cached property — bit-for-bit
+          identical to today.
+        - **Named module (+ optional inline overrides)**: looks up the
+          named module in ``self._steering_module_registry``, applies
+          the request's module-level scale uniformly via
+          :func:`scale_steering_spec`, merges the result with any inline
+          tier specs via :func:`merge_steering_specs`, then collapses to
+          pre-scaled flat vectors via
+          :func:`resolve_effective_vectors`.  The merge order matches the
+          original server-side ``resolve_for_request`` so semantics are
+          preserved.
+
+        Raises :class:`RuntimeError` when the request references a name
+        that is missing from the worker's registry.  This matches the
+        strict-capacity contract elsewhere in the steering runtime —
+        silent fall-through to inline-only would change the request
+        payload after the scheduler has already committed to a hash.
+        """
+        if phase not in ("prefill", "decode"):
+            raise ValueError(f"phase must be 'prefill' or 'decode', got {phase!r}")
+
+        ref = sp.steering_module_ref
+        if ref is None:
+            return (
+                sp.effective_prefill_steering
+                if phase == "prefill"
+                else sp.effective_decode_steering
+            )
+
+        name, scale = ref
+        module_specs = self._steering_module_registry.get(name)
+        if module_specs is None:
+            available = sorted(self._steering_module_registry.keys())
+            raise RuntimeError(
+                f"Steering module '{name}' is not registered on this worker. "
+                f"Available: {available or 'none'}.  This indicates the "
+                "module-registry RPC has not been broadcast yet, or the "
+                "module was unregistered after the request was scheduled."
+            )
+
+        inline_phase_spec = (
+            sp.prefill_steering_vectors
+            if phase == "prefill"
+            else sp.decode_steering_vectors
+        )
+
+        # Fast path: no inline overrides on either tier.  Use the
+        # pre-resolved cache populated at registration time and skip the
+        # per-request merge + resolve numpy work.  Profiling on
+        # gemma-3-4b-it (3 active hooks) showed this path eliminates
+        # ~37 ms/generate of host-side stalls — see
+        # docs/features/sae_steering.md "Named-module fast path" for
+        # the decomposition.
+        if sp.steering_vectors is None and inline_phase_spec is None:
+            cached = self._steering_module_resolved_cache.get(name)
+            if cached is not None:
+                resolved = cached[0] if phase == "prefill" else cached[1]
+                if resolved is None:
+                    return None
+                if scale == 1.0:
+                    return resolved
+                # Scaled fast path: one numpy multiply per (hook, layer)
+                # array vs. the full merge_steering_specs +
+                # resolve_effective_vectors machinery.
+                return {
+                    hook: {layer: arr * scale for layer, arr in layer_dict.items()}
+                    for hook, layer_dict in resolved.items()
+                }
+
+        # Slow path: inline overrides force a per-request merge + resolve.
+        base_spec, prefill_spec, decode_spec = module_specs
+        scaled_base = scale_steering_spec(base_spec, scale)
+        phase_module_spec = (
+            scale_steering_spec(prefill_spec, scale)
+            if phase == "prefill"
+            else scale_steering_spec(decode_spec, scale)
+        )
+
+        merged_base = merge_steering_specs(scaled_base, sp.steering_vectors)
+        merged_phase = merge_steering_specs(phase_module_spec, inline_phase_spec)
+        return resolve_effective_vectors(merged_base, merged_phase)
+
+    # -----------------------------------------------------------------------
+    # Per-step buffer / index maintenance
+    # -----------------------------------------------------------------------
+
+    def _update_steering_buffers(self, scheduler_output: "SchedulerOutput") -> None:
+        """Update per-layer steering tables and the shared steering index.
+
+        Each step:
+        1. Populate each layer's per-hook steering_table from the manager
+        2. Build the steering_index mapping tokens to table rows
+
+        The ``SteeringManager`` is constructed eagerly during model
+        load by ``_init_steering_state``.  When steering is disabled
+        or no steerable layers exist, the manager is ``None`` and this
+        function short-circuits — model code (e.g. Gemma3) registers
+        per-layer steering_table buffers unconditionally so the forward
+        path stays branch-free.
+        """
+        if self._steering_manager is None or not self._steerable_layers_cache:
+            return
+
+        # Short-circuit when no steering state is actually active. The model
+        # runner allocates per-layer steering buffers (zero-initialized) and
+        # the forward path always calls apply_steering, but if no per-request
+        # configs are registered and no global vectors have been set, every
+        # gather hits the zero sentinel and adds nothing. There is nothing
+        # to populate.
+        #
+        # Correctness: when we previously had active steering and now don't
+        # (e.g., the last steered request just finished), the steering_index
+        # may still contain non-zero row references from the previous step.
+        # We must zero it before returning to ensure all gathers point to
+        # row 0. We only do this on the transition; in the steady "nothing
+        # ever active" case the index is already zero from initialization.
+        if (
+            not self._steering_manager.config_to_row
+            and not self._steering_manager.global_base_vectors
+            and not self._steering_manager.global_prefill_vectors
+            and not self._steering_manager.global_decode_vectors
+        ):
+            if self._steering_index_dirty:
+                any_layer = next(iter(self._steerable_layers_cache.values()))
+                steering_index = cast(torch.Tensor, any_layer.steering_index)
+                steering_index.zero_()
+                # Nothing-active transition: clear every per-layer
+                # ``_any_active`` flag so apply_steering short-circuits on
+                # this and subsequent steps.  Mirrors the index zero-out
+                # above — only paid on the active->inactive transition;
+                # steady-state inactive runs skip this branch entirely
+                # (``_steering_index_dirty`` stays False).
+                for mod in self._steerable_layers_cache.values():
+                    for hp in SteeringHookPoint:
+                        flag_buf = getattr(mod, HOOK_POINT_ANY_ACTIVE_ATTR[hp], None)
+                        if flag_buf is not None:
+                            flag_buf.zero_()
+                self._steering_index_dirty = False
+            return
+
+        # 1. Populate steering tables — but only if state has changed since
+        # the last populate. populate_steering_tables() clears the flag at
+        # the end, and every state mutator (register_config new-row,
+        # release_config refcount->0, update_global_vectors,
+        # clear_global_vectors) sets it. In steady-state decode steps
+        # where no config churn happens, this skips ~102 kernel launches
+        # per step.
+        if self._steering_manager._tables_dirty:
+            self._steering_manager.populate_steering_tables(
+                self._steerable_layers_cache
+            )
+
+        # 2. Build steering index
+        # Get the shared steering_index buffer (all layers share one tensor)
+        any_layer = next(iter(self._steerable_layers_cache.values()))
+        steering_index = cast(torch.Tensor, any_layer.steering_index)
+
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids
+
+        # Vectorized build: walk requests once to record each request's
+        # table row + token count into pre-allocated CPU int64 scratch
+        # buffers, then expand the row-per-request array into a
+        # row-per-token array via ``np.repeat`` and copy the whole
+        # thing to the GPU in a single non-blocking H2D.  Replaces
+        # ``num_reqs`` independent ``_set_item`` kernel launches per
+        # step with one ``copy_``.
+        rows_scratch = self._steering_rows_scratch
+        n_tokens_scratch = self._steering_n_tokens_scratch
+        index_pinned = self._steering_index_pinned
+        assert rows_scratch is not None
+        assert n_tokens_scratch is not None
+        assert index_pinned is not None
+
+        # Grow per-request scratches if the batch ever exceeds the
+        # initial sizing.  This is defensive — ``max_num_seqs`` should
+        # bound ``num_reqs`` — but cheap to handle.
+        if rows_scratch.shape[0] < num_reqs:
+            rows_scratch = np.zeros(num_reqs, dtype=np.int64)
+            n_tokens_scratch = np.zeros(num_reqs, dtype=np.int64)
+            self._steering_rows_scratch = rows_scratch
+            self._steering_n_tokens_scratch = n_tokens_scratch
+
+        active_count = 0
+        for i in range(num_reqs):
+            req_id = req_ids[i]
+            n_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if n_tokens == 0:
+                continue
+
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                # Request not in batch yet (shouldn't happen but guard).
+                # Row 0 is the no-steering sentinel.
+                rows_scratch[active_count] = 0
+                n_tokens_scratch[active_count] = n_tokens
+                active_count += 1
+                continue
+
+            # Determine phase from num_computed vs num_prompt
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+            is_prefilling = num_computed < num_prompt
+
+            if is_prefilling:
+                # Prefill: use prefill steering hash
+                prefill_hash = int(
+                    self.input_batch.request_prefill_steering_hash[req_index]
+                )
+                row = self._steering_manager.get_row_for_config(
+                    prefill_hash, is_prefill=True
+                )
+                rows_scratch[active_count] = row
+                n_tokens_scratch[active_count] = n_tokens
+
+                # Check if this request will transition to decode after
+                # this step's tokens are processed. Must happen in this
+                # same pass — the registration / refcount semantics are
+                # externally observable.
+                num_computed_after = num_computed + n_tokens
+                if num_computed_after >= num_prompt:
+                    self._handle_steering_transition(req_id, req_index, prefill_hash)
+            else:
+                # Decode: use decode steering hash
+                decode_hash = int(
+                    self.input_batch.request_decode_steering_hash[req_index]
+                )
+                row = self._steering_manager.get_row_for_config(
+                    decode_hash, is_prefill=False
+                )
+                rows_scratch[active_count] = row
+                n_tokens_scratch[active_count] = n_tokens
+
+            active_count += 1
+
+        # Single non-blocking H2D copy: expand per-request rows into
+        # the per-token row array (written into the pre-allocated
+        # pinned-memory scratch), then copy that prefix to the GPU
+        # in one shot.
+        if active_count > 0:
+            expanded = np.repeat(
+                rows_scratch[:active_count],
+                n_tokens_scratch[:active_count],
+            )
+            n_expanded = int(expanded.shape[0])
+            # Cap to the device buffer size; the scheduler enforces
+            # this bound but cap defensively to avoid out-of-range
+            # writes if upstream invariants ever drift.
+            n_expanded = min(n_expanded, index_pinned.shape[0], steering_index.shape[0])
+            # Stage in the pinned scratch so the copy is genuinely
+            # asynchronous on CUDA devices.
+            index_pinned[:n_expanded].copy_(torch.from_numpy(expanded[:n_expanded]))
+            steering_index[:n_expanded].copy_(
+                index_pinned[:n_expanded], non_blocking=True
+            )
+        else:
+            n_expanded = 0
+
+        # Zero out remaining positions so old tokens past the active
+        # prefix read row 0 (the no-steering sentinel).
+        if n_expanded < steering_index.shape[0]:
+            steering_index[n_expanded:].zero_()
+
+        # Mark the index as having non-zero row references this step. The
+        # no-active-state short-circuit on a future step will zero the index
+        # if needed when transitioning back to "nothing active".
+        self._steering_index_dirty = True
+
+    def _handle_steering_transition(
+        self,
+        req_id: str,
+        req_index: int,
+        prefill_hash: int,
+    ) -> None:
+        """Handle prefill->decode steering config transition.
+
+        Called when a request will complete prefill after this step.
+        Releases the prefill config and registers the decode config
+        so it is ready for the next step's table population.
+
+        Capacity for the decode row is reserved by the scheduler at
+        the same step the prefill is scheduled to complete (see the
+        ``will_complete`` branch in ``Scheduler._schedule_running``),
+        so ``register_config`` is expected to succeed.  If it raises,
+        that's a scheduler accounting bug and the exception
+        propagates.
+        """
+        mgr = self._steering_manager
+        assert mgr is not None, (
+            "_handle_steering_transition called without an initialised manager"
+        )
+        if prefill_hash != 0:
+            mgr.release_config(prefill_hash, "prefill")
+
+        decode_hash = int(self.input_batch.request_decode_steering_hash[req_index])
+        if decode_hash != 0:
+            req_state = self.requests.get(req_id)
+            if req_state is not None and req_state.sampling_params is not None:
+                sp = req_state.sampling_params
+                effective_decode = self._resolve_request_steering(sp, "decode")
+                if effective_decode:
+                    mgr.register_config(
+                        decode_hash,
+                        effective_decode,
+                        phase="decode",
+                        locally_owned_layers=self._locally_owned_layers,
+                    )
+
+        self._req_steering_phase[req_id] = "decode"
+
+    def _reset_steering_for_resumption(
+        self,
+        req_id: str,
+        req_state: "CachedRequestState",
+        new_num_computed_tokens: int,
+    ) -> None:
+        """Reset steering config registration when a request re-enters prefill.
+
+        Called when a preempted request is resumed with num_computed_tokens
+        reset. If the request had transitioned to decode before preemption,
+        its decode config is still registered and its phase is stale.
+        This helper releases the stale decode config and re-registers the
+        prefill config.  The scheduler reserves the prefill row when it
+        re-admits the resumed request, so ``register_config`` is expected
+        to succeed; a ``RuntimeError`` here indicates a scheduler bug and
+        propagates.
+        """
+        mgr = self._steering_manager
+        if mgr is None:
+            return
+        prev_phase = self._req_steering_phase.get(req_id)
+        if prev_phase != "decode":
+            return
+        if new_num_computed_tokens >= req_state.num_prompt_tokens:
+            return  # still in decode, nothing to reset
+
+        # Release the stale decode config.
+        if req_state.decode_steering_config_hash != 0:
+            mgr.release_config(req_state.decode_steering_config_hash, "decode")
+
+        self._req_steering_phase[req_id] = "prefill"
+
+        sp = req_state.sampling_params
+        prefill_hash = req_state.prefill_steering_config_hash
+        if prefill_hash == 0 or sp is None:
+            return
+        effective_prefill = self._resolve_request_steering(sp, "prefill")
+        if not effective_prefill:
+            return
+        mgr.register_config(
+            prefill_hash,
+            effective_prefill,
+            phase="prefill",
+            locally_owned_layers=self._locally_owned_layers,
+        )
+
+    # -----------------------------------------------------------------------
+    # Hooks called from _update_states() / _update_streaming_request()
+    # -----------------------------------------------------------------------
+
+    def _release_finished_steering_configs(
+        self, finished_req_ids: "set[str] | list[str]"
+    ) -> None:
+        """Release the currently-active steering config for finished requests.
+
+        Called before finished request state is popped so
+        ``prefill_steering_config_hash`` /
+        ``decode_steering_config_hash`` are still accessible.
+        """
+        mgr = self._steering_manager
+        if mgr is None:
+            return
+
+        for req_id in finished_req_ids:
+            phase = self._req_steering_phase.pop(req_id, None)
+            if phase is not None:
+                req_state = self.requests.get(req_id)
+                if req_state is not None:
+                    if phase == "prefill":
+                        h = req_state.prefill_steering_config_hash
+                    else:
+                        h = req_state.decode_steering_config_hash
+                    if h != 0:
+                        mgr.release_config(h, phase)
+
+    def _register_initial_steering_config(
+        self,
+        req_id: str,
+        new_req_data: "NewRequestData",
+        req_state: "CachedRequestState",
+    ) -> None:
+        """Register the initial-phase steering config for a new request.
+
+        Normally requests start in prefill, but a full prefix-cache hit
+        (``num_computed >= num_prompt``) puts a request directly into
+        decode.  The scheduler reserves the appropriate row at admission
+        time, so ``register_config`` is expected to succeed; a
+        ``RuntimeError`` here indicates a scheduler bug and propagates.
+        """
+        mgr = self._steering_manager
+        if mgr is None or new_req_data.sampling_params is None:
+            return
+
+        sp = new_req_data.sampling_params
+        if new_req_data.num_computed_tokens >= req_state.num_prompt_tokens:
+            # Already past prefill — register decode config.
+            effective_decode = self._resolve_request_steering(sp, "decode")
+            if new_req_data.decode_steering_config_hash != 0 and effective_decode:
+                mgr.register_config(
+                    new_req_data.decode_steering_config_hash,
+                    effective_decode,
+                    phase="decode",
+                    locally_owned_layers=self._locally_owned_layers,
+                )
+            self._req_steering_phase[req_id] = "decode"
+        else:
+            # Normal: start in prefill; decode registered
+            # on transition in _update_steering_buffers.
+            effective_prefill = self._resolve_request_steering(sp, "prefill")
+            if new_req_data.prefill_steering_config_hash != 0 and effective_prefill:
+                mgr.register_config(
+                    new_req_data.prefill_steering_config_hash,
+                    effective_prefill,
+                    phase="prefill",
+                    locally_owned_layers=self._locally_owned_layers,
+                )
+            self._req_steering_phase[req_id] = "prefill"
+
+    def _refresh_streaming_steering(
+        self,
+        req_id: str,
+        new_req_data: "NewRequestData",
+        old_prefill_hash: int,
+        old_decode_hash: int,
+        new_prefill_hash: int,
+        new_decode_hash: int,
+    ) -> None:
+        """Refresh steering state for a streaming re-added request.
+
+        Streaming re-adds go back through prefill, so we must:
+        1. Release the old config (whatever phase we were tracking)
+        2. Register the new prefill config
+        3. Update phase tracking
+
+        The scheduler reserves the prefill row when re-admitting the
+        streaming request, so ``register_config`` is expected to
+        succeed; a ``RuntimeError`` here indicates a scheduler bug and
+        propagates.
+        """
+        mgr = self._steering_manager
+        if mgr is None:
+            return
+
+        # Release the old phase config.
+        old_phase = self._req_steering_phase.get(req_id)
+        if old_phase is not None:
+            if old_phase == "prefill" and old_prefill_hash != 0:
+                mgr.release_config(old_prefill_hash, "prefill")
+            elif old_phase == "decode" and old_decode_hash != 0:
+                mgr.release_config(old_decode_hash, "decode")
+
+        # Register new prefill config (streaming re-adds start
+        # in prefill).
+        sp = new_req_data.sampling_params
+        effective_prefill = (
+            self._resolve_request_steering(sp, "prefill") if sp is not None else None
+        )
+        if new_prefill_hash != 0 and sp is not None and effective_prefill:
+            mgr.register_config(
+                new_prefill_hash,
+                effective_prefill,
+                phase="prefill",
+                locally_owned_layers=self._locally_owned_layers,
+            )
+            self._req_steering_phase[req_id] = "prefill"
+        elif new_prefill_hash == 0 and new_decode_hash == 0:
+            # No steering for this request anymore.
+            self._req_steering_phase.pop(req_id, None)
+        else:
+            # Has hashes but no effective prefill vectors (e.g.,
+            # decode-only steering).  Mark as prefill since the
+            # request re-enters prefill; transition to decode
+            # will handle decode registration.
+            self._req_steering_phase[req_id] = "prefill"

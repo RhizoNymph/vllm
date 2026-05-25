@@ -14,6 +14,10 @@ from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnota
 from pydantic import Field, PrivateAttr, model_serializer, model_validator
 
 from vllm.config import ModelConfig
+from vllm.config.steering_types import (
+    SteeringVectorSpecPacked,
+    unpack_steering_vectors,
+)
 from vllm.config.utils import replace
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -477,6 +481,38 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    # Per-request inline steering vectors in binary wire format.  Each entry
+    # is ``{dtype, shape, layer_indices, data: base64, scales?}`` — see
+    # ``vllm.config.steering_types.SteeringHookPacked``.  The packed form
+    # avoids the JSON parse + ``np.asarray(list_of_floats)`` overhead that
+    # dominates inline-request preprocessing on the API-server thread.
+    steering_vectors: SteeringVectorSpecPacked | None = Field(
+        default=None,
+        description="Per-request activation steering vectors keyed by hook "
+        "point name (pre_attn, post_attn, post_mlp). Each hook carries one "
+        "base64-encoded (num_layers, hidden_size) blob plus a sibling "
+        "layer_indices list (and optional per-row scales).",
+    )
+
+    prefill_steering_vectors: SteeringVectorSpecPacked | None = Field(
+        default=None,
+        description="Phase-specific steering vectors added to base during "
+        "prefill only. Same packed format as steering_vectors.",
+    )
+
+    decode_steering_vectors: SteeringVectorSpecPacked | None = Field(
+        default=None,
+        description="Phase-specific steering vectors added to base during "
+        "decode only. Same packed format as steering_vectors.",
+    )
+
+    steering_name: str | None = Field(
+        default=None,
+        description="Name of a pre-registered steering module. "
+        "When set, the named vectors are resolved and additively "
+        "composed with any inline steering vector fields.",
+    )
+
     # --8<-- [end:chat-completion-extra-params]
 
     @model_validator(mode="before")
@@ -692,6 +728,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
+            steering_vectors=unpack_steering_vectors(self.steering_vectors),
+            prefill_steering_vectors=unpack_steering_vectors(
+                self.prefill_steering_vectors
+            ),
+            decode_steering_vectors=unpack_steering_vectors(
+                self.decode_steering_vectors
+            ),
         )
         # Attach the capture dict (keyed by consumer name). The
         # entrypoint's ``_admit_capture`` mutates each value in place

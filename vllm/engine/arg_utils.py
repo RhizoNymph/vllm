@@ -57,6 +57,7 @@ from vllm.config import (
     ReasoningConfig,
     SchedulerConfig,
     SpeculativeConfig,
+    SteeringConfig,
     StructuredOutputsConfig,
     UVAOffloadConfig,
     VllmConfig,
@@ -589,6 +590,9 @@ class EngineArgs:
     enable_tower_connector_lora: bool = LoRAConfig.enable_tower_connector_lora
     specialize_active_lora: bool = LoRAConfig.specialize_active_lora
     enable_mixed_moe_lora_format: bool = LoRAConfig.enable_mixed_moe_lora_format
+    # Steering fields
+    enable_steering: bool = False
+    max_steering_configs: int = SteeringConfig.max_steering_configs
 
     # --capture-consumers is repeatable (action="append"); when unset the
     # whole capture-consumer pipeline stays disabled.
@@ -1332,6 +1336,22 @@ class EngineArgs:
             "parameter values.",
         )
 
+        # Steering related configs
+        steering_kwargs = get_kwargs(SteeringConfig)
+        steering_group = parser.add_argument_group(
+            title="SteeringConfig",
+            description=SteeringConfig.__doc__,
+        )
+        steering_group.add_argument(
+            "--enable-steering",
+            action=argparse.BooleanOptionalAction,
+            help="If True, enable per-request activation steering.",
+        )
+        steering_group.add_argument(
+            "--max-steering-configs",
+            **steering_kwargs["max_steering_configs"],
+        )
+
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
         observability_group = parser.add_argument_group(
@@ -2039,6 +2059,14 @@ class EngineArgs:
             target_parallel_config=parallel_config,
         )
 
+        steering_config = (
+            SteeringConfig(
+                max_steering_configs=self.max_steering_configs,
+            )
+            if self.enable_steering
+            else None
+        )
+
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context,
             model_config,
@@ -2284,6 +2312,7 @@ class EngineArgs:
             kernel_config=kernel_config,
             lora_config=lora_config,
             capture_consumers_config=capture_consumers_config,
+            steering_config=steering_config,
             speculative_config=speculative_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,

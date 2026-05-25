@@ -348,6 +348,36 @@ class OpenAIServingChat(OpenAIServing):
 
         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
 
+        # Named steering module: validate name exists, then pass a
+        # ``(name, scale)`` reference through to ``SamplingParams`` so
+        # the worker resolves against its broadcast registry instead of
+        # the server materializing the full vector spec into the
+        # multiprocessing payload (perf optimization, see PR 7 of
+        # the activation-steering plan).  Inline overrides ride along
+        # unmodified on ``request.steering_vectors`` etc.
+        steering_module_ref: tuple[str, float] | None = None
+        if request.steering_name is not None:
+            steering_registry = (
+                None
+                if raw_request is None
+                else getattr(raw_request.app.state, "steering_module_registry", None)
+            )
+            if steering_registry is None:
+                return self.create_error_response(
+                    "Named steering modules are not available. "
+                    "Ensure the server was started with steering enabled.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            if steering_registry.get(request.steering_name) is None:
+                return self.create_error_response(
+                    (
+                        f"Unknown steering module '{request.steering_name}'. "
+                        f"Available: {steering_registry.list_modules() or 'none'}"
+                    ),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            steering_module_ref = (request.steering_name, 1.0)
+
         model_name = self.models.model_name(lora_request)
 
         # Extract data_parallel_rank from header (router can inject it)
@@ -386,6 +416,12 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                # Attach the named-module reference (validated above).
+                # Worker resolves the (name, scale) tuple against its
+                # broadcast registry; we never serialize the resolved
+                # vectors over multiprocessing.
+                if steering_module_ref is not None:
+                    sampling_params.steering_module_ref = steering_module_ref
 
             # Per-request capture-consumer admission validation. Runs
             # AFTER sampling-params construction (we need the tokenized
