@@ -133,6 +133,8 @@ class GGUFModelLoader(BaseModelLoader):
             # Gemma3 models use "gemma3_text" in HuggingFace but
             # "gemma3" in GGUF architecture naming
             model_type = "gemma3"
+        if model_type == "gemma4_text":
+            model_type = "gemma4"
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
@@ -293,12 +295,17 @@ class GGUFModelLoader(BaseModelLoader):
             if hf_name.endswith((".weight", ".bias")):
                 base_name, suffix = hf_name.rsplit(".", 1)
             else:
-                base_name, suffix = hf_name, ""
+                # HF tensors whose name doesn't end in ".weight" / ".bias"
+                # (e.g. registered buffers like Gemma4's `layer_scalar`) are
+                # still stored in GGUF with a ".weight" suffix appended.
+                # Default to "weight" — without this the lookup produces a
+                # trailing-dot key (`...layer_output_scale.`) that silently
+                # never matches the actual GGUF tensor.
+                base_name, suffix = hf_name, "weight"
                 # Handle '_weight' suffix (Gemma3 naming: parameter ends with
                 # '_weight' instead of '.weight')
                 if base_name.endswith("_weight"):
                     base_name = base_name[:-7]  # Remove '_weight'
-                    suffix = "weight"
 
             gguf_name = None
             # Priority 1: Search vision/projector parameters for multimodal models
