@@ -317,6 +317,19 @@ class Request:
         self.__dict__.pop("decode_steering_config_hash", None)
 
     def get_skip_reading_prefix_cache(self) -> bool:
+        # Capture-bearing requests must skip prefix-cache reuse. A cache hit
+        # serves cached blocks without re-running the forward pass for those
+        # positions, so the hook taps that produce captured residuals never
+        # fire on the cached prefix and the capture admission validator
+        # rejects the spec. The cache itself is unaffected; other concurrent
+        # requests continue to benefit normally. Checked first because
+        # ``SamplingParams.skip_reading_prefix_cache`` is resolved during
+        # construction, before the OpenAI entrypoint attaches ``capture``.
+        if (
+            self.sampling_params is not None
+            and self.sampling_params.capture
+        ):
+            return True
         if (
             self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None

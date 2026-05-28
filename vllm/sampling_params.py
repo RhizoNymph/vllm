@@ -537,10 +537,19 @@ class SamplingParams(
         self._all_stop_token_ids.update(self.stop_token_ids)
 
         if self.skip_reading_prefix_cache is None:
-            # If prefix caching is enabled,
-            # the output of prompt logprobs may less than n_prompt_tokens,
-            # we need to skip reading cache at this request.
-            self.skip_reading_prefix_cache = self.prompt_logprobs is not None
+            # Disable prefix-cache reuse for this request when:
+            # - prompt_logprobs is requested: with caching the output of
+            #   prompt logprobs may be less than n_prompt_tokens
+            # - a per-request capture spec is attached: prefix-cache hits
+            #   skip the forward pass for the cached prefix, so the hook
+            #   taps that produce captured residuals never fire on those
+            #   positions and the capture admission validator rejects the
+            #   request. Disabling cache reuse for this request only is
+            #   the minimal fix; it does not invalidate the cache for
+            #   other concurrent requests, which still benefit normally.
+            self.skip_reading_prefix_cache = self.prompt_logprobs is not None or (
+                self.capture is not None and len(self.capture) > 0
+            )
 
     def _validate_capture(self) -> None:
         """Structural check on ``capture``.

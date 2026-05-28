@@ -199,7 +199,15 @@ class OpenAIServingCompletion(OpenAIServing):
                     param=f"capture.{name}",
                 )
 
-        sampling_params.capture = validated
+        # NOTE: We intentionally do NOT overwrite ``sampling_params.capture``
+        # with the validated ``CaptureSpec`` dict. ``CaptureSpec`` is not
+        # serializable across the engine IPC boundary (see
+        # ``vllm/v1/capture/types.py``), so the worker would receive a plain
+        # ``{hooks, positions}`` dict missing the consumer-specific fields
+        # (request_id, tag, ...) and re-validation would fail. Leaving the
+        # original raw dict in place lets the worker's own validator
+        # reconstruct the consumer request type cleanly.
+        del validated
         return None
 
     async def render_completion_request(
