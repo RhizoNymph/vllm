@@ -450,4 +450,18 @@ def validate_filesystem_request(
     return CaptureSpec(hooks=resolved_hooks, positions=resolved_positions)
 
 
-__all__: list[str] = ["validate_filesystem_request"]
+def slug_path_components(raw: FilesystemCaptureRequest) -> tuple[str, str]:
+    """Slug ``tag`` and ``request_id`` for filesystem path use.
+
+    Exposed alongside ``validate_filesystem_request`` so the consumer can
+    record the slugs at admission time (when the raw ``FilesystemCaptureRequest``
+    is still in hand) for later use at submit/finalize time, since the
+    framework's :class:`CaptureSpec` only carries ``hooks`` and ``positions``.
+    Raises :class:`CaptureValidationError` on invalid slugs.
+    """
+    tag_slug = _slug(raw.tag, field="capture.tag")
+    request_id_slug = _slug(raw.request_id, field="capture.request_id")
+    return tag_slug, request_id_slug
+
+
+__all__: list[str] = ["validate_filesystem_request", "slug_path_components"]

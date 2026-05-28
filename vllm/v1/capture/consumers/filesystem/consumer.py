@@ -96,6 +96,20 @@ class FilesystemConsumer:
         # components per CaptureKey for use at finalize time.
         self._lock = threading.Lock()
         self._key_paths: dict[CaptureKey, tuple[str, str]] = {}
+        # Slug components recorded at admission time, keyed by
+        # ``vllm_internal_request_id``. The framework's ``CaptureSpec``
+        # only carries ``(hooks, positions)``, so the per-request
+        # ``tag`` and ``request_id`` from the client's
+        # ``FilesystemCaptureRequest`` would otherwise be lost between
+        # ``validate_client_spec`` and ``submit_chunk``/``submit_finalize``.
+        # Looked up by ``str(_request_id)`` because ``CaptureKey``'s
+        # request-id component carries that string form.
+        self._request_slugs: dict[str, tuple[str, str]] = {}
+        # Total captured rows per key, accumulated across chunks. Used
+        # to write ``shape`` into the sidecar JSON at finalize time so
+        # readers can ``np.frombuffer`` the .bin without recomputing
+        # from filesize / hidden_size externally.
+        self._key_shapes: dict[CaptureKey, list[int]] = {}
         # Per writer-key events set by _on_write_result when a result
         # goes terminal. Keyed by writer-side (str, int, str) tuples.
         self._wait_lock = threading.Lock()
@@ -131,37 +145,87 @@ class FilesystemConsumer:
         # module load time — keeps the consumer importable in lightweight
         # test environments.
         from vllm.v1.capture.consumers.filesystem.validation import (
+            slug_path_components,
             validate_filesystem_request,
         )
 
-        return validate_filesystem_request(raw_spec, self._vllm_config, ctx)
+        spec = validate_filesystem_request(raw_spec, self._vllm_config, ctx)
+        # Record the slugs keyed by vllm_internal_request_id. The
+        # ``CaptureSpec`` we return only carries hooks+positions; we
+        # need the tag/request_id again at submit time to build the
+        # correct on-disk path. Slugging happens here (admission) so
+        # invalid slugs surface as a HTTP 400 rather than silently
+        # falling through to ``"default"``.
+        tag_slug, request_id_slug = slug_path_components(raw_spec)
+        with self._lock:
+            self._request_slugs[str(ctx.vllm_internal_request_id)] = (
+                tag_slug,
+                request_id_slug,
+            )
+        return spec
 
     def submit_chunk(self, chunk: CaptureChunk) -> None:
         """Convert a ``CaptureChunk`` to bytes and submit a ``WriteTask``."""
         key = chunk.key
         _request_id, layer_idx, hook_name = key
 
-        # Compute path: {root}/{tag}/{request_id}/{layer}_{hook}.bin
-        # We need tag and request_id slugs. The CaptureKey only has the
-        # vllm_internal_request_id. For the filesystem layout we use
-        # the key components directly — the request_id in the key IS the
-        # vllm internal id, and we use it as the directory name.
-        # The tag comes from the metadata on the first chunk, or we
-        # fall back to "default".
-        tag_slug = chunk.metadata.get("tag_slug", "default")
-        request_id_slug = chunk.metadata.get("request_id_slug", str(_request_id))
+        # Compute path: {root}/{tag}/{request_id}/{layer}_{hook}.bin.
+        # Slug priority (highest to lowest):
+        #   1. ``chunk.metadata["tag_slug" / "request_id_slug"]`` — allows
+        #      the framework / manager to inject per-chunk overrides.
+        #   2. ``self._request_slugs[str(_request_id)]`` — slugs recorded
+        #      at admission from the client's
+        #      ``FilesystemCaptureRequest.tag`` / ``request_id``. This is
+        #      the normal per-request path.
+        #   3. ``("default", str(_request_id))`` — final fallback when
+        #      neither source supplied slugs (e.g., a global capture spec
+        #      that never went through ``validate_client_spec``).
+        with self._lock:
+            recorded = self._request_slugs.get(str(_request_id))
+        fallback_tag, fallback_req = recorded or ("default", str(_request_id))
+        tag_slug = chunk.metadata.get("tag_slug", fallback_tag)
+        request_id_slug = chunk.metadata.get("request_id_slug", fallback_req)
 
-        # Cache the slug paths for use at finalize time.
+        # Cache the slug paths for use at finalize time, and accumulate
+        # the captured-row count so the finalize sidecar can carry an
+        # accurate ``shape``.
+        tensor_shape = tuple(chunk.tensor.shape)
         with self._lock:
             if key not in self._key_paths:
                 self._key_paths[key] = (tag_slug, request_id_slug)
+            existing = self._key_shapes.get(key)
+            if existing is None:
+                # tensor_shape is (num_rows, hidden_size); start the
+                # accumulator at that shape.
+                self._key_shapes[key] = [tensor_shape[0], tensor_shape[1]]
+            else:
+                existing[0] += tensor_shape[0]
+                # Sanity: hidden size must not change across chunks.
+                if tensor_shape[1] != existing[1]:
+                    logger.warning(
+                        "hidden-size mismatch across chunks for key=%s: "
+                        "expected %d, got %d",
+                        key,
+                        existing[1],
+                        tensor_shape[1],
+                    )
 
         bin_path = (
             self._root / tag_slug / request_id_slug / f"{layer_idx}_{hook_name}.bin"
         )
 
         # Convert tensor to bytes (tensor is already on CPU).
-        tensor_bytes = chunk.tensor.numpy().tobytes()
+        # NOTE: ``torch.Tensor.numpy()`` does not support bf16 (numpy has no
+        # native bf16 dtype). The on-disk .bin format spec is "raw bytes in
+        # the model's residual dtype; bf16 stored as raw uint16 bytes" (see
+        # the capture_consumers user guide), so we view bf16 as uint16
+        # before going through numpy. Other dtypes pass through unchanged.
+        import torch as _torch
+
+        _tensor = chunk.tensor
+        if _tensor.dtype == _torch.bfloat16:
+            _tensor = _tensor.view(_torch.uint16)
+        tensor_bytes = _tensor.numpy().tobytes()
 
         writer_key = (str(_request_id), layer_idx, hook_name)
         self._writer.submit(
@@ -181,11 +245,19 @@ class FilesystemConsumer:
         # Retrieve cached path slugs.
         with self._lock:
             path_info = self._key_paths.pop(key, None)
+            shape_info = self._key_shapes.pop(key, None)
 
-        tag_slug = "default"
-        request_id_slug = str(_request_id)
+        # Fallback slug from admission-time recording, if submit_chunk
+        # was never called for this key (e.g., zero captured rows).
+        with self._lock:
+            recorded = self._request_slugs.get(str(_request_id))
+
         if path_info is not None:
             tag_slug, request_id_slug = path_info
+        elif recorded is not None:
+            tag_slug, request_id_slug = recorded
+        else:
+            tag_slug, request_id_slug = "default", str(_request_id)
 
         # Also check the finalize sidecar for slug overrides.
         tag_slug = finalize.sidecar.get("tag_slug", tag_slug)
@@ -203,6 +275,12 @@ class FilesystemConsumer:
             "hook": hook_name,
         }
         sidecar_payload.update(finalize.sidecar)
+        # Carry the captured tensor shape into the sidecar so readers
+        # can ``np.frombuffer`` the .bin without recomputing the layout
+        # from filesize / hidden_size externally. Falls back gracefully
+        # if submit_chunk never fired for this key.
+        if shape_info is not None:
+            sidecar_payload["shape"] = list(shape_info)
 
         writer_key = (str(_request_id), layer_idx, hook_name)
         self._writer.submit(
