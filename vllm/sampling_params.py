@@ -350,6 +350,17 @@ class SamplingParams(
 
     Not client-settable; ignore any value supplied at construction."""
 
+    capture_min_prompt_position: int | None = None
+    """Lowest prompt position this request's capture taps, or ``None``.
+
+    Set by ``_admit_capture`` alongside ``capture_touches_prompt`` when the
+    latter is ``True``. Prefix-cache reuse is clamped to this position so
+    it (and every later position) is re-forwarded and its residual can be
+    captured; positions strictly below it may still be served from cache.
+    See :meth:`vllm.v1.request.Request.get_capture_prefix_cache_limit`.
+    ``None`` when no capture clamp applies (no capture, generated-only, or
+    unclassified). Not client-settable."""
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can

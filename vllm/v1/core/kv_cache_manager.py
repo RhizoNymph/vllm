@@ -217,6 +217,16 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+
+        # A prompt-touching capture request caps the hit at its lowest
+        # captured prompt position so that position (and everything after) is
+        # re-forwarded and its residual can be captured; lower positions still
+        # reuse the cache. find_longest_cache_hit() block-aligns the cap down,
+        # so the request stays block-size aligned. None means no clamp.
+        capture_limit = request.get_capture_prefix_cache_limit()
+        if capture_limit is not None:
+            max_cache_hit_length = min(max_cache_hit_length, capture_limit)
+
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length

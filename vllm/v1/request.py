@@ -256,20 +256,28 @@ class Request:
         return self.num_encoder_inputs > 0
 
     def get_skip_reading_prefix_cache(self) -> bool:
-        # Capture-bearing requests skip prefix-cache reuse only when the
-        # capture actually taps a prompt position. A cache hit serves cached
-        # blocks without re-running the forward pass for those positions, so
-        # the hook taps that produce captured residuals never fire on the
-        # cached prefix. That conflict exists only for prompt-range positions;
-        # a capture of generated-only positions is unaffected and keeps prefix
-        # caching. ``capture_touches_prompt`` carries the classification from
-        # admission (``_admit_capture``); ``None`` means it could not be
-        # classified (e.g. the offline ``LLM`` path) and is treated
-        # conservatively as prompt-touching. Checked before the explicit
+        # A capture-bearing request whose classification is unknown skips
+        # prefix-cache reuse entirely. A cache hit serves cached blocks
+        # without re-running the forward pass, so the hook taps that produce
+        # captured residuals never fire on the cached prefix. ``None`` means
+        # the capture could not be classified at admission (e.g. the offline
+        # ``LLM`` path does not resolve specs there), so we cannot know which
+        # positions are tapped and must conservatively skip reuse.
+        #
+        # Classified capture requests fall through to the normal resolution
+        # below: generated-only captures (``capture_touches_prompt`` False)
+        # keep full prefix caching, and prompt-touching captures
+        # (``capture_touches_prompt`` True) reuse the cache up to
+        # ``get_capture_prefix_cache_limit`` and re-forward the rest rather
+        # than skipping reuse wholesale. Checked before the explicit
         # ``skip_reading_prefix_cache`` value because the latter is resolved
         # during construction, before the entrypoint attaches ``capture``.
-        if self.sampling_params is not None and self.sampling_params.capture:
-            return self.sampling_params.capture_touches_prompt is not False
+        if (
+            self.sampling_params is not None
+            and self.sampling_params.capture
+            and self.sampling_params.capture_touches_prompt is None
+        ):
+            return True
         if (
             self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None
@@ -281,6 +289,24 @@ class Request:
         ):
             return self.pooling_params.skip_reading_prefix_cache
         return False
+
+    def get_capture_prefix_cache_limit(self) -> int | None:
+        """Upper bound on prefix-cache hit length imposed by capture.
+
+        A prompt-touching capture must re-forward from its lowest captured
+        prompt position so that position's residual is produced; positions
+        strictly below it may still be served from cache. Returns that floor
+        as a cap on the cache-hit length, or ``None`` when no capture clamp
+        applies (no capture, generated-only, or unclassified — the
+        unclassified case is instead handled by
+        :meth:`get_skip_reading_prefix_cache` skipping reuse entirely).
+        """
+        sp = self.sampling_params
+        if sp is None or not sp.capture:
+            return None
+        if sp.capture_touches_prompt is not True:
+            return None
+        return sp.capture_min_prompt_position
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)

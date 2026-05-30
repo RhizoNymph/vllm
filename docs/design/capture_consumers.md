@@ -631,22 +631,32 @@ The fix is staged in three layers, B → C → A:
   `_admit_capture` (chat + completion serving) computes this once the
   consumer specs are resolved and records it on
   `SamplingParams.capture_touches_prompt`
-  (`True`/`False`/`None`-unclassified). `Request.get_skip_reading_prefix_cache`
-  skips prefix-cache reuse only when that flag is not `False`. Result:
-  generated-only captures on the served path keep full prefix caching;
-  prompt-touching captures still skip it. The offline `LLM` path does not
-  resolve specs at admission, so it leaves the flag `None` and stays
-  conservatively disabled (correct, not optimized) until C.
+  (`True`/`False`/`None`-unclassified) — see also C, which records the
+  re-forward floor alongside it. `Request.get_skip_reading_prefix_cache`
+  skips prefix-cache reuse entirely only when the flag is `None`
+  (unclassified). Generated-only captures keep full prefix caching;
+  prompt-touching captures fall through to C's clamp rather than skipping
+  wholesale. The offline `LLM` path does not resolve specs at admission,
+  so it leaves the flag `None` and stays conservatively disabled
+  (correct, not optimized).
 
-- **C — schedule-time hit clamp (planned).** Move the decision below the
-  API/offline split, into KV-cache-hit computation. Let prefix matching
-  run, then clamp the accepted hit down to the block boundary at or below
-  the lowest captured prompt position, re-forwarding only that tail (its
-  residuals materialize; the earlier prefix stays cached). This recovers
-  partial-prompt captures and the offline path uniformly. Open question:
-  the scheduler runs in the engine core while the resolved `CaptureSpec`
-  is reconstructed in the worker, so a compact summary (e.g. the minimum
-  captured prompt position) must reach the clamp point.
+- **C — schedule-time hit clamp (implemented).** Rather than skipping
+  reuse for a prompt-touching capture, clamp it. `_admit_capture` records
+  the request-wide re-forward floor — the lowest captured prompt position
+  across consumers, via `min_captured_prompt_position` — on
+  `SamplingParams.capture_min_prompt_position`, which travels to the
+  engine core on the sampling params. `Request.get_capture_prefix_cache_limit`
+  surfaces it, and `KVCacheManager.get_computed_blocks` caps
+  `max_cache_hit_length` at that floor before calling
+  `find_longest_cache_hit` (which block-aligns the cap down, so the
+  request stays block-size aligned). The prefix below the floor is reused
+  from cache; the floor and everything after are re-forwarded so their
+  residuals can be captured. A floor of `0` (`all_prompt`/`all`) clamps to
+  no reuse; `last_prompt` clamps to almost the whole prompt. This is still
+  API-path for its *data*: the floor is computed at admission, so the
+  offline `LLM` path (no resolved specs at admission) keeps B's
+  conservative skip. Offline-path clamping would require resolving specs
+  in the offline path — a later extension.
 
 - **A — activation store (planned).** With steering off, a pristine
   residual is a pure function of the prefix token ids, so it is
@@ -715,10 +725,14 @@ worth tightening:
   end-to-end.
 - `tests/v1/capture/test_sampling_params.py` — structural
   validation on `SamplingParams.capture`.
-- `tests/v1/capture/test_prefix_cache_gating.py` — the B-layer
-  `spec_touches_prompt` classifier, relaxed `SamplingParams`
-  construction, and the `Request.get_skip_reading_prefix_cache` gate.
-  `tests/entrypoints/openai/test_capture_protocol.py` covers
-  `_admit_capture` setting `capture_touches_prompt`.
+- `tests/v1/capture/test_prefix_cache_gating.py` — the B/C
+  `spec_touches_prompt` / `min_captured_prompt_position` classifiers,
+  relaxed `SamplingParams` construction, and the
+  `Request.get_skip_reading_prefix_cache` / `get_capture_prefix_cache_limit`
+  accessors. `tests/entrypoints/openai/test_capture_protocol.py` covers
+  `_admit_capture` setting `capture_touches_prompt` and
+  `capture_min_prompt_position`.
+- `tests/v1/core/test_prefix_caching.py::test_capture_clamps_prefix_cache_hit`
+  — the C clamp end-to-end in `KVCacheManager.get_computed_blocks`.
 - `tests/engine/test_arg_utils.py::TestCaptureConsumersFlag` —
   CLI-flag parsing.

@@ -55,7 +55,7 @@ from vllm.v1.capture import (
     CaptureConsumer,
     CaptureContext,
     CaptureValidationError,
-    spec_touches_prompt,
+    min_captured_prompt_position,
 )
 from vllm.v1.capture import registry as capture_registry
 
@@ -200,15 +200,29 @@ class OpenAIServingCompletion(OpenAIServing):
                     param=f"capture.{name}",
                 )
 
-        # Classify whether any consumer taps a prompt-range position. This is
-        # the only point on the served path where the resolved positions
-        # exist (the worker re-validates from the raw dict, but only after
-        # scheduling). The result drives prefix-cache reuse in
-        # ``Request.get_skip_reading_prefix_cache``: generated-only captures
-        # keep prefix caching, prompt-touching captures skip it.
-        sampling_params.capture_touches_prompt = any(
-            spec_touches_prompt(spec, num_prompt_tokens) for spec in validated.values()
-        )
+        # Classify the capture against the prompt range. The resolved
+        # positions exist only here on the served path (the worker
+        # re-validates from the raw dict, but only after scheduling). Take
+        # the lowest prompt position any consumer taps; that request-wide
+        # floor drives prefix-cache reuse in
+        # ``Request.get_skip_reading_prefix_cache`` /
+        # ``get_capture_prefix_cache_limit``: generated-only captures keep
+        # full prefix caching, prompt-touching captures reuse the cache only
+        # up to the floor and re-forward from there.
+        floors = [
+            pos
+            for pos in (
+                min_captured_prompt_position(spec, num_prompt_tokens)
+                for spec in validated.values()
+            )
+            if pos is not None
+        ]
+        if floors:
+            sampling_params.capture_touches_prompt = True
+            sampling_params.capture_min_prompt_position = min(floors)
+        else:
+            sampling_params.capture_touches_prompt = False
+            sampling_params.capture_min_prompt_position = None
 
         # NOTE: We intentionally do NOT overwrite ``sampling_params.capture``
         # with the validated ``CaptureSpec`` dict. ``CaptureSpec`` is not

@@ -329,6 +329,57 @@ def test_prefill(hash_fn):
     )
 
 
+def test_capture_clamps_prefix_cache_hit():
+    """A prompt-touching capture clamps the prefix-cache hit to its floor.
+
+    The hit must stop at the block boundary at or below the lowest captured
+    prompt position so that position (and everything after) is re-forwarded
+    and its residual can be captured. Generated-only captures are unclamped.
+    """
+    block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config(block_size, 11),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    # Populate the cache with 3 full common blocks (48 tokens) + a partial.
+    common_token_ids = [i for i in range(3) for _ in range(block_size)]
+    tail = [9] * 5
+    req0 = make_request("0", common_token_ids + tail, block_size, sha256)
+    computed, n0 = manager.get_computed_blocks(req0)
+    assert n0 == 0
+    manager.allocate_slots(req0, len(common_token_ids) + len(tail), 0, computed)
+
+    def _capture_request(req_id: str, touches_prompt, floor):
+        req = make_request(req_id, common_token_ids + tail, block_size, sha256)
+        req.sampling_params.capture = {"c": {}}
+        req.sampling_params.capture_touches_prompt = touches_prompt
+        req.sampling_params.capture_min_prompt_position = floor
+        # In production these are set before Request construction, so the
+        # cached skip flag already reflects them; recompute it here since we
+        # mutated after construction.
+        req.skip_reading_prefix_cache = req.get_skip_reading_prefix_cache()
+        return req
+
+    # Floor at token 20 -> hit clamped to the block boundary below it (16).
+    _, n_clamped = manager.get_computed_blocks(_capture_request("clamp", True, 20))
+    assert n_clamped == block_size
+
+    # Generated-only capture -> no clamp -> full 3-block hit.
+    _, n_full = manager.get_computed_blocks(_capture_request("generated", False, None))
+    assert n_full == 3 * block_size
+
+    # Floor at 0 (e.g. all_prompt) -> no reusable prefix at all.
+    _, n_zero = manager.get_computed_blocks(_capture_request("all", True, 0))
+    assert n_zero == 0
+
+    # Unclassified (offline path) -> skip reuse entirely via the skip flag.
+    _, n_offline = manager.get_computed_blocks(_capture_request("offline", None, None))
+    assert n_offline == 0
+
+
 def test_prefill_hybrid_model():
     block_size = 16
     manager = KVCacheManager(

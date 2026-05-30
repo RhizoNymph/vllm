@@ -16,7 +16,11 @@ from __future__ import annotations
 import pytest
 
 from vllm.sampling_params import SamplingParams
-from vllm.v1.capture import CaptureSpec, spec_touches_prompt
+from vllm.v1.capture import (
+    CaptureSpec,
+    min_captured_prompt_position,
+    spec_touches_prompt,
+)
 from vllm.v1.request import Request
 
 
@@ -87,26 +91,74 @@ class TestSamplingParamsConstruction:
 class TestRequestGate:
     """``Request.get_skip_reading_prefix_cache`` consults the classification."""
 
-    def test_prompt_touching_skips(self) -> None:
+    def test_prompt_touching_does_not_skip_but_clamps(self) -> None:
+        # Under C, a prompt-touching capture no longer skips reuse wholesale;
+        # it reuses the cache up to the clamp and re-forwards the rest.
         sp = SamplingParams(capture={"logging": {}})
         sp.capture_touches_prompt = True
-        assert _request(sp).get_skip_reading_prefix_cache() is True
+        sp.capture_min_prompt_position = 2
+        req = _request(sp)
+        assert req.get_skip_reading_prefix_cache() is False
+        assert req.get_capture_prefix_cache_limit() == 2
 
     def test_generated_only_keeps_cache(self) -> None:
         sp = SamplingParams(capture={"logging": {}})
         sp.capture_touches_prompt = False
-        assert _request(sp).get_skip_reading_prefix_cache() is False
+        req = _request(sp)
+        assert req.get_skip_reading_prefix_cache() is False
+        assert req.get_capture_prefix_cache_limit() is None
 
     def test_unclassified_is_conservative(self) -> None:
-        # The offline ``LLM`` path leaves this ``None`` -> skip (safe).
+        # The offline ``LLM`` path leaves this ``None`` -> skip (safe), and
+        # there is no clamp to apply since the positions are unknown.
         sp = SamplingParams(capture={"logging": {}})
         assert sp.capture_touches_prompt is None
-        assert _request(sp).get_skip_reading_prefix_cache() is True
+        req = _request(sp)
+        assert req.get_skip_reading_prefix_cache() is True
+        assert req.get_capture_prefix_cache_limit() is None
 
     def test_no_capture_defaults_false(self) -> None:
         sp = SamplingParams()
-        assert _request(sp).get_skip_reading_prefix_cache() is False
+        req = _request(sp)
+        assert req.get_skip_reading_prefix_cache() is False
+        assert req.get_capture_prefix_cache_limit() is None
 
     def test_no_capture_explicit_skip_true(self) -> None:
         sp = SamplingParams(skip_reading_prefix_cache=True)
         assert _request(sp).get_skip_reading_prefix_cache() is True
+
+    def test_prompt_touching_with_prompt_logprobs_still_skips(self) -> None:
+        # prompt_logprobs forces a full-prompt forward, which subsumes the
+        # clamp; the request skips reuse entirely.
+        sp = SamplingParams(capture={"logging": {}}, prompt_logprobs=1)
+        sp.capture_touches_prompt = True
+        sp.capture_min_prompt_position = 2
+        assert _request(sp).get_skip_reading_prefix_cache() is True
+
+
+class TestMinCapturedPromptPosition:
+    """``min_captured_prompt_position`` returns the re-forward floor."""
+
+    def test_all_generated_is_none(self) -> None:
+        assert min_captured_prompt_position(_spec("all_generated"), 10) is None
+
+    def test_all_floor_is_zero(self) -> None:
+        assert min_captured_prompt_position(_spec("all"), 10) == 0
+
+    def test_all_prompt_floor_is_zero(self) -> None:
+        assert min_captured_prompt_position(_spec("all_prompt"), 10) == 0
+
+    def test_last_prompt_floor_is_last_index(self) -> None:
+        assert min_captured_prompt_position(_spec("last_prompt"), 10) == 9
+
+    def test_last_prompt_empty_prompt_is_none(self) -> None:
+        assert min_captured_prompt_position(_spec("last_prompt"), 0) is None
+
+    def test_explicit_takes_min_prompt_index(self) -> None:
+        assert min_captured_prompt_position(_spec([7, 3, 12]), 10) == 3
+
+    def test_explicit_all_generated_is_none(self) -> None:
+        assert min_captured_prompt_position(_spec([10, 11]), 10) is None
+
+    def test_unknown_symbol_is_conservative_zero(self) -> None:
+        assert min_captured_prompt_position(_spec("bogus"), 10) == 0

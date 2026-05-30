@@ -488,14 +488,13 @@ class TestAdmitCaptureValidation:
         assert ctx.tensor_parallel_size == 1
         assert ctx.pipeline_parallel_size == 1
 
-    def test_sets_capture_touches_prompt_true_for_prompt_spec(
-        self, monkeypatch
-    ) -> None:
-        """A prompt-tapping spec marks the request to skip prefix-cache reuse.
+    def test_sets_capture_floor_for_prompt_spec(self, monkeypatch) -> None:
+        """A prompt-tapping spec records the re-forward floor.
 
-        ``_FakeConsumerAccepts`` resolves to ``positions="last_prompt"``,
-        which taps a prompt position, so admission must classify the
-        request as prompt-touching.
+        ``_FakeConsumerAccepts`` resolves to ``positions="last_prompt"``
+        and the stub prompt length is 8, so the lowest captured prompt
+        position is 7. Admission classifies the request as prompt-touching
+        and records that floor to clamp prefix-cache reuse.
         """
         from vllm.sampling_params import SamplingParams
 
@@ -514,6 +513,7 @@ class TestAdmitCaptureValidation:
         )
         assert result is None
         assert sp.capture_touches_prompt is True
+        assert sp.capture_min_prompt_position == 7
 
     def test_sets_capture_touches_prompt_false_for_generated_spec(
         self, monkeypatch
@@ -543,3 +543,4 @@ class TestAdmitCaptureValidation:
         )
         assert result is None
         assert sp.capture_touches_prompt is False
+        assert sp.capture_min_prompt_position is None
