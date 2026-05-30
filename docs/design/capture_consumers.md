@@ -609,6 +609,58 @@ Writer details (`writer.py`):
     only `consumer_index` plus whatever the consumer put in its
     own `client_specs`/admission path.
 
+## Prefix-Cache Interaction
+
+A capture tap reads the residual stream at a `(layer, hook)` point for a
+token position. That residual exists only if the position is forwarded
+through the model. Prefix caching reuses the **KV** of a matched prefix
+and skips the forward pass for those positions, so a tap on a cached
+prompt position never fires — the activation simply does not exist. The
+conflict is therefore **per-position**: it arises only when a capture
+taps a position that a prefix-cache hit would serve from cache.
+
+The fix is staged in three layers, B → C → A:
+
+- **B — admission class gate (implemented).** A capture only conflicts
+  when it taps a *prompt-range* position. `spec_touches_prompt`
+  (`vllm/v1/capture/types.py`) classifies a resolved `CaptureSpec`
+  against `num_prompt_tokens`: `"all_generated"` and explicit lists
+  entirely `>= num_prompt_tokens` are generated-only and never conflict;
+  `"all"`, unresolved `"all_prompt"`/`"last_prompt"`, and any
+  prompt-range index are prompt-touching. The OpenAI entrypoint's
+  `_admit_capture` (chat + completion serving) computes this once the
+  consumer specs are resolved and records it on
+  `SamplingParams.capture_touches_prompt`
+  (`True`/`False`/`None`-unclassified). `Request.get_skip_reading_prefix_cache`
+  skips prefix-cache reuse only when that flag is not `False`. Result:
+  generated-only captures on the served path keep full prefix caching;
+  prompt-touching captures still skip it. The offline `LLM` path does not
+  resolve specs at admission, so it leaves the flag `None` and stays
+  conservatively disabled (correct, not optimized) until C.
+
+- **C — schedule-time hit clamp (planned).** Move the decision below the
+  API/offline split, into KV-cache-hit computation. Let prefix matching
+  run, then clamp the accepted hit down to the block boundary at or below
+  the lowest captured prompt position, re-forwarding only that tail (its
+  residuals materialize; the earlier prefix stays cached). This recovers
+  partial-prompt captures and the offline path uniformly. Open question:
+  the scheduler runs in the engine core while the resolved `CaptureSpec`
+  is reconstructed in the worker, so a compact summary (e.g. the minimum
+  captured prompt position) must reach the clamp point.
+
+- **A — activation store (planned).** With steering off, a pristine
+  residual is a pure function of the prefix token ids, so it is
+  content-addressable by the same block-hash chain the KV cache uses. A
+  CPU-RAM, bounded, LRU, drop-on-eviction store keyed by
+  `(block_hash_chain, layer, hook, dtype, weights_version)` lets repeated
+  `all_prompt` captures over a fixed corpus serve from the store instead
+  of re-forwarding. C's tail re-forward write-through populates it. A
+  miss or eviction falls through to C (recompute) — the store is a pure
+  cache, never a source of truth; durability is the consumer's output,
+  not the store's. Participation requires steering off (taps are
+  pre-steering, but upstream steering poisons the residual) and must
+  invalidate on weight update (same hook as `reset_prefix_cache`).
+
 ## Known Limitations
 
 These are behaviors the current implementation exhibits that may be
@@ -663,5 +715,10 @@ worth tightening:
   end-to-end.
 - `tests/v1/capture/test_sampling_params.py` — structural
   validation on `SamplingParams.capture`.
+- `tests/v1/capture/test_prefix_cache_gating.py` — the B-layer
+  `spec_touches_prompt` classifier, relaxed `SamplingParams`
+  construction, and the `Request.get_skip_reading_prefix_cache` gate.
+  `tests/entrypoints/openai/test_capture_protocol.py` covers
+  `_admit_capture` setting `capture_touches_prompt`.
 - `tests/engine/test_arg_utils.py::TestCaptureConsumersFlag` —
   CLI-flag parsing.

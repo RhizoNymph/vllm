@@ -311,9 +311,16 @@ response body as `capture_results`, mirroring the structure above.
   scope for the current framework.
 - **Prefix-cache hits**: positions below
   `CaptureContext.num_computed_tokens` were served from the prefix
-  cache and never forwarded through the model. Consumers reject such
-  positions at admission; enforcement is the consumer's
-  responsibility.
+  cache and never forwarded through the model, so their residuals
+  cannot be captured. To guarantee captured positions are forwarded, a
+  request whose capture taps a **prompt-range** position skips
+  prefix-cache reuse *for itself* (other requests are unaffected); a
+  capture of **generated-only** positions keeps prefix caching. On the
+  served (OpenAI API) path this is classified at admission
+  (`capture_touches_prompt`); the offline `LLM` path conservatively
+  skips reuse for any capture request. Consumers also reject cached
+  positions at admission as a backstop. See "Prefix-Cache Interaction"
+  in `docs/design/capture_consumers.md`.
 - **Hook coverage**: only the decoder architectures that wire the
   `apply_layer_steering` / `maybe_capture_residual` pair fire hooks.
   See [Activation Steering](steering.md) for the list of covered

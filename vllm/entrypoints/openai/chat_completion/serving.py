@@ -80,6 +80,7 @@ from vllm.v1.capture import (
     CaptureConsumer,
     CaptureContext,
     CaptureValidationError,
+    spec_touches_prompt,
 )
 from vllm.v1.capture import registry as capture_registry
 
@@ -493,10 +494,12 @@ class OpenAIServingChat(OpenAIServing):
         Iterates each ``(consumer_name, raw_spec)`` entry in
         ``sampling_params.capture``, looking the consumer up in the
         serving-layer cache and calling its
-        ``validate_client_spec(raw, ctx)``. On success, the dict entry
-        is mutated in place to the validated :class:`CaptureSpec`. On
-        failure, an HTTP 400 ``ErrorResponse`` is returned and the
-        request is rejected before reaching the engine.
+        ``validate_client_spec(raw, ctx)``. The raw payload is left in
+        place (the worker re-validates it; see the NOTE below); on
+        success the resolved positions are used to set
+        ``sampling_params.capture_touches_prompt``. On failure, an HTTP
+        400 ``ErrorResponse`` is returned and the request is rejected
+        before reaching the engine.
         """
         if sampling_params.capture is None:
             return None
@@ -562,6 +565,16 @@ class OpenAIServingChat(OpenAIServing):
                     status_code=HTTPStatus.BAD_REQUEST,
                     param=f"capture.{name}",
                 )
+
+        # Classify whether any consumer taps a prompt-range position. This is
+        # the only point on the served path where the resolved positions
+        # exist (the worker re-validates from the raw dict, but only after
+        # scheduling). The result drives prefix-cache reuse in
+        # ``Request.get_skip_reading_prefix_cache``: generated-only captures
+        # keep prefix caching, prompt-touching captures skip it.
+        sampling_params.capture_touches_prompt = any(
+            spec_touches_prompt(spec, num_prompt_tokens) for spec in validated.values()
+        )
 
         # NOTE: We intentionally do NOT overwrite ``sampling_params.capture``
         # with the validated ``CaptureSpec`` dict. ``CaptureSpec`` is not

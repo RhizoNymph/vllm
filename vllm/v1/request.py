@@ -256,19 +256,20 @@ class Request:
         return self.num_encoder_inputs > 0
 
     def get_skip_reading_prefix_cache(self) -> bool:
-        # Capture-bearing requests must skip prefix-cache reuse. A cache hit
-        # serves cached blocks without re-running the forward pass for those
-        # positions, so the hook taps that produce captured residuals never
-        # fire on the cached prefix and the capture admission validator
-        # rejects the spec. The cache itself is unaffected; other concurrent
-        # requests continue to benefit normally. Checked first because
-        # ``SamplingParams.skip_reading_prefix_cache`` is resolved during
-        # construction, before the OpenAI entrypoint attaches ``capture``.
-        if (
-            self.sampling_params is not None
-            and self.sampling_params.capture
-        ):
-            return True
+        # Capture-bearing requests skip prefix-cache reuse only when the
+        # capture actually taps a prompt position. A cache hit serves cached
+        # blocks without re-running the forward pass for those positions, so
+        # the hook taps that produce captured residuals never fire on the
+        # cached prefix. That conflict exists only for prompt-range positions;
+        # a capture of generated-only positions is unaffected and keeps prefix
+        # caching. ``capture_touches_prompt`` carries the classification from
+        # admission (``_admit_capture``); ``None`` means it could not be
+        # classified (e.g. the offline ``LLM`` path) and is treated
+        # conservatively as prompt-touching. Checked before the explicit
+        # ``skip_reading_prefix_cache`` value because the latter is resolved
+        # during construction, before the entrypoint attaches ``capture``.
+        if self.sampling_params is not None and self.sampling_params.capture:
+            return self.sampling_params.capture_touches_prompt is not False
         if (
             self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None

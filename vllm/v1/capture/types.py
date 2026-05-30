@@ -81,6 +81,35 @@ class CaptureSpec:
     positions: PositionSelector
 
 
+def spec_touches_prompt(spec: CaptureSpec, num_prompt_tokens: int) -> bool:
+    """Whether ``spec`` captures any position in the prompt range.
+
+    A capture tap only produces a residual for a token position that is
+    actually forwarded through the model. Prefix-cache reuse skips the
+    forward pass for cached prompt positions, so a request that captures
+    a prompt position must forgo prefix-cache reuse *for itself*. A
+    request that captures only generated positions never conflicts and
+    can keep prefix caching.
+
+    Called at admission (the OpenAI entrypoint's ``_admit_capture``) on
+    each consumer's resolved :class:`CaptureSpec`. By that point
+    ``positions`` is consumer-resolved: ``"last_prompt"`` / ``"all_prompt"``
+    and explicit lists have become concrete index lists, while
+    ``"all_generated"`` and ``"all"`` stay symbolic. Returns ``False``
+    only for ``"all_generated"`` and explicit lists whose every index is
+    ``>= num_prompt_tokens``; every other selector — ``"all"``,
+    unresolved ``"all_prompt"`` / ``"last_prompt"``, or any unrecognized
+    symbol — is treated conservatively as prompt-touching.
+    """
+    positions = spec.positions
+    if positions == "all_generated":
+        return False
+    if isinstance(positions, list):
+        return any(p < num_prompt_tokens for p in positions)
+    # "all" and any unresolved/unrecognized symbolic selector → conservative.
+    return True
+
+
 # ---------------------------------------------------------------------------
 # CaptureChunk and CaptureFinalize
 # ---------------------------------------------------------------------------

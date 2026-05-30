@@ -326,9 +326,29 @@ class SamplingParams(
     byte-budget, prefix-cache positions — runs at the OpenAI entrypoint
     against the active consumer registry and is *not* performed here.
 
-    The entrypoint mutates this dict in place after validation, replacing
-    each raw value with the consumer-produced :class:`CaptureSpec`. The
-    runner tolerates both shapes."""
+    The entrypoint validates each value at admission but leaves the raw
+    payload in place: :class:`CaptureSpec` is not serializable across the
+    engine IPC boundary, so the worker re-validates from this raw dict.
+    Admission instead records the resolved prompt-overlap on
+    ``capture_touches_prompt``."""
+
+    capture_touches_prompt: bool | None = None
+    """Whether this request's capture spec taps any prompt-range position.
+
+    Resolved by the OpenAI entrypoint's ``_admit_capture`` once the
+    consumer specs are validated (it is the only place the resolved
+    positions exist at admission). Drives prefix-cache reuse via
+    :meth:`vllm.v1.request.Request.get_skip_reading_prefix_cache`:
+
+    - ``True``  — a prompt position is captured; the prefix must be
+      re-forwarded, so prefix-cache reuse is skipped for this request.
+    - ``False`` — only generated positions are captured; prefix caching
+      is safe and kept.
+    - ``None``  — unclassified (e.g. the offline ``LLM`` path, which does
+      not resolve specs at admission). Treated conservatively as
+      prompt-touching.
+
+    Not client-settable; ignore any value supplied at construction."""
 
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
@@ -464,19 +484,18 @@ class SamplingParams(
         self._all_stop_token_ids.update(self.stop_token_ids)
 
         if self.skip_reading_prefix_cache is None:
-            # Disable prefix-cache reuse for this request when:
-            # - prompt_logprobs is requested: with caching the output of
-            #   prompt logprobs may be less than n_prompt_tokens
-            # - a per-request capture spec is attached: prefix-cache hits
-            #   skip the forward pass for the cached prefix, so the hook
-            #   taps that produce captured residuals never fire on those
-            #   positions and the capture admission validator rejects the
-            #   request. Disabling cache reuse for this request only is
-            #   the minimal fix; it does not invalidate the cache for
-            #   other concurrent requests, which still benefit normally.
-            self.skip_reading_prefix_cache = self.prompt_logprobs is not None or (
-                self.capture is not None and len(self.capture) > 0
-            )
+            # Disable prefix-cache reuse for this request when prompt_logprobs
+            # is requested: with caching the number of returned prompt
+            # logprobs may be less than n_prompt_tokens.
+            #
+            # The capture case is handled separately, not here: a prefix-cache
+            # hit skips the forward pass for the cached prefix, so the hook
+            # taps never fire on those positions. But that only conflicts when
+            # the capture actually taps a prompt position. Whether it does is
+            # not known until the consumer specs are resolved at admission, so
+            # the decision lives in ``Request.get_skip_reading_prefix_cache``
+            # via ``capture_touches_prompt`` rather than in this constructor.
+            self.skip_reading_prefix_cache = self.prompt_logprobs is not None
 
     def _validate_capture(self) -> None:
         """Structural check on ``capture``.
