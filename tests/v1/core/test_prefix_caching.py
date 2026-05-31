@@ -449,6 +449,35 @@ def test_capture_serves_from_store_instead_of_reforwarding():
         set_active_activation_store(None)
 
 
+def test_reset_prefix_cache_invalidates_activation_store():
+    """Resetting the prefix cache (e.g. on weight update) drops the store.
+
+    The activation store is keyed by prefix content under the current
+    weights, so it must be invalidated wherever the prefix cache is.
+    """
+    from vllm.v1.capture.activation_store import (
+        ActivationStore,
+        set_active_activation_store,
+    )
+
+    manager = KVCacheManager(
+        make_kv_cache_config(16, 11),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    store = ActivationStore(max_bytes=10_000)
+    store.put((b"b", 0, 1, "post_mlp"), torch.zeros(2, dtype=torch.float32))
+    set_active_activation_store(store)
+    try:
+        assert len(store) == 1
+        assert manager.reset_prefix_cache() is True
+        assert len(store) == 0
+        assert store.stats().invalidations == 1
+    finally:
+        set_active_activation_store(None)
+
+
 def test_prefill_hybrid_model():
     block_size = 16
     manager = KVCacheManager(

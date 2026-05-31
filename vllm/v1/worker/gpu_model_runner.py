@@ -574,6 +574,19 @@ class GPUModelRunner(
             # the compiled forward graph.
             set_active_capture_manager(self._capture_manager)
 
+            # Install the activation store (prefix-cache/capture reuse layer)
+            # when a budget is configured. Same process as the scheduler under
+            # the TP1/PP1 UniProcExecutor, so one shared instance bridges the
+            # scheduler's reuse decision and the worker's write-through/serve.
+            budget = self.vllm_config.capture_consumers_config.activation_cache_bytes
+            if budget > 0:
+                from vllm.v1.capture.activation_store import (
+                    ActivationStore,
+                    set_active_activation_store,
+                )
+
+                set_active_activation_store(ActivationStore(max_bytes=budget))
+
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down

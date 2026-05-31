@@ -594,6 +594,11 @@ class EngineArgs:
     # whole capture-consumer pipeline stays disabled.
     capture_consumers: list[str] | None = None
 
+    # Byte budget (expressed in GB on the CLI) for the activation store that
+    # lets repeated captures over a shared prefix be served from RAM instead
+    # of re-forwarded. 0 disables it; only meaningful with --capture-consumers.
+    capture_activation_cache_gb: float = 0.0
+
     # Programmatic override: Python callers (``LLM(capture_consumers=[...])``)
     # pre-build a ``CaptureConsumersConfig`` directly and skip the CLI
     # shorthand parser. When set, takes precedence over ``capture_consumers``.
@@ -1330,6 +1335,16 @@ class EngineArgs:
             "consumers (e.g. --capture-consumers filesystem:root=/tmp "
             "--capture-consumers logging). Use YAML config for complex "
             "parameter values.",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-activation-cache-gb",
+            type=float,
+            default=EngineArgs.capture_activation_cache_gb,
+            metavar="GB",
+            help="CPU-RAM budget (in GB) for the activation store, which "
+            "serves repeated captures over a shared prefix from RAM instead "
+            "of re-forwarding them. 0 (default) disables it. Only takes "
+            "effect together with --capture-consumers.",
         )
 
         # Observability arguments
@@ -2269,6 +2284,14 @@ class EngineArgs:
             validate_consumer_specs(specs)
             capture_consumers_config = CaptureConsumersConfig(
                 consumers=specs,
+            )
+
+        # Apply the activation-store budget to whichever config we ended up
+        # with (CLI- or override-built). Capture must be active for it to
+        # matter; a budget with no consumers is a harmless no-op.
+        if capture_consumers_config is not None and self.capture_activation_cache_gb:
+            capture_consumers_config.activation_cache_bytes = int(
+                self.capture_activation_cache_gb * 1_000_000_000
             )
 
         config = VllmConfig(

@@ -725,9 +725,15 @@ The fix is staged in three layers, B → C → A:
     Because admission also resolves with `num_computed=0`, the worker's
     resolution matches the threaded union exactly, so the serve payload is
     always complete.
-  - **A.4 config + invalidation:** a `--capture-activation-cache-gb` budget
-    flag, store instantiation, and the `invalidate_all` call on weight
-    update.
+  - **A.4 config + invalidation (done):** `--capture-activation-cache-gb`
+    (a `CaptureConsumersConfig.activation_cache_bytes` budget, runtime-only
+    so excluded from `compute_hash`); the runner instantiates the
+    `ActivationStore` and calls `set_active_activation_store` when capture
+    is on and the budget > 0; and `KVCacheManager.reset_prefix_cache`
+    calls `invalidate_all` (the single chokepoint every reset / RLHF
+    weight-update path flows through). With the budget at its default `0`
+    the store is never installed, so A.2/A.3 are inert — the flag is the
+    on-switch for the whole reuse layer.
 
 ## Known Limitations
 

@@ -8,7 +8,10 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
-from vllm.v1.capture.activation_store import try_reserve_store_serve
+from vllm.v1.capture.activation_store import (
+    get_active_activation_store,
+    try_reserve_store_serve,
+)
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -498,6 +501,13 @@ class KVCacheManager:
         """
         if not self.block_pool.reset_prefix_cache():
             return False
+        # The activation store is keyed by prefix-block content under the
+        # current weights; a reset (notably an RLHF weight update) invalidates
+        # that premise, so drop it alongside the prefix cache. Same process as
+        # the runner under TP1/PP1, so the global store is visible here.
+        store = get_active_activation_store()
+        if store is not None:
+            store.invalidate_all()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True
