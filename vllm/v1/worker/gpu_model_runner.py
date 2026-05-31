@@ -1615,6 +1615,7 @@ class GPUModelRunner(
         except Exception:
             element_size_bytes = 2
 
+        from vllm.v1.capture.activation_store import pop_pending_serve
         from vllm.v1.capture.errors import CaptureValidationError
         from vllm.v1.capture.types import (
             CaptureContext,
@@ -1622,10 +1623,22 @@ class GPUModelRunner(
             VllmInternalRequestId,
         )
 
+        # Step A serve: when the scheduler reserved a whole-prefix store
+        # serve, the prompt prefix was reused from the KV cache (num_computed
+        # advanced over it) and its residuals come from the store, not the
+        # forward. Validate against num_computed=0 so the validator does not
+        # reject those positions; the forward then naturally captures only the
+        # positions inside its step window (the generated tail), and the
+        # served prompt rows are injected after registration.
+        served_rows = pop_pending_serve(new_req_data.req_id)
+        ctx_num_computed = (
+            0 if served_rows is not None else new_req_data.num_computed_tokens
+        )
+
         ctx = CaptureContext(
             vllm_internal_request_id=VllmInternalRequestId(new_req_data.req_id),
             num_prompt_tokens=prompt_len,
-            num_computed_tokens=new_req_data.num_computed_tokens,
+            num_computed_tokens=ctx_num_computed,
             num_hidden_layers=self.model_config.get_num_layers(
                 self.vllm_config.parallel_config
             ),
@@ -1721,6 +1734,8 @@ class GPUModelRunner(
                 block_hashes=new_req_data.capture_block_hashes,
                 hash_block_size=new_req_data.capture_hash_block_size,
             )
+            if served_rows is not None:
+                mgr.serve_from_store(new_req_data.req_id, served_rows)
         except ValueError as exc:
             mgr.record_request_error(new_req_data.req_id, str(exc))
             logger.warning(

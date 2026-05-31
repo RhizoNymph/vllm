@@ -57,6 +57,7 @@ from vllm.v1.capture.types import (
     CaptureStatus,
     HookName,
     VllmInternalRequestId,
+    captured_prompt_positions,
 )
 
 logger = logging.getLogger(__name__)
@@ -702,6 +703,66 @@ class CaptureManager:
                     self._pending_dispatches -= 1
                     if self._pending_dispatches == 0:
                         self._pending_cond.notify_all()
+
+    def serve_from_store(
+        self, req_id: str, payload: dict[tuple[int, str, int], torch.Tensor]
+    ) -> None:
+        """Inject store-served prompt residuals as capture chunks.
+
+        Called once at registration when the scheduler reserved a
+        whole-prefix store serve: the prompt positions were reused from the
+        KV cache and not forwarded, so for each consumer active for ``req_id``
+        we assemble its requested ``(layer, hook)`` rows from ``payload``
+        (keyed by ``(layer, hook, position)``) and submit them to its sink
+        exactly like a forward-path chunk. Generated positions still flow
+        through the normal forward path. Runs on the registration (main)
+        thread; sinks lock ``submit_chunk``, and a request's serve precedes
+        its own forward dispatch, so there is no same-request race.
+        """
+        state = self._requests.get(req_id)
+        if state is None:
+            return
+        rid = VllmInternalRequestId(req_id)
+        for consumer_idx, spec in state.consumer_specs.items():
+            positions = captured_prompt_positions(spec, state.num_prompt_tokens)
+            if not positions:
+                continue
+            sink = self._consumers[consumer_idx]
+            try:
+                for hook, layers in spec.hooks.items():
+                    for layer in layers:
+                        rows: list[torch.Tensor] = []
+                        kept: list[int] = []
+                        for pos in positions:
+                            row = payload.get((layer, hook, pos))
+                            if row is not None:
+                                rows.append(row)
+                                kept.append(pos)
+                        if not rows:
+                            continue
+                        tensor = torch.stack(rows, dim=0)
+                        sink.submit_chunk(
+                            CaptureChunk(
+                                key=(rid, layer, hook),
+                                tensor=tensor,
+                                dtype=tensor.dtype,
+                                row_offset=0,
+                                step_index=0,
+                                metadata={
+                                    "consumer_index": consumer_idx,
+                                    "positions": kept,
+                                    "served_from_store": True,
+                                },
+                            )
+                        )
+            except Exception:
+                logger.exception(
+                    "Consumer %d raised during store serve; other consumers "
+                    "are unaffected.",
+                    consumer_idx,
+                )
+                if state.error is None:
+                    state.error = f"consumer {consumer_idx} store serve failed"
 
     def _write_through_to_store(self, packet: _DispatchPacket) -> None:
         """Populate the activation store with freshly-captured prompt rows.

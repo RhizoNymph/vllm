@@ -25,6 +25,7 @@ from vllm.v1.capture.types import (
     HookName,
     PositionSelector,
     VllmInternalRequestId,
+    captured_prompt_positions,
     min_captured_prompt_position,
     spec_touches_prompt,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "PositionSelector",
     "UnknownCaptureConsumerError",
     "VllmInternalRequestId",
+    "captured_prompt_positions",
     "min_captured_prompt_position",
     "spec_touches_prompt",
 ]

@@ -697,30 +697,34 @@ The fix is staged in three layers, B → C → A:
     being re-derived worker-side, because it can diverge from the KV block
     size; using the wrong granularity would silently misalign keys. No
     behavior change yet — this only fills the store.
-  - **A.3 read floor + serve-inject (primitives done; serve wiring
-    pending a decision):** raise C's floor past store-resident positions
-    (so they are not re-forwarded) and have the worker fetch the stored
-    rows and dispatch them to the consumer as if captured. The race-safe
-    store primitives are landed: `ActivationStore.extract_all` (an atomic
-    all-or-nothing snapshot under the store lock — taking the rows at
-    decision time is what frees the read path from a check-then-serve
-    eviction race against dispatch-thread write-through/eviction), the
-    same-process serve bridge (`stash_pending_serve` / `pop_pending_serve`,
-    sound because capture is TP1/PP1), and `try_reserve_store_serve` (the
-    scheduler-side reserve: compose keys, extract, stash for the worker).
+  - **A.3 read floor + serve-inject (done):** when the whole captured
+    prefix is store-resident, reuse the full KV prefix (skip the
+    re-forward) and inject the stored rows. The race-safe primitives:
+    `ActivationStore.extract_all` (an atomic all-or-nothing snapshot under
+    the store lock — taking the rows at decision time frees the read path
+    from a check-then-serve eviction race against dispatch-thread
+    write-through/eviction), the same-process serve bridge
+    (`stash_pending_serve` / `pop_pending_serve`, sound because capture is
+    TP1/PP1), and `try_reserve_store_serve` (the scheduler-side reserve:
+    compose keys, extract, stash). Read floor:
+    `KVCacheManager.get_computed_blocks` calls `try_reserve_store_serve`
+    before the C clamp — on success it skips the clamp (full KV reuse), on
+    any miss (all-or-nothing) it falls through to C, so a captured position
+    is never served from KV without its residual available. Admission
+    threads the union `capture_store_hook_layers` / `capture_store_positions`.
 
-    Wiring these into `get_computed_blocks` (raise the floor) and the
-    worker (serve-inject) is blocked on one design decision: serving a
-    prompt position means `num_computed_tokens` advances over it, but the
-    capture validator *rejects* captured positions `< num_computed_tokens`
-    (the "captured ⇒ forwarded" invariant, `validation.py`). The two clean
-    resolutions are (1) **spec-split** — register only the
-    generated/uncached positions for forward-capture and serve the prompt
-    positions from the store separately (pure `all_prompt` registers
-    nothing, serves everything); or (2) **serve-aware validator** — thread
-    the served-position set into `CaptureContext` so the validator skips
-    its rejection for them. (1) is preferred — it keeps the validator
-    invariant intact and localizes the change to registration.
+    The spec-split (resolution 1) is **implicit**: serving advances
+    `num_computed_tokens` over the prompt, so the worker validates the spec
+    with `num_computed=0` (it pops the pending serve at registration) to
+    avoid the validator's `< num_computed` rejection, and `build_step_plan`
+    then naturally forward-captures only the step-window (generated) tail —
+    no manual spec surgery. The served prompt rows are injected by
+    `CaptureManager.serve_from_store`, which assembles per-consumer chunks
+    from the payload and submits them like forward-path chunks (sinks lock
+    `submit_chunk`; a request's serve precedes its own forward dispatch).
+    Because admission also resolves with `num_computed=0`, the worker's
+    resolution matches the threaded union exactly, so the serve payload is
+    always complete.
   - **A.4 config + invalidation:** a `--capture-activation-cache-gb` budget
     flag, store instantiation, and the `invalidate_all` call on weight
     update.
@@ -794,6 +798,10 @@ worth tightening:
   `activation_key` composition, `CaptureManager` write-through
   (content keying, prompt-only, clone-off-buffer, no-op guards), and the
   A.3 read primitives (`extract_all` all-or-nothing, the pending-serve
-  bridge, `try_reserve_store_serve`).
+  bridge, `try_reserve_store_serve`), and `serve_from_store` chunk
+  injection.
+- `tests/v1/core/test_prefix_caching.py::test_capture_serves_from_store_instead_of_reforwarding`
+  — the A.3 read floor end-to-end (full reuse on a resident prefix;
+  all-or-nothing fallback to the C clamp on a miss).
 - `tests/engine/test_arg_utils.py::TestCaptureConsumersFlag` —
   CLI-flag parsing.

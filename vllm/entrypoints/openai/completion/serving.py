@@ -55,6 +55,7 @@ from vllm.v1.capture import (
     CaptureConsumer,
     CaptureContext,
     CaptureValidationError,
+    captured_prompt_positions,
     min_captured_prompt_position,
 )
 from vllm.v1.capture import registry as capture_registry
@@ -220,9 +221,25 @@ class OpenAIServingCompletion(OpenAIServing):
         if floors:
             sampling_params.capture_touches_prompt = True
             sampling_params.capture_min_prompt_position = min(floors)
+            # Union (hook, layer) and prompt positions for activation-store
+            # serve (step A): the scheduler tests whether this whole set is
+            # store-resident and, if so, serves it instead of re-forwarding.
+            hook_layers: set[tuple[str, int]] = set()
+            store_positions: set[int] = set()
+            for spec in validated.values():
+                for hook, layers in spec.hooks.items():
+                    for layer in layers:
+                        hook_layers.add((hook, layer))
+                store_positions.update(
+                    captured_prompt_positions(spec, num_prompt_tokens)
+                )
+            sampling_params.capture_store_hook_layers = sorted(hook_layers)
+            sampling_params.capture_store_positions = sorted(store_positions)
         else:
             sampling_params.capture_touches_prompt = False
             sampling_params.capture_min_prompt_position = None
+            sampling_params.capture_store_hook_layers = None
+            sampling_params.capture_store_positions = None
 
         # NOTE: We intentionally do NOT overwrite ``sampling_params.capture``
         # with the validated ``CaptureSpec`` dict. ``CaptureSpec`` is not

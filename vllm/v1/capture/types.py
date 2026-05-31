@@ -126,6 +126,28 @@ def spec_touches_prompt(spec: CaptureSpec, num_prompt_tokens: int) -> bool:
     return min_captured_prompt_position(spec, num_prompt_tokens) is not None
 
 
+def captured_prompt_positions(spec: CaptureSpec, num_prompt_tokens: int) -> list[int]:
+    """The prompt-range positions ``spec`` captures (sorted, deduped).
+
+    Empty for generated-only specs. Used at admission to record which
+    positions a whole-prefix activation-store serve must cover, and by the
+    worker to assemble served chunks per consumer. ``"all"`` is treated as
+    covering the whole prompt here (its generated half is captured by the
+    normal forward path, not served).
+    """
+    positions = spec.positions
+    if num_prompt_tokens <= 0 or positions == "all_generated":
+        return []
+    if positions == "all" or positions == "all_prompt":
+        return list(range(num_prompt_tokens))
+    if positions == "last_prompt":
+        return [num_prompt_tokens - 1]
+    if isinstance(positions, list):
+        return sorted({p for p in positions if 0 <= p < num_prompt_tokens})
+    # Unrecognized symbolic selector → conservative: whole prompt.
+    return list(range(num_prompt_tokens))
+
+
 # ---------------------------------------------------------------------------
 # CaptureChunk and CaptureFinalize
 # ---------------------------------------------------------------------------

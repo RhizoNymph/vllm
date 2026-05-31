@@ -28,6 +28,7 @@ from vllm.v1.capture.manager import (
     _RequestCaptureState,
 )
 from vllm.v1.capture.plan import CapturePositionEntry
+from vllm.v1.capture.types import CaptureSpec
 
 ROW_BYTES = 4 * 4  # torch.float32, hidden=4
 
@@ -253,6 +254,51 @@ class TestReserveStoreServe:
         finally:
             set_active_activation_store(None)
         assert ok is False
+
+
+class _RecordingSink:
+    def __init__(self) -> None:
+        self.chunks: list = []
+
+    def submit_chunk(self, chunk) -> None:
+        self.chunks.append(chunk)
+
+    def submit_finalize(self, finalize) -> None:  # pragma: no cover - unused
+        pass
+
+    def wait_for_result(self, key, timeout=None):  # pragma: no cover - unused
+        return None
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        pass
+
+
+class TestServeFromStore:
+    def test_injects_chunks_per_consumer(self) -> None:
+        sink = _RecordingSink()
+        spec = CaptureSpec(hooks={"post_mlp": [1]}, positions="all_prompt")
+        mgr = CaptureManager(
+            consumers=(sink,),
+            consumer_specs=(spec,),
+            num_hidden_layers=4,
+            hidden_size=2,
+            model_dtype=torch.float32,
+        )
+        mgr.register_request("r", client_specs=None, num_prompt_tokens=2)
+        payload = {
+            (1, "post_mlp", 0): _row(10.0),
+            (1, "post_mlp", 1): _row(11.0),
+        }
+        try:
+            mgr.serve_from_store("r", payload)
+        finally:
+            mgr.shutdown(timeout=2.0)
+        assert len(sink.chunks) == 1
+        chunk = sink.chunks[0]
+        assert chunk.key == ("r", 1, "post_mlp")
+        assert chunk.metadata["positions"] == [0, 1]
+        assert chunk.metadata["served_from_store"] is True
+        assert torch.equal(chunk.tensor, torch.stack([_row(10.0), _row(11.0)]))
 
 
 class TestActivationKey:

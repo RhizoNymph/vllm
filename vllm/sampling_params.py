@@ -361,6 +361,20 @@ class SamplingParams(
     ``None`` when no capture clamp applies (no capture, generated-only, or
     unclassified). Not client-settable."""
 
+    capture_store_hook_layers: list[tuple[str, int]] | None = None
+    """Union of ``(hook, layer)`` pairs this request's capture taps.
+
+    Set by ``_admit_capture`` for prompt-touching captures. Used by the
+    scheduler with ``capture_store_positions`` and the request's block
+    hashes to test whether the captured prompt prefix is wholly resident in
+    the activation store (and serve it from there instead of re-forwarding).
+    Not client-settable."""
+
+    capture_store_positions: list[int] | None = None
+    """Union of captured prompt positions (sorted) for activation-store
+    serve. Set by ``_admit_capture`` alongside ``capture_store_hook_layers``.
+    Not client-settable."""
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
