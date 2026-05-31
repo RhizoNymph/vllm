@@ -686,14 +686,21 @@ The fix is staged in three layers, B → C → A:
   `Request`, not in the `CaptureManager`):
   - **A.1 store core (done):** the data structure + global accessor +
     tests.
-  - **A.2 read floor + write-through:** the scheduler computes per-captured
-    position store keys from `Request.block_hashes` + the resolved spec,
-    raises C's floor past store-resident positions, and passes keys to the
-    worker via the capture batch view; the worker writes freshly-captured
-    CPU rows under those keys.
-  - **A.3 serve-inject:** for store-resident positions that were not
-    forwarded, the worker fetches the stored rows and dispatches them to
-    the consumer as if captured.
+  - **A.2 write-through (done):** the worker populates the store with
+    freshly-captured prompt residuals. `NewRequestData.from_request`
+    carries the request's prompt `block_hashes` and the scheduler's
+    `hash_block_size` to the worker (only for capture requests); the
+    `CaptureManager` keys each captured prompt row via `activation_key`
+    (`(block_hash, offset_in_block, layer, hook)`) and writes a clone into
+    the store from the dispatch thread, once per `(request, layer, hook,
+    position)`. The hash block size travels with the hashes rather than
+    being re-derived worker-side, because it can diverge from the KV block
+    size; using the wrong granularity would silently misalign keys. No
+    behavior change yet — this only fills the store.
+  - **A.3 read floor + serve-inject:** raise C's floor past store-resident
+    positions (so they are not re-forwarded) and have the worker fetch the
+    stored rows and dispatch them to the consumer as if captured. This is
+    where the store starts saving compute.
   - **A.4 config + invalidation:** a `--capture-activation-cache-gb` budget
     flag, store instantiation, and the `invalidate_all` call on weight
     update.
@@ -762,7 +769,9 @@ worth tightening:
 - `tests/v1/core/test_prefix_caching.py::test_capture_clamps_prefix_cache_hit`
   — the C clamp end-to-end in `KVCacheManager.get_computed_blocks`.
 - `tests/v1/capture/test_activation_store.py` — the A-layer
-  `ActivationStore` core: LRU eviction, byte budget, oversize skip,
-  replacement accounting, invalidation, and the global accessor.
+  `ActivationStore` core (LRU eviction, byte budget, oversize skip,
+  replacement accounting, invalidation, global accessor), the
+  `activation_key` composition, and `CaptureManager` write-through
+  (content keying, prompt-only, clone-off-buffer, no-op guards).
 - `tests/engine/test_arg_utils.py::TestCaptureConsumersFlag` —
   CLI-flag parsing.

@@ -15,9 +15,16 @@ import torch
 
 from vllm.v1.capture.activation_store import (
     ActivationStore,
+    activation_key,
     get_active_activation_store,
     set_active_activation_store,
 )
+from vllm.v1.capture.manager import (
+    CaptureManager,
+    _DispatchPacket,
+    _RequestCaptureState,
+)
+from vllm.v1.capture.plan import CapturePositionEntry
 
 ROW_BYTES = 4 * 4  # torch.float32, hidden=4
 
@@ -155,3 +162,149 @@ class TestGlobalAccessor:
         finally:
             set_active_activation_store(None)
         assert get_active_activation_store() is None
+
+
+class TestActivationKey:
+    def test_basic_key(self) -> None:
+        # hash_block_size=2: position 3 -> block 1, offset 1.
+        assert activation_key([b"blk0", b"blk1"], 2, 3, 5, "post_mlp") == (
+            b"blk1",
+            1,
+            5,
+            "post_mlp",
+        )
+
+    def test_position_zero(self) -> None:
+        assert activation_key([b"a"], 2, 0, 0, "post_attn") == (b"a", 0, 0, "post_attn")
+
+    def test_partial_block_unhashed_is_none(self) -> None:
+        # position 4 -> block 2, but only 2 blocks are hashed.
+        assert activation_key([b"a", b"b"], 2, 4, 0, "post_mlp") is None
+
+    def test_negative_position_is_none(self) -> None:
+        assert activation_key([b"a"], 2, -1, 0, "h") is None
+
+    def test_zero_block_size_is_none(self) -> None:
+        assert activation_key([b"a"], 0, 0, 0, "h") is None
+
+
+def _manager() -> CaptureManager:
+    return CaptureManager(
+        consumers=(),
+        consumer_specs=(),
+        num_hidden_layers=4,
+        hidden_size=2,
+        model_dtype=torch.float32,
+    )
+
+
+def _state(num_prompt_tokens: int, block_hashes, hash_block_size: int):
+    return _RequestCaptureState(
+        req_id="r",
+        consumer_specs={},
+        position_kind={},
+        static_positions={},
+        num_prompt_tokens=num_prompt_tokens,
+        block_hashes=block_hashes,
+        hash_block_size=hash_block_size,
+    )
+
+
+def _entries(positions, layer=1, hook="post_mlp"):
+    return [
+        CapturePositionEntry(
+            request_id="r",
+            layer=layer,
+            hook=hook,
+            logical_pos=p,
+            scratch_row=i,
+            step_index=0,
+            consumer_mask=1,
+        )
+        for i, p in enumerate(positions)
+    ]
+
+
+def _packet(entries, view, layer=1, hook="post_mlp"):
+    return _DispatchPacket(
+        entries=entries,
+        scratch_pinned={(layer, hook): (None, view)},
+        cuda_event=None,
+    )
+
+
+class TestWriteThrough:
+    def test_stores_prompt_rows_keyed_by_content(self) -> None:
+        mgr = _manager()
+        mgr._requests["r"] = _state(4, [b"blk0", b"blk1"], 2)
+        # One row per prompt position 0..3, hidden=2.
+        view = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        store = ActivationStore(max_bytes=10_000)
+        set_active_activation_store(store)
+        try:
+            mgr._write_through_to_store(_packet(_entries([0, 1, 2, 3]), view))
+        finally:
+            set_active_activation_store(None)
+            mgr.shutdown(timeout=2.0)
+        # positions 0,1 -> blk0 off 0,1 ; positions 2,3 -> blk1 off 0,1.
+        assert (b"blk0", 0, 1, "post_mlp") in store
+        assert (b"blk1", 1, 1, "post_mlp") in store
+        got = store.get((b"blk1", 1, 1, "post_mlp"))
+        assert got is not None and torch.equal(got, view[3])
+
+    def test_skips_generated_positions(self) -> None:
+        mgr = _manager()
+        # Only the first 2 positions are prompt; 2 and 3 are generated.
+        mgr._requests["r"] = _state(2, [b"blk0", b"blk1"], 2)
+        view = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        store = ActivationStore(max_bytes=10_000)
+        set_active_activation_store(store)
+        try:
+            mgr._write_through_to_store(_packet(_entries([0, 1, 2, 3]), view))
+        finally:
+            set_active_activation_store(None)
+            mgr.shutdown(timeout=2.0)
+        assert (b"blk0", 0, 1, "post_mlp") in store
+        # Position 2 (generated) must not be stored.
+        assert (b"blk1", 0, 1, "post_mlp") not in store
+        assert len(store) == 2
+
+    def test_rows_are_cloned_off_buffer(self) -> None:
+        mgr = _manager()
+        mgr._requests["r"] = _state(2, [b"blk0"], 2)
+        view = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        store = ActivationStore(max_bytes=10_000)
+        set_active_activation_store(store)
+        try:
+            mgr._write_through_to_store(_packet(_entries([0, 1]), view))
+        finally:
+            set_active_activation_store(None)
+            mgr.shutdown(timeout=2.0)
+        # Mutating the (recycled) pinned buffer must not corrupt the store.
+        before = store.get((b"blk0", 0, 1, "post_mlp")).clone()
+        view.zero_()
+        after = store.get((b"blk0", 0, 1, "post_mlp"))
+        assert torch.equal(after, before)
+
+    def test_noop_without_store(self) -> None:
+        mgr = _manager()
+        mgr._requests["r"] = _state(2, [b"blk0"], 2)
+        view = torch.zeros(2, 2, dtype=torch.float32)
+        set_active_activation_store(None)
+        try:
+            mgr._write_through_to_store(_packet(_entries([0, 1]), view))  # no error
+        finally:
+            mgr.shutdown(timeout=2.0)
+
+    def test_noop_when_block_hashes_absent(self) -> None:
+        mgr = _manager()
+        mgr._requests["r"] = _state(2, None, 0)  # offline / no hashes
+        view = torch.zeros(2, 2, dtype=torch.float32)
+        store = ActivationStore(max_bytes=10_000)
+        set_active_activation_store(store)
+        try:
+            mgr._write_through_to_store(_packet(_entries([0, 1]), view))
+        finally:
+            set_active_activation_store(None)
+            mgr.shutdown(timeout=2.0)
+        assert len(store) == 0

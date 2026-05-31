@@ -1718,6 +1718,8 @@ class GPUModelRunner(
                 client_specs=client_specs,
                 num_prompt_tokens=prompt_len,
                 sidecar_fields=sidecar_fields,
+                block_hashes=new_req_data.capture_block_hashes,
+                hash_block_size=new_req_data.capture_hash_block_size,
             )
         except ValueError as exc:
             mgr.record_request_error(new_req_data.req_id, str(exc))

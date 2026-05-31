@@ -187,6 +187,37 @@ class ActivationStore:
             )
 
 
+def activation_key(
+    block_hashes: list[BlockHash],
+    hash_block_size: int,
+    position: int,
+    layer_idx: int,
+    hook_name: str,
+) -> ActivationKey | None:
+    """Compose the store key for a token ``position``, or ``None``.
+
+    ``block_hashes[i]`` chains the prefix through hash-block ``i`` (which
+    covers tokens ``[i*hash_block_size, (i+1)*hash_block_size)``), so it
+    plus the within-block offset uniquely identifies the tokens
+    ``0..position`` that determine the residual. ``hash_block_size`` must
+    be the granularity ``block_hashes`` was actually computed at — it is
+    threaded alongside the hashes rather than re-derived, because the
+    scheduler's hash block size can differ from its KV block size for
+    hybrid / context-parallel configs.
+
+    Returns ``None`` when the position cannot be content-addressed: a
+    non-positive block size, a negative position, or a position in a block
+    that has no hash yet (the final partial block of a sequence is
+    unhashed), so the caller falls back to re-forwarding.
+    """
+    if hash_block_size <= 0 or position < 0:
+        return None
+    block_index = position // hash_block_size
+    if block_index >= len(block_hashes):
+        return None
+    return (block_hashes[block_index], position % hash_block_size, layer_idx, hook_name)
+
+
 # ---------------------------------------------------------------------------
 # Process-global active store
 # ---------------------------------------------------------------------------
@@ -213,6 +244,7 @@ __all__ = [
     "ActivationKey",
     "ActivationStore",
     "ActivationStoreStats",
+    "activation_key",
     "get_active_activation_store",
     "set_active_activation_store",
 ]
