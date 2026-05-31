@@ -626,3 +626,115 @@ class TestSteeringAPIKeyAuth:
         client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
         resp = client.get("/v1/steering")
         assert resp.status_code == 200
+
+
+# --- POST /v1/steering/set: binary-wire packed input ---
+
+
+class TestSetSteeringPacked:
+    """``/v1/steering/set`` accepts the same SteeringHookPacked shape that
+    per-request steering already uses, in addition to the legacy JSON
+    list-of-floats form.  Coverage targets the coercion seam introduced by
+    ``coerce_steering_spec``; the rest of the pipeline (validation, RPC
+    fan-out, cache invalidation) is shared with the legacy-form tests."""
+
+    def test_set_packed_base_vectors(self, client, engine):
+        """Single hook, two layers, default scales — round-trips to RPC."""
+        from tests.entrypoints.serve.steering._packed_helpers import pack_hook
+
+        engine.collective_rpc.side_effect = [
+            [(0, 0, [0, 3])],
+            [(0, 0, [0, 3])],
+        ]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "vectors": {
+                    _HP: pack_hook({0: [1.0, 2.0], 3: [4.0, 5.0]}),
+                }
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        assert resp.json()["layers_updated"] == [0, 3]
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", {})
+        vectors = kwargs.get("vectors", {})
+        assert list(vectors[_HP][0]) == [1.0, 2.0]
+        assert list(vectors[_HP][3]) == [4.0, 5.0]
+
+    def test_set_packed_with_scales(self, client, engine):
+        """Per-row ``scales`` field is honored at unpack time."""
+        from tests.entrypoints.serve.steering._packed_helpers import pack_hook
+
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "vectors": {
+                    _HP: pack_hook({0: [1.0, 2.0]}, scales=[3.0]),
+                }
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", {})
+        vectors = kwargs.get("vectors", {})
+        # fp32 round-trip: 1.0 * 3.0 == 3.0, 2.0 * 3.0 == 6.0
+        assert [round(v, 5) for v in vectors[_HP][0]] == [3.0, 6.0]
+
+    def test_set_packed_mixed_tiers(self, client, engine):
+        """Base tier packed + prefill tier legacy in the same request."""
+        from tests.entrypoints.serve.steering._packed_helpers import pack_hook
+
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "vectors": {_HP: pack_hook({0: [1.0, 2.0]})},
+                "prefill_vectors": {_HP: {"0": [0.1, 0.2]}},
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", {})
+        assert list(kwargs["vectors"][_HP][0]) == [1.0, 2.0]
+        assert list(kwargs["prefill_vectors"][_HP][0]) == [0.1, 0.2]
+
+    def test_set_packed_malformed_data_length(self, client, engine):
+        """A packed blob whose ``data`` byte length disagrees with
+        ``shape``/``dtype`` returns 400 (caught at the coercion seam)."""
+        import pybase64 as base64
+
+        # shape says 1×4 fp32 (=16 bytes), but we send 8 bytes
+        bad = {
+            "dtype": "float32",
+            "shape": [1, 4],
+            "layer_indices": [0],
+            "data": base64.b64encode(b"\x00" * 8).decode("ascii"),
+        }
+        resp = client.post(
+            "/v1/steering/set",
+            json={"vectors": {_HP: bad}},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "Malformed steering payload" in body["error"]
+        engine.collective_rpc.assert_not_called()
+
+    def test_set_packed_decode_only_tier(self, client, engine):
+        """Packed input works on the decode-only tier as well."""
+        from tests.entrypoints.serve.steering._packed_helpers import pack_hook
+
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "decode_vectors": {_HP: pack_hook({0: [0.5, 0.6]})},
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", {})
+        assert list(kwargs["decode_vectors"][_HP][0]) == [0.5, 0.6]
+        assert kwargs.get("vectors") is None
+        assert kwargs.get("prefill_vectors") is None

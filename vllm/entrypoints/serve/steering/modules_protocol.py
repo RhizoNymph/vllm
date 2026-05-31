@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Any
 
-from vllm.config.steering_types import SteeringVectorSpec
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RegisterSteeringModuleRequest(BaseModel):
@@ -12,18 +12,25 @@ class RegisterSteeringModuleRequest(BaseModel):
     name: str = Field(
         description="Unique name for the steering module.",
     )
-    vectors: SteeringVectorSpec | None = Field(
+    # Each tier accepts either the legacy ``SteeringVectorSpec`` shape or
+    # the binary-wire ``SteeringVectorSpecPacked`` shape; see
+    # ``SetSteeringRequest`` in ``protocol.py`` for the discrimination
+    # rationale.  The handler calls ``coerce_steering_spec`` to normalize.
+    vectors: dict[str, Any] | None = Field(
         default=None,
-        description="Base steering vectors (both phases). Same format as "
-        "the /v1/steering/set endpoint.",
+        description="Base steering vectors (both phases). Same accepted "
+        "shapes as the /v1/steering/set endpoint (legacy SteeringVectorSpec "
+        "or binary-wire SteeringHookPacked per hook).",
     )
-    prefill_vectors: SteeringVectorSpec | None = Field(
+    prefill_vectors: dict[str, Any] | None = Field(
         default=None,
-        description="Prefill-phase steering vectors.",
+        description="Prefill-phase steering vectors. Same accepted shapes "
+        "as vectors.",
     )
-    decode_vectors: SteeringVectorSpec | None = Field(
+    decode_vectors: dict[str, Any] | None = Field(
         default=None,
-        description="Decode-phase steering vectors.",
+        description="Decode-phase steering vectors. Same accepted shapes "
+        "as vectors.",
     )
 
 
