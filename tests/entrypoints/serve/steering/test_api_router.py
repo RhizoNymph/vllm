@@ -659,6 +659,8 @@ class TestSetSteeringPacked:
         validate_call = engine.collective_rpc.call_args_list[0]
         kwargs = validate_call.kwargs.get("kwargs", {})
         vectors = kwargs.get("vectors", {})
+        # Exact equality is fine here: 1.0, 2.0, 4.0, 5.0 are all
+        # bit-exact in fp32.
         assert list(vectors[_HP][0]) == [1.0, 2.0]
         assert list(vectors[_HP][3]) == [4.0, 5.0]
 
@@ -680,7 +682,7 @@ class TestSetSteeringPacked:
         kwargs = validate_call.kwargs.get("kwargs", {})
         vectors = kwargs.get("vectors", {})
         # fp32 round-trip: 1.0 * 3.0 == 3.0, 2.0 * 3.0 == 6.0
-        assert [round(v, 5) for v in vectors[_HP][0]] == [3.0, 6.0]
+        assert list(vectors[_HP][0]) == pytest.approx([3.0, 6.0], rel=1e-6)
 
     def test_set_packed_mixed_tiers(self, client, engine):
         """Base tier packed + prefill tier legacy in the same request."""
@@ -697,8 +699,10 @@ class TestSetSteeringPacked:
         assert resp.status_code == 200, resp.json()
         validate_call = engine.collective_rpc.call_args_list[0]
         kwargs = validate_call.kwargs.get("kwargs", {})
+        # Packed values: bit-exact in fp32.  Legacy list values: pass
+        # through unchanged so exact compare also works.
         assert list(kwargs["vectors"][_HP][0]) == [1.0, 2.0]
-        assert list(kwargs["prefill_vectors"][_HP][0]) == [0.1, 0.2]
+        assert kwargs["prefill_vectors"][_HP][0] == [0.1, 0.2]
 
     def test_set_packed_malformed_data_length(self, client, engine):
         """A packed blob whose ``data`` byte length disagrees with
@@ -735,6 +739,9 @@ class TestSetSteeringPacked:
         assert resp.status_code == 200, resp.json()
         validate_call = engine.collective_rpc.call_args_list[0]
         kwargs = validate_call.kwargs.get("kwargs", {})
-        assert list(kwargs["decode_vectors"][_HP][0]) == [0.5, 0.6]
+        # 0.5 is bit-exact in fp32; 0.6 round-trips with fp32 epsilon.
+        assert list(kwargs["decode_vectors"][_HP][0]) == pytest.approx(
+            [0.5, 0.6], rel=1e-6
+        )
         assert kwargs.get("vectors") is None
         assert kwargs.get("prefill_vectors") is None

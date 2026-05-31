@@ -95,20 +95,51 @@ def coerce_steering_spec(
     ``SteeringModuleRegistry._validate_layer_entry``) keep working
     unchanged.  Per-row ``scales`` are pre-applied during unpack.
 
+    For both shapes the inner layer-index keys are normalized to ``int``.
+    Pydantic v2 used to coerce JSON ``"0"`` → ``0`` when the protocol
+    field was typed ``dict[int, ...]``; the global-set and module-register
+    handlers now widen those fields to ``dict[str, Any]`` (to admit the
+    packed shape), so this helper takes over the int-key coercion that
+    callers downstream rely on (e.g. ``set`` math against worker-reported
+    ``validated_layers``, registry lookups keyed by ``int``).
+
     Returns ``None`` if *tier* is ``None`` or empty.  Raises ``ValueError``
-    on malformed packed payloads (length / shape mismatch).
+    on malformed packed payloads (length / shape mismatch) or on a legacy
+    inner key that cannot be converted to ``int``.
     """
     if not tier:
         return None
-    if not _looks_packed(tier):
-        return tier
-    unpacked = unpack_steering_vectors(tier)
-    if unpacked is None:
-        return None
-    return {
-        hook: {layer_idx: arr.tolist() for layer_idx, arr in layer_dict.items()}
-        for hook, layer_dict in unpacked.items()
-    }
+    if _looks_packed(tier):
+        unpacked = unpack_steering_vectors(tier)
+        if unpacked is None:
+            return None
+        return {
+            hook: {layer_idx: arr.tolist() for layer_idx, arr in layer_dict.items()}
+            for hook, layer_dict in unpacked.items()
+        }
+    # Legacy shape: ensure inner layer keys are ints, regardless of whether
+    # they arrived as ints (in-process callers) or strings (JSON over HTTP).
+    result: dict[str, dict[int, list[float] | dict]] = {}
+    for hook, layer_vecs in tier.items():
+        if not isinstance(layer_vecs, dict):
+            raise ValueError(
+                f"Steering tier {hook!r} must map layer indices to entries, "
+                f"got {type(layer_vecs).__name__}"
+            )
+        coerced_layers: dict[int, list[float] | dict] = {}
+        for layer_key, entry in layer_vecs.items():
+            if isinstance(layer_key, int):
+                coerced_layers[layer_key] = entry
+                continue
+            try:
+                coerced_layers[int(layer_key)] = entry
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Steering tier {hook!r} has invalid layer index "
+                    f"{layer_key!r}; expected an integer"
+                ) from exc
+        result[hook] = coerced_layers
+    return result
 
 
 def unpack_steering_vectors(
