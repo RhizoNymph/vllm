@@ -183,6 +183,39 @@ Important behavior:
 - `replace=true` clears all current steering before applying the new state
 - changing global base or prefill steering invalidates prefix-cache reuse
 
+Each tier in `/v1/steering/set` also accepts the binary wire shape used by
+per-request steering (`SteeringHookPacked`: base64-encoded
+`(num_layers, hidden_size)` blob + `layer_indices` + `dtype`/`shape`,
+optional per-row `scales`). The server detects the shape per hook and
+decodes via `np.frombuffer`, so a single client-side packing helper works
+across global and per-request paths:
+
+```python
+import base64
+
+import numpy as np
+import requests
+
+vec = np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
+stacked = np.stack([vec], axis=0)  # (num_layers, hidden_size)
+
+packed_hook = {
+    "dtype": str(stacked.dtype),
+    "shape": list(stacked.shape),
+    "layer_indices": [15],
+    "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+    "scales": [2.0],  # optional per-row scales
+}
+
+requests.post(
+    "http://localhost:8000/v1/steering/set",
+    json={"vectors": {"post_mlp": packed_hook}},
+)
+```
+
+Legacy and packed shapes can be mixed across tiers in the same request —
+e.g. `vectors` packed, `prefill_vectors` legacy.
+
 ### Clear Steering
 
 ```bash
@@ -316,12 +349,31 @@ The JSON file uses the same three-tier format as the global steering API:
 }
 ```
 
+Any tier in the file may instead use the binary-wire `SteeringHookPacked`
+shape — the loader detects the shape per hook. Useful when steering banks
+are large enough that the JSON list-of-floats parse becomes the dominant
+startup cost:
+
+```json
+{
+  "vectors": {
+    "post_mlp": {
+      "dtype": "float32",
+      "shape": [2, 2560],
+      "layer_indices": [15, 20],
+      "data": "<base64 of the (2, 2560) buffer>",
+      "scales": [1.0, 2.0]
+    }
+  }
+}
+```
+
 ### Registering at Runtime (API)
 
 Runtime management endpoints require `VLLM_SERVER_DEV_MODE=1`.
 
 ```bash
-# Register a module
+# Register a module (legacy JSON form)
 curl -X POST http://localhost:8000/v1/steering/modules/register \
   -H "Content-Type: application/json" \
   -d '{
@@ -338,6 +390,37 @@ curl http://localhost:8000/v1/steering/modules
 curl -X POST http://localhost:8000/v1/steering/modules/unregister \
   -H "Content-Type: application/json" \
   -d '{"name": "creativity"}'
+```
+
+`/v1/steering/modules/register` accepts the same binary-wire shape as
+`/v1/steering/set` and the per-request paths. The example below
+registers a module whose `vectors` tier is packed; the registry
+normalizes back to the legacy shape before storing so worker broadcast
+and per-request resolution stay unchanged:
+
+```python
+import base64
+
+import numpy as np
+import requests
+
+vec = np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
+stacked = np.stack([vec], axis=0)
+
+requests.post(
+    "http://localhost:8000/v1/steering/modules/register",
+    json={
+        "name": "creativity",
+        "vectors": {
+            "post_mlp": {
+                "dtype": str(stacked.dtype),
+                "shape": list(stacked.shape),
+                "layer_indices": [15],
+                "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+            }
+        },
+    },
+)
 ```
 
 ### Using Named Modules in Requests

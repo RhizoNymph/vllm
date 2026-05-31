@@ -67,6 +67,81 @@ class SteeringHookPacked(TypedDict):
 SteeringVectorSpecPacked = dict[str, SteeringHookPacked]
 
 
+def _looks_packed(tier: dict) -> bool:
+    """Detect whether *tier* is the binary ``SteeringVectorSpecPacked`` shape.
+
+    Both the legacy and packed shapes are ``dict[str, dict[...]]`` at the
+    top level; the discriminator lives in the inner dict.  ``SteeringHookPacked``
+    carries marker keys ``dtype`` and ``data``; the legacy form maps stringified
+    layer indices to lists or ``{"vector", "scale"}`` dicts.
+    """
+    first = next(iter(tier.values()), None)
+    return isinstance(first, dict) and "data" in first and "dtype" in first
+
+
+def coerce_steering_spec(
+    tier: dict | None,
+) -> dict[str, dict[int, list[float] | dict]] | None:
+    """Return *tier* as a ``SteeringVectorSpec``-shaped dict, unpacking the
+    binary wire form if present.
+
+    Packed tiers are detected via :func:`_looks_packed`, decoded with
+    :func:`unpack_steering_vectors`, then the resulting ``np.ndarray``
+    rows are flattened back to ``list[float]`` so the output is uniformly
+    legacy-shaped regardless of input.  The list conversion makes the
+    helper a single normalization seam for every steering ingestion site
+    (global set, module register, JSON file loader) — downstream
+    validators that strictly require ``list`` (see
+    ``SteeringModuleRegistry._validate_layer_entry``) keep working
+    unchanged.  Per-row ``scales`` are pre-applied during unpack.
+
+    For both shapes the inner layer-index keys are normalized to ``int``.
+    Pydantic v2 used to coerce JSON ``"0"`` → ``0`` when the protocol
+    field was typed ``dict[int, ...]``; the global-set and module-register
+    handlers now widen those fields to ``dict[str, Any]`` (to admit the
+    packed shape), so this helper takes over the int-key coercion that
+    callers downstream rely on (e.g. ``set`` math against worker-reported
+    ``validated_layers``, registry lookups keyed by ``int``).
+
+    Returns ``None`` if *tier* is ``None`` or empty.  Raises ``ValueError``
+    on malformed packed payloads (length / shape mismatch) or on a legacy
+    inner key that cannot be converted to ``int``.
+    """
+    if not tier:
+        return None
+    if _looks_packed(tier):
+        unpacked = unpack_steering_vectors(tier)
+        if unpacked is None:
+            return None
+        return {
+            hook: {layer_idx: arr.tolist() for layer_idx, arr in layer_dict.items()}
+            for hook, layer_dict in unpacked.items()
+        }
+    # Legacy shape: ensure inner layer keys are ints, regardless of whether
+    # they arrived as ints (in-process callers) or strings (JSON over HTTP).
+    result: dict[str, dict[int, list[float] | dict]] = {}
+    for hook, layer_vecs in tier.items():
+        if not isinstance(layer_vecs, dict):
+            raise ValueError(
+                f"Steering tier {hook!r} must map layer indices to entries, "
+                f"got {type(layer_vecs).__name__}"
+            )
+        coerced_layers: dict[int, list[float] | dict] = {}
+        for layer_key, entry in layer_vecs.items():
+            if isinstance(layer_key, int):
+                coerced_layers[layer_key] = entry
+                continue
+            try:
+                coerced_layers[int(layer_key)] = entry
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Steering tier {hook!r} has invalid layer index "
+                    f"{layer_key!r}; expected an integer"
+                ) from exc
+        result[hook] = coerced_layers
+    return result
+
+
 def unpack_steering_vectors(
     packed: SteeringVectorSpecPacked | None,
 ) -> dict[str, dict[int, np.ndarray]] | None:
