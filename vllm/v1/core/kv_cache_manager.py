@@ -507,7 +507,19 @@ class KVCacheManager:
         # the runner under TP1/PP1, so the global store is visible here.
         store = get_active_activation_store()
         if store is not None:
+            stats = store.stats()
             store.invalidate_all()
+            if stats.entries:
+                logger.info(
+                    "Capture activation store invalidated on prefix-cache "
+                    "reset: dropped entries=%d bytes=%d (lifetime hits=%d "
+                    "puts=%d evictions=%d)",
+                    stats.entries,
+                    stats.resident_bytes,
+                    stats.hits,
+                    stats.puts,
+                    stats.evictions,
+                )
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True

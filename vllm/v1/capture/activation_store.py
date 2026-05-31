@@ -48,8 +48,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.logger import init_logger
+
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+logger = init_logger(__name__)
 
 # ``(block_hash, offset_in_block, layer_idx, hook_name)``. ``block_hash``
 # chains the full prefix, so together with the within-block offset it
@@ -328,13 +332,29 @@ def try_reserve_store_serve(
         for hook, layer in hook_layers:
             key = activation_key(block_hashes, hash_block_size, pos, layer, hook)
             if key is None:
+                logger.debug(
+                    "activation store: req=%s has an unkeyable position "
+                    "(partial block); re-forwarding",
+                    req_id,
+                )
                 return False
             labels.append((layer, hook, pos))
             keys.append(key)
     rows = store.extract_all(keys)
     if rows is None:
+        logger.debug(
+            "activation store miss: req=%s keys=%d; re-forwarding",
+            req_id,
+            len(keys),
+        )
         return False
     stash_pending_serve(req_id, dict(zip(labels, rows)))
+    logger.debug(
+        "activation store serve reserved: req=%s positions=%d keys=%d",
+        req_id,
+        len(positions),
+        len(keys),
+    )
     return True
 
 

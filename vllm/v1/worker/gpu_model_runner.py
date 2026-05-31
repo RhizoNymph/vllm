@@ -586,6 +586,10 @@ class GPUModelRunner(
                 )
 
                 set_active_activation_store(ActivationStore(max_bytes=budget))
+                logger.info(
+                    "Capture activation store enabled: budget=%.3f GB",
+                    budget / 1_000_000_000,
+                )
 
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
