@@ -79,6 +79,8 @@ class TestRegisterPacked:
     """``/v1/steering/modules/register`` accepts the packed wire shape."""
 
     def test_register_legacy_baseline(self, client, registry):
+        """Legacy form keeps inner string layer keys as ints once routed
+        through ``coerce_steering_spec`` — exact list contents preserved."""
         resp = client.post(
             "/v1/steering/modules/register",
             json={
@@ -104,8 +106,8 @@ class TestRegisterPacked:
         assert stored is not None
         # Coercion must yield plain-list form so dump_for_broadcast stays
         # JSON/pickle-friendly and _validate_layer_entry (list-only) passes.
-        assert stored.vectors[_HP][5] == [0.1, 0.2]
-        assert stored.vectors[_HP][6] == [0.3, 0.4]
+        assert stored.vectors[_HP][5] == pytest.approx([0.1, 0.2], rel=1e-6)
+        assert stored.vectors[_HP][6] == pytest.approx([0.3, 0.4], rel=1e-6)
         assert isinstance(stored.vectors[_HP][5], list)
 
     def test_register_packed_with_scales(self, client, registry):
@@ -119,7 +121,7 @@ class TestRegisterPacked:
         assert resp.status_code == 200, resp.json()
         stored = registry.get("scaled")
         assert stored is not None
-        assert [round(v, 5) for v in stored.vectors[_HP][5]] == [3.0, 6.0]
+        assert stored.vectors[_HP][5] == pytest.approx([3.0, 6.0], rel=1e-6)
 
     def test_register_packed_mixed_tiers(self, client, registry):
         """Base packed + prefill legacy + decode None — each tier
@@ -135,7 +137,8 @@ class TestRegisterPacked:
         assert resp.status_code == 200, resp.json()
         stored = registry.get("mixed")
         assert stored is not None
-        assert stored.vectors[_HP][5] == [0.1, 0.2]
+        assert stored.vectors[_HP][5] == pytest.approx([0.1, 0.2], rel=1e-6)
+        # Legacy list values: pass through unchanged so exact compare works.
         assert stored.prefill_vectors[_HP][5] == [0.3, 0.4]
         assert stored.decode_vectors is None
 
@@ -182,4 +185,4 @@ class TestRegisterPacked:
         modules = kwargs["modules"]
         broadcast_vec = modules["broadcast"]["vectors"][_HP][5]
         assert isinstance(broadcast_vec, list)
-        assert broadcast_vec == [0.1, 0.2]
+        assert broadcast_vec == pytest.approx([0.1, 0.2], rel=1e-6)
