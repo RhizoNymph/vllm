@@ -658,18 +658,45 @@ The fix is staged in three layers, B → C → A:
   conservative skip. Offline-path clamping would require resolving specs
   in the offline path — a later extension.
 
-- **A — activation store (planned).** With steering off, a pristine
-  residual is a pure function of the prefix token ids, so it is
-  content-addressable by the same block-hash chain the KV cache uses. A
-  CPU-RAM, bounded, LRU, drop-on-eviction store keyed by
-  `(block_hash_chain, layer, hook, dtype, weights_version)` lets repeated
-  `all_prompt` captures over a fixed corpus serve from the store instead
-  of re-forwarding. C's tail re-forward write-through populates it. A
-  miss or eviction falls through to C (recompute) — the store is a pure
-  cache, never a source of truth; durability is the consumer's output,
-  not the store's. Participation requires steering off (taps are
-  pre-steering, but upstream steering poisons the residual) and must
-  invalidate on weight update (same hook as `reset_prefix_cache`).
+- **A — activation store (store core implemented; wiring in progress).**
+  A pristine residual is a pure function of the prefix token ids and the
+  weights, so it is content-addressable by the same block-hash chain the
+  KV cache uses. A CPU-RAM, bounded, LRU, drop-on-eviction store
+  (`vllm/v1/capture/activation_store.py`, `ActivationStore`) keyed by
+  `(block_hash, offset_in_block, layer, hook)` lets repeated `all_prompt`
+  captures over a fixed corpus serve from the store instead of
+  re-forwarding. A miss or eviction falls through to C (re-forward) — the
+  store is a pure cache, never a source of truth; durability is the
+  consumer's output, not the store's. Dtype/weights are not in the key:
+  one model runs at one dtype, and `invalidate_all` is called wholesale on
+  weight update (same path as `reset_prefix_cache`).
+
+  Two findings shaped the design. (1) Capture is TP1/PP1 only, and
+  `world_size==1` uses `UniProcExecutor`, so the scheduler
+  (`KVCacheManager`) and the capture manager run in **one process** — a
+  single shared `ActivationStore` instance, no cross-process coherence;
+  access is mutex-guarded because write-through runs on the capture
+  dispatch thread while the scheduler reads on the main thread. (2)
+  Activation steering is not yet implemented in this tree, so the
+  steering-off premise holds unconditionally for now; when steering lands,
+  the read/serve path must gate on steering being off (taps are
+  pre-steering, but upstream steering poisons the residual).
+
+  Remaining wiring sub-steps (block hashes live only in the engine-core
+  `Request`, not in the `CaptureManager`):
+  - **A.1 store core (done):** the data structure + global accessor +
+    tests.
+  - **A.2 read floor + write-through:** the scheduler computes per-captured
+    position store keys from `Request.block_hashes` + the resolved spec,
+    raises C's floor past store-resident positions, and passes keys to the
+    worker via the capture batch view; the worker writes freshly-captured
+    CPU rows under those keys.
+  - **A.3 serve-inject:** for store-resident positions that were not
+    forwarded, the worker fetches the stored rows and dispatches them to
+    the consumer as if captured.
+  - **A.4 config + invalidation:** a `--capture-activation-cache-gb` budget
+    flag, store instantiation, and the `invalidate_all` call on weight
+    update.
 
 ## Known Limitations
 
@@ -734,5 +761,8 @@ worth tightening:
   `capture_min_prompt_position`.
 - `tests/v1/core/test_prefix_caching.py::test_capture_clamps_prefix_cache_hit`
   — the C clamp end-to-end in `KVCacheManager.get_computed_blocks`.
+- `tests/v1/capture/test_activation_store.py` — the A-layer
+  `ActivationStore` core: LRU eviction, byte budget, oversize skip,
+  replacement accounting, invalidation, and the global accessor.
 - `tests/engine/test_arg_utils.py::TestCaptureConsumersFlag` —
   CLI-flag parsing.
