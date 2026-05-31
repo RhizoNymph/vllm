@@ -17,7 +17,10 @@ from vllm.v1.capture.activation_store import (
     ActivationStore,
     activation_key,
     get_active_activation_store,
+    pop_pending_serve,
     set_active_activation_store,
+    stash_pending_serve,
+    try_reserve_store_serve,
 )
 from vllm.v1.capture.manager import (
     CaptureManager,
@@ -162,6 +165,94 @@ class TestGlobalAccessor:
         finally:
             set_active_activation_store(None)
         assert get_active_activation_store() is None
+
+
+class TestExtractAll:
+    def test_returns_cloned_rows_in_key_order(self) -> None:
+        store = ActivationStore(max_bytes=10_000)
+        store.put(_key(0), _row(0.0))
+        store.put(_key(1), _row(1.0))
+        rows = store.extract_all([_key(1), _key(0)])
+        assert rows is not None
+        assert torch.equal(rows[0], _row(1.0))
+        assert torch.equal(rows[1], _row(0.0))
+
+    def test_all_or_nothing_on_any_miss(self) -> None:
+        store = ActivationStore(max_bytes=10_000)
+        store.put(_key(0), _row(0.0))
+        assert store.extract_all([_key(0), _key(9)]) is None
+
+    def test_rows_are_clones(self) -> None:
+        store = ActivationStore(max_bytes=10_000)
+        store.put(_key(0), _row(1.0))
+        rows = store.extract_all([_key(0)])
+        rows[0].zero_()  # mutating the extracted row must not touch the store
+        again = store.get(_key(0))
+        assert torch.equal(again, _row(1.0))
+
+
+class TestPendingServe:
+    def test_stash_and_pop(self) -> None:
+        payload = {(1, "post_mlp", 0): _row(0.0)}
+        stash_pending_serve("rq", payload)
+        assert pop_pending_serve("rq") is payload
+        assert pop_pending_serve("rq") is None  # cleared
+
+    def test_pop_unknown_is_none(self) -> None:
+        assert pop_pending_serve("never") is None
+
+
+class TestReserveStoreServe:
+    def _populate(self, store, block_hashes, hbs, hook_layers, positions):
+        for pos in positions:
+            for hook, layer in hook_layers:
+                store.put(
+                    activation_key(block_hashes, hbs, pos, layer, hook), _row(pos + 1)
+                )
+
+    def test_reserves_when_all_resident(self) -> None:
+        store = ActivationStore(max_bytes=10_000)
+        set_active_activation_store(store)
+        hook_layers = [("post_mlp", 1)]
+        positions = [0, 1]
+        self._populate(store, [b"b0"], 2, hook_layers, positions)
+        try:
+            ok = try_reserve_store_serve("rq", [b"b0"], 2, hook_layers, positions)
+            assert ok is True
+            payload = pop_pending_serve("rq")
+        finally:
+            set_active_activation_store(None)
+        assert payload is not None
+        assert set(payload.keys()) == {(1, "post_mlp", 0), (1, "post_mlp", 1)}
+
+    def test_no_reserve_on_any_miss(self) -> None:
+        store = ActivationStore(max_bytes=10_000)
+        set_active_activation_store(store)
+        hook_layers = [("post_mlp", 1)]
+        # Only position 0 is present; position 1 is missing.
+        self._populate(store, [b"b0"], 2, hook_layers, [0])
+        try:
+            ok = try_reserve_store_serve("rq", [b"b0"], 2, hook_layers, [0, 1])
+        finally:
+            set_active_activation_store(None)
+        assert ok is False
+        assert pop_pending_serve("rq") is None  # nothing stashed
+
+    def test_no_reserve_without_store(self) -> None:
+        set_active_activation_store(None)
+        assert (
+            try_reserve_store_serve("rq", [b"b0"], 2, [("post_mlp", 1)], [0]) is False
+        )
+
+    def test_no_reserve_on_unkeyable_position(self) -> None:
+        store = ActivationStore(max_bytes=10_000)
+        set_active_activation_store(store)
+        try:
+            # position 4 -> block 2, but only one block is hashed -> unkeyable.
+            ok = try_reserve_store_serve("rq", [b"b0"], 2, [("post_mlp", 1)], [4])
+        finally:
+            set_active_activation_store(None)
+        assert ok is False
 
 
 class TestActivationKey:

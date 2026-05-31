@@ -165,6 +165,32 @@ class ActivationStore:
             self._resident_bytes -= self._row_bytes(evicted)
             self._evictions += 1
 
+    def extract_all(self, keys: list[ActivationKey]) -> list[torch.Tensor] | None:
+        """Atomically return cloned rows for ALL ``keys``, or ``None``.
+
+        All-or-nothing under a single lock acquisition: if every key is
+        present, returns their rows (cloned, so later eviction cannot affect
+        them) in ``keys`` order and LRU-touches them; if any key is missing,
+        returns ``None`` and stores nothing of the partial result. This is
+        the read/serve primitive — taking the snapshot under the lock at
+        decision time is what makes whole-prefix store reuse free of a
+        check-then-serve eviction race.
+        """
+        with self._lock:
+            found: list[tuple[ActivationKey, torch.Tensor]] = []
+            for key in keys:
+                row = self._entries.get(key)
+                if row is None:
+                    self._misses += 1
+                    return None
+                found.append((key, row))
+            out: list[torch.Tensor] = []
+            for key, row in found:
+                self._entries.move_to_end(key)
+                out.append(row.clone())
+            self._hits += len(found)
+            return out
+
     def invalidate_all(self) -> None:
         """Drop every entry. Must be called when model weights change."""
         with self._lock:
@@ -240,11 +266,88 @@ def get_active_activation_store() -> ActivationStore | None:
     return _ACTIVE_ACTIVATION_STORE
 
 
+# ---------------------------------------------------------------------------
+# Pending serve bridge (scheduler thread -> worker)
+# ---------------------------------------------------------------------------
+#
+# When the scheduler decides a capture request's prompt prefix can be served
+# wholly from the store (so it is not re-forwarded), it extracts the rows
+# under the store lock and stashes them here keyed by request id. The worker
+# drains them at registration and submits them to consumers as if captured.
+# A process-global is sound because capture is TP1/PP1 only, so scheduler and
+# worker share one process; the rows are already cloned snapshots.
+
+# ``(layer_idx, hook_name, position) -> CPU row``.
+ServeKey = tuple[int, str, int]
+ServePayload = dict[ServeKey, "torch.Tensor"]
+
+_PENDING_SERVES: dict[str, ServePayload] = {}
+_PENDING_SERVES_LOCK = threading.Lock()
+
+
+def stash_pending_serve(req_id: str, payload: ServePayload) -> None:
+    """Record rows the worker should serve from the store for ``req_id``."""
+    with _PENDING_SERVES_LOCK:
+        _PENDING_SERVES[req_id] = payload
+
+
+def pop_pending_serve(req_id: str) -> ServePayload | None:
+    """Take (and clear) the pending serve payload for ``req_id``, if any."""
+    with _PENDING_SERVES_LOCK:
+        return _PENDING_SERVES.pop(req_id, None)
+
+
+def try_reserve_store_serve(
+    req_id: str,
+    block_hashes: list[BlockHash],
+    hash_block_size: int,
+    hook_layers: list[tuple[str, int]],
+    positions: list[int],
+) -> bool:
+    """Reserve a whole-prefix store serve for a capture request.
+
+    Returns ``True`` — and stashes the rows for the worker via
+    :func:`stash_pending_serve` — iff the active store holds *every*
+    ``(position, layer, hook)`` the request captures, so the prompt prefix
+    can be served from the store instead of re-forwarded. Returns ``False``
+    and stashes nothing on no store, an unkeyable position (a partial,
+    unhashed block), or any miss; the caller then falls back to the C
+    re-forward clamp. All-or-nothing: a captured position is never left to
+    be served from the KV cache without its residual being available.
+
+    The store snapshot is taken atomically under the store lock
+    (:meth:`ActivationStore.extract_all`), so concurrent write-through /
+    eviction on the dispatch thread cannot race this decision.
+    """
+    store = get_active_activation_store()
+    if store is None or not hook_layers or not positions:
+        return False
+    labels: list[ServeKey] = []
+    keys: list[ActivationKey] = []
+    for pos in positions:
+        for hook, layer in hook_layers:
+            key = activation_key(block_hashes, hash_block_size, pos, layer, hook)
+            if key is None:
+                return False
+            labels.append((layer, hook, pos))
+            keys.append(key)
+    rows = store.extract_all(keys)
+    if rows is None:
+        return False
+    stash_pending_serve(req_id, dict(zip(labels, rows)))
+    return True
+
+
 __all__ = [
     "ActivationKey",
     "ActivationStore",
     "ActivationStoreStats",
+    "ServeKey",
+    "ServePayload",
     "activation_key",
     "get_active_activation_store",
+    "pop_pending_serve",
     "set_active_activation_store",
+    "stash_pending_serve",
+    "try_reserve_store_serve",
 ]

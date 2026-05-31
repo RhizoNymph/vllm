@@ -697,10 +697,30 @@ The fix is staged in three layers, B → C → A:
     being re-derived worker-side, because it can diverge from the KV block
     size; using the wrong granularity would silently misalign keys. No
     behavior change yet — this only fills the store.
-  - **A.3 read floor + serve-inject:** raise C's floor past store-resident
-    positions (so they are not re-forwarded) and have the worker fetch the
-    stored rows and dispatch them to the consumer as if captured. This is
-    where the store starts saving compute.
+  - **A.3 read floor + serve-inject (primitives done; serve wiring
+    pending a decision):** raise C's floor past store-resident positions
+    (so they are not re-forwarded) and have the worker fetch the stored
+    rows and dispatch them to the consumer as if captured. The race-safe
+    store primitives are landed: `ActivationStore.extract_all` (an atomic
+    all-or-nothing snapshot under the store lock — taking the rows at
+    decision time is what frees the read path from a check-then-serve
+    eviction race against dispatch-thread write-through/eviction), the
+    same-process serve bridge (`stash_pending_serve` / `pop_pending_serve`,
+    sound because capture is TP1/PP1), and `try_reserve_store_serve` (the
+    scheduler-side reserve: compose keys, extract, stash for the worker).
+
+    Wiring these into `get_computed_blocks` (raise the floor) and the
+    worker (serve-inject) is blocked on one design decision: serving a
+    prompt position means `num_computed_tokens` advances over it, but the
+    capture validator *rejects* captured positions `< num_computed_tokens`
+    (the "captured ⇒ forwarded" invariant, `validation.py`). The two clean
+    resolutions are (1) **spec-split** — register only the
+    generated/uncached positions for forward-capture and serve the prompt
+    positions from the store separately (pure `all_prompt` registers
+    nothing, serves everything); or (2) **serve-aware validator** — thread
+    the served-position set into `CaptureContext` so the validator skips
+    its rejection for them. (1) is preferred — it keeps the validator
+    invariant intact and localizes the change to registration.
   - **A.4 config + invalidation:** a `--capture-activation-cache-gb` budget
     flag, store instantiation, and the `invalidate_all` call on weight
     update.
@@ -771,7 +791,9 @@ worth tightening:
 - `tests/v1/capture/test_activation_store.py` — the A-layer
   `ActivationStore` core (LRU eviction, byte budget, oversize skip,
   replacement accounting, invalidation, global accessor), the
-  `activation_key` composition, and `CaptureManager` write-through
-  (content keying, prompt-only, clone-off-buffer, no-op guards).
+  `activation_key` composition, `CaptureManager` write-through
+  (content keying, prompt-only, clone-off-buffer, no-op guards), and the
+  A.3 read primitives (`extract_all` all-or-nothing, the pending-serve
+  bridge, `try_reserve_store_serve`).
 - `tests/engine/test_arg_utils.py::TestCaptureConsumersFlag` —
   CLI-flag parsing.
