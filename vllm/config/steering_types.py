@@ -67,6 +67,50 @@ class SteeringHookPacked(TypedDict):
 SteeringVectorSpecPacked = dict[str, SteeringHookPacked]
 
 
+def _looks_packed(tier: dict) -> bool:
+    """Detect whether *tier* is the binary ``SteeringVectorSpecPacked`` shape.
+
+    Both the legacy and packed shapes are ``dict[str, dict[...]]`` at the
+    top level; the discriminator lives in the inner dict.  ``SteeringHookPacked``
+    carries marker keys ``dtype`` and ``data``; the legacy form maps stringified
+    layer indices to lists or ``{"vector", "scale"}`` dicts.
+    """
+    first = next(iter(tier.values()), None)
+    return isinstance(first, dict) and "data" in first and "dtype" in first
+
+
+def coerce_steering_spec(
+    tier: dict | None,
+) -> dict[str, dict[int, list[float] | dict]] | None:
+    """Return *tier* as a ``SteeringVectorSpec``-shaped dict, unpacking the
+    binary wire form if present.
+
+    Packed tiers are detected via :func:`_looks_packed`, decoded with
+    :func:`unpack_steering_vectors`, then the resulting ``np.ndarray``
+    rows are flattened back to ``list[float]`` so the output is uniformly
+    legacy-shaped regardless of input.  The list conversion makes the
+    helper a single normalization seam for every steering ingestion site
+    (global set, module register, JSON file loader) — downstream
+    validators that strictly require ``list`` (see
+    ``SteeringModuleRegistry._validate_layer_entry``) keep working
+    unchanged.  Per-row ``scales`` are pre-applied during unpack.
+
+    Returns ``None`` if *tier* is ``None`` or empty.  Raises ``ValueError``
+    on malformed packed payloads (length / shape mismatch).
+    """
+    if not tier:
+        return None
+    if not _looks_packed(tier):
+        return tier
+    unpacked = unpack_steering_vectors(tier)
+    if unpacked is None:
+        return None
+    return {
+        hook: {layer_idx: arr.tolist() for layer_idx, arr in layer_dict.items()}
+        for hook, layer_dict in unpacked.items()
+    }
+
+
 def unpack_steering_vectors(
     packed: SteeringVectorSpecPacked | None,
 ) -> dict[str, dict[int, np.ndarray]] | None:

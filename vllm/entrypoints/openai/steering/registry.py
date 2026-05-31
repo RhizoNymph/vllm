@@ -18,6 +18,8 @@ from typing import Any
 
 from vllm.config.steering_types import (
     SteeringVectorSpec,
+    _looks_packed,
+    coerce_steering_spec,
     merge_steering_specs,
     normalize_layer_entry,
 )
@@ -48,11 +50,26 @@ class SteeringModuleRegistry:
     async def register(
         self,
         name: str,
-        vectors: SteeringVectorSpec | None = None,
-        prefill_vectors: SteeringVectorSpec | None = None,
-        decode_vectors: SteeringVectorSpec | None = None,
+        vectors: SteeringVectorSpec | dict | None = None,
+        prefill_vectors: SteeringVectorSpec | dict | None = None,
+        decode_vectors: SteeringVectorSpec | dict | None = None,
     ) -> None:
-        """Register a named steering module. Overwrites if name exists."""
+        """Register a named steering module. Overwrites if name exists.
+
+        Each tier may be either the legacy ``SteeringVectorSpec`` shape or
+        the binary-wire ``SteeringVectorSpecPacked`` shape; the latter is
+        normalized to the former via :func:`coerce_steering_spec` so the
+        stored ``SteeringModule`` always carries the legacy shape and
+        ``dump_for_broadcast`` continues to emit pickle-friendly plain
+        Python collections.
+        """
+        # Normalize packed-shape inputs to legacy shape so downstream
+        # validation (_validate_layer_entry) and the broadcast payload
+        # both see plain lists.
+        vectors = coerce_steering_spec(vectors)
+        prefill_vectors = coerce_steering_spec(prefill_vectors)
+        decode_vectors = coerce_steering_spec(decode_vectors)
+
         # Validate that at least one tier has vectors
         if not vectors and not prefill_vectors and not decode_vectors:
             raise ValueError(f"Steering module '{name}' has no vectors in any tier")
@@ -134,15 +151,15 @@ class SteeringModuleRegistry:
     async def load_from_file(self, name: str, path: str) -> None:
         """Load a steering module from a JSON file and register it.
 
-        Expected JSON format::
+        Each tier in the JSON file may be either the legacy shape::
 
-            {
-                "vectors": {"post_mlp": {"14": [0.1, ...]}},
-                "prefill_vectors": {"pre_attn": {"14": [0.3, ...]}},
-                "decode_vectors": null,
-            }
+            {"vectors": {"post_mlp": {"14": [0.1, ...]}}}
 
-        JSON uses string keys for layer indices; they are converted to int.
+        (string layer keys are converted to int) or the binary-wire
+        ``SteeringVectorSpecPacked`` shape (base64-encoded ``data`` field
+        plus ``dtype``/``shape``/``layer_indices``), which is decoded via
+        :func:`coerce_steering_spec`.  Both shapes survive ``json.load``
+        because the packed ``data`` field is a base64 ASCII string.
         """
         file_path = Path(path)
         if not file_path.exists():
@@ -157,12 +174,11 @@ class SteeringModuleRegistry:
                 f"got {type(data).__name__}"
             )
 
-        # Extract three tiers, converting string layer keys to int
-        vectors = _convert_layer_keys(data.get("vectors"), field_name="vectors")
-        prefill_vectors = _convert_layer_keys(
+        vectors = _load_tier_from_json(data.get("vectors"), field_name="vectors")
+        prefill_vectors = _load_tier_from_json(
             data.get("prefill_vectors"), field_name="prefill_vectors"
         )
-        decode_vectors = _convert_layer_keys(
+        decode_vectors = _load_tier_from_json(
             data.get("decode_vectors"), field_name="decode_vectors"
         )
 
@@ -267,6 +283,33 @@ class SteeringModuleRegistry:
                 f"{layer_idx}. Valid steerable layers: "
                 f"{sorted(self._valid_layer_indices) or 'none'}"
             )
+
+
+def _load_tier_from_json(
+    tier: dict[str, Any] | None,
+    *,
+    field_name: str,
+) -> SteeringVectorSpec | None:
+    """Decode a single steering tier from a parsed JSON object.
+
+    Routes between the legacy and packed shapes: packed inputs go through
+    :func:`coerce_steering_spec` (which decodes the base64 blob and
+    returns int-keyed ``list[float]`` rows directly); legacy inputs go
+    through :func:`_convert_layer_keys` to coerce JSON string layer keys
+    into ints.
+    """
+    if tier is None:
+        return None
+    if not isinstance(tier, dict):
+        raise ValueError(
+            f"Steering module field {field_name!r} must be a JSON object, "
+            f"got {type(tier).__name__}"
+        )
+    if not tier:
+        return None
+    if _looks_packed(tier):
+        return coerce_steering_spec(tier)
+    return _convert_layer_keys(tier, field_name=field_name)
 
 
 def _convert_layer_keys(

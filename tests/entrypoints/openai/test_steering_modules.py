@@ -395,6 +395,101 @@ class TestSteeringModuleRegistry:
         finally:
             os.unlink(tmp_path)
 
+    # --- load_from_file: binary-wire packed tier shape ---
+
+    @pytest.mark.asyncio
+    async def test_load_from_file_packed_tier(self):
+        """A JSON file may carry a SteeringHookPacked blob per tier; the
+        loader detects the shape and decodes it to legacy int-keyed
+        ``list[float]`` form before the registry sees it."""
+        import pybase64 as base64
+
+        import numpy as np
+
+        vec = np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
+        stacked = np.stack([vec], axis=0)
+        packed_hook = {
+            "dtype": "float32",
+            "shape": list(stacked.shape),
+            "layer_indices": [14],
+            "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+        }
+        data = {
+            "vectors": {"post_mlp": packed_hook},
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            tmp_path = f.name
+
+        try:
+            registry = SteeringModuleRegistry()
+            await registry.load_from_file("packed", tmp_path)
+            module = registry.get("packed")
+            assert module is not None
+            stored = module.vectors["post_mlp"][14]
+            assert isinstance(stored, list)
+            assert [round(v, 5) for v in stored] == [
+                round(float(x), 5) for x in vec
+            ]
+        finally:
+            os.unlink(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_load_from_file_packed_with_scales(self):
+        """Per-row ``scales`` from the packed file are pre-applied at
+        unpack time, mirroring the per-request packed path."""
+        import pybase64 as base64
+
+        import numpy as np
+
+        vec = np.asarray([1.0, 2.0], dtype=np.float32)
+        stacked = np.stack([vec], axis=0)
+        packed_hook = {
+            "dtype": "float32",
+            "shape": list(stacked.shape),
+            "layer_indices": [14],
+            "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+            "scales": [3.0],
+        }
+        data = {"vectors": {"post_mlp": packed_hook}}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            tmp_path = f.name
+
+        try:
+            registry = SteeringModuleRegistry()
+            await registry.load_from_file("packed_scaled", tmp_path)
+            stored = registry.get("packed_scaled").vectors["post_mlp"][14]
+            assert [round(v, 5) for v in stored] == [3.0, 6.0]
+        finally:
+            os.unlink(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_load_from_file_packed_malformed_raises(self):
+        """A packed blob whose ``data`` byte length disagrees with
+        ``shape``/``dtype`` raises ``ValueError`` — same exception type
+        the legacy loader uses, so callers do not need to special-case
+        the packed path."""
+        import pybase64 as base64
+
+        bad_hook = {
+            "dtype": "float32",
+            "shape": [1, 4],
+            "layer_indices": [14],
+            "data": base64.b64encode(b"\x00" * 8).decode("ascii"),
+        }
+        data = {"vectors": {"post_mlp": bad_hook}}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            tmp_path = f.name
+
+        try:
+            registry = SteeringModuleRegistry()
+            with pytest.raises(ValueError, match="data length"):
+                await registry.load_from_file("packed_bad", tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
 
 @pytest.mark.asyncio
 async def test_init_app_state_only_sets_registry_when_steering_enabled():

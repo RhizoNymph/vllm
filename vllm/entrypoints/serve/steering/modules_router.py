@@ -7,6 +7,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import vllm.envs as envs
+from vllm.config.steering_types import coerce_steering_spec
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.steering.modules_protocol import (
     RegisterSteeringModuleRequest,
@@ -113,12 +114,26 @@ async def register_steering_module(
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
 
+    # Each tier may arrive as either the legacy SteeringVectorSpec or the
+    # binary-wire SteeringVectorSpecPacked shape; normalize before handing
+    # off so the registry, the broadcast payload, and the pre-materialize
+    # path all see the same legacy-shaped dict.
+    try:
+        vectors = coerce_steering_spec(request.vectors)
+        prefill_vectors = coerce_steering_spec(request.prefill_vectors)
+        decode_vectors = coerce_steering_spec(request.decode_vectors)
+    except (KeyError, ValueError, TypeError) as err:
+        return JSONResponse(
+            content={"error": f"Malformed steering payload: {err}"},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+
     try:
         await registry.register(
             name=request.name,
-            vectors=request.vectors,
-            prefill_vectors=request.prefill_vectors,
-            decode_vectors=request.decode_vectors,
+            vectors=vectors,
+            prefill_vectors=prefill_vectors,
+            decode_vectors=decode_vectors,
         )
         # Push the freshly-registered module to every worker so requests
         # carrying ``SamplingParams.steering_module_ref`` resolve it
@@ -129,9 +144,9 @@ async def register_steering_module(
             engine,
             request.name,
             {
-                "vectors": request.vectors,
-                "prefill_vectors": request.prefill_vectors,
-                "decode_vectors": request.decode_vectors,
+                "vectors": vectors,
+                "prefill_vectors": prefill_vectors,
+                "decode_vectors": decode_vectors,
             },
         )
         # Eagerly upload the module's vectors to the manager so the

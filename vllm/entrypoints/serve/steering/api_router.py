@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 import vllm.envs as envs
 from vllm.config.steering_types import (
     SteeringVectorSpec,
+    coerce_steering_spec,
     normalize_layer_entry,
 )
 from vllm.engine.protocol import EngineClient
@@ -138,14 +139,23 @@ async def set_steering(
 
     engine = engine_client(raw_request)
 
-    # Collect all tiers that have data.
+    # Collect all tiers that have data.  Each tier may arrive as either the
+    # legacy SteeringVectorSpec or the binary-wire SteeringVectorSpecPacked
+    # shape; ``coerce_steering_spec`` decodes the latter to ndarray entries
+    # that the downstream resolver/normalizer accepts transparently.
     tiers: dict[str, SteeringVectorSpec] = {}
-    if request.vectors:
-        tiers["vectors"] = request.vectors
-    if request.prefill_vectors:
-        tiers["prefill_vectors"] = request.prefill_vectors
-    if request.decode_vectors:
-        tiers["decode_vectors"] = request.decode_vectors
+    try:
+        if (v := coerce_steering_spec(request.vectors)) is not None:
+            tiers["vectors"] = v
+        if (v := coerce_steering_spec(request.prefill_vectors)) is not None:
+            tiers["prefill_vectors"] = v
+        if (v := coerce_steering_spec(request.decode_vectors)) is not None:
+            tiers["decode_vectors"] = v
+    except (KeyError, ValueError, TypeError) as err:
+        return JSONResponse(
+            content={"error": f"Malformed steering payload: {err}"},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
 
     if not tiers:
         return JSONResponse(
