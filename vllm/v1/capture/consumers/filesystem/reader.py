@@ -1,0 +1,181 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Reference reader for filesystem-captured activations.
+
+Reads both on-disk layouts produced by :class:`FilesystemConsumer` and
+returns the captured tensors as NumPy arrays. NumPy-only (no torch) so
+offline analysis scripts can import it in a lightweight environment.
+
+Layouts
+-------
+``per_file`` (one file per ``(layer, hook)``)::
+
+    {root}/{tag}/{request}/{layer}_{hook}.bin    raw bytes, residual dtype
+    {root}/{tag}/{request}/{layer}_{hook}.json   {request_id, layer, hook,
+                                                  shape, dtype, ...}
+
+``packed`` (one file per request, all tensors concatenated)::
+
+    {root}/{tag}/{request}/packed.bin            raw bytes, concatenated
+    {root}/{tag}/{request}/packed.json           {request_id, layout:"packed",
+                                                  dtype, entries:[
+                                                    {layer, hook, offset,
+                                                     nbytes, shape}, ...]}
+
+Both ``.bin`` files use the same byte encoding as the original format:
+raw little-endian bytes in the model's residual dtype, with ``bfloat16``
+stored as raw ``uint16`` (NumPy has no native bf16). Such captures are
+returned here as ``uint16`` arrays; recover bf16 with
+``torch.from_numpy(arr).view(torch.bfloat16)``.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+from dataclasses import dataclass
+
+import numpy as np
+
+from vllm.v1.capture.consumers.filesystem.types import (
+    PACKED_BIN_NAME,
+    PACKED_INDEX_NAME,
+)
+
+# Logical dtype string (as recorded in the sidecar) -> NumPy dtype used to
+# interpret the on-disk bytes. bfloat16 has no NumPy equivalent, so its
+# bytes are read as uint16 (their on-disk representation).
+_DTYPE_TO_NUMPY: dict[str, str] = {
+    "float64": "float64",
+    "float32": "float32",
+    "float16": "float16",
+    "bfloat16": "uint16",
+    "uint16": "uint16",
+    "int8": "int8",
+    "uint8": "uint8",
+    "int16": "int16",
+    "int32": "int32",
+    "int64": "int64",
+}
+
+# Used when a per_file sidecar predates the self-describing ``dtype`` field.
+_DEFAULT_DTYPE = "float32"
+
+
+@dataclass
+class CaptureEntry:
+    """One captured ``(layer, hook)`` tensor, decoded to NumPy."""
+
+    layer: int
+    hook: str
+    array: np.ndarray  # shape (rows, hidden); bf16 captures come back uint16
+    dtype: str  # logical dtype string from the sidecar (e.g. "bfloat16")
+
+
+def _np_dtype(logical: str) -> np.dtype:
+    try:
+        return np.dtype(_DTYPE_TO_NUMPY[logical])
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown capture dtype {logical!r}; known: {sorted(_DTYPE_TO_NUMPY)}"
+        ) from exc
+
+
+def _decode(buf: bytes, shape: list[int], logical_dtype: str) -> np.ndarray:
+    arr = np.frombuffer(buf, dtype=_np_dtype(logical_dtype))
+    return arr.reshape(shape)
+
+
+def read_per_file(bin_path: str | pathlib.Path) -> CaptureEntry:
+    """Read a single ``per_file`` capture (``{layer}_{hook}.bin`` + sidecar)."""
+    bin_path = pathlib.Path(bin_path)
+    sidecar_path = bin_path.with_suffix(".json")
+    sidecar = json.loads(sidecar_path.read_text())
+    dtype = sidecar.get("dtype", _DEFAULT_DTYPE)
+    shape = sidecar["shape"]
+    array = _decode(bin_path.read_bytes(), shape, dtype)
+    return CaptureEntry(
+        layer=int(sidecar["layer"]),
+        hook=str(sidecar["hook"]),
+        array=array,
+        dtype=dtype,
+    )
+
+
+def read_packed(
+    path: str | pathlib.Path,
+) -> dict[tuple[int, str], CaptureEntry]:
+    """Read a ``packed`` capture (``packed.json`` index + ``packed.bin``).
+
+    ``path`` may be the index file, the bin file, or the request directory.
+    Returns a dict keyed by ``(layer, hook)``.
+    """
+    path = pathlib.Path(path)
+    if path.is_dir():
+        index_path = path / PACKED_INDEX_NAME
+    elif path.name == PACKED_BIN_NAME:
+        index_path = path.with_name(PACKED_INDEX_NAME)
+    else:
+        index_path = path
+    index = json.loads(index_path.read_text())
+    dtype = index["dtype"]
+    bin_path = index_path.with_name(PACKED_BIN_NAME)
+    raw = bin_path.read_bytes()
+
+    # A (layer, hook) capture may span several entries — one per
+    # submitted chunk (decode step) — because chunks for different keys
+    # interleave in submission order. Group by key and concatenate the
+    # chunk arrays in byte-offset order to recover the full tensor.
+    grouped: dict[tuple[int, str], list[tuple[int, np.ndarray]]] = {}
+    for entry in index["entries"]:
+        offset = int(entry["offset"])
+        nbytes = int(entry["nbytes"])
+        chunk = raw[offset : offset + nbytes]
+        if len(chunk) != nbytes:
+            raise ValueError(
+                f"packed bin {bin_path} truncated: entry "
+                f"({entry['layer']}, {entry['hook']}) wants bytes "
+                f"[{offset}:{offset + nbytes}] but file is {len(raw)} bytes"
+            )
+        layer, hook = int(entry["layer"]), str(entry["hook"])
+        grouped.setdefault((layer, hook), []).append(
+            (offset, _decode(chunk, entry["shape"], dtype))
+        )
+
+    out: dict[tuple[int, str], CaptureEntry] = {}
+    for (layer, hook), parts in grouped.items():
+        parts.sort(key=lambda p: p[0])
+        arrays = [a for _, a in parts]
+        array = arrays[0] if len(arrays) == 1 else np.concatenate(arrays, axis=0)
+        out[(layer, hook)] = CaptureEntry(
+            layer=layer, hook=hook, array=array, dtype=dtype
+        )
+    return out
+
+
+def read_request(
+    request_dir: str | pathlib.Path,
+) -> dict[tuple[int, str], CaptureEntry]:
+    """Read every capture for a request, auto-detecting the layout.
+
+    ``packed`` if a ``packed.json`` index is present, else ``per_file``
+    (one entry per ``{layer}_{hook}.bin``).
+    """
+    request_dir = pathlib.Path(request_dir)
+    if (request_dir / PACKED_INDEX_NAME).exists():
+        return read_packed(request_dir)
+    out: dict[tuple[int, str], CaptureEntry] = {}
+    for bin_path in sorted(request_dir.glob("*.bin")):
+        if bin_path.name == PACKED_BIN_NAME:
+            continue
+        entry = read_per_file(bin_path)
+        out[(entry.layer, entry.hook)] = entry
+    return out
+
+
+__all__ = [
+    "CaptureEntry",
+    "read_per_file",
+    "read_packed",
+    "read_request",
+]

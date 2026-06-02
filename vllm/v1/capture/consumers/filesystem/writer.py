@@ -168,6 +168,8 @@ class ActivationWriter:
         timeout_seconds: float = 180.0,
         on_collision: CollisionPolicy = "overwrite",
         fd_cache_size: int = 256,
+        fsync: bool = True,
+        atomic_publish: bool = True,
     ) -> None:
         if num_threads <= 0:
             raise ValueError(f"num_threads must be >= 1, got {num_threads}")
@@ -182,6 +184,13 @@ class ActivationWriter:
                 f"on_collision must be one of 'overwrite' / 'error' / "
                 f"'suffix', got {on_collision!r}"
             )
+        if not atomic_publish and on_collision != "overwrite":
+            # Direct-write mode has no rename step to enforce a
+            # collision policy against, so it only supports overwrite.
+            raise ValueError(
+                "atomic_publish=False requires on_collision='overwrite', "
+                f"got {on_collision!r}"
+            )
 
         self.root = pathlib.Path(root)
         self.num_threads = num_threads
@@ -189,6 +198,22 @@ class ActivationWriter:
         self.timeout_seconds = timeout_seconds
         self.on_collision: CollisionPolicy = on_collision
         self.fd_cache_size = fd_cache_size
+        # When False, skip every ``os.fsync``. On network filesystems an
+        # fsync-per-file is the dominant finalize cost (a synchronous
+        # server round-trip each); skipping it trades crash-durability
+        # for throughput. The atomic ``os.replace`` still gives readers
+        # close-to-open visibility (NFS flushes dirty pages on close),
+        # so consumers see complete files either way — only durability
+        # across a server crash is relaxed.
+        self._fsync = fsync
+        # When True, writes land on ``<path>.tmp`` and an atomic
+        # ``os.replace`` publishes them. When False, write straight to
+        # the final path and skip the rename. On NFS each ``rename`` is
+        # a synchronous metadata RPC; dropping the two per capture
+        # (.bin + sidecar) is the main lever for small-capture
+        # throughput, at the cost of atomic visibility (a reader can
+        # observe a partially written file mid-capture).
+        self._atomic = atomic_publish
 
         self._queues: list[queue.Queue[Any]] = [
             queue.Queue(maxsize=queue_size) for _ in range(num_threads)
@@ -428,17 +453,21 @@ class ActivationWriter:
     # ------------------------------------------------------------------
     # WriteTask handling
 
+    def _target_path(self, path: pathlib.Path) -> pathlib.Path:
+        """Where bytes are written: ``.tmp`` sibling if atomic, else final."""
+        return _tmp_path(path) if self._atomic else path
+
     def _handle_write(self, partition: _PartitionState, task: WriteTask) -> None:
-        tmp_path = _tmp_path(task.path)
-        fd = self._acquire_fd(partition, task.key, tmp_path, task.append)
+        target = self._target_path(task.path)
+        fd = self._acquire_fd(partition, task.key, target, task.append)
         try:
             _full_write(fd, task.payload)
         except OSError as exc:
             # Evict the fd on I/O error so the next attempt reopens.
             self._drop_fd(partition, task.key, fsync=False)
             raise WriteError(
-                f"write to {tmp_path} failed: {exc}",
-                path=tmp_path,
+                f"write to {target} failed: {exc}",
+                path=target,
                 key=task.key,
                 errno_code=exc.errno,
             ) from exc
@@ -491,14 +520,15 @@ class ActivationWriter:
         cache = partition.fd_cache
         while len(cache) > partition.cache_capacity:
             evict_key, evict_fd = cache.popitem(last=False)
-            try:
-                os.fsync(evict_fd)
-            except OSError as exc:
-                logger.warning(
-                    "fsync on evicted fd for key=%s failed: %s",
-                    evict_key,
-                    exc,
-                )
+            if self._fsync:
+                try:
+                    os.fsync(evict_fd)
+                except OSError as exc:
+                    logger.warning(
+                        "fsync on evicted fd for key=%s failed: %s",
+                        evict_key,
+                        exc,
+                    )
             try:
                 os.close(evict_fd)
             except OSError as exc:  # pragma: no cover - best effort
@@ -518,7 +548,7 @@ class ActivationWriter:
         fd = partition.fd_cache.pop(key, None)
         if fd is None:
             return None
-        if fsync:
+        if fsync and self._fsync:
             try:
                 os.fsync(fd)
             except OSError as exc:
@@ -532,10 +562,13 @@ class ActivationWriter:
     def _close_all_fds(self, partition: _PartitionState) -> None:
         while partition.fd_cache:
             key, fd = partition.fd_cache.popitem(last=False)
-            try:
-                os.fsync(fd)
-            except OSError as exc:
-                logger.warning("fsync on shutdown fd for key=%s failed: %s", key, exc)
+            if self._fsync:
+                try:
+                    os.fsync(fd)
+                except OSError as exc:
+                    logger.warning(
+                        "fsync on shutdown fd for key=%s failed: %s", key, exc
+                    )
             try:
                 os.close(fd)
             except OSError as exc:  # pragma: no cover - best effort
@@ -556,8 +589,8 @@ class ActivationWriter:
                 self._drop_fd(partition, task.key, fsync=False)
                 return
 
-        bin_tmp = _tmp_path(task.bin_path)
-        sidecar_tmp = _tmp_path(task.sidecar_path)
+        bin_tmp = self._target_path(task.bin_path)
+        sidecar_tmp = self._target_path(task.sidecar_path)
 
         # Ensure the .bin.tmp exists. If no WriteTask was ever sent
         # for this key (zero-byte capture), touch the tmp file now so
@@ -588,17 +621,18 @@ class ActivationWriter:
             cached_fd = None
         if cached_fd is not None:
             fd = cached_fd
-            try:
-                os.fsync(fd)
-            except OSError as exc:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-                raise WriteError(
-                    f"fsync {bin_tmp} failed: {exc}",
-                    path=bin_tmp,
-                    key=task.key,
-                    errno_code=exc.errno,
-                ) from exc
+            if self._fsync:
+                try:
+                    os.fsync(fd)
+                except OSError as exc:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                    raise WriteError(
+                        f"fsync {bin_tmp} failed: {exc}",
+                        path=bin_tmp,
+                        key=task.key,
+                        errno_code=exc.errno,
+                    ) from exc
             try:
                 os.close(fd)
             except OSError as exc:
@@ -610,11 +644,16 @@ class ActivationWriter:
                 ) from exc
 
         # Promote .bin.tmp -> task.bin_path under the collision policy.
-        final_bin = self._promote(
-            tmp_path=bin_tmp,
-            target=task.bin_path,
-            key=task.key,
-        )
+        # In direct-write mode the bytes are already at the final path,
+        # so there is no rename RPC to issue.
+        if self._atomic:
+            final_bin = self._promote(
+                tmp_path=bin_tmp,
+                target=task.bin_path,
+                key=task.key,
+            )
+        else:
+            final_bin = task.bin_path
 
         # Write the sidecar: json -> .json.tmp -> fsync -> promote.
         try:
@@ -651,15 +690,16 @@ class ActivationWriter:
             ) from exc
         try:
             _full_write(sidecar_fd, payload)
-            try:
-                os.fsync(sidecar_fd)
-            except OSError as exc:
-                raise WriteError(
-                    f"fsync {sidecar_tmp} failed: {exc}",
-                    path=sidecar_tmp,
-                    key=task.key,
-                    errno_code=exc.errno,
-                ) from exc
+            if self._fsync:
+                try:
+                    os.fsync(sidecar_fd)
+                except OSError as exc:
+                    raise WriteError(
+                        f"fsync {sidecar_tmp} failed: {exc}",
+                        path=sidecar_tmp,
+                        key=task.key,
+                        errno_code=exc.errno,
+                    ) from exc
         except OSError as exc:
             raise WriteError(
                 f"write {sidecar_tmp} failed: {exc}",
@@ -671,11 +711,14 @@ class ActivationWriter:
             with contextlib.suppress(OSError):
                 os.close(sidecar_fd)
 
-        final_sidecar = self._promote(
-            tmp_path=sidecar_tmp,
-            target=task.sidecar_path,
-            key=task.key,
-        )
+        if self._atomic:
+            final_sidecar = self._promote(
+                tmp_path=sidecar_tmp,
+                target=task.sidecar_path,
+                key=task.key,
+            )
+        else:
+            final_sidecar = task.sidecar_path
 
         self._record_ok(task.key, bin_path=final_bin, sidecar_path=final_sidecar)
 
