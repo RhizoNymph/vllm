@@ -60,6 +60,11 @@ class FilesystemConsumerParams:
     # Default on-disk layout for requests that don't set their own
     # ``layout`` ("per_file" or "packed"). See FilesystemCaptureRequest.
     default_layout: str = "per_file"
+    # Merge consecutive same-key queued writes into one vectored write,
+    # up to this many bytes. Amortizes per-write syscall/RTT overhead —
+    # most effective for the ``packed`` layout (many small per-step
+    # appends share one file). 0 disables.
+    coalesce_max_bytes: int = 1 << 20
 
 
 # Valid values for FilesystemCaptureRequest.layout / default_layout.
