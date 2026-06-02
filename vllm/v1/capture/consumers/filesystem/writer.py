@@ -170,6 +170,7 @@ class ActivationWriter:
         fd_cache_size: int = 256,
         fsync: bool = True,
         atomic_publish: bool = True,
+        coalesce_max_bytes: int = 1 << 20,
     ) -> None:
         if num_threads <= 0:
             raise ValueError(f"num_threads must be >= 1, got {num_threads}")
@@ -190,6 +191,10 @@ class ActivationWriter:
             raise ValueError(
                 "atomic_publish=False requires on_collision='overwrite', "
                 f"got {on_collision!r}"
+            )
+        if coalesce_max_bytes < 0:
+            raise ValueError(
+                f"coalesce_max_bytes must be >= 0, got {coalesce_max_bytes}"
             )
 
         self.root = pathlib.Path(root)
@@ -214,6 +219,14 @@ class ActivationWriter:
         # throughput, at the cost of atomic visibility (a reader can
         # observe a partially written file mid-capture).
         self._atomic = atomic_publish
+        # Merge consecutive same-key ``WriteTask``s already queued on a
+        # worker into a single vectored ``os.writev``, up to this many
+        # bytes. With the ``packed`` layout a request's many small
+        # per-(step,layer,hook) appends all share one writer key, so
+        # coalescing turns hundreds of tiny ~16 KB writes into a few
+        # large ones — the throughput lever once per-file finalize is
+        # already amortized. 0 disables (one ``os.write`` per chunk).
+        self._coalesce_max_bytes = coalesce_max_bytes
 
         self._queues: list[queue.Queue[Any]] = [
             queue.Queue(maxsize=queue_size) for _ in range(num_threads)
@@ -418,13 +431,22 @@ class ActivationWriter:
         partition: _PartitionState,
     ) -> None:
         try:
+            # ``carry`` holds a task dequeued while coalescing that did
+            # not belong to the current batch; processed next iteration
+            # so it is never lost. Set before any I/O for that reason.
+            carry: Any = None
             while True:
-                task = q.get()
+                task = carry if carry is not None else q.get()
+                carry = None
                 if task is _SHUTDOWN:
                     break
                 try:
                     if isinstance(task, WriteTask):
-                        self._handle_write(partition, task)
+                        payloads = [task.payload]
+                        carry = self._coalesce_same_key(q, task, payloads)
+                        self._handle_write_batch(
+                            partition, task.key, task.path, task.append, payloads
+                        )
                     elif isinstance(task, FinalizeTask):
                         self._handle_finalize(partition, task)
                     else:  # pragma: no cover - defensive
@@ -457,18 +479,65 @@ class ActivationWriter:
         """Where bytes are written: ``.tmp`` sibling if atomic, else final."""
         return _tmp_path(path) if self._atomic else path
 
+    def _coalesce_same_key(
+        self,
+        q: queue.Queue[Any],
+        first: WriteTask,
+        payloads: list[bytes],
+    ) -> Any:
+        """Greedily drain queued same-key ``WriteTask``s into ``payloads``.
+
+        Pulls tasks already sitting in ``q`` (never blocks); while they
+        are ``WriteTask``s for ``first.key`` with ``append=True``,
+        appends their payloads until ``coalesce_max_bytes`` is reached or
+        the queue drains. The first non-matching task (different key, a
+        ``FinalizeTask``, or ``_SHUTDOWN``) is returned as the worker
+        loop's ``carry`` — it has been removed from the queue, so it must
+        not be dropped. Returns ``None`` if nothing non-matching popped.
+        """
+        limit = self._coalesce_max_bytes
+        if limit <= 0:
+            return None
+        total = len(first.payload)
+        while total < limit:
+            try:
+                nxt = q.get_nowait()
+            except queue.Empty:
+                return None
+            if isinstance(nxt, WriteTask) and nxt.key == first.key and nxt.append:
+                payloads.append(nxt.payload)
+                total += len(nxt.payload)
+            else:
+                return nxt
+        return None
+
     def _handle_write(self, partition: _PartitionState, task: WriteTask) -> None:
-        target = self._target_path(task.path)
-        fd = self._acquire_fd(partition, task.key, target, task.append)
+        self._handle_write_batch(
+            partition, task.key, task.path, task.append, [task.payload]
+        )
+
+    def _handle_write_batch(
+        self,
+        partition: _PartitionState,
+        key: CaptureKey,
+        path: pathlib.Path,
+        append: bool,
+        payloads: list[bytes],
+    ) -> None:
+        target = self._target_path(path)
+        fd = self._acquire_fd(partition, key, target, append)
         try:
-            _full_write(fd, task.payload)
+            if len(payloads) == 1:
+                _full_write(fd, payloads[0])
+            else:
+                _full_writev(fd, payloads)
         except OSError as exc:
             # Evict the fd on I/O error so the next attempt reopens.
-            self._drop_fd(partition, task.key, fsync=False)
+            self._drop_fd(partition, key, fsync=False)
             raise WriteError(
                 f"write to {target} failed: {exc}",
                 path=target,
-                key=task.key,
+                key=key,
                 errno_code=exc.errno,
             ) from exc
 
@@ -863,3 +932,26 @@ def _full_write(fd: int, payload: bytes) -> None:
         if written <= 0:
             raise OSError(errno.EIO, "os.write returned 0 bytes")
         offset += written
+
+
+def _full_writev(fd: int, payloads: list[bytes]) -> None:
+    """Vectored ``os.writev`` that drains every buffer, retrying shorts.
+
+    Writes all of ``payloads`` to ``fd`` in order with one syscall per
+    pass, avoiding both per-buffer ``os.write`` overhead and a
+    concatenation copy. ``os.writev`` may accept fewer bytes than offered
+    (notably on NFS); we advance past fully written buffers, slice the
+    partially written one, and loop until drained.
+    """
+    views = [memoryview(b) for b in payloads]
+    idx = 0
+    n = len(views)
+    while idx < n:
+        written = os.writev(fd, views[idx:])
+        if written <= 0:
+            raise OSError(errno.EIO, "os.writev returned 0 bytes")
+        while idx < n and written >= len(views[idx]):
+            written -= len(views[idx])
+            idx += 1
+        if written > 0 and idx < n:
+            views[idx] = views[idx][written:]

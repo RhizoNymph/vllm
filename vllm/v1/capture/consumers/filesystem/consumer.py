@@ -75,6 +75,7 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
         fsync=bool(params.get("fsync", True)),
         atomic_publish=bool(params.get("atomic_publish", True)),
         default_layout=str(params.get("default_layout", "per_file")),
+        coalesce_max_bytes=int(params.get("coalesce_max_bytes", 1 << 20)),
     )
 
 
@@ -136,6 +137,7 @@ class FilesystemConsumer:
             fd_cache_size=self._params.fd_cache_size,
             fsync=self._params.fsync,
             atomic_publish=self._params.atomic_publish,
+            coalesce_max_bytes=self._params.coalesce_max_bytes,
         )
         # Lock protecting _key_paths which tracks the slug-based path
         # components per CaptureKey for use at finalize time.
