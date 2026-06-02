@@ -4432,6 +4432,19 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            # Build the per-step activation-capture plan *before* the
+            # cudagraph dispatch decision. ``CaptureManager.on_hook``
+            # gathers rows with per-step Python that cannot run inside a
+            # replayed CUDA graph, so any step that actually captures
+            # must run eager. Non-capturing steps (the common case) keep
+            # full cudagraph speed. Safe to build here: it only needs
+            # ``scheduler_output`` + ``input_batch``, both already
+            # populated by ``_prepare_inputs`` above.
+            capture_pending = False
+            if self._capture_manager is not None:
+                self._prepare_capture_step(scheduler_output)
+                capture_pending = self._capture_manager.has_pending_capture()
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4445,6 +4458,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                force_eager=capture_pending,
             )
 
             logger.debug(
@@ -4586,10 +4600,9 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
-        # Build the per-step activation capture plan, if any consumer
-        # has registered interest for a request in this batch.
-        if self._capture_manager is not None:
-            self._prepare_capture_step(scheduler_output)
+        # (The per-step activation-capture plan is built earlier, before
+        # the cudagraph dispatch decision, so capturing steps can force
+        # eager execution — see ``_prepare_capture_step`` call above.)
 
         # Update per-request steering tables and index before forward.
         self._update_steering_buffers(scheduler_output)

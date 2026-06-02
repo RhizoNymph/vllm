@@ -510,6 +510,19 @@ class CaptureManager:
         self._step_plan = None
         return plan
 
+    def has_pending_capture(self) -> bool:
+        """True if the current step's plan actually gathers any rows.
+
+        The model runner consults this *before* the cudagraph dispatch
+        decision: :meth:`on_hook` does per-step Python gathering that
+        cannot run inside a replayed CUDA graph, so any step that really
+        captures must execute eagerly. Returns ``False`` when no plan is
+        built or the plan has no gather targets (so non-capturing steps
+        keep full cudagraph speed).
+        """
+        plan = self._step_plan
+        return plan is not None and bool(plan.gather_indices)
+
     def on_hook(
         self,
         layer_idx: int,
