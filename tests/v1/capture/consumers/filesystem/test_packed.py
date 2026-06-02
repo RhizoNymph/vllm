@@ -324,3 +324,84 @@ class TestPackedConsumer:
             assert entry.dtype == "float32"  # sidecar now self-describing
         finally:
             c.shutdown(timeout=5.0)
+
+    # --- entrypoint path: raw dict spec (as SamplingParams.capture carries) ---
+
+    def test_dict_spec_layout_packed(self, tmp_path: pathlib.Path) -> None:
+        # _admit_capture passes the raw dict straight to validate_client_spec;
+        # a dict carrying layout="packed" must produce the packed layout.
+        req = "req-dict-pk"
+        c = _consumer(tmp_path)
+        try:
+            c.validate_client_spec(
+                {
+                    "request_id": req,
+                    "tag": "t",
+                    "hooks": {"post_mlp": [0, 1]},
+                    "positions": "last_prompt",
+                    "layout": "packed",
+                },
+                _ctx(req),
+            )
+            for layer in (0, 1):
+                c.submit_chunk(_chunk(req, layer, "post_mlp", torch.randn(2, 8), 0))
+            for layer in (0, 1):
+                c.submit_finalize(_finalize(req, layer, "post_mlp"))
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+            assert _wait(c, key0).status == "ok"
+            req_dir = tmp_path / "t" / req
+            assert (req_dir / PACKED_INDEX_NAME).exists()
+            assert set(read_request(req_dir)) == {(0, "post_mlp"), (1, "post_mlp")}
+        finally:
+            c.shutdown(timeout=5.0)
+
+    def test_dict_spec_defaults_per_file(self, tmp_path: pathlib.Path) -> None:
+        # A dict without layout keeps the default (per_file).
+        req = "req-dict-pf"
+        c = _consumer(tmp_path)
+        try:
+            c.validate_client_spec(
+                {
+                    "request_id": req,
+                    "tag": "t",
+                    "hooks": {"post_mlp": [0]},
+                    "positions": "last_prompt",
+                },
+                _ctx(req),
+            )
+            c.submit_chunk(_chunk(req, 0, "post_mlp", torch.randn(2, 8), 0))
+            c.submit_finalize(_finalize(req, 0, "post_mlp"))
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+            assert _wait(c, key0).status == "ok"
+            req_dir = tmp_path / "t" / req
+            assert (req_dir / "0_post_mlp.bin").exists()
+            assert not (req_dir / PACKED_INDEX_NAME).exists()
+        finally:
+            c.shutdown(timeout=5.0)
+
+    def test_invalid_layout_rejected(self, tmp_path: pathlib.Path) -> None:
+        # Bad layout must raise CaptureValidationError (→ HTTP 400 at the
+        # entrypoint), not silently fall through.
+        from vllm.v1.capture.errors import CaptureValidationError
+
+        req = "req-bad"
+        c = _consumer(tmp_path)
+        try:
+            raised = False
+            try:
+                c.validate_client_spec(
+                    {
+                        "request_id": req,
+                        "tag": "t",
+                        "hooks": {"post_mlp": [0]},
+                        "positions": "last_prompt",
+                        "layout": "bogus",
+                    },
+                    _ctx(req),
+                )
+            except CaptureValidationError as e:
+                raised = True
+                assert "layout" in str(e)
+            assert raised, "expected CaptureValidationError for invalid layout"
+        finally:
+            c.shutdown(timeout=5.0)

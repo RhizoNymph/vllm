@@ -473,7 +473,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "instance name. Each value is an opaque raw spec that the "
             "corresponding consumer's ``validate_client_spec`` interprets "
             "(the filesystem consumer expects a ``FilesystemCaptureRequest``-"
-            "shaped dict; other consumers expose their own schema). The "
+            "shaped dict — ``request_id``, ``tag``, ``hooks``, ``positions``, "
+            'and an optional ``layout`` of ``"per_file"`` (default) or '
+            '``"packed"`` (one indexed file per request); other consumers '
+            "expose their own schema). The "
             "response body returns a sibling ``capture_results`` dict with "
             "per-consumer status/payload. Rejected with HTTP 400 when a "
             "name does not match any registered consumer or when the raw "

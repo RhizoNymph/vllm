@@ -276,6 +276,7 @@ response = httpx.post(
                     "tag": "capital-probe",
                     "hooks": {"post_mlp": [12, 16, 20, 24]},
                     "positions": "last_prompt",
+                    "layout": "packed",
                 },
             },
         },
@@ -284,8 +285,11 @@ response = httpx.post(
 ).json()
 ```
 
-Validation happens at admission time; an invalid spec returns HTTP
-400 with a descriptive error.
+`layout` is optional (`"per_file"` default, `"packed"` for one indexed
+file per request — see the `filesystem` consumer section). Validation
+happens at admission time; an invalid spec (unknown consumer, bad
+layout, out-of-range layer, …) returns HTTP 400 with a descriptive
+error.
 
 ## Reading Results
 
