@@ -537,6 +537,34 @@ On finalize:
 3. Writer thread `fsync`s the `.bin.tmp`, `os.replace`s it to the
    final `.bin`, writes + `fsync`s + renames the sidecar JSON.
 
+**Layout modes** (`FilesystemCaptureRequest.layout`, else the consumer's
+`default_layout`; `per_file` is the default and unchanged behavior):
+
+- **`per_file`** — the flow above: one `.bin` + `.json` per
+  `(request, layer, hook)`. Lowest latency; supports mid-request
+  streaming (a reader can tail a `.bin` as steps append). File count
+  scales with `requests × layers × hooks`.
+- **`packed`** — one `packed.bin` + one `packed.json` index per
+  *request*, all `(layer, hook)` tensors concatenated. The consumer
+  routes every chunk of a request to a single writer key (one fd, one
+  file), records a per-chunk index entry `{layer, hook, offset, nbytes,
+  shape}`, and — because per-key finalizes arrive in one synchronous
+  burst after the dispatch-drain barrier — publishes the file only once
+  **all** expected `(layer, hook)` keys have finalized. Every key's
+  `CaptureResult` then maps to the single packed `WriteResult`. Cuts
+  file count by `layers × hooks` — the throughput lever on network
+  mounts (~4.5× on NFS in `bench_capture_packed.py`); a capture is
+  readable once its request finalizes. Packing is entirely
+  consumer-side; the writer is unchanged.
+
+Both layouts write raw residual-dtype bytes (bf16 as `uint16`) and a
+self-describing sidecar carrying `dtype` + `shape`. `reader.py`
+(`read_per_file` / `read_packed` / `read_request`, NumPy-only) decodes
+either layout; `read_request` auto-detects by the presence of
+`packed.json`. Packed entries are per-chunk, so a `(layer, hook)`
+spanning multiple steps appears as several entries the reader
+concatenates in offset order.
+
 Writer details (`writer.py`):
 
 - One `queue.Queue` per thread, partitioned by `hash(request_id) %
@@ -544,6 +572,13 @@ Writer details (`writer.py`):
   locks.
 - Per-thread LRU fd cache (default 256 entries); eviction `fsync`s +
   closes the fd.
+- `fsync` (default True): when False, skip every `os.fsync`. On NFS the
+  per-file fsync is near-redundant with the close-time COMMIT, so it is
+  mostly a no-op there but a real durability/throughput knob on other
+  backends.
+- `atomic_publish` (default True): when False, write straight to the
+  final path (no `.tmp` + rename), dropping two rename RPCs per file at
+  the cost of atomic visibility. Requires `on_collision="overwrite"`.
 - Collision policy (`overwrite` / `error` / `suffix`) applied at
   finalize.
 - Structured `WriteError` with errno, path, key; surfaces back on

@@ -60,6 +60,9 @@ Python API):
 | `timeout_seconds` | `float` | `180.0` | Per-write timeout; failures become `partial_error`. |
 | `on_collision` | `"overwrite" \| "error" \| "suffix"` | `"overwrite"` | What to do when the target `.bin` already exists. |
 | `fd_cache_size` | `int` | `256` | Per-thread LRU file-descriptor cache. |
+| `fsync` | `bool` | `True` | `fsync` each file before publish. `False` trades crash-durability for throughput (near-no-op on NFS, where `close` already COMMITs). |
+| `atomic_publish` | `bool` | `True` | Publish via `.tmp` + atomic rename. `False` writes straight to the final path (drops two rename RPCs/file, loses atomic visibility; requires `on_collision="overwrite"`). |
+| `default_layout` | `"per_file" \| "packed"` | `"per_file"` | Layout for requests that don't set their own `layout`. |
 
 **Per-request client spec** (`FilesystemCaptureRequest`):
 
@@ -70,6 +73,7 @@ class FilesystemCaptureRequest:
     tag: str                             # grouping label, slugged
     hooks: dict[str, Any]                # hook name -> layer selector
     positions: str | list[int]           # position selector
+    layout: str | None = None            # "per_file" | "packed" (else default)
 ```
 
 Client `hooks` values may be a list of ints, the literal string
@@ -77,11 +81,30 @@ Client `hooks` values may be a list of ints, the literal string
 `positions` accepts `"last_prompt"`, `"all_prompt"`,
 `"all_generated"`, `"all"`, or an explicit `list[int]`.
 
+**Layout** (`layout`, else the consumer's `default_layout`):
+
+- **`per_file`** (default) — one `.bin` + `.json` per
+  `(layer, hook)`. Lowest latency; a reader can tail a `.bin` as
+  decode steps append (mid-request streaming). File count scales with
+  `layers × hooks` per request.
+- **`packed`** — one `packed.bin` + one `packed.json` index per
+  *request*, with all `(layer, hook)` tensors concatenated. Cuts the
+  file count by `layers × hooks` — a large throughput win on network
+  mounts (one set of metadata RPCs per request instead of per
+  `(layer, hook)`; ~4.5× on NFS in benchmarks). A capture is readable
+  once its request finalizes (no mid-request streaming). Choose this
+  for offline/bulk analysis of multi-layer captures.
+
 **On-disk layout**:
 
 ```text
+# per_file
 {root}/{tag_slug}/{request_id_slug}/{layer_idx}_{hook_name}.bin
 {root}/{tag_slug}/{request_id_slug}/{layer_idx}_{hook_name}.json
+
+# packed
+{root}/{tag_slug}/{request_id_slug}/packed.bin
+{root}/{tag_slug}/{request_id_slug}/packed.json   # index over the .bin
 ```
 
 `tag_slug` and `request_id_slug` are produced by the admission
@@ -92,9 +115,15 @@ validator — characters outside `[a-zA-Z0-9._-]` are replaced with
 is stored as raw uint16 bytes; readers should round-trip through
 `torch.uint16.view(torch.bfloat16)`.
 
-**Sidecar JSON**: written atomically alongside the `.bin` file on
-finalize. Contains `request_id`, `layer`, `hook`, plus any fields
-the framework propagates via the per-finalize `sidecar` dict.
+**Sidecar JSON**: written atomically alongside the `.bin` on finalize.
+`per_file` sidecars carry `request_id`, `layer`, `hook`, `shape`,
+`dtype`, plus framework-propagated fields. `packed` sidecars carry
+`request_id`, `layout: "packed"`, `dtype`, and an `entries` list of
+`{layer, hook, offset, nbytes, shape}` indexing the `packed.bin`.
+
+**Reading**: `vllm.v1.capture.consumers.filesystem.reader` (NumPy-only)
+provides `read_per_file`, `read_packed`, and `read_request` (which
+auto-detects the layout) returning decoded `(layer, hook)` arrays.
 
 ### `logging`
 
