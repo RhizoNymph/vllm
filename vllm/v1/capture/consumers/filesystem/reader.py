@@ -40,6 +40,7 @@ import numpy as np
 from vllm.v1.capture.consumers.filesystem.types import (
     PACKED_BIN_NAME,
     PACKED_INDEX_NAME,
+    SHARD_INDEX_GLOB,
 )
 
 # Logical dtype string (as recorded in the sidecar) -> NumPy dtype used to
@@ -173,9 +174,65 @@ def read_request(
     return out
 
 
+def read_sharded(
+    tag_dir: str | pathlib.Path,
+) -> dict[str, dict[tuple[int, str], CaptureEntry]]:
+    """Read every capture in a tag's shard files, grouped by request.
+
+    Scans all sealed ``shard-*.json`` indexes under ``tag_dir`` (the
+    "sharded" layout writes many requests' captures into shared shard
+    files). Returns ``{request_id: {(layer, hook): CaptureEntry}}``. A
+    capture that spans multiple shards (because a shard sealed mid-request)
+    is reassembled across them in (shard seq, byte-offset) order.
+
+    Only **sealed** shards are visible — unsealed shards (still being
+    written, or never flushed) have no ``.json`` and are skipped.
+    """
+    tag_dir = pathlib.Path(tag_dir)
+    # (request_id, layer, hook) -> (logical_dtype, list[(sort_key, array)])
+    grouped: dict[
+        tuple[str, int, str], tuple[str, list[tuple[tuple[int, int], np.ndarray]]]
+    ] = {}
+    for index_path in sorted(tag_dir.glob(SHARD_INDEX_GLOB)):
+        index = json.loads(index_path.read_text())
+        dtype = index["dtype"]
+        seq = int(index.get("seq", 0))
+        bin_path = index_path.with_suffix(".bin")
+        raw = bin_path.read_bytes()
+        for entry in index["entries"]:
+            offset = int(entry["offset"])
+            nbytes = int(entry["nbytes"])
+            chunk = raw[offset : offset + nbytes]
+            if len(chunk) != nbytes:
+                raise ValueError(
+                    f"shard bin {bin_path} truncated: entry "
+                    f"({entry['request_id']}, {entry['layer']}, {entry['hook']}) "
+                    f"wants [{offset}:{offset + nbytes}] but file is {len(raw)} bytes"
+                )
+            rid = str(entry["request_id"])
+            layer, hook = int(entry["layer"]), str(entry["hook"])
+            key = (rid, layer, hook)
+            if key not in grouped:
+                grouped[key] = (dtype, [])
+            grouped[key][1].append(
+                ((seq, offset), _decode(chunk, entry["shape"], dtype))
+            )
+
+    out: dict[str, dict[tuple[int, str], CaptureEntry]] = {}
+    for (rid, layer, hook), (dtype, parts) in grouped.items():
+        parts.sort(key=lambda p: p[0])
+        arrays = [a for _, a in parts]
+        array = arrays[0] if len(arrays) == 1 else np.concatenate(arrays, axis=0)
+        out.setdefault(rid, {})[(layer, hook)] = CaptureEntry(
+            layer=layer, hook=hook, array=array, dtype=dtype
+        )
+    return out
+
+
 __all__ = [
     "CaptureEntry",
     "read_per_file",
     "read_packed",
     "read_request",
+    "read_sharded",
 ]

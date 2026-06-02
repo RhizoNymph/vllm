@@ -29,6 +29,11 @@ class FilesystemCaptureRequest:
     #                (layer, hook) tensors concatenated; far fewer files
     #                (the throughput win on network mounts), available
     #                once the request finalizes.
+    #   "sharded"  — many requests' captures share a small set of large
+    #                shard files (per tag), sealed by size/at shutdown.
+    #                Fewest files for the many-tiny-requests case; a
+    #                capture is readable only after its shard seals
+    #                (end-of-run / bulk reader model).
     # ``None`` defers to the consumer-level ``default_layout``.
     layout: str | None = None
 
@@ -65,11 +70,30 @@ class FilesystemConsumerParams:
     # most effective for the ``packed`` layout (many small per-step
     # appends share one file). 0 disables.
     coalesce_max_bytes: int = 1 << 20
+    # "sharded" layout: number of shard files per tag (requests assigned
+    # by hash(request_id) % num_shards) and the size threshold at which
+    # an open shard is sealed (published) and a new one started.
+    num_shards: int = 8
+    shard_max_bytes: int = 256 << 20  # 256 MiB
 
 
 # Valid values for FilesystemCaptureRequest.layout / default_layout.
-VALID_LAYOUTS: frozenset[str] = frozenset(("per_file", "packed"))
+VALID_LAYOUTS: frozenset[str] = frozenset(("per_file", "packed", "sharded"))
 
 # Filenames used by the "packed" layout (one set per request directory).
 PACKED_BIN_NAME = "packed.bin"
 PACKED_INDEX_NAME = "packed.json"
+
+
+def shard_bin_name(shard_idx: int, seq: int) -> str:
+    """``.bin`` filename for shard ``shard_idx`` rotation ``seq``."""
+    return f"shard-{shard_idx:03d}-{seq:06d}.bin"
+
+
+def shard_index_name(shard_idx: int, seq: int) -> str:
+    """``.json`` index filename for shard ``shard_idx`` rotation ``seq``."""
+    return f"shard-{shard_idx:03d}-{seq:06d}.json"
+
+
+# Glob to find sealed shard index files in a tag directory.
+SHARD_INDEX_GLOB = "shard-*.json"

@@ -62,7 +62,10 @@ Python API):
 | `fd_cache_size` | `int` | `256` | Per-thread LRU file-descriptor cache. |
 | `fsync` | `bool` | `True` | `fsync` each file before publish. `False` trades crash-durability for throughput (near-no-op on NFS, where `close` already COMMITs). |
 | `atomic_publish` | `bool` | `True` | Publish via `.tmp` + atomic rename. `False` writes straight to the final path (drops two rename RPCs/file, loses atomic visibility; requires `on_collision="overwrite"`). |
-| `default_layout` | `"per_file" \| "packed"` | `"per_file"` | Layout for requests that don't set their own `layout`. |
+| `default_layout` | `"per_file" \| "packed" \| "sharded"` | `"per_file"` | Layout for requests that don't set their own `layout`. |
+| `coalesce_max_bytes` | `int` | `1<<20` | Merge consecutive same-key queued writes into one `writev` up to this size (`0` disables). Most effective for `packed`/`sharded`. |
+| `num_shards` | `int` | `8` | `sharded` layout: shard files per tag (request → `hash(id) % num_shards`). |
+| `shard_max_bytes` | `int` | `256<<20` | `sharded` layout: size at which an open shard is sealed and a new one started. |
 
 **Per-request client spec** (`FilesystemCaptureRequest`):
 
@@ -73,7 +76,7 @@ class FilesystemCaptureRequest:
     tag: str                             # grouping label, slugged
     hooks: dict[str, Any]                # hook name -> layer selector
     positions: str | list[int]           # position selector
-    layout: str | None = None            # "per_file" | "packed" (else default)
+    layout: str | None = None     # "per_file" | "packed" | "sharded" (else default)
 ```
 
 Client `hooks` values may be a list of ints, the literal string
@@ -94,6 +97,16 @@ Client `hooks` values may be a list of ints, the literal string
   `(layer, hook)`; ~4.5× on NFS in benchmarks). A capture is readable
   once its request finalizes (no mid-request streaming). Choose this
   for offline/bulk analysis of multi-layer captures.
+- **`sharded`** — many requests' captures share a small set of large
+  shard files **per tag** (a request is assigned to shard
+  `hash(request_id) % num_shards`). Shards are sealed (published) when
+  they cross `shard_max_bytes` or at shutdown, then a new one starts.
+  Fewest files for the **many-tiny-requests** case (e.g. thousands of
+  `last_prompt` single-row captures), where even `packed` makes one
+  tiny file per request. Tradeoff: a capture is readable only **after
+  its shard seals** (end-of-run/bulk model), and a request's result is
+  `ok` ("captured into shard, durable after seal") rather than a
+  ready-to-read file.
 
 **On-disk layout**:
 
@@ -105,6 +118,10 @@ Client `hooks` values may be a list of ints, the literal string
 # packed
 {root}/{tag_slug}/{request_id_slug}/packed.bin
 {root}/{tag_slug}/{request_id_slug}/packed.json   # index over the .bin
+
+# sharded (per tag; many requests share each shard)
+{root}/{tag_slug}/shard-{NNN}-{SEQ}.bin
+{root}/{tag_slug}/shard-{NNN}-{SEQ}.json   # index: per-chunk entries with request_id
 ```
 
 `tag_slug` and `request_id_slug` are produced by the admission
@@ -120,10 +137,14 @@ is stored as raw uint16 bytes; readers should round-trip through
 `dtype`, plus framework-propagated fields. `packed` sidecars carry
 `request_id`, `layout: "packed"`, `dtype`, and an `entries` list of
 `{layer, hook, offset, nbytes, shape}` indexing the `packed.bin`.
+`sharded` shard indexes carry `layout: "sharded"`, `shard_idx`, `seq`,
+`dtype`, and per-chunk `entries` that additionally include `request_id`
+(shards interleave many requests).
 
 **Reading**: `vllm.v1.capture.consumers.filesystem.reader` (NumPy-only)
-provides `read_per_file`, `read_packed`, and `read_request` (which
-auto-detects the layout) returning decoded `(layer, hook)` arrays.
+provides `read_per_file`, `read_packed`, `read_request` (auto-detects
+per_file/packed), and `read_sharded(tag_dir)` → `{request_id:
+{(layer, hook): array}}` (scans a tag's sealed shard indexes).
 
 ### `logging`
 
