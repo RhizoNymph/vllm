@@ -36,6 +36,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -724,6 +725,11 @@ class Gemma4DecoderLayer(nn.Module):
         # 1. input_norm(x) → attn → post_attn_norm → ADD residual
         # 2. pre_ff_norm → mlp → post_ff_norm → ADD residual
         residual = hidden_states
+        # Activation-capture taps (no-op unless a capture manager is active).
+        # Read the pristine residual stream at each hook point, before any
+        # steering is applied, so captures record the model's natural
+        # activations; mirrors apply_layer_steering's hook placement.
+        maybe_capture_residual(residual, self.layer_idx, "pre_attn")
         residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         hidden_states = self.input_layernorm(residual)
@@ -736,6 +742,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        maybe_capture_residual(hidden_states, self.layer_idx, "post_attn")
         # POST_ATTN steers the combined tensor before it is split into the
         # MLP-input path and the residual carried to the final add.
         hidden_states = apply_layer_steering(
@@ -762,6 +769,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        maybe_capture_residual(hidden_states, self.layer_idx, "post_mlp")
         hidden_states = apply_layer_steering(
             self, hidden_states, SteeringHookPoint.POST_MLP
         )
