@@ -26,6 +26,8 @@ from vllm.v1.capture.consumers.filesystem.types import (
     VALID_LAYOUTS,
     FilesystemCaptureRequest,
     FilesystemConsumerParams,
+    shard_bin_name,
+    shard_index_name,
 )
 from vllm.v1.capture.consumers.filesystem.writer import (
     ActivationWriter,
@@ -76,6 +78,8 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
         atomic_publish=bool(params.get("atomic_publish", True)),
         default_layout=str(params.get("default_layout", "per_file")),
         coalesce_max_bytes=int(params.get("coalesce_max_bytes", 1 << 20)),
+        num_shards=int(params.get("num_shards", 8)),
+        shard_max_bytes=int(params.get("shard_max_bytes", 256 << 20)),
     )
 
 
@@ -106,6 +110,55 @@ class _PackedState:
     entries: list[dict[str, Any]] = field(default_factory=list)
     finalized: set[tuple[int, str]] = field(default_factory=set)
     sidecar_fields: dict[str, Any] = field(default_factory=dict)
+
+
+# Sentinel hook for shard writer keys (see _ShardState). The shard
+# writer key is ``(f"{tag_slug}#{shard_idx}", seq, _SHARD_HOOK)``: a
+# stable key[0] keeps a shard pinned to one writer thread (ordered
+# appends), and ``seq`` in the layer slot rotates the fd on each seal.
+_SHARD_HOOK = "__shard__"
+
+
+@dataclass
+class _ShardState:
+    """Accumulation state for one shard file (``sharded`` layout).
+
+    Keyed by ``(tag_slug, shard_idx)`` in the consumer. Holds the current
+    rotation ``seq``, byte offset, and the per-chunk index entries (each
+    carrying ``request_id``, since a shard interleaves many requests).
+    Sealed when ``running_offset`` crosses ``shard_max_bytes`` or at
+    shutdown; sealing publishes the index + renames the .bin and bumps
+    ``seq`` to start a fresh shard. Guarded by ``FilesystemConsumer._lock``.
+    """
+
+    tag_slug: str
+    shard_idx: int
+    seq: int = 0
+    running_offset: int = 0
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    dtype: str | None = None
+
+
+@dataclass
+class _ShardedRequestState:
+    """Per-request completion tracking for the ``sharded`` layout.
+
+    A request's chunks all go to one shard (``hash(request_id) %
+    num_shards`` within its tag). Unlike per_file/packed, the request's
+    result is *not* a writer ``WriteResult`` (the shard file is shared and
+    seals asynchronously): the request is reported ``ok`` once all its
+    expected keys finalize, with payload = the shard file(s) it landed in.
+    A capture becomes *readable* only after its shard seals (size or
+    shutdown) — an end-of-run/bulk model.
+    """
+
+    tag_slug: str
+    request_id_slug: str
+    shard_idx: int
+    expected_keys: set[tuple[int, str]]
+    finalized: set[tuple[int, str]] = field(default_factory=set)
+    shard_bins: set[str] = field(default_factory=set)
+    done: bool = False
 
 
 class FilesystemConsumer:
@@ -159,6 +212,13 @@ class FilesystemConsumer:
         # Per-request packed accumulation state, created lazily on first
         # chunk/finalize for a packed request. Guarded by self._lock.
         self._packed_states: dict[str, _PackedState] = {}
+        # "sharded" layout state. Open shards keyed by (tag_slug,
+        # shard_idx); per-request completion tracking keyed by req_str;
+        # per-request completion events for wait_for_result. All guarded
+        # by self._lock / self._wait_lock.
+        self._shard_states: dict[tuple[str, int], _ShardState] = {}
+        self._sharded_requests: dict[str, _ShardedRequestState] = {}
+        self._sharded_events: dict[str, threading.Event] = {}
         # Logical dtype string per key (per_file), captured from the
         # first chunk so the finalize sidecar is self-describing.
         self._key_dtype: dict[CaptureKey, str] = {}
@@ -224,20 +284,28 @@ class FilesystemConsumer:
             )
 
         req_str = str(ctx.vllm_internal_request_id)
+        # The full (layer, hook) set we must see finalized before a
+        # request's data is complete (used by packed + sharded).
+        expected = {
+            (layer_idx, hook_name)
+            for hook_name, layers in spec.hooks.items()
+            for layer_idx in layers
+        }
         with self._lock:
             self._request_slugs[req_str] = (tag_slug, request_id_slug)
             self._request_layout[req_str] = layout
             if layout == "packed":
-                # The full (layer, hook) set we must see finalized
-                # before the single packed file can be published.
-                expected = {
-                    (layer_idx, hook_name)
-                    for hook_name, layers in spec.hooks.items()
-                    for layer_idx in layers
-                }
                 self._packed_states[req_str] = _PackedState(
                     tag_slug=tag_slug,
                     request_id_slug=request_id_slug,
+                    expected_keys=expected,
+                )
+            elif layout == "sharded":
+                shard_idx = hash(req_str) % max(1, self._params.num_shards)
+                self._sharded_requests[req_str] = _ShardedRequestState(
+                    tag_slug=tag_slug,
+                    request_id_slug=request_id_slug,
+                    shard_idx=shard_idx,
                     expected_keys=expected,
                 )
         return spec
@@ -299,8 +367,11 @@ class FilesystemConsumer:
     def submit_chunk(self, chunk: CaptureChunk) -> None:
         """Convert a ``CaptureChunk`` to bytes and submit a ``WriteTask``."""
         req_str = str(chunk.key[0])
-        if self._layout_for(req_str) == "packed":
+        layout = self._layout_for(req_str)
+        if layout == "packed":
             self._submit_chunk_packed(chunk, req_str)
+        elif layout == "sharded":
+            self._submit_chunk_sharded(chunk, req_str)
         else:
             self._submit_chunk_per_file(chunk, req_str)
 
@@ -399,6 +470,99 @@ class FilesystemConsumer:
             )
         )
 
+    def _submit_chunk_sharded(self, chunk: CaptureChunk, req_str: str) -> None:
+        _request_id, layer_idx, hook_name = chunk.key
+        tensor_bytes, rows, hidden, dtype_str = self._tensor_to_bytes(chunk.tensor)
+        nbytes = len(tensor_bytes)
+
+        # Route to the request's shard (assigned at admission). Append the
+        # bytes to the shard's open .bin and record a per-chunk index
+        # entry (carrying request_id, since shards interleave requests).
+        # Seal + rotate the shard if it crosses the size threshold. All
+        # state mutation is under the lock; the WriteTask submit (and any
+        # seal task) is issued after releasing it.
+        seal_task: FinalizeTask | None = None
+        with self._lock:
+            req = self._sharded_requests.get(req_str)
+            if req is None:
+                # No admission record (non-validated path) — create lazily
+                # with the default shard assignment and empty expected set.
+                shard_idx = hash(req_str) % max(1, self._params.num_shards)
+                tag_slug, request_id_slug = self._resolve_chunk_slugs(req_str, chunk)
+                req = _ShardedRequestState(
+                    tag_slug=tag_slug,
+                    request_id_slug=request_id_slug,
+                    shard_idx=shard_idx,
+                    expected_keys=set(),
+                )
+                self._sharded_requests[req_str] = req
+
+            shard_key = (req.tag_slug, req.shard_idx)
+            shard = self._shard_states.get(shard_key)
+            if shard is None:
+                shard = _ShardState(tag_slug=req.tag_slug, shard_idx=req.shard_idx)
+                self._shard_states[shard_key] = shard
+            if shard.dtype is None:
+                shard.dtype = dtype_str
+
+            shard.entries.append(
+                {
+                    "request_id": req_str,
+                    "layer": layer_idx,
+                    "hook": hook_name,
+                    "offset": shard.running_offset,
+                    "nbytes": nbytes,
+                    "shape": [rows, hidden],
+                }
+            )
+            shard.running_offset += nbytes
+            bin_name = shard_bin_name(shard.shard_idx, shard.seq)
+            bin_path = self._root / req.tag_slug / bin_name
+            req.shard_bins.add(str(bin_path))
+            writer_key = (f"{req.tag_slug}#{shard.shard_idx}", shard.seq, _SHARD_HOOK)
+            # Seal when the shard crosses the size threshold.
+            if shard.running_offset >= self._params.shard_max_bytes:
+                seal_task = self._build_shard_seal_locked(shard)
+
+        self._writer.submit(
+            WriteTask(
+                path=bin_path, payload=tensor_bytes, append=True, key=writer_key
+            )
+        )
+        if seal_task is not None:
+            self._writer.submit(seal_task)
+
+    def _build_shard_seal_locked(self, shard: _ShardState) -> FinalizeTask:
+        """Build the seal ``FinalizeTask`` for ``shard`` and rotate it.
+
+        Must be called with ``self._lock`` held. Snapshots the current
+        entries into an index payload, returns the FinalizeTask (publishes
+        ``shard-k-seq.bin`` + ``.json``), then bumps ``seq`` and resets the
+        shard's running state so subsequent chunks open a fresh file.
+        """
+        tag_dir = self._root / shard.tag_slug
+        bin_path = tag_dir / shard_bin_name(shard.shard_idx, shard.seq)
+        sidecar_path = tag_dir / shard_index_name(shard.shard_idx, shard.seq)
+        index_payload: dict[str, Any] = {
+            "layout": "sharded",
+            "shard_idx": shard.shard_idx,
+            "seq": shard.seq,
+            "dtype": shard.dtype or "float32",
+            "entries": shard.entries,
+        }
+        writer_key = (f"{shard.tag_slug}#{shard.shard_idx}", shard.seq, _SHARD_HOOK)
+        task = FinalizeTask(
+            bin_path=bin_path,
+            sidecar_path=sidecar_path,
+            sidecar_payload=index_payload,
+            key=writer_key,
+        )
+        # Rotate: next chunks for this shard start a fresh file.
+        shard.seq += 1
+        shard.running_offset = 0
+        shard.entries = []
+        return task
+
     # ------------------------------------------------------------------
     # submit_finalize
     # ------------------------------------------------------------------
@@ -407,8 +571,11 @@ class FilesystemConsumer:
         """Finalize one capture key (per_file) or accumulate toward the
         single packed-file finalize (packed)."""
         req_str = str(finalize.key[0])
-        if self._layout_for(req_str) == "packed":
+        layout = self._layout_for(req_str)
+        if layout == "packed":
             self._submit_finalize_packed(finalize, req_str)
+        elif layout == "sharded":
+            self._submit_finalize_sharded(finalize, req_str)
         else:
             self._submit_finalize_per_file(finalize, req_str)
 
@@ -500,13 +667,49 @@ class FilesystemConsumer:
         if task is not None:
             self._writer.submit(task)
 
+    def _submit_finalize_sharded(
+        self, finalize: CaptureFinalize, req_str: str
+    ) -> None:
+        _request_id, layer_idx, hook_name = finalize.key
+        # The request's bytes are already in its shard (written during
+        # submit_chunk). Finalize just tracks completion: once every
+        # expected (layer, hook) has finalized, the request is "ok" — its
+        # data lives in shard_bins and becomes readable when those shards
+        # seal (size threshold or shutdown). No per-request file to write.
+        completed = False
+        with self._lock:
+            req = self._sharded_requests.get(req_str)
+            if req is None:
+                return
+            req.finalized.add((layer_idx, hook_name))
+            if req.expected_keys.issubset(req.finalized) and not req.done:
+                req.done = True
+                completed = True
+        if completed:
+            with self._wait_lock:
+                event = self._sharded_events.get(req_str)
+            if event is not None:
+                event.set()
+
     def get_result(self, key: CaptureKey) -> CaptureResult | None:
         """Map the writer's ``WriteResult`` to a ``CaptureResult``.
 
         For ``packed`` requests every ``(layer, hook)`` key maps to the
         request's single packed ``WriteResult``, so each key reports the
-        packed file's status/paths.
+        packed file's status/paths. For ``sharded`` requests the result is
+        consumer-tracked (the shard file is shared and seals async): every
+        key reports ``ok`` once the request's keys have all finalized, with
+        payload = the shard file(s) it landed in (readable after seal).
         """
+        req_str = str(key[0])
+        if self._layout_for(req_str) == "sharded":
+            with self._lock:
+                req = self._sharded_requests.get(req_str)
+                if req is None or not req.done:
+                    return None
+                payload = sorted(req.shard_bins)
+            return CaptureResult(key=key, status="ok", error=None, payload=payload)
+
         writer_key = self._writer_key_for(key)
         write_result = self._writer.get_result(writer_key)
         if write_result is None:
@@ -543,6 +746,20 @@ class FilesystemConsumer:
         status.  If the result is already terminal on entry the method
         returns immediately without waiting.
         """
+        req_str = str(key[0])
+        if self._layout_for(req_str) == "sharded":
+            # Sharded completion is consumer-tracked (set when the
+            # request's last expected key finalizes), not a WriteResult.
+            with self._wait_lock:
+                with self._lock:
+                    req = self._sharded_requests.get(req_str)
+                    already_done = req is not None and req.done
+                if already_done:
+                    return self.get_result(key)
+                event = self._sharded_events.setdefault(req_str, threading.Event())
+            event.wait(timeout=timeout)
+            return self.get_result(key)
+
         writer_key = self._writer_key_for(key)
 
         with self._wait_lock:
@@ -569,5 +786,20 @@ class FilesystemConsumer:
                 event.set()
 
     def shutdown(self, timeout: float = 30.0) -> None:
-        """Forward shutdown to the underlying ``ActivationWriter``."""
+        """Seal any open shards, then drain the underlying writer.
+
+        Open ``sharded`` shards holding unsealed data are published now so
+        their captures become readable; otherwise a partial final shard
+        would never get an index. per_file/packed have nothing to seal.
+        """
+        seal_tasks: list[FinalizeTask] = []
+        with self._lock:
+            for shard in self._shard_states.values():
+                if shard.entries:
+                    seal_tasks.append(self._build_shard_seal_locked(shard))
+        for task in seal_tasks:
+            try:
+                self._writer.submit(task)
+            except Exception:
+                logger.exception("failed to submit shard seal at shutdown")
         self._writer.shutdown(timeout=timeout)
