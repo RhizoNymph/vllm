@@ -258,6 +258,72 @@ class TestPackedConsumer:
         finally:
             c.shutdown(timeout=5.0)
 
+    def test_submit_chunk_batch_round_trip(self, tmp_path: pathlib.Path) -> None:
+        # Batched submit: a step's worth of (layer) chunks handed over in
+        # one call must produce the same packed file as per-chunk submits.
+        # Two steps batched; (0,post_mlp) spans both, (2,post_mlp) only
+        # step 0 — concatenation order must follow submission order.
+        req = "req-batch"
+        c = _consumer(tmp_path)
+        try:
+            _register_packed(c, req, {"post_mlp": [0, 2]})
+            a0 = torch.randn(2, 8, dtype=torch.float32)
+            b0 = torch.randn(1, 8, dtype=torch.float32)
+            a1 = torch.randn(3, 8, dtype=torch.float32)
+            # step 0: both layers, in one batch
+            c.submit_chunk_batch(
+                [_chunk(req, 0, "post_mlp", a0, 0), _chunk(req, 2, "post_mlp", b0, 0)]
+            )
+            # step 1: only layer 0
+            c.submit_chunk_batch([_chunk(req, 0, "post_mlp", a1, 1)])
+            for layer in (0, 2):
+                c.submit_finalize(_finalize(req, layer, "post_mlp"))
+
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+            assert _wait(c, key0).status == "ok"
+
+            req_dir = tmp_path / "t" / req
+            # One packed file for the whole request, no per-file bins.
+            assert (req_dir / PACKED_BIN_NAME).exists()
+            assert not list(req_dir.glob("*_post_mlp.bin"))
+
+            got = read_request(req_dir)
+            assert set(got) == {(0, "post_mlp"), (2, "post_mlp")}
+            np.testing.assert_array_equal(
+                got[(0, "post_mlp")].array, torch.cat([a0, a1]).numpy()
+            )
+            np.testing.assert_array_equal(got[(2, "post_mlp")].array, b0.numpy())
+        finally:
+            c.shutdown(timeout=5.0)
+
+    def test_batch_matches_per_chunk_bytes(self, tmp_path: pathlib.Path) -> None:
+        # The batched and per-chunk paths must write byte-identical packed
+        # files for the same chunks.
+        layers = [0, 1, 2, 3]
+        tensors = {layer: torch.randn(2, 8, dtype=torch.float32) for layer in layers}
+
+        def run(req: str, batched: bool) -> bytes:
+            c = _consumer(tmp_path)
+            try:
+                _register_packed(c, req, {"post_mlp": layers})
+                step_chunks = [
+                    _chunk(req, layer, "post_mlp", tensors[layer], 0) for layer in layers
+                ]
+                if batched:
+                    c.submit_chunk_batch(step_chunks)
+                else:
+                    for ch in step_chunks:
+                        c.submit_chunk(ch)
+                for layer in layers:
+                    c.submit_finalize(_finalize(req, layer, "post_mlp"))
+                key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+                assert _wait(c, key0).status == "ok"
+                return (tmp_path / "t" / req / PACKED_BIN_NAME).read_bytes()
+            finally:
+                c.shutdown(timeout=5.0)
+
+        assert run("req-perchunk", batched=False) == run("req-batched", batched=True)
+
     def test_finalize_aggregation_waits_for_all_keys(
         self, tmp_path: pathlib.Path
     ) -> None:
