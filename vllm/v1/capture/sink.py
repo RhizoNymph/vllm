@@ -53,6 +53,21 @@ class CaptureSink(Protocol):
         """Non-blocking enqueue of a chunk of captured rows."""
         ...
 
+    def submit_chunk_batch(self, chunks: list[CaptureChunk]) -> None:
+        """Optional: enqueue one dispatch step's worth of chunks at once.
+
+        The manager hands every chunk it produced for this sink in a single
+        step to this method in one call. Sinks that can amortize per-chunk
+        overhead across the batch — locking, write-task creation, payload
+        concatenation — should override this; the default just forwards each
+        chunk to ``submit_chunk`` so the manager can always call it.
+
+        The manager invokes this opportunistically (via ``getattr``); sinks
+        that do not define it keep working through the per-chunk path.
+        """
+        for chunk in chunks:
+            self.submit_chunk(chunk)
+
     def submit_finalize(self, finalize: CaptureFinalize) -> None:
         """Non-blocking request-completion signal.
 
