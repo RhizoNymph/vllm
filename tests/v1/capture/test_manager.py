@@ -35,6 +35,11 @@ def _make_sink(name: str = "sink") -> MagicMock:
     sink = MagicMock()
     sink.location = "worker"
     sink.submit_chunk = MagicMock()
+    # ``submit_chunk_batch`` is an optional sink method; the manager calls it
+    # when present and otherwise falls back to per-chunk ``submit_chunk``.
+    # A bare MagicMock would auto-expose it and divert the manager off the
+    # fallback path these tests assert on, so model a submit_chunk-only sink.
+    sink.submit_chunk_batch = None
     sink.submit_finalize = MagicMock()
     sink.get_result = MagicMock(return_value=None)
     sink.wait_for_result = MagicMock(return_value=None)
