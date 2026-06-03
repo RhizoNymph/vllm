@@ -723,6 +723,13 @@ class CaptureManager:
                 continue
 
             try:
+                # Build every chunk for this consumer's slice of the step,
+                # then hand them over in one batch call. Batching lets sinks
+                # amortize per-chunk overhead (locking, write-task creation,
+                # payload concatenation) across the whole step instead of
+                # paying it per (layer, hook) — the dominant cost when a
+                # request captures many layers per step.
+                chunks: list[CaptureChunk] = []
                 for (req_id, layer, hook), chunk_entries in grouped.items():
                     scratch_key = (layer, hook)
                     if scratch_key not in packet.scratch_pinned:
@@ -739,18 +746,27 @@ class CaptureManager:
                         layer,
                         hook,
                     )
-                    chunk = CaptureChunk(
-                        key=capture_key,
-                        tensor=chunk_tensor,
-                        dtype=chunk_tensor.dtype,
-                        row_offset=0,
-                        step_index=step_index,
-                        metadata={
-                            "consumer_index": consumer_idx,
-                            "positions": [e.logical_pos for e in chunk_entries],
-                        },
+                    chunks.append(
+                        CaptureChunk(
+                            key=capture_key,
+                            tensor=chunk_tensor,
+                            dtype=chunk_tensor.dtype,
+                            row_offset=0,
+                            step_index=step_index,
+                            metadata={
+                                "consumer_index": consumer_idx,
+                                "positions": [e.logical_pos for e in chunk_entries],
+                            },
+                        )
                     )
-                    sink.submit_chunk(chunk)
+
+                if chunks:
+                    batch_submit = getattr(sink, "submit_chunk_batch", None)
+                    if batch_submit is not None:
+                        batch_submit(chunks)
+                    else:
+                        for chunk in chunks:
+                            sink.submit_chunk(chunk)
             except Exception:
                 logger.exception(
                     "Consumer %d raised during dispatch; "

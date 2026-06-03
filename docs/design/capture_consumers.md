@@ -177,6 +177,7 @@ class CaptureSink(Protocol):
     location: ClassVar[Literal["worker", "driver"]]
 
     def submit_chunk(self, chunk: CaptureChunk) -> None: ...
+    def submit_chunk_batch(self, chunks: list[CaptureChunk]) -> None: ...
     def submit_finalize(self, finalize: CaptureFinalize) -> None: ...
     def get_result(self, key: CaptureKey) -> CaptureResult | None: ...
     def shutdown(self, timeout: float = 30.0) -> None: ...
@@ -187,6 +188,14 @@ Ordering guarantees:
 - For a given key, chunks arrive in `row_offset` order.
 - `CaptureFinalize` for a key arrives after all chunks for that key.
 - Different keys have no ordering relationship.
+- `submit_chunk_batch` delivers all of one dispatch step's chunks for a
+  sink in a single call (chunks within the batch retain submission order).
+  It is **optional**: the default forwards each chunk to `submit_chunk`, and
+  the manager calls it opportunistically (via `getattr`). Sinks that can
+  amortize per-chunk overhead across the step — locking, write-task
+  creation, payload concatenation — override it; the filesystem consumer
+  does so for the `packed` layout (one WriteTask + one lock per request per
+  step instead of one per `(layer, hook)`).
 - All methods are called from the manager's dispatch thread; direct
   `CaptureSink` implementations are responsible for their own thread
   safety (the manager does not serialize calls across sinks).
@@ -378,9 +387,11 @@ take ownership of the plan and `dispatch_step_captures(plan)`:
 1. For each consumer index `i`, group entries where bit `i` is set
    in `consumer_mask` by `(request_id, layer, hook)`.
 2. For each group, `index_select` the consumer's rows out of the
-   scratch tensor, `.cpu()` them, build a `CaptureChunk`, and call
-   `sink.submit_chunk`. `metadata` carries `consumer_index` and the
-   logical positions.
+   scratch tensor, `.cpu()` them, and build a `CaptureChunk` (`metadata`
+   carries `consumer_index` and the logical positions). The step's chunks
+   for a consumer are collected and handed over in one `submit_chunk_batch`
+   call (falling back to per-chunk `submit_chunk` if the sink lacks it), so
+   sinks can amortize per-chunk overhead across the whole step.
 3. Wrap per-consumer dispatch in `try/except` so a failing sink
    never prevents delivery to the others (invariant 9). A failing
    dispatch records an error on every request that consumer was
