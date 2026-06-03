@@ -49,7 +49,10 @@ class FilesystemConsumerParams:
     root: str
     writer_threads: int = 4
     queue_size: int = 1024
-    timeout_seconds: float = 180.0
+    # How long ``submit`` blocks on a full writer queue before raising. Short
+    # so a wedged writer surfaces quickly rather than stalling for minutes;
+    # the dispatch-queue overload policy is the primary backpressure path.
+    timeout_seconds: float = 30.0
     on_collision: str = "overwrite"
     fd_cache_size: int = 256
     # fsync each file before its atomic rename. Durable but, on network

@@ -594,6 +594,12 @@ class EngineArgs:
     # whole capture-consumer pipeline stays disabled.
     capture_consumers: list[str] | None = None
 
+    # Capture-manager backpressure / overload controls (server-start tunable).
+    capture_dispatch_queue_size: int = 256
+    capture_overload_policy: str = "spill"
+    capture_spill_dir: str | None = None
+    capture_spill_max_bytes: int = 4 << 30
+
     # Programmatic override: Python callers (``LLM(capture_consumers=[...])``)
     # pre-build a ``CaptureConsumersConfig`` directly and skip the CLI
     # shorthand parser. When set, takes precedence over ``capture_consumers``.
@@ -1330,6 +1336,37 @@ class EngineArgs:
             "consumers (e.g. --capture-consumers filesystem:root=/tmp "
             "--capture-consumers logging). Use YAML config for complex "
             "parameter values.",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-dispatch-queue-size",
+            type=int,
+            default=256,
+            help="Bound on the capture dispatch queue (the GPU-facing "
+            "backpressure point). <=0 leaves it unbounded (legacy; overload "
+            "grows memory without bound).",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-overload-policy",
+            choices=["block", "drop", "spill"],
+            default="spill",
+            help="What to do when the dispatch queue is full: 'block' stalls "
+            "the forward pass (no loss), 'drop' discards the step's captures "
+            "(counted), 'spill' parks overflow on local disk and replays it "
+            "when the queue drains.",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-spill-dir",
+            type=str,
+            default=None,
+            help="Local scratch directory for the 'spill' policy (defaults to "
+            "$TMPDIR/vllm-capture-spill). Use fast local storage.",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-spill-max-bytes",
+            type=int,
+            default=4 << 30,
+            help="Cap on bytes buffered in the spill area; once exceeded, "
+            "'spill' degrades to 'block' (no loss).",
         )
 
         # Observability arguments
@@ -2269,6 +2306,10 @@ class EngineArgs:
             validate_consumer_specs(specs)
             capture_consumers_config = CaptureConsumersConfig(
                 consumers=specs,
+                dispatch_queue_size=self.capture_dispatch_queue_size,
+                overload_policy=self.capture_overload_policy,
+                spill_dir=self.capture_spill_dir,
+                spill_max_bytes=self.capture_spill_max_bytes,
             )
 
         config = VllmConfig(

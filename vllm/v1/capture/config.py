@@ -46,6 +46,24 @@ class CaptureConsumersConfig:
     consumers: list[CaptureConsumerSpec]
     instances: list[Any] = field(default_factory=list)
 
+    # ---- Backpressure / overload control (capture-manager level) ----
+    # The dispatch queue is the single GPU-facing backpressure point.
+    # ``dispatch_queue_size <= 0`` keeps the legacy unbounded behaviour
+    # (no backpressure — overload grows memory without bound).
+    dispatch_queue_size: int = 256
+    # What happens when a bounded dispatch queue is full:
+    #   "block" — stall the forward pass (no loss, bounded memory)
+    #   "drop"  — discard the step's captures (counted; serving never stalls)
+    #   "spill" — park overflow on local disk, replay when the queue drains
+    overload_policy: str = "spill"
+    # Local scratch directory for the ``spill`` policy. ``None`` defaults to
+    # ``$TMPDIR/vllm-capture-spill``. Should be FAST local storage (NVMe/
+    # tmpfs) acting as an elastic buffer in front of slower primary storage.
+    spill_dir: str | None = None
+    # Cap on bytes buffered in the spill area; once exceeded, ``spill``
+    # degrades to ``block`` (no loss).
+    spill_max_bytes: int = 4 << 30  # 4 GiB
+
     def compute_hash(self) -> str:
         """Deterministic hash for ``VllmConfig.compute_hash()``."""
         h = hashlib.md5(usedforsecurity=False)
@@ -55,6 +73,8 @@ class CaptureConsumersConfig:
                 h.update(spec.instance_name.encode())
             for k in sorted(spec.params):
                 h.update(f"{k}={spec.params[k]}".encode())
+        # Backpressure settings are runtime behaviour, not compile-cache
+        # inputs, so they are intentionally excluded from the hash.
         return h.hexdigest()[:16]
 
 

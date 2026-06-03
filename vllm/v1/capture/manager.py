@@ -204,6 +204,10 @@ class CaptureManager:
         model_dtype: torch.dtype,
         device: torch.device | str = "cpu",
         finalize_timeout_s: float = 5.0,
+        dispatch_queue_size: int = 0,
+        overload_policy: str = "block",
+        spill_dir: str | None = None,
+        spill_max_bytes: int = 4 << 30,
     ) -> None:
         if len(consumers) != len(consumer_specs):
             msg = (
@@ -211,6 +215,11 @@ class CaptureManager:
                 f"consumer_specs length ({len(consumer_specs)})"
             )
             raise ValueError(msg)
+        if overload_policy not in ("block", "drop", "spill"):
+            raise ValueError(
+                f"overload_policy must be 'block', 'drop', or 'spill', "
+                f"got {overload_policy!r}"
+            )
         self._consumers = consumers
         self._consumer_specs = consumer_specs
         self._num_hidden_layers = num_hidden_layers
@@ -233,7 +242,21 @@ class CaptureManager:
         # the previous in-line ``cuda.synchronize()`` and per-chunk
         # construction off the model-runner critical path so they can
         # overlap with the next forward step.
-        self._dispatch_queue: queue.Queue[_DispatchPacket | None] = queue.Queue()
+        # Bounded dispatch queue is the single GPU-facing backpressure
+        # point. ``dispatch_queue_size <= 0`` keeps the legacy unbounded
+        # behaviour (no backpressure). ``overload_policy`` decides what
+        # happens when a bounded queue is full: ``block`` stalls the
+        # forward (no loss, bounded memory), ``drop`` discards the step's
+        # captures (counted), ``spill`` parks them on local disk to be
+        # replayed when the queue drains (implemented in the spill path).
+        maxsize = dispatch_queue_size if dispatch_queue_size > 0 else 0
+        self._dispatch_queue: queue.Queue[_DispatchPacket | None] = queue.Queue(
+            maxsize=maxsize
+        )
+        self._overload_policy = overload_policy
+        self._spill_dir = spill_dir
+        self._spill_max_bytes = spill_max_bytes
+        self._dropped_packets = 0
         self._pinned_pool: dict[tuple[int, str], list[torch.Tensor]] = {}
         self._pinned_lock = threading.Lock()
         self._pending_dispatches = 0
@@ -616,9 +639,71 @@ class CaptureManager:
             scratch_pinned=scratch_pinned,
             cuda_event=cuda_event,
         )
+        self._enqueue_packet(packet)
+
+    def _release_packet_buffers(self, packet: _DispatchPacket) -> None:
+        """Return a packet's pinned host buffers to the pool.
+
+        Called when a packet is discarded (``drop`` policy) so dropping a
+        step's captures does not leak pinned memory.
+        """
+        for key, (pinned, _view) in packet.scratch_pinned.items():
+            if pinned is not None:
+                self._release_pinned(key, pinned)
+
+    def _enqueue_packet(self, packet: _DispatchPacket) -> None:
+        """Hand a packet to the dispatch thread under the overload policy.
+
+        ``block`` (or an unbounded queue): ``put`` blocks until there is
+        room, propagating backpressure to the forward pass. ``drop``: try
+        non-blocking, and on a full queue discard the packet (counted) so
+        serving never stalls. ``spill``: park the packet on local disk when
+        the queue is full and replay it when the queue drains; falls back to
+        ``block`` if the spill area is exhausted.
+        """
+        policy = self._overload_policy
+        if policy == "block" or self._dispatch_queue.maxsize == 0:
+            with self._pending_cond:
+                self._pending_dispatches += 1
+            self._dispatch_queue.put(packet)
+            return
+
+        # Non-blocking policies: count the in-flight packet first, then try
+        # to enqueue; undo the count if we end up discarding it.
         with self._pending_cond:
             self._pending_dispatches += 1
+        try:
+            self._dispatch_queue.put_nowait(packet)
+            return
+        except queue.Full:
+            pass
+
+        if policy == "drop":
+            self._release_packet_buffers(packet)
+            with self._pending_cond:
+                self._pending_dispatches -= 1
+                self._dropped_packets += 1
+                if self._pending_dispatches == 0:
+                    self._pending_cond.notify_all()
+            return
+
+        # policy == "spill": handled by the spill subsystem; until it is
+        # wired up, degrade to block (never lose data).
+        self._spill_or_block(packet)
+
+    def _spill_or_block(self, packet: _DispatchPacket) -> None:
+        """Spill an overflow packet to disk, or block if spill is exhausted.
+
+        Placeholder for the spill subsystem: currently blocks (degrades to
+        the ``block`` policy) so no data is lost. ``_pending_dispatches`` has
+        already been incremented by the caller.
+        """
         self._dispatch_queue.put(packet)
+
+    @property
+    def dropped_packets(self) -> int:
+        """Number of capture steps discarded under the ``drop`` policy."""
+        return self._dropped_packets
 
     # --------------------------------------------------- pinned-pool helpers
 

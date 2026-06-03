@@ -553,6 +553,7 @@ class GPUModelRunner(
                     spec = None
                 global_specs.append(spec)
 
+            cc_config = self.vllm_config.capture_consumers_config
             self._capture_manager = CaptureManager(
                 consumers=sinks,
                 consumer_specs=tuple(global_specs),
@@ -562,6 +563,12 @@ class GPUModelRunner(
                 hidden_size=self.model_config.get_hidden_size(),
                 model_dtype=self.model_config.dtype,
                 device=self.device,
+                dispatch_queue_size=getattr(
+                    cc_config, "dispatch_queue_size", 256
+                ),
+                overload_policy=getattr(cc_config, "overload_policy", "spill"),
+                spill_dir=getattr(cc_config, "spill_dir", None),
+                spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
             )
             self._capture_validators = validators
             self._capture_name_to_index = dict(name_to_index)

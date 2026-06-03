@@ -71,7 +71,7 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
         root=str(params["root"]),
         writer_threads=int(params.get("writer_threads", 4)),
         queue_size=int(params.get("queue_size", 1024)),
-        timeout_seconds=float(params.get("timeout_seconds", 180.0)),
+        timeout_seconds=float(params.get("timeout_seconds", 30.0)),
         on_collision=str(params.get("on_collision", "overwrite")),
         fd_cache_size=int(params.get("fd_cache_size", 256)),
         fsync=bool(params.get("fsync", True)),
