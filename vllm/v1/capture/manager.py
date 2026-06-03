@@ -272,6 +272,9 @@ class CaptureManager:
         # is non-empty, new packets route to spill (never the in-memory queue),
         # so the queue (older) always drains before spill (newer).
         self._spill_lock = threading.Lock()
+        # Throttle overload-warning spam: log at most once per interval.
+        self._last_overload_log = 0.0
+        self._overload_log_interval = 5.0
         self._spill_pending: deque[tuple[pathlib.Path, int]] = deque()
         self._spill_seq = 0
         self._spill_bytes = 0
@@ -723,6 +726,7 @@ class CaptureManager:
                 self._dropped_packets += 1
                 if self._pending_dispatches == 0:
                     self._pending_cond.notify_all()
+            self._log_overload("drop")
             return
 
         # policy == "spill": the queue is full -> spill this packet to disk.
@@ -759,6 +763,22 @@ class CaptureManager:
             # Spill area full: wait for the dispatch loop to drain some.
             time.sleep(0.01)
         path.write_bytes(data)
+        self._log_overload("spill")
+
+    def _log_overload(self, kind: str) -> None:
+        """Throttled warning so the policy is visible on a live server."""
+        now = time.monotonic()
+        if now - self._last_overload_log < self._overload_log_interval:
+            return
+        self._last_overload_log = now
+        logger.warning(
+            "capture overload: dispatch queue full, policy=%s "
+            "(dropped=%d, spilled=%d, spill_backlog=%.1f MiB)",
+            kind,
+            self._dropped_packets,
+            self._spilled_packets,
+            self._spill_bytes / (1 << 20),
+        )
 
     def _serialize_packet(self, packet: _DispatchPacket) -> bytes:
         """Serialize a packet's entries + CPU scratch tensors to bytes."""
@@ -1015,6 +1035,13 @@ class CaptureManager:
         self._drain_dispatch_queue()
         self._dispatch_queue.put(None)
         self._dispatch_thread.join(timeout=timeout)
+        if self._dropped_packets or self._spilled_packets:
+            logger.info(
+                "capture overload summary: %d dropped, %d spilled (policy=%s)",
+                self._dropped_packets,
+                self._spilled_packets,
+                self._overload_policy,
+            )
         # Best-effort cleanup of the spill scratch directory.
         if self._spill_dir is not None:
             import shutil
