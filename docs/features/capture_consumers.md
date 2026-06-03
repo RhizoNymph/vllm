@@ -146,6 +146,30 @@ provides `read_per_file`, `read_packed`, `read_request` (auto-detects
 per_file/packed), and `read_sharded(tag_dir)` → `{request_id:
 {(layer, hook): array}}` (scans a tag's sealed shard indexes).
 
+#### Throughput tuning
+
+**First, find your bottleneck** — `dd if=/dev/zero of=<target>/probe bs=1M
+count=1024 oflag=direct conv=fsync` measures your capture target's raw write
+ceiling. The right lever depends on whether you're disk-bound or code-bound:
+
+- **Disk-bound** (slow/network storage — e.g. NFS over a single connection,
+  spinning disk, a SATA SSD): the capture *code* can't push past the disk.
+  Reach for storage-side levers: faster storage; `nconnect=N` on the NFS
+  mount to use parallel bandwidth; the **`packed`** layout (one file per
+  request, far fewer metadata round-trips than `per_file`); or **`sharded`**
+  for the many-small-requests case (collapses commit count to ~`num_shards`).
+  `coalesce_max_bytes` (default 1 MiB) merges per-step appends; larger rarely
+  helps. `fsync`/`atomic_publish` toggles are near-no-ops on a sync NFS export.
+- **Code-bound** (fast local NVMe / tmpfs, where the disk isn't the wall):
+  the single dispatch/submit thread is the limit. Use `packed` (one
+  `WriteTask` + one lock per request per step via the batched submit path)
+  and a handful of `writer_threads`. On fast storage this reaches multiple
+  hundreds of MB/s to ~1 GB/s; on a network mount it makes no difference,
+  because the disk caps you first.
+
+For online capture during serving, none of this is on the critical path —
+residual-stream volume at token-generation rate is far below these ceilings.
+
 ### `logging`
 
 Minimal observation consumer. Logs one line per finalized capture:
