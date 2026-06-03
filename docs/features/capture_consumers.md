@@ -170,6 +170,32 @@ ceiling. The right lever depends on whether you're disk-bound or code-bound:
 For online capture during serving, none of this is on the critical path —
 residual-stream volume at token-generation rate is far below these ceilings.
 
+#### Backpressure & overload
+
+When capture volume *does* outrun consumer throughput (heavy capture — many
+layers × hooks × all positions, or a prefill burst), the **dispatch queue**
+is the single backpressure point. It is bounded by
+`--capture-dispatch-queue-size` (default 256; `<=0` is unbounded/legacy,
+where overload grows memory without limit). When it fills,
+`--capture-overload-policy` decides what happens:
+
+| policy | behaviour | trade-off |
+|---|---|---|
+| `block` | stall the forward pass until the queue drains | no loss, bounded memory, serving slows |
+| `drop` | discard the step's captures (counted via `dropped_packets`) | serving never stalls; lossy |
+| `spill` *(default)* | serialize overflow to a local scratch dir and replay it, in order, when the queue drains | no loss, no stall, bounded RAM; uses local disk |
+
+`spill` parks overflow under `--capture-spill-dir` (default
+`$TMPDIR/vllm-capture-spill`; use fast local storage). It preserves strict
+per-key ordering — once spilling starts, every packet routes through the
+spill FIFO until it drains, so replayed data never races live data. The
+dispatch thread replays spilled packets when the in-memory queue is idle, and
+`finalize` waits for spilled data to reach consumers (no loss). If the spill
+area hits `--capture-spill-max-bytes` (default 4 GiB), `spill` degrades to
+`block` rather than dropping. The filesystem writer's own submit timeout is
+`timeout_seconds` (default 30 s), after which a wedged writer surfaces a
+`WriteError` instead of stalling indefinitely.
+
 ### `logging`
 
 Minimal observation consumer. Logs one line per finalized capture:
