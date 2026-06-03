@@ -375,6 +375,35 @@ class FilesystemConsumer:
         else:
             self._submit_chunk_per_file(chunk, req_str)
 
+    def submit_chunk_batch(self, chunks: list[CaptureChunk]) -> None:
+        """Submit one dispatch step's chunks, amortizing per-chunk overhead.
+
+        For the ``packed`` layout every chunk of a request in this step
+        targets the same file (one writer key), so they are concatenated
+        into a single ``WriteTask`` and their index entries recorded under a
+        single lock acquisition — collapsing ~num_layers tasks/locks per
+        request per step into one. ``per_file``/``sharded`` chunks fall
+        through to the per-chunk path (each targets its own key/shard, so
+        there is no same-key batching win there).
+        """
+        packed_by_req: dict[str, list[CaptureChunk]] = {}
+        others: list[tuple[CaptureChunk, str]] = []
+        for chunk in chunks:
+            req_str = str(chunk.key[0])
+            if self._layout_for(req_str) == "packed":
+                packed_by_req.setdefault(req_str, []).append(chunk)
+            else:
+                others.append((chunk, req_str))
+
+        for req_str, group in packed_by_req.items():
+            self._submit_chunk_packed_batch(group, req_str)
+        for chunk, req_str in others:
+            layout = self._layout_for(req_str)
+            if layout == "sharded":
+                self._submit_chunk_sharded(chunk, req_str)
+            else:
+                self._submit_chunk_per_file(chunk, req_str)
+
     def _submit_chunk_per_file(self, chunk: CaptureChunk, req_str: str) -> None:
         key = chunk.key
         _request_id, layer_idx, hook_name = key
@@ -465,6 +494,71 @@ class FilesystemConsumer:
             WriteTask(
                 path=bin_path,
                 payload=tensor_bytes,
+                append=True,
+                key=(req_str, _PACKED_LAYER, _PACKED_HOOK),
+            )
+        )
+
+    def _submit_chunk_packed_batch(
+        self, chunks: list[CaptureChunk], req_str: str
+    ) -> None:
+        """Batched packed submit: one WriteTask + one lock for the group.
+
+        All chunks belong to ``req_str`` (same packed file / writer key).
+        Serialize outside the lock, reserve all byte ranges and record all
+        index entries in one lock acquisition (preserving append order, so
+        offsets match the concatenated payload), then submit a single
+        ``WriteTask`` with the concatenated bytes.
+        """
+        if not chunks:
+            return
+        # Serialize every chunk outside the lock (cheap; not the bottleneck).
+        tag_slug, request_id_slug = self._resolve_chunk_slugs(req_str, chunks[0])
+        serialized: list[tuple[int, str, bytes, int, int, str]] = []
+        for chunk in chunks:
+            _request_id, layer_idx, hook_name = chunk.key
+            payload, rows, hidden, dtype_str = self._tensor_to_bytes(chunk.tensor)
+            serialized.append((layer_idx, hook_name, payload, rows, hidden, dtype_str))
+
+        payloads: list[bytes] = []
+        with self._lock:
+            state = self._packed_states.get(req_str)
+            if state is None:
+                state = _PackedState(
+                    tag_slug=tag_slug,
+                    request_id_slug=request_id_slug,
+                    expected_keys=set(),
+                )
+                self._packed_states[req_str] = state
+            for layer_idx, hook_name, payload, rows, hidden, dtype_str in serialized:
+                if state.dtype is None:
+                    state.dtype = dtype_str
+                elif state.dtype != dtype_str:
+                    logger.warning(
+                        "dtype mismatch in packed request %s: %s vs %s",
+                        req_str,
+                        state.dtype,
+                        dtype_str,
+                    )
+                state.entries.append(
+                    {
+                        "layer": layer_idx,
+                        "hook": hook_name,
+                        "offset": state.running_offset,
+                        "nbytes": len(payload),
+                        "shape": [rows, hidden],
+                    }
+                )
+                state.running_offset += len(payload)
+                payloads.append(payload)
+            bin_tag, bin_req = state.tag_slug, state.request_id_slug
+
+        bin_path = self._root / bin_tag / bin_req / PACKED_BIN_NAME
+        combined = payloads[0] if len(payloads) == 1 else b"".join(payloads)
+        self._writer.submit(
+            WriteTask(
+                path=bin_path,
+                payload=combined,
                 append=True,
                 key=(req_str, _PACKED_LAYER, _PACKED_HOOK),
             )
