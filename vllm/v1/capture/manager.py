@@ -29,10 +29,16 @@ See ``docs/design/capture_consumers.md`` for the full spec.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
+import os
+import pathlib
 import queue
+import tempfile
 import threading
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -254,9 +260,28 @@ class CaptureManager:
             maxsize=maxsize
         )
         self._overload_policy = overload_policy
-        self._spill_dir = spill_dir
         self._spill_max_bytes = spill_max_bytes
         self._dropped_packets = 0
+        self._spilled_packets = 0
+        # Spill state (``spill`` policy): overflow packets are serialized to
+        # numbered files in ``_spill_dir`` and replayed by the dispatch
+        # thread, in order, when the in-memory queue drains. ``_spill_pending``
+        # is the FIFO of (path, nbytes) awaiting replay; ``_spill_bytes``
+        # tracks on-disk usage against ``spill_max_bytes``. All under
+        # ``_spill_lock``. Strict ordering invariant: while ``_spill_pending``
+        # is non-empty, new packets route to spill (never the in-memory queue),
+        # so the queue (older) always drains before spill (newer).
+        self._spill_lock = threading.Lock()
+        self._spill_pending: deque[tuple[pathlib.Path, int]] = deque()
+        self._spill_seq = 0
+        self._spill_bytes = 0
+        self._spill_dir: pathlib.Path | None = None
+        if overload_policy == "spill":
+            base = spill_dir or os.path.join(
+                tempfile.gettempdir(), "vllm-capture-spill"
+            )
+            self._spill_dir = pathlib.Path(base) / f"mgr-{id(self):x}"
+            self._spill_dir.mkdir(parents=True, exist_ok=True)
         self._pinned_pool: dict[tuple[int, str], list[torch.Tensor]] = {}
         self._pinned_lock = threading.Lock()
         self._pending_dispatches = 0
@@ -672,6 +697,19 @@ class CaptureManager:
         # to enqueue; undo the count if we end up discarding it.
         with self._pending_cond:
             self._pending_dispatches += 1
+
+        # Ordering invariant for ``spill``: once any packet has spilled,
+        # route every new packet to spill (even if the in-memory queue has
+        # since drained) until spill is fully empty. Otherwise a new packet
+        # could ``put_nowait`` onto the queue and jump ahead of older spilled
+        # packets, which the dispatch loop drains only after the queue.
+        if policy == "spill":
+            with self._spill_lock:
+                spill_active = bool(self._spill_pending)
+            if spill_active:
+                self._spill_packet(packet)
+                return
+
         try:
             self._dispatch_queue.put_nowait(packet)
             return
@@ -687,23 +725,85 @@ class CaptureManager:
                     self._pending_cond.notify_all()
             return
 
-        # policy == "spill": handled by the spill subsystem; until it is
-        # wired up, degrade to block (never lose data).
-        self._spill_or_block(packet)
+        # policy == "spill": the queue is full -> spill this packet to disk.
+        self._spill_packet(packet)
 
-    def _spill_or_block(self, packet: _DispatchPacket) -> None:
-        """Spill an overflow packet to disk, or block if spill is exhausted.
+    def _spill_packet(self, packet: _DispatchPacket) -> None:
+        """Serialize an overflow packet to the spill area (``spill`` policy).
 
-        Placeholder for the spill subsystem: currently blocks (degrades to
-        the ``block`` policy) so no data is lost. ``_pending_dispatches`` has
-        already been incremented by the caller.
+        ``_pending_dispatches`` is already incremented by the caller, and
+        stays counted until the dispatch loop replays this packet — so
+        ``_drain_dispatch_queue`` (and thus finalize) waits for spilled data
+        to reach consumers, never losing it. If the spill area is at its cap,
+        blocks until the dispatch loop frees room (degrades to ``block``).
         """
-        self._dispatch_queue.put(packet)
+        data = self._serialize_packet(packet)
+        # Bytes are captured; release the pinned host buffers now.
+        self._release_packet_buffers(packet)
+        n = len(data)
+        while True:
+            with self._spill_lock:
+                if (
+                    self._spill_bytes + n <= self._spill_max_bytes
+                    or not self._spill_pending
+                ):
+                    # Accept when under cap, or when spill is empty (a single
+                    # packet larger than the cap still goes through rather
+                    # than deadlocking).
+                    path = self._spill_dir / f"spill-{self._spill_seq:012d}.pkt"
+                    self._spill_seq += 1
+                    self._spill_bytes += n
+                    self._spill_pending.append((path, n))
+                    self._spilled_packets += 1
+                    break
+            # Spill area full: wait for the dispatch loop to drain some.
+            time.sleep(0.01)
+        path.write_bytes(data)
+
+    def _serialize_packet(self, packet: _DispatchPacket) -> bytes:
+        """Serialize a packet's entries + CPU scratch tensors to bytes."""
+        scratch = {
+            key: view for key, (_owner, view) in packet.scratch_pinned.items()
+        }
+        buf = io.BytesIO()
+        torch.save({"entries": packet.entries, "scratch": scratch}, buf)
+        return buf.getvalue()
+
+    def _deserialize_packet(self, data: bytes) -> _DispatchPacket:
+        """Rebuild a packet from spill bytes (CPU scratch, no pinned owner)."""
+        obj = torch.load(io.BytesIO(data), weights_only=False)
+        scratch_pinned = {
+            key: (None, view) for key, view in obj["scratch"].items()
+        }
+        return _DispatchPacket(
+            entries=obj["entries"],
+            scratch_pinned=scratch_pinned,
+            cuda_event=None,
+        )
+
+    def _next_spilled_packet(self) -> _DispatchPacket | None:
+        """Pop and reload the oldest spilled packet, or ``None`` if empty."""
+        with self._spill_lock:
+            if not self._spill_pending:
+                return None
+            path, n = self._spill_pending.popleft()
+            self._spill_bytes -= n
+        try:
+            data = path.read_bytes()
+        finally:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        return self._deserialize_packet(data)
 
     @property
     def dropped_packets(self) -> int:
         """Number of capture steps discarded under the ``drop`` policy."""
         return self._dropped_packets
+
+    @property
+    def spilled_packets(self) -> int:
+        """Number of capture steps spilled to disk under the ``spill`` policy."""
+        return self._spilled_packets
 
     # --------------------------------------------------- pinned-pool helpers
 
@@ -766,23 +866,45 @@ class CaptureManager:
            :meth:`_drain_dispatch_queue`.
         """
         while True:
-            packet = self._dispatch_queue.get()
-            if packet is None:
-                return
             try:
-                if packet.cuda_event is not None:
-                    packet.cuda_event.synchronize()
-                self._fan_out_to_consumers(packet)
-            except Exception:
-                logger.exception("capture dispatch loop error")
-            finally:
-                for key, (pinned, _view) in packet.scratch_pinned.items():
-                    if pinned is not None:
-                        self._release_pinned(key, pinned)
-                with self._pending_cond:
-                    self._pending_dispatches -= 1
-                    if self._pending_dispatches == 0:
-                        self._pending_cond.notify_all()
+                # Short timeout so that, when the in-memory queue drains while
+                # spilled packets are still pending, we pick them up promptly
+                # (the producer can't wake a blocked get() — the queue is full
+                # precisely when it spills).
+                packet = self._dispatch_queue.get(timeout=0.1)
+            except queue.Empty:
+                spilled = self._next_spilled_packet()
+                if spilled is not None:
+                    self._process_packet(spilled)
+                continue
+            if packet is None:
+                # Shutdown sentinel: drain any remaining spill first so no
+                # spilled captures are lost on shutdown.
+                while True:
+                    s = self._next_spilled_packet()
+                    if s is None:
+                        break
+                    self._process_packet(s)
+                return
+            # Live queue items are always older than spilled items (the
+            # ordering invariant routes new packets to spill while spill is
+            # active), so process the queue before touching spill.
+            self._process_packet(packet)
+
+    def _process_packet(self, packet: _DispatchPacket) -> None:
+        """Sync the packet's H2D copies, fan out to sinks, recycle buffers."""
+        try:
+            if packet.cuda_event is not None:
+                packet.cuda_event.synchronize()
+            self._fan_out_to_consumers(packet)
+        except Exception:
+            logger.exception("capture dispatch loop error")
+        finally:
+            self._release_packet_buffers(packet)
+            with self._pending_cond:
+                self._pending_dispatches -= 1
+                if self._pending_dispatches == 0:
+                    self._pending_cond.notify_all()
 
     def _fan_out_to_consumers(self, packet: _DispatchPacket) -> None:
         """Walk consumers and submit chunks for ``packet`` (dispatch thread).
@@ -893,6 +1015,12 @@ class CaptureManager:
         self._drain_dispatch_queue()
         self._dispatch_queue.put(None)
         self._dispatch_thread.join(timeout=timeout)
+        # Best-effort cleanup of the spill scratch directory.
+        if self._spill_dir is not None:
+            import shutil
+
+            with contextlib.suppress(OSError):
+                shutil.rmtree(self._spill_dir, ignore_errors=True)
 
     # ----------------------------------------------------- finalization
 
