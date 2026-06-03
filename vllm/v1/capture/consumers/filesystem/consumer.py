@@ -110,6 +110,9 @@ class _PackedState:
     entries: list[dict[str, Any]] = field(default_factory=list)
     finalized: set[tuple[int, str]] = field(default_factory=set)
     sidecar_fields: dict[str, Any] = field(default_factory=dict)
+    # Cached on first chunk so the (slow) pathlib construction runs once
+    # per request instead of once per submitted batch.
+    bin_path: "pathlib.Path | None" = None
 
 
 # Sentinel hook for shard writer keys (see _ShardState). The shard
@@ -386,23 +389,22 @@ class FilesystemConsumer:
         through to the per-chunk path (each targets its own key/shard, so
         there is no same-key batching win there).
         """
-        packed_by_req: dict[str, list[CaptureChunk]] = {}
-        others: list[tuple[CaptureChunk, str]] = []
+        # Group by request in one pass, then resolve the layout once per
+        # request (not once per chunk — the layout is fixed per request).
+        by_req: dict[str, list[CaptureChunk]] = {}
         for chunk in chunks:
-            req_str = str(chunk.key[0])
-            if self._layout_for(req_str) == "packed":
-                packed_by_req.setdefault(req_str, []).append(chunk)
-            else:
-                others.append((chunk, req_str))
+            by_req.setdefault(str(chunk.key[0]), []).append(chunk)
 
-        for req_str, group in packed_by_req.items():
-            self._submit_chunk_packed_batch(group, req_str)
-        for chunk, req_str in others:
+        for req_str, group in by_req.items():
             layout = self._layout_for(req_str)
-            if layout == "sharded":
-                self._submit_chunk_sharded(chunk, req_str)
+            if layout == "packed":
+                self._submit_chunk_packed_batch(group, req_str)
+            elif layout == "sharded":
+                for chunk in group:
+                    self._submit_chunk_sharded(chunk, req_str)
             else:
-                self._submit_chunk_per_file(chunk, req_str)
+                for chunk in group:
+                    self._submit_chunk_per_file(chunk, req_str)
 
     def _submit_chunk_per_file(self, chunk: CaptureChunk, req_str: str) -> None:
         key = chunk.key
@@ -513,7 +515,6 @@ class FilesystemConsumer:
         if not chunks:
             return
         # Serialize every chunk outside the lock (cheap; not the bottleneck).
-        tag_slug, request_id_slug = self._resolve_chunk_slugs(req_str, chunks[0])
         serialized: list[tuple[int, str, bytes, int, int, str]] = []
         for chunk in chunks:
             _request_id, layer_idx, hook_name = chunk.key
@@ -524,9 +525,15 @@ class FilesystemConsumer:
         with self._lock:
             state = self._packed_states.get(req_str)
             if state is None:
+                # Resolve slugs only on first sight of the request (under the
+                # lock we already hold); they're fixed for the request, so
+                # this avoids a per-batch _resolve_chunk_slugs lock round-trip.
+                recorded = self._request_slugs.get(req_str)
+                fallback_tag, fallback_req = recorded or ("default", req_str)
+                meta = chunks[0].metadata
                 state = _PackedState(
-                    tag_slug=tag_slug,
-                    request_id_slug=request_id_slug,
+                    tag_slug=meta.get("tag_slug", fallback_tag),
+                    request_id_slug=meta.get("request_id_slug", fallback_req),
                     expected_keys=set(),
                 )
                 self._packed_states[req_str] = state
@@ -551,9 +558,12 @@ class FilesystemConsumer:
                 )
                 state.running_offset += len(payload)
                 payloads.append(payload)
-            bin_tag, bin_req = state.tag_slug, state.request_id_slug
+            if state.bin_path is None:
+                state.bin_path = (
+                    self._root / state.tag_slug / state.request_id_slug / PACKED_BIN_NAME
+                )
+            bin_path = state.bin_path
 
-        bin_path = self._root / bin_tag / bin_req / PACKED_BIN_NAME
         combined = payloads[0] if len(payloads) == 1 else b"".join(payloads)
         self._writer.submit(
             WriteTask(
