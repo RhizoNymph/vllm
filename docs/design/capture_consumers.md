@@ -600,10 +600,14 @@ Writer details (`writer.py`):
 
 **Validation constraints** (`validation.py`):
 
-- `tensor_parallel_size == 1 && pipeline_parallel_size == 1`.
+- TP / PP / EP / DP are all accepted for the replicated residual hooks
+  (no parallel-size rejection). See
+  [Capture Consumers under Parallelism](capture_parallelism.md).
 - Every hook name is in `{pre_attn, post_attn, post_mlp, mlp_in,
   mlp_out}`.
-- Every resolved layer is in `[0, num_hidden_layers)`.
+- Every resolved layer is in `[0, num_hidden_layers)`, the **global**
+  layer count (admission validates the full layer space; the runner then
+  filters each pipeline stage's spec to its owned slice).
 - Tag / request_id: non-empty, ≤256 chars, no `..`, no leading `/`;
   characters outside `[a-zA-Z0-9._-]` become `_`.
 - Explicit positions ≥ `num_computed_tokens` (reject prefix-cache
@@ -640,10 +644,14 @@ Writer details (`writer.py`):
 7. **Prefix-cache positions rejected at admission.** Filesystem
    validator raises `CaptureValidationError` on any explicit
    position below `num_computed_tokens`.
-8. **TP > 1 / PP > 1 rejected with a clear error.** The filesystem
-   validator checks `CaptureContext.tensor_parallel_size` and
-   `pipeline_parallel_size` before any other work. Other
-   residual-collecting consumers should do the same.
+8. **Parallelism is supported for replicated residual hooks.** The
+   residual stream is replicated across the TP/EP plane within each
+   pipeline stage, so TP rank 0 of each stage captures its
+   global-indexed layers and the engine unions the per-stage results
+   (`merge_capture_results`). Worker-location consumers (incl.
+   `filesystem`) work under TP/PP/EP/DP; sharded-activation capture and
+   single-process driver-side gather across PP stages remain future
+   work. See [Capture Consumers under Parallelism](capture_parallelism.md).
 9. **Consumer isolation.** `dispatch_step_captures` wraps each
    consumer's slice-and-submit in `try/except`; `_BatchedAdapter.
    submit_finalize` catches `on_capture` exceptions and records
