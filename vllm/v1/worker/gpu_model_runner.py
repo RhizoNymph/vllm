@@ -523,6 +523,13 @@ class GPUModelRunner(
         # Pending terminal results keyed by request id → consumer name →
         # ``CaptureResult``.  Drained onto every ``ModelRunnerOutput``.
         self._pending_capture_results: dict[str, dict[str, CaptureResult]] = {}
+        # Set on *every* rank (capturer or not) — drives the per-step
+        # cross-rank force-eager agreement in ``execute_model`` so all
+        # ranks participate in the collective. Independent of the
+        # capturer gate, which only controls who installs a manager.
+        self._capture_feature_enabled = (
+            self.vllm_config.capture_consumers_config is not None
+        )
         if self.vllm_config.capture_consumers_config is not None:
             from vllm.model_executor.layers.activation_capture import (
                 set_active_capture_manager,
@@ -4474,6 +4481,19 @@ class GPUModelRunner(
                 self._prepare_capture_step(scheduler_output)
                 capture_pending = self._capture_manager.has_pending_capture()
 
+            # Force eager on every step while the capture feature is
+            # enabled. The per-step gather can't run inside a replayed CUDA
+            # graph, and under pipeline parallelism every rank must agree on
+            # ``num_tokens_padded`` for the TP all-reduce / PP send-recv to
+            # line up. Deciding purely from the feature flag (identical on
+            # every rank) keeps all ranks in lockstep with no per-step
+            # collective — a cross-PP all-reduce here would be a synchronous
+            # barrier inside PP's asynchronous pipeline and deadlock against
+            # the send/recv. Costs cudagraph speed while capture is
+            # configured, which is acceptable for a capture run.
+            if self._capture_feature_enabled:
+                capture_pending = True
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4683,6 +4703,14 @@ class GPUModelRunner(
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    # Non-last PP stages return here, before ``sample_tokens``
+                    # (and its ``_finalize_capture_step``) ever runs for this
+                    # step. The forward above has already populated this
+                    # stage's capture scratch, so dispatch it now — otherwise
+                    # only the last stage's layers reach consumers and the
+                    # earlier stages' files are written empty.
+                    if self._capture_manager is not None:
+                        self._finalize_capture_step()
                     return hidden_states
 
                 if self.is_pooling_model:
