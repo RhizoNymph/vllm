@@ -262,10 +262,18 @@ Phase 4 remains future work.
 - Per-stage spec filtering (Phase 0) means each pipeline stage's TP
   rank 0 writes its own global-layer files to the shared mount.
 - Cross-rank result merge: `_CaptureAwareAggregator`
-  (`multiproc_executor.py`) wraps the optional `KVOutputAggregator` and
+  (`executor/abstract.py`) wraps the optional `KVOutputAggregator` and
   unions every rank's `ModelRunnerOutput.capture_results` per
   `(request, consumer)` into `output_rank`'s output
   (`manager.merge_capture_results`), reusing the all-outputs reply path.
+  It lives on the base `Executor` (via `_output_aggregator()`), so it
+  works identically on **single-node multiproc and multi-node Ray**
+  (`MultiprocExecutor`, `RayExecutorV2`, and `RayDistributedExecutor`).
+  The SPMD `ExecutorWithExternalLauncher` (torchrun) is the one backend
+  not wired: it returns a single worker's output with no central
+  collection point, so under it the files still land but the
+  `capture_results` dict reflects only `output_rank` — use Ray for
+  multi-node capture.
 - **Shared-storage requirement:** capture targets must be a shared mount
   reachable by every PP node (resolved assumption below).
 
