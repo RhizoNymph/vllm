@@ -880,3 +880,104 @@ class TestEdgeCases:
                 },
                 num_prompt_tokens=10,
             )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-parallel local layer-range filtering
+# ---------------------------------------------------------------------------
+
+GLOBAL_LAYERS = 8
+
+
+def _make_pp_manager(
+    local_layer_range,
+    spec: CaptureSpec,
+) -> tuple[CaptureManager, MagicMock]:
+    """A manager over an 8-layer model owning ``local_layer_range``."""
+    sink = _make_sink()
+    mgr = CaptureManager(
+        consumers=(sink,),
+        consumer_specs=(spec,),
+        num_hidden_layers=GLOBAL_LAYERS,
+        hidden_size=HIDDEN_SIZE,
+        model_dtype=MODEL_DTYPE,
+        local_layer_range=local_layer_range,
+    )
+    return mgr, sink
+
+
+def _captured_layers(mgr: CaptureManager) -> set[int]:
+    """Register 'r1' then build a plan; return the global layers planned."""
+    mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+    if not mgr.has_request("r1"):
+        return set()
+    view = _batch_view(
+        req_ids=["r1"],
+        num_prompt_tokens=[10],
+        num_computed_tokens=[0],
+        num_scheduled_tokens=[10],
+    )
+    plan = mgr.build_step_plan(view)
+    return {layer for (layer, _hook) in plan.gather_indices}
+
+
+class TestLocalLayerRangeFiltering:
+    def test_first_stage_keeps_only_its_layers(self):
+        spec = CaptureSpec(hooks={"post_mlp": [2, 6]}, positions="last_prompt")
+        mgr, sink = _make_pp_manager((0, 4), spec)
+        assert _captured_layers(mgr) == {2}
+        # Finalize touches only the in-range layer (layer 2), not layer 6.
+        mgr.finalize_request("r1")
+        finalized_layers = {
+            call.args[0].key[1] for call in sink.submit_finalize.call_args_list
+        }
+        assert finalized_layers == {2}
+
+    def test_second_stage_keeps_only_its_layers(self):
+        spec = CaptureSpec(hooks={"post_mlp": [2, 6]}, positions="last_prompt")
+        mgr, _ = _make_pp_manager((4, 8), spec)
+        assert _captured_layers(mgr) == {6}
+
+    def test_none_range_keeps_all_layers(self):
+        spec = CaptureSpec(hooks={"post_mlp": [2, 6]}, positions="last_prompt")
+        mgr, _ = _make_pp_manager(None, spec)
+        assert _captured_layers(mgr) == {2, 6}
+
+    def test_all_layers_out_of_local_range_inactive(self):
+        spec = CaptureSpec(hooks={"post_mlp": [6, 7]}, positions="last_prompt")
+        mgr, _ = _make_pp_manager((0, 4), spec)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        # No requested layer lives on this stage → request not registered.
+        assert not mgr.has_request("r1")
+        assert mgr.finalize_request("r1") == {}
+
+    def test_out_of_global_range_still_raises_per_stage(self):
+        # A genuinely out-of-range layer is rejected even though it is also
+        # outside this stage's local slice.
+        spec = CaptureSpec(hooks={"post_mlp": [100]}, positions="last_prompt")
+        mgr, _ = _make_pp_manager((0, 4), spec)
+        with pytest.raises(ValueError, match="out of range"):
+            mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+
+    def test_partial_hook_layers_filtered(self):
+        # Multiple hooks, each split across the stage boundary.
+        spec = CaptureSpec(
+            hooks={"post_mlp": [1, 5], "post_attn": [3, 7]},
+            positions="last_prompt",
+        )
+        mgr, _ = _make_pp_manager((0, 4), spec)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        plan = mgr.build_step_plan(view)
+        assert set(plan.gather_indices) == {(1, "post_mlp"), (3, "post_attn")}
+
+    @pytest.mark.parametrize("bad_range", [(-1, 4), (4, 2), (0, 9)])
+    def test_invalid_local_range_rejected(self, bad_range):
+        spec = CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        with pytest.raises(ValueError, match="local_layer_range"):
+            _make_pp_manager(bad_range, spec)
