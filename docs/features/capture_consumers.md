@@ -406,13 +406,39 @@ if result is not None and result.status == "ok":
 On the OpenAI-compatible HTTP path, results are attached to the
 response body as `capture_results`, mirroring the structure above.
 
+## Parallelism
+
+Capturing the residual-stream hooks (`pre_attn`, `post_attn`,
+`post_mlp`) is supported under **tensor, pipeline, expert, and data
+parallelism** for worker-location consumers — including the built-in
+`filesystem` consumer. How it works:
+
+- The residual stream these hooks read is **replicated** across the
+  tensor- and expert-parallel ranks within each pipeline stage (it is
+  read after the TP all-reduce / MoE combine), so exactly one rank — TP
+  rank 0 of each stage — captures it; the other ranks add no overhead.
+- Under **pipeline parallelism**, each stage's TP rank 0 captures the
+  (global-indexed) layers that stage owns and writes them to the capture
+  target; the engine merges the per-stage results into one
+  `RequestOutput.capture_results`. Layer indices in a client spec are
+  always **global** (`0..num_hidden_layers-1`).
+- Under **data parallelism**, each replica is an independent engine core
+  over disjoint requests; captures partition naturally with no merge.
+
+**Requirement — shared storage:** under pipeline parallelism the capture
+target (`filesystem` `root`) must be a **shared mount** (e.g. an NFS
+volume) reachable by every pipeline node, because different stages write
+different layers of the same request. Files are keyed by global layer
+index, so stages never collide.
+
+**Not yet supported:** (1) `location="driver"` consumers that need a
+request's *full* layer stack assembled in one process across pipeline
+stages (worker-location consumers are unaffected); (2) capturing
+genuinely *sharded* activations (MLP intermediate / per-expert outputs).
+See [Capture Consumers under Parallelism](../design/capture_parallelism.md).
+
 ## Limits
 
-- **Tensor/pipeline parallelism**: the filesystem consumer rejects
-  any request under `tensor_parallel_size > 1` or
-  `pipeline_parallel_size > 1`. Third-party consumers that collect
-  residuals should do the same — multi-rank collection is out of
-  scope for the current framework.
 - **Prefix-cache hits**: positions below
   `CaptureContext.num_computed_tokens` were served from the prefix
   cache and never forwarded through the model. Consumers reject such
