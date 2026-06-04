@@ -1627,21 +1627,24 @@ class GPUModelRunner(
             CaptureContext,
             CaptureSpec,
             VllmInternalRequestId,
+            capture_expert_parallel_size,
         )
 
+        parallel_config = self.vllm_config.parallel_config
         ctx = CaptureContext(
             vllm_internal_request_id=VllmInternalRequestId(new_req_data.req_id),
             num_prompt_tokens=prompt_len,
             num_computed_tokens=new_req_data.num_computed_tokens,
-            num_hidden_layers=self.model_config.get_num_layers(
-                self.vllm_config.parallel_config
-            ),
+            # Global layer count: client specs reference global layer
+            # indices, so admission must validate against the full layer
+            # space even on a pipeline stage that owns only a slice.
+            num_hidden_layers=self.model_config.get_total_num_hidden_layers(),
             hidden_size=self.model_config.get_hidden_size(),
             element_size_bytes=element_size_bytes,
-            tensor_parallel_size=self.vllm_config.parallel_config.tensor_parallel_size,
-            pipeline_parallel_size=(
-                self.vllm_config.parallel_config.pipeline_parallel_size
-            ),
+            tensor_parallel_size=parallel_config.tensor_parallel_size,
+            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+            expert_parallel_size=capture_expert_parallel_size(parallel_config),
+            data_parallel_size=parallel_config.data_parallel_size,
         )
 
         raw_client = getattr(sp, "capture", None)

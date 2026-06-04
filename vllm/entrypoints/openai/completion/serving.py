@@ -55,6 +55,7 @@ from vllm.v1.capture import (
     CaptureConsumer,
     CaptureContext,
     CaptureValidationError,
+    capture_expert_parallel_size,
 )
 from vllm.v1.capture import registry as capture_registry
 
@@ -175,6 +176,8 @@ class OpenAIServingCompletion(OpenAIServing):
             element_size_bytes=int(element_size_bytes),
             tensor_parallel_size=parallel_config.tensor_parallel_size,
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+            expert_parallel_size=capture_expert_parallel_size(parallel_config),
+            data_parallel_size=parallel_config.data_parallel_size,
         )
 
         validated: dict[str, Any] = {}

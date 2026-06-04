@@ -25,6 +25,7 @@ from vllm.v1.capture.types import (
     HookName,
     PositionSelector,
     VllmInternalRequestId,
+    capture_expert_parallel_size,
 )
 
 __all__ = [
@@ -42,4 +43,5 @@ __all__ = [
     "PositionSelector",
     "UnknownCaptureConsumerError",
     "VllmInternalRequestId",
+    "capture_expert_parallel_size",
 ]
