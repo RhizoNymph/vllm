@@ -188,6 +188,34 @@ def _classify_positions(
     return positions, None
 
 
+def _filter_specs_to_layer_range(
+    specs: dict[int, CaptureSpec],
+    start: int,
+    end: int,
+) -> dict[int, CaptureSpec]:
+    """Restrict every consumer spec to layers in the global ``[start, end)``.
+
+    Returns a new mapping containing only consumers that retain at least
+    one hook layer in range. Hook entries that become empty are dropped,
+    and a consumer whose every hook empties out is removed entirely. The
+    layer indices are global (as produced by ``make_layers``), so the
+    comparison is directly against this stage's owned slice.
+    """
+    filtered: dict[int, CaptureSpec] = {}
+    for consumer_idx, spec in specs.items():
+        kept_hooks: dict[HookName, list[int]] = {}
+        for hook_name, layers in spec.hooks.items():
+            in_range = [layer for layer in layers if start <= layer < end]
+            if in_range:
+                kept_hooks[hook_name] = in_range
+        if kept_hooks:
+            filtered[consumer_idx] = CaptureSpec(
+                hooks=kept_hooks,
+                positions=spec.positions,
+            )
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Capture manager
 # ---------------------------------------------------------------------------
@@ -214,6 +242,7 @@ class CaptureManager:
         overload_policy: str = "block",
         spill_dir: str | None = None,
         spill_max_bytes: int = 4 << 30,
+        local_layer_range: tuple[int, int] | None = None,
     ) -> None:
         if len(consumers) != len(consumer_specs):
             msg = (
@@ -228,7 +257,25 @@ class CaptureManager:
             )
         self._consumers = consumers
         self._consumer_specs = consumer_specs
+        # ``num_hidden_layers`` is the GLOBAL layer count (across all
+        # pipeline stages); client/global specs reference global layer
+        # indices and are validated against it.
         self._num_hidden_layers = num_hidden_layers
+        # The global ``[start, end)`` layer slice this manager's worker
+        # actually computes (its pipeline stage). Specs are filtered to
+        # this range at registration so each stage captures and finalizes
+        # only its own layers; ``None`` means the whole model (no PP).
+        if local_layer_range is None:
+            self._local_layer_range = (0, num_hidden_layers)
+        else:
+            start, end = local_layer_range
+            if not (0 <= start <= end <= num_hidden_layers):
+                raise ValueError(
+                    f"local_layer_range {local_layer_range!r} must satisfy "
+                    f"0 <= start <= end <= num_hidden_layers "
+                    f"({num_hidden_layers})"
+                )
+            self._local_layer_range = (start, end)
         self._hidden_size = hidden_size
         self._model_dtype = model_dtype
         self._device = torch.device(device) if isinstance(device, str) else device
@@ -353,7 +400,9 @@ class CaptureManager:
             # No consumer has a spec for this request — nothing to do.
             return
 
-        # Validate hook layers.
+        # Validate hook layers against the GLOBAL layer space (a client
+        # genuinely out of range, e.g. layer 999 on a 64-layer model, is
+        # rejected regardless of which pipeline stage admits it).
         for consumer_idx, spec in merged.items():
             for hook_name, layers in spec.hooks.items():
                 for layer_idx in layers:
@@ -365,6 +414,17 @@ class CaptureManager:
                             f"[0, {self._num_hidden_layers})"
                         )
                         raise ValueError(msg)
+
+        # Filter each spec to the layers this pipeline stage owns. Under
+        # PP a request's layers are split across stages; each stage's
+        # manager captures and finalizes only its slice, and the engine
+        # merges per-stage results. Consumers left with no in-range layer
+        # are inactive for this request on this rank.
+        start, end = self._local_layer_range
+        merged = _filter_specs_to_layer_range(merged, start, end)
+        if not merged:
+            # None of the requested layers live on this stage.
+            return
 
         position_kind: dict[int, str] = {}
         static_positions: dict[int, list[int] | None] = {}
