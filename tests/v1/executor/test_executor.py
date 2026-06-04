@@ -179,7 +179,7 @@ class TestCaptureAwareAggregator:
         )
 
     def test_merges_captures_without_kv_aggregator(self):
-        from vllm.v1.executor.multiproc_executor import _CaptureAwareAggregator
+        from vllm.v1.executor.abstract import _CaptureAwareAggregator
 
         stage0 = self._fake_output({"r": {"fs": self._result("r", 1)}})
         stage1 = self._fake_output({})  # output_rank captured nothing itself
@@ -192,7 +192,7 @@ class TestCaptureAwareAggregator:
     def test_delegates_to_wrapped_kv_aggregator(self):
         from unittest.mock import MagicMock
 
-        from vllm.v1.executor.multiproc_executor import _CaptureAwareAggregator
+        from vllm.v1.executor.abstract import _CaptureAwareAggregator
 
         stage0 = self._fake_output({"r": {"fs": self._result("r", 1)}})
         stage1 = self._fake_output({})

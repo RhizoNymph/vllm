@@ -460,7 +460,12 @@ class RayDistributedExecutor(Executor):
 
         refs = self.forward_dag.execute((scheduler_output, grammar_output))  # type: ignore
 
-        if not self.has_connector:
+        # An aggregator is returned when a KV connector and/or activation
+        # capture is active; both need every worker's output, not just
+        # ``output_rank``'s. ``refs[0]`` is ``output_rank``, so the
+        # aggregator's default ``output_rank=0`` lines up.
+        aggregator = self._output_aggregator()
+        if aggregator is None:
             # Get output only from a single worker (output_rank)
             # When PP is not used, we block here until the result is available.
             if not non_block:
@@ -472,17 +477,17 @@ class RayDistributedExecutor(Executor):
             # the scheduler can yield to the next batch.
             return FutureWrapper(refs[0])
 
-        # Get output from all workers when connector is present
-        assert self.kv_output_aggregator is not None
+        # Get output from all workers and aggregate (KV transfer metadata
+        # and/or cross-stage capture_results).
         if not non_block:
             # Block and get results from all workers
             outputs = ray.get(refs)
             for output in outputs:
                 detach_zero_copy_from_model_runner_output(output)
-            return self.kv_output_aggregator.aggregate(outputs)
+            return aggregator.aggregate(outputs)
 
         # Return a future that will aggregate outputs from all workers
-        return FutureWrapper(refs, self.kv_output_aggregator)
+        return FutureWrapper(refs, aggregator)
 
     def collective_rpc(  # type: ignore[override]
         self,
