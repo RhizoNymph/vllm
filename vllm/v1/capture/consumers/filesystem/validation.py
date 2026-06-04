@@ -14,15 +14,17 @@ The checks performed here are the ones that can't be done at
 ``SamplingParams`` construction time because they need a
 ``VllmConfig`` or request context:
 
-1. ``tensor_parallel_size == 1`` and ``pipeline_parallel_size == 1``.
-   Multi-rank residual collection is out of scope for v1.
-2. Every layer referenced by every hook is in
-   ``[0, num_hidden_layers)``.
-3. Tag and request_id slug cleanly (reject ``..``, leading ``/``,
+1. Every layer referenced by every hook is in
+   ``[0, num_hidden_layers)`` (the *global* layer count under PP).
+2. Tag and request_id slug cleanly (reject ``..``, leading ``/``,
    > 256 chars, empty).
-4. Explicit position indices are valid and not below
+3. Explicit position indices are valid and not below
    ``num_computed_tokens`` (prefix-cache hits that were never
    forwarded).
+
+Tensor / pipeline / expert / data parallelism are all supported for
+the replicated residual hooks; see the parallelism note at the
+rejection site (now removed) and ``docs/design/capture_parallelism.md``.
 
 Runtime concerns (writer pool, plan building, finalization) are not
 this module's job.
@@ -365,19 +367,20 @@ def validate_filesystem_request(
     # 1. Structural validation.
     _structural_validate(raw)
 
-    # 2. TP/PP > 1 rejected.
-    if ctx.tensor_parallel_size != 1:
-        raise CaptureValidationError(
-            f"filesystem capture is only supported with "
-            f"tensor_parallel_size=1; got {ctx.tensor_parallel_size}. "
-            "Multi-rank residual collection is out of scope for v1."
-        )
-    if ctx.pipeline_parallel_size != 1:
-        raise CaptureValidationError(
-            f"filesystem capture is only supported with "
-            f"pipeline_parallel_size=1; got {ctx.pipeline_parallel_size}. "
-            "Multi-rank residual collection is out of scope for v1."
-        )
+    # 2. Parallelism. The residual hooks captured today (pre_attn /
+    # post_attn / post_mlp) read the residual stream after the
+    # tensor-parallel all-reduce / MoE combine, so it is replicated and
+    # full-width across the TP and EP planes; data parallelism partitions
+    # requests across independent engine cores. All four axes are
+    # therefore supported: TP rank 0 of each pipeline stage captures that
+    # stage's (global-indexed) layers to the shared mount, and the engine
+    # merges the per-stage results. No accept/reject branch on TP / PP /
+    # EP / DP size is needed here.
+    #
+    # Phase 4 (sharded-activation capture: MLP intermediate / per-expert
+    # outputs) will reintroduce a rejection *for sharded hooks only*,
+    # since those tensors are partitioned across the TP / EP plane and
+    # need a gather. The residual hooks above remain unconditional.
 
     # 3. Slug tag + request_id so we surface a clean error (rather
     # than failing much later on a filesystem write).

@@ -76,6 +76,8 @@ def _make_context(
     element_size_bytes: int = 2,
     tp: int = 1,
     pp: int = 1,
+    ep: int = 1,
+    dp: int = 1,
 ) -> CaptureContext:
     return CaptureContext(
         vllm_internal_request_id=VllmInternalRequestId(request_id),
@@ -86,6 +88,8 @@ def _make_context(
         element_size_bytes=element_size_bytes,
         tensor_parallel_size=tp,
         pipeline_parallel_size=pp,
+        expert_parallel_size=ep,
+        data_parallel_size=dp,
     )
 
 
@@ -356,6 +360,40 @@ class TestValidateClientSpec:
             assert isinstance(spec, CaptureSpec)
             assert "pre_attn" in spec.hooks
             assert len(spec.hooks["pre_attn"]) == 32  # all layers
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    @pytest.mark.parametrize(
+        "tp,pp,ep,dp",
+        [
+            (2, 1, 1, 1),  # tensor parallel
+            (1, 2, 1, 1),  # pipeline parallel
+            (1, 1, 4, 1),  # expert parallel
+            (1, 1, 1, 2),  # data parallel
+            (2, 2, 4, 2),  # all axes together
+        ],
+    )
+    def test_parallel_sizes_accepted_for_residual_hooks(
+        self, tp: int, pp: int, ep: int, dp: int
+    ) -> None:
+        # The replicated residual hooks are supported under every
+        # parallel axis — admission no longer rejects TP/PP/EP/DP > 1.
+        vllm_config = _make_vllm_config()
+        consumer = FilesystemConsumer(
+            vllm_config=vllm_config,
+            params={"root": "/tmp/test"},
+        )
+        try:
+            ctx = _make_context(tp=tp, pp=pp, ep=ep, dp=dp)
+            raw = FilesystemCaptureRequest(
+                request_id="par-req",
+                tag="par-tag",
+                hooks={"post_mlp": [0, 1, 2]},
+                positions="last_prompt",
+            )
+            spec = consumer.validate_client_spec(raw, ctx)
+            assert isinstance(spec, CaptureSpec)
+            assert spec.hooks["post_mlp"] == [0, 1, 2]
         finally:
             consumer.shutdown(timeout=5.0)
 
