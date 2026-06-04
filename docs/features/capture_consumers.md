@@ -431,6 +431,13 @@ volume) reachable by every pipeline node, because different stages write
 different layers of the same request. Files are keyed by global layer
 index, so stages never collide.
 
+**Requirement — `per_file` layout under PP:** only `layout="per_file"`
+works with `pipeline_parallel_size > 1`. `packed` and `sharded` write a
+single file per request (or per tag), so every pipeline stage would race
+to write the *same* path on the shared mount — interleaved bytes and an
+orphaned, never-published `.tmp`. Admission **rejects** `packed`/`sharded`
+under PP with a clear error; use `per_file` (the default).
+
 **Not yet supported:** (1) `location="driver"` consumers that need a
 request's *full* layer stack assembled in one process across pipeline
 stages (worker-location consumers are unaffected); (2) capturing

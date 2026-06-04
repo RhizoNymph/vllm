@@ -397,6 +397,35 @@ class TestValidateClientSpec:
         finally:
             consumer.shutdown(timeout=5.0)
 
+    @pytest.mark.parametrize("layout", ["packed", "sharded"])
+    def test_packed_sharded_rejected_under_pipeline_parallelism(
+        self, layout: str
+    ) -> None:
+        # packed/sharded write one file per request/tag; under PP the
+        # stages collide on the shared mount, so admission must reject.
+        from vllm.v1.capture.errors import CaptureValidationError
+
+        consumer = FilesystemConsumer(
+            vllm_config=_make_vllm_config(),
+            params={"root": "/tmp/test"},
+        )
+        try:
+            ctx = _make_context(pp=2)
+            raw = FilesystemCaptureRequest(
+                request_id="pp-packed",
+                tag="pp-packed",
+                hooks={"post_mlp": [0, 1]},
+                positions="last_prompt",
+                layout=layout,
+            )
+            with pytest.raises(CaptureValidationError, match="pipeline_parallel"):
+                consumer.validate_client_spec(raw, ctx)
+            # per_file is fine under PP.
+            raw.layout = "per_file"
+            assert isinstance(consumer.validate_client_spec(raw, ctx), CaptureSpec)
+        finally:
+            consumer.shutdown(timeout=5.0)
+
 
 class TestGetResultLifecycle:
     """Verify the result transitions: None -> pending -> ok."""
