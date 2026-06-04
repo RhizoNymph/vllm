@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1058,3 +1059,70 @@ class TestMergeCaptureResults:
         # output_rank points at the None entry → no crash, no-op.
         merge_capture_results(outputs, output_rank=1)
         assert outputs[1] is None
+
+
+# ---------------------------------------------------------------------------
+# Non-blocking finalize_request_async
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeAsync:
+    def test_callback_receives_aggregated_results(self):
+        sink = _make_sink("sink0")
+        spec = CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        key = (VllmInternalRequestId("r1"), 0, "post_mlp")
+        sink.wait_for_result.return_value = CaptureResult(
+            key=key, status="ok", payload={"path": "/tmp/x"}
+        )
+        mgr, _ = _make_manager(sinks=(sink,), specs=(spec,))
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+
+        done = threading.Event()
+        captured: dict[int, CaptureResult] = {}
+
+        def _on_complete(results):
+            captured.update(results)
+            done.set()
+
+        assert mgr.finalize_request_async("r1", _on_complete) is True
+        assert done.wait(timeout=5.0)
+        assert captured[0].status == "ok"
+        assert captured[0].payload == {"path": "/tmp/x"}
+        # State is popped on the caller thread at enqueue time.
+        assert not mgr.has_request("r1")
+
+    def test_unknown_request_returns_false_and_no_callback(self):
+        mgr, _ = _make_manager()
+        called = threading.Event()
+        assert mgr.finalize_request_async("nope", lambda r: called.set()) is False
+        # Give any (erroneous) callback a chance to fire.
+        assert not called.wait(timeout=0.2)
+
+    def test_does_not_block_the_caller(self):
+        # The caller (model-runner step thread) must return before the
+        # blocking wait_for_result completes.
+        sink = _make_sink("sink0")
+        spec = CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        key = (VllmInternalRequestId("r1"), 0, "post_mlp")
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _blocking_wait(_key, timeout=None):
+            entered.set()
+            release.wait(timeout=5.0)
+            return CaptureResult(key=key, status="ok")
+
+        sink.wait_for_result.side_effect = _blocking_wait
+        mgr, _ = _make_manager(sinks=(sink,), specs=(spec,))
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+
+        done = threading.Event()
+        assert mgr.finalize_request_async("r1", lambda r: done.set()) is True
+        # The finalize thread is now blocked inside wait_for_result, but the
+        # caller already returned and the callback has NOT fired.
+        assert entered.wait(timeout=5.0)
+        assert not done.is_set()
+        # Releasing the sink lets finalize complete and the callback fire.
+        release.set()
+        assert done.wait(timeout=5.0)

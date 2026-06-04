@@ -518,7 +518,11 @@ class GPUModelRunner(
         self._capture_index_to_name: dict[int, str] = {}
         # Pending terminal results keyed by request id → consumer name →
         # ``CaptureResult``.  Drained onto every ``ModelRunnerOutput``.
+        # Written by the manager's finalize thread (via the async finalize
+        # callback) and drained on the step thread, so all access is
+        # guarded by ``_pending_capture_results_lock``.
         self._pending_capture_results: dict[str, dict[str, CaptureResult]] = {}
+        self._pending_capture_results_lock = threading.Lock()
         # Set on *every* rank (capturer or not). Drives the per-step
         # force-eager decision in ``execute_model`` via
         # ``_capture_step_gate``, which every rank evaluates identically
@@ -1257,23 +1261,22 @@ class GPUModelRunner(
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
-            # Finalize activation capture for this request before the
-            # persistent batch drops it.  The new manager returns a
-            # ``{consumer_name: CaptureResult}`` dict; empty when no
-            # consumer was active for this request.  We stash it on
-            # ``_pending_capture_results`` so the next
-            # ``ModelRunnerOutput`` can ferry it to the scheduler →
-            # engine core → output processor.
             # Drop the request from the rank-replicated force-eager gate
             # on every rank (capturer or not), mirroring the broadcast
             # ``finished_req_ids`` so the gate stays consistent across the
             # TP/PP topology.
             if self._capture_step_gate is not None:
                 self._capture_step_gate.drop(req_id)
+            # Finalize activation capture for this request before the
+            # persistent batch drops it. The finalize runs on the manager's
+            # finalize thread (off this step thread); its callback stashes
+            # the ``{consumer_name: CaptureResult}`` dict on
+            # ``_pending_capture_results`` so a later ``ModelRunnerOutput``
+            # can ferry it to the scheduler → engine core → output
+            # processor if it is ready in time (best-effort; the captured
+            # data on disk is unaffected either way).
             if self._capture_manager is not None:
-                results = self._finalize_capture_for_request(req_id)
-                if results:
-                    self._pending_capture_results[req_id] = results
+                self._finalize_capture_for_request_async(req_id)
             self.input_batch.remove_request(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
@@ -1855,26 +1858,36 @@ class GPUModelRunner(
             token_offsets=token_offsets,
         )
 
-    def _finalize_capture_for_request(self, req_id: str) -> dict[str, "CaptureResult"]:
-        """Drive the new capture manager to finalize *req_id*.
+    def _finalize_capture_for_request_async(self, req_id: str) -> None:
+        """Drive the capture manager to finalize *req_id* off the step thread.
 
-        Returns a ``{consumer_name: CaptureResult}`` dict (possibly
-        empty).  Empty means no consumer was active for the request or
-        the manager never saw it.
+        The manager pops the request's capture state here (on the step
+        thread) and runs the blocking finalize on its finalize thread. The
+        callback maps consumer indices to names and stashes the
+        ``{consumer_name: CaptureResult}`` dict on
+        ``_pending_capture_results`` (under the lock, since it fires on the
+        finalize thread) for a later ``ModelRunnerOutput`` to drain. A
+        no-op when the manager never saw the request.
         """
         mgr = self._capture_manager
         if mgr is None:
-            return {}
-        if not mgr.has_request(req_id):
-            return {}
+            return
 
-        indexed = mgr.finalize_request(req_id)
-        if not indexed:
-            return {}
-        return {
-            self._capture_index_to_name.get(idx, f"consumer_{idx}"): result
-            for idx, result in indexed.items()
-        }
+        index_to_name = self._capture_index_to_name
+        pending = self._pending_capture_results
+        lock = self._pending_capture_results_lock
+
+        def _on_complete(indexed: dict[int, "CaptureResult"]) -> None:
+            if not indexed:
+                return
+            named = {
+                index_to_name.get(idx, f"consumer_{idx}"): result
+                for idx, result in indexed.items()
+            }
+            with lock:
+                pending.setdefault(req_id, {}).update(named)
+
+        mgr.finalize_request_async(req_id, _on_complete)
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -4955,17 +4968,21 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        # Transfer any capture results that were finalized during
-        # this step.  ``_pending_capture_results`` is populated by
-        # ``_update_states`` when a finished request drops out of
-        # the persistent batch; we flush it here so it rides on the
-        # same ``ModelRunnerOutput`` as the terminal token.
+        # Transfer any capture results that have finalized so far.
+        # ``_pending_capture_results`` is populated asynchronously by the
+        # manager's finalize thread (via the async finalize callback) for
+        # requests that have dropped out of the persistent batch; we flush
+        # whatever is ready here so it rides on a ``ModelRunnerOutput``.
+        # Best-effort: a result not yet ready simply attaches to a later
+        # step's output (or not at all). The lock guards against the
+        # finalize thread writing while we swap the dict out.
         capture_results_for_step: dict[str, dict[str, CaptureResult]]
-        if self._pending_capture_results:
-            capture_results_for_step = self._pending_capture_results
-            self._pending_capture_results = {}
-        else:
-            capture_results_for_step = {}
+        with self._pending_capture_results_lock:
+            if self._pending_capture_results:
+                capture_results_for_step = self._pending_capture_results
+                self._pending_capture_results = {}
+            else:
+                capture_results_for_step = {}
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
