@@ -527,63 +527,94 @@ class GPUModelRunner(
             from vllm.model_executor.layers.activation_capture import (
                 set_active_capture_manager,
             )
-            from vllm.v1.capture import registry as _capture_registry
-            from vllm.v1.capture.manager import CaptureManager
 
-            # Pre-constructed driver-side instances ride on the
-            # ``CaptureConsumersConfig.instances`` field populated by the
-            # ``LLM`` constructor.  Dict-form consumers come through
-            # ``config.consumers`` as before; both paths are handled by
-            # ``build_consumers``.
-            instances = list(self.vllm_config.capture_consumers_config.instances)
+            # Capturer-rank gate. The replicated residual hooks
+            # (pre_attn/post_attn/post_mlp) read the residual stream after
+            # the tensor-parallel all-reduce / MoE combine, so it is
+            # byte-identical across the tensor-parallel group within each
+            # (data-parallel, pipeline) cell. Exactly one rank — TP rank 0
+            # — captures it; every other rank installs no manager and runs
+            # the cold path, so the graph-local capture op never enters its
+            # compiled graph (divergent per-rank graphs are safe because
+            # the op carries no collective). Each pipeline stage's TP rank 0
+            # captures the layers that stage owns; the engine merges the
+            # per-stage results.
+            if get_tp_group().rank_in_group != 0:
+                set_active_capture_manager(None)
+            else:
+                from vllm.v1.capture import registry as _capture_registry
+                from vllm.v1.capture.manager import CaptureManager
 
-            sinks, validators, name_to_index = _capture_registry.build_consumers(
-                self.vllm_config, consumer_instances=instances
-            )
+                # Pre-constructed driver-side instances ride on the
+                # ``CaptureConsumersConfig.instances`` field populated by
+                # the ``LLM`` constructor.  Dict-form consumers come
+                # through ``config.consumers`` as before; both paths are
+                # handled by ``build_consumers``.
+                instances = list(
+                    self.vllm_config.capture_consumers_config.instances
+                )
 
-            # Gather each consumer's global spec.  The batched-adapter
-            # path reaches the ``CaptureConsumer`` via the validator;
-            # direct sink consumers (e.g. ``FilesystemConsumer``)
-            # expose the method on themselves — ``_select_validator``
-            # points the validator tuple at whichever object carries
-            # ``validate_client_spec`` / ``global_capture_spec``.
-            global_specs: list[Any] = []
-            for validator in validators:
-                spec = None
-                try:
-                    if hasattr(validator, "global_capture_spec"):
-                        spec = validator.global_capture_spec()
-                except Exception:
+                sinks, validators, name_to_index = (
+                    _capture_registry.build_consumers(
+                        self.vllm_config, consumer_instances=instances
+                    )
+                )
+
+                # Gather each consumer's global spec.  The batched-adapter
+                # path reaches the ``CaptureConsumer`` via the validator;
+                # direct sink consumers (e.g. ``FilesystemConsumer``)
+                # expose the method on themselves — ``_select_validator``
+                # points the validator tuple at whichever object carries
+                # ``validate_client_spec`` / ``global_capture_spec``.
+                global_specs: list[Any] = []
+                for validator in validators:
                     spec = None
-                global_specs.append(spec)
+                    try:
+                        if hasattr(validator, "global_capture_spec"):
+                            spec = validator.global_capture_spec()
+                    except Exception:
+                        spec = None
+                    global_specs.append(spec)
 
-            cc_config = self.vllm_config.capture_consumers_config
-            self._capture_manager = CaptureManager(
-                consumers=sinks,
-                consumer_specs=tuple(global_specs),
-                num_hidden_layers=self.model_config.get_num_layers(
-                    self.vllm_config.parallel_config
-                ),
-                hidden_size=self.model_config.get_hidden_size(),
-                model_dtype=self.model_config.dtype,
-                device=self.device,
-                dispatch_queue_size=getattr(
-                    cc_config, "dispatch_queue_size", 256
-                ),
-                overload_policy=getattr(cc_config, "overload_policy", "spill"),
-                spill_dir=getattr(cc_config, "spill_dir", None),
-                spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
-            )
-            self._capture_validators = validators
-            self._capture_name_to_index = dict(name_to_index)
-            self._capture_index_to_name = {
-                idx: name for name, idx in name_to_index.items()
-            }
+                cc_config = self.vllm_config.capture_consumers_config
+                self._capture_manager = CaptureManager(
+                    consumers=sinks,
+                    consumer_specs=tuple(global_specs),
+                    # Global layer count for validation; the local slice
+                    # this pipeline stage owns drives spec filtering so it
+                    # captures and finalizes only its own layers.
+                    num_hidden_layers=(
+                        self.model_config.get_total_num_hidden_layers()
+                    ),
+                    local_layer_range=(
+                        self.model_config.get_layers_start_end_indices(
+                            self.vllm_config.parallel_config
+                        )
+                    ),
+                    hidden_size=self.model_config.get_hidden_size(),
+                    model_dtype=self.model_config.dtype,
+                    device=self.device,
+                    dispatch_queue_size=getattr(
+                        cc_config, "dispatch_queue_size", 256
+                    ),
+                    overload_policy=getattr(
+                        cc_config, "overload_policy", "spill"
+                    ),
+                    spill_dir=getattr(cc_config, "spill_dir", None),
+                    spill_max_bytes=getattr(
+                        cc_config, "spill_max_bytes", 4 << 30
+                    ),
+                )
+                self._capture_validators = validators
+                self._capture_name_to_index = dict(name_to_index)
+                self._capture_index_to_name = {
+                    idx: name for name, idx in name_to_index.items()
+                }
 
-            # Install as the process-global active capture manager so
-            # the ``capture_residual`` custom op finds it from inside
-            # the compiled forward graph.
-            set_active_capture_manager(self._capture_manager)
+                # Install as the process-global active capture manager so
+                # the ``capture_residual`` custom op finds it from inside
+                # the compiled forward graph.
+                set_active_capture_manager(self._capture_manager)
 
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
