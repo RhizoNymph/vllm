@@ -546,14 +546,10 @@ class GPUModelRunner(
                 # the ``LLM`` constructor.  Dict-form consumers come
                 # through ``config.consumers`` as before; both paths are
                 # handled by ``build_consumers``.
-                instances = list(
-                    self.vllm_config.capture_consumers_config.instances
-                )
+                instances = list(self.vllm_config.capture_consumers_config.instances)
 
-                sinks, validators, name_to_index = (
-                    _capture_registry.build_consumers(
-                        self.vllm_config, consumer_instances=instances
-                    )
+                sinks, validators, name_to_index = _capture_registry.build_consumers(
+                    self.vllm_config, consumer_instances=instances
                 )
 
                 # Gather each consumer's global spec.  The batched-adapter
@@ -579,9 +575,7 @@ class GPUModelRunner(
                     # Global layer count for validation; the local slice
                     # this pipeline stage owns drives spec filtering so it
                     # captures and finalizes only its own layers.
-                    num_hidden_layers=(
-                        self.model_config.get_total_num_hidden_layers()
-                    ),
+                    num_hidden_layers=self.model_config.get_total_num_hidden_layers(),
                     local_layer_range=(
                         self.model_config.get_layers_start_end_indices(
                             self.vllm_config.parallel_config
@@ -590,16 +584,10 @@ class GPUModelRunner(
                     hidden_size=self.model_config.get_hidden_size(),
                     model_dtype=self.model_config.dtype,
                     device=self.device,
-                    dispatch_queue_size=getattr(
-                        cc_config, "dispatch_queue_size", 256
-                    ),
-                    overload_policy=getattr(
-                        cc_config, "overload_policy", "spill"
-                    ),
+                    dispatch_queue_size=getattr(cc_config, "dispatch_queue_size", 256),
+                    overload_policy=getattr(cc_config, "overload_policy", "spill"),
                     spill_dir=getattr(cc_config, "spill_dir", None),
-                    spill_max_bytes=getattr(
-                        cc_config, "spill_max_bytes", 4 << 30
-                    ),
+                    spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
                 )
                 self._capture_validators = validators
                 self._capture_name_to_index = dict(name_to_index)

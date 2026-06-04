@@ -843,9 +843,7 @@ class CaptureManager:
 
     def _serialize_packet(self, packet: _DispatchPacket) -> bytes:
         """Serialize a packet's entries + CPU scratch tensors to bytes."""
-        scratch = {
-            key: view for key, (_owner, view) in packet.scratch_pinned.items()
-        }
+        scratch = {key: view for key, (_owner, view) in packet.scratch_pinned.items()}
         buf = io.BytesIO()
         torch.save({"entries": packet.entries, "scratch": scratch}, buf)
         return buf.getvalue()
@@ -853,9 +851,7 @@ class CaptureManager:
     def _deserialize_packet(self, data: bytes) -> _DispatchPacket:
         """Rebuild a packet from spill bytes (CPU scratch, no pinned owner)."""
         obj = torch.load(io.BytesIO(data), weights_only=False)
-        scratch_pinned = {
-            key: (None, view) for key, view in obj["scratch"].items()
-        }
+        scratch_pinned = {key: (None, view) for key, view in obj["scratch"].items()}
         return _DispatchPacket(
             entries=obj["entries"],
             scratch_pinned=scratch_pinned,
@@ -1284,9 +1280,7 @@ def merge_capture_results(
     for req_id, per_consumer in collected.items():
         merged[req_id] = {
             name: (
-                results[0]
-                if len(results) == 1
-                else _aggregate_capture_results(results)
+                results[0] if len(results) == 1 else _aggregate_capture_results(results)
             )
             for name, results in per_consumer.items()
         }

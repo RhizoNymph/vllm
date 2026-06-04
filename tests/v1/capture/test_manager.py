@@ -4,12 +4,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
-
-from types import SimpleNamespace
 
 from vllm.v1.capture.manager import (
     CaptureManager,

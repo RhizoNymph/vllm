@@ -286,9 +286,7 @@ class MultiprocExecutor(Executor):
         # ``ModelRunnerOutput``. Collecting all ranks' outputs and unioning
         # ``capture_results`` recovers the full per-request result — the
         # same all-outputs path the KV connector uses.
-        self.capture_enabled = (
-            self.vllm_config.capture_consumers_config is not None
-        )
+        self.capture_enabled = self.vllm_config.capture_consumers_config is not None
 
     def _get_parallel_sizes(self) -> tuple[int, int, int]:
         self.world_size = self.parallel_config.world_size
