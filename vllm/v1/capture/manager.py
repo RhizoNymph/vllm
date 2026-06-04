@@ -39,6 +39,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -1246,7 +1247,54 @@ def _aggregate_capture_results(results: list[CaptureResult]) -> CaptureResult:
     )
 
 
+def merge_capture_results(
+    outputs: Sequence[Any | None],
+    output_rank: int,
+) -> None:
+    """Union every rank's ``capture_results`` into ``outputs[output_rank]``.
+
+    Mutates ``outputs[output_rank].capture_results`` in place. Under
+    pipeline parallelism a request's captured layers are split across
+    stages, so each stage's TP-rank-0 worker produces capture results for
+    the layers it owns. Only ``outputs[output_rank]`` (TP rank 0 of the
+    last stage) is returned to the engine, so the other ranks' results are
+    folded in here: grouped by ``(request_id, consumer_name)`` and reduced
+    with the same worst-of-status precedence ``finalize`` uses within a
+    rank. ``outputs`` is duck-typed on ``.capture_results`` to avoid a
+    hard import of ``ModelRunnerOutput`` into this module.
+
+    A request whose layers all live on one rank contributes exactly one
+    result for that ``(request, consumer)`` and passes through unchanged.
+    """
+    target = outputs[output_rank] if 0 <= output_rank < len(outputs) else None
+    if target is None:
+        return
+
+    # request_id -> consumer_name -> list[CaptureResult]
+    collected: dict[str, dict[str, list[CaptureResult]]] = {}
+    for out in outputs:
+        if out is None:
+            continue
+        for req_id, per_consumer in out.capture_results.items():
+            req_bucket = collected.setdefault(req_id, {})
+            for name, result in per_consumer.items():
+                req_bucket.setdefault(name, []).append(result)
+
+    merged: dict[str, dict[str, CaptureResult]] = {}
+    for req_id, per_consumer in collected.items():
+        merged[req_id] = {
+            name: (
+                results[0]
+                if len(results) == 1
+                else _aggregate_capture_results(results)
+            )
+            for name, results in per_consumer.items()
+        }
+    target.capture_results = merged
+
+
 __all__ = [
     "CaptureManager",
     "_aggregate_capture_results",
+    "merge_capture_results",
 ]

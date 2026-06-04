@@ -9,9 +9,12 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from types import SimpleNamespace
+
 from vllm.v1.capture.manager import (
     CaptureManager,
     _aggregate_capture_results,
+    merge_capture_results,
 )
 from vllm.v1.capture.plan import CaptureBatchView, StepCapturePlan
 from vllm.v1.capture.types import (
@@ -981,3 +984,78 @@ class TestLocalLayerRangeFiltering:
         spec = CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
         with pytest.raises(ValueError, match="local_layer_range"):
             _make_pp_manager(bad_range, spec)
+
+
+# ---------------------------------------------------------------------------
+# Cross-rank capture_results merge (executor aggregation path)
+# ---------------------------------------------------------------------------
+
+
+def _result(req: str, layer: int, status: str = "ok", payload=None) -> CaptureResult:
+    return CaptureResult(
+        key=(VllmInternalRequestId(req), layer, "post_mlp"),
+        status=status,
+        payload=payload,
+    )
+
+
+def _fake_output(capture_results):
+    # Duck-typed stand-in for ModelRunnerOutput (only .capture_results used).
+    return SimpleNamespace(capture_results=capture_results)
+
+
+class TestMergeCaptureResults:
+    def test_disjoint_requests_unioned_into_output_rank(self):
+        # rank 0 (stage 0) captured req-a; rank 1 (output_rank) captured req-b.
+        stage0 = _fake_output({"req-a": {"filesystem": _result("req-a", 1)}})
+        stage1 = _fake_output({"req-b": {"filesystem": _result("req-b", 3)}})
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        assert set(outputs[1].capture_results) == {"req-a", "req-b"}
+        assert "filesystem" in outputs[1].capture_results["req-a"]
+        assert "filesystem" in outputs[1].capture_results["req-b"]
+
+    def test_same_request_across_stages_aggregated(self):
+        # Both stages captured different layers of the same request.
+        stage0 = _fake_output(
+            {"req": {"filesystem": _result("req", 1, payload=["a.bin"])}}
+        )
+        stage1 = _fake_output(
+            {"req": {"filesystem": _result("req", 5, payload=["b.bin"])}}
+        )
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        merged = outputs[1].capture_results["req"]["filesystem"]
+        # Aggregated payload keeps both stages' keys.
+        assert merged.status == "ok"
+        assert isinstance(merged.payload, dict)
+        assert len(merged.payload) == 2
+
+    def test_worst_status_wins(self):
+        stage0 = _fake_output({"req": {"fs": _result("req", 1, status="error")}})
+        stage1 = _fake_output({"req": {"fs": _result("req", 5, status="ok")}})
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        assert outputs[1].capture_results["req"]["fs"].status == "error"
+
+    def test_single_rank_result_passes_through_unchanged(self):
+        only = _result("req", 2)
+        stage0 = _fake_output({})  # non-capturing stage
+        stage1 = _fake_output({"req": {"fs": only}})
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        # Exactly one contributor → same object, not re-wrapped.
+        assert outputs[1].capture_results["req"]["fs"] is only
+
+    def test_none_outputs_skipped(self):
+        stage0 = None
+        stage1 = _fake_output({"req": {"fs": _result("req", 1)}})
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        assert set(outputs[1].capture_results) == {"req"}
+
+    def test_none_target_is_noop(self):
+        outputs = [_fake_output({"req": {"fs": _result("req", 1)}}), None]
+        # output_rank points at the None entry → no crash, no-op.
+        merge_capture_results(outputs, output_rank=1)
+        assert outputs[1] is None
