@@ -206,8 +206,5 @@ def capture_expert_parallel_size(parallel_config: ParallelConfig) -> int:
     construction site so the derivation stays in one place.
     """
     if getattr(parallel_config, "enable_expert_parallel", False):
-        return (
-            parallel_config.tensor_parallel_size
-            * parallel_config.data_parallel_size
-        )
+        return parallel_config.tensor_parallel_size * parallel_config.data_parallel_size
     return 1
