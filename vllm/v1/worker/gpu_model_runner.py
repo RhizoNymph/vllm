@@ -519,16 +519,32 @@ class GPUModelRunner(
         # Pending terminal results keyed by request id → consumer name →
         # ``CaptureResult``.  Drained onto every ``ModelRunnerOutput``.
         self._pending_capture_results: dict[str, dict[str, CaptureResult]] = {}
-        # Set on *every* rank (capturer or not) — drives the per-step
-        # cross-rank force-eager agreement in ``execute_model`` so all
-        # ranks participate in the collective. Independent of the
-        # capturer gate, which only controls who installs a manager.
+        # Set on *every* rank (capturer or not). Drives the per-step
+        # force-eager decision in ``execute_model`` via
+        # ``_capture_step_gate``, which every rank evaluates identically
+        # from the broadcast ``scheduler_output`` — so no cross-rank
+        # collective is needed and all ranks stay in lockstep on
+        # ``num_tokens_padded``. Independent of the capturer gate, which
+        # only controls who installs a manager.
         self._capture_feature_enabled = (
             self.vllm_config.capture_consumers_config is not None
         )
+        # Rank-replicated force-eager predicate. Built on every rank
+        # (capturer or not) so the eager-vs-cudagraph choice agrees across
+        # the TP/PP topology without a per-step collective. ``None`` when
+        # the capture feature is disabled.
+        self._capture_step_gate: Any = None
         if self.vllm_config.capture_consumers_config is not None:
             from vllm.model_executor.layers.activation_capture import (
                 set_active_capture_manager,
+            )
+            from vllm.v1.capture.step_gate import (
+                CaptureStepGate,
+                force_all_from_config,
+            )
+
+            self._capture_step_gate = CaptureStepGate(
+                force_all=force_all_from_config(self.vllm_config)
             )
 
             # Capturer-rank gate. The replicated residual hooks
@@ -1248,6 +1264,12 @@ class GPUModelRunner(
             # ``_pending_capture_results`` so the next
             # ``ModelRunnerOutput`` can ferry it to the scheduler →
             # engine core → output processor.
+            # Drop the request from the rank-replicated force-eager gate
+            # on every rank (capturer or not), mirroring the broadcast
+            # ``finished_req_ids`` so the gate stays consistent across the
+            # TP/PP topology.
+            if self._capture_step_gate is not None:
+                self._capture_step_gate.drop(req_id)
             if self._capture_manager is not None:
                 results = self._finalize_capture_for_request(req_id)
                 if results:
@@ -1348,6 +1370,16 @@ class GPUModelRunner(
             # recorded on the manager and surfaced later as a terminal
             # ``CaptureResult.status == "error"`` — they never abort
             # text generation (spec invariant 7).
+            #
+            # Track the request in the rank-replicated force-eager gate on
+            # *every* rank (capturer or not), reading the client capture
+            # spec that rides in ``sampling_params`` on all ranks. This is
+            # what lets the eager-vs-cudagraph decision agree across the
+            # TP/PP topology without a collective.
+            if self._capture_step_gate is not None and sampling_params is not None:
+                self._capture_step_gate.register(
+                    req_id, getattr(sampling_params, "capture", None)
+                )
             if self._capture_manager is not None and sampling_params is not None:
                 self._register_capture_request(new_req_data, req_state)
 
@@ -1760,20 +1792,6 @@ class GPUModelRunner(
             logger.warning(
                 "capture register rejected req=%s: %s", new_req_data.req_id, exc
             )
-
-    def _prepare_capture_step(self, scheduler_output: "SchedulerOutput") -> None:
-        """Build the per-step capture plan via the new manager.
-
-        Runs just before the forward pass.  A no-op when no consumers
-        are configured or when no request currently registered with
-        the manager wants anything this step.
-        """
-        if self._capture_manager is None:
-            return
-        if not self._capture_manager.is_active():
-            return
-        batch_view = self._build_capture_batch_view(scheduler_output)
-        self._capture_manager.build_step_plan(batch_view)
 
     def _finalize_capture_step(self) -> None:
         """Dispatch captured rows to every consumer's sink.
@@ -4426,31 +4444,36 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
-            # Build the per-step activation-capture plan *before* the
-            # cudagraph dispatch decision. ``CaptureManager.on_hook``
-            # gathers rows with per-step Python that cannot run inside a
-            # replayed CUDA graph, so any step that actually captures
-            # must run eager. Non-capturing steps (the common case) keep
-            # full cudagraph speed. Safe to build here: it only needs
-            # ``scheduler_output`` + ``input_batch``, both already
-            # populated by ``_prepare_inputs`` above.
+            # Decide force-eager *before* the cudagraph dispatch.
+            # ``CaptureManager.on_hook`` gathers rows with per-step Python
+            # that cannot run inside a replayed CUDA graph, so any step
+            # that actually captures must run eager. Under TP/PP every rank
+            # must reach the *same* decision: a divergent
+            # ``num_tokens_padded`` (eager skips the cudagraph padding)
+            # misaligns the TP all-reduce / PP send-recv and deadlocks, and
+            # a per-step collective to agree would itself deadlock inside
+            # PP's asynchronous pipeline. ``CaptureStepGate`` evaluates the
+            # identical predicate on every rank from the broadcast
+            # ``scheduler_output`` (projected into ``capture_view``) with no
+            # collective, so plain requests and the decode steps of
+            # ``last_prompt`` captures keep full cudagraph speed while
+            # genuinely capturing steps run eager. The view only needs
+            # ``scheduler_output`` + ``input_batch``, both already populated
+            # by ``_prepare_inputs`` above.
             capture_pending = False
-            if self._capture_manager is not None:
-                self._prepare_capture_step(scheduler_output)
-                capture_pending = self._capture_manager.has_pending_capture()
-
-            # Force eager on every step while the capture feature is
-            # enabled. The per-step gather can't run inside a replayed CUDA
-            # graph, and under pipeline parallelism every rank must agree on
-            # ``num_tokens_padded`` for the TP all-reduce / PP send-recv to
-            # line up. Deciding purely from the feature flag (identical on
-            # every rank) keeps all ranks in lockstep with no per-step
-            # collective — a cross-PP all-reduce here would be a synchronous
-            # barrier inside PP's asynchronous pipeline and deadlock against
-            # the send/recv. Costs cudagraph speed while capture is
-            # configured, which is acceptable for a capture run.
-            if self._capture_feature_enabled:
-                capture_pending = True
+            if self._capture_step_gate is not None:
+                capture_view = self._build_capture_batch_view(scheduler_output)
+                capture_pending = self._capture_step_gate.step_captures(capture_view)
+                # The capturer rank builds the real gather plan from the
+                # same view. ``build_step_plan`` is a strict subset of the
+                # gate's decision (it additionally honours pipeline-stage
+                # layer filtering and admission validation), so it never
+                # gathers on a step the gate left in cudagraph mode.
+                if (
+                    self._capture_manager is not None
+                    and self._capture_manager.is_active()
+                ):
+                    self._capture_manager.build_step_plan(capture_view)
 
             (
                 cudagraph_mode,
@@ -4609,7 +4632,8 @@ class GPUModelRunner(
 
         # (The per-step activation-capture plan is built earlier, before
         # the cudagraph dispatch decision, so capturing steps can force
-        # eager execution — see ``_prepare_capture_step`` call above.)
+        # eager execution — see the ``_capture_step_gate`` /
+        # ``build_step_plan`` block above.)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
