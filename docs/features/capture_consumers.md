@@ -406,6 +406,15 @@ if result is not None and result.status == "ok":
 On the OpenAI-compatible HTTP path, results are attached to the
 response body as `capture_results`, mirroring the structure above.
 
+> **Best-effort result delivery.** Finalize (flushing a request's captured
+> activations to the consumer and collecting the per-key result) runs on a
+> background thread so it never blocks the model-runner step — see
+> [Performance](#performance). The `capture_results` field is attached to
+> the response only if finalize completes before the request's output is
+> emitted; otherwise it may be absent even though the captured data was
+> written successfully. **The activations on disk are the source of truth**;
+> treat `capture_results` as an optional, best-effort acknowledgement.
+
 ## Parallelism
 
 Capturing the residual-stream hooks (`pre_attn`, `post_attn`,
@@ -443,6 +452,38 @@ request's *full* layer stack assembled in one process across pipeline
 stages (worker-location consumers are unaffected); (2) capturing
 genuinely *sharded* activations (MLP intermediate / per-expert outputs).
 See [Capture Consumers under Parallelism](../design/capture_parallelism.md).
+
+## Performance
+
+Capture is designed to stay off the critical path except on the steps that
+genuinely capture.
+
+- **Per-step eager only when capturing.** The per-step activation gather
+  runs Python that cannot execute inside a replayed CUDA graph, so a step
+  that captures must run eager. Rather than forcing eager on *every* step
+  while capture is configured, a rank-replicated `CaptureStepGate` decides
+  per step whether any scheduled request actually captures a position in
+  that step's window. Plain requests on a capture-enabled server, and the
+  decode steps of a `last_prompt` capture (which only fires during
+  prefill), keep full cudagraph speed. The gate is evaluated identically on
+  every TP/PP rank from the broadcast `scheduler_output` — no per-step
+  collective — so all ranks agree on eager-vs-cudagraph and stay in
+  lockstep on `num_tokens_padded`. It is a strict superset of what the
+  capturer actually gathers, so it never runs a capturing step in cudagraph
+  mode. A consumer with a *global* spec (captures for every request, e.g.
+  `logging`) puts the gate in always-eager mode, since every request
+  captures.
+- **Non-blocking finalize.** Finalizing a request flushes its captured
+  activations and waits for each `(layer, hook)` result — under the
+  `filesystem` consumer, roughly one small-file write per captured layer.
+  These waits run on a dedicated background finalize thread, not the
+  model-runner step thread, so a finishing capture request does not stall
+  the batch. The result is surfaced best-effort (see
+  [Reading Results](#reading-results)).
+
+Tail latency under capture is dominated by the consumer's own write path;
+for the `filesystem` consumer see [Throughput tuning](#throughput-tuning)
+and [Backpressure & overload](#backpressure--overload).
 
 ## Limits
 

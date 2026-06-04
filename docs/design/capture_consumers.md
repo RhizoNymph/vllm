@@ -434,17 +434,54 @@ indices back to consumer names via `_capture_index_to_name`.
 
 Per-step hooks:
 
-- `_prepare_capture_step(scheduler_output)` — builds the batch view
-  (matching `SteeringModelRunnerMixin._update_steering_buffers`
-  offset walk exactly so gather indices line up) and calls
-  `manager.build_step_plan`.
+- Before the cudagraph dispatch decision, the runner builds the batch
+  view (matching `SteeringModelRunnerMixin._update_steering_buffers`
+  offset walk exactly so gather indices line up). The view feeds two
+  things: the rank-replicated `CaptureStepGate` (which decides whether
+  this step must run eager — see [Force-eager step gate](#force-eager-step-gate)),
+  and, on the capturer rank, `manager.build_step_plan`.
 - `_finalize_capture_step()` — calls `manager.consume_step_plan()`
-  and `manager.dispatch_step_captures(plan)`.
+  and `manager.dispatch_step_captures(plan)` after the forward pass.
 
 Per-request finalize: when a request completes, the runner calls
-`_finalize_capture_for_request(req_id)` which invokes
-`manager.finalize_request(req_id)` and translates indices back to
-names, surfacing the dict on `ModelRunnerOutput.capture_results`.
+`_finalize_capture_for_request_async(req_id)`, which has the manager pop
+the request's capture state on the step thread (so `_requests` stays
+single-threaded) and run the blocking finalize — `submit_finalize` plus
+the per-key `wait_for_result` round-trips — on the manager's dedicated
+finalize thread via `manager.finalize_request_async(req_id, on_complete)`.
+The `on_complete` callback (on the finalize thread) translates indices
+back to names and stashes the dict on the lock-guarded
+`_pending_capture_results`, which a later step drains onto
+`ModelRunnerOutput.capture_results`. Result delivery is therefore
+**best-effort**: if finalize has not completed by the time the request's
+output is emitted, the result is absent from the response even though the
+captured data was written. The synchronous `manager.finalize_request` is
+retained for tests and inline callers.
+
+### Force-eager step gate
+
+`CaptureManager.on_hook` gathers rows with per-step Python that cannot run
+inside a replayed CUDA graph, so any step that actually captures must run
+eager. Under TP/PP every rank must reach the *same* eager-vs-cudagraph
+decision or `num_tokens_padded` diverges and the TP all-reduce / PP
+send-recv deadlock; a per-step collective to agree would itself deadlock
+inside PP's asynchronous pipeline.
+
+`CaptureStepGate` (`vllm/v1/capture/step_gate.py`) resolves this with no
+collective. It is built on *every* rank, populated from the broadcast
+new-request stream (`register`) and finished stream (`drop`), and each step
+evaluates `step_captures(view)` purely from the rank-identical
+`scheduler_output` plus each request's client capture spec (which rides in
+`SamplingParams` on every rank). Identical inputs + a pure predicate ⇒
+identical decision by construction. The gate ignores pipeline-stage layer
+filtering and admission validation, so it is a strict **superset** of the
+capturer's actual gather: it never leaves a capturing step in cudagraph
+mode (which would silently no-op the gather), only occasionally over-forces
+a harmless extra eager step. Position logic is shared with `build_step_plan`
+via `selector_hits_window`. A consumer with a non-`None` `global_capture_spec`
+(detected by probe-constructing each configured consumer once via
+`force_all_from_config`) puts the gate in always-eager mode, since every
+request then captures.
 
 ## Driver Bridge
 
