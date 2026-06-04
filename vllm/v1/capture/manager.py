@@ -164,6 +164,38 @@ def _resolve_positions(
     raise ValueError(msg)
 
 
+def selector_hits_window(
+    positions: list[int] | str,
+    num_prompt_tokens: int,
+    num_computed: int,
+    num_scheduled: int,
+) -> bool:
+    """True if a position selector captures anything in this step window.
+
+    This is the boolean reduction of :func:`_resolve_positions` against
+    the step window ``[num_computed, num_computed + num_scheduled)`` — the
+    exact intersection :meth:`CaptureManager.build_step_plan` performs per
+    consumer (``in_step = [p for p in all_positions if step_start <= p <
+    step_end]``).  It is factored out so the rank-replicated
+    ``CaptureStepGate`` can decide force-eager identically on every rank
+    using the same logic the capturer rank uses to gather, without
+    building a step plan.  Reusing :func:`_resolve_positions` keeps the
+    two in lockstep by construction.
+
+    An unknown selector raises (matching :func:`_resolve_positions`); the
+    gate treats that as "capture" so a malformed spec never silently
+    skips the eager step it needs.
+    """
+    step_start = num_computed
+    step_end = num_computed + num_scheduled
+    if step_end <= step_start:
+        return False
+    resolved = _resolve_positions(
+        positions, num_prompt_tokens, num_computed, num_scheduled
+    )
+    return any(step_start <= p < step_end for p in resolved)
+
+
 def _classify_positions(
     spec: CaptureSpec,
     num_prompt_tokens: int,
