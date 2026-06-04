@@ -112,7 +112,7 @@ class _PackedState:
     sidecar_fields: dict[str, Any] = field(default_factory=dict)
     # Cached on first chunk so the (slow) pathlib construction runs once
     # per request instead of once per submitted batch.
-    bin_path: "pathlib.Path | None" = None
+    bin_path: pathlib.Path | None = None
 
 
 # Sentinel hook for shard writer keys (see _ShardState). The shard
@@ -284,6 +284,20 @@ class FilesystemConsumer:
         if layout not in VALID_LAYOUTS:
             raise CaptureValidationError(
                 f"capture.layout must be one of {sorted(VALID_LAYOUTS)}, got {layout!r}"
+            )
+        # ``packed`` / ``sharded`` write one file per request (per tag),
+        # so under pipeline parallelism every stage's writer races to the
+        # same path on the shared mount — interleaved bytes, mismatched
+        # index, and an orphaned ``.tmp`` that never publishes. Only
+        # ``per_file`` (keyed by the global layer index) is collision-free
+        # across stages. Fail closed rather than silently corrupt.
+        if layout != "per_file" and ctx.pipeline_parallel_size > 1:
+            raise CaptureValidationError(
+                f"filesystem capture.layout={layout!r} is not supported with "
+                f"pipeline_parallel_size>1 (got {ctx.pipeline_parallel_size}); "
+                "each pipeline stage would write the same per-request file and "
+                "they collide on the shared mount. Use layout='per_file' under "
+                "pipeline parallelism."
             )
 
         req_str = str(ctx.vllm_internal_request_id)
@@ -560,7 +574,10 @@ class FilesystemConsumer:
                 payloads.append(payload)
             if state.bin_path is None:
                 state.bin_path = (
-                    self._root / state.tag_slug / state.request_id_slug / PACKED_BIN_NAME
+                    self._root
+                    / state.tag_slug
+                    / state.request_id_slug
+                    / PACKED_BIN_NAME
                 )
             bin_path = state.bin_path
 
@@ -629,9 +646,7 @@ class FilesystemConsumer:
                 seal_task = self._build_shard_seal_locked(shard)
 
         self._writer.submit(
-            WriteTask(
-                path=bin_path, payload=tensor_bytes, append=True, key=writer_key
-            )
+            WriteTask(path=bin_path, payload=tensor_bytes, append=True, key=writer_key)
         )
         if seal_task is not None:
             self._writer.submit(seal_task)
@@ -771,9 +786,7 @@ class FilesystemConsumer:
         if task is not None:
             self._writer.submit(task)
 
-    def _submit_finalize_sharded(
-        self, finalize: CaptureFinalize, req_str: str
-    ) -> None:
+    def _submit_finalize_sharded(self, finalize: CaptureFinalize, req_str: str) -> None:
         _request_id, layer_idx, hook_name = finalize.key
         # The request's bytes are already in its shard (written during
         # submit_chunk). Finalize just tracks completion: once every
