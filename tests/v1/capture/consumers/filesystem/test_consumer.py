@@ -397,14 +397,12 @@ class TestValidateClientSpec:
         finally:
             consumer.shutdown(timeout=5.0)
 
-    @pytest.mark.parametrize("layout", ["packed", "sharded"])
-    def test_packed_sharded_rejected_under_pipeline_parallelism(
-        self, layout: str
-    ) -> None:
-        # packed/sharded write one file per request/tag; under PP the
-        # stages collide on the shared mount, so admission must reject.
-        from vllm.v1.capture.errors import CaptureValidationError
-
+    @pytest.mark.parametrize("layout", ["packed", "sharded", "per_file"])
+    def test_layouts_accepted_under_pipeline_parallelism(self, layout: str) -> None:
+        # packed/sharded now split their per-request/per-tag files by
+        # pipeline stage rank, so admission accepts them under PP rather
+        # than rejecting (see test_packed.py / test_sharded.py for the
+        # per-stage on-disk behavior).
         consumer = FilesystemConsumer(
             vllm_config=_make_vllm_config(),
             params={"root": "/tmp/test"},
@@ -412,19 +410,73 @@ class TestValidateClientSpec:
         try:
             ctx = _make_context(pp=2)
             raw = FilesystemCaptureRequest(
-                request_id="pp-packed",
-                tag="pp-packed",
+                request_id="pp-accepts",
+                tag="pp-accepts",
                 hooks={"post_mlp": [0, 1]},
                 positions="last_prompt",
                 layout=layout,
             )
-            with pytest.raises(CaptureValidationError, match="pipeline_parallel"):
-                consumer.validate_client_spec(raw, ctx)
-            # per_file is fine under PP.
-            raw.layout = "per_file"
             assert isinstance(consumer.validate_client_spec(raw, ctx), CaptureSpec)
         finally:
             consumer.shutdown(timeout=5.0)
+
+
+@_skip_no_pydantic
+class TestPPGeometry:
+    """Validate ``_pp_geometry`` against the *real* ``ParallelConfig`` and
+    the real ``ModelConfig.get_layers_start_end_indices`` layer-split logic
+    — the production path the other PP tests stub with a fake config."""
+
+    @staticmethod
+    def _geom(pp: int, tp: int, rank: int, total_layers: int):
+        from types import SimpleNamespace
+
+        from vllm.config.model import ModelConfig
+        from vllm.config.parallel import ParallelConfig
+        from vllm.v1.capture.consumers.filesystem.consumer import _pp_geometry
+
+        # Bind the real (unbound) ModelConfig method to a stub carrying only
+        # the layer count it needs, so the real split arithmetic runs.
+        real_split = ModelConfig.get_layers_start_end_indices
+
+        class _ModelStub:
+            def get_total_num_hidden_layers(self) -> int:
+                return total_layers
+
+            def get_layers_start_end_indices(self, parallel_config: object):
+                return real_split(self, parallel_config)
+
+        pc = ParallelConfig(pipeline_parallel_size=pp, tensor_parallel_size=tp)
+        pc.rank = rank
+        cfg = SimpleNamespace(parallel_config=pc, model_config=_ModelStub())
+        return _pp_geometry(cfg)
+
+    def test_pp_disabled_is_inert(self) -> None:
+        # pp_size == 1 → legacy filenames, no local-range filtering.
+        assert self._geom(pp=1, tp=1, rank=0, total_layers=4) == (1, 0, None)
+
+    def test_two_stage_tp1_splits_layers(self) -> None:
+        assert self._geom(pp=2, tp=1, rank=0, total_layers=4) == (2, 0, (0, 2))
+        assert self._geom(pp=2, tp=1, rank=1, total_layers=4) == (2, 1, (2, 4))
+
+    def test_tp_replicas_share_their_stage_slice(self) -> None:
+        # stage = (rank // tp) % pp: ranks 0,1 are stage 0; ranks 2,3 stage 1.
+        assert self._geom(pp=2, tp=2, rank=0, total_layers=4) == (2, 0, (0, 2))
+        assert self._geom(pp=2, tp=2, rank=1, total_layers=4) == (2, 0, (0, 2))
+        assert self._geom(pp=2, tp=2, rank=2, total_layers=4) == (2, 1, (2, 4))
+        assert self._geom(pp=2, tp=2, rank=3, total_layers=4) == (2, 1, (2, 4))
+
+    def test_four_stage_even_split(self) -> None:
+        for rank in range(4):
+            pp_size, pp_rank, rng = self._geom(pp=4, tp=1, rank=rank, total_layers=32)
+            assert (pp_size, pp_rank) == (4, rank)
+            assert rng == (rank * 8, rank * 8 + 8)
+
+    def test_non_config_falls_back_to_legacy(self) -> None:
+        from vllm.v1.capture.consumers.filesystem.consumer import _pp_geometry
+
+        # A MagicMock (its attrs don't coerce to int) → pp disabled.
+        assert _pp_geometry(MagicMock()) == (1, 0, None)
 
 
 class TestGetResultLifecycle:

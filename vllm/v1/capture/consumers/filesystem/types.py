@@ -84,19 +84,60 @@ class FilesystemConsumerParams:
 VALID_LAYOUTS: frozenset[str] = frozenset(("per_file", "packed", "sharded"))
 
 # Filenames used by the "packed" layout (one set per request directory).
+# These are the pipeline-parallel-agnostic names used when pp_size == 1.
+# Under pipeline parallelism each stage owns a disjoint slice of the
+# request's layers and writes its own file (``packed-pp{rank}.*``), so the
+# stages never race for the same path on the shared mount.
 PACKED_BIN_NAME = "packed.bin"
 PACKED_INDEX_NAME = "packed.json"
 
 
-def shard_bin_name(shard_idx: int, seq: int) -> str:
-    """``.bin`` filename for shard ``shard_idx`` rotation ``seq``."""
-    return f"shard-{shard_idx:03d}-{seq:06d}.bin"
+def packed_bin_name(pp_rank: int | None = None) -> str:
+    """``.bin`` filename for a request's packed file.
+
+    ``pp_rank is None`` (pipeline parallelism disabled) keeps the legacy
+    ``packed.bin``; under PP each stage writes ``packed-pp{rank}.bin`` so
+    per-stage files don't collide in the shared request directory.
+    """
+    if pp_rank is None:
+        return PACKED_BIN_NAME
+    return f"packed-pp{pp_rank:02d}.bin"
 
 
-def shard_index_name(shard_idx: int, seq: int) -> str:
-    """``.json`` index filename for shard ``shard_idx`` rotation ``seq``."""
-    return f"shard-{shard_idx:03d}-{seq:06d}.json"
+def packed_index_name(pp_rank: int | None = None) -> str:
+    """``.json`` index filename for a request's packed file (see
+    :func:`packed_bin_name`)."""
+    if pp_rank is None:
+        return PACKED_INDEX_NAME
+    return f"packed-pp{pp_rank:02d}.json"
 
 
-# Glob to find sealed shard index files in a tag directory.
+def shard_bin_name(shard_idx: int, seq: int, pp_rank: int | None = None) -> str:
+    """``.bin`` filename for shard ``shard_idx`` rotation ``seq``.
+
+    Under pipeline parallelism (``pp_rank is not None``) the stage rank is
+    embedded so each stage's shards land in distinct files within the tag
+    directory; the ``shard-*`` prefix is preserved so the reader's glob
+    still discovers them.
+    """
+    if pp_rank is None:
+        return f"shard-{shard_idx:03d}-{seq:06d}.bin"
+    return f"shard-pp{pp_rank:02d}-{shard_idx:03d}-{seq:06d}.bin"
+
+
+def shard_index_name(shard_idx: int, seq: int, pp_rank: int | None = None) -> str:
+    """``.json`` index filename for shard ``shard_idx`` rotation ``seq``
+    (see :func:`shard_bin_name`)."""
+    if pp_rank is None:
+        return f"shard-{shard_idx:03d}-{seq:06d}.json"
+    return f"shard-pp{pp_rank:02d}-{shard_idx:03d}-{seq:06d}.json"
+
+
+# Glob to find sealed shard index files in a tag directory. Matches both
+# the pp-agnostic ``shard-NNN-NNNNNN.json`` and the per-stage
+# ``shard-ppNN-NNN-NNNNNN.json`` produced under pipeline parallelism.
 SHARD_INDEX_GLOB = "shard-*.json"
+
+# Glob to find a request's packed index files. Matches the pp-agnostic
+# ``packed.json`` and the per-stage ``packed-ppNN.json``.
+PACKED_INDEX_GLOB = "packed*.json"

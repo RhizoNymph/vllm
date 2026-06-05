@@ -167,7 +167,11 @@ declared `location` can select between them.
   + request_id on a **shared** mount.
 - The on-disk layout merges naturally: stage 0 writes
   `…/req/12_post_mlp.bin`, stage 1 writes `…/req/40_post_mlp.bin`, no
-  collision.
+  collision. The `packed`/`sharded` layouts (one file per request / per
+  tag) cannot merge by global layer index alone, so under PP each stage
+  writes its **own** file keyed by stage rank
+  (`packed-pp{RR}.{bin,json}`, `shard-pp{RR}-{NNN}-{SEQ}.{bin,json}`) and
+  the reference reader merges the per-stage files on read. **Implemented.**
 - The only thing the engine merges is the per-rank `CaptureResult`
   *status/payload* dicts, via the `KVOutputAggregator` pattern (union
   the written-path lists, status = worst-of).

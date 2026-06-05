@@ -122,6 +122,12 @@ Client `hooks` values may be a list of ints, the literal string
 # sharded (per tag; many requests share each shard)
 {root}/{tag_slug}/shard-{NNN}-{SEQ}.bin
 {root}/{tag_slug}/shard-{NNN}-{SEQ}.json   # index: per-chunk entries with request_id
+
+# packed / sharded under pipeline parallelism (pp_size > 1): each stage
+# writes its own file for the layers it owns, keyed by stage rank. The
+# reader merges the per-stage files back into one request.
+{root}/{tag_slug}/{request_id_slug}/packed-pp{RR}.bin   # + .json
+{root}/{tag_slug}/shard-pp{RR}-{NNN}-{SEQ}.bin          # + .json
 ```
 
 `tag_slug` and `request_id_slug` are produced by the admission
@@ -144,7 +150,11 @@ is stored as raw uint16 bytes; readers should round-trip through
 **Reading**: `vllm.v1.capture.consumers.filesystem.reader` (NumPy-only)
 provides `read_per_file`, `read_packed`, `read_request` (auto-detects
 per_file/packed), and `read_sharded(tag_dir)` → `{request_id:
-{(layer, hook): array}}` (scans a tag's sealed shard indexes).
+{(layer, hook): array}}` (scans a tag's sealed shard indexes). Under
+pipeline parallelism, pointing `read_packed`/`read_request` at a request
+directory merges all per-stage `packed-pp{RR}` files, and `read_sharded`
+merges per-stage `shard-pp{RR}` files by request — callers get the full
+layer set transparently regardless of how many stages wrote it.
 
 #### Throughput tuning
 
@@ -437,15 +447,18 @@ parallelism** for worker-location consumers — including the built-in
 **Requirement — shared storage:** under pipeline parallelism the capture
 target (`filesystem` `root`) must be a **shared mount** (e.g. an NFS
 volume) reachable by every pipeline node, because different stages write
-different layers of the same request. Files are keyed by global layer
-index, so stages never collide.
+different layers of the same request.
 
-**Requirement — `per_file` layout under PP:** only `layout="per_file"`
-works with `pipeline_parallel_size > 1`. `packed` and `sharded` write a
-single file per request (or per tag), so every pipeline stage would race
-to write the *same* path on the shared mount — interleaved bytes and an
-orphaned, never-published `.tmp`. Admission **rejects** `packed`/`sharded`
-under PP with a clear error; use `per_file` (the default).
+**All layouts work under PP.** `per_file` is keyed by global layer index,
+so stages never collide. `packed` and `sharded` would otherwise write a
+single file per request (or per tag) and have every stage race for the
+same path — so under `pipeline_parallel_size > 1` each stage instead
+writes its **own** file for the layers it owns, keyed by stage rank
+(`packed-pp{RR}.{bin,json}`, `shard-pp{RR}-{NNN}-{SEQ}.{bin,json}`). The
+reference reader merges the per-stage files back into one request, so
+`read_packed` / `read_request` / `read_sharded` return the full layer set
+transparently. Completion is tracked per stage against only the layers
+that stage captures.
 
 **Not yet supported:** (1) `location="driver"` consumers that need a
 request's *full* layer stack assembled in one process across pipeline

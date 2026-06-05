@@ -52,16 +52,25 @@ def _write_shard(tag_dir, shard_idx, seq, entries_with_arrays, dtype):
         payload = arr.tobytes()
         entries.append(
             {
-                "request_id": rid, "layer": layer, "hook": hook,
-                "offset": len(blob), "nbytes": len(payload), "shape": list(arr.shape),
+                "request_id": rid,
+                "layer": layer,
+                "hook": hook,
+                "offset": len(blob),
+                "nbytes": len(payload),
+                "shape": list(arr.shape),
             }
         )
         blob += payload
     (tag_dir / shard_bin_name(shard_idx, seq)).write_bytes(blob)
     (tag_dir / shard_index_name(shard_idx, seq)).write_text(
         json.dumps(
-            {"layout": "sharded", "shard_idx": shard_idx, "seq": seq,
-             "dtype": dtype, "entries": entries}
+            {
+                "layout": "sharded",
+                "shard_idx": shard_idx,
+                "seq": seq,
+                "dtype": dtype,
+                "entries": entries,
+            }
         )
     )
 
@@ -72,11 +81,17 @@ class TestShardedReader:
         a = np.random.randn(2, 8).astype(np.float32)  # reqA L0
         b = np.random.randn(3, 8).astype(np.float32)  # reqB L0
         c = np.random.randn(1, 8).astype(np.float32)  # reqA L1
-        _write_shard(tag, 0, 0, [
-            ("reqA", 0, "post_mlp", a),
-            ("reqB", 0, "post_mlp", b),
-            ("reqA", 1, "post_mlp", c),
-        ], "float32")
+        _write_shard(
+            tag,
+            0,
+            0,
+            [
+                ("reqA", 0, "post_mlp", a),
+                ("reqB", 0, "post_mlp", b),
+                ("reqA", 1, "post_mlp", c),
+            ],
+            "float32",
+        )
         got = read_sharded(tag)
         assert set(got) == {"reqA", "reqB"}
         np.testing.assert_array_equal(got["reqA"][(0, "post_mlp")].array, a)
@@ -105,9 +120,13 @@ class TestShardedReader:
 def _ctx(req_id: str, *, num_hidden_layers: int = 4) -> CaptureContext:
     return CaptureContext(
         vllm_internal_request_id=VllmInternalRequestId(req_id),
-        num_prompt_tokens=10, num_computed_tokens=0,
-        num_hidden_layers=num_hidden_layers, hidden_size=8,
-        element_size_bytes=4, tensor_parallel_size=1, pipeline_parallel_size=1,
+        num_prompt_tokens=10,
+        num_computed_tokens=0,
+        num_hidden_layers=num_hidden_layers,
+        hidden_size=8,
+        element_size_bytes=4,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
     )
 
 
@@ -120,8 +139,11 @@ def _consumer(tmp_path: pathlib.Path, **params: object) -> FilesystemConsumer:
 def _register(c, req_id, hooks, tag="t"):
     c.validate_client_spec(
         FilesystemCaptureRequest(
-            request_id=req_id, tag=tag, hooks=hooks,
-            positions="last_prompt", layout="sharded",
+            request_id=req_id,
+            tag=tag,
+            hooks=hooks,
+            positions="last_prompt",
+            layout="sharded",
         ),
         _ctx(req_id),
     )
@@ -129,8 +151,12 @@ def _register(c, req_id, hooks, tag="t"):
 
 def _chunk(req_id, layer, hook, tensor, step):
     return CaptureChunk(
-        key=(VllmInternalRequestId(req_id), layer, hook), tensor=tensor,
-        dtype=tensor.dtype, row_offset=0, step_index=step, metadata={},
+        key=(VllmInternalRequestId(req_id), layer, hook),
+        tensor=tensor,
+        dtype=tensor.dtype,
+        row_offset=0,
+        step_index=step,
+        metadata={},
     )
 
 
@@ -168,9 +194,9 @@ class TestShardedConsumer:
             for rid in reqs:
                 for layer in (0, 1):
                     c.submit_finalize(_finalize(rid, layer, "post_mlp"))
-                    expected.setdefault(rid, {})[(layer, "post_mlp")] = (
-                        torch.cat(tensors[(rid, layer)]).numpy()
-                    )
+                    expected.setdefault(rid, {})[(layer, "post_mlp")] = torch.cat(
+                        tensors[(rid, layer)]
+                    ).numpy()
             # results are ok before seal (data captured, readable after seal)
             r = _wait(c, (VllmInternalRequestId("req0"), 0, "post_mlp"))
             assert r is not None and r.status == "ok"
@@ -209,3 +235,87 @@ class TestShardedConsumer:
         np.testing.assert_array_equal(
             got["r"][(0, "post_mlp")].array, torch.cat(tensors).numpy()
         )
+
+
+# ---------------------------------------------------------------------------
+# Sharded under pipeline parallelism (per-stage shard files, merged on read)
+# ---------------------------------------------------------------------------
+
+
+class _FakePPConfig:
+    """``VllmConfig`` stand-in exposing the parallel/model geometry the
+    consumer reads to derive its pipeline-parallel stage + layer slice."""
+
+    def __init__(self, *, pp_size: int, pp_rank: int, total_layers: int) -> None:
+        from vllm.distributed.utils import get_pp_indices
+
+        class _Parallel:
+            pipeline_parallel_size = pp_size
+            tensor_parallel_size = 1
+            rank = pp_rank  # tp=1 → rank == pp_rank
+
+        class _Model:
+            def get_layers_start_end_indices(self, parallel_config: object):
+                pp_rank_ = (
+                    parallel_config.rank // parallel_config.tensor_parallel_size
+                ) % parallel_config.pipeline_parallel_size
+                return get_pp_indices(total_layers, pp_rank_, pp_size)
+
+        self.parallel_config = _Parallel()
+        self.model_config = _Model()
+
+
+def _pp_consumer(
+    tmp_path: pathlib.Path, *, pp_rank: int, **params: object
+) -> FilesystemConsumer:
+    p: dict[str, object] = {"root": str(tmp_path), "default_layout": "per_file"}
+    p.update(params)
+    cfg = _FakePPConfig(pp_size=2, pp_rank=pp_rank, total_layers=4)
+    return FilesystemConsumer(vllm_config=cfg, params=p)
+
+
+class TestShardedPipelineParallel:
+    def test_two_stage_shards_merge(self, tmp_path: pathlib.Path) -> None:
+        # pp_size=2, 4 layers → stage 0 owns [0,2), stage 1 owns [2,4). Each
+        # stage seals its own shard-pp{rank} files; read_sharded merges by
+        # request across both, recovering the full layer set.
+        req = "req"
+        hooks = {"post_mlp": [0, 1, 2, 3]}
+        tensors = {layer: torch.randn(2, 8, dtype=torch.float32) for layer in range(4)}
+        c0 = _pp_consumer(tmp_path, pp_rank=0, num_shards=1)
+        c1 = _pp_consumer(tmp_path, pp_rank=1, num_shards=1)
+        try:
+            _register(c0, req, hooks)
+            _register(c1, req, hooks)
+            for layer in (0, 1):
+                c0.submit_chunk(_chunk(req, layer, "post_mlp", tensors[layer], 0))
+                c0.submit_finalize(_finalize(req, layer, "post_mlp"))
+            for layer in (2, 3):
+                c1.submit_chunk(_chunk(req, layer, "post_mlp", tensors[layer], 0))
+                c1.submit_finalize(_finalize(req, layer, "post_mlp"))
+        finally:
+            c0.shutdown(timeout=5.0)  # seal each stage's open shard
+            c1.shutdown(timeout=5.0)
+
+        tag = tmp_path / "t"
+        # Both stages' shard files live in the tag dir, distinguished by rank.
+        assert sorted(p.name for p in tag.glob("shard-pp00-*.bin"))
+        assert sorted(p.name for p in tag.glob("shard-pp01-*.bin"))
+        got = read_sharded(tag)
+        assert set(got) == {req}
+        assert set(got[req]) == {(layer, "post_mlp") for layer in range(4)}
+        for layer in range(4):
+            np.testing.assert_array_equal(
+                got[req][(layer, "post_mlp")].array, tensors[layer].numpy()
+            )
+
+    def test_stage_owning_no_layers_creates_no_state(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        req = "req-skip"
+        c1 = _pp_consumer(tmp_path, pp_rank=1, num_shards=1)
+        try:
+            _register(c1, req, {"post_mlp": [0, 1]})  # all on stage 0
+            assert req not in c1._sharded_requests
+        finally:
+            c1.shutdown(timeout=5.0)

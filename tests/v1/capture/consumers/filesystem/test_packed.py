@@ -32,12 +32,15 @@ from vllm.v1.capture.consumers.filesystem.types import (
     PACKED_BIN_NAME,
     PACKED_INDEX_NAME,
     FilesystemCaptureRequest,
+    packed_bin_name,
+    packed_index_name,
 )
 from vllm.v1.capture.types import (
     CaptureChunk,
     CaptureContext,
     CaptureFinalize,
     CaptureKey,
+    CaptureSpec,
     VllmInternalRequestId,
 )
 
@@ -188,6 +191,50 @@ def _consumer(tmp_path: pathlib.Path, **params: object) -> FilesystemConsumer:
     return FilesystemConsumer(vllm_config=MagicMock(), params=p)
 
 
+class _FakePPConfig:
+    """Minimal ``VllmConfig`` stand-in exposing the parallel/model fields
+    ``FilesystemConsumer`` reads to derive its pipeline-parallel geometry.
+
+    Mirrors production: ``get_layers_start_end_indices`` defers to the same
+    ``get_pp_indices`` the real ``ModelConfig`` / ``CaptureManager`` use, so
+    the consumer's local layer slice matches what the manager would feed it.
+    """
+
+    def __init__(self, *, pp_size: int, pp_rank: int, total_layers: int) -> None:
+        from vllm.distributed.utils import get_pp_indices
+
+        tp_size = 1
+
+        class _Parallel:
+            pipeline_parallel_size = pp_size
+            tensor_parallel_size = tp_size
+            rank = pp_rank * tp_size  # layout DP x PP x TP; tp=1 → rank==pp_rank
+
+        class _Model:
+            def get_layers_start_end_indices(self, parallel_config: object):
+                pp_rank_ = (
+                    parallel_config.rank // parallel_config.tensor_parallel_size
+                ) % parallel_config.pipeline_parallel_size
+                return get_pp_indices(total_layers, pp_rank_, pp_size)
+
+        self.parallel_config = _Parallel()
+        self.model_config = _Model()
+
+
+def _pp_consumer(
+    tmp_path: pathlib.Path,
+    *,
+    pp_size: int,
+    pp_rank: int,
+    total_layers: int,
+    **params: object,
+) -> FilesystemConsumer:
+    p: dict[str, object] = {"root": str(tmp_path)}
+    p.update(params)
+    cfg = _FakePPConfig(pp_size=pp_size, pp_rank=pp_rank, total_layers=total_layers)
+    return FilesystemConsumer(vllm_config=cfg, params=p)
+
+
 def _register_packed(consumer: FilesystemConsumer, req_id: str, hooks: dict) -> None:
     raw = FilesystemCaptureRequest(
         request_id=req_id,
@@ -307,7 +354,8 @@ class TestPackedConsumer:
             try:
                 _register_packed(c, req, {"post_mlp": layers})
                 step_chunks = [
-                    _chunk(req, layer, "post_mlp", tensors[layer], 0) for layer in layers
+                    _chunk(req, layer, "post_mlp", tensors[layer], 0)
+                    for layer in layers
                 ]
                 if batched:
                     c.submit_chunk_batch(step_chunks)
@@ -471,3 +519,93 @@ class TestPackedConsumer:
             assert raised, "expected CaptureValidationError for invalid layout"
         finally:
             c.shutdown(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# Packed under pipeline parallelism (per-stage files, merged on read)
+# ---------------------------------------------------------------------------
+
+
+def _pp_raw(req: str, hooks: dict) -> FilesystemCaptureRequest:
+    return FilesystemCaptureRequest(
+        request_id=req, tag="t", hooks=hooks, positions="last_prompt", layout="packed"
+    )
+
+
+class TestPackedPipelineParallel:
+    def test_two_stage_split_and_merge(self, tmp_path: pathlib.Path) -> None:
+        # pp_size=2, 4 layers → stage 0 owns [0,2), stage 1 owns [2,4). Each
+        # stage writes its own packed-pp{rank} file; the reader merges them
+        # back into the request's full layer set.
+        req = "req-pp"
+        total = 4
+        hooks = {"post_mlp": [0, 1, 2, 3]}
+        tensors = {layer: torch.randn(2, 8, dtype=torch.float32) for layer in range(4)}
+        c0 = _pp_consumer(tmp_path, pp_size=2, pp_rank=0, total_layers=total)
+        c1 = _pp_consumer(tmp_path, pp_size=2, pp_rank=1, total_layers=total)
+        try:
+            c0.validate_client_spec(_pp_raw(req, hooks), _ctx(req))
+            c1.validate_client_spec(_pp_raw(req, hooks), _ctx(req))
+            # The manager only feeds each stage its owned layers.
+            for layer in (0, 1):
+                c0.submit_chunk(_chunk(req, layer, "post_mlp", tensors[layer], 0))
+            for layer in (0, 1):
+                c0.submit_finalize(_finalize(req, layer, "post_mlp"))
+            for layer in (2, 3):
+                c1.submit_chunk(_chunk(req, layer, "post_mlp", tensors[layer], 0))
+            for layer in (2, 3):
+                c1.submit_finalize(_finalize(req, layer, "post_mlp"))
+
+            assert _wait(c0, (VllmInternalRequestId(req), 0, "post_mlp")).status == "ok"
+            assert _wait(c1, (VllmInternalRequestId(req), 2, "post_mlp")).status == "ok"
+
+            req_dir = tmp_path / "t" / req
+            # Per-stage files exist; the pp-agnostic packed.json does not.
+            assert (req_dir / packed_index_name(0)).exists()
+            assert (req_dir / packed_bin_name(0)).exists()
+            assert (req_dir / packed_index_name(1)).exists()
+            assert (req_dir / packed_bin_name(1)).exists()
+            assert not (req_dir / PACKED_INDEX_NAME).exists()
+            assert not (req_dir / PACKED_BIN_NAME).exists()
+
+            got = read_request(req_dir)
+            assert set(got) == {(layer, "post_mlp") for layer in range(4)}
+            for layer in range(4):
+                np.testing.assert_array_equal(
+                    got[(layer, "post_mlp")].array, tensors[layer].numpy()
+                )
+        finally:
+            c0.shutdown(timeout=5.0)
+            c1.shutdown(timeout=5.0)
+
+    def test_stage_owning_no_layers_writes_nothing(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        # A request whose layers all live on stage 0: stage 1 must create no
+        # packed state and write no file (the manager drops the consumer for
+        # this request on that stage).
+        req = "req-pp-skip"
+        c1 = _pp_consumer(tmp_path, pp_size=2, pp_rank=1, total_layers=4)
+        try:
+            spec = c1.validate_client_spec(
+                _pp_raw(req, {"post_mlp": [0, 1]}), _ctx(req)
+            )
+            assert isinstance(spec, CaptureSpec)
+            # No accumulation state for a stage that owns none of the layers.
+            assert req not in c1._packed_states
+        finally:
+            c1.shutdown(timeout=5.0)
+
+    def test_expected_keys_filtered_to_local_slice(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        # Stage 1 ([2,4)) given a global spec must track only its own layers,
+        # else the packed index would wait forever on stage 0's layers.
+        req = "req-pp-expected"
+        c1 = _pp_consumer(tmp_path, pp_size=2, pp_rank=1, total_layers=4)
+        try:
+            c1.validate_client_spec(_pp_raw(req, {"post_mlp": [0, 1, 2, 3]}), _ctx(req))
+            state = c1._packed_states[req]
+            assert state.expected_keys == {(2, "post_mlp"), (3, "post_mlp")}
+        finally:
+            c1.shutdown(timeout=5.0)

@@ -38,7 +38,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from vllm.v1.capture.consumers.filesystem.types import (
-    PACKED_BIN_NAME,
+    PACKED_INDEX_GLOB,
     PACKED_INDEX_NAME,
     SHARD_INDEX_GLOB,
 )
@@ -103,24 +103,13 @@ def read_per_file(bin_path: str | pathlib.Path) -> CaptureEntry:
     )
 
 
-def read_packed(
-    path: str | pathlib.Path,
+def _read_one_packed_index(
+    index_path: pathlib.Path,
 ) -> dict[tuple[int, str], CaptureEntry]:
-    """Read a ``packed`` capture (``packed.json`` index + ``packed.bin``).
-
-    ``path`` may be the index file, the bin file, or the request directory.
-    Returns a dict keyed by ``(layer, hook)``.
-    """
-    path = pathlib.Path(path)
-    if path.is_dir():
-        index_path = path / PACKED_INDEX_NAME
-    elif path.name == PACKED_BIN_NAME:
-        index_path = path.with_name(PACKED_INDEX_NAME)
-    else:
-        index_path = path
+    """Decode a single packed index file (``packed*.json``) + its ``.bin``."""
     index = json.loads(index_path.read_text())
     dtype = index["dtype"]
-    bin_path = index_path.with_name(PACKED_BIN_NAME)
+    bin_path = index_path.with_suffix(".bin")
     raw = bin_path.read_bytes()
 
     # A (layer, hook) capture may span several entries — one per
@@ -154,20 +143,54 @@ def read_packed(
     return out
 
 
+def read_packed(
+    path: str | pathlib.Path,
+) -> dict[tuple[int, str], CaptureEntry]:
+    """Read a ``packed`` capture, keyed by ``(layer, hook)``.
+
+    ``path`` may be a packed index file, a packed bin file, or the request
+    directory. Under pipeline parallelism a request directory holds one
+    ``packed-pp{rank}.json``/``.bin`` pair per stage (each over the layers
+    that stage owns); pointing ``read_packed`` at the directory merges all
+    of them into the request's full layer set. Pointing it at a single
+    index/bin reads just that file. With PP off the directory holds the
+    single legacy ``packed.json``/``packed.bin`` pair.
+    """
+    path = pathlib.Path(path)
+    if path.is_dir():
+        index_paths = sorted(path.glob(PACKED_INDEX_GLOB))
+        if not index_paths:
+            # Preserve the legacy "missing file" error surface.
+            index_paths = [path / PACKED_INDEX_NAME]
+    elif path.suffix == ".bin":
+        index_paths = [path.with_suffix(".json")]
+    else:
+        index_paths = [path]
+
+    out: dict[tuple[int, str], CaptureEntry] = {}
+    for index_path in index_paths:
+        out.update(_read_one_packed_index(index_path))
+    return out
+
+
 def read_request(
     request_dir: str | pathlib.Path,
 ) -> dict[tuple[int, str], CaptureEntry]:
     """Read every capture for a request, auto-detecting the layout.
 
-    ``packed`` if a ``packed.json`` index is present, else ``per_file``
-    (one entry per ``{layer}_{hook}.bin``).
+    ``packed`` if any ``packed*.json`` index is present (one per pipeline
+    stage under PP, else the single ``packed.json``), in which case the
+    per-stage files are merged. Otherwise ``per_file`` (one entry per
+    ``{layer}_{hook}.bin``).
     """
     request_dir = pathlib.Path(request_dir)
-    if (request_dir / PACKED_INDEX_NAME).exists():
+    if any(request_dir.glob(PACKED_INDEX_GLOB)):
         return read_packed(request_dir)
     out: dict[tuple[int, str], CaptureEntry] = {}
     for bin_path in sorted(request_dir.glob("*.bin")):
-        if bin_path.name == PACKED_BIN_NAME:
+        # Skip packed bins (``packed.bin`` / ``packed-pp{rank}.bin``); a
+        # per_file capture is always ``{layer}_{hook}.bin``.
+        if bin_path.name.startswith("packed"):
             continue
         entry = read_per_file(bin_path)
         out[(entry.layer, entry.hook)] = entry
