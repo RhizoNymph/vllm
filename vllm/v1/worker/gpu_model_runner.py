@@ -542,14 +542,16 @@ class GPUModelRunner(
             from vllm.model_executor.layers.activation_capture import (
                 set_active_capture_manager,
             )
-            from vllm.v1.capture.step_gate import (
-                CaptureStepGate,
-                force_all_from_config,
-            )
+            from vllm.v1.capture.step_gate import CaptureStepGate
 
-            self._capture_step_gate = CaptureStepGate(
-                force_all=force_all_from_config(self.vllm_config)
-            )
+            # Global capture specs no longer force eager: they ride a
+            # CUDA-graph-safe persistent-buffer path (a fixed-shape
+            # full-residual copy baked into each graph at warmup — see
+            # ``CaptureManager._global_buffers`` / ``on_hook``). The gate
+            # therefore forces eager only when a per-request *client* spec
+            # captures this step; global-only and plain steps keep full
+            # cudagraph speed.
+            self._capture_step_gate = CaptureStepGate()
 
             # Capturer-rank gate. The replicated residual hooks
             # (pre_attn/post_attn/post_mlp) read the residual stream after
@@ -611,6 +613,10 @@ class GPUModelRunner(
                     hidden_size=self.model_config.get_hidden_size(),
                     model_dtype=self.model_config.dtype,
                     device=self.device,
+                    # Sizes the persistent global-capture buffers; the
+                    # warmup full-residual copy never exceeds the largest
+                    # cudagraph descriptor, which is bounded by this.
+                    max_num_tokens=self.max_num_tokens,
                     dispatch_queue_size=getattr(cc_config, "dispatch_queue_size", 256),
                     overload_policy=getattr(cc_config, "overload_policy", "spill"),
                     spill_dir=getattr(cc_config, "spill_dir", None),

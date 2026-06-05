@@ -287,6 +287,7 @@ class CaptureManager:
         hidden_size: int,
         model_dtype: torch.dtype,
         device: torch.device | str = "cpu",
+        max_num_tokens: int = 0,
         finalize_timeout_s: float = 5.0,
         dispatch_queue_size: int = 0,
         overload_policy: str = "block",
@@ -331,6 +332,80 @@ class CaptureManager:
         self._device = torch.device(device) if isinstance(device, str) else device
         self._finalize_timeout = finalize_timeout_s
         self._requests: dict[str, _RequestCaptureState] = {}
+
+        # ---- Global-spec persistent buffers (CUDA-graph-safe path) ----
+        #
+        # A *global* spec captures for every request, so the set of
+        # ``(layer, hook)`` keys it touches is fixed at construction and
+        # independent of any per-request client spec.  That lets the
+        # gather run inside a replayed CUDA graph: instead of the dynamic
+        # ``index_select`` (which allocates a fresh, variable-size output
+        # each step and therefore only works eager), :meth:`on_hook`
+        # issues a fixed-shape full-residual ``copy_`` of the hook's
+        # ``[num_tokens, hidden]`` tensor into a persistent buffer.  That
+        # copy is recorded into every cudagraph descriptor at warmup (the
+        # manager is installed before ``capture_model`` runs) and replays
+        # against the persistent address, so a global-only step keeps full
+        # cudagraph speed.  After the forward the host slices the wanted
+        # rows out of the buffer (eager, off-graph) — see
+        # :meth:`_materialize_global_keys`.
+        #
+        # The candidate global keys are restricted to the layers this
+        # pipeline stage owns (``local_layer_range``); other stages never
+        # see those hooks fire.
+        #
+        # The graph-safe buffer path is enabled only when ``max_num_tokens
+        # > 0`` (always true in the real runner, where it is the scheduler
+        # token budget).  When it is unset — direct ``CaptureManager``
+        # construction in CPU unit tests, where there are no CUDA graphs
+        # and every step runs eager — ``_global_keys`` stays empty and
+        # global specs fall through the dynamic ``index_select`` path like
+        # client specs.  That keeps the eager-only behavior unchanged while
+        # the runner gets the recorded full-residual copy.
+        start, end = self._local_layer_range
+        candidate_keys: set[tuple[int, str]] = set()
+        for spec in self._consumer_specs:
+            if spec is None:
+                continue
+            for hook_name, layers in spec.hooks.items():
+                for layer_idx in layers:
+                    if start <= layer_idx < end:
+                        candidate_keys.add((layer_idx, hook_name))
+
+        self._global_buffers: dict[tuple[int, str], torch.Tensor] = {}
+        if candidate_keys and max_num_tokens > 0:
+            for key in candidate_keys:
+                self._global_buffers[key] = torch.empty(
+                    (max_num_tokens, hidden_size),
+                    dtype=model_dtype,
+                    device=self._device,
+                )
+            total_bytes = sum(
+                b.numel() * b.element_size() for b in self._global_buffers.values()
+            )
+            logger.info(
+                "capture: allocated %d persistent global-capture buffer(s) "
+                "(%.1f MiB total) for CUDA-graph-safe capture",
+                len(self._global_buffers),
+                total_bytes / (1 << 20),
+                extra={
+                    "num_buffers": len(self._global_buffers),
+                    "total_bytes": total_bytes,
+                    "max_num_tokens": max_num_tokens,
+                    "hidden_size": hidden_size,
+                    "global_keys": sorted(candidate_keys),
+                },
+            )
+        elif candidate_keys:
+            logger.debug(
+                "capture: %d global capture key(s) present but max_num_tokens "
+                "is unset; using the eager dynamic-gather path (no persistent "
+                "buffers)",
+                len(candidate_keys),
+            )
+        # Keys actually served by the buffer path. Empty unless buffers were
+        # allocated, so :meth:`build_step_plan` routing and ``on_hook`` agree.
+        self._global_keys: frozenset[tuple[int, str]] = frozenset(self._global_buffers)
         # Active plan buffered between ``build_step_plan`` (called by the
         # runner pre-forward) and ``on_hook`` fires from inside the
         # compiled forward graph.  Cleared by ``consume_step_plan`` once
@@ -646,20 +721,32 @@ class CaptureManager:
         # :meth:`on_hook` is a device-local op.  ``scratch_gpu`` starts
         # empty — :meth:`on_hook` populates it by storing the gathered
         # tensor directly, so there is no point pre-allocating here.
+        # Split the per-key gather rows by capture path.  Global keys are
+        # served from the persistent buffer post-forward
+        # (``global_gather_indices``); client-only keys take the in-hook
+        # dynamic ``index_select`` (``gather_indices``).  A key requested
+        # by *both* a global and a client consumer this step routes to the
+        # global path — the buffer holds the full residual, so any
+        # consumer's rows can be sliced from it, and the per-entry
+        # ``consumer_mask`` still fans the rows out to both.
         gather_indices: dict[tuple[int, str], torch.Tensor] = {}
+        global_gather_indices: dict[tuple[int, str], torch.Tensor] = {}
         scratch_gpu: dict[tuple[int, str], torch.Tensor] = {}
         scratch_dtype: dict[tuple[int, str], torch.dtype] = {}
         for key, rows in gather_rows.items():
-            gather_indices[key] = torch.tensor(
-                rows, dtype=torch.int64, device=self._device
-            )
+            idx = torch.tensor(rows, dtype=torch.int64, device=self._device)
             scratch_dtype[key] = self._model_dtype
+            if key in self._global_keys:
+                global_gather_indices[key] = idx
+            else:
+                gather_indices[key] = idx
 
         plan = StepCapturePlan(
             gather_indices=gather_indices,
             scratch_gpu=scratch_gpu,
             scratch_dtype=scratch_dtype,
             entries=entries,
+            global_gather_indices=global_gather_indices,
             request_errors=request_errors,
         )
         self._step_plan = plan
@@ -715,10 +802,30 @@ class CaptureManager:
         The tensor passed in is the pristine residual (spec invariant
         1); we must not mutate it.
         """
+        key: tuple[int, str] = (layer_idx, hook_name)
+
+        # Global-spec path: a fixed-shape full-residual copy into a
+        # persistent buffer.  Runs whenever this is a global key —
+        # *independent of any per-step plan* — so it fires during warmup
+        # graph capture (recording the copy into every cudagraph
+        # descriptor) and on eager steps alike.  At replay no Python runs
+        # but the recorded ``copy_`` reproduces against the persistent
+        # buffer address; the host slices the wanted rows out afterwards
+        # in :meth:`_materialize_global_keys`.  The copy is collective-free
+        # (a local D2D), so adding it to only the capturer rank's graph
+        # keeps the divergent per-rank graphs safe.
+        buf = self._global_buffers.get(key)
+        if buf is not None:
+            n = hidden_states.shape[0]
+            buf[:n].copy_(hidden_states)
+
+        # Client-spec path: dynamic per-step gather.  ``index_select``
+        # allocates a fresh, variable-size output each step, so it cannot
+        # be replayed from a CUDA graph — it only runs eager, and the step
+        # gate forces eager whenever a client-spec request captures.
         plan = self._step_plan
         if plan is None:
             return
-        key: tuple[int, str] = (layer_idx, hook_name)
         idx = plan.gather_indices.get(key)
         if idx is None:
             return
@@ -729,6 +836,36 @@ class CaptureManager:
         plan.scratch_gpu[key] = gathered
 
     # ----------------------------------------------------- dispatch
+
+    def _materialize_global_keys(self, plan: StepCapturePlan) -> None:
+        """Slice global-spec rows out of the persistent buffers to scratch.
+
+        Runs after the forward pass (eager, off the CUDA graph).  The
+        graph's recorded ``copy_`` — or the eager ``on_hook`` copy on a
+        forced-eager step — has already filled each global key's
+        persistent buffer with this step's full ``[num_tokens, hidden]``
+        residual.  Here we gather the wanted rows in the same
+        ``scratch_row`` order the plan's ``entries`` assume (the order
+        ``build_step_plan`` appended them), so from this point on the
+        dispatch path handles global keys exactly like client keys.
+
+        The ``index_select`` allocates a fresh output (independent of the
+        buffer), so the next step's forward may overwrite the buffer
+        without racing this step's already-copied-out rows.  It is issued
+        on the current (compute) stream after the forward, so it observes
+        the buffer the forward wrote.
+        """
+        if not plan.global_gather_indices:
+            return
+        for key, idx in plan.global_gather_indices.items():
+            buf = self._global_buffers.get(key)
+            if buf is None:
+                # Defensive: a global gather index with no buffer would
+                # mean a key escaped the construction-time global set.
+                # Skip rather than crash; entries for this key yield no
+                # rows downstream.
+                continue
+            plan.scratch_gpu[key] = buf.index_select(0, idx)
 
     def dispatch_step_captures(self, plan: StepCapturePlan) -> None:
         """Hand a finished step's scratch tensors to the dispatch thread.
@@ -748,6 +885,11 @@ class CaptureManager:
         dispatch loop, so a failure in one sink never blocks delivery
         to the others.
         """
+        # Pull global-spec rows out of the persistent buffers into
+        # ``scratch_gpu`` first, so the rest of this method treats global
+        # and client keys uniformly. No-op when no global key captured.
+        self._materialize_global_keys(plan)
+
         if not plan.entries:
             return
 
@@ -1239,9 +1381,7 @@ class CaptureManager:
                 self._drain_dispatch_queue()
                 results = self._run_finalize(job.req_id, job.state)
             except Exception:
-                logger.exception(
-                    "capture finalize failed for req=%s", job.req_id
-                )
+                logger.exception("capture finalize failed for req=%s", job.req_id)
                 results = {}
             try:
                 job.on_complete(results)
