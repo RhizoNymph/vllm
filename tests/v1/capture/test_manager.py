@@ -176,6 +176,174 @@ class TestSingleConsumerGlobalSpec:
 
 
 # ---------------------------------------------------------------------------
+# Global spec via the CUDA-graph-safe persistent-buffer path
+# ---------------------------------------------------------------------------
+
+
+def _make_buffer_manager(
+    sinks: tuple[MagicMock, ...] | None = None,
+    specs: tuple[CaptureSpec | None, ...] | None = None,
+    max_num_tokens: int = 16,
+) -> tuple[CaptureManager, tuple[MagicMock, ...]]:
+    """A manager with ``max_num_tokens`` set, enabling the buffer path."""
+    if sinks is None:
+        sinks = (_make_sink(),)
+    if specs is None:
+        specs = (
+            CaptureSpec(hooks={"post_mlp": [0, 1]}, positions="last_prompt"),
+        ) * len(sinks)
+    mgr = CaptureManager(
+        consumers=sinks,
+        consumer_specs=specs,
+        num_hidden_layers=NUM_LAYERS,
+        hidden_size=HIDDEN_SIZE,
+        model_dtype=MODEL_DTYPE,
+        max_num_tokens=max_num_tokens,
+    )
+    return mgr, sinks
+
+
+class TestGlobalSpecBufferPath:
+    def test_buffers_allocated_for_global_keys(self):
+        mgr, _ = _make_buffer_manager(max_num_tokens=16)
+        assert mgr._global_keys == frozenset({(0, "post_mlp"), (1, "post_mlp")})
+        for key in mgr._global_keys:
+            buf = mgr._global_buffers[key]
+            assert buf.shape == (16, HIDDEN_SIZE)
+            assert buf.dtype == MODEL_DTYPE
+
+    def test_no_buffers_without_max_num_tokens(self):
+        """Falls back to the dynamic path (eager-only) when unsized."""
+        mgr, _ = _make_manager()  # max_num_tokens defaults to 0
+        assert mgr._global_keys == frozenset()
+        assert mgr._global_buffers == {}
+
+    def test_no_buffers_when_no_global_spec(self):
+        mgr, _ = _make_buffer_manager(specs=(None,), max_num_tokens=16)
+        assert mgr._global_keys == frozenset()
+        assert mgr._global_buffers == {}
+
+    def test_build_step_plan_routes_global_keys_to_global_gather(self):
+        mgr, _ = _make_buffer_manager(max_num_tokens=16)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        plan = mgr.build_step_plan(view)
+        # Global keys take the buffer path, not the dynamic in-hook gather.
+        assert plan.gather_indices == {}
+        assert (0, "post_mlp") in plan.global_gather_indices
+        assert (1, "post_mlp") in plan.global_gather_indices
+        # last_prompt of a 10-token prompt is absolute row 9.
+        assert plan.global_gather_indices[(0, "post_mlp")].tolist() == [9]
+        assert len(plan.entries) == 2
+
+    def test_on_hook_copies_full_residual_into_buffer(self):
+        mgr, _ = _make_buffer_manager(max_num_tokens=16)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        mgr.build_step_plan(view)
+        # Distinct per-row values so we can verify the exact copy.
+        hidden = torch.arange(10 * HIDDEN_SIZE, dtype=MODEL_DTYPE).reshape(
+            10, HIDDEN_SIZE
+        )
+        mgr.on_hook(0, "post_mlp", hidden)
+        buf = mgr._global_buffers[(0, "post_mlp")]
+        # The full residual is copied (fixed-shape, graph-safe), not gathered.
+        torch.testing.assert_close(buf[:10], hidden)
+        # on_hook must not populate scratch for global keys (host does that
+        # post-forward in _materialize_global_keys).
+        assert (0, "post_mlp") not in mgr._step_plan.scratch_gpu
+
+    def test_materialize_dispatch_finalize_via_buffer(self):
+        mgr, (sink,) = _make_buffer_manager(max_num_tokens=16)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        plan = mgr.build_step_plan(view)
+
+        # Simulate the forward: on_hook copies the full residual into each
+        # global key's persistent buffer (the recorded copy at replay).
+        hidden = torch.arange(10 * HIDDEN_SIZE, dtype=MODEL_DTYPE).reshape(
+            10, HIDDEN_SIZE
+        )
+        mgr.on_hook(0, "post_mlp", hidden)
+        mgr.on_hook(1, "post_mlp", hidden + 1000.0)
+
+        mgr.dispatch_step_captures(plan)
+        mgr._drain_dispatch_queue()
+
+        assert sink.submit_chunk.call_count == 2
+        # The dispatched row must be the last-prompt position (row 9) sliced
+        # out of the buffer by _materialize_global_keys.
+        chunks = [c.args[0] for c in sink.submit_chunk.call_args_list]
+        by_layer = {c.key[1]: c for c in chunks}
+        torch.testing.assert_close(by_layer[0].tensor[0], hidden[9])
+        torch.testing.assert_close(by_layer[1].tensor[0], (hidden + 1000.0)[9])
+
+        results = mgr.finalize_request("r1")
+        assert 0 in results
+        assert sink.submit_finalize.call_count == 2
+
+    def test_global_and_client_keys_coexist(self):
+        """A global-spec consumer and a client-spec consumer in one step.
+
+        The global consumer's key rides the buffer path; the client
+        consumer's distinct key rides the dynamic in-hook gather.
+        """
+        global_sink = _make_sink("global")
+        client_sink = _make_sink("client")
+        mgr, _ = _make_buffer_manager(
+            sinks=(global_sink, client_sink),
+            specs=(
+                CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt"),
+                None,  # consumer 1 has no global spec — client-driven
+            ),
+            max_num_tokens=16,
+        )
+        client_spec = CaptureSpec(hooks={"pre_attn": [2]}, positions="last_prompt")
+        mgr.register_request("r1", client_specs={1: client_spec}, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        plan = mgr.build_step_plan(view)
+        # Global key on the buffer path; client key on the dynamic path.
+        assert (0, "post_mlp") in plan.global_gather_indices
+        assert (2, "pre_attn") in plan.gather_indices
+        assert (0, "post_mlp") not in plan.gather_indices
+
+        hidden = torch.arange(10 * HIDDEN_SIZE, dtype=MODEL_DTYPE).reshape(
+            10, HIDDEN_SIZE
+        )
+        # Global key: full-residual copy. Client key: dynamic gather (eager).
+        mgr.on_hook(0, "post_mlp", hidden)
+        mgr.on_hook(2, "pre_attn", hidden + 1000.0)
+        # The client key's scratch was populated by the dynamic gather.
+        assert (2, "pre_attn") in plan.scratch_gpu
+
+        mgr.dispatch_step_captures(plan)
+        mgr._drain_dispatch_queue()
+
+        assert global_sink.submit_chunk.call_count == 1
+        assert client_sink.submit_chunk.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Two consumers with overlapping global specs
 # ---------------------------------------------------------------------------
 

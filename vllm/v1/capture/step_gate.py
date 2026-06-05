@@ -2,13 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rank-replicated force-eager predicate for activation capture.
 
-The per-step activation gather (``CaptureManager.on_hook``) runs Python
-that cannot execute inside a replayed CUDA graph, so any forward step
-that actually captures must run eager.  Under tensor/pipeline parallelism
-every rank must reach the *same* eager-vs-cudagraph decision: a divergent
-``num_tokens_padded`` would misalign the TP all-reduce / PP send-recv and
-deadlock.  A per-step collective to agree is impossible — it would be a
-synchronous barrier inside PP's asynchronous pipeline.
+The **client-spec** activation gather (``CaptureManager.on_hook``'s
+``index_select`` path) allocates a fresh, variable-size output each step,
+so it cannot execute inside a replayed CUDA graph: any forward step that
+gathers for a client spec must run eager.  (Global specs take a separate,
+CUDA-graph-safe path — a fixed-shape full-residual ``copy_`` into a
+persistent buffer baked into the graph at warmup — so they do **not**
+force eager; see :meth:`CaptureManager.on_hook` and
+``CaptureManager._global_buffers``.)
+
+Under tensor/pipeline parallelism every rank must reach the *same*
+eager-vs-cudagraph decision: a divergent ``num_tokens_padded`` would
+misalign the TP all-reduce / PP send-recv and deadlock.  A per-step
+collective to agree is impossible — it would be a synchronous barrier
+inside PP's asynchronous pipeline.
 
 :class:`CaptureStepGate` resolves this without any collective.  It is built
 identically on every rank and fed only data that is byte-identical across
@@ -21,22 +28,21 @@ same boolean by construction.
 The gate is a deliberate **superset** of what the capturer rank actually
 gathers: it ignores pipeline-stage layer filtering and admission-time
 validation (both of which only *reduce* the capturer's captures).  So it
-never returns ``False`` on a step the capturer would capture — it can only
-force an occasional harmless extra eager step.  Under-forcing would be a
-correctness bug (the gather would silently no-op inside a CUDA graph);
-over-forcing only costs a little cudagraph speed.
+never returns ``False`` on a step the capturer would gather for a client
+spec — it can only force an occasional harmless extra eager step.
+Under-forcing would be a correctness bug (the dynamic gather would
+silently no-op inside a CUDA graph); over-forcing only costs a little
+cudagraph speed.
 """
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from vllm.v1.capture.manager import selector_hits_window
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
     from vllm.v1.capture.plan import CaptureBatchView
 
 # A position selector as it appears in a client capture spec: either an
@@ -89,13 +95,14 @@ class CaptureStepGate:
     """
 
     def __init__(self, *, force_all: bool = False) -> None:
-        # ``force_all`` mirrors the old always-eager "hammer": set when any
-        # configured consumer *may* define a global capture spec (one that
-        # captures for every request, independent of the client spec).  In
-        # that mode essentially every request captures, so there is no
-        # plain-request speedup to recover and the gate degrades to the
-        # safe always-eager behavior.  Detected from config identically on
-        # every rank (see :func:`force_all_from_config`).
+        # ``force_all`` is a manual always-eager escape hatch (debugging,
+        # or a hypothetical consumer whose capture genuinely cannot use the
+        # graph-safe global-buffer path).  It is **off** by default: global
+        # specs no longer force eager — they ride the persistent-buffer
+        # path baked into the CUDA graph at warmup — so the gate forces
+        # eager only when a *client* spec actually captures this step.  It
+        # must still be set identically on every rank when used, since the
+        # eager decision is rank-replicated.
         self._force_all = force_all
         self._selectors: dict[str, list[PositionSelector]] = {}
 
@@ -120,14 +127,16 @@ class CaptureStepGate:
         return len(self._selectors)
 
     def step_captures(self, view: CaptureBatchView) -> bool:
-        """True iff some request in *view* captures a position this step.
+        """True iff some *client*-spec request captures a position this step.
 
         Pure function of *view* (rank-identical) and the registered
-        selectors (parsed from rank-identical client specs).
+        client-spec selectors (parsed from rank-identical
+        ``SamplingParams.capture``).  Global specs are excluded — they are
+        served by the CUDA-graph-safe persistent-buffer path and never
+        force eager.
         """
         if self._force_all:
-            # Global-spec mode: every request captures — reproduce the
-            # always-eager hammer exactly.
+            # Manual always-eager escape hatch (off by default).
             return True
         if not self._selectors:
             return False
@@ -146,84 +155,3 @@ class CaptureStepGate:
                 ):
                     return True
         return False
-
-
-def force_all_from_config(vllm_config: VllmConfig) -> bool:
-    """Detect whether any configured consumer defines a global spec.
-
-    A global capture spec captures for *every* request regardless of the
-    client spec, so its presence means the gate must fall back to
-    always-eager (there are no plain requests left to speed up).
-
-    ``global_capture_spec()`` can return ``None`` even when overridden
-    (e.g. :class:`FilesystemConsumer` defines it to return ``None``), so a
-    class-level "is it overridden" check is too coarse — it would wrongly
-    flag filesystem-only deployments and defeat the whole optimization.
-    We instead **probe-construct** each configured consumer once, call
-    ``global_capture_spec()``, and shut it down.  This is run identically
-    on every rank against the rank-identical config, so the result agrees
-    by construction with no collective.  The probe builds the consumer
-    class directly (not via ``build_consumers``), so it installs no driver
-    bridge; any writer threads it spins are joined immediately by the
-    ``shutdown`` in the ``finally``.  Construction or spec-evaluation
-    failure is treated conservatively as "has a global spec" (safe
-    over-forcing), keeping ranks identical.
-
-    This runs once at model-runner construction; the cost is a transient
-    consumer build, never on the per-step hot path.
-    """
-    config = getattr(vllm_config, "capture_consumers_config", None)
-    if config is None:
-        return False
-
-    if hasattr(config, "consumers"):
-        config_entries: list[Any] = list(config.consumers)
-    elif isinstance(config, list):
-        config_entries = list(config)
-    else:
-        config_entries = []
-
-    for entry in config_entries:
-        if hasattr(entry, "name"):
-            name = entry.name
-            params = getattr(entry, "params", {}) or {}
-        else:
-            name = entry["name"]
-            params = entry.get("params", {}) or {}
-        if _probe_has_global_spec(name, vllm_config, params):
-            return True
-
-    for instance in getattr(config, "instances", None) or []:
-        try:
-            if instance.global_capture_spec() is not None:
-                return True
-        except Exception:
-            return True
-
-    return False
-
-
-def _probe_has_global_spec(
-    name: str, vllm_config: VllmConfig, params: dict[str, Any]
-) -> bool:
-    """Construct consumer *name*, ask for its global spec, then tear down."""
-    from vllm.v1.capture.registry import load_consumer_class
-
-    try:
-        cls = load_consumer_class(name)
-    except Exception:
-        # Unknown consumer name → conservative.
-        return True
-
-    consumer = None
-    try:
-        consumer = cls(vllm_config, params)
-        return consumer.global_capture_spec() is not None
-    except Exception:
-        return True
-    finally:
-        if consumer is not None:
-            shutdown = getattr(consumer, "shutdown", None)
-            if callable(shutdown):
-                with contextlib.suppress(Exception):
-                    shutdown()

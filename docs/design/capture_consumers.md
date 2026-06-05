@@ -344,22 +344,42 @@ explicit list — resolved once at registration) and *dynamic*
 2. For each `(layer, hook)` that any consumer wants, record the
    absolute batch row index plus a per-position `consumer_mask`
    bitset (bit *i* set ⇒ consumer *i* wants this row).
-3. Allocate `gather_indices[(layer, hook)]` (device `int64`) and
-   `scratch_gpu[(layer, hook)]` (device, model residual dtype) sized
-   for the union.
+3. Allocate an `int64` row-index tensor for each `(layer, hook)`,
+   routed by capture path (see below), plus `scratch_dtype` (model
+   residual dtype). `scratch_gpu` starts empty and is populated during
+   (client keys) or after (global keys) the forward.
 
 Gather happens **once** per `(layer, hook)` regardless of how many
 consumers want it. Fan-out happens at dispatch time via the
 `consumer_mask`.
 
+**Two gather paths.** Each `(layer, hook)` is routed by whether it
+belongs to a **global** spec (one whose `(layer, hook)` set is fixed at
+startup, served by the CUDA-graph-safe persistent buffer) or only a
+**client** spec (per-request, dynamic):
+
+- **Client keys → `gather_indices`.** The in-hook `index_select`
+  (variable output size, fresh allocation) — only valid eager, so the
+  step gate forces eager whenever a client key captures.
+- **Global keys → `global_gather_indices`.** Served from a persistent
+  per-key buffer that `on_hook` fills with a fixed-shape full-residual
+  `copy_` (graph-safe — recorded into the cudagraph at warmup). The host
+  slices these rows out of the buffer *after* the forward. A key wanted
+  by both a global and a client consumer this step routes to the global
+  path; the buffer holds the full residual, so any consumer's rows can be
+  sliced from it.
+
 `StepCapturePlan` holds:
 
-- `gather_indices: dict[(layer, hook), Tensor]`
+- `gather_indices: dict[(layer, hook), Tensor]` — client keys (in-hook).
+- `global_gather_indices: dict[(layer, hook), Tensor]` — global keys
+  (sliced from the persistent buffer post-forward).
 - `scratch_gpu: dict[(layer, hook), Tensor]`
 - `scratch_dtype: dict[(layer, hook), torch.dtype]`
 - `entries: list[CapturePositionEntry]` — one per captured row, with
   `(request_id, layer, hook, logical_pos, scratch_row, step_index,
-  consumer_mask)`.
+  consumer_mask)`. `scratch_row` ordering is identical for both paths,
+  so dispatch treats global and client keys uniformly.
 - `request_errors: dict[req_id, str]` — registration-time or
   step-time failures.
 
@@ -378,11 +398,26 @@ During the forward:
   `mutates_args=["hidden_states"]` — a deliberate white lie so
   `torch.compile` does not DCE it.
 - The op looks up the active manager and calls `on_hook(layer_idx,
-  hook_name, hidden_states)`, which `index_select`s into
-  `plan.scratch_gpu[(layer, hook)]`. `hidden_states` is never mutated.
+  hook_name, hidden_states)`. `hidden_states` is never mutated. `on_hook`
+  has two independent branches:
+    - **Global key** (`(layer, hook)` in `_global_buffers`): a
+      fixed-shape `buf[:n].copy_(hidden_states)` of the full residual
+      into the persistent buffer. This runs *independently of the
+      per-step plan*, so it fires during the warmup capture pass (where
+      the `copy_` kernel is **recorded into every cudagraph descriptor**)
+      and on eager steps alike; at replay no Python runs but the recorded
+      copy reproduces against the persistent address. Collective-free, so
+      recording it on only the capturer rank's graphs is safe.
+    - **Client key** (`plan.gather_indices`): the dynamic
+      `index_select` into `plan.scratch_gpu[(layer, hook)]`. Allocates a
+      fresh, variable-size output, so it only runs eager.
 
 After the forward step, the runner calls `consume_step_plan()` to
-take ownership of the plan and `dispatch_step_captures(plan)`:
+take ownership of the plan and `dispatch_step_captures(plan)`, which
+first calls `_materialize_global_keys(plan)` — for each global key it
+slices `buf.index_select(0, global_gather_indices[key])` into
+`scratch_gpu` (eager, off-graph, on the post-forward compute stream),
+after which global and client keys are handled identically:
 
 1. For each consumer index `i`, group entries where bit `i` is set
    in `consumer_mask` by `(request_id, layer, hook)`.
@@ -460,12 +495,15 @@ retained for tests and inline callers.
 
 ### Force-eager step gate
 
-`CaptureManager.on_hook` gathers rows with per-step Python that cannot run
-inside a replayed CUDA graph, so any step that actually captures must run
-eager. Under TP/PP every rank must reach the *same* eager-vs-cudagraph
-decision or `num_tokens_padded` diverges and the TP all-reduce / PP
-send-recv deadlock; a per-step collective to agree would itself deadlock
-inside PP's asynchronous pipeline.
+`CaptureManager.on_hook`'s **client**-key gather (`index_select`) allocates
+a fresh, variable-size output each step and cannot run inside a replayed
+CUDA graph, so any step that gathers for a client spec must run eager.
+(Global keys take the graph-safe persistent-buffer copy instead — see
+[Forward and Dispatch](#forward-and-dispatch) — and never force eager.)
+Under TP/PP every rank must reach the *same* eager-vs-cudagraph decision or
+`num_tokens_padded` diverges and the TP all-reduce / PP send-recv deadlock;
+a per-step collective to agree would itself deadlock inside PP's
+asynchronous pipeline.
 
 `CaptureStepGate` (`vllm/v1/capture/step_gate.py`) resolves this with no
 collective. It is built on *every* rank, populated from the broadcast
@@ -475,13 +513,13 @@ evaluates `step_captures(view)` purely from the rank-identical
 `SamplingParams` on every rank). Identical inputs + a pure predicate ⇒
 identical decision by construction. The gate ignores pipeline-stage layer
 filtering and admission validation, so it is a strict **superset** of the
-capturer's actual gather: it never leaves a capturing step in cudagraph
-mode (which would silently no-op the gather), only occasionally over-forces
-a harmless extra eager step. Position logic is shared with `build_step_plan`
-via `selector_hits_window`. A consumer with a non-`None` `global_capture_spec`
-(detected by probe-constructing each configured consumer once via
-`force_all_from_config`) puts the gate in always-eager mode, since every
-request then captures.
+capturer's actual client gather: it never leaves a client-capturing step in
+cudagraph mode (which would silently no-op the gather), only occasionally
+over-forces a harmless extra eager step. Position logic is shared with
+`build_step_plan` via `selector_hits_window`. Global specs no longer force
+eager — they are served by the persistent buffer — so a `logging`-style
+global consumer keeps full cudagraph speed; `force_all` remains only as a
+manual always-eager escape hatch (off by default).
 
 ## Driver Bridge
 

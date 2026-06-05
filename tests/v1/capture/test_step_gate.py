@@ -4,8 +4,9 @@
 
 Covers :func:`vllm.v1.capture.manager.selector_hits_window` (the shared
 position/window predicate) and :class:`CaptureStepGate` (the per-step
-force-eager decision), plus :func:`force_all_from_config` global-spec
-detection.
+force-eager decision). Global specs no longer force eager — they ride the
+CUDA-graph-safe persistent-buffer path — so the gate fires only on client
+captures; ``force_all`` remains only as a manual escape hatch.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from vllm.v1.capture.plan import CaptureBatchView
 from vllm.v1.capture.step_gate import (
     CaptureStepGate,
     _extract_selectors,
-    force_all_from_config,
 )
 
 # ---------------------------------------------------------------------------
@@ -179,73 +179,10 @@ def test_gate_drop_stops_forcing():
 
 
 def test_gate_force_all_always_eager():
+    # ``force_all`` is now a manual escape hatch (no longer auto-enabled by
+    # global specs), but when set it still forces eager unconditionally.
     gate = CaptureStepGate(force_all=True)
     # register is a no-op under force_all, but the gate still forces eager.
     gate.register("a", None)
     assert gate.step_captures(_view([("a", 10, 10, 1)])) is True
     assert gate.step_captures(_view([("a", 10, 99, 1)])) is True
-
-
-# ---------------------------------------------------------------------------
-# force_all_from_config
-# ---------------------------------------------------------------------------
-
-
-def test_force_all_from_config_none():
-    assert (
-        force_all_from_config(SimpleNamespace(capture_consumers_config=None)) is False
-    )
-
-
-def test_force_all_from_config_filesystem_only_is_false(tmp_path):
-    # FilesystemConsumer.global_capture_spec returns None → not a global
-    # spec → no forced always-eager.  This is the deployment the per-step
-    # gate optimization targets, so locking it to False matters.
-    cfg = SimpleNamespace(
-        capture_consumers_config=SimpleNamespace(
-            consumers=[
-                SimpleNamespace(name="filesystem", params={"root": str(tmp_path)})
-            ],
-            instances=[],
-        )
-    )
-    assert force_all_from_config(cfg) is False
-
-
-def test_force_all_from_config_logging_is_true():
-    # LoggingConsumer.global_capture_spec returns a real spec → always-eager.
-    cfg = SimpleNamespace(
-        capture_consumers_config=SimpleNamespace(
-            consumers=[
-                SimpleNamespace(name="logging", params={"hooks": {"post_mlp": [0]}})
-            ],
-            instances=[],
-        )
-    )
-    assert force_all_from_config(cfg) is True
-
-
-def test_force_all_from_config_unknown_name_is_conservative():
-    cfg = SimpleNamespace(
-        capture_consumers_config=SimpleNamespace(
-            consumers=[SimpleNamespace(name="does_not_exist", params={})],
-            instances=[],
-        )
-    )
-    assert force_all_from_config(cfg) is True
-
-
-def test_force_all_from_config_instance_with_global_spec():
-    inst = SimpleNamespace(global_capture_spec=lambda: object())
-    cfg = SimpleNamespace(
-        capture_consumers_config=SimpleNamespace(consumers=[], instances=[inst])
-    )
-    assert force_all_from_config(cfg) is True
-
-
-def test_force_all_from_config_instance_without_global_spec():
-    inst = SimpleNamespace(global_capture_spec=lambda: None)
-    cfg = SimpleNamespace(
-        capture_consumers_config=SimpleNamespace(consumers=[], instances=[inst])
-    )
-    assert force_all_from_config(cfg) is False

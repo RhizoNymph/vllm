@@ -88,14 +88,28 @@ class CapturePositionEntry:
 class StepCapturePlan:
     """Snapshot of everything the capture path needs for one forward step.
 
-    ``gather_indices`` maps each ``(layer, hook)`` pair to an int64
-    tensor of absolute batch-row indices.  The forward-pass hook uses
-    ``index_select`` to copy those rows into ``scratch_gpu``.
+    ``gather_indices`` maps each **client-spec** ``(layer, hook)`` pair to
+    an int64 tensor of absolute batch-row indices.  The forward-pass hook
+    (:meth:`CaptureManager.on_hook`) uses ``index_select`` to copy those
+    rows into ``scratch_gpu``.  This dynamic gather allocates a fresh
+    output each step and therefore only runs on **eager** steps — the
+    :class:`~vllm.v1.capture.step_gate.CaptureStepGate` forces eager
+    whenever a client-spec request captures.
+
+    ``global_gather_indices`` maps each **global-spec** ``(layer, hook)``
+    pair to the rows to slice *after* the forward pass.  Global keys are
+    captured by a fixed-shape full-residual ``copy_`` into a persistent
+    buffer that is baked into the CUDA graph at warmup (see
+    :meth:`CaptureManager.on_hook` and the ``_global_buffers`` design), so
+    a global-only step keeps full cudagraph speed.  The host slices these
+    rows out of the persistent buffer into ``scratch_gpu`` post-forward
+    (eager, off-graph) via :meth:`CaptureManager._materialize_global_keys`.
 
     ``entries`` is a flat list whose order matches the row order inside
-    each ``(layer, hook)`` scratch tensor.  The dispatch path groups
-    entries by ``(request_id, layer, hook)`` to build per-consumer
-    ``CaptureChunk`` objects.
+    each ``(layer, hook)`` scratch tensor — for both client and global
+    keys — so the dispatch path groups entries by
+    ``(request_id, layer, hook)`` to build per-consumer ``CaptureChunk``
+    objects regardless of which path populated the scratch row.
 
     ``request_errors`` surfaces registration-time or step-time failures
     keyed by request id.
@@ -105,6 +119,9 @@ class StepCapturePlan:
     scratch_gpu: dict[tuple[int, str], torch.Tensor]
     scratch_dtype: dict[tuple[int, str], torch.dtype]
     entries: list[CapturePositionEntry]
+    global_gather_indices: dict[tuple[int, str], torch.Tensor] = field(
+        default_factory=dict
+    )
     request_errors: dict[str, str] = field(default_factory=dict)
 
 
