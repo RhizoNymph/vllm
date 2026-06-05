@@ -471,21 +471,34 @@ See [Capture Consumers under Parallelism](../design/capture_parallelism.md).
 Capture is designed to stay off the critical path except on the steps that
 genuinely capture.
 
-- **Per-step eager only when capturing.** The per-step activation gather
-  runs Python that cannot execute inside a replayed CUDA graph, so a step
-  that captures must run eager. Rather than forcing eager on *every* step
-  while capture is configured, a rank-replicated `CaptureStepGate` decides
-  per step whether any scheduled request actually captures a position in
-  that step's window. Plain requests on a capture-enabled server, and the
-  decode steps of a `last_prompt` capture (which only fires during
-  prefill), keep full cudagraph speed. The gate is evaluated identically on
-  every TP/PP rank from the broadcast `scheduler_output` — no per-step
-  collective — so all ranks agree on eager-vs-cudagraph and stay in
-  lockstep on `num_tokens_padded`. It is a strict superset of what the
-  capturer actually gathers, so it never runs a capturing step in cudagraph
-  mode. A consumer with a *global* spec (captures for every request, e.g.
-  `logging`) puts the gate in always-eager mode, since every request
-  captures.
+- **Per-step eager only for client-spec captures.** The per-request
+  *client*-spec gather selects a variable number of rows and allocates a
+  fresh output each step, which cannot execute inside a replayed CUDA
+  graph — so a step that gathers for a client spec must run eager. Rather
+  than forcing eager on *every* step while capture is configured, a
+  rank-replicated `CaptureStepGate` decides per step whether any scheduled
+  request actually captures a client-spec position in that step's window.
+  Plain requests on a capture-enabled server, and the decode steps of a
+  `last_prompt` capture (which only fires during prefill), keep full
+  cudagraph speed. The gate is evaluated identically on every TP/PP rank
+  from the broadcast `scheduler_output` — no per-step collective — so all
+  ranks agree on eager-vs-cudagraph and stay in lockstep on
+  `num_tokens_padded`. It is a strict superset of what the capturer
+  actually gathers, so it never runs a client-capturing step in cudagraph
+  mode.
+- **Global specs keep full cudagraph speed.** A consumer with a *global*
+  spec (captures for every request, e.g. `logging`) captures the same
+  fixed `(layer, hook)` set on every request, so it does **not** force
+  eager. Its `(layer, hook)` set is known at startup, so the capturer
+  records a fixed-shape full-residual `copy_` of each global hook's
+  `[num_tokens, hidden]` tensor into a persistent buffer; that copy is
+  baked into every CUDA graph at warmup and replays against the persistent
+  address. After the forward the host slices the wanted rows out of the
+  buffer (off-graph) and dispatches them. The copy is collective-free, so
+  it is safe to record on only the capturer rank's graphs. The buffers
+  cost `max_num_tokens × hidden × dtype` bytes per global `(layer, hook)`
+  — negligible for a single-layer `logging`-style probe, but proportional
+  to the layer count for an all-layers global spec.
 - **Non-blocking finalize.** Finalizing a request flushes its captured
   activations and waits for each `(layer, hook)` result — under the
   `filesystem` consumer, roughly one small-file write per captured layer.
