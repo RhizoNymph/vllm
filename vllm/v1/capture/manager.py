@@ -39,7 +39,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -125,6 +125,23 @@ class _DispatchPacket:
     cuda_event: torch.cuda.Event | None
 
 
+@dataclass
+class _FinalizeJob:
+    """One request's finalize work, handed to the finalize thread.
+
+    The request's capture state is popped from ``_requests`` on the
+    *caller* (model-runner step) thread at enqueue time, so the finalize
+    thread never touches ``_requests`` and the step thread never blocks on
+    ``submit_finalize`` / ``wait_for_result`` (the ~per-layer NFS waits).
+    ``on_complete`` is invoked on the finalize thread with the aggregated
+    ``{consumer_index: CaptureResult}`` once every key is terminal.
+    """
+
+    req_id: str
+    state: _RequestCaptureState
+    on_complete: Callable[[dict[int, CaptureResult]], None]
+
+
 # ---------------------------------------------------------------------------
 # Position expansion helpers
 # ---------------------------------------------------------------------------
@@ -162,6 +179,38 @@ def _resolve_positions(
 
     msg = f"Unknown position selector: {positions!r}"
     raise ValueError(msg)
+
+
+def selector_hits_window(
+    positions: list[int] | str,
+    num_prompt_tokens: int,
+    num_computed: int,
+    num_scheduled: int,
+) -> bool:
+    """True if a position selector captures anything in this step window.
+
+    This is the boolean reduction of :func:`_resolve_positions` against
+    the step window ``[num_computed, num_computed + num_scheduled)`` — the
+    exact intersection :meth:`CaptureManager.build_step_plan` performs per
+    consumer (``in_step = [p for p in all_positions if step_start <= p <
+    step_end]``).  It is factored out so the rank-replicated
+    ``CaptureStepGate`` can decide force-eager identically on every rank
+    using the same logic the capturer rank uses to gather, without
+    building a step plan.  Reusing :func:`_resolve_positions` keeps the
+    two in lockstep by construction.
+
+    An unknown selector raises (matching :func:`_resolve_positions`); the
+    gate treats that as "capture" so a malformed spec never silently
+    skips the eager step it needs.
+    """
+    step_start = num_computed
+    step_end = num_computed + num_scheduled
+    if step_end <= step_start:
+        return False
+    resolved = _resolve_positions(
+        positions, num_prompt_tokens, num_computed, num_scheduled
+    )
+    return any(step_start <= p < step_end for p in resolved)
 
 
 def _classify_positions(
@@ -350,6 +399,21 @@ class CaptureManager:
             daemon=True,
         )
         self._dispatch_thread.start()
+        # Finalize runs on its own thread so the model-runner step never
+        # blocks on the per-layer ``submit_finalize`` / ``wait_for_result``
+        # NFS round-trips. The step thread pops the request state and
+        # enqueues a ``_FinalizeJob``; this thread drains the dispatch
+        # queue (so all of the request's chunks have landed), issues the
+        # finalizes, waits for results, and invokes the job callback.
+        # Unbounded queue: finalize jobs are tiny control messages and must
+        # never be dropped (they carry the request's terminal result).
+        self._finalize_queue: queue.Queue[_FinalizeJob | None] = queue.Queue()
+        self._finalize_thread = threading.Thread(
+            target=self._finalize_loop,
+            name="vllm-capture-finalize",
+            daemon=True,
+        )
+        self._finalize_thread.start()
 
     # ------------------------------------------------------------------ props
 
@@ -1089,6 +1153,12 @@ class CaptureManager:
         """
         if not self._dispatch_thread.is_alive():
             return
+        # Stop the finalize thread first: pending finalize jobs drain the
+        # dispatch queue, so the dispatch thread must still be alive while
+        # they run. The sentinel is processed only after all queued jobs.
+        if self._finalize_thread.is_alive():
+            self._finalize_queue.put(None)
+            self._finalize_thread.join(timeout=timeout)
         self._drain_dispatch_queue()
         self._dispatch_queue.put(None)
         self._dispatch_thread.join(timeout=timeout)
@@ -1109,25 +1179,87 @@ class CaptureManager:
     # ----------------------------------------------------- finalization
 
     def finalize_request(self, req_id: str) -> dict[int, CaptureResult]:
-        """Finalize capture for a request across all consumers.
+        """Synchronously finalize capture for a request across consumers.
 
-        For each consumer that had a spec for this request, call
-        ``submit_finalize`` on the sink and aggregate the terminal
-        per-key results.
-
-        Returns a dict mapping consumer index to ``CaptureResult``.
-
-        Drains any in-flight dispatches first, so all per-step chunks
-        for this request have already been submitted by the time we
-        send the finalize and start waiting on results.
+        Drains in-flight dispatches, pops the request, then issues
+        ``submit_finalize`` and waits for every key's terminal result on
+        the calling thread.  Retained for tests and any caller that wants
+        the result inline; the model runner uses
+        :meth:`finalize_request_async` to keep finalize off the step
+        thread.  Returns a dict mapping consumer index to ``CaptureResult``
+        (empty if the request was never registered).
         """
         self._drain_dispatch_queue()
-
         state = self._requests.pop(req_id, None)
-        results: dict[int, CaptureResult] = {}
-
         if state is None:
-            return results
+            return {}
+        return self._run_finalize(req_id, state)
+
+    def finalize_request_async(
+        self,
+        req_id: str,
+        on_complete: Callable[[dict[int, CaptureResult]], None],
+    ) -> bool:
+        """Finalize *req_id* off the model-runner step thread.
+
+        Pops the request's capture state on the **caller's** thread (so
+        ``_requests`` stays single-threaded) and hands the blocking
+        finalize work — draining the dispatch queue, ``submit_finalize``,
+        and the per-key ``wait_for_result`` NFS round-trips — to the
+        dedicated finalize thread.  ``on_complete`` is invoked there with
+        the aggregated ``{consumer_index: CaptureResult}`` once finalize
+        finishes.  Returns ``False`` if the request was never registered
+        (caller should skip), ``True`` once the job is enqueued.
+
+        Best-effort by design: the caller is free to proceed (and the
+        request's text output to be emitted) before ``on_complete`` runs,
+        so the result may attach to a later step's output or not reach the
+        client at all.  The captured activations on disk are unaffected.
+        """
+        state = self._requests.pop(req_id, None)
+        if state is None:
+            return False
+        self._finalize_queue.put(
+            _FinalizeJob(req_id=req_id, state=state, on_complete=on_complete)
+        )
+        return True
+
+    def _finalize_loop(self) -> None:
+        """Background thread draining ``_finalize_queue``.
+
+        Each job: drain the dispatch queue so all of the request's chunks
+        have been submitted to the sinks, run the (blocking) finalize, then
+        invoke the job callback.  ``None`` is the shutdown sentinel.
+        """
+        while True:
+            job = self._finalize_queue.get()
+            if job is None:
+                return
+            try:
+                self._drain_dispatch_queue()
+                results = self._run_finalize(job.req_id, job.state)
+            except Exception:
+                logger.exception(
+                    "capture finalize failed for req=%s", job.req_id
+                )
+                results = {}
+            try:
+                job.on_complete(results)
+            except Exception:
+                logger.exception(
+                    "capture finalize callback failed for req=%s", job.req_id
+                )
+
+    def _run_finalize(
+        self, req_id: str, state: _RequestCaptureState
+    ) -> dict[int, CaptureResult]:
+        """Issue ``submit_finalize`` + ``wait_for_result`` for every key.
+
+        Pure work over an already-popped *state* — no dispatch-queue drain
+        and no ``_requests`` access — so it runs identically on the calling
+        thread (sync path) or the finalize thread (async path).
+        """
+        results: dict[int, CaptureResult] = {}
 
         for consumer_idx, spec in state.consumer_specs.items():
             sink = self._consumers[consumer_idx]

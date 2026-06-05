@@ -522,17 +522,37 @@ class GPUModelRunner(
         self._capture_index_to_name: dict[int, str] = {}
         # Pending terminal results keyed by request id → consumer name →
         # ``CaptureResult``.  Drained onto every ``ModelRunnerOutput``.
+        # Written by the manager's finalize thread (via the async finalize
+        # callback) and drained on the step thread, so all access is
+        # guarded by ``_pending_capture_results_lock``.
         self._pending_capture_results: dict[str, dict[str, CaptureResult]] = {}
-        # Set on *every* rank (capturer or not) — drives the per-step
-        # cross-rank force-eager agreement in ``execute_model`` so all
-        # ranks participate in the collective. Independent of the
-        # capturer gate, which only controls who installs a manager.
+        self._pending_capture_results_lock = threading.Lock()
+        # Set on *every* rank (capturer or not). Drives the per-step
+        # force-eager decision in ``execute_model`` via
+        # ``_capture_step_gate``, which every rank evaluates identically
+        # from the broadcast ``scheduler_output`` — so no cross-rank
+        # collective is needed and all ranks stay in lockstep on
+        # ``num_tokens_padded``. Independent of the capturer gate, which
+        # only controls who installs a manager.
         self._capture_feature_enabled = (
             self.vllm_config.capture_consumers_config is not None
         )
+        # Rank-replicated force-eager predicate. Built on every rank
+        # (capturer or not) so the eager-vs-cudagraph choice agrees across
+        # the TP/PP topology without a per-step collective. ``None`` when
+        # the capture feature is disabled.
+        self._capture_step_gate: Any = None
         if self.vllm_config.capture_consumers_config is not None:
             from vllm.model_executor.layers.activation_capture import (
                 set_active_capture_manager,
+            )
+            from vllm.v1.capture.step_gate import (
+                CaptureStepGate,
+                force_all_from_config,
+            )
+
+            self._capture_step_gate = CaptureStepGate(
+                force_all=force_all_from_config(self.vllm_config)
             )
 
             # Capturer-rank gate. The replicated residual hooks
@@ -1249,17 +1269,22 @@ class GPUModelRunner(
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
+            # Drop the request from the rank-replicated force-eager gate
+            # on every rank (capturer or not), mirroring the broadcast
+            # ``finished_req_ids`` so the gate stays consistent across the
+            # TP/PP topology.
+            if self._capture_step_gate is not None:
+                self._capture_step_gate.drop(req_id)
             # Finalize activation capture for this request before the
-            # persistent batch drops it.  The new manager returns a
-            # ``{consumer_name: CaptureResult}`` dict; empty when no
-            # consumer was active for this request.  We stash it on
-            # ``_pending_capture_results`` so the next
-            # ``ModelRunnerOutput`` can ferry it to the scheduler →
-            # engine core → output processor.
+            # persistent batch drops it. The finalize runs on the manager's
+            # finalize thread (off this step thread); its callback stashes
+            # the ``{consumer_name: CaptureResult}`` dict on
+            # ``_pending_capture_results`` so a later ``ModelRunnerOutput``
+            # can ferry it to the scheduler → engine core → output
+            # processor if it is ready in time (best-effort; the captured
+            # data on disk is unaffected either way).
             if self._capture_manager is not None:
-                results = self._finalize_capture_for_request(req_id)
-                if results:
-                    self._pending_capture_results[req_id] = results
+                self._finalize_capture_for_request_async(req_id)
             self.input_batch.remove_request(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
@@ -1360,6 +1385,16 @@ class GPUModelRunner(
             # recorded on the manager and surfaced later as a terminal
             # ``CaptureResult.status == "error"`` — they never abort
             # text generation (spec invariant 7).
+            #
+            # Track the request in the rank-replicated force-eager gate on
+            # *every* rank (capturer or not), reading the client capture
+            # spec that rides in ``sampling_params`` on all ranks. This is
+            # what lets the eager-vs-cudagraph decision agree across the
+            # TP/PP topology without a collective.
+            if self._capture_step_gate is not None and sampling_params is not None:
+                self._capture_step_gate.register(
+                    req_id, getattr(sampling_params, "capture", None)
+                )
             if self._capture_manager is not None and sampling_params is not None:
                 self._register_capture_request(new_req_data, req_state)
 
@@ -1782,20 +1817,6 @@ class GPUModelRunner(
                 "capture register rejected req=%s: %s", new_req_data.req_id, exc
             )
 
-    def _prepare_capture_step(self, scheduler_output: "SchedulerOutput") -> None:
-        """Build the per-step capture plan via the new manager.
-
-        Runs just before the forward pass.  A no-op when no consumers
-        are configured or when no request currently registered with
-        the manager wants anything this step.
-        """
-        if self._capture_manager is None:
-            return
-        if not self._capture_manager.is_active():
-            return
-        batch_view = self._build_capture_batch_view(scheduler_output)
-        self._capture_manager.build_step_plan(batch_view)
-
     def _finalize_capture_step(self) -> None:
         """Dispatch captured rows to every consumer's sink.
 
@@ -1858,26 +1879,36 @@ class GPUModelRunner(
             token_offsets=token_offsets,
         )
 
-    def _finalize_capture_for_request(self, req_id: str) -> dict[str, "CaptureResult"]:
-        """Drive the new capture manager to finalize *req_id*.
+    def _finalize_capture_for_request_async(self, req_id: str) -> None:
+        """Drive the capture manager to finalize *req_id* off the step thread.
 
-        Returns a ``{consumer_name: CaptureResult}`` dict (possibly
-        empty).  Empty means no consumer was active for the request or
-        the manager never saw it.
+        The manager pops the request's capture state here (on the step
+        thread) and runs the blocking finalize on its finalize thread. The
+        callback maps consumer indices to names and stashes the
+        ``{consumer_name: CaptureResult}`` dict on
+        ``_pending_capture_results`` (under the lock, since it fires on the
+        finalize thread) for a later ``ModelRunnerOutput`` to drain. A
+        no-op when the manager never saw the request.
         """
         mgr = self._capture_manager
         if mgr is None:
-            return {}
-        if not mgr.has_request(req_id):
-            return {}
+            return
 
-        indexed = mgr.finalize_request(req_id)
-        if not indexed:
-            return {}
-        return {
-            self._capture_index_to_name.get(idx, f"consumer_{idx}"): result
-            for idx, result in indexed.items()
-        }
+        index_to_name = self._capture_index_to_name
+        pending = self._pending_capture_results
+        lock = self._pending_capture_results_lock
+
+        def _on_complete(indexed: dict[int, "CaptureResult"]) -> None:
+            if not indexed:
+                return
+            named = {
+                index_to_name.get(idx, f"consumer_{idx}"): result
+                for idx, result in indexed.items()
+            }
+            with lock:
+                pending.setdefault(req_id, {}).update(named)
+
+        mgr.finalize_request_async(req_id, _on_complete)
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -4468,31 +4499,36 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
-            # Build the per-step activation-capture plan *before* the
-            # cudagraph dispatch decision. ``CaptureManager.on_hook``
-            # gathers rows with per-step Python that cannot run inside a
-            # replayed CUDA graph, so any step that actually captures
-            # must run eager. Non-capturing steps (the common case) keep
-            # full cudagraph speed. Safe to build here: it only needs
-            # ``scheduler_output`` + ``input_batch``, both already
-            # populated by ``_prepare_inputs`` above.
+            # Decide force-eager *before* the cudagraph dispatch.
+            # ``CaptureManager.on_hook`` gathers rows with per-step Python
+            # that cannot run inside a replayed CUDA graph, so any step
+            # that actually captures must run eager. Under TP/PP every rank
+            # must reach the *same* decision: a divergent
+            # ``num_tokens_padded`` (eager skips the cudagraph padding)
+            # misaligns the TP all-reduce / PP send-recv and deadlocks, and
+            # a per-step collective to agree would itself deadlock inside
+            # PP's asynchronous pipeline. ``CaptureStepGate`` evaluates the
+            # identical predicate on every rank from the broadcast
+            # ``scheduler_output`` (projected into ``capture_view``) with no
+            # collective, so plain requests and the decode steps of
+            # ``last_prompt`` captures keep full cudagraph speed while
+            # genuinely capturing steps run eager. The view only needs
+            # ``scheduler_output`` + ``input_batch``, both already populated
+            # by ``_prepare_inputs`` above.
             capture_pending = False
-            if self._capture_manager is not None:
-                self._prepare_capture_step(scheduler_output)
-                capture_pending = self._capture_manager.has_pending_capture()
-
-            # Force eager on every step while the capture feature is
-            # enabled. The per-step gather can't run inside a replayed CUDA
-            # graph, and under pipeline parallelism every rank must agree on
-            # ``num_tokens_padded`` for the TP all-reduce / PP send-recv to
-            # line up. Deciding purely from the feature flag (identical on
-            # every rank) keeps all ranks in lockstep with no per-step
-            # collective — a cross-PP all-reduce here would be a synchronous
-            # barrier inside PP's asynchronous pipeline and deadlock against
-            # the send/recv. Costs cudagraph speed while capture is
-            # configured, which is acceptable for a capture run.
-            if self._capture_feature_enabled:
-                capture_pending = True
+            if self._capture_step_gate is not None:
+                capture_view = self._build_capture_batch_view(scheduler_output)
+                capture_pending = self._capture_step_gate.step_captures(capture_view)
+                # The capturer rank builds the real gather plan from the
+                # same view. ``build_step_plan`` is a strict subset of the
+                # gate's decision (it additionally honours pipeline-stage
+                # layer filtering and admission validation), so it never
+                # gathers on a step the gate left in cudagraph mode.
+                if (
+                    self._capture_manager is not None
+                    and self._capture_manager.is_active()
+                ):
+                    self._capture_manager.build_step_plan(capture_view)
 
             (
                 cudagraph_mode,
@@ -4651,7 +4687,8 @@ class GPUModelRunner(
 
         # (The per-step activation-capture plan is built earlier, before
         # the cudagraph dispatch decision, so capturing steps can force
-        # eager execution — see ``_prepare_capture_step`` call above.)
+        # eager execution — see the ``_capture_step_gate`` /
+        # ``build_step_plan`` block above.)
 
         # Update per-request steering tables and index before forward.
         self._update_steering_buffers(scheduler_output)
@@ -4976,17 +5013,21 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        # Transfer any capture results that were finalized during
-        # this step.  ``_pending_capture_results`` is populated by
-        # ``_update_states`` when a finished request drops out of
-        # the persistent batch; we flush it here so it rides on the
-        # same ``ModelRunnerOutput`` as the terminal token.
+        # Transfer any capture results that have finalized so far.
+        # ``_pending_capture_results`` is populated asynchronously by the
+        # manager's finalize thread (via the async finalize callback) for
+        # requests that have dropped out of the persistent batch; we flush
+        # whatever is ready here so it rides on a ``ModelRunnerOutput``.
+        # Best-effort: a result not yet ready simply attaches to a later
+        # step's output (or not at all). The lock guards against the
+        # finalize thread writing while we swap the dict out.
         capture_results_for_step: dict[str, dict[str, CaptureResult]]
-        if self._pending_capture_results:
-            capture_results_for_step = self._pending_capture_results
-            self._pending_capture_results = {}
-        else:
-            capture_results_for_step = {}
+        with self._pending_capture_results_lock:
+            if self._pending_capture_results:
+                capture_results_for_step = self._pending_capture_results
+                self._pending_capture_results = {}
+            else:
+                capture_results_for_step = {}
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
