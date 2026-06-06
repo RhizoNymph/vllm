@@ -446,7 +446,14 @@ class TestPPGeometry:
             def get_layers_start_end_indices(self, parallel_config: object):
                 return real_split(self, parallel_config)
 
-        pc = ParallelConfig(pipeline_parallel_size=pp, tensor_parallel_size=tp)
+        # distributed_executor_backend="ray" skips ParallelConfig's
+        # single-node GPU-count validation, so the test runs on a box with
+        # fewer GPUs than world_size (e.g. CI / a 1-GPU node).
+        pc = ParallelConfig(
+            pipeline_parallel_size=pp,
+            tensor_parallel_size=tp,
+            distributed_executor_backend="ray",
+        )
         pc.rank = rank
         cfg = SimpleNamespace(parallel_config=pc, model_config=_ModelStub())
         return _pp_geometry(cfg)
