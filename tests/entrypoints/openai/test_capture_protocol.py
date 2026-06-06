@@ -314,6 +314,7 @@ def _build_admit_ctx_factories(monkeypatch):
             class _ParallelConfig:
                 tensor_parallel_size = 1
                 pipeline_parallel_size = 1
+                data_parallel_size = 1
 
             class _ModelConfig:
                 @staticmethod
