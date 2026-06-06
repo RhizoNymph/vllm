@@ -21,11 +21,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from vllm.v1.capture.consumers.filesystem.types import (
-    PACKED_BIN_NAME,
-    PACKED_INDEX_NAME,
     VALID_LAYOUTS,
     FilesystemCaptureRequest,
     FilesystemConsumerParams,
+    packed_bin_name,
+    packed_index_name,
     shard_bin_name,
     shard_index_name,
 )
@@ -81,6 +81,43 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
         num_shards=int(params.get("num_shards", 8)),
         shard_max_bytes=int(params.get("shard_max_bytes", 256 << 20)),
     )
+
+
+def _pp_geometry(
+    vllm_config: Any,
+) -> tuple[int, int, tuple[int, int] | None]:
+    """Resolve ``(pp_size, pp_rank, local_layer_range)`` for this worker.
+
+    Under pipeline parallelism each stage's consumer runs in its own
+    process, owns a disjoint slice of the model's layers, and must (a)
+    write packed/sharded files under per-stage names so stages don't race
+    for the same path on the shared mount, and (b) track completion against
+    only the layers this stage actually captures. Both need the stage's
+    pp rank and its ``[start, end)`` global layer slice — derived here
+    exactly as :meth:`ModelConfig.get_layers_start_end_indices` /
+    ``CaptureManager`` derive them, so the consumer and manager agree on
+    the slice.
+
+    Returns ``(1, 0, None)`` when pipeline parallelism is disabled or the
+    config does not expose usable parallel/model info (e.g. a test
+    ``MagicMock``, whose attributes don't coerce to ``int``). In that case
+    packed/sharded use the legacy pp-agnostic filenames and track every
+    requested layer.
+    """
+    try:
+        parallel_config = vllm_config.parallel_config
+        pp_size = int(parallel_config.pipeline_parallel_size)
+    except (AttributeError, TypeError, ValueError):
+        return 1, 0, None
+    if pp_size <= 1:
+        return 1, 0, None
+    # PP is genuinely enabled: a failure to resolve the layer slice here is
+    # a real misconfiguration, so let it surface rather than silently
+    # falling back to colliding pp-agnostic filenames.
+    tp_size = int(parallel_config.tensor_parallel_size)
+    pp_rank = (int(parallel_config.rank) // tp_size) % pp_size
+    start, end = vllm_config.model_config.get_layers_start_end_indices(parallel_config)
+    return pp_size, pp_rank, (int(start), int(end))
 
 
 # Sentinel writer-key components for a request's single packed file.
@@ -184,6 +221,19 @@ class FilesystemConsumer:
         self._vllm_config = vllm_config
         self._params = _parse_params(params)
         self._root = pathlib.Path(self._params.root)
+        # Pipeline-parallel geometry. Under PP each stage owns a disjoint
+        # global layer slice and writes its own packed/sharded files keyed
+        # by stage rank (``_file_pp_rank``); completion is tracked against
+        # only this stage's layers (``_local_layer_range``). With PP off
+        # both are inert (legacy filenames, all layers expected).
+        self._pp_size, self._pp_rank, self._local_layer_range = _pp_geometry(
+            vllm_config
+        )
+        # ``None`` selects the legacy pp-agnostic filenames; an int embeds
+        # the stage rank so per-stage files never collide on the mount.
+        self._file_pp_rank: int | None = None if self._pp_size <= 1 else self._pp_rank
+        self._packed_bin_name = packed_bin_name(self._file_pp_rank)
+        self._packed_index_name = packed_index_name(self._file_pp_rank)
         self._writer = ActivationWriter(
             root=self._root,
             num_threads=self._params.writer_threads,
@@ -285,46 +335,58 @@ class FilesystemConsumer:
             raise CaptureValidationError(
                 f"capture.layout must be one of {sorted(VALID_LAYOUTS)}, got {layout!r}"
             )
-        # ``packed`` / ``sharded`` write one file per request (per tag),
-        # so under pipeline parallelism every stage's writer races to the
-        # same path on the shared mount — interleaved bytes, mismatched
-        # index, and an orphaned ``.tmp`` that never publishes. Only
-        # ``per_file`` (keyed by the global layer index) is collision-free
-        # across stages. Fail closed rather than silently corrupt.
-        if layout != "per_file" and ctx.pipeline_parallel_size > 1:
-            raise CaptureValidationError(
-                f"filesystem capture.layout={layout!r} is not supported with "
-                f"pipeline_parallel_size>1 (got {ctx.pipeline_parallel_size}); "
-                "each pipeline stage would write the same per-request file and "
-                "they collide on the shared mount. Use layout='per_file' under "
-                "pipeline parallelism."
-            )
+        # ``packed``/``sharded`` write one file per request (per tag). Under
+        # pipeline parallelism each stage owns a disjoint global layer slice
+        # and writes its own ``packed-pp{rank}``/``shard-pp{rank}`` files
+        # (see ``_file_pp_rank``), so stages never race for the same path on
+        # the shared mount. The pp-agnostic ``per_file`` layout is keyed by
+        # global layer index and is collision-free regardless.
 
         req_str = str(ctx.vllm_internal_request_id)
-        # The full (layer, hook) set we must see finalized before a
-        # request's data is complete (used by packed + sharded).
+        # The (layer, hook) set this stage must see finalized before its
+        # share of the request is complete (used by packed + sharded). The
+        # client spec carries *global* layers (validated against the global
+        # layer space); under PP the manager only ever captures and
+        # finalizes the layers this stage owns, so completion must be
+        # tracked against the local slice — otherwise the packed index
+        # (sharded ``done`` flag) would wait forever on layers another
+        # stage holds. With PP off ``_local_layer_range`` is ``None`` and
+        # every requested layer is expected.
         expected = {
             (layer_idx, hook_name)
             for hook_name, layers in spec.hooks.items()
             for layer_idx in layers
         }
+        if self._local_layer_range is not None:
+            start, end = self._local_layer_range
+            expected = {
+                (layer_idx, hook_name)
+                for (layer_idx, hook_name) in expected
+                if start <= layer_idx < end
+            }
+
         with self._lock:
             self._request_slugs[req_str] = (tag_slug, request_id_slug)
             self._request_layout[req_str] = layout
-            if layout == "packed":
-                self._packed_states[req_str] = _PackedState(
-                    tag_slug=tag_slug,
-                    request_id_slug=request_id_slug,
-                    expected_keys=expected,
-                )
-            elif layout == "sharded":
-                shard_idx = hash(req_str) % max(1, self._params.num_shards)
-                self._sharded_requests[req_str] = _ShardedRequestState(
-                    tag_slug=tag_slug,
-                    request_id_slug=request_id_slug,
-                    shard_idx=shard_idx,
-                    expected_keys=expected,
-                )
+            # When this stage owns none of the request's layers, the manager
+            # drops the consumer for the request — no chunks/finalizes will
+            # arrive — so don't create accumulation state that would never
+            # complete (and would leak).
+            if expected:
+                if layout == "packed":
+                    self._packed_states[req_str] = _PackedState(
+                        tag_slug=tag_slug,
+                        request_id_slug=request_id_slug,
+                        expected_keys=expected,
+                    )
+                elif layout == "sharded":
+                    shard_idx = hash(req_str) % max(1, self._params.num_shards)
+                    self._sharded_requests[req_str] = _ShardedRequestState(
+                        tag_slug=tag_slug,
+                        request_id_slug=request_id_slug,
+                        shard_idx=shard_idx,
+                        expected_keys=expected,
+                    )
         return spec
 
     # ------------------------------------------------------------------
@@ -505,7 +567,7 @@ class FilesystemConsumer:
             # writes and the finalize index land in the same directory.
             bin_tag, bin_req = state.tag_slug, state.request_id_slug
 
-        bin_path = self._root / bin_tag / bin_req / PACKED_BIN_NAME
+        bin_path = self._root / bin_tag / bin_req / self._packed_bin_name
         self._writer.submit(
             WriteTask(
                 path=bin_path,
@@ -577,7 +639,7 @@ class FilesystemConsumer:
                     self._root
                     / state.tag_slug
                     / state.request_id_slug
-                    / PACKED_BIN_NAME
+                    / self._packed_bin_name
                 )
             bin_path = state.bin_path
 
@@ -637,7 +699,7 @@ class FilesystemConsumer:
                 }
             )
             shard.running_offset += nbytes
-            bin_name = shard_bin_name(shard.shard_idx, shard.seq)
+            bin_name = shard_bin_name(shard.shard_idx, shard.seq, self._file_pp_rank)
             bin_path = self._root / req.tag_slug / bin_name
             req.shard_bins.add(str(bin_path))
             writer_key = (f"{req.tag_slug}#{shard.shard_idx}", shard.seq, _SHARD_HOOK)
@@ -660,8 +722,12 @@ class FilesystemConsumer:
         shard's running state so subsequent chunks open a fresh file.
         """
         tag_dir = self._root / shard.tag_slug
-        bin_path = tag_dir / shard_bin_name(shard.shard_idx, shard.seq)
-        sidecar_path = tag_dir / shard_index_name(shard.shard_idx, shard.seq)
+        bin_path = tag_dir / shard_bin_name(
+            shard.shard_idx, shard.seq, self._file_pp_rank
+        )
+        sidecar_path = tag_dir / shard_index_name(
+            shard.shard_idx, shard.seq, self._file_pp_rank
+        )
         index_payload: dict[str, Any] = {
             "layout": "sharded",
             "shard_idx": shard.shard_idx,
@@ -669,6 +735,10 @@ class FilesystemConsumer:
             "dtype": shard.dtype or "float32",
             "entries": shard.entries,
         }
+        # Under PP each stage seals its own shard files; record the stage.
+        if self._file_pp_rank is not None:
+            index_payload["pp_rank"] = self._file_pp_rank
+            index_payload["pp_size"] = self._pp_size
         writer_key = (f"{shard.tag_slug}#{shard.shard_idx}", shard.seq, _SHARD_HOOK)
         task = FinalizeTask(
             bin_path=bin_path,
@@ -775,10 +845,15 @@ class FilesystemConsumer:
                     "entries": state.entries,
                 }
             )
+            # Under PP this index covers only this stage's layers; record
+            # the stage so readers/operators can attribute the file.
+            if self._file_pp_rank is not None:
+                index_payload["pp_rank"] = self._file_pp_rank
+                index_payload["pp_size"] = self._pp_size
             req_dir = self._root / state.tag_slug / state.request_id_slug
             task = FinalizeTask(
-                bin_path=req_dir / PACKED_BIN_NAME,
-                sidecar_path=req_dir / PACKED_INDEX_NAME,
+                bin_path=req_dir / self._packed_bin_name,
+                sidecar_path=req_dir / self._packed_index_name,
                 sidecar_payload=index_payload,
                 key=(req_str, _PACKED_LAYER, _PACKED_HOOK),
             )
