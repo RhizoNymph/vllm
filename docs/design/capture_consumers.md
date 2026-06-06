@@ -177,6 +177,7 @@ class CaptureSink(Protocol):
     location: ClassVar[Literal["worker", "driver"]]
 
     def submit_chunk(self, chunk: CaptureChunk) -> None: ...
+    def submit_chunk_batch(self, chunks: list[CaptureChunk]) -> None: ...
     def submit_finalize(self, finalize: CaptureFinalize) -> None: ...
     def get_result(self, key: CaptureKey) -> CaptureResult | None: ...
     def shutdown(self, timeout: float = 30.0) -> None: ...
@@ -187,6 +188,14 @@ Ordering guarantees:
 - For a given key, chunks arrive in `row_offset` order.
 - `CaptureFinalize` for a key arrives after all chunks for that key.
 - Different keys have no ordering relationship.
+- `submit_chunk_batch` delivers all of one dispatch step's chunks for a
+  sink in a single call (chunks within the batch retain submission order).
+  It is **optional**: the default forwards each chunk to `submit_chunk`, and
+  the manager calls it opportunistically (via `getattr`). Sinks that can
+  amortize per-chunk overhead across the step — locking, write-task
+  creation, payload concatenation — override it; the filesystem consumer
+  does so for the `packed` layout (one WriteTask + one lock per request per
+  step instead of one per `(layer, hook)`).
 - All methods are called from the manager's dispatch thread; direct
   `CaptureSink` implementations are responsible for their own thread
   safety (the manager does not serialize calls across sinks).
@@ -335,22 +344,42 @@ explicit list — resolved once at registration) and *dynamic*
 2. For each `(layer, hook)` that any consumer wants, record the
    absolute batch row index plus a per-position `consumer_mask`
    bitset (bit *i* set ⇒ consumer *i* wants this row).
-3. Allocate `gather_indices[(layer, hook)]` (device `int64`) and
-   `scratch_gpu[(layer, hook)]` (device, model residual dtype) sized
-   for the union.
+3. Allocate an `int64` row-index tensor for each `(layer, hook)`,
+   routed by capture path (see below), plus `scratch_dtype` (model
+   residual dtype). `scratch_gpu` starts empty and is populated during
+   (client keys) or after (global keys) the forward.
 
 Gather happens **once** per `(layer, hook)` regardless of how many
 consumers want it. Fan-out happens at dispatch time via the
 `consumer_mask`.
 
+**Two gather paths.** Each `(layer, hook)` is routed by whether it
+belongs to a **global** spec (one whose `(layer, hook)` set is fixed at
+startup, served by the CUDA-graph-safe persistent buffer) or only a
+**client** spec (per-request, dynamic):
+
+- **Client keys → `gather_indices`.** The in-hook `index_select`
+  (variable output size, fresh allocation) — only valid eager, so the
+  step gate forces eager whenever a client key captures.
+- **Global keys → `global_gather_indices`.** Served from a persistent
+  per-key buffer that `on_hook` fills with a fixed-shape full-residual
+  `copy_` (graph-safe — recorded into the cudagraph at warmup). The host
+  slices these rows out of the buffer *after* the forward. A key wanted
+  by both a global and a client consumer this step routes to the global
+  path; the buffer holds the full residual, so any consumer's rows can be
+  sliced from it.
+
 `StepCapturePlan` holds:
 
-- `gather_indices: dict[(layer, hook), Tensor]`
+- `gather_indices: dict[(layer, hook), Tensor]` — client keys (in-hook).
+- `global_gather_indices: dict[(layer, hook), Tensor]` — global keys
+  (sliced from the persistent buffer post-forward).
 - `scratch_gpu: dict[(layer, hook), Tensor]`
 - `scratch_dtype: dict[(layer, hook), torch.dtype]`
 - `entries: list[CapturePositionEntry]` — one per captured row, with
   `(request_id, layer, hook, logical_pos, scratch_row, step_index,
-  consumer_mask)`.
+  consumer_mask)`. `scratch_row` ordering is identical for both paths,
+  so dispatch treats global and client keys uniformly.
 - `request_errors: dict[req_id, str]` — registration-time or
   step-time failures.
 
@@ -369,18 +398,35 @@ During the forward:
   `mutates_args=["hidden_states"]` — a deliberate white lie so
   `torch.compile` does not DCE it.
 - The op looks up the active manager and calls `on_hook(layer_idx,
-  hook_name, hidden_states)`, which `index_select`s into
-  `plan.scratch_gpu[(layer, hook)]`. `hidden_states` is never mutated.
+  hook_name, hidden_states)`. `hidden_states` is never mutated. `on_hook`
+  has two independent branches:
+    - **Global key** (`(layer, hook)` in `_global_buffers`): a
+      fixed-shape `buf[:n].copy_(hidden_states)` of the full residual
+      into the persistent buffer. This runs *independently of the
+      per-step plan*, so it fires during the warmup capture pass (where
+      the `copy_` kernel is **recorded into every cudagraph descriptor**)
+      and on eager steps alike; at replay no Python runs but the recorded
+      copy reproduces against the persistent address. Collective-free, so
+      recording it on only the capturer rank's graphs is safe.
+    - **Client key** (`plan.gather_indices`): the dynamic
+      `index_select` into `plan.scratch_gpu[(layer, hook)]`. Allocates a
+      fresh, variable-size output, so it only runs eager.
 
 After the forward step, the runner calls `consume_step_plan()` to
-take ownership of the plan and `dispatch_step_captures(plan)`:
+take ownership of the plan and `dispatch_step_captures(plan)`, which
+first calls `_materialize_global_keys(plan)` — for each global key it
+slices `buf.index_select(0, global_gather_indices[key])` into
+`scratch_gpu` (eager, off-graph, on the post-forward compute stream),
+after which global and client keys are handled identically:
 
 1. For each consumer index `i`, group entries where bit `i` is set
    in `consumer_mask` by `(request_id, layer, hook)`.
 2. For each group, `index_select` the consumer's rows out of the
-   scratch tensor, `.cpu()` them, build a `CaptureChunk`, and call
-   `sink.submit_chunk`. `metadata` carries `consumer_index` and the
-   logical positions.
+   scratch tensor, `.cpu()` them, and build a `CaptureChunk` (`metadata`
+   carries `consumer_index` and the logical positions). The step's chunks
+   for a consumer are collected and handed over in one `submit_chunk_batch`
+   call (falling back to per-chunk `submit_chunk` if the sink lacks it), so
+   sinks can amortize per-chunk overhead across the whole step.
 3. Wrap per-consumer dispatch in `try/except` so a failing sink
    never prevents delivery to the others (invariant 9). A failing
    dispatch records an error on every request that consumer was
@@ -423,17 +469,57 @@ indices back to consumer names via `_capture_index_to_name`.
 
 Per-step hooks:
 
-- `_prepare_capture_step(scheduler_output)` — builds the batch view
-  (matching `SteeringModelRunnerMixin._update_steering_buffers`
-  offset walk exactly so gather indices line up) and calls
-  `manager.build_step_plan`.
+- Before the cudagraph dispatch decision, the runner builds the batch
+  view (matching `SteeringModelRunnerMixin._update_steering_buffers`
+  offset walk exactly so gather indices line up). The view feeds two
+  things: the rank-replicated `CaptureStepGate` (which decides whether
+  this step must run eager — see [Force-eager step gate](#force-eager-step-gate)),
+  and, on the capturer rank, `manager.build_step_plan`.
 - `_finalize_capture_step()` — calls `manager.consume_step_plan()`
-  and `manager.dispatch_step_captures(plan)`.
+  and `manager.dispatch_step_captures(plan)` after the forward pass.
 
 Per-request finalize: when a request completes, the runner calls
-`_finalize_capture_for_request(req_id)` which invokes
-`manager.finalize_request(req_id)` and translates indices back to
-names, surfacing the dict on `ModelRunnerOutput.capture_results`.
+`_finalize_capture_for_request_async(req_id)`, which has the manager pop
+the request's capture state on the step thread (so `_requests` stays
+single-threaded) and run the blocking finalize — `submit_finalize` plus
+the per-key `wait_for_result` round-trips — on the manager's dedicated
+finalize thread via `manager.finalize_request_async(req_id, on_complete)`.
+The `on_complete` callback (on the finalize thread) translates indices
+back to names and stashes the dict on the lock-guarded
+`_pending_capture_results`, which a later step drains onto
+`ModelRunnerOutput.capture_results`. Result delivery is therefore
+**best-effort**: if finalize has not completed by the time the request's
+output is emitted, the result is absent from the response even though the
+captured data was written. The synchronous `manager.finalize_request` is
+retained for tests and inline callers.
+
+### Force-eager step gate
+
+`CaptureManager.on_hook`'s **client**-key gather (`index_select`) allocates
+a fresh, variable-size output each step and cannot run inside a replayed
+CUDA graph, so any step that gathers for a client spec must run eager.
+(Global keys take the graph-safe persistent-buffer copy instead — see
+[Forward and Dispatch](#forward-and-dispatch) — and never force eager.)
+Under TP/PP every rank must reach the *same* eager-vs-cudagraph decision or
+`num_tokens_padded` diverges and the TP all-reduce / PP send-recv deadlock;
+a per-step collective to agree would itself deadlock inside PP's
+asynchronous pipeline.
+
+`CaptureStepGate` (`vllm/v1/capture/step_gate.py`) resolves this with no
+collective. It is built on *every* rank, populated from the broadcast
+new-request stream (`register`) and finished stream (`drop`), and each step
+evaluates `step_captures(view)` purely from the rank-identical
+`scheduler_output` plus each request's client capture spec (which rides in
+`SamplingParams` on every rank). Identical inputs + a pure predicate ⇒
+identical decision by construction. The gate ignores pipeline-stage layer
+filtering and admission validation, so it is a strict **superset** of the
+capturer's actual client gather: it never leaves a client-capturing step in
+cudagraph mode (which would silently no-op the gather), only occasionally
+over-forces a harmless extra eager step. Position logic is shared with
+`build_step_plan` via `selector_hits_window`. Global specs no longer force
+eager — they are served by the persistent buffer — so a `logging`-style
+global consumer keeps full cudagraph speed; `force_all` remains only as a
+manual always-eager escape hatch (off by default).
 
 ## Driver Bridge
 
@@ -537,6 +623,34 @@ On finalize:
 3. Writer thread `fsync`s the `.bin.tmp`, `os.replace`s it to the
    final `.bin`, writes + `fsync`s + renames the sidecar JSON.
 
+**Layout modes** (`FilesystemCaptureRequest.layout`, else the consumer's
+`default_layout`; `per_file` is the default and unchanged behavior):
+
+- **`per_file`** — the flow above: one `.bin` + `.json` per
+  `(request, layer, hook)`. Lowest latency; supports mid-request
+  streaming (a reader can tail a `.bin` as steps append). File count
+  scales with `requests × layers × hooks`.
+- **`packed`** — one `packed.bin` + one `packed.json` index per
+  *request*, all `(layer, hook)` tensors concatenated. The consumer
+  routes every chunk of a request to a single writer key (one fd, one
+  file), records a per-chunk index entry `{layer, hook, offset, nbytes,
+  shape}`, and — because per-key finalizes arrive in one synchronous
+  burst after the dispatch-drain barrier — publishes the file only once
+  **all** expected `(layer, hook)` keys have finalized. Every key's
+  `CaptureResult` then maps to the single packed `WriteResult`. Cuts
+  file count by `layers × hooks` — the throughput lever on network
+  mounts (~4.5× on NFS in `bench_capture_packed.py`); a capture is
+  readable once its request finalizes. Packing is entirely
+  consumer-side; the writer is unchanged.
+
+Both layouts write raw residual-dtype bytes (bf16 as `uint16`) and a
+self-describing sidecar carrying `dtype` + `shape`. `reader.py`
+(`read_per_file` / `read_packed` / `read_request`, NumPy-only) decodes
+either layout; `read_request` auto-detects by the presence of
+`packed.json`. Packed entries are per-chunk, so a `(layer, hook)`
+spanning multiple steps appears as several entries the reader
+concatenates in offset order.
+
 Writer details (`writer.py`):
 
 - One `queue.Queue` per thread, partitioned by `hash(request_id) %
@@ -544,6 +658,13 @@ Writer details (`writer.py`):
   locks.
 - Per-thread LRU fd cache (default 256 entries); eviction `fsync`s +
   closes the fd.
+- `fsync` (default True): when False, skip every `os.fsync`. On NFS the
+  per-file fsync is near-redundant with the close-time COMMIT, so it is
+  mostly a no-op there but a real durability/throughput knob on other
+  backends.
+- `atomic_publish` (default True): when False, write straight to the
+  final path (no `.tmp` + rename), dropping two rename RPCs per file at
+  the cost of atomic visibility. Requires `on_collision="overwrite"`.
 - Collision policy (`overwrite` / `error` / `suffix`) applied at
   finalize.
 - Structured `WriteError` with errno, path, key; surfaces back on
@@ -554,10 +675,14 @@ Writer details (`writer.py`):
 
 **Validation constraints** (`validation.py`):
 
-- `tensor_parallel_size == 1 && pipeline_parallel_size == 1`.
+- TP / PP / EP / DP are all accepted for the replicated residual hooks
+  (no parallel-size rejection). See
+  [Capture Consumers under Parallelism](capture_parallelism.md).
 - Every hook name is in `{pre_attn, post_attn, post_mlp, mlp_in,
   mlp_out}`.
-- Every resolved layer is in `[0, num_hidden_layers)`.
+- Every resolved layer is in `[0, num_hidden_layers)`, the **global**
+  layer count (admission validates the full layer space; the runner then
+  filters each pipeline stage's spec to its owned slice).
 - Tag / request_id: non-empty, ≤256 chars, no `..`, no leading `/`;
   characters outside `[a-zA-Z0-9._-]` become `_`.
 - Explicit positions ≥ `num_computed_tokens` (reject prefix-cache
@@ -594,10 +719,14 @@ Writer details (`writer.py`):
 7. **Prefix-cache positions rejected at admission.** Filesystem
    validator raises `CaptureValidationError` on any explicit
    position below `num_computed_tokens`.
-8. **TP > 1 / PP > 1 rejected with a clear error.** The filesystem
-   validator checks `CaptureContext.tensor_parallel_size` and
-   `pipeline_parallel_size` before any other work. Other
-   residual-collecting consumers should do the same.
+8. **Parallelism is supported for replicated residual hooks.** The
+   residual stream is replicated across the TP/EP plane within each
+   pipeline stage, so TP rank 0 of each stage captures its
+   global-indexed layers and the engine unions the per-stage results
+   (`merge_capture_results`). Worker-location consumers (incl.
+   `filesystem`) work under TP/PP/EP/DP; sharded-activation capture and
+   single-process driver-side gather across PP stages remain future
+   work. See [Capture Consumers under Parallelism](capture_parallelism.md).
 9. **Consumer isolation.** `dispatch_step_captures` wraps each
    consumer's slice-and-submit in `try/except`; `_BatchedAdapter.
    submit_finalize` catches `on_capture` exceptions and records

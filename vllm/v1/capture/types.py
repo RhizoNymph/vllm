@@ -14,9 +14,12 @@ authoritative field-by-field spec.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, NewType
+from typing import TYPE_CHECKING, Any, Literal, NewType
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm.config import ParallelConfig
 
 # ---------------------------------------------------------------------------
 # Request identity
@@ -241,8 +244,34 @@ class CaptureContext:
     # Prefix-cache hits; positions below this index are already in the
     # KV cache and cannot be re-captured.
     num_computed_tokens: int
+    # Global layer count (across all pipeline stages), so client specs
+    # validate against the model's full layer space regardless of which
+    # pipeline-parallel rank performs admission.
     num_hidden_layers: int
     hidden_size: int
     element_size_bytes: int
     tensor_parallel_size: int
     pipeline_parallel_size: int
+    # Size of the expert-parallel plane (ranks experts are sharded over);
+    # 1 when expert parallelism is disabled. Replicated residual hooks are
+    # identical across this plane; only sharded-expert capture (Phase 4)
+    # depends on it.
+    expert_parallel_size: int = 1
+    # Number of data-parallel replicas. Each replica is an independent
+    # engine core over disjoint requests, so capture never aggregates
+    # across this axis; carried for completeness / validator messaging.
+    data_parallel_size: int = 1
+
+
+def capture_expert_parallel_size(parallel_config: ParallelConfig) -> int:
+    """EP-plane size for a :class:`CaptureContext`.
+
+    vLLM has no standalone ``expert_parallel_size`` field. When
+    ``enable_expert_parallel`` is set, experts shard across the
+    ``tensor_parallel_size * data_parallel_size`` plane; otherwise the
+    plane is a single rank. Shared by every ``CaptureContext``
+    construction site so the derivation stays in one place.
+    """
+    if getattr(parallel_config, "enable_expert_parallel", False):
+        return parallel_config.tensor_parallel_size * parallel_config.data_parallel_size
+    return 1

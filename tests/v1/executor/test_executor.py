@@ -157,3 +157,51 @@ def test_custom_executor_async(distributed_executor_backend, tmp_path):
         assert os.path.exists(".marker")
     finally:
         os.chdir(cwd)
+
+
+class TestCaptureAwareAggregator:
+    """``_CaptureAwareAggregator`` composes KV aggregation with the
+    cross-stage ``capture_results`` merge used under pipeline parallelism."""
+
+    @staticmethod
+    def _fake_output(capture_results):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(capture_results=capture_results)
+
+    @staticmethod
+    def _result(req, layer):
+        from vllm.v1.capture.types import CaptureResult, VllmInternalRequestId
+
+        return CaptureResult(
+            key=(VllmInternalRequestId(req), layer, "post_mlp"),
+            status="ok",
+        )
+
+    def test_merges_captures_without_kv_aggregator(self):
+        from vllm.v1.executor.abstract import _CaptureAwareAggregator
+
+        stage0 = self._fake_output({"r": {"fs": self._result("r", 1)}})
+        stage1 = self._fake_output({})  # output_rank captured nothing itself
+        agg = _CaptureAwareAggregator(None)
+        result = agg.aggregate([stage0, stage1], output_rank=1)
+        # Returns output_rank's object, now carrying the other stage's result.
+        assert result is stage1
+        assert set(stage1.capture_results) == {"r"}
+
+    def test_delegates_to_wrapped_kv_aggregator(self):
+        from unittest.mock import MagicMock
+
+        from vllm.v1.executor.abstract import _CaptureAwareAggregator
+
+        stage0 = self._fake_output({"r": {"fs": self._result("r", 1)}})
+        stage1 = self._fake_output({})
+        kv = MagicMock()
+        kv.aggregate = MagicMock(return_value=stage1)
+        agg = _CaptureAwareAggregator(kv)
+        result = agg.aggregate([stage0, stage1], output_rank=1)
+        # KV aggregation runs and its result is returned …
+        kv.aggregate.assert_called_once_with([stage0, stage1], output_rank=1)
+        assert result is stage1
+        # … and capture results are still merged in.
+        assert set(stage1.capture_results) == {"r"}

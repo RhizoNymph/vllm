@@ -36,6 +36,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -705,6 +706,10 @@ class Gemma4DecoderLayer(nn.Module):
         # 1. input_norm(x) → attn → post_attn_norm → ADD residual
         # 2. pre_ff_norm → mlp → post_ff_norm → ADD residual
         residual = hidden_states
+        # Activation-capture taps (no-op unless a capture manager is active).
+        # Read the pristine residual stream at each hook point; mirrors the
+        # hook placement used by apply_layer_steering on feat/integration.
+        maybe_capture_residual(residual, self.layer_idx, "pre_attn")
 
         hidden_states = self.input_layernorm(residual)
 
@@ -716,6 +721,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        maybe_capture_residual(hidden_states, self.layer_idx, "post_attn")
         residual = hidden_states
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
@@ -737,6 +743,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        maybe_capture_residual(hidden_states, self.layer_idx, "post_mlp")
 
         # Apply PLE (Per-Layer Embedding) if configured
         if per_layer_input is not None and self.per_layer_input_gate is not None:

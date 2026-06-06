@@ -29,10 +29,17 @@ See ``docs/design/capture_consumers.md`` for the full spec.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
+import os
+import pathlib
 import queue
+import tempfile
 import threading
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -127,6 +134,23 @@ class _DispatchPacket:
     cuda_event: torch.cuda.Event | None
 
 
+@dataclass
+class _FinalizeJob:
+    """One request's finalize work, handed to the finalize thread.
+
+    The request's capture state is popped from ``_requests`` on the
+    *caller* (model-runner step) thread at enqueue time, so the finalize
+    thread never touches ``_requests`` and the step thread never blocks on
+    ``submit_finalize`` / ``wait_for_result`` (the ~per-layer NFS waits).
+    ``on_complete`` is invoked on the finalize thread with the aggregated
+    ``{consumer_index: CaptureResult}`` once every key is terminal.
+    """
+
+    req_id: str
+    state: _RequestCaptureState
+    on_complete: Callable[[dict[int, CaptureResult]], None]
+
+
 # ---------------------------------------------------------------------------
 # Position expansion helpers
 # ---------------------------------------------------------------------------
@@ -166,6 +190,38 @@ def _resolve_positions(
     raise ValueError(msg)
 
 
+def selector_hits_window(
+    positions: list[int] | str,
+    num_prompt_tokens: int,
+    num_computed: int,
+    num_scheduled: int,
+) -> bool:
+    """True if a position selector captures anything in this step window.
+
+    This is the boolean reduction of :func:`_resolve_positions` against
+    the step window ``[num_computed, num_computed + num_scheduled)`` — the
+    exact intersection :meth:`CaptureManager.build_step_plan` performs per
+    consumer (``in_step = [p for p in all_positions if step_start <= p <
+    step_end]``).  It is factored out so the rank-replicated
+    ``CaptureStepGate`` can decide force-eager identically on every rank
+    using the same logic the capturer rank uses to gather, without
+    building a step plan.  Reusing :func:`_resolve_positions` keeps the
+    two in lockstep by construction.
+
+    An unknown selector raises (matching :func:`_resolve_positions`); the
+    gate treats that as "capture" so a malformed spec never silently
+    skips the eager step it needs.
+    """
+    step_start = num_computed
+    step_end = num_computed + num_scheduled
+    if step_end <= step_start:
+        return False
+    resolved = _resolve_positions(
+        positions, num_prompt_tokens, num_computed, num_scheduled
+    )
+    return any(step_start <= p < step_end for p in resolved)
+
+
 def _classify_positions(
     spec: CaptureSpec,
     num_prompt_tokens: int,
@@ -191,6 +247,34 @@ def _classify_positions(
     return positions, None
 
 
+def _filter_specs_to_layer_range(
+    specs: dict[int, CaptureSpec],
+    start: int,
+    end: int,
+) -> dict[int, CaptureSpec]:
+    """Restrict every consumer spec to layers in the global ``[start, end)``.
+
+    Returns a new mapping containing only consumers that retain at least
+    one hook layer in range. Hook entries that become empty are dropped,
+    and a consumer whose every hook empties out is removed entirely. The
+    layer indices are global (as produced by ``make_layers``), so the
+    comparison is directly against this stage's owned slice.
+    """
+    filtered: dict[int, CaptureSpec] = {}
+    for consumer_idx, spec in specs.items():
+        kept_hooks: dict[HookName, list[int]] = {}
+        for hook_name, layers in spec.hooks.items():
+            in_range = [layer for layer in layers if start <= layer < end]
+            if in_range:
+                kept_hooks[hook_name] = in_range
+        if kept_hooks:
+            filtered[consumer_idx] = CaptureSpec(
+                hooks=kept_hooks,
+                positions=spec.positions,
+            )
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Capture manager
 # ---------------------------------------------------------------------------
@@ -212,7 +296,13 @@ class CaptureManager:
         hidden_size: int,
         model_dtype: torch.dtype,
         device: torch.device | str = "cpu",
+        max_num_tokens: int = 0,
         finalize_timeout_s: float = 5.0,
+        dispatch_queue_size: int = 0,
+        overload_policy: str = "block",
+        spill_dir: str | None = None,
+        spill_max_bytes: int = 4 << 30,
+        local_layer_range: tuple[int, int] | None = None,
     ) -> None:
         if len(consumers) != len(consumer_specs):
             msg = (
@@ -220,14 +310,111 @@ class CaptureManager:
                 f"consumer_specs length ({len(consumer_specs)})"
             )
             raise ValueError(msg)
+        if overload_policy not in ("block", "drop", "spill"):
+            raise ValueError(
+                f"overload_policy must be 'block', 'drop', or 'spill', "
+                f"got {overload_policy!r}"
+            )
         self._consumers = consumers
         self._consumer_specs = consumer_specs
+        # ``num_hidden_layers`` is the GLOBAL layer count (across all
+        # pipeline stages); client/global specs reference global layer
+        # indices and are validated against it.
         self._num_hidden_layers = num_hidden_layers
+        # The global ``[start, end)`` layer slice this manager's worker
+        # actually computes (its pipeline stage). Specs are filtered to
+        # this range at registration so each stage captures and finalizes
+        # only its own layers; ``None`` means the whole model (no PP).
+        if local_layer_range is None:
+            self._local_layer_range = (0, num_hidden_layers)
+        else:
+            start, end = local_layer_range
+            if not (0 <= start <= end <= num_hidden_layers):
+                raise ValueError(
+                    f"local_layer_range {local_layer_range!r} must satisfy "
+                    f"0 <= start <= end <= num_hidden_layers "
+                    f"({num_hidden_layers})"
+                )
+            self._local_layer_range = (start, end)
         self._hidden_size = hidden_size
         self._model_dtype = model_dtype
         self._device = torch.device(device) if isinstance(device, str) else device
         self._finalize_timeout = finalize_timeout_s
         self._requests: dict[str, _RequestCaptureState] = {}
+
+        # ---- Global-spec persistent buffers (CUDA-graph-safe path) ----
+        #
+        # A *global* spec captures for every request, so the set of
+        # ``(layer, hook)`` keys it touches is fixed at construction and
+        # independent of any per-request client spec.  That lets the
+        # gather run inside a replayed CUDA graph: instead of the dynamic
+        # ``index_select`` (which allocates a fresh, variable-size output
+        # each step and therefore only works eager), :meth:`on_hook`
+        # issues a fixed-shape full-residual ``copy_`` of the hook's
+        # ``[num_tokens, hidden]`` tensor into a persistent buffer.  That
+        # copy is recorded into every cudagraph descriptor at warmup (the
+        # manager is installed before ``capture_model`` runs) and replays
+        # against the persistent address, so a global-only step keeps full
+        # cudagraph speed.  After the forward the host slices the wanted
+        # rows out of the buffer (eager, off-graph) — see
+        # :meth:`_materialize_global_keys`.
+        #
+        # The candidate global keys are restricted to the layers this
+        # pipeline stage owns (``local_layer_range``); other stages never
+        # see those hooks fire.
+        #
+        # The graph-safe buffer path is enabled only when ``max_num_tokens
+        # > 0`` (always true in the real runner, where it is the scheduler
+        # token budget).  When it is unset — direct ``CaptureManager``
+        # construction in CPU unit tests, where there are no CUDA graphs
+        # and every step runs eager — ``_global_keys`` stays empty and
+        # global specs fall through the dynamic ``index_select`` path like
+        # client specs.  That keeps the eager-only behavior unchanged while
+        # the runner gets the recorded full-residual copy.
+        start, end = self._local_layer_range
+        candidate_keys: set[tuple[int, str]] = set()
+        for spec in self._consumer_specs:
+            if spec is None:
+                continue
+            for hook_name, layers in spec.hooks.items():
+                for layer_idx in layers:
+                    if start <= layer_idx < end:
+                        candidate_keys.add((layer_idx, hook_name))
+
+        self._global_buffers: dict[tuple[int, str], torch.Tensor] = {}
+        if candidate_keys and max_num_tokens > 0:
+            for key in candidate_keys:
+                self._global_buffers[key] = torch.empty(
+                    (max_num_tokens, hidden_size),
+                    dtype=model_dtype,
+                    device=self._device,
+                )
+            total_bytes = sum(
+                b.numel() * b.element_size() for b in self._global_buffers.values()
+            )
+            logger.info(
+                "capture: allocated %d persistent global-capture buffer(s) "
+                "(%.1f MiB total) for CUDA-graph-safe capture",
+                len(self._global_buffers),
+                total_bytes / (1 << 20),
+                extra={
+                    "num_buffers": len(self._global_buffers),
+                    "total_bytes": total_bytes,
+                    "max_num_tokens": max_num_tokens,
+                    "hidden_size": hidden_size,
+                    "global_keys": sorted(candidate_keys),
+                },
+            )
+        elif candidate_keys:
+            logger.debug(
+                "capture: %d global capture key(s) present but max_num_tokens "
+                "is unset; using the eager dynamic-gather path (no persistent "
+                "buffers)",
+                len(candidate_keys),
+            )
+        # Keys actually served by the buffer path. Empty unless buffers were
+        # allocated, so :meth:`build_step_plan` routing and ``on_hook`` agree.
+        self._global_keys: frozenset[tuple[int, str]] = frozenset(self._global_buffers)
         # Active plan buffered between ``build_step_plan`` (called by the
         # runner pre-forward) and ``on_hook`` fires from inside the
         # compiled forward graph.  Cleared by ``consume_step_plan`` once
@@ -242,7 +429,43 @@ class CaptureManager:
         # the previous in-line ``cuda.synchronize()`` and per-chunk
         # construction off the model-runner critical path so they can
         # overlap with the next forward step.
-        self._dispatch_queue: queue.Queue[_DispatchPacket | None] = queue.Queue()
+        # Bounded dispatch queue is the single GPU-facing backpressure
+        # point. ``dispatch_queue_size <= 0`` keeps the legacy unbounded
+        # behaviour (no backpressure). ``overload_policy`` decides what
+        # happens when a bounded queue is full: ``block`` stalls the
+        # forward (no loss, bounded memory), ``drop`` discards the step's
+        # captures (counted), ``spill`` parks them on local disk to be
+        # replayed when the queue drains (implemented in the spill path).
+        maxsize = dispatch_queue_size if dispatch_queue_size > 0 else 0
+        self._dispatch_queue: queue.Queue[_DispatchPacket | None] = queue.Queue(
+            maxsize=maxsize
+        )
+        self._overload_policy = overload_policy
+        self._spill_max_bytes = spill_max_bytes
+        self._dropped_packets = 0
+        self._spilled_packets = 0
+        # Spill state (``spill`` policy): overflow packets are serialized to
+        # numbered files in ``_spill_dir`` and replayed by the dispatch
+        # thread, in order, when the in-memory queue drains. ``_spill_pending``
+        # is the FIFO of (path, nbytes) awaiting replay; ``_spill_bytes``
+        # tracks on-disk usage against ``spill_max_bytes``. All under
+        # ``_spill_lock``. Strict ordering invariant: while ``_spill_pending``
+        # is non-empty, new packets route to spill (never the in-memory queue),
+        # so the queue (older) always drains before spill (newer).
+        self._spill_lock = threading.Lock()
+        # Throttle overload-warning spam: log at most once per interval.
+        self._last_overload_log = 0.0
+        self._overload_log_interval = 5.0
+        self._spill_pending: deque[tuple[pathlib.Path, int]] = deque()
+        self._spill_seq = 0
+        self._spill_bytes = 0
+        self._spill_dir: pathlib.Path | None = None
+        if overload_policy == "spill":
+            base = spill_dir or os.path.join(
+                tempfile.gettempdir(), "vllm-capture-spill"
+            )
+            self._spill_dir = pathlib.Path(base) / f"mgr-{id(self):x}"
+            self._spill_dir.mkdir(parents=True, exist_ok=True)
         self._pinned_pool: dict[tuple[int, str], list[torch.Tensor]] = {}
         self._pinned_lock = threading.Lock()
         self._pending_dispatches = 0
@@ -260,6 +483,21 @@ class CaptureManager:
             daemon=True,
         )
         self._dispatch_thread.start()
+        # Finalize runs on its own thread so the model-runner step never
+        # blocks on the per-layer ``submit_finalize`` / ``wait_for_result``
+        # NFS round-trips. The step thread pops the request state and
+        # enqueues a ``_FinalizeJob``; this thread drains the dispatch
+        # queue (so all of the request's chunks have landed), issues the
+        # finalizes, waits for results, and invokes the job callback.
+        # Unbounded queue: finalize jobs are tiny control messages and must
+        # never be dropped (they carry the request's terminal result).
+        self._finalize_queue: queue.Queue[_FinalizeJob | None] = queue.Queue()
+        self._finalize_thread = threading.Thread(
+            target=self._finalize_loop,
+            name="vllm-capture-finalize",
+            daemon=True,
+        )
+        self._finalize_thread.start()
 
     # ------------------------------------------------------------------ props
 
@@ -317,7 +555,9 @@ class CaptureManager:
             # No consumer has a spec for this request — nothing to do.
             return
 
-        # Validate hook layers.
+        # Validate hook layers against the GLOBAL layer space (a client
+        # genuinely out of range, e.g. layer 999 on a 64-layer model, is
+        # rejected regardless of which pipeline stage admits it).
         for consumer_idx, spec in merged.items():
             for hook_name, layers in spec.hooks.items():
                 for layer_idx in layers:
@@ -329,6 +569,17 @@ class CaptureManager:
                             f"[0, {self._num_hidden_layers})"
                         )
                         raise ValueError(msg)
+
+        # Filter each spec to the layers this pipeline stage owns. Under
+        # PP a request's layers are split across stages; each stage's
+        # manager captures and finalizes only its slice, and the engine
+        # merges per-stage results. Consumers left with no in-range layer
+        # are inactive for this request on this rank.
+        start, end = self._local_layer_range
+        merged = _filter_specs_to_layer_range(merged, start, end)
+        if not merged:
+            # None of the requested layers live on this stage.
+            return
 
         position_kind: dict[int, str] = {}
         static_positions: dict[int, list[int] | None] = {}
@@ -487,20 +738,32 @@ class CaptureManager:
         # :meth:`on_hook` is a device-local op.  ``scratch_gpu`` starts
         # empty — :meth:`on_hook` populates it by storing the gathered
         # tensor directly, so there is no point pre-allocating here.
+        # Split the per-key gather rows by capture path.  Global keys are
+        # served from the persistent buffer post-forward
+        # (``global_gather_indices``); client-only keys take the in-hook
+        # dynamic ``index_select`` (``gather_indices``).  A key requested
+        # by *both* a global and a client consumer this step routes to the
+        # global path — the buffer holds the full residual, so any
+        # consumer's rows can be sliced from it, and the per-entry
+        # ``consumer_mask`` still fans the rows out to both.
         gather_indices: dict[tuple[int, str], torch.Tensor] = {}
+        global_gather_indices: dict[tuple[int, str], torch.Tensor] = {}
         scratch_gpu: dict[tuple[int, str], torch.Tensor] = {}
         scratch_dtype: dict[tuple[int, str], torch.dtype] = {}
         for key, rows in gather_rows.items():
-            gather_indices[key] = torch.tensor(
-                rows, dtype=torch.int64, device=self._device
-            )
+            idx = torch.tensor(rows, dtype=torch.int64, device=self._device)
             scratch_dtype[key] = self._model_dtype
+            if key in self._global_keys:
+                global_gather_indices[key] = idx
+            else:
+                gather_indices[key] = idx
 
         plan = StepCapturePlan(
             gather_indices=gather_indices,
             scratch_gpu=scratch_gpu,
             scratch_dtype=scratch_dtype,
             entries=entries,
+            global_gather_indices=global_gather_indices,
             request_errors=request_errors,
         )
         self._step_plan = plan
@@ -527,6 +790,19 @@ class CaptureManager:
         self._step_plan = None
         return plan
 
+    def has_pending_capture(self) -> bool:
+        """True if the current step's plan actually gathers any rows.
+
+        The model runner consults this *before* the cudagraph dispatch
+        decision: :meth:`on_hook` does per-step Python gathering that
+        cannot run inside a replayed CUDA graph, so any step that really
+        captures must execute eagerly. Returns ``False`` when no plan is
+        built or the plan has no gather targets (so non-capturing steps
+        keep full cudagraph speed).
+        """
+        plan = self._step_plan
+        return plan is not None and bool(plan.gather_indices)
+
     def on_hook(
         self,
         layer_idx: int,
@@ -543,10 +819,30 @@ class CaptureManager:
         The tensor passed in is the pristine residual (spec invariant
         1); we must not mutate it.
         """
+        key: tuple[int, str] = (layer_idx, hook_name)
+
+        # Global-spec path: a fixed-shape full-residual copy into a
+        # persistent buffer.  Runs whenever this is a global key —
+        # *independent of any per-step plan* — so it fires during warmup
+        # graph capture (recording the copy into every cudagraph
+        # descriptor) and on eager steps alike.  At replay no Python runs
+        # but the recorded ``copy_`` reproduces against the persistent
+        # buffer address; the host slices the wanted rows out afterwards
+        # in :meth:`_materialize_global_keys`.  The copy is collective-free
+        # (a local D2D), so adding it to only the capturer rank's graph
+        # keeps the divergent per-rank graphs safe.
+        buf = self._global_buffers.get(key)
+        if buf is not None:
+            n = hidden_states.shape[0]
+            buf[:n].copy_(hidden_states)
+
+        # Client-spec path: dynamic per-step gather.  ``index_select``
+        # allocates a fresh, variable-size output each step, so it cannot
+        # be replayed from a CUDA graph — it only runs eager, and the step
+        # gate forces eager whenever a client-spec request captures.
         plan = self._step_plan
         if plan is None:
             return
-        key: tuple[int, str] = (layer_idx, hook_name)
         idx = plan.gather_indices.get(key)
         if idx is None:
             return
@@ -557,6 +853,36 @@ class CaptureManager:
         plan.scratch_gpu[key] = gathered
 
     # ----------------------------------------------------- dispatch
+
+    def _materialize_global_keys(self, plan: StepCapturePlan) -> None:
+        """Slice global-spec rows out of the persistent buffers to scratch.
+
+        Runs after the forward pass (eager, off the CUDA graph).  The
+        graph's recorded ``copy_`` — or the eager ``on_hook`` copy on a
+        forced-eager step — has already filled each global key's
+        persistent buffer with this step's full ``[num_tokens, hidden]``
+        residual.  Here we gather the wanted rows in the same
+        ``scratch_row`` order the plan's ``entries`` assume (the order
+        ``build_step_plan`` appended them), so from this point on the
+        dispatch path handles global keys exactly like client keys.
+
+        The ``index_select`` allocates a fresh output (independent of the
+        buffer), so the next step's forward may overwrite the buffer
+        without racing this step's already-copied-out rows.  It is issued
+        on the current (compute) stream after the forward, so it observes
+        the buffer the forward wrote.
+        """
+        if not plan.global_gather_indices:
+            return
+        for key, idx in plan.global_gather_indices.items():
+            buf = self._global_buffers.get(key)
+            if buf is None:
+                # Defensive: a global gather index with no buffer would
+                # mean a key escaped the construction-time global set.
+                # Skip rather than crash; entries for this key yield no
+                # rows downstream.
+                continue
+            plan.scratch_gpu[key] = buf.index_select(0, idx)
 
     def dispatch_step_captures(self, plan: StepCapturePlan) -> None:
         """Hand a finished step's scratch tensors to the dispatch thread.
@@ -576,6 +902,11 @@ class CaptureManager:
         dispatch loop, so a failure in one sink never blocks delivery
         to the others.
         """
+        # Pull global-spec rows out of the persistent buffers into
+        # ``scratch_gpu`` first, so the rest of this method treats global
+        # and client keys uniformly. No-op when no global key captured.
+        self._materialize_global_keys(plan)
+
         if not plan.entries:
             return
 
@@ -620,9 +951,159 @@ class CaptureManager:
             scratch_pinned=scratch_pinned,
             cuda_event=cuda_event,
         )
+        self._enqueue_packet(packet)
+
+    def _release_packet_buffers(self, packet: _DispatchPacket) -> None:
+        """Return a packet's pinned host buffers to the pool.
+
+        Called when a packet is discarded (``drop`` policy) so dropping a
+        step's captures does not leak pinned memory.
+        """
+        for key, (pinned, _view) in packet.scratch_pinned.items():
+            if pinned is not None:
+                self._release_pinned(key, pinned)
+
+    def _enqueue_packet(self, packet: _DispatchPacket) -> None:
+        """Hand a packet to the dispatch thread under the overload policy.
+
+        ``block`` (or an unbounded queue): ``put`` blocks until there is
+        room, propagating backpressure to the forward pass. ``drop``: try
+        non-blocking, and on a full queue discard the packet (counted) so
+        serving never stalls. ``spill``: park the packet on local disk when
+        the queue is full and replay it when the queue drains; falls back to
+        ``block`` if the spill area is exhausted.
+        """
+        policy = self._overload_policy
+        if policy == "block" or self._dispatch_queue.maxsize == 0:
+            with self._pending_cond:
+                self._pending_dispatches += 1
+            self._dispatch_queue.put(packet)
+            return
+
+        # Non-blocking policies: count the in-flight packet first, then try
+        # to enqueue; undo the count if we end up discarding it.
         with self._pending_cond:
             self._pending_dispatches += 1
-        self._dispatch_queue.put(packet)
+
+        # Ordering invariant for ``spill``: once any packet has spilled,
+        # route every new packet to spill (even if the in-memory queue has
+        # since drained) until spill is fully empty. Otherwise a new packet
+        # could ``put_nowait`` onto the queue and jump ahead of older spilled
+        # packets, which the dispatch loop drains only after the queue.
+        if policy == "spill":
+            with self._spill_lock:
+                spill_active = bool(self._spill_pending)
+            if spill_active:
+                self._spill_packet(packet)
+                return
+
+        try:
+            self._dispatch_queue.put_nowait(packet)
+            return
+        except queue.Full:
+            pass
+
+        if policy == "drop":
+            self._release_packet_buffers(packet)
+            with self._pending_cond:
+                self._pending_dispatches -= 1
+                self._dropped_packets += 1
+                if self._pending_dispatches == 0:
+                    self._pending_cond.notify_all()
+            self._log_overload("drop")
+            return
+
+        # policy == "spill": the queue is full -> spill this packet to disk.
+        self._spill_packet(packet)
+
+    def _spill_packet(self, packet: _DispatchPacket) -> None:
+        """Serialize an overflow packet to the spill area (``spill`` policy).
+
+        ``_pending_dispatches`` is already incremented by the caller, and
+        stays counted until the dispatch loop replays this packet — so
+        ``_drain_dispatch_queue`` (and thus finalize) waits for spilled data
+        to reach consumers, never losing it. If the spill area is at its cap,
+        blocks until the dispatch loop frees room (degrades to ``block``).
+        """
+        data = self._serialize_packet(packet)
+        # Bytes are captured; release the pinned host buffers now.
+        self._release_packet_buffers(packet)
+        n = len(data)
+        while True:
+            with self._spill_lock:
+                if (
+                    self._spill_bytes + n <= self._spill_max_bytes
+                    or not self._spill_pending
+                ):
+                    # Accept when under cap, or when spill is empty (a single
+                    # packet larger than the cap still goes through rather
+                    # than deadlocking).
+                    path = self._spill_dir / f"spill-{self._spill_seq:012d}.pkt"
+                    self._spill_seq += 1
+                    self._spill_bytes += n
+                    self._spill_pending.append((path, n))
+                    self._spilled_packets += 1
+                    break
+            # Spill area full: wait for the dispatch loop to drain some.
+            time.sleep(0.01)
+        path.write_bytes(data)
+        self._log_overload("spill")
+
+    def _log_overload(self, kind: str) -> None:
+        """Throttled warning so the policy is visible on a live server."""
+        now = time.monotonic()
+        if now - self._last_overload_log < self._overload_log_interval:
+            return
+        self._last_overload_log = now
+        logger.warning(
+            "capture overload: dispatch queue full, policy=%s "
+            "(dropped=%d, spilled=%d, spill_backlog=%.1f MiB)",
+            kind,
+            self._dropped_packets,
+            self._spilled_packets,
+            self._spill_bytes / (1 << 20),
+        )
+
+    def _serialize_packet(self, packet: _DispatchPacket) -> bytes:
+        """Serialize a packet's entries + CPU scratch tensors to bytes."""
+        scratch = {key: view for key, (_owner, view) in packet.scratch_pinned.items()}
+        buf = io.BytesIO()
+        torch.save({"entries": packet.entries, "scratch": scratch}, buf)
+        return buf.getvalue()
+
+    def _deserialize_packet(self, data: bytes) -> _DispatchPacket:
+        """Rebuild a packet from spill bytes (CPU scratch, no pinned owner)."""
+        obj = torch.load(io.BytesIO(data), weights_only=False)
+        scratch_pinned = {key: (None, view) for key, view in obj["scratch"].items()}
+        return _DispatchPacket(
+            entries=obj["entries"],
+            scratch_pinned=scratch_pinned,
+            cuda_event=None,
+        )
+
+    def _next_spilled_packet(self) -> _DispatchPacket | None:
+        """Pop and reload the oldest spilled packet, or ``None`` if empty."""
+        with self._spill_lock:
+            if not self._spill_pending:
+                return None
+            path, n = self._spill_pending.popleft()
+            self._spill_bytes -= n
+        try:
+            data = path.read_bytes()
+        finally:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        return self._deserialize_packet(data)
+
+    @property
+    def dropped_packets(self) -> int:
+        """Number of capture steps discarded under the ``drop`` policy."""
+        return self._dropped_packets
+
+    @property
+    def spilled_packets(self) -> int:
+        """Number of capture steps spilled to disk under the ``spill`` policy."""
+        return self._spilled_packets
 
     # --------------------------------------------------- pinned-pool helpers
 
@@ -685,24 +1166,46 @@ class CaptureManager:
            :meth:`_drain_dispatch_queue`.
         """
         while True:
-            packet = self._dispatch_queue.get()
-            if packet is None:
-                return
             try:
-                if packet.cuda_event is not None:
-                    packet.cuda_event.synchronize()
-                self._fan_out_to_consumers(packet)
-                self._write_through_to_store(packet)
-            except Exception:
-                logger.exception("capture dispatch loop error")
-            finally:
-                for key, (pinned, _view) in packet.scratch_pinned.items():
-                    if pinned is not None:
-                        self._release_pinned(key, pinned)
-                with self._pending_cond:
-                    self._pending_dispatches -= 1
-                    if self._pending_dispatches == 0:
-                        self._pending_cond.notify_all()
+                # Short timeout so that, when the in-memory queue drains while
+                # spilled packets are still pending, we pick them up promptly
+                # (the producer can't wake a blocked get() — the queue is full
+                # precisely when it spills).
+                packet = self._dispatch_queue.get(timeout=0.1)
+            except queue.Empty:
+                spilled = self._next_spilled_packet()
+                if spilled is not None:
+                    self._process_packet(spilled)
+                continue
+            if packet is None:
+                # Shutdown sentinel: drain any remaining spill first so no
+                # spilled captures are lost on shutdown.
+                while True:
+                    s = self._next_spilled_packet()
+                    if s is None:
+                        break
+                    self._process_packet(s)
+                return
+            # Live queue items are always older than spilled items (the
+            # ordering invariant routes new packets to spill while spill is
+            # active), so process the queue before touching spill.
+            self._process_packet(packet)
+
+    def _process_packet(self, packet: _DispatchPacket) -> None:
+        """Sync the packet's H2D copies, fan out to sinks, recycle buffers."""
+        try:
+            if packet.cuda_event is not None:
+                packet.cuda_event.synchronize()
+            self._fan_out_to_consumers(packet)
+            self._write_through_to_store(packet)
+        except Exception:
+            logger.exception("capture dispatch loop error")
+        finally:
+            self._release_packet_buffers(packet)
+            with self._pending_cond:
+                self._pending_dispatches -= 1
+                if self._pending_dispatches == 0:
+                    self._pending_cond.notify_all()
 
     def serve_from_store(
         self, req_id: str, payload: dict[tuple[int, str, int], torch.Tensor]
@@ -832,6 +1335,13 @@ class CaptureManager:
                 continue
 
             try:
+                # Build every chunk for this consumer's slice of the step,
+                # then hand them over in one batch call. Batching lets sinks
+                # amortize per-chunk overhead (locking, write-task creation,
+                # payload concatenation) across the whole step instead of
+                # paying it per (layer, hook) — the dominant cost when a
+                # request captures many layers per step.
+                chunks: list[CaptureChunk] = []
                 for (req_id, layer, hook), chunk_entries in grouped.items():
                     scratch_key = (layer, hook)
                     if scratch_key not in packet.scratch_pinned:
@@ -848,18 +1358,27 @@ class CaptureManager:
                         layer,
                         hook,
                     )
-                    chunk = CaptureChunk(
-                        key=capture_key,
-                        tensor=chunk_tensor,
-                        dtype=chunk_tensor.dtype,
-                        row_offset=0,
-                        step_index=step_index,
-                        metadata={
-                            "consumer_index": consumer_idx,
-                            "positions": [e.logical_pos for e in chunk_entries],
-                        },
+                    chunks.append(
+                        CaptureChunk(
+                            key=capture_key,
+                            tensor=chunk_tensor,
+                            dtype=chunk_tensor.dtype,
+                            row_offset=0,
+                            step_index=step_index,
+                            metadata={
+                                "consumer_index": consumer_idx,
+                                "positions": [e.logical_pos for e in chunk_entries],
+                            },
+                        )
                     )
-                    sink.submit_chunk(chunk)
+
+                if chunks:
+                    batch_submit = getattr(sink, "submit_chunk_batch", None)
+                    if batch_submit is not None:
+                        batch_submit(chunks)
+                    else:
+                        for chunk in chunks:
+                            sink.submit_chunk(chunk)
             except Exception:
                 logger.exception(
                     "Consumer %d raised during dispatch; "
@@ -898,32 +1417,111 @@ class CaptureManager:
         """
         if not self._dispatch_thread.is_alive():
             return
+        # Stop the finalize thread first: pending finalize jobs drain the
+        # dispatch queue, so the dispatch thread must still be alive while
+        # they run. The sentinel is processed only after all queued jobs.
+        if self._finalize_thread.is_alive():
+            self._finalize_queue.put(None)
+            self._finalize_thread.join(timeout=timeout)
         self._drain_dispatch_queue()
         self._dispatch_queue.put(None)
         self._dispatch_thread.join(timeout=timeout)
+        if self._dropped_packets or self._spilled_packets:
+            logger.info(
+                "capture overload summary: %d dropped, %d spilled (policy=%s)",
+                self._dropped_packets,
+                self._spilled_packets,
+                self._overload_policy,
+            )
+        # Best-effort cleanup of the spill scratch directory.
+        if self._spill_dir is not None:
+            import shutil
+
+            with contextlib.suppress(OSError):
+                shutil.rmtree(self._spill_dir, ignore_errors=True)
 
     # ----------------------------------------------------- finalization
 
     def finalize_request(self, req_id: str) -> dict[int, CaptureResult]:
-        """Finalize capture for a request across all consumers.
+        """Synchronously finalize capture for a request across consumers.
 
-        For each consumer that had a spec for this request, call
-        ``submit_finalize`` on the sink and aggregate the terminal
-        per-key results.
-
-        Returns a dict mapping consumer index to ``CaptureResult``.
-
-        Drains any in-flight dispatches first, so all per-step chunks
-        for this request have already been submitted by the time we
-        send the finalize and start waiting on results.
+        Drains in-flight dispatches, pops the request, then issues
+        ``submit_finalize`` and waits for every key's terminal result on
+        the calling thread.  Retained for tests and any caller that wants
+        the result inline; the model runner uses
+        :meth:`finalize_request_async` to keep finalize off the step
+        thread.  Returns a dict mapping consumer index to ``CaptureResult``
+        (empty if the request was never registered).
         """
         self._drain_dispatch_queue()
-
         state = self._requests.pop(req_id, None)
-        results: dict[int, CaptureResult] = {}
-
         if state is None:
-            return results
+            return {}
+        return self._run_finalize(req_id, state)
+
+    def finalize_request_async(
+        self,
+        req_id: str,
+        on_complete: Callable[[dict[int, CaptureResult]], None],
+    ) -> bool:
+        """Finalize *req_id* off the model-runner step thread.
+
+        Pops the request's capture state on the **caller's** thread (so
+        ``_requests`` stays single-threaded) and hands the blocking
+        finalize work — draining the dispatch queue, ``submit_finalize``,
+        and the per-key ``wait_for_result`` NFS round-trips — to the
+        dedicated finalize thread.  ``on_complete`` is invoked there with
+        the aggregated ``{consumer_index: CaptureResult}`` once finalize
+        finishes.  Returns ``False`` if the request was never registered
+        (caller should skip), ``True`` once the job is enqueued.
+
+        Best-effort by design: the caller is free to proceed (and the
+        request's text output to be emitted) before ``on_complete`` runs,
+        so the result may attach to a later step's output or not reach the
+        client at all.  The captured activations on disk are unaffected.
+        """
+        state = self._requests.pop(req_id, None)
+        if state is None:
+            return False
+        self._finalize_queue.put(
+            _FinalizeJob(req_id=req_id, state=state, on_complete=on_complete)
+        )
+        return True
+
+    def _finalize_loop(self) -> None:
+        """Background thread draining ``_finalize_queue``.
+
+        Each job: drain the dispatch queue so all of the request's chunks
+        have been submitted to the sinks, run the (blocking) finalize, then
+        invoke the job callback.  ``None`` is the shutdown sentinel.
+        """
+        while True:
+            job = self._finalize_queue.get()
+            if job is None:
+                return
+            try:
+                self._drain_dispatch_queue()
+                results = self._run_finalize(job.req_id, job.state)
+            except Exception:
+                logger.exception("capture finalize failed for req=%s", job.req_id)
+                results = {}
+            try:
+                job.on_complete(results)
+            except Exception:
+                logger.exception(
+                    "capture finalize callback failed for req=%s", job.req_id
+                )
+
+    def _run_finalize(
+        self, req_id: str, state: _RequestCaptureState
+    ) -> dict[int, CaptureResult]:
+        """Issue ``submit_finalize`` + ``wait_for_result`` for every key.
+
+        Pure work over an already-popped *state* — no dispatch-queue drain
+        and no ``_requests`` access — so it runs identically on the calling
+        thread (sync path) or the finalize thread (async path).
+        """
+        results: dict[int, CaptureResult] = {}
 
         for consumer_idx, spec in state.consumer_specs.items():
             sink = self._consumers[consumer_idx]
@@ -1039,7 +1637,52 @@ def _aggregate_capture_results(results: list[CaptureResult]) -> CaptureResult:
     )
 
 
+def merge_capture_results(
+    outputs: Sequence[Any | None],
+    output_rank: int,
+) -> None:
+    """Union every rank's ``capture_results`` into ``outputs[output_rank]``.
+
+    Mutates ``outputs[output_rank].capture_results`` in place. Under
+    pipeline parallelism a request's captured layers are split across
+    stages, so each stage's TP-rank-0 worker produces capture results for
+    the layers it owns. Only ``outputs[output_rank]`` (TP rank 0 of the
+    last stage) is returned to the engine, so the other ranks' results are
+    folded in here: grouped by ``(request_id, consumer_name)`` and reduced
+    with the same worst-of-status precedence ``finalize`` uses within a
+    rank. ``outputs`` is duck-typed on ``.capture_results`` to avoid a
+    hard import of ``ModelRunnerOutput`` into this module.
+
+    A request whose layers all live on one rank contributes exactly one
+    result for that ``(request, consumer)`` and passes through unchanged.
+    """
+    target = outputs[output_rank] if 0 <= output_rank < len(outputs) else None
+    if target is None:
+        return
+
+    # request_id -> consumer_name -> list[CaptureResult]
+    collected: dict[str, dict[str, list[CaptureResult]]] = {}
+    for out in outputs:
+        if out is None:
+            continue
+        for req_id, per_consumer in out.capture_results.items():
+            req_bucket = collected.setdefault(req_id, {})
+            for name, result in per_consumer.items():
+                req_bucket.setdefault(name, []).append(result)
+
+    merged: dict[str, dict[str, CaptureResult]] = {}
+    for req_id, per_consumer in collected.items():
+        merged[req_id] = {
+            name: (
+                results[0] if len(results) == 1 else _aggregate_capture_results(results)
+            )
+            for name, results in per_consumer.items()
+        }
+    target.capture_results = merged
+
+
 __all__ = [
     "CaptureManager",
     "_aggregate_capture_results",
+    "merge_capture_results",
 ]

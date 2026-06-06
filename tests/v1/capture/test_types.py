@@ -140,3 +140,25 @@ def test_capture_context_round_trip():
     assert ctx.element_size_bytes == 2
     assert ctx.tensor_parallel_size == 1
     assert ctx.pipeline_parallel_size == 1
+    # EP/DP sizes default to 1 (single-rank) when omitted.
+    assert ctx.expert_parallel_size == 1
+    assert ctx.data_parallel_size == 1
+
+
+def test_capture_context_parallel_sizes():
+    ctx = CaptureContext(
+        vllm_internal_request_id=VllmInternalRequestId("req-2"),
+        num_prompt_tokens=8,
+        num_computed_tokens=0,
+        num_hidden_layers=64,
+        hidden_size=4096,
+        element_size_bytes=2,
+        tensor_parallel_size=4,
+        pipeline_parallel_size=2,
+        expert_parallel_size=8,
+        data_parallel_size=2,
+    )
+    assert ctx.tensor_parallel_size == 4
+    assert ctx.pipeline_parallel_size == 2
+    assert ctx.expert_parallel_size == 8
+    assert ctx.data_parallel_size == 2

@@ -80,6 +80,7 @@ from vllm.v1.capture import (
     CaptureConsumer,
     CaptureContext,
     CaptureValidationError,
+    capture_expert_parallel_size,
     captured_prompt_positions,
     min_captured_prompt_position,
 )
@@ -543,6 +544,8 @@ class OpenAIServingChat(OpenAIServing):
             element_size_bytes=int(element_size_bytes),
             tensor_parallel_size=parallel_config.tensor_parallel_size,
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+            expert_parallel_size=capture_expert_parallel_size(parallel_config),
+            data_parallel_size=parallel_config.data_parallel_size,
         )
 
         validated: dict[str, Any] = {}

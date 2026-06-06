@@ -382,3 +382,79 @@ def test_build_consumers_returns_sinks_validators_and_name_index(
             if hasattr(sink, "shutdown"):
                 sink.shutdown()
         _reset_cache_for_testing()
+
+
+# ---------------------------------------------------------------------------
+# 5. Pipeline-parallel cooperative capture across two stages.
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_parallel_two_stage_shared_fs(tmp_path: pathlib.Path) -> None:
+    """Two pipeline stages cooperatively capture one request to a shared root.
+
+    Each stage stands in for the TP-rank-0 capturer of a pipeline stage:
+    its ``CaptureManager`` is built with the *global* layer count and the
+    stage's *local* ``[start, end)`` slice, and both write to the same
+    root (the shared mount). A client spec spanning both stages
+    (``post_mlp`` at layers 1 and 3 of a 4-layer model) must land exactly
+    one file per layer under its global-layer path, with each stage
+    writing only the layers it owns — the Option-A merge the engine then
+    unions at the result level.
+    """
+    GLOBAL = 4
+    req_id = "req-pp"
+    client_spec = CaptureSpec(hooks={"post_mlp": [1, 3]}, positions="last_prompt")
+
+    def _drive_stage(local_range: tuple[int, int], owned_layer: int) -> None:
+        consumer = FilesystemConsumer(
+            vllm_config=_FakeVllmConfig(),
+            params={"root": str(tmp_path), "writer_threads": 1},
+        )
+        mgr = CaptureManager(
+            consumers=(consumer,),
+            consumer_specs=(None,),
+            num_hidden_layers=GLOBAL,
+            hidden_size=8,
+            model_dtype=torch.float32,
+            device="cpu",
+            local_layer_range=local_range,
+        )
+        mgr.register_request(
+            req_id,
+            client_specs={0: client_spec},
+            num_prompt_tokens=3,
+            sidecar_fields={
+                "tag_slug": "default",
+                "request_id_slug": req_id,
+                "vllm_internal_request_id": req_id,
+            },
+        )
+        batch_view = CaptureBatchView(
+            req_ids=[req_id],
+            num_prompt_tokens=[3],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[3],
+            token_offsets=[0],
+        )
+        plan = mgr.build_step_plan(batch_view)
+        # Only this stage's owned layer is planned.
+        assert set(plan.gather_indices) == {(owned_layer, "post_mlp")}
+
+        hidden = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+        # Firing the other stage's layer is a no-op on this manager.
+        mgr.on_hook(owned_layer, "post_mlp", hidden)
+        mgr.dispatch_step_captures(plan)
+        results = mgr.finalize_request(req_id)
+        assert list(results.keys()) == [0]
+        _wait_for_status(consumer, (req_id, owned_layer, "post_mlp"))
+        consumer.shutdown()
+
+    # Stage 0 owns global layers [0, 2) → captures layer 1.
+    _drive_stage((0, 2), owned_layer=1)
+    # Stage 1 owns global layers [2, 4) → captures layer 3.
+    _drive_stage((2, 4), owned_layer=3)
+
+    req_dir = tmp_path / "default" / req_id
+    written = sorted(p.name for p in req_dir.glob("*.bin"))
+    # Exactly one file per requested layer, keyed by the GLOBAL layer index.
+    assert written == ["1_post_mlp.bin", "3_post_mlp.bin"]

@@ -312,7 +312,7 @@ class MultiprocExecutor(Executor):
             unique_reply_rank=self.output_rank,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
-            kv_output_aggregator=self.kv_output_aggregator,
+            kv_output_aggregator=self._output_aggregator(),
         )
 
     def sample_tokens(  # type: ignore[override]
@@ -324,7 +324,7 @@ class MultiprocExecutor(Executor):
             unique_reply_rank=self.output_rank,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
-            kv_output_aggregator=self.kv_output_aggregator,
+            kv_output_aggregator=self._output_aggregator(),
         )
 
     def execute_dummy_batch(self) -> None:

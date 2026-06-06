@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,6 +14,7 @@ import torch
 from vllm.v1.capture.manager import (
     CaptureManager,
     _aggregate_capture_results,
+    merge_capture_results,
 )
 from vllm.v1.capture.plan import CaptureBatchView, StepCapturePlan
 from vllm.v1.capture.types import (
@@ -35,6 +38,11 @@ def _make_sink(name: str = "sink") -> MagicMock:
     sink = MagicMock()
     sink.location = "worker"
     sink.submit_chunk = MagicMock()
+    # ``submit_chunk_batch`` is an optional sink method; the manager calls it
+    # when present and otherwise falls back to per-chunk ``submit_chunk``.
+    # A bare MagicMock would auto-expose it and divert the manager off the
+    # fallback path these tests assert on, so model a submit_chunk-only sink.
+    sink.submit_chunk_batch = None
     sink.submit_finalize = MagicMock()
     sink.get_result = MagicMock(return_value=None)
     sink.wait_for_result = MagicMock(return_value=None)
@@ -165,6 +173,174 @@ class TestSingleConsumerGlobalSpec:
         plan = mgr.build_step_plan(view)
         assert len(plan.entries) == 0
         assert len(plan.gather_indices) == 0
+
+
+# ---------------------------------------------------------------------------
+# Global spec via the CUDA-graph-safe persistent-buffer path
+# ---------------------------------------------------------------------------
+
+
+def _make_buffer_manager(
+    sinks: tuple[MagicMock, ...] | None = None,
+    specs: tuple[CaptureSpec | None, ...] | None = None,
+    max_num_tokens: int = 16,
+) -> tuple[CaptureManager, tuple[MagicMock, ...]]:
+    """A manager with ``max_num_tokens`` set, enabling the buffer path."""
+    if sinks is None:
+        sinks = (_make_sink(),)
+    if specs is None:
+        specs = (
+            CaptureSpec(hooks={"post_mlp": [0, 1]}, positions="last_prompt"),
+        ) * len(sinks)
+    mgr = CaptureManager(
+        consumers=sinks,
+        consumer_specs=specs,
+        num_hidden_layers=NUM_LAYERS,
+        hidden_size=HIDDEN_SIZE,
+        model_dtype=MODEL_DTYPE,
+        max_num_tokens=max_num_tokens,
+    )
+    return mgr, sinks
+
+
+class TestGlobalSpecBufferPath:
+    def test_buffers_allocated_for_global_keys(self):
+        mgr, _ = _make_buffer_manager(max_num_tokens=16)
+        assert mgr._global_keys == frozenset({(0, "post_mlp"), (1, "post_mlp")})
+        for key in mgr._global_keys:
+            buf = mgr._global_buffers[key]
+            assert buf.shape == (16, HIDDEN_SIZE)
+            assert buf.dtype == MODEL_DTYPE
+
+    def test_no_buffers_without_max_num_tokens(self):
+        """Falls back to the dynamic path (eager-only) when unsized."""
+        mgr, _ = _make_manager()  # max_num_tokens defaults to 0
+        assert mgr._global_keys == frozenset()
+        assert mgr._global_buffers == {}
+
+    def test_no_buffers_when_no_global_spec(self):
+        mgr, _ = _make_buffer_manager(specs=(None,), max_num_tokens=16)
+        assert mgr._global_keys == frozenset()
+        assert mgr._global_buffers == {}
+
+    def test_build_step_plan_routes_global_keys_to_global_gather(self):
+        mgr, _ = _make_buffer_manager(max_num_tokens=16)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        plan = mgr.build_step_plan(view)
+        # Global keys take the buffer path, not the dynamic in-hook gather.
+        assert plan.gather_indices == {}
+        assert (0, "post_mlp") in plan.global_gather_indices
+        assert (1, "post_mlp") in plan.global_gather_indices
+        # last_prompt of a 10-token prompt is absolute row 9.
+        assert plan.global_gather_indices[(0, "post_mlp")].tolist() == [9]
+        assert len(plan.entries) == 2
+
+    def test_on_hook_copies_full_residual_into_buffer(self):
+        mgr, _ = _make_buffer_manager(max_num_tokens=16)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        mgr.build_step_plan(view)
+        # Distinct per-row values so we can verify the exact copy.
+        hidden = torch.arange(10 * HIDDEN_SIZE, dtype=MODEL_DTYPE).reshape(
+            10, HIDDEN_SIZE
+        )
+        mgr.on_hook(0, "post_mlp", hidden)
+        buf = mgr._global_buffers[(0, "post_mlp")]
+        # The full residual is copied (fixed-shape, graph-safe), not gathered.
+        torch.testing.assert_close(buf[:10], hidden)
+        # on_hook must not populate scratch for global keys (host does that
+        # post-forward in _materialize_global_keys).
+        assert (0, "post_mlp") not in mgr._step_plan.scratch_gpu
+
+    def test_materialize_dispatch_finalize_via_buffer(self):
+        mgr, (sink,) = _make_buffer_manager(max_num_tokens=16)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        plan = mgr.build_step_plan(view)
+
+        # Simulate the forward: on_hook copies the full residual into each
+        # global key's persistent buffer (the recorded copy at replay).
+        hidden = torch.arange(10 * HIDDEN_SIZE, dtype=MODEL_DTYPE).reshape(
+            10, HIDDEN_SIZE
+        )
+        mgr.on_hook(0, "post_mlp", hidden)
+        mgr.on_hook(1, "post_mlp", hidden + 1000.0)
+
+        mgr.dispatch_step_captures(plan)
+        mgr._drain_dispatch_queue()
+
+        assert sink.submit_chunk.call_count == 2
+        # The dispatched row must be the last-prompt position (row 9) sliced
+        # out of the buffer by _materialize_global_keys.
+        chunks = [c.args[0] for c in sink.submit_chunk.call_args_list]
+        by_layer = {c.key[1]: c for c in chunks}
+        torch.testing.assert_close(by_layer[0].tensor[0], hidden[9])
+        torch.testing.assert_close(by_layer[1].tensor[0], (hidden + 1000.0)[9])
+
+        results = mgr.finalize_request("r1")
+        assert 0 in results
+        assert sink.submit_finalize.call_count == 2
+
+    def test_global_and_client_keys_coexist(self):
+        """A global-spec consumer and a client-spec consumer in one step.
+
+        The global consumer's key rides the buffer path; the client
+        consumer's distinct key rides the dynamic in-hook gather.
+        """
+        global_sink = _make_sink("global")
+        client_sink = _make_sink("client")
+        mgr, _ = _make_buffer_manager(
+            sinks=(global_sink, client_sink),
+            specs=(
+                CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt"),
+                None,  # consumer 1 has no global spec — client-driven
+            ),
+            max_num_tokens=16,
+        )
+        client_spec = CaptureSpec(hooks={"pre_attn": [2]}, positions="last_prompt")
+        mgr.register_request("r1", client_specs={1: client_spec}, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        plan = mgr.build_step_plan(view)
+        # Global key on the buffer path; client key on the dynamic path.
+        assert (0, "post_mlp") in plan.global_gather_indices
+        assert (2, "pre_attn") in plan.gather_indices
+        assert (0, "post_mlp") not in plan.gather_indices
+
+        hidden = torch.arange(10 * HIDDEN_SIZE, dtype=MODEL_DTYPE).reshape(
+            10, HIDDEN_SIZE
+        )
+        # Global key: full-residual copy. Client key: dynamic gather (eager).
+        mgr.on_hook(0, "post_mlp", hidden)
+        mgr.on_hook(2, "pre_attn", hidden + 1000.0)
+        # The client key's scratch was populated by the dynamic gather.
+        assert (2, "pre_attn") in plan.scratch_gpu
+
+        mgr.dispatch_step_captures(plan)
+        mgr._drain_dispatch_queue()
+
+        assert global_sink.submit_chunk.call_count == 1
+        assert client_sink.submit_chunk.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -875,3 +1051,246 @@ class TestEdgeCases:
                 },
                 num_prompt_tokens=10,
             )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-parallel local layer-range filtering
+# ---------------------------------------------------------------------------
+
+GLOBAL_LAYERS = 8
+
+
+def _make_pp_manager(
+    local_layer_range,
+    spec: CaptureSpec,
+) -> tuple[CaptureManager, MagicMock]:
+    """A manager over an 8-layer model owning ``local_layer_range``."""
+    sink = _make_sink()
+    mgr = CaptureManager(
+        consumers=(sink,),
+        consumer_specs=(spec,),
+        num_hidden_layers=GLOBAL_LAYERS,
+        hidden_size=HIDDEN_SIZE,
+        model_dtype=MODEL_DTYPE,
+        local_layer_range=local_layer_range,
+    )
+    return mgr, sink
+
+
+def _captured_layers(mgr: CaptureManager) -> set[int]:
+    """Register 'r1' then build a plan; return the global layers planned."""
+    mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+    if not mgr.has_request("r1"):
+        return set()
+    view = _batch_view(
+        req_ids=["r1"],
+        num_prompt_tokens=[10],
+        num_computed_tokens=[0],
+        num_scheduled_tokens=[10],
+    )
+    plan = mgr.build_step_plan(view)
+    return {layer for (layer, _hook) in plan.gather_indices}
+
+
+class TestLocalLayerRangeFiltering:
+    def test_first_stage_keeps_only_its_layers(self):
+        spec = CaptureSpec(hooks={"post_mlp": [2, 6]}, positions="last_prompt")
+        mgr, sink = _make_pp_manager((0, 4), spec)
+        assert _captured_layers(mgr) == {2}
+        # Finalize touches only the in-range layer (layer 2), not layer 6.
+        mgr.finalize_request("r1")
+        finalized_layers = {
+            call.args[0].key[1] for call in sink.submit_finalize.call_args_list
+        }
+        assert finalized_layers == {2}
+
+    def test_second_stage_keeps_only_its_layers(self):
+        spec = CaptureSpec(hooks={"post_mlp": [2, 6]}, positions="last_prompt")
+        mgr, _ = _make_pp_manager((4, 8), spec)
+        assert _captured_layers(mgr) == {6}
+
+    def test_none_range_keeps_all_layers(self):
+        spec = CaptureSpec(hooks={"post_mlp": [2, 6]}, positions="last_prompt")
+        mgr, _ = _make_pp_manager(None, spec)
+        assert _captured_layers(mgr) == {2, 6}
+
+    def test_all_layers_out_of_local_range_inactive(self):
+        spec = CaptureSpec(hooks={"post_mlp": [6, 7]}, positions="last_prompt")
+        mgr, _ = _make_pp_manager((0, 4), spec)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        # No requested layer lives on this stage → request not registered.
+        assert not mgr.has_request("r1")
+        assert mgr.finalize_request("r1") == {}
+
+    def test_out_of_global_range_still_raises_per_stage(self):
+        # A genuinely out-of-range layer is rejected even though it is also
+        # outside this stage's local slice.
+        spec = CaptureSpec(hooks={"post_mlp": [100]}, positions="last_prompt")
+        mgr, _ = _make_pp_manager((0, 4), spec)
+        with pytest.raises(ValueError, match="out of range"):
+            mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+
+    def test_partial_hook_layers_filtered(self):
+        # Multiple hooks, each split across the stage boundary.
+        spec = CaptureSpec(
+            hooks={"post_mlp": [1, 5], "post_attn": [3, 7]},
+            positions="last_prompt",
+        )
+        mgr, _ = _make_pp_manager((0, 4), spec)
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        view = _batch_view(
+            req_ids=["r1"],
+            num_prompt_tokens=[10],
+            num_computed_tokens=[0],
+            num_scheduled_tokens=[10],
+        )
+        plan = mgr.build_step_plan(view)
+        assert set(plan.gather_indices) == {(1, "post_mlp"), (3, "post_attn")}
+
+    @pytest.mark.parametrize("bad_range", [(-1, 4), (4, 2), (0, 9)])
+    def test_invalid_local_range_rejected(self, bad_range):
+        spec = CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        with pytest.raises(ValueError, match="local_layer_range"):
+            _make_pp_manager(bad_range, spec)
+
+
+# ---------------------------------------------------------------------------
+# Cross-rank capture_results merge (executor aggregation path)
+# ---------------------------------------------------------------------------
+
+
+def _result(req: str, layer: int, status: str = "ok", payload=None) -> CaptureResult:
+    return CaptureResult(
+        key=(VllmInternalRequestId(req), layer, "post_mlp"),
+        status=status,
+        payload=payload,
+    )
+
+
+def _fake_output(capture_results):
+    # Duck-typed stand-in for ModelRunnerOutput (only .capture_results used).
+    return SimpleNamespace(capture_results=capture_results)
+
+
+class TestMergeCaptureResults:
+    def test_disjoint_requests_unioned_into_output_rank(self):
+        # rank 0 (stage 0) captured req-a; rank 1 (output_rank) captured req-b.
+        stage0 = _fake_output({"req-a": {"filesystem": _result("req-a", 1)}})
+        stage1 = _fake_output({"req-b": {"filesystem": _result("req-b", 3)}})
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        assert set(outputs[1].capture_results) == {"req-a", "req-b"}
+        assert "filesystem" in outputs[1].capture_results["req-a"]
+        assert "filesystem" in outputs[1].capture_results["req-b"]
+
+    def test_same_request_across_stages_aggregated(self):
+        # Both stages captured different layers of the same request.
+        stage0 = _fake_output(
+            {"req": {"filesystem": _result("req", 1, payload=["a.bin"])}}
+        )
+        stage1 = _fake_output(
+            {"req": {"filesystem": _result("req", 5, payload=["b.bin"])}}
+        )
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        merged = outputs[1].capture_results["req"]["filesystem"]
+        # Aggregated payload keeps both stages' keys.
+        assert merged.status == "ok"
+        assert isinstance(merged.payload, dict)
+        assert len(merged.payload) == 2
+
+    def test_worst_status_wins(self):
+        stage0 = _fake_output({"req": {"fs": _result("req", 1, status="error")}})
+        stage1 = _fake_output({"req": {"fs": _result("req", 5, status="ok")}})
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        assert outputs[1].capture_results["req"]["fs"].status == "error"
+
+    def test_single_rank_result_passes_through_unchanged(self):
+        only = _result("req", 2)
+        stage0 = _fake_output({})  # non-capturing stage
+        stage1 = _fake_output({"req": {"fs": only}})
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        # Exactly one contributor → same object, not re-wrapped.
+        assert outputs[1].capture_results["req"]["fs"] is only
+
+    def test_none_outputs_skipped(self):
+        stage0 = None
+        stage1 = _fake_output({"req": {"fs": _result("req", 1)}})
+        outputs = [stage0, stage1]
+        merge_capture_results(outputs, output_rank=1)
+        assert set(outputs[1].capture_results) == {"req"}
+
+    def test_none_target_is_noop(self):
+        outputs = [_fake_output({"req": {"fs": _result("req", 1)}}), None]
+        # output_rank points at the None entry → no crash, no-op.
+        merge_capture_results(outputs, output_rank=1)
+        assert outputs[1] is None
+
+
+# ---------------------------------------------------------------------------
+# Non-blocking finalize_request_async
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeAsync:
+    def test_callback_receives_aggregated_results(self):
+        sink = _make_sink("sink0")
+        spec = CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        key = (VllmInternalRequestId("r1"), 0, "post_mlp")
+        sink.wait_for_result.return_value = CaptureResult(
+            key=key, status="ok", payload={"path": "/tmp/x"}
+        )
+        mgr, _ = _make_manager(sinks=(sink,), specs=(spec,))
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+
+        done = threading.Event()
+        captured: dict[int, CaptureResult] = {}
+
+        def _on_complete(results):
+            captured.update(results)
+            done.set()
+
+        assert mgr.finalize_request_async("r1", _on_complete) is True
+        assert done.wait(timeout=5.0)
+        assert captured[0].status == "ok"
+        assert captured[0].payload == {"path": "/tmp/x"}
+        # State is popped on the caller thread at enqueue time.
+        assert not mgr.has_request("r1")
+
+    def test_unknown_request_returns_false_and_no_callback(self):
+        mgr, _ = _make_manager()
+        called = threading.Event()
+        assert mgr.finalize_request_async("nope", lambda r: called.set()) is False
+        # Give any (erroneous) callback a chance to fire.
+        assert not called.wait(timeout=0.2)
+
+    def test_does_not_block_the_caller(self):
+        # The caller (model-runner step thread) must return before the
+        # blocking wait_for_result completes.
+        sink = _make_sink("sink0")
+        spec = CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        key = (VllmInternalRequestId("r1"), 0, "post_mlp")
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _blocking_wait(_key, timeout=None):
+            entered.set()
+            release.wait(timeout=5.0)
+            return CaptureResult(key=key, status="ok")
+
+        sink.wait_for_result.side_effect = _blocking_wait
+        mgr, _ = _make_manager(sinks=(sink,), specs=(spec,))
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+
+        done = threading.Event()
+        assert mgr.finalize_request_async("r1", lambda r: done.set()) is True
+        # The finalize thread is now blocked inside wait_for_result, but the
+        # caller already returned and the callback has NOT fired.
+        assert entered.wait(timeout=5.0)
+        assert not done.is_set()
+        # Releasing the sink lets finalize complete and the callback fire.
+        release.set()
+        assert done.wait(timeout=5.0)

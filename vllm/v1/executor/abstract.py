@@ -34,6 +34,41 @@ _R = TypeVar("_R")
 FailureCallback = Callable[[], None]
 
 
+class _CaptureAwareAggregator(KVOutputAggregator):
+    """KV aggregator wrapper that also merges activation-capture results.
+
+    The executor's all-outputs reply path calls ``aggregate(outputs,
+    output_rank)`` on whatever object sits in the ``kv_output_aggregator``
+    slot. When activation capture is on, every pipeline stage's TP-rank-0
+    worker emits ``capture_results`` for the layers it owns, but only
+    ``output_rank`` returns its ``ModelRunnerOutput``. This wrapper
+    delegates KV aggregation to the wrapped aggregator (if any) and then
+    unions the per-stage ``capture_results`` into ``output_rank``'s output,
+    so capture composes with KV transfer. Shared by every executor backend
+    (multiproc, Ray) so multi-node setups merge results identically.
+    """
+
+    def __init__(self, kv_aggregator: KVOutputAggregator | None) -> None:
+        # Intentionally does not call ``super().__init__``: this wrapper
+        # holds no KV finished-count state of its own; it forwards to the
+        # wrapped aggregator for that.
+        self._kv_aggregator = kv_aggregator
+
+    def aggregate(
+        self, outputs: list[ModelRunnerOutput | None], output_rank: int = 0
+    ) -> ModelRunnerOutput | None:
+        from vllm.v1.capture.manager import merge_capture_results
+
+        if self._kv_aggregator is not None:
+            result = self._kv_aggregator.aggregate(outputs, output_rank=output_rank)
+        elif 0 <= output_rank < len(outputs):
+            result = outputs[output_rank]
+        else:
+            result = None
+        merge_capture_results(outputs, output_rank)
+        return result
+
+
 class Executor(ABC):
     """Abstract base class for vLLM executors."
 
@@ -110,6 +145,9 @@ class Executor(ABC):
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
         self.kv_output_aggregator: KVOutputAggregator | None = None
+        # Activation capture also needs every rank's output merged (see
+        # ``_output_aggregator``); set once here so all backends agree.
+        self.capture_enabled = vllm_config.capture_consumers_config is not None
 
     @abstractmethod
     def _init_executor(self) -> None:
@@ -286,6 +324,22 @@ class Executor(ABC):
         self.kv_output_aggregator = KVOutputAggregator.from_connector(
             connector, self.parallel_config.world_size
         )
+
+    def _output_aggregator(self) -> KVOutputAggregator | None:
+        """Aggregator for the per-step all-outputs reply path, or ``None``.
+
+        Returning a non-``None`` aggregator signals the backend to collect
+        *every* worker's ``ModelRunnerOutput`` (not just ``output_rank``'s)
+        and reduce them. With activation capture enabled,
+        ``_CaptureAwareAggregator`` wraps the optional KV aggregator and
+        additionally unions ``capture_results`` across pipeline stages —
+        the same on single-node (multiproc) and multi-node (Ray) backends.
+        Without capture, the plain KV aggregator (or ``None``) is returned
+        and behaviour is unchanged.
+        """
+        if self.capture_enabled:
+            return _CaptureAwareAggregator(self.kv_output_aggregator)
+        return self.kv_output_aggregator
 
     @cached_property  # Avoid unnecessary RPC calls
     def supported_tasks(self) -> tuple[SupportedTask, ...]:
