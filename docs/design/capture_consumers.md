@@ -264,8 +264,9 @@ Entry surfaces:
   code paths (like `LLM(...)`) that build the config directly.
 - `LLM(capture_consumers=[...])` accepts both dict entries (become
   `CaptureConsumerSpec`s) and pre-constructed `CaptureConsumer`
-  instances (passed to the worker via
-  `VllmConfig._capture_consumer_instances`).
+  instances; both ride on `CaptureConsumersConfig` (`.consumers` and
+  `.instances`) so they survive the `EngineArgs → VllmConfig` plumbing
+  and reach the worker.
 
 `validate_consumer_specs` enforces:
 
@@ -459,7 +460,7 @@ indices back to consumer names via `_capture_index_to_name`.
 `vllm_config.capture_consumers_config is not None`:
 
 1. Call `registry.build_consumers(vllm_config,
-   consumer_instances=vllm_config._capture_consumer_instances)`.
+   consumer_instances=vllm_config.capture_consumers_config.instances)`.
 2. For each validator, call `global_capture_spec()` defensively (any
    exception becomes `None`).
 3. Instantiate `CaptureManager(sinks, global_specs, num_hidden_layers,
@@ -772,12 +773,16 @@ The fix is staged in three layers, B → C → A:
   (`vllm/v1/engine/input_processor.py`) before the request reaches the
   scheduler. The offline call is idempotent (it only fires when the flag
   is still `None`, so served requests already stamped by `_admit_capture`
-  skip it) and best-effort: spec/dict-form consumers resolve from
-  `vllm_config.capture_consumers_config`, while an unresolvable spec —
-  instance-form `LLM(capture_consumers=[obj])` consumers, which are not
-  config-rebuildable, or an invalid spec — leaves the flag `None`
-  (conservatively disabled, correct) and the worker re-validates the raw
-  spec at registration.
+  skip it). Both entry points build their `name -> validator` map via the
+  shared `build_admission_validators` (`vllm/v1/capture/registry.py`),
+  which keys consumers exactly as the worker's `name_to_index` — dict/spec
+  form rebuilt from `vllm_config.capture_consumers_config.consumers`,
+  pre-built instances (`LLM(capture_consumers=[obj])`) used directly from
+  `.instances` and keyed by class name — so the same client name resolves
+  to the same consumer at admission and at the worker. Resolution is
+  best-effort: an invalid spec leaves the flag `None` (conservatively
+  disabled, correct) and the worker re-validates the raw spec at
+  registration.
 
 - **C — schedule-time hit clamp (implemented).** Rather than skipping
   reuse for a prompt-touching capture, clamp it. `_admit_capture` records
@@ -794,8 +799,7 @@ The fix is staged in three layers, B → C → A:
   no reuse; `last_prompt` clamps to almost the whole prompt. The floor is
   computed by the shared `resolve_capture_prefix_flags` on both paths (see
   B), so the offline `LLM` path gets the same clamp as the served path for
-  spec/dict-form consumers; instance-form consumers keep B's conservative
-  skip.
+  both dict/spec-form and instance-form consumers.
 
 - **A — activation store (implemented).**
   A pristine residual is a pure function of the prefix token ids and the
@@ -907,15 +911,6 @@ worth tightening:
   tears down, but there is no explicit LIFO ordering or per-consumer
   budget propagation — each consumer's `shutdown(timeout)` default
   is 30s.
-- **`LLM(capture_consumers=[instance])` is not fully wired.** The
-  `LLM` constructor stores instances on
-  `self._capture_consumer_instances` but does not attach them to
-  `VllmConfig`. The runner reads
-  `vllm_config._capture_consumer_instances` (see
-  `GPUModelRunner.__init__`), so end-to-end instance handoff
-  requires closing the gap between the `LLM` field and the
-  `VllmConfig` attribute. Dict-form entries flow through the config
-  and work today.
 
 ## Testing
 
@@ -954,9 +949,11 @@ worth tightening:
   classification, the cross-consumer floor, the store serve-set, and the
   unknown-consumer / invalid-spec error contract (`capture_param`).
 - `tests/v1/engine/test_input_processor_capture.py` — the offline
-  `InputProcessor` admission path: spec-form flag stamping, the
-  conservative skip on an unresolvable / invalid spec (no rejection), and
-  `_build_capture_consumers` (spec-form built from config, instance-form
-  skipped).
+  `InputProcessor` admission path: spec-form and instance-form flag
+  stamping, and the conservative skip on an invalid spec (no rejection).
+- `tests/v1/capture/test_registry.py::TestBuildAdmissionValidators` —
+  `build_admission_validators` keys validators exactly as the worker's
+  `name_to_index`: dict/spec form by `instance_name or name`, instances by
+  class name with `#2` collision suffixing.
 - `tests/engine/test_arg_utils.py::TestCaptureConsumersFlag` —
   CLI-flag parsing.

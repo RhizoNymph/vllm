@@ -6,7 +6,8 @@ Both the OpenAI serving layer (``OpenAIServing._admit_capture``) and the
 offline ``InputProcessor`` resolve the per-request ``capture`` dict into the
 same prefix-cache reuse flags on ``SamplingParams`` *before* the request
 reaches the scheduler. The resolution is pure — a deterministic function of
-the raw spec, the config-built consumer validators, and the request's
+the raw spec, the consumer validators (see ``build_admission_validators``),
+and the request's
 :class:`CaptureContext` — and the worker re-runs the identical resolution at
 registration. Centralizing it here keeps the two entry points exactly in
 step so the scheduler's prefix-cache decision is the same on both paths.
@@ -82,7 +83,7 @@ def resolve_capture_prefix_flags(
 ) -> None:
     """Resolve ``sampling_params.capture`` and stamp the prefix-cache flags.
 
-    For each ``(name, raw_spec)`` entry, looks up the config-built validator
+    For each ``(name, raw_spec)`` entry, looks up the consumer validator
     and resolves the raw payload into a ``CaptureSpec``. From the resolved
     specs it computes the request-wide re-forward floor and the
     activation-store serve set, then writes them onto ``sampling_params``

@@ -525,11 +525,12 @@ and [Backpressure & overload](#backpressure--overload).
   affected. The clamp uses the resolved capture positions, computed by a
   shared admission step on **both** paths: the served (OpenAI API) path
   resolves in `_admit_capture`, and the offline `LLM` path resolves in the
-  `InputProcessor` before the request reaches the scheduler. Specs given
-  as pre-built consumer instances (`LLM(capture_consumers=[obj])`) are not
-  config-rebuildable, so they conservatively skip reuse. Consumers also
-  reject cached positions at admission as a backstop. See "Prefix-Cache
-  Interaction" in `docs/design/capture_consumers.md`.
+  `InputProcessor` before the request reaches the scheduler. Both dict/spec
+  form and pre-built instance-form consumers
+  (`LLM(capture_consumers=[obj])`) resolve, keyed identically to the
+  worker. Consumers also reject cached positions at admission as a
+  backstop. See "Prefix-Cache Interaction" in
+  `docs/design/capture_consumers.md`.
 - **Hook coverage**: only the decoder architectures that wire the
   `apply_layer_steering` / `maybe_capture_residual` pair fire hooks.
   See [Activation Steering](steering.md) for the list of covered

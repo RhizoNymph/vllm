@@ -112,20 +112,13 @@ class OpenAIServingCompletion(OpenAIServing):
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
 
-        # Capture-consumer instance cache — mirrors
+        # Capture-consumer validator cache — mirrors
         # ``OpenAIServingChat.__init__``.
-        self._capture_consumers: dict[str, CaptureConsumer] = {}
-        capture_config = getattr(
-            self.engine_client.vllm_config, "capture_consumers_config", None
+        self._capture_consumers: dict[str, CaptureConsumer] = (
+            capture_registry.build_admission_validators(
+                self.engine_client.vllm_config
+            )
         )
-        if capture_config is not None:
-            for spec in capture_config.consumers:
-                key = spec.instance_name or spec.name
-                self._capture_consumers[key] = capture_registry.build_consumer(
-                    spec.name,
-                    self.engine_client.vllm_config,
-                    spec.params,
-                )
 
     def _admit_capture(
         self,

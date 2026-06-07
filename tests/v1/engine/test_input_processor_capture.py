@@ -114,37 +114,17 @@ class TestOfflinePrefixFlagResolution:
 
         assert sp.capture_touches_prompt is None
 
-
-class TestBuildCaptureConsumers:
-    def test_builds_spec_form_and_skips_instances(self, monkeypatch) -> None:
-        built: list[str] = []
-
-        def _fake_build_consumer(name, vllm_config, params):
-            built.append(name)
-            return _PromptConsumer()
-
-        import vllm.v1.capture.registry as registry
-
-        monkeypatch.setattr(registry, "build_consumer", _fake_build_consumer)
-
-        config = SimpleNamespace(
-            consumers=[
-                SimpleNamespace(name="filesystem", instance_name=None, params={}),
-                SimpleNamespace(
-                    name="filesystem", instance_name="fs2", params={"root": "/x"}
-                ),
-            ],
-            instances=[object()],  # instance-form: intentionally ignored
-        )
+    def test_resolves_instance_form_consumer(self) -> None:
+        # Pre-built instance-form consumers (``LLM(capture_consumers=[obj])``)
+        # are keyed by class name (matching the runner's ``name_to_index``) and
+        # now resolve at admission too — leaving ``_capture_consumers=None`` so
+        # the processor builds the map via ``build_admission_validators``.
+        instance = _PromptConsumer()
+        config = SimpleNamespace(consumers=[], instances=[instance])
         proc = _processor(config, None)
+        sp = SamplingParams(capture={"_PromptConsumer": {}})
 
-        consumers = proc._build_capture_consumers(config)
+        proc._resolve_capture_prefix_flags("r", sp, [1, 2, 3, 4, 5, 6, 7, 8], None)
 
-        # Keyed by ``instance_name or name``; instances are not included.
-        assert set(consumers.keys()) == {"filesystem", "fs2"}
-        assert built == ["filesystem", "filesystem"]
-
-    def test_empty_config_builds_nothing(self) -> None:
-        config = SimpleNamespace(consumers=[], instances=[])
-        proc = _processor(config, None)
-        assert proc._build_capture_consumers(config) == {}
+        assert sp.capture_touches_prompt is True
+        assert sp.capture_min_prompt_position == 7

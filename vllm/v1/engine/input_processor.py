@@ -412,19 +412,16 @@ class InputProcessor:
 
         Resolves ``sampling_params.capture`` into the prefix-cache reuse flags
         so offline (and any non-OpenAI) requests get the same prefix-cache
-        treatment as served ones. Best-effort: any resolution failure — an
-        unknown consumer (e.g. instance-form consumers, which are not
-        config-rebuildable) or an invalid spec — leaves the flags unset so the
-        request stays conservatively correct (prefix caching disabled for the
-        capture) and the worker re-validates the raw spec at registration.
-        """
-        config = getattr(self.vllm_config, "capture_consumers_config", None)
-        if config is None:
-            return
+        treatment as served ones. Best-effort: an invalid spec leaves the flags
+        unset so the request stays conservatively correct (prefix caching
+        disabled for the capture) and the worker re-validates the raw spec at
+        registration.
 
-        if self._capture_consumers is None:
-            self._capture_consumers = self._build_capture_consumers(config)
-        if not self._capture_consumers:
+        Both spec/dict-form and pre-built instance-form consumers
+        (``LLM(capture_consumers=[obj])``) resolve here:
+        ``build_admission_validators`` keys them exactly as the runner does.
+        """
+        if getattr(self.vllm_config, "capture_consumers_config", None) is None:
             return
 
         from vllm.v1.capture.admission import (
@@ -435,6 +432,12 @@ class InputProcessor:
             CaptureValidationError,
             UnknownCaptureConsumerError,
         )
+        from vllm.v1.capture.registry import build_admission_validators
+
+        if self._capture_consumers is None:
+            self._capture_consumers = build_admission_validators(self.vllm_config)
+        if not self._capture_consumers:
+            return
 
         num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
@@ -453,29 +456,6 @@ class InputProcessor:
                 request_id,
                 exc,
             )
-
-    def _build_capture_consumers(self, config: Any) -> dict[str, Any]:
-        """Build config-driven capture validators keyed by request-facing name.
-
-        Mirrors the OpenAI serving layer: validation-only instances built from
-        the entry-point registry (we never dispatch to them, so ``location`` is
-        irrelevant). Instance-form consumers
-        (``LLM(capture_consumers=[obj])``) are intentionally skipped — they are
-        not rebuildable from config, so instance-form captures take the
-        conservative no-reuse path.
-        """
-        consumers: dict[str, Any] = {}
-        specs = getattr(config, "consumers", None) or []
-        if not specs:
-            return consumers
-        from vllm.v1.capture import registry as capture_registry
-
-        for spec in specs:
-            key = spec.instance_name or spec.name
-            consumers[key] = capture_registry.build_consumer(
-                spec.name, self.vllm_config, spec.params
-            )
-        return consumers
 
     def _validate_prompt_len(
         self,

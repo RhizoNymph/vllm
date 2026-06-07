@@ -211,25 +211,18 @@ class OpenAIServingChat(OpenAIServing):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
 
-        # Build a capture-consumer instance cache at serving-layer init so
+        # Build a capture-consumer validator cache at serving-layer init so
         # per-request ``validate_client_spec`` calls do not re-import or
-        # re-instantiate consumers. Instances are driver-side (the
-        # entrypoint runs in the driver process) and used only for
-        # admission validation — not for dispatching captures. Keyed by
-        # ``spec.instance_name or spec.name`` so multiple instances of
-        # the same class can coexist.
-        self._capture_consumers: dict[str, CaptureConsumer] = {}
-        capture_config = getattr(
-            self.engine_client.vllm_config, "capture_consumers_config", None
+        # re-instantiate consumers. Used only for admission validation — not
+        # for dispatching captures. Keyed exactly as the runner's
+        # ``name_to_index`` (see ``build_admission_validators``) so a client's
+        # ``capture={<name>: ...}`` resolves to the same consumer here and at
+        # the worker.
+        self._capture_consumers: dict[str, CaptureConsumer] = (
+            capture_registry.build_admission_validators(
+                self.engine_client.vllm_config
+            )
         )
-        if capture_config is not None:
-            for spec in capture_config.consumers:
-                key = spec.instance_name or spec.name
-                self._capture_consumers[key] = capture_registry.build_consumer(
-                    spec.name,
-                    self.engine_client.vllm_config,
-                    spec.params,
-                )
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
         self.override_max_tokens = (
