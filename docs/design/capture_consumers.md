@@ -765,9 +765,19 @@ The fix is staged in three layers, B → C → A:
   skips prefix-cache reuse entirely only when the flag is `None`
   (unclassified). Generated-only captures keep full prefix caching;
   prompt-touching captures fall through to C's clamp rather than skipping
-  wholesale. The offline `LLM` path does not resolve specs at admission,
-  so it leaves the flag `None` and stays conservatively disabled
-  (correct, not optimized).
+  wholesale. Both entry points resolve specs through the shared
+  `resolve_capture_prefix_flags` (`vllm/v1/capture/admission.py`): the
+  OpenAI `_admit_capture` calls it (mapping errors to HTTP 400), and the
+  offline `LLM` path calls it from `InputProcessor.process_inputs`
+  (`vllm/v1/engine/input_processor.py`) before the request reaches the
+  scheduler. The offline call is idempotent (it only fires when the flag
+  is still `None`, so served requests already stamped by `_admit_capture`
+  skip it) and best-effort: spec/dict-form consumers resolve from
+  `vllm_config.capture_consumers_config`, while an unresolvable spec —
+  instance-form `LLM(capture_consumers=[obj])` consumers, which are not
+  config-rebuildable, or an invalid spec — leaves the flag `None`
+  (conservatively disabled, correct) and the worker re-validates the raw
+  spec at registration.
 
 - **C — schedule-time hit clamp (implemented).** Rather than skipping
   reuse for a prompt-touching capture, clamp it. `_admit_capture` records
@@ -781,13 +791,13 @@ The fix is staged in three layers, B → C → A:
   request stays block-size aligned). The prefix below the floor is reused
   from cache; the floor and everything after are re-forwarded so their
   residuals can be captured. A floor of `0` (`all_prompt`/`all`) clamps to
-  no reuse; `last_prompt` clamps to almost the whole prompt. This is still
-  API-path for its *data*: the floor is computed at admission, so the
-  offline `LLM` path (no resolved specs at admission) keeps B's
-  conservative skip. Offline-path clamping would require resolving specs
-  in the offline path — a later extension.
+  no reuse; `last_prompt` clamps to almost the whole prompt. The floor is
+  computed by the shared `resolve_capture_prefix_flags` on both paths (see
+  B), so the offline `LLM` path gets the same clamp as the served path for
+  spec/dict-form consumers; instance-form consumers keep B's conservative
+  skip.
 
-- **A — activation store (store core implemented; wiring in progress).**
+- **A — activation store (implemented).**
   A pristine residual is a pure function of the prefix token ids and the
   weights, so it is content-addressable by the same block-hash chain the
   KV cache uses. A CPU-RAM, bounded, LRU, drop-on-eviction store
@@ -938,5 +948,15 @@ worth tightening:
 - `tests/v1/core/test_prefix_caching.py::test_capture_serves_from_store_instead_of_reforwarding`
   — the A.3 read floor end-to-end (full reuse on a resident prefix;
   all-or-nothing fallback to the C clamp on a miss).
+- `tests/v1/capture/test_admission.py` — the shared
+  `resolve_capture_prefix_flags` / `build_capture_context`
+  (`vllm/v1/capture/admission.py`): generated-only vs prompt-touching
+  classification, the cross-consumer floor, the store serve-set, and the
+  unknown-consumer / invalid-spec error contract (`capture_param`).
+- `tests/v1/engine/test_input_processor_capture.py` — the offline
+  `InputProcessor` admission path: spec-form flag stamping, the
+  conservative skip on an unresolvable / invalid spec (no rejection), and
+  `_build_capture_consumers` (spec-form built from config, instance-form
+  skipped).
 - `tests/engine/test_arg_utils.py::TestCaptureConsumersFlag` —
   CLI-flag parsing.

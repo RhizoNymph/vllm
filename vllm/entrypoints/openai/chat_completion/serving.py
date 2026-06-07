@@ -78,13 +78,14 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 from vllm.v1.capture import (
     CaptureConsumer,
-    CaptureContext,
     CaptureValidationError,
-    capture_expert_parallel_size,
-    captured_prompt_positions,
-    min_captured_prompt_position,
+    UnknownCaptureConsumerError,
 )
 from vllm.v1.capture import registry as capture_registry
+from vllm.v1.capture.admission import (
+    build_capture_context,
+    resolve_capture_prefix_flags,
+)
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -506,10 +507,6 @@ class OpenAIServingChat(OpenAIServing):
         if sampling_params.capture is None:
             return None
 
-        vllm_config = self.engine_client.vllm_config
-        parallel_config = vllm_config.parallel_config
-        model_config = vllm_config.model_config
-
         try:
             num_prompt_tokens = self._extract_prompt_len(engine_input)
         except Exception as exc:  # pragma: no cover - defensive
@@ -520,14 +517,9 @@ class OpenAIServingChat(OpenAIServing):
             )
 
         try:
-            num_hidden_layers = model_config.get_total_num_hidden_layers()
-            hidden_size = model_config.get_hidden_size()
-            dt = model_config.dtype
-            element_size_bytes = getattr(dt, "itemsize", None)
-            if element_size_bytes is None:
-                import torch
-
-                element_size_bytes = torch.tensor([], dtype=dt).element_size()
+            ctx = build_capture_context(
+                self.engine_client.vllm_config, num_prompt_tokens, request_id
+            )
         except Exception as exc:  # pragma: no cover - defensive
             return self.create_error_response(
                 f"capture: failed to read model shape: {exc}",
@@ -535,90 +527,19 @@ class OpenAIServingChat(OpenAIServing):
                 param="capture",
             )
 
-        ctx = CaptureContext(
-            vllm_internal_request_id=request_id,  # type: ignore[arg-type]
-            num_prompt_tokens=num_prompt_tokens,
-            num_computed_tokens=0,
-            num_hidden_layers=num_hidden_layers,
-            hidden_size=hidden_size,
-            element_size_bytes=int(element_size_bytes),
-            tensor_parallel_size=parallel_config.tensor_parallel_size,
-            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
-            expert_parallel_size=capture_expert_parallel_size(parallel_config),
-            data_parallel_size=parallel_config.data_parallel_size,
-        )
-
-        validated: dict[str, Any] = {}
-        for name, raw_spec in sampling_params.capture.items():
-            consumer = self._capture_consumers.get(name)
-            if consumer is None:
-                available = sorted(self._capture_consumers.keys())
-                return self.create_error_response(
-                    (
-                        f"capture: no consumer named {name!r} is registered. "
-                        f"Available consumers: {available}."
-                    ),
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    param=f"capture.{name}",
-                )
-            try:
-                validated[name] = consumer.validate_client_spec(raw_spec, ctx)
-            except CaptureValidationError as exc:
-                return self.create_error_response(
-                    str(exc),
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    param=f"capture.{name}",
-                )
-
-        # Classify the capture against the prompt range. The resolved
-        # positions exist only here on the served path (the worker
-        # re-validates from the raw dict, but only after scheduling). Take
-        # the lowest prompt position any consumer taps; that request-wide
-        # floor drives prefix-cache reuse in
-        # ``Request.get_skip_reading_prefix_cache`` /
-        # ``get_capture_prefix_cache_limit``: generated-only captures keep
-        # full prefix caching, prompt-touching captures reuse the cache only
-        # up to the floor and re-forward from there.
-        floors = [
-            pos
-            for pos in (
-                min_captured_prompt_position(spec, num_prompt_tokens)
-                for spec in validated.values()
+        # Resolve every per-request spec and stamp the prefix-cache reuse
+        # flags onto ``sampling_params`` (shared with the offline
+        # ``InputProcessor`` path). The raw ``capture`` dict is left in place:
+        # ``CaptureSpec`` is not IPC-serializable, so the worker re-validates
+        # from the original dict after scheduling.
+        try:
+            resolve_capture_prefix_flags(self._capture_consumers, sampling_params, ctx)
+        except (UnknownCaptureConsumerError, CaptureValidationError) as exc:
+            return self.create_error_response(
+                str(exc),
+                status_code=HTTPStatus.BAD_REQUEST,
+                param=getattr(exc, "capture_param", "capture"),
             )
-            if pos is not None
-        ]
-        if floors:
-            sampling_params.capture_touches_prompt = True
-            sampling_params.capture_min_prompt_position = min(floors)
-            # Union (hook, layer) and prompt positions for activation-store
-            # serve (step A): the scheduler tests whether this whole set is
-            # store-resident and, if so, serves it instead of re-forwarding.
-            hook_layers: set[tuple[str, int]] = set()
-            store_positions: set[int] = set()
-            for spec in validated.values():
-                for hook, layers in spec.hooks.items():
-                    for layer in layers:
-                        hook_layers.add((hook, layer))
-                store_positions.update(
-                    captured_prompt_positions(spec, num_prompt_tokens)
-                )
-            sampling_params.capture_store_hook_layers = sorted(hook_layers)
-            sampling_params.capture_store_positions = sorted(store_positions)
-        else:
-            sampling_params.capture_touches_prompt = False
-            sampling_params.capture_min_prompt_position = None
-            sampling_params.capture_store_hook_layers = None
-            sampling_params.capture_store_positions = None
-
-        # NOTE: We intentionally do NOT overwrite ``sampling_params.capture``
-        # with the validated ``CaptureSpec`` dict. ``CaptureSpec`` is not
-        # serializable across the engine IPC boundary (see
-        # ``vllm/v1/capture/types.py``), so the worker would receive a plain
-        # ``{hooks, positions}`` dict missing the consumer-specific fields
-        # (request_id, tag, ...) and re-validation would fail. Leaving the
-        # original raw dict in place lets the worker's own validator
-        # reconstruct the consumer request type cleanly.
-        del validated
         return None
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:

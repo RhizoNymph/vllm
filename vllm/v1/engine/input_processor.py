@@ -71,6 +71,14 @@ class InputProcessor:
             mm_registry=mm_registry,
         )
 
+        # Config-driven capture-consumer validators, used only to resolve
+        # per-request capture specs into prefix-cache flags before the
+        # request reaches the scheduler (the offline analogue of the OpenAI
+        # serving layer's ``_admit_capture``). Built lazily on the first
+        # capture request; stays ``None`` for non-capture workloads so they
+        # pay nothing. See ``vllm/v1/capture/admission.py``.
+        self._capture_consumers: dict[str, Any] | None = None
+
     @property
     def tokenizer(self) -> TokenizerLike | None:
         return self.renderer.tokenizer
@@ -321,6 +329,23 @@ class InputProcessor:
         else:
             pooling_params = params.clone()
 
+        # Offline capture admission: resolve the per-request capture spec into
+        # prefix-cache reuse flags (the OpenAI path does this in
+        # ``_admit_capture``). Idempotent — served requests arrive with the
+        # flag already set, so this only fires for offline / direct ``LLM``
+        # requests, which never pass through the serving-layer admission step.
+        if (
+            sampling_params is not None
+            and sampling_params.capture is not None
+            and sampling_params.capture_touches_prompt is None
+        ):
+            self._resolve_capture_prefix_flags(
+                request_id,
+                sampling_params,
+                prompt_token_ids,
+                prompt_embeds,
+            )
+
         # Multimodal related.
         mm_features: list[MultiModalFeatureSpec] | None = None
 
@@ -375,6 +400,82 @@ class InputProcessor:
             trace_headers=trace_headers,
             resumable=resumable,
         )
+
+    def _resolve_capture_prefix_flags(
+        self,
+        request_id: str,
+        sampling_params: SamplingParams,
+        prompt_token_ids: list[int] | None,
+        prompt_embeds: Any,
+    ) -> None:
+        """Offline analogue of the serving layer's ``_admit_capture``.
+
+        Resolves ``sampling_params.capture`` into the prefix-cache reuse flags
+        so offline (and any non-OpenAI) requests get the same prefix-cache
+        treatment as served ones. Best-effort: any resolution failure — an
+        unknown consumer (e.g. instance-form consumers, which are not
+        config-rebuildable) or an invalid spec — leaves the flags unset so the
+        request stays conservatively correct (prefix caching disabled for the
+        capture) and the worker re-validates the raw spec at registration.
+        """
+        config = getattr(self.vllm_config, "capture_consumers_config", None)
+        if config is None:
+            return
+
+        if self._capture_consumers is None:
+            self._capture_consumers = self._build_capture_consumers(config)
+        if not self._capture_consumers:
+            return
+
+        from vllm.v1.capture.admission import (
+            build_capture_context,
+            resolve_capture_prefix_flags,
+        )
+        from vllm.v1.capture.errors import (
+            CaptureValidationError,
+            UnknownCaptureConsumerError,
+        )
+
+        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+            prompt_token_ids, prompt_embeds
+        )
+        try:
+            ctx = build_capture_context(
+                self.vllm_config, num_prompt_tokens, request_id
+            )
+            resolve_capture_prefix_flags(
+                self._capture_consumers, sampling_params, ctx
+            )
+        except (UnknownCaptureConsumerError, CaptureValidationError) as exc:
+            logger.debug(
+                "capture: offline prefix-flag resolution skipped for "
+                "request %s: %s",
+                request_id,
+                exc,
+            )
+
+    def _build_capture_consumers(self, config: Any) -> dict[str, Any]:
+        """Build config-driven capture validators keyed by request-facing name.
+
+        Mirrors the OpenAI serving layer: validation-only instances built from
+        the entry-point registry (we never dispatch to them, so ``location`` is
+        irrelevant). Instance-form consumers
+        (``LLM(capture_consumers=[obj])``) are intentionally skipped — they are
+        not rebuildable from config, so instance-form captures take the
+        conservative no-reuse path.
+        """
+        consumers: dict[str, Any] = {}
+        specs = getattr(config, "consumers", None) or []
+        if not specs:
+            return consumers
+        from vllm.v1.capture import registry as capture_registry
+
+        for spec in specs:
+            key = spec.instance_name or spec.name
+            consumers[key] = capture_registry.build_consumer(
+                spec.name, self.vllm_config, spec.params
+            )
+        return consumers
 
     def _validate_prompt_len(
         self,
