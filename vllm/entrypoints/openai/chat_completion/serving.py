@@ -219,9 +219,7 @@ class OpenAIServingChat(OpenAIServing):
         # ``capture={<name>: ...}`` resolves to the same consumer here and at
         # the worker.
         self._capture_consumers: dict[str, CaptureConsumer] = (
-            capture_registry.build_admission_validators(
-                self.engine_client.vllm_config
-            )
+            capture_registry.build_admission_validators(self.engine_client.vllm_config)
         )
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config

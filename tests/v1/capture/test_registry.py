@@ -181,9 +181,7 @@ class TestBuildAdmissionValidators:
 
     def test_includes_instances_keyed_by_class_name(self) -> None:
         inst = _DriverInstance()
-        cfg = _vllm_config_with(
-            SimpleNamespace(consumers=[], instances=[inst])
-        )
+        cfg = _vllm_config_with(SimpleNamespace(consumers=[], instances=[inst]))
         validators = build_admission_validators(cfg)
         # The instance is used directly (not rebuilt) and keyed by class name.
         assert validators == {"_DriverInstance": inst}

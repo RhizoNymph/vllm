@@ -152,9 +152,7 @@ def resolve_capture_prefix_flags(
             for hook, layers in spec.hooks.items():
                 for layer in layers:
                     hook_layers.add((hook, layer))
-            store_positions.update(
-                captured_prompt_positions(spec, num_prompt_tokens)
-            )
+            store_positions.update(captured_prompt_positions(spec, num_prompt_tokens))
         sampling_params.capture_store_hook_layers = sorted(hook_layers)
         sampling_params.capture_store_positions = sorted(store_positions)
     else:

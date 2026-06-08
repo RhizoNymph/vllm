@@ -443,16 +443,11 @@ class InputProcessor:
             prompt_token_ids, prompt_embeds
         )
         try:
-            ctx = build_capture_context(
-                self.vllm_config, num_prompt_tokens, request_id
-            )
-            resolve_capture_prefix_flags(
-                self._capture_consumers, sampling_params, ctx
-            )
+            ctx = build_capture_context(self.vllm_config, num_prompt_tokens, request_id)
+            resolve_capture_prefix_flags(self._capture_consumers, sampling_params, ctx)
         except (UnknownCaptureConsumerError, CaptureValidationError) as exc:
             logger.debug(
-                "capture: offline prefix-flag resolution skipped for "
-                "request %s: %s",
+                "capture: offline prefix-flag resolution skipped for request %s: %s",
                 request_id,
                 exc,
             )

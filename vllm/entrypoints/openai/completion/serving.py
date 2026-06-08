@@ -115,9 +115,7 @@ class OpenAIServingCompletion(OpenAIServing):
         # Capture-consumer validator cache — mirrors
         # ``OpenAIServingChat.__init__``.
         self._capture_consumers: dict[str, CaptureConsumer] = (
-            capture_registry.build_admission_validators(
-                self.engine_client.vllm_config
-            )
+            capture_registry.build_admission_validators(self.engine_client.vllm_config)
         )
 
     def _admit_capture(
