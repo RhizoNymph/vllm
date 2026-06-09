@@ -329,6 +329,155 @@ def test_prefill(hash_fn):
     )
 
 
+def test_capture_clamps_prefix_cache_hit():
+    """A prompt-touching capture clamps the prefix-cache hit to its floor.
+
+    The hit must stop at the block boundary at or below the lowest captured
+    prompt position so that position (and everything after) is re-forwarded
+    and its residual can be captured. Generated-only captures are unclamped.
+    """
+    block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config(block_size, 11),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    # Populate the cache with 3 full common blocks (48 tokens) + a partial.
+    common_token_ids = [i for i in range(3) for _ in range(block_size)]
+    tail = [9] * 5
+    req0 = make_request("0", common_token_ids + tail, block_size, sha256)
+    computed, n0 = manager.get_computed_blocks(req0)
+    assert n0 == 0
+    manager.allocate_slots(req0, len(common_token_ids) + len(tail), 0, computed)
+
+    def _capture_request(req_id: str, touches_prompt, floor):
+        req = make_request(req_id, common_token_ids + tail, block_size, sha256)
+        req.sampling_params.capture = {"c": {}}
+        req.sampling_params.capture_touches_prompt = touches_prompt
+        req.sampling_params.capture_min_prompt_position = floor
+        # In production these are set before Request construction, so the
+        # cached skip flag already reflects them; recompute it here since we
+        # mutated after construction.
+        req.skip_reading_prefix_cache = req.get_skip_reading_prefix_cache()
+        return req
+
+    # Floor at token 20 -> hit clamped to the block boundary below it (16).
+    _, n_clamped = manager.get_computed_blocks(_capture_request("clamp", True, 20))
+    assert n_clamped == block_size
+
+    # Generated-only capture -> no clamp -> full 3-block hit.
+    _, n_full = manager.get_computed_blocks(_capture_request("generated", False, None))
+    assert n_full == 3 * block_size
+
+    # Floor at 0 (e.g. all_prompt) -> no reusable prefix at all.
+    _, n_zero = manager.get_computed_blocks(_capture_request("all", True, 0))
+    assert n_zero == 0
+
+    # Unclassified (offline path) -> skip reuse entirely via the skip flag.
+    _, n_offline = manager.get_computed_blocks(_capture_request("offline", None, None))
+    assert n_offline == 0
+
+
+def test_capture_serves_from_store_instead_of_reforwarding():
+    """A fully store-resident captured prefix is served, not re-forwarded.
+
+    When the activation store holds every captured ``(position, layer,
+    hook)``, the read path reuses the full KV prefix (no clamp) and reserves
+    a serve; if any key is missing it falls back to the C clamp (all-or-
+    nothing), so a captured position is never served from KV without its
+    residual available.
+    """
+    from vllm.v1.capture.activation_store import (
+        ActivationStore,
+        activation_key,
+        pop_pending_serve,
+        set_active_activation_store,
+    )
+
+    block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config(block_size, 11),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    # Exactly 3 full blocks so every prompt position is in a hashed block.
+    tokens = [i for i in range(3) for _ in range(block_size)]
+    req0 = make_request("0", tokens, block_size, sha256)
+    computed, n0 = manager.get_computed_blocks(req0)
+    assert n0 == 0
+    manager.allocate_slots(req0, len(tokens), 0, computed)
+
+    def _capture_req(req_id: str):
+        req = make_request(req_id, tokens, block_size, sha256)
+        sp = req.sampling_params
+        sp.capture = {"c": {}}
+        sp.capture_touches_prompt = True
+        sp.capture_min_prompt_position = 0  # all_prompt -> C floor is 0
+        sp.capture_store_hook_layers = [("post_mlp", 1)]
+        sp.capture_store_positions = list(range(len(tokens)))
+        req.skip_reading_prefix_cache = req.get_skip_reading_prefix_cache()
+        return req
+
+    store = ActivationStore(max_bytes=10_000_000)
+    set_active_activation_store(store)
+    try:
+        req1 = _capture_req("1")
+        keys = [
+            activation_key(req1.block_hashes, block_size, p, 1, "post_mlp")
+            for p in range(len(tokens))
+        ]
+        for k in keys:
+            store.put(k, torch.zeros(2, dtype=torch.float32))
+
+        # Fully resident -> not clamped to floor 0, and a serve is reserved.
+        _, n_served = manager.get_computed_blocks(req1)
+        assert n_served > 0
+        assert pop_pending_serve("1") is not None
+
+        # Drop one key -> all-or-nothing miss -> clamp to floor 0, no serve.
+        store.invalidate_all()
+        for k in keys[:-1]:
+            store.put(k, torch.zeros(2, dtype=torch.float32))
+        req3 = _capture_req("3")
+        _, n_clamped = manager.get_computed_blocks(req3)
+        assert n_clamped == 0
+        assert pop_pending_serve("3") is None
+    finally:
+        set_active_activation_store(None)
+
+
+def test_reset_prefix_cache_invalidates_activation_store():
+    """Resetting the prefix cache (e.g. on weight update) drops the store.
+
+    The activation store is keyed by prefix content under the current
+    weights, so it must be invalidated wherever the prefix cache is.
+    """
+    from vllm.v1.capture.activation_store import (
+        ActivationStore,
+        set_active_activation_store,
+    )
+
+    manager = KVCacheManager(
+        make_kv_cache_config(16, 11),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    store = ActivationStore(max_bytes=10_000)
+    store.put((b"b", 0, 1, "post_mlp"), torch.zeros(2, dtype=torch.float32))
+    set_active_activation_store(store)
+    try:
+        assert len(store) == 1
+        assert manager.reset_prefix_cache() is True
+        assert len(store) == 0
+        assert store.stats().invalidations == 1
+    finally:
+        set_active_activation_store(None)
+
+
 def test_prefill_hybrid_model():
     block_size = 16
     manager = KVCacheManager(

@@ -223,6 +223,10 @@ class Scheduler(SchedulerInterface):
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
+        # Granularity ``Request.block_hashes`` is computed at; forwarded to
+        # the worker for capture activation-store keying (can differ from
+        # ``block_size`` for hybrid / context-parallel configs).
+        self.hash_block_size = hash_block_size
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -1015,13 +1019,16 @@ class Scheduler(SchedulerInterface):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    hash_block_size=self.hash_block_size,
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    hash_block_size=self.hash_block_size,
                 )
                 for req in scheduled_new_reqs
             ]

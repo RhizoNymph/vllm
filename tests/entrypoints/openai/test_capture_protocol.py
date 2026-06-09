@@ -314,6 +314,7 @@ def _build_admit_ctx_factories(monkeypatch):
             class _ParallelConfig:
                 tensor_parallel_size = 1
                 pipeline_parallel_size = 1
+                data_parallel_size = 1
 
             class _ModelConfig:
                 @staticmethod
@@ -405,7 +406,7 @@ class TestAdmitCaptureValidation:
         assert result["param"] == "capture.filesystem"
         assert "layer out of range" in result["message"]
 
-    def test_happy_path_mutates_sampling_params_to_spec(self, monkeypatch) -> None:
+    def test_happy_path_leaves_capture_raw(self, monkeypatch) -> None:
         from vllm.sampling_params import SamplingParams
 
         stub_cls, admit = _build_admit_ctx_factories(monkeypatch)
@@ -413,9 +414,8 @@ class TestAdmitCaptureValidation:
         consumer = _FakeConsumerAccepts.__new__(_FakeConsumerAccepts)
         stub._capture_consumers = {"filesystem": consumer}
 
-        sp = SamplingParams(
-            capture={"filesystem": {"tag": "t", "hooks": {"post_mlp": [0]}}}
-        )
+        raw = {"tag": "t", "hooks": {"post_mlp": [0]}}
+        sp = SamplingParams(capture={"filesystem": raw})
 
         result = admit(
             stub,
@@ -425,8 +425,11 @@ class TestAdmitCaptureValidation:
         )
 
         assert result is None
-        # The validator's CaptureSpec replaces the raw payload in place.
-        assert isinstance(sp.capture["filesystem"], CaptureSpec)
+        # _admit_capture deliberately does NOT overwrite the raw payload:
+        # CaptureSpec is not serializable across the engine IPC boundary, so
+        # the worker re-validates from the original dict. The entry must
+        # survive admission untouched.
+        assert sp.capture["filesystem"] is raw
 
     def test_noop_when_capture_is_none(self, monkeypatch) -> None:
         from vllm.sampling_params import SamplingParams
@@ -485,3 +488,60 @@ class TestAdmitCaptureValidation:
         assert ctx.element_size_bytes == 2
         assert ctx.tensor_parallel_size == 1
         assert ctx.pipeline_parallel_size == 1
+
+    def test_sets_capture_floor_for_prompt_spec(self, monkeypatch) -> None:
+        """A prompt-tapping spec records the re-forward floor.
+
+        ``_FakeConsumerAccepts`` resolves to ``positions="last_prompt"``
+        and the stub prompt length is 8, so the lowest captured prompt
+        position is 7. Admission classifies the request as prompt-touching
+        and records that floor to clamp prefix-cache reuse.
+        """
+        from vllm.sampling_params import SamplingParams
+
+        stub_cls, admit = _build_admit_ctx_factories(monkeypatch)
+        stub = stub_cls()
+        stub._capture_consumers = {
+            "fs": _FakeConsumerAccepts.__new__(_FakeConsumerAccepts)
+        }
+        sp = SamplingParams(capture={"fs": {"hooks": {"post_mlp": [0]}}})
+
+        result = admit(
+            stub,
+            sampling_params=sp,
+            engine_input=object(),
+            request_id="req-1",
+        )
+        assert result is None
+        assert sp.capture_touches_prompt is True
+        assert sp.capture_min_prompt_position == 7
+
+    def test_sets_capture_touches_prompt_false_for_generated_spec(
+        self, monkeypatch
+    ) -> None:
+        """A generated-only spec leaves prefix caching enabled."""
+        from vllm.sampling_params import SamplingParams
+
+        class _GeneratedOnly(CaptureConsumer):
+            reads_client_spec = True
+
+            def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
+                return CaptureSpec(hooks={"post_mlp": [0]}, positions="all_generated")
+
+            def on_capture(self, key, tensor, sidecar):  # pragma: no cover
+                pass
+
+        stub_cls, admit = _build_admit_ctx_factories(monkeypatch)
+        stub = stub_cls()
+        stub._capture_consumers = {"fs": _GeneratedOnly.__new__(_GeneratedOnly)}
+        sp = SamplingParams(capture={"fs": {}})
+
+        result = admit(
+            stub,
+            sampling_params=sp,
+            engine_input=object(),
+            request_id="req-1",
+        )
+        assert result is None
+        assert sp.capture_touches_prompt is False
+        assert sp.capture_min_prompt_position is None
