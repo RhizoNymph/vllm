@@ -41,10 +41,15 @@ class CaptureConsumersConfig:
     ``location='driver'`` instances are permitted (the runner's registry
     enforces this).  Instances don't contribute to ``compute_hash``
     because they're per-run driver-side state, not compile-cache inputs.
+
+    ``activation_cache_bytes`` is the byte budget for the activation store
+    (the prefix-cache/capture reuse layer): ``0`` disables it. Like
+    ``instances`` it is runtime-only and excluded from ``compute_hash``.
     """
 
     consumers: list[CaptureConsumerSpec]
     instances: list[Any] = field(default_factory=list)
+    activation_cache_bytes: int = 0
 
     # ---- Backpressure / overload control (capture-manager level) ----
     # The dispatch queue is the single GPU-facing backpressure point.

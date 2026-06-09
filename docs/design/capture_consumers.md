@@ -264,8 +264,9 @@ Entry surfaces:
   code paths (like `LLM(...)`) that build the config directly.
 - `LLM(capture_consumers=[...])` accepts both dict entries (become
   `CaptureConsumerSpec`s) and pre-constructed `CaptureConsumer`
-  instances (passed to the worker via
-  `VllmConfig._capture_consumer_instances`).
+  instances; both ride on `CaptureConsumersConfig` (`.consumers` and
+  `.instances`) so they survive the `EngineArgs → VllmConfig` plumbing
+  and reach the worker.
 
 `validate_consumer_specs` enforces:
 
@@ -459,7 +460,7 @@ indices back to consumer names via `_capture_index_to_name`.
 `vllm_config.capture_consumers_config is not None`:
 
 1. Call `registry.build_consumers(vllm_config,
-   consumer_instances=vllm_config._capture_consumer_instances)`.
+   consumer_instances=vllm_config.capture_consumers_config.instances)`.
 2. For each validator, call `global_capture_spec()` defensively (any
    exception becomes `None`).
 3. Instantiate `CaptureManager(sinks, global_specs, num_hidden_layers,
@@ -738,6 +739,145 @@ Writer details (`writer.py`):
     only `consumer_index` plus whatever the consumer put in its
     own `client_specs`/admission path.
 
+## Prefix-Cache Interaction
+
+A capture tap reads the residual stream at a `(layer, hook)` point for a
+token position. That residual exists only if the position is forwarded
+through the model. Prefix caching reuses the **KV** of a matched prefix
+and skips the forward pass for those positions, so a tap on a cached
+prompt position never fires — the activation simply does not exist. The
+conflict is therefore **per-position**: it arises only when a capture
+taps a position that a prefix-cache hit would serve from cache.
+
+The fix is staged in three layers, B → C → A:
+
+- **B — admission class gate (implemented).** A capture only conflicts
+  when it taps a *prompt-range* position. `spec_touches_prompt`
+  (`vllm/v1/capture/types.py`) classifies a resolved `CaptureSpec`
+  against `num_prompt_tokens`: `"all_generated"` and explicit lists
+  entirely `>= num_prompt_tokens` are generated-only and never conflict;
+  `"all"`, unresolved `"all_prompt"`/`"last_prompt"`, and any
+  prompt-range index are prompt-touching. The OpenAI entrypoint's
+  `_admit_capture` (chat + completion serving) computes this once the
+  consumer specs are resolved and records it on
+  `SamplingParams.capture_touches_prompt`
+  (`True`/`False`/`None`-unclassified) — see also C, which records the
+  re-forward floor alongside it. `Request.get_skip_reading_prefix_cache`
+  skips prefix-cache reuse entirely only when the flag is `None`
+  (unclassified). Generated-only captures keep full prefix caching;
+  prompt-touching captures fall through to C's clamp rather than skipping
+  wholesale. Both entry points resolve specs through the shared
+  `resolve_capture_prefix_flags` (`vllm/v1/capture/admission.py`): the
+  OpenAI `_admit_capture` calls it (mapping errors to HTTP 400), and the
+  offline `LLM` path calls it from `InputProcessor.process_inputs`
+  (`vllm/v1/engine/input_processor.py`) before the request reaches the
+  scheduler. The offline call is idempotent (it only fires when the flag
+  is still `None`, so served requests already stamped by `_admit_capture`
+  skip it). Both entry points build their `name -> validator` map via the
+  shared `build_admission_validators` (`vllm/v1/capture/registry.py`),
+  which keys consumers exactly as the worker's `name_to_index` — dict/spec
+  form rebuilt from `vllm_config.capture_consumers_config.consumers`,
+  pre-built instances (`LLM(capture_consumers=[obj])`) used directly from
+  `.instances` and keyed by class name — so the same client name resolves
+  to the same consumer at admission and at the worker. Resolution is
+  best-effort: an invalid spec leaves the flag `None` (conservatively
+  disabled, correct) and the worker re-validates the raw spec at
+  registration.
+
+- **C — schedule-time hit clamp (implemented).** Rather than skipping
+  reuse for a prompt-touching capture, clamp it. `_admit_capture` records
+  the request-wide re-forward floor — the lowest captured prompt position
+  across consumers, via `min_captured_prompt_position` — on
+  `SamplingParams.capture_min_prompt_position`, which travels to the
+  engine core on the sampling params. `Request.get_capture_prefix_cache_limit`
+  surfaces it, and `KVCacheManager.get_computed_blocks` caps
+  `max_cache_hit_length` at that floor before calling
+  `find_longest_cache_hit` (which block-aligns the cap down, so the
+  request stays block-size aligned). The prefix below the floor is reused
+  from cache; the floor and everything after are re-forwarded so their
+  residuals can be captured. A floor of `0` (`all_prompt`/`all`) clamps to
+  no reuse; `last_prompt` clamps to almost the whole prompt. The floor is
+  computed by the shared `resolve_capture_prefix_flags` on both paths (see
+  B), so the offline `LLM` path gets the same clamp as the served path for
+  both dict/spec-form and instance-form consumers.
+
+- **A — activation store (implemented).**
+  A pristine residual is a pure function of the prefix token ids and the
+  weights, so it is content-addressable by the same block-hash chain the
+  KV cache uses. A CPU-RAM, bounded, LRU, drop-on-eviction store
+  (`vllm/v1/capture/activation_store.py`, `ActivationStore`) keyed by
+  `(block_hash, offset_in_block, layer, hook)` lets repeated `all_prompt`
+  captures over a fixed corpus serve from the store instead of
+  re-forwarding. A miss or eviction falls through to C (re-forward) — the
+  store is a pure cache, never a source of truth; durability is the
+  consumer's output, not the store's. Dtype/weights are not in the key:
+  one model runs at one dtype, and `invalidate_all` is called wholesale on
+  weight update (same path as `reset_prefix_cache`).
+
+  Two findings shaped the design. (1) Capture is TP1/PP1 only, and
+  `world_size==1` uses `UniProcExecutor`, so the scheduler
+  (`KVCacheManager`) and the capture manager run in **one process** — a
+  single shared `ActivationStore` instance, no cross-process coherence;
+  access is mutex-guarded because write-through runs on the capture
+  dispatch thread while the scheduler reads on the main thread. (2)
+  Activation steering is not yet implemented in this tree, so the
+  steering-off premise holds unconditionally for now; when steering lands,
+  the read/serve path must gate on steering being off (taps are
+  pre-steering, but upstream steering poisons the residual).
+
+  Remaining wiring sub-steps (block hashes live only in the engine-core
+  `Request`, not in the `CaptureManager`):
+  - **A.1 store core (done):** the data structure + global accessor +
+    tests.
+  - **A.2 write-through (done):** the worker populates the store with
+    freshly-captured prompt residuals. `NewRequestData.from_request`
+    carries the request's prompt `block_hashes` and the scheduler's
+    `hash_block_size` to the worker (only for capture requests); the
+    `CaptureManager` keys each captured prompt row via `activation_key`
+    (`(block_hash, offset_in_block, layer, hook)`) and writes a clone into
+    the store from the dispatch thread, once per `(request, layer, hook,
+    position)`. The hash block size travels with the hashes rather than
+    being re-derived worker-side, because it can diverge from the KV block
+    size; using the wrong granularity would silently misalign keys. No
+    behavior change yet — this only fills the store.
+  - **A.3 read floor + serve-inject (done):** when the whole captured
+    prefix is store-resident, reuse the full KV prefix (skip the
+    re-forward) and inject the stored rows. The race-safe primitives:
+    `ActivationStore.extract_all` (an atomic all-or-nothing snapshot under
+    the store lock — taking the rows at decision time frees the read path
+    from a check-then-serve eviction race against dispatch-thread
+    write-through/eviction), the same-process serve bridge
+    (`stash_pending_serve` / `pop_pending_serve`, sound because capture is
+    TP1/PP1), and `try_reserve_store_serve` (the scheduler-side reserve:
+    compose keys, extract, stash). Read floor:
+    `KVCacheManager.get_computed_blocks` calls `try_reserve_store_serve`
+    before the C clamp — on success it skips the clamp (full KV reuse), on
+    any miss (all-or-nothing) it falls through to C, so a captured position
+    is never served from KV without its residual available. Admission
+    threads the union `capture_store_hook_layers` / `capture_store_positions`.
+
+    The spec-split (resolution 1) is **implicit**: serving advances
+    `num_computed_tokens` over the prompt, so the worker validates the spec
+    with `num_computed=0` (it pops the pending serve at registration) to
+    avoid the validator's `< num_computed` rejection, and `build_step_plan`
+    then naturally forward-captures only the step-window (generated) tail —
+    no manual spec surgery. The served prompt rows are injected by
+    `CaptureManager.serve_from_store`, which assembles per-consumer chunks
+    from the payload and submits them like forward-path chunks (sinks lock
+    `submit_chunk`; a request's serve precedes its own forward dispatch).
+    Because admission also resolves with `num_computed=0`, the worker's
+    resolution matches the threaded union exactly, so the serve payload is
+    always complete.
+  - **A.4 config + invalidation (done):** `--capture-activation-cache-gb`
+    (a `CaptureConsumersConfig.activation_cache_bytes` budget, runtime-only
+    so excluded from `compute_hash`); the runner instantiates the
+    `ActivationStore` and calls `set_active_activation_store` when capture
+    is on and the budget > 0; and `KVCacheManager.reset_prefix_cache`
+    calls `invalidate_all` (the single chokepoint every reset / RLHF
+    weight-update path flows through). With the budget at its default `0`
+    the store is never installed, so A.2/A.3 are inert — the flag is the
+    on-switch for the whole reuse layer.
+
 ## Known Limitations
 
 These are behaviors the current implementation exhibits that may be
@@ -771,15 +911,6 @@ worth tightening:
   tears down, but there is no explicit LIFO ordering or per-consumer
   budget propagation — each consumer's `shutdown(timeout)` default
   is 30s.
-- **`LLM(capture_consumers=[instance])` is not fully wired.** The
-  `LLM` constructor stores instances on
-  `self._capture_consumer_instances` but does not attach them to
-  `VllmConfig`. The runner reads
-  `vllm_config._capture_consumer_instances` (see
-  `GPUModelRunner.__init__`), so end-to-end instance handoff
-  requires closing the gap between the `LLM` field and the
-  `VllmConfig` attribute. Dict-form entries flow through the config
-  and work today.
 
 ## Testing
 
@@ -792,5 +923,37 @@ worth tightening:
   end-to-end.
 - `tests/v1/capture/test_sampling_params.py` — structural
   validation on `SamplingParams.capture`.
+- `tests/v1/capture/test_prefix_cache_gating.py` — the B/C
+  `spec_touches_prompt` / `min_captured_prompt_position` classifiers,
+  relaxed `SamplingParams` construction, and the
+  `Request.get_skip_reading_prefix_cache` / `get_capture_prefix_cache_limit`
+  accessors. `tests/entrypoints/openai/test_capture_protocol.py` covers
+  `_admit_capture` setting `capture_touches_prompt` and
+  `capture_min_prompt_position`.
+- `tests/v1/core/test_prefix_caching.py::test_capture_clamps_prefix_cache_hit`
+  — the C clamp end-to-end in `KVCacheManager.get_computed_blocks`.
+- `tests/v1/capture/test_activation_store.py` — the A-layer
+  `ActivationStore` core (LRU eviction, byte budget, oversize skip,
+  replacement accounting, invalidation, global accessor), the
+  `activation_key` composition, `CaptureManager` write-through
+  (content keying, prompt-only, clone-off-buffer, no-op guards), and the
+  A.3 read primitives (`extract_all` all-or-nothing, the pending-serve
+  bridge, `try_reserve_store_serve`), and `serve_from_store` chunk
+  injection.
+- `tests/v1/core/test_prefix_caching.py::test_capture_serves_from_store_instead_of_reforwarding`
+  — the A.3 read floor end-to-end (full reuse on a resident prefix;
+  all-or-nothing fallback to the C clamp on a miss).
+- `tests/v1/capture/test_admission.py` — the shared
+  `resolve_capture_prefix_flags` / `build_capture_context`
+  (`vllm/v1/capture/admission.py`): generated-only vs prompt-touching
+  classification, the cross-consumer floor, the store serve-set, and the
+  unknown-consumer / invalid-spec error contract (`capture_param`).
+- `tests/v1/engine/test_input_processor_capture.py` — the offline
+  `InputProcessor` admission path: spec-form and instance-form flag
+  stamping, and the conservative skip on an invalid spec (no rejection).
+- `tests/v1/capture/test_registry.py::TestBuildAdmissionValidators` —
+  `build_admission_validators` keys validators exactly as the worker's
+  `name_to_index`: dict/spec form by `instance_name or name`, instances by
+  class name with `#2` collision suffixing.
 - `tests/engine/test_arg_utils.py::TestCaptureConsumersFlag` —
   CLI-flag parsing.

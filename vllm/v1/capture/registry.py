@@ -229,6 +229,59 @@ def build_consumers(
     return tuple(sinks), tuple(validators), name_to_index
 
 
+def build_admission_validators(vllm_config: VllmConfig) -> dict[str, Any]:
+    """Build the ``name -> validator`` map used to resolve client capture
+    specs at admission (the OpenAI ``_admit_capture`` and the offline
+    ``InputProcessor``).
+
+    The keys match :func:`build_consumers`' ``name_to_index`` exactly —
+    same iteration order (config entries, then pre-built instances) and the
+    same ``_insert_unique`` collision suffixing — so the name a client puts
+    in ``capture={<name>: ...}`` resolves to the same consumer at admission
+    as it does at the worker. Unlike ``build_consumers`` this skips sink
+    wrapping and driver bridges: admission only calls the side-effect-free
+    ``validate_client_spec``, which lives on the raw consumer / instance.
+
+    Config (dict/spec-form) consumers are rebuilt from the entry-point
+    registry; pre-built instances (``LLM(capture_consumers=[obj])``) are used
+    directly. Returns an empty map when capture is not configured.
+    """
+    config = getattr(vllm_config, "capture_consumers_config", None)
+    if config is None:
+        return {}
+
+    # Same two shapes ``build_consumers`` accepts: the ``CaptureConsumersConfig``
+    # dataclass or a plain ``list[dict]`` (test/legacy convenience).
+    if hasattr(config, "consumers"):
+        config_entries: list[Any] = list(config.consumers)
+        instances: list[Any] = list(getattr(config, "instances", []) or [])
+    else:
+        config_entries = list(config)
+        instances = []
+
+    # Build a parallel validators list + name_to_index via the shared
+    # ``_insert_unique`` so the keying is byte-for-byte the runner's.
+    validators: list[Any] = []
+    name_to_index: dict[str, int] = {}
+    for entry in config_entries:
+        if hasattr(entry, "name"):
+            entry_name: str = entry.name
+            instance_name: str | None = getattr(entry, "instance_name", None)
+            params: dict[str, Any] = getattr(entry, "params", {}) or {}
+        else:
+            entry_name = entry["name"]
+            instance_name = entry.get("instance_name")
+            params = entry.get("params", {}) or {}
+        validators.append(build_consumer(entry_name, vllm_config, params))
+        _insert_unique(name_to_index, instance_name or entry_name, len(validators) - 1)
+
+    for instance in instances:
+        validators.append(instance)
+        _insert_unique(name_to_index, type(instance).__name__, len(validators) - 1)
+
+    return {name: validators[idx] for name, idx in name_to_index.items()}
+
+
 def _insert_unique(mapping: dict[str, int], key: str, value: int) -> None:
     """Insert ``key -> value`` into *mapping*, suffixing duplicates.
 
