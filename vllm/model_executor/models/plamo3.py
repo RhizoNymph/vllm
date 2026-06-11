@@ -275,9 +275,9 @@ class Plamo3DecoderLayer(nn.Module):
             self.pre_mlp_norm.weight,
             {"weight_loader": rms_norm_weight_loader(offset=1.0)},
         )
-        self.post_mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_block_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         set_weight_attrs(
-            self.post_mlp_norm.weight,
+            self.post_block_norm.weight,
             {"weight_loader": rms_norm_weight_loader(offset=1.0 / (5**1.5))},
         )
 
@@ -305,9 +305,9 @@ class Plamo3DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.pre_mlp_norm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_norm(hidden_states)
+        hidden_states = self.post_block_norm(hidden_states)
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
         return hidden_states, residual
 

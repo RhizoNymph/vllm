@@ -209,7 +209,7 @@ class Glm4DecoderLayer(nn.Module):
         self.post_self_attn_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_block_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -235,8 +235,8 @@ class Glm4DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_layernorm(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        hidden_states = self.post_block_layernorm(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
 
         return hidden_states, residual
 

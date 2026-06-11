@@ -42,7 +42,7 @@ VllmInternalRequestId = NewType("VllmInternalRequestId", str)
 HookName = Literal[
     "pre_attn",
     "post_attn",
-    "post_mlp",
+    "post_block",
     "mlp_in",
     "mlp_out",
 ]

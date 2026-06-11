@@ -369,7 +369,7 @@ class TransformerBlockWithSplits(nn.Module):
         )
 
         # Post-MLP norm
-        self.post_mlp_norm = nn.Parameter(torch.ones(hidden_size, dtype=torch.bfloat16))
+        self.post_block_norm = nn.Parameter(torch.ones(hidden_size, dtype=torch.bfloat16))
 
     def forward(self, x: torch.Tensor):
         # Attention block with residual
@@ -391,7 +391,7 @@ class TransformerBlockWithSplits(nn.Module):
 
         # Fused add + norm (maybe_inplace: residual1 is donated)
         normed2, residual2 = ops.fused_add_rms_norm.maybe_inplace(
-            mlp_out, residual1, self.post_mlp_norm, 1e-5
+            mlp_out, residual1, self.post_block_norm, 1e-5
         )
 
         return normed2, residual2

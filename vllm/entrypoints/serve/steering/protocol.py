@@ -23,7 +23,7 @@ class SetSteeringRequest(BaseModel):
         default=None,
         description="Base steering vectors applied to both prefill and "
         "decode phases. Keyed by hook point name (pre_attn, post_attn, "
-        "post_mlp). Each hook's value is either a legacy layer map "
+        "post_block). Each hook's value is either a legacy layer map "
         "({layer_idx: list[float] | {\"vector\": [...], \"scale\": float}}) "
         "or a binary-wire SteeringHookPacked blob (base64-encoded "
         "(num_layers, hidden_size) buffer + layer_indices + dtype/shape, "

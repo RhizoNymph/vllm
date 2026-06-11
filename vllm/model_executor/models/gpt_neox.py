@@ -212,7 +212,7 @@ class GPTNeoXLayer(nn.Module):
                 self, hidden_states, SteeringHookPoint.POST_ATTN
             )
             hidden_states = apply_layer_steering(
-                self, hidden_states, SteeringHookPoint.POST_MLP
+                self, hidden_states, SteeringHookPoint.POST_BLOCK
             )
         else:
             # pseudocode:
@@ -226,7 +226,7 @@ class GPTNeoXLayer(nn.Module):
             mlp_output = self.mlp(mlp_input)
             hidden_states = mlp_output + attn_output
             hidden_states = apply_layer_steering(
-                self, hidden_states, SteeringHookPoint.POST_MLP
+                self, hidden_states, SteeringHookPoint.POST_BLOCK
             )
         return hidden_states
 

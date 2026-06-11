@@ -960,7 +960,7 @@ class OpenPanguDecoderLayer(nn.Module):
             self.pre_mlp_layernorm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-            self.post_mlp_layernorm = RMSNorm(
+            self.post_block_layernorm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
@@ -1015,8 +1015,8 @@ class OpenPanguDecoderLayer(nn.Module):
             hidden_states *= 1.0 / self.routed_scaling_factor
 
         if self.sandwich_norm:
-            hidden_states = self.post_mlp_layernorm(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+            hidden_states = self.post_block_layernorm(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
 
         return hidden_states, residual
 

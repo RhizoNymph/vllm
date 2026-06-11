@@ -339,7 +339,7 @@ class AfmoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.pre_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_block_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -364,7 +364,7 @@ class AfmoeDecoderLayer(nn.Module):
             hidden_states, residual
         )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_layernorm(hidden_states)  # ffn norm b
+        hidden_states = self.post_block_layernorm(hidden_states)  # ffn norm b
 
         return hidden_states, residual
 

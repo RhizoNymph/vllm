@@ -61,7 +61,7 @@ class TestChatProtocolRoundTrip:
                 "filesystem": {
                     "request_id": "r1",
                     "tag": "t1",
-                    "hooks": {"post_mlp": [0]},
+                    "hooks": {"post_block": [0]},
                     "positions": "last_prompt",
                 },
             },
@@ -226,13 +226,13 @@ class TestBuildCaptureResultsResponse:
         final = _FakeFinal(
             capture_results={
                 "fs": CaptureResult(
-                    key=("r1", 0, "post_mlp"),
+                    key=("r1", 0, "post_block"),
                     status="ok",
                     error=None,
                     payload=["/tmp/a.bin", "/tmp/a.json"],
                 ),
                 "log": CaptureResult(
-                    key=("r1", 0, "post_mlp"),
+                    key=("r1", 0, "post_block"),
                     status="partial_error",
                     error="dropped",
                     payload=None,
@@ -280,7 +280,7 @@ class _FakeConsumerAccepts(CaptureConsumer):
 
     def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
         # Returns a valid CaptureSpec derived from the raw payload.
-        return CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        return CaptureSpec(hooks={"post_block": [0]}, positions="last_prompt")
 
     def on_capture(self, key, tensor, sidecar):  # pragma: no cover - unused
         pass
@@ -414,7 +414,7 @@ class TestAdmitCaptureValidation:
         stub._capture_consumers = {"filesystem": consumer}
 
         sp = SamplingParams(
-            capture={"filesystem": {"tag": "t", "hooks": {"post_mlp": [0]}}}
+            capture={"filesystem": {"tag": "t", "hooks": {"post_block": [0]}}}
         )
 
         result = admit(
@@ -460,7 +460,7 @@ class TestAdmitCaptureValidation:
 
             def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
                 received.append(ctx)
-                return CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+                return CaptureSpec(hooks={"post_block": [0]}, positions="last_prompt")
 
             def on_capture(self, key, tensor, sidecar):  # pragma: no cover
                 pass

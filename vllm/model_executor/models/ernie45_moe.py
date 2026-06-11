@@ -421,7 +421,7 @@ class Ernie4_5_MoeDecoderLayer(nn.Module):
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
 
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
 
         return hidden_states, residual
 

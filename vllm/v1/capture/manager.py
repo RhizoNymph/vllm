@@ -1461,7 +1461,7 @@ class CaptureManager:
                 dummy_key = (
                     VllmInternalRequestId(req_id),
                     0,
-                    "post_mlp",
+                    "post_block",
                 )
                 results[consumer_idx] = CaptureResult(
                     key=dummy_key,

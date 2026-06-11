@@ -492,7 +492,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     steering_vectors: SteeringVectorSpecPacked | None = Field(
         default=None,
         description="Per-request activation steering vectors keyed by hook "
-        "point name (pre_attn, post_attn, post_mlp). Each hook carries one "
+        "point name (pre_attn, post_attn, post_block). Each hook carries one "
         "base64-encoded (num_layers, hidden_size) blob plus a sibling "
         "layer_indices list (and optional per-row scales).",
     )

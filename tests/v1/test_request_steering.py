@@ -30,8 +30,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 # Helpers
 # ---------------------------------------------------------------------------
 
-STEERING_A = {"post_mlp": {0: [1.0, 2.0]}}
-STEERING_B = {"post_mlp": {0: [99.0, 100.0]}}
+STEERING_A = {"post_block": {0: [1.0, 2.0]}}
+STEERING_B = {"post_block": {0: [99.0, 100.0]}}
 
 init_none_hash(sha256_cbor)
 

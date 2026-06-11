@@ -319,7 +319,7 @@ class HyperCLOVAXDecoderLayer(nn.Module):
         # The residual is added outside the layernorm function to apply muP.
         hidden_states = residual + hidden_states * self.residual_multiplier  # muP
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
 
         return hidden_states, residual

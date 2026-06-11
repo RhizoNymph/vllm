@@ -418,7 +418,7 @@ class MiniCPMDecoderLayer(nn.Module):
             self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
         )
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
 
         return hidden_states, None

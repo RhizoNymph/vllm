@@ -690,7 +690,7 @@ class Plamo2DecoderLayer(nn.Module):
         self.pre_mixer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_mixer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_block_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -729,9 +729,9 @@ class Plamo2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.pre_mlp_norm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_norm(hidden_states)
+        hidden_states = self.post_block_norm(hidden_states)
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
         return hidden_states, residual
 
@@ -1007,7 +1007,7 @@ class Plamo2ForCausalLM(
                 loaded_weight += 1.0 / 5
             elif ".pre_mlp_norm" in name:
                 loaded_weight += 1.0
-            elif ".post_mlp_norm" in name:
+            elif ".post_block_norm" in name:
                 loaded_weight += 1.0 / (5**1.5)
             elif "model.norm.weight" in name:
                 loaded_weight += 1.0

@@ -578,7 +578,7 @@ class Gemma3nDecoderLayer(nn.Module):
         attn_ffw_norm = self.post_feedforward_layernorm(attn_ffw)
         attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
         attn_ffw_laurel_gated = apply_layer_steering(
-            self, attn_ffw_laurel_gated, SteeringHookPoint.POST_MLP
+            self, attn_ffw_laurel_gated, SteeringHookPoint.POST_BLOCK
         )
 
         # ActUp (connect).

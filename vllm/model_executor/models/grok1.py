@@ -452,7 +452,7 @@ class Grok1DecoderLayer(nn.Module):
         else:
             hidden_states = self.moe_block(hidden_states)
         hidden_states = self.post_moe_norm(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
 
         return hidden_states, residual
 

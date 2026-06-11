@@ -649,7 +649,7 @@ class AXK1DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_block_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.routed_scaling_factor = config.routed_scaling_factor
 
     def _is_layer_sparse(self) -> bool:
@@ -701,7 +701,7 @@ class AXK1DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         if self.is_layer_sparse:
-            hidden_states = self.post_mlp_layernorm(hidden_states)
+            hidden_states = self.post_block_layernorm(hidden_states)
 
         if isinstance(self.mlp, AXK1MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
@@ -710,7 +710,7 @@ class AXK1DecoderLayer(nn.Module):
             # The scaling of AXK1MOE output would be done in the forward
             # of AXK1MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
 
         return hidden_states, residual
 

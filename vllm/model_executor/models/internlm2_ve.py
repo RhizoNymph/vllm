@@ -110,7 +110,7 @@ class InternLM2VEDecoderLayer(nn.Module):
                 ).flatten()
         else:
             hidden_states = self.feed_forward(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
         return hidden_states, residual
 
 

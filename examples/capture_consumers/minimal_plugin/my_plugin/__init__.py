@@ -28,7 +28,7 @@ class SumConsumer(CaptureConsumer):
 
     def global_capture_spec(self) -> CaptureSpec:
         return CaptureSpec(
-            hooks={"post_mlp": self._layers},
+            hooks={"post_block": self._layers},
             positions="last_prompt",
         )
 

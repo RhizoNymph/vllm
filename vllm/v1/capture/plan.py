@@ -62,7 +62,7 @@ class CapturePositionEntry:
     Attributes:
         request_id: The owning request's id.
         layer: Decoder-layer index.
-        hook: Hook-point name (e.g. ``"post_mlp"``).
+        hook: Hook-point name (e.g. ``"post_block"``).
         logical_pos: Absolute position in the request's token sequence.
         scratch_row: Index within the ``(layer, hook)``'s scratch tensor.
         step_index: Capture-step ordinal for this request.

@@ -227,7 +227,7 @@ class PhiLayer(nn.Module):
         )
         hidden_states = attn_hidden_states + feed_forward_hidden_states
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
         return hidden_states
 
