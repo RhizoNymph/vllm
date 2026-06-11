@@ -26,6 +26,12 @@ from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
 )
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.steering_action_queue import (
+    SteeringActionQueue,
+    apply_steering_updates,
+    get_steering_action_queue,
+    install_steering_action_queue,
+)
 from vllm.v1.worker.steering_manager import SteeringManager
 
 
@@ -211,6 +217,29 @@ class SteeringModelRunnerMixin:
             steering_config.max_steering_configs,
             device=table_device,
         )
+
+        # Dynamic steering action queue (Phase 0). Installed only in
+        # single-rank topologies: capture consumers — the expected
+        # submitters — are constructed on TP rank 0 only, so updates
+        # originating from one would silently diverge the steering
+        # tables across TP/PP ranks. See steering_action_queue.py and
+        # docs/design/dynamic_steering.md for the determinism contract.
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        tp_size = getattr(parallel_config, "tensor_parallel_size", 1)
+        pp_size = getattr(parallel_config, "pipeline_parallel_size", 1)
+        if tp_size == 1 and pp_size == 1:
+            install_steering_action_queue(SteeringActionQueue())
+            logger.info(
+                "dynamic steering action queue installed (tp=1, pp=1)"
+            )
+        else:
+            install_steering_action_queue(None)
+            logger.info(
+                "dynamic steering action queue unavailable: requires "
+                "tp=1 and pp=1, got tp=%d pp=%d",
+                tp_size,
+                pp_size,
+            )
 
         # Pre-allocate CPU scratch buffers for the vectorized
         # steering_index build in ``_update_steering_buffers``.  The
@@ -875,6 +904,24 @@ class SteeringModelRunnerMixin:
         """
         if self._steering_manager is None or not self._steerable_layers_cache:
             return
+
+        # Dynamic steering (Phase 0): drain the in-process action queue
+        # before anything else so updates submitted during step N (by a
+        # capture consumer on the dispatch thread) are visible to the
+        # tables built for step N+1. Must run before the nothing-active
+        # short-circuit below — a drained update may be exactly what
+        # activates steering. Application sets ``_tables_dirty``, so the
+        # existing populate path uploads the new state; no new buffer
+        # code path. Empty-queue steady state costs one global read and
+        # one truthiness check per step.
+        action_queue = get_steering_action_queue()
+        if action_queue is not None and action_queue:
+            apply_steering_updates(
+                action_queue.drain(),
+                self._steering_manager,
+                self._steerable_layers_cache,
+                queue=action_queue,
+            )
 
         # Short-circuit when no steering state is actually active. The model
         # runner allocates per-layer steering buffers (zero-initialized) and
