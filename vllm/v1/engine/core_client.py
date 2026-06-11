@@ -976,7 +976,14 @@ class AsyncMPClient(MPClient):
                             return
                         await output_handler(_self, outputs)
 
-                    if outputs.outputs or outputs.scheduler_stats:
+                    if (
+                        outputs.outputs
+                        or outputs.scheduler_stats
+                        # Late capture results ride a bare EngineCoreOutputs
+                        # (no per-request outputs: the owning request already
+                        # finished) -- don't drop them here.
+                        or outputs.late_capture_results
+                    ):
                         outputs_queue.put_nowait(outputs)
             except Exception as e:
                 outputs_queue.put_nowait(e)

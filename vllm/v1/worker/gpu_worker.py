@@ -332,6 +332,11 @@ class Worker(WorkerBase):
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
+    def drain_pending_capture_results(self) -> dict:
+        """collective_rpc target -- see GPUModelRunner.drain_pending_capture_results."""
+        fn = getattr(self.model_runner, "drain_pending_capture_results", None)
+        return fn() if fn is not None else {}
+
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         with (
             self._maybe_get_memory_pool_context(tag="weights"),

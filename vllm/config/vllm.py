@@ -2039,6 +2039,16 @@ class VllmConfig:
             # Will be added by https://github.com/vllm-project/vllm/pull/38163
             unsupported.append("routed experts capture")
 
+        # Activation capture + steering are wired into the v1 model runner
+        # only (apply_layer_steering call sites / CaptureManager live in
+        # vllm/v1/worker/gpu_model_runner.py). Selecting the v2 runner with
+        # either feature configured silently no-ops every capture/steer, so
+        # force the v1 fallback (the standard warning fires).
+        if getattr(self, "capture_consumers_config", None) is not None:
+            unsupported.append("activation capture consumers")
+        if getattr(self, "steering_config", None) is not None:
+            unsupported.append("activation steering")
+
         has_logitsproc_plugins = False
         if model_config is not None:
             from importlib.metadata import entry_points

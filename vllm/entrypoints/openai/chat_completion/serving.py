@@ -106,13 +106,24 @@ def _capture_result_to_response_payload(payload: Any) -> dict[str, Any]:
       dict JSON-safe.
     - Everything else is wrapped as ``{"value": <payload>}``.
     """
+    def _coerce(p: Any) -> Any:
+        # Results that crossed the engine-IPC boundary (late finalize,
+        # ``capture_wait``) are msgspec round-tripped: ``Path`` objects
+        # arrive as ``bytes``/``str``, not ``Path`` -- so don't rely on
+        # ``__fspath__`` alone. Anything non-JSON-primitive is stringified.
+        if isinstance(p, bytes):
+            return p.decode("utf-8", errors="replace")
+        if isinstance(p, (str, int, float, bool)) or p is None:
+            return p
+        return str(p)
+
     if payload is None:
         return {}
     if isinstance(payload, dict):
-        return dict(payload)
+        return {str(k): _coerce(v) for k, v in payload.items()}
     if isinstance(payload, (list, tuple)):
-        return {"items": [str(p) if hasattr(p, "__fspath__") else p for p in payload]}
-    return {"value": payload}
+        return {"items": [_coerce(p) for p in payload]}
+    return {"value": _coerce(payload)}
 
 
 def _build_capture_results_response(
@@ -125,9 +136,29 @@ def _build_capture_results_response(
     response field entirely, keeping the payload small for the common
     uncaptured request.
     """
-    del request  # kept for uniform signature with other response builders
     results = getattr(final_res, "capture_results", None)
     if not results:
+        # The request finished generating before its captures finalized
+        # (writes are asynchronous -- a request's files may land seconds
+        # after the response on slow filesystems). If the request opted
+        # into capture, surface that explicitly instead of omitting the
+        # field, so clients can tell "capture pending" from "no capture".
+        requested = getattr(request, "capture", None)
+        if requested:
+            return {
+                name: CaptureResultResponse(
+                    status="pending",
+                    error=None,
+                    payload={
+                        "detail": (
+                            "capture admitted; results are written "
+                            "asynchronously and had not finalized when the "
+                            "response was generated"
+                        )
+                    },
+                )
+                for name in requested
+            }
         return None
     response: dict[str, CaptureResultResponse] = {}
     for name, result in results.items():
@@ -1611,6 +1642,18 @@ class OpenAIServingChat(OpenAIServing):
 
         # ``final_res.prompt`` is the rendered chat-templated prompt text
         prompt_text = final_res.prompt if request.return_prompt_text else None
+        if (
+            request.capture
+            and getattr(request, "capture_wait", False)
+            and not final_res.capture_results
+            and hasattr(self.engine_client, "wait_for_capture_results")
+        ):
+            late = await self.engine_client.wait_for_capture_results(
+                final_res.request_id
+            )
+            if late:
+                final_res.capture_results = late
+
 
         response = ChatCompletionResponse(
             id=request_id,

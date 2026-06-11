@@ -1691,7 +1691,7 @@ class Scheduler(SchedulerInterface):
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
-                        capture_results=capture_results.get(req_id, {}),
+                        capture_results=capture_results.pop(req_id, {}),
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
                         kv_transfer_params=kv_transfer_params,
@@ -1752,6 +1752,19 @@ class Scheduler(SchedulerInterface):
             client_index: EngineCoreOutputs(outputs=outs)
             for client_index, outs in outputs.items()
         }
+
+        # Anything still in ``capture_results`` finalized AFTER its request
+        # finished (no EngineCoreOutput exists to carry it). Surface it
+        # batch-level for ``capture_wait`` clients. NOTE: delivered on
+        # client 0's outputs -- the owning client is no longer tracked once
+        # the request finishes; multi-client routing is a follow-up.
+        late_capture_results = {
+            rid: res for rid, res in capture_results.items() if res
+        }
+        if late_capture_results:
+            if 0 not in engine_core_outputs:
+                engine_core_outputs[0] = EngineCoreOutputs()
+            engine_core_outputs[0].late_capture_results = late_capture_results
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:

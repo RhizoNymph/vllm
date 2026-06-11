@@ -68,6 +68,15 @@ class FilesystemConsumerParams:
     # Default on-disk layout for requests that don't set their own
     # ``layout`` ("per_file" or "packed"). See FilesystemCaptureRequest.
     default_layout: str = "per_file"
+    # Optional GLOBAL capture spec: when set, EVERY request is captured
+    # without per-request opt-in (dedicated batch-capture servers). String
+    # format is CLI-shorthand-safe (no commas):
+    # ``"<hook>:<layers>[;<hook>:<layers>]"`` where ``<layers>`` is
+    # ``all`` | ``<a>-<b>`` (inclusive) | ``<i>.<j>.<k>`` (dot-separated).
+    # e.g. ``global_hooks=post_block:all`` or ``pre_attn:0-17;post_block:20``.
+    global_hooks: str | None = None
+    # Position selector for the global spec (default "all_prompt").
+    global_positions: str = "all_prompt"
     # Merge consecutive same-key queued writes into one vectored write,
     # up to this many bytes. Amortizes per-write syscall/RTT overhead —
     # most effective for the ``packed`` layout (many small per-step

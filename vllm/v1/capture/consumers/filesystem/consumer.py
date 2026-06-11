@@ -77,6 +77,10 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
         fsync=bool(params.get("fsync", True)),
         atomic_publish=bool(params.get("atomic_publish", True)),
         default_layout=str(params.get("default_layout", "per_file")),
+        global_hooks=(
+            str(params["global_hooks"]) if params.get("global_hooks") else None
+        ),
+        global_positions=str(params.get("global_positions", "all_prompt")),
         coalesce_max_bytes=int(params.get("coalesce_max_bytes", 1 << 20)),
         num_shards=int(params.get("num_shards", 8)),
         shard_max_bytes=int(params.get("shard_max_bytes", 256 << 20)),
@@ -290,9 +294,42 @@ class FilesystemConsumer:
     # CaptureSink protocol
     # ------------------------------------------------------------------
 
-    def global_capture_spec(self) -> None:
-        """Filesystem consumer has no global spec — capture is per-request."""
-        return None
+    def global_capture_spec(self) -> "CaptureSpec | None":
+        """Global spec from boot-time params (``global_hooks``), if any.
+
+        Lets a dedicated batch-capture server capture EVERY request without
+        per-request opt-in -- and, because global specs ride the persistent-
+        buffer path, without forcing eager steps under CUDA graphs. Files
+        for un-tagged requests land under the request-id slug fallback.
+        """
+        if self._params.global_hooks is None:
+            return None
+        from vllm.v1.capture.types import CaptureSpec
+
+        num_layers = (
+            self._vllm_config.model_config.get_total_num_hidden_layers()
+        )
+
+        def layers(spec: str) -> list[int]:
+            spec = spec.strip()
+            if spec == "all":
+                return list(range(num_layers))
+            if "-" in spec:
+                lo, hi = spec.split("-", 1)
+                return list(range(int(lo), int(hi) + 1))
+            return [int(x) for x in spec.split(".")]
+
+        hooks: dict[str, list[int]] = {}
+        for part in self._params.global_hooks.split(";"):
+            hook, _, layerspec = part.partition(":")
+            if not layerspec:
+                raise ValueError(
+                    f"global_hooks entry {part!r} must be '<hook>:<layers>'"
+                )
+            hooks[hook.strip()] = layers(layerspec)
+        return CaptureSpec(
+            hooks=hooks, positions=self._params.global_positions
+        )
 
     def validate_client_spec(
         self,

@@ -60,7 +60,7 @@ Python API):
 | `timeout_seconds` | `float` | `180.0` | Per-write timeout; failures become `partial_error`. |
 | `on_collision` | `"overwrite" \| "error" \| "suffix"` | `"overwrite"` | What to do when the target `.bin` already exists. |
 | `fd_cache_size` | `int` | `256` | Per-thread LRU file-descriptor cache. |
-| `fsync` | `bool` | `True` | `fsync` each file before publish. `False` trades crash-durability for throughput (near-no-op on NFS, where `close` already COMMITs). |
+| `fsync` | `bool` | `True` | `fsync` each file before publish. `False` trades crash-durability for throughput. **Not** a no-op on NFS: the writer holds files open in its LRU FD cache, so close-time COMMIT semantics don't apply -- each publish-time `fsync` is a synchronous COMMIT round-trip to the file server (measured ~90 files/s on one NFS deployment; a 100-request x 36-layer `per_file` run takes ~40 s to flush). Prefer `fsync=False` and/or the `packed` layout on network filesystems when captures are reproducible. |
 | `atomic_publish` | `bool` | `True` | Publish via `.tmp` + atomic rename. `False` writes straight to the final path (drops two rename RPCs/file, loses atomic visibility; requires `on_collision="overwrite"`). |
 | `default_layout` | `"per_file" \| "packed" \| "sharded"` | `"per_file"` | Layout for requests that don't set their own `layout`. |
 | `coalesce_max_bytes` | `int` | `1<<20` | Merge consecutive same-key queued writes into one `writev` up to this size (`0` disables). Most effective for `packed`/`sharded`. |
@@ -179,6 +179,16 @@ ceiling. The right lever depends on whether you're disk-bound or code-bound:
 
 For online capture during serving, none of this is on the critical path —
 residual-stream volume at token-generation rate is far below these ceilings.
+
+#### Durability vs. response timing
+
+A request's HTTP response is generated when **text generation** finishes;
+its capture files are written **asynchronously** and may land seconds later
+(see the `fsync` note above). The response's `capture_results` field reports
+`status: "pending"` in that case. Clients that read files immediately after
+a batch should wait for the expected file set per request (`layers x hooks`
+files in `per_file` layout) rather than sleeping a fixed interval -- a
+fixed sleep races the flush and is indistinguishable from data loss.
 
 #### Backpressure & overload
 
