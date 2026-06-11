@@ -274,3 +274,81 @@ def test_float64_input_cast_to_float32():
     applied, _ = apply_steering_updates([_update(vec=vec)], mgr, {0: _FakeLayer()})
     assert applied == 1
     assert mgr.calls[0][2].dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# End-to-end against the real SteeringManager
+# ---------------------------------------------------------------------------
+
+
+class _RealSteerableLayer(torch.nn.Module):
+    """Layer with a real registered steering-table buffer."""
+
+    def __init__(self, num_rows: int, hidden_size: int):
+        super().__init__()
+        self.register_buffer(
+            "steering_table_post_mlp", torch.zeros(num_rows, hidden_size)
+        )
+
+
+def _real_setup():
+    from vllm.v1.worker.steering_manager import SteeringManager
+
+    mgr = SteeringManager(max_steering_configs=4, device=None)
+    layers = {0: _RealSteerableLayer(4 + 3, HIDDEN)}
+    return mgr, layers
+
+
+def test_real_manager_decode_update_lands_in_row_2():
+    """Drained decode update must materialize in the global-decode row
+    (row 2) of the layer's table after the populate path runs — the
+    same sequence ``_update_steering_buffers`` performs each step."""
+    mgr, layers = _real_setup()
+    q = SteeringActionQueue()
+    vec = np.linspace(0.0, 1.5, HIDDEN, dtype=np.float32)
+    q.submit(_update(vec=vec))
+
+    applied, rejected = apply_steering_updates(q.drain(), mgr, layers, queue=q)
+    assert (applied, rejected) == (1, 0)
+    assert mgr._tables_dirty
+
+    mgr.populate_steering_tables(layers)
+    table = layers[0].steering_table_post_mlp
+    torch.testing.assert_close(table[2], torch.from_numpy(vec))
+    # Prefill row and sentinel untouched.
+    assert torch.all(table[0] == 0)
+    assert torch.all(table[1] == 0)
+
+
+def test_real_manager_zero_vector_disengages():
+    """A follow-up zero-vector update must zero the decode row (the
+    plugin's disengage emission)."""
+    mgr, layers = _real_setup()
+    apply_steering_updates(
+        [_update(vec=np.ones(HIDDEN, dtype=np.float32))], mgr, layers
+    )
+    mgr.populate_steering_tables(layers)
+    assert torch.all(layers[0].steering_table_post_mlp[2] == 1.0)
+
+    apply_steering_updates(
+        [_update(vec=np.zeros(HIDDEN, dtype=np.float32))], mgr, layers
+    )
+    mgr.populate_steering_tables(layers)
+    assert torch.all(layers[0].steering_table_post_mlp[2] == 0.0)
+
+
+def test_real_manager_decode_update_composes_with_per_request_config():
+    """Rows 3+ combine global decode + per-request vectors; a dynamic
+    global-decode update must flow into a decode-phase request row."""
+    mgr, layers = _real_setup()
+    req_vec = [2.0] * HIDDEN
+    row = mgr.register_config(
+        config_hash=7, vectors={"post_mlp": {0: req_vec}}, phase="decode"
+    )
+    apply_steering_updates(
+        [_update(vec=np.ones(HIDDEN, dtype=np.float32))], mgr, layers
+    )
+    mgr.populate_steering_tables(layers)
+    table = layers[0].steering_table_post_mlp
+    # Request row = global decode (1.0) + per-request (2.0).
+    assert torch.all(table[row] == 3.0)
