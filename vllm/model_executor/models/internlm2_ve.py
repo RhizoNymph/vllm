@@ -14,6 +14,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     register_steering_buffers,
 )
@@ -110,7 +111,7 @@ class InternLM2VEDecoderLayer(nn.Module):
                 ).flatten()
         else:
             hidden_states = self.feed_forward(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 

@@ -63,6 +63,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -1016,7 +1017,7 @@ class OpenPanguDecoderLayer(nn.Module):
 
         if self.sandwich_norm:
             hidden_states = self.post_block_layernorm(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 
         return hidden_states, residual
 

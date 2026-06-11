@@ -50,6 +50,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -219,7 +220,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 
         return hidden_states, residual
 

@@ -39,6 +39,7 @@ from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionW
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -398,7 +399,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 

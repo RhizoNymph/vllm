@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -268,7 +269,7 @@ class Gemma2DecoderLayer(nn.Module):
             hidden_states, residual
         )
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         return hidden_states, residual
 

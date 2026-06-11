@@ -19,6 +19,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
 )
 from vllm.model_executor.models.llama import (
@@ -206,7 +207,7 @@ class MistralDecoderLayer(LlamaDecoderLayer):
             hidden_states = hidden_states * (1 + self.ada_rms_norm_t_cond(t_cond))
 
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
