@@ -28,6 +28,7 @@ from vllm.model_executor.layers.steering import (
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.steering_action_queue import (
     SteeringActionQueue,
+    SteeringVectorUpdate,
     apply_steering_updates,
     get_steering_action_queue,
     install_steering_action_queue,
@@ -190,6 +191,9 @@ class SteeringModelRunnerMixin:
         self._steering_module_registry = {}
         self._steering_module_resolved_cache = {}
         self._steering_module_pinned_rows = {}
+        # Per-source applied/rejected counters for dynamic steering
+        # actions (both transports), keyed by submitting source name.
+        self._dynamic_steering_stats: dict[str, dict[str, int]] = {}
 
         steering_config = getattr(self.vllm_config, "steering_config", None)
         if steering_config is None or not steerable:
@@ -888,6 +892,65 @@ class SteeringModelRunnerMixin:
     # Per-step buffer / index maintenance
     # -----------------------------------------------------------------------
 
+    def _apply_steering_actions(
+        self,
+        actions: list,
+        *,
+        source: str,
+        queue: "SteeringActionQueue | None" = None,
+    ) -> tuple[int, int]:
+        """Validate and apply dynamic steering actions on the step thread.
+
+        The single apply path shared by both transports: the async
+        action queue (drained at the top of
+        ``_update_steering_buffers``) and sync consumers' ``on_step``
+        returns (applied inline post-forward by the runner). Returns
+        ``(applied, rejected)`` and records per-``source`` counters.
+
+        Unknown action types are rejected (counted, warned) rather than
+        raised — observer isolation extends to malformed action lists.
+        """
+        applied = 0
+        rejected = 0
+        updates: list[SteeringVectorUpdate] = []
+        for action in actions:
+            if isinstance(action, SteeringVectorUpdate):
+                updates.append(action)
+            else:
+                rejected += 1
+                logger.warning(
+                    "rejected dynamic steering action from %s: "
+                    "unsupported action type %s",
+                    source,
+                    type(action).__name__,
+                )
+
+        if updates:
+            if self._steering_manager is None or not self._steerable_layers_cache:
+                rejected += len(updates)
+                logger.warning(
+                    "rejected %d dynamic steering update(s) from %s: "
+                    "steering is not initialized on this worker",
+                    len(updates),
+                    source,
+                )
+            else:
+                ok, bad = apply_steering_updates(
+                    updates,
+                    self._steering_manager,
+                    self._steerable_layers_cache,
+                    queue=queue,
+                )
+                applied += ok
+                rejected += bad
+
+        stats = self._dynamic_steering_stats.setdefault(
+            source, {"applied": 0, "rejected": 0}
+        )
+        stats["applied"] += applied
+        stats["rejected"] += rejected
+        return applied, rejected
+
     def _update_steering_buffers(self, scheduler_output: "SchedulerOutput") -> None:
         """Update per-layer steering tables and the shared steering index.
 
@@ -905,21 +968,23 @@ class SteeringModelRunnerMixin:
         if self._steering_manager is None or not self._steerable_layers_cache:
             return
 
-        # Dynamic steering (Phase 0): drain the in-process action queue
-        # before anything else so updates submitted during step N (by a
-        # capture consumer on the dispatch thread) are visible to the
-        # tables built for step N+1. Must run before the nothing-active
-        # short-circuit below — a drained update may be exactly what
-        # activates steering. Application sets ``_tables_dirty``, so the
-        # existing populate path uploads the new state; no new buffer
-        # code path. Empty-queue steady state costs one global read and
-        # one truthiness check per step.
+        # Dynamic steering, async transport: drain the in-process action
+        # queue before anything else so updates submitted during step N
+        # (by a capture consumer on the dispatch thread) are visible to
+        # the tables built for step N+1. Must run before the
+        # nothing-active short-circuit below — a drained update may be
+        # exactly what activates steering. Application sets
+        # ``_tables_dirty``, so the existing populate path uploads the
+        # new state; no new buffer code path. Empty-queue steady state
+        # costs one global read and one truthiness check per step.
+        # (The sync transport — sync consumers' ``on_step`` returns —
+        # applies through the same ``_apply_steering_actions`` path,
+        # inline at the end of the previous step.)
         action_queue = get_steering_action_queue()
         if action_queue is not None and action_queue:
-            apply_steering_updates(
+            self._apply_steering_actions(
                 action_queue.drain(),
-                self._steering_manager,
-                self._steerable_layers_cache,
+                source="action_queue",
                 queue=action_queue,
             )
 

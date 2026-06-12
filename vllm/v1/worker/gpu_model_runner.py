@@ -542,6 +542,18 @@ class GPUModelRunner(
         # the TP/PP topology without a per-step collective. ``None`` when
         # the capture feature is disabled.
         self._capture_step_gate: Any = None
+        # Sync-execution consumers (``execution="sync"``): constructed
+        # on EVERY TP rank, run on the step thread post-forward via
+        # ``_run_sync_consumers``, reading the persistent global
+        # capture buffers. ``_sync_capture_buffers`` is whichever
+        # manager owns those buffers on this rank — the full manager on
+        # TP rank 0, a slim (buffers-only) manager elsewhere. See
+        # docs/design/dynamic_steering.md §5.1.
+        self._sync_consumers: list[tuple[str, Any]] = []
+        self._sync_capture_buffers: Any = None
+        self._sync_monitor_keys: list[tuple[int, str]] = []
+        self._sync_consumer_stats: dict[str, dict[str, Any]] = {}
+        self._sync_step_counter = 0
         if self.vllm_config.capture_consumers_config is not None:
             from vllm.model_executor.layers.activation_capture import (
                 set_active_capture_manager,
@@ -569,7 +581,47 @@ class GPUModelRunner(
             # captures the layers that stage owns; the engine merges the
             # per-stage results.
             if get_tp_group().rank_in_group != 0:
-                set_active_capture_manager(None)
+                from vllm.v1.capture import registry as _capture_registry
+                from vllm.v1.capture.manager import CaptureManager
+
+                # Sync consumers exist on every rank; async consumers
+                # must NOT be constructed here (their constructors have
+                # side effects — writer threads, open files).
+                self._sync_consumers = _capture_registry.build_sync_consumers(
+                    self.vllm_config
+                )
+                if not self._sync_consumers:
+                    set_active_capture_manager(None)
+                else:
+                    # Buffers-only manager: gives this rank the same
+                    # graph-baked full-residual ``copy_`` for the sync
+                    # monitor keys that rank 0 gets, with no dispatch
+                    # pipeline. The runner's ``_capture_manager`` stays
+                    # None so every existing rank-0-only call site
+                    # (register/build_step_plan/finalize) short-circuits.
+                    slim_mgr = CaptureManager(
+                        consumers=(),
+                        consumer_specs=(),
+                        extra_global_specs=tuple(
+                            c.global_capture_spec()
+                            for _, c in self._sync_consumers
+                        ),
+                        num_hidden_layers=(
+                            self.model_config.get_total_num_hidden_layers()
+                        ),
+                        local_layer_range=(
+                            self.model_config.get_layers_start_end_indices(
+                                self.vllm_config.parallel_config
+                            )
+                        ),
+                        hidden_size=self.model_config.get_hidden_size(),
+                        model_dtype=self.model_config.dtype,
+                        device=self.device,
+                        max_num_tokens=self.max_num_tokens,
+                        slim=True,
+                    )
+                    self._sync_capture_buffers = slim_mgr
+                    set_active_capture_manager(slim_mgr)
             else:
                 from vllm.v1.capture import registry as _capture_registry
                 from vllm.v1.capture.manager import CaptureManager
@@ -581,9 +633,15 @@ class GPUModelRunner(
                 # handled by ``build_consumers``.
                 instances = list(self.vllm_config.capture_consumers_config.instances)
 
-                sinks, validators, name_to_index = _capture_registry.build_consumers(
+                (
+                    sinks,
+                    validators,
+                    name_to_index,
+                    sync_consumers,
+                ) = _capture_registry.build_consumers(
                     self.vllm_config, consumer_instances=instances
                 )
+                self._sync_consumers = sync_consumers
 
                 # Gather each consumer's global spec.  The batched-adapter
                 # path reaches the ``CaptureConsumer`` via the validator;
@@ -605,6 +663,12 @@ class GPUModelRunner(
                 self._capture_manager = CaptureManager(
                     consumers=sinks,
                     consumer_specs=tuple(global_specs),
+                    # Sync consumers' monitor keys get persistent
+                    # buffers without sink slots; they read the buffers
+                    # directly on the step thread.
+                    extra_global_specs=tuple(
+                        c.global_capture_spec() for _, c in sync_consumers
+                    ),
                     # Global layer count for validation; the local slice
                     # this pipeline stage owns drives spec filtering so it
                     # captures and finalizes only its own layers.
@@ -636,6 +700,27 @@ class GPUModelRunner(
                 # the ``capture_residual`` custom op finds it from inside
                 # the compiled forward graph.
                 set_active_capture_manager(self._capture_manager)
+                # Sync consumers on rank 0 read the full manager's
+                # buffers.
+                self._sync_capture_buffers = self._capture_manager
+
+            # Sorted union of every sync consumer's monitored
+            # (layer, hook) keys — deterministic iteration order for the
+            # per-step view build on every rank.
+            if self._sync_consumers:
+                monitor_keys: set[tuple[int, str]] = set()
+                for _name, sync_consumer in self._sync_consumers:
+                    sync_spec = sync_consumer.global_capture_spec()
+                    for hook_name, layers in sync_spec.hooks.items():
+                        monitor_keys.update(
+                            (int(layer), hook_name) for layer in layers
+                        )
+                self._sync_monitor_keys = sorted(monitor_keys)
+                logger.info(
+                    "sync capture consumers active: %s (monitor keys: %s)",
+                    [name for name, _ in self._sync_consumers],
+                    self._sync_monitor_keys,
+                )
 
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
@@ -1884,6 +1969,95 @@ class GPUModelRunner(
             num_scheduled_tokens=num_scheduled_tokens,
             token_offsets=token_offsets,
         )
+
+    def _build_step_capture_view(self, scheduler_output: "SchedulerOutput"):
+        """Build the :class:`StepCaptureView` for sync consumers.
+
+        Every input is rank-identical — ``scheduler_output`` is
+        broadcast, and the ``input_batch`` arrays consulted here are
+        maintained on every rank by ``_update_states`` — so the view
+        (and any pure consumer decision derived from it) agrees across
+        the TP group without communication.
+        """
+        from vllm.v1.capture.step_view import StepCaptureView, StepRequestView
+
+        num_tokens = int(scheduler_output.total_num_scheduled_tokens)
+        tensors: dict[tuple[int, str], torch.Tensor] = {}
+        for key in self._sync_monitor_keys:
+            buf = self._sync_capture_buffers.global_buffer(key)
+            if buf is not None:
+                tensors[key] = buf[:num_tokens]
+
+        num_scheduled_map = scheduler_output.num_scheduled_tokens
+        requests: list[StepRequestView] = []
+        token_offset = 0
+        for i in range(self.input_batch.num_reqs):
+            req_id = self.input_batch.req_ids[i]
+            n_tokens = num_scheduled_map.get(req_id, 0)
+            if n_tokens == 0:
+                continue
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                # Mirror ``_build_capture_batch_view``: not in the batch
+                # yet — advance the offset, expose no request view.
+                token_offset += n_tokens
+                continue
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+            token_ids = np.asarray(
+                self.input_batch.token_ids_cpu[
+                    req_index, num_computed : num_computed + n_tokens
+                ]
+            ).copy()
+            requests.append(
+                StepRequestView(
+                    req_id=req_id,
+                    start=token_offset,
+                    end=token_offset + n_tokens,
+                    phase="prefill" if num_computed < num_prompt else "decode",
+                    token_ids=token_ids,
+                )
+            )
+            token_offset += n_tokens
+
+        return StepCaptureView(
+            step=self._sync_step_counter,
+            tensors=tensors,
+            requests=requests,
+        )
+
+    def _run_sync_consumers(self, scheduler_output: "SchedulerOutput") -> None:
+        """Run every sync consumer's ``on_step`` on the step thread.
+
+        Called post-forward (after capture dispatch) on **every** TP
+        rank. Consumer exceptions are isolated; returned steering
+        actions apply inline through the mixin's
+        ``_apply_steering_actions`` so they are visible to the next
+        step's ``_update_steering_buffers``. Per-consumer wall time is
+        accumulated in ``_sync_consumer_stats``.
+        """
+        self._sync_step_counter += 1
+        view = self._build_step_capture_view(scheduler_output)
+        for name, consumer in self._sync_consumers:
+            t0 = time.perf_counter()
+            try:
+                actions = consumer.on_step(view)
+            except Exception:
+                logger.exception(
+                    "sync capture consumer %s failed in on_step; "
+                    "continuing without its actions",
+                    name,
+                )
+                actions = None
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            stats = self._sync_consumer_stats.setdefault(
+                name, {"steps": 0, "total_ms": 0.0, "max_ms": 0.0}
+            )
+            stats["steps"] += 1
+            stats["total_ms"] += elapsed_ms
+            stats["max_ms"] = max(stats["max_ms"], elapsed_ms)
+            if actions:
+                self._apply_steering_actions(actions, source=name)
 
     def _finalize_capture_for_request_async(self, req_id: str) -> None:
         """Drive the capture manager to finalize *req_id* off the step thread.
@@ -4872,6 +5046,14 @@ class GPUModelRunner(
         # Drain the active capture plan.
         if self._capture_manager is not None:
             self._finalize_capture_step()
+
+        # Sync-execution consumers: run on EVERY rank (outside the
+        # rank-0-only manager guard above), post-forward, so returned
+        # steering actions are applied before the next step's
+        # ``_update_steering_buffers``. Same-thread ordering with the
+        # next step is what keeps the steering manager single-mutator.
+        if self._sync_consumers:
+            self._run_sync_consumers(scheduler_output)
 
         if self.use_async_scheduling:
             pp = get_pp_group()

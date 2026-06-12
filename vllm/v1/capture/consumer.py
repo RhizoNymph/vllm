@@ -27,6 +27,7 @@ from vllm.v1.capture.types import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.capture.step_view import StepCaptureView
     from vllm.v1.capture.types import CaptureContext
 
 
@@ -55,6 +56,16 @@ class CaptureConsumer(ABC):
       opt-in via ``SamplingParams.capture[consumer_name]``. Default
       ``False`` — most consumers have a global spec set at
       registration time.
+    - ``execution``: ``"async"`` (default) delivers data through the
+      dispatch/finalize pipeline off the critical path. ``"sync"``
+      consumers instead implement ``on_step`` and run **on the
+      model-runner step thread** immediately after each forward —
+      they never receive chunks or finalize calls. Sync consumers
+      must have ``location = "worker"``, must not read client specs,
+      must return a non-``None`` ``global_capture_spec()``, and are
+      constructed on every tensor-parallel rank (see the determinism
+      contract on ``on_step``). See
+      ``docs/design/dynamic_steering.md`` §5.1.
 
     Override points, in order of necessity:
 
@@ -76,6 +87,7 @@ class CaptureConsumer(ABC):
     location: Literal["worker", "driver"] = "worker"
     required_sidecar_fields: ClassVar[frozenset[str]] = frozenset()
     reads_client_spec: ClassVar[bool] = False
+    execution: ClassVar[Literal["async", "sync"]] = "async"
 
     def __init__(  # noqa: B027 — intentional no-op default.
         self,
@@ -117,6 +129,31 @@ class CaptureConsumer(ABC):
         error: str,
     ) -> None:
         pass
+
+    def on_step(self, view: StepCaptureView) -> list[Any] | None:
+        """Sync-execution hook: called once per forward step on the
+        model-runner step thread (``execution = "sync"`` only).
+
+        ``view.tensors`` are zero-copy GPU views of the persistent
+        capture buffers — **valid only until the next forward pass
+        begins**; finish all reads (probe GEMMs, D2H) before
+        returning. The return value is a list of steering actions
+        (e.g. ``SteeringVectorUpdate`` from
+        ``vllm.v1.worker.steering_action_queue``) applied inline
+        before the next step builds its steering tables, or ``None``.
+
+        Determinism contract: this method runs on **every**
+        tensor-parallel rank with a byte-identical ``view``. It must
+        be a pure function of the view and the consumer's own state,
+        and that state must evolve identically on every rank — no
+        RNG, no wall-clock reads, no iteration over unordered
+        collections, no I/O-dependent decisions. Divergent actions
+        silently desynchronize the ranks' steering tables.
+
+        This method is on the critical path: its wall time adds
+        directly to step latency and is tracked per consumer.
+        """
+        return None
 
     def shutdown(self, timeout: float = 30.0) -> None:  # noqa: B027
         pass
