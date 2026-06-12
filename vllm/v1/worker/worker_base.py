@@ -193,6 +193,9 @@ class WorkerBase:
     def get_steering_status(self) -> dict:
         raise NotImplementedError
 
+    def get_dynamic_steering_status(self) -> dict:
+        raise NotImplementedError
+
     def register_steering_modules(
         self,
         modules: dict[str, dict],

@@ -6,7 +6,7 @@ import gc
 import itertools
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
@@ -2033,8 +2033,16 @@ class GPUModelRunner(
         rank. Consumer exceptions are isolated; returned steering
         actions apply inline through the mixin's
         ``_apply_steering_actions`` so they are visible to the next
-        step's ``_update_steering_buffers``. Per-consumer wall time is
-        accumulated in ``_sync_consumer_stats``.
+        step's ``_update_steering_buffers``.
+
+        Observability (docs/design/dynamic_steering.md §5.5): per
+        consumer, wall time is accumulated in ``_sync_consumer_stats``
+        and a bounded ring of recent ``(step, on_step_ms, n_actions)``
+        tuples is kept for the ``/v1/steering/dynamic`` endpoint. A
+        consumer whose ``on_step`` exceeds its budget (consumer attr
+        ``sync_budget_ms``, default 5.0) triggers a rate-limited
+        warning — metric + warning only, never an automatic disable
+        (a disable trigger would itself need to be rank-replicated).
         """
         self._sync_step_counter += 1
         view = self._build_step_capture_view(scheduler_output)
@@ -2051,11 +2059,38 @@ class GPUModelRunner(
                 actions = None
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             stats = self._sync_consumer_stats.setdefault(
-                name, {"steps": 0, "total_ms": 0.0, "max_ms": 0.0}
+                name,
+                {
+                    "steps": 0,
+                    "total_ms": 0.0,
+                    "max_ms": 0.0,
+                    "over_budget_steps": 0,
+                    "ring": deque(maxlen=256),
+                    "_last_budget_warn": 0.0,
+                },
             )
             stats["steps"] += 1
             stats["total_ms"] += elapsed_ms
             stats["max_ms"] = max(stats["max_ms"], elapsed_ms)
+            n_actions = len(actions) if actions else 0
+            stats["ring"].append(
+                (self._sync_step_counter, round(elapsed_ms, 3), n_actions)
+            )
+            budget_ms = float(getattr(consumer, "sync_budget_ms", 5.0))
+            if elapsed_ms > budget_ms:
+                stats["over_budget_steps"] += 1
+                now = time.monotonic()
+                if now - stats["_last_budget_warn"] >= 5.0:
+                    stats["_last_budget_warn"] = now
+                    logger.warning(
+                        "sync capture consumer %s on_step took %.2f ms "
+                        "(budget %.2f ms, %d over-budget steps so far); "
+                        "this time is on the model-runner critical path",
+                        name,
+                        elapsed_ms,
+                        budget_ms,
+                        stats["over_budget_steps"],
+                    )
             if actions:
                 self._apply_steering_actions(actions, source=name)
 

@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Standalone tests for DynamicSteeringController and ProbePolicy.
+"""Standalone tests for DynamicSteeringController (sync execution).
 
-Runs the CaptureSink lifecycle end-to-end against a MagicMock
-``VllmConfig``, tempfile probe/steering vectors, and a manually
-installed ``SteeringActionQueue``. No engine or GPU required.
+Drives ``on_step`` against synthetic ``StepCaptureView``s with a
+MagicMock ``VllmConfig`` and tempfile probe/steering vectors. No engine
+or GPU required.
 
 Usage: ``python test.py`` or ``pytest test.py``.
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -28,13 +30,17 @@ from dynamic_steering_controller import (  # noqa: E402
     ProbePolicy,
 )
 
-from vllm.v1.capture.types import CaptureChunk, CaptureFinalize  # noqa: E402
+from vllm.v1.capture.step_view import (  # noqa: E402
+    StepCaptureView,
+    StepRequestView,
+)
 from vllm.v1.worker.steering_action_queue import (  # noqa: E402
-    SteeringActionQueue,
-    install_steering_action_queue,
+    RequestSteeringOverride,
+    SteeringVectorUpdate,
 )
 
 HIDDEN = 32
+MONITOR = (3, "post_mlp")
 
 
 # ---------------------------------------------------------------------------
@@ -51,44 +57,53 @@ def _policy(**kwargs) -> ProbePolicy:
 def test_policy_engages_above_threshold():
     p = _policy()
     p.observe("r1", np.array([0.6]))
-    assert p.current_gain() == 2.0
-    assert p.engaged
+    assert p.current_gain("r1") == 2.0
+    assert p.engaged("r1")
 
 
 def test_policy_stays_disengaged_below_threshold():
     p = _policy()
     p.observe("r1", np.array([0.49]))
-    assert p.current_gain() == 0.0
-    assert not p.engaged
+    assert p.current_gain("r1") == 0.0
+    assert not p.engaged("r1")
 
 
 def test_policy_hysteresis_holds_engagement():
     p = _policy()
     p.observe("r1", np.array([0.6]))
-    assert p.current_gain() == 2.0
+    assert p.current_gain("r1") == 2.0
     # Dips below threshold but above threshold - hysteresis: stays on.
     p.observe("r1", np.array([0.4]))
-    assert p.current_gain() == 2.0
-    # Below the disengage level: off, and re-engage needs full threshold.
+    assert p.current_gain("r1") == 2.0
+    # Below the disengage level: off; re-engage needs full threshold.
     p.observe("r1", np.array([0.29]))
-    assert p.current_gain() == 0.0
+    assert p.current_gain("r1") == 0.0
     p.observe("r1", np.array([0.4]))
-    assert p.current_gain() == 0.0
+    assert p.current_gain("r1") == 0.0
+
+
+def test_policy_states_are_independent_per_request():
+    p = _policy()
+    p.observe("hot", np.array([0.9]))
+    p.observe("cold", np.array([0.1]))
+    assert p.current_gain("hot") == 2.0
+    assert p.current_gain("cold") == 0.0
+    assert p.engaged("hot") and not p.engaged("cold")
 
 
 def test_policy_ema_smoothing():
     p = _policy(ema_alpha=0.5, hysteresis=0.0)
-    p.observe("r1", np.array([1.0]))  # ema = 1.0
-    p.observe("r1", np.array([0.0]))  # ema = 0.5
-    assert p.aggregate_score() == pytest.approx(0.5)
-    p.observe("r1", np.array([0.0]))  # ema = 0.25
-    assert p.aggregate_score() == pytest.approx(0.25)
+    p.observe("r1", np.array([1.0]))
+    p.observe("r1", np.array([0.0]))
+    assert p.score("r1") == pytest.approx(0.5)
+    p.observe("r1", np.array([0.0]))
+    assert p.score("r1") == pytest.approx(0.25)
 
 
 def test_policy_multi_token_chunk_folds_in_order():
     p = _policy(ema_alpha=0.5)
     p.observe("r1", np.array([1.0, 0.0]))
-    assert p.aggregate_score() == pytest.approx(0.5)
+    assert p.score("r1") == pytest.approx(0.5)
 
 
 def test_policy_aggregate_max_vs_mean():
@@ -103,41 +118,44 @@ def test_policy_aggregate_max_vs_mean():
     assert p_mean.aggregate_score() == pytest.approx(0.5)
 
 
-def test_policy_forget_drops_request_and_disengages():
-    p = _policy()
+def test_policy_global_gain_uses_aggregate():
+    p = _policy(aggregate="max")
     p.observe("r1", np.array([0.9]))
-    assert p.current_gain() == 2.0
+    assert p.current_global_gain() == 2.0
     p.forget("r1")
-    assert p.aggregate_score() is None
-    assert p.current_gain() == 0.0
-    assert not p.engaged
+    assert p.current_global_gain() == 0.0
+
+
+def test_policy_forget_and_prune():
+    p = _policy()
+    p.observe("r1", np.array([0.9]), step=1)
+    p.observe("r2", np.array([0.9]), step=10)
+    pruned = p.prune_unseen(current_step=14, max_age=5)
+    assert pruned == ["r1"]
+    assert p.keys() == ["r2"]
+    p.forget("r2")
+    assert p.keys() == []
 
 
 def test_policy_proportional_gain_ramps():
     p = _policy(gain_mode="proportional", threshold=0.5, hysteresis=0.2, gain=2.0)
-    # Engage at threshold: full gain.
     p.observe("r1", np.array([0.5]))
-    assert p.current_gain() == pytest.approx(2.0)
-    # Mid-band (0.4 between disengage 0.3 and threshold 0.5): half gain.
+    assert p.current_gain("r1") == pytest.approx(2.0)
     p.observe("r1", np.array([0.4]))
-    assert p.current_gain() == pytest.approx(1.0)
-    # Above threshold clamps at full gain.
+    assert p.current_gain("r1") == pytest.approx(1.0)
     p.observe("r1", np.array([0.9]))
-    assert p.current_gain() == pytest.approx(2.0)
+    assert p.current_gain("r1") == pytest.approx(2.0)
 
 
 def test_policy_emission_gating():
     p = _policy(min_emit_delta=0.5, gain_mode="proportional", gain=2.0)
-    # Silent while never engaged.
-    assert not p.should_emit(0.0)
-    # First non-zero gain emits.
-    assert p.should_emit(1.0)
-    p.mark_emitted(1.0)
-    # Small move suppressed; big move emits.
-    assert not p.should_emit(1.2)
-    assert p.should_emit(1.6)
-    # Engagement flip always emits, even with a huge min_emit_delta.
-    assert p.should_emit(0.0)
+    assert not p.should_emit("r1", 0.0)
+    assert p.should_emit("r1", 1.0)
+    p.mark_emitted("r1", 1.0)
+    assert not p.should_emit("r1", 1.2)
+    assert p.should_emit("r1", 1.6)
+    # Engagement flip always emits.
+    assert p.should_emit("r1", 0.0)
 
 
 def test_policy_config_validation():
@@ -152,14 +170,13 @@ def test_policy_config_validation():
 
 
 # ---------------------------------------------------------------------------
-# DynamicSteeringController
+# Controller fixtures
 # ---------------------------------------------------------------------------
 
 
-def _mock_config(tp: int = 1, pp: int = 1) -> MagicMock:
+def _mock_config(pp: int = 1) -> MagicMock:
     cfg = MagicMock()
     cfg.model_config.get_hidden_size.return_value = HIDDEN
-    cfg.parallel_config.tensor_parallel_size = tp
     cfg.parallel_config.pipeline_parallel_size = pp
     return cfg
 
@@ -175,8 +192,8 @@ def _make_controller(
     torch.save(probe, probe_path)
     torch.save(steer, steer_path)
     params = {
-        "monitor_layer": 3,
-        "monitor_hook": "post_mlp",
+        "monitor_layer": MONITOR[0],
+        "monitor_hook": MONITOR[1],
         "probe_path": str(probe_path),
         "steering_vector_path": str(steer_path),
         "threshold": 0.5,
@@ -188,18 +205,35 @@ def _make_controller(
     return DynamicSteeringController(_mock_config(), params)
 
 
-def _chunk(rows: torch.Tensor, req: str = "req-1", step: int = 0) -> CaptureChunk:
-    return CaptureChunk(
-        key=(req, 3, "post_mlp"),
-        tensor=rows,
-        dtype=rows.dtype,
-        row_offset=0,
-        step_index=step,
-    )
+def _view(
+    rows_by_req: dict[str, torch.Tensor],
+    phases: dict[str, str] | None = None,
+    step: int = 0,
+) -> StepCaptureView:
+    """Build a StepCaptureView from per-request activation rows."""
+    phases = phases or {}
+    requests = []
+    chunks = []
+    offset = 0
+    for req_id, rows in rows_by_req.items():
+        n = rows.shape[0]
+        requests.append(
+            StepRequestView(
+                req_id=req_id,
+                start=offset,
+                end=offset + n,
+                phase=phases.get(req_id, "decode"),
+                token_ids=np.arange(n, dtype=np.int64),
+            )
+        )
+        chunks.append(rows)
+        offset += n
+    tensor = torch.cat(chunks, dim=0) if chunks else torch.zeros(0, HIDDEN)
+    return StepCaptureView(step=step, tensors={MONITOR: tensor}, requests=requests)
 
 
-def _aligned_rows(probe: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    return (probe * scale).unsqueeze(0)
+def _aligned(probe: torch.Tensor, scale: float = 1.0, n: int = 1) -> torch.Tensor:
+    return (probe * scale).repeat(n, 1)
 
 
 @pytest.fixture()
@@ -208,16 +242,19 @@ def tmp() -> Path:
         yield Path(d)
 
 
-@pytest.fixture(autouse=True)
-def action_queue():
-    q = SteeringActionQueue()
-    install_steering_action_queue(q)
-    yield q
-    install_steering_action_queue(None)
+@pytest.fixture()
+def probe() -> torch.Tensor:
+    p = torch.zeros(HIDDEN)
+    p[0] = 1.0
+    return p
 
 
-def test_rejects_multi_rank_topology(tmp: Path):
-    probe = torch.randn(HIDDEN)
+# ---------------------------------------------------------------------------
+# Controller: construction validation
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_pipeline_parallel(tmp: Path, probe: torch.Tensor):
     torch.save(probe, tmp / "p.pt")
     params = {
         "monitor_layer": 0,
@@ -225,14 +262,11 @@ def test_rejects_multi_rank_topology(tmp: Path):
         "steering_vector_path": str(tmp / "p.pt"),
         "threshold": 0.5,
     }
-    with pytest.raises(ValueError, match="tensor_parallel_size=1"):
-        DynamicSteeringController(_mock_config(tp=2), params)
     with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
         DynamicSteeringController(_mock_config(pp=2), params)
 
 
-def test_rejects_bad_vectors(tmp: Path):
-    probe = torch.randn(HIDDEN)
+def test_rejects_bad_vectors(tmp: Path, probe: torch.Tensor):
     with pytest.raises(ValueError, match="hidden_size"):
         _make_controller(tmp, torch.randn(HIDDEN + 1), probe)
     with pytest.raises(ValueError, match="zero norm"):
@@ -241,128 +275,211 @@ def test_rejects_bad_vectors(tmp: Path):
         _make_controller(tmp, torch.randn(2, HIDDEN), probe)
 
 
-def test_global_spec_targets_monitor_site(tmp: Path):
-    probe = torch.randn(HIDDEN)
-    ctrl = _make_controller(tmp, probe, probe, monitor_layer=7)
+def test_rejects_capture_only_steer_hook(tmp: Path, probe: torch.Tensor):
+    with pytest.raises(ValueError, match="steer_hook"):
+        _make_controller(tmp, probe, probe, steer_hook="mlp_in")
+
+
+def test_sync_class_attributes(tmp: Path, probe: torch.Tensor):
+    ctrl = _make_controller(tmp, probe, probe)
+    assert ctrl.execution == "sync"
+    assert ctrl.location == "worker"
+    assert not ctrl.reads_client_spec
+    assert ctrl.sync_budget_ms == 5.0
     spec = ctrl.global_capture_spec()
-    assert spec.hooks == {"post_mlp": [7]}
+    assert spec.hooks == {MONITOR[1]: [MONITOR[0]]}
     assert spec.positions == "all_generated"
 
 
-def test_engage_emits_scaled_update(tmp: Path, action_queue):
-    probe = torch.zeros(HIDDEN)
-    probe[0] = 1.0
+# ---------------------------------------------------------------------------
+# Controller: per-request actuation
+# ---------------------------------------------------------------------------
+
+
+def test_per_request_override_for_firing_request_only(tmp: Path, probe: torch.Tensor):
     steer = torch.full((HIDDEN,), 3.0)
     ctrl = _make_controller(tmp, probe, steer, steer_layers=[3, 5])
 
-    # Activation perfectly aligned with the probe: cosine = 1.0 > 0.5.
-    ctrl.submit_chunk(_chunk(_aligned_rows(probe, scale=4.0)))
+    hot = _aligned(probe, 4.0)  # cosine 1.0 → fires
+    cold = torch.zeros(1, HIDDEN)
+    cold[0, 1] = 5.0  # cosine 0.0 → silent
+    actions = ctrl.on_step(_view({"hot": hot, "cold": cold}))
 
-    updates = action_queue.drain()
-    assert len(updates) == 1
-    update = updates[0]
+    assert len(actions) == 1
+    action = actions[0]
+    assert isinstance(action, RequestSteeringOverride)
+    assert action.req_id == "hot"
+    assert set(action.vectors["post_mlp"].keys()) == {3, 5}
+    np.testing.assert_allclose(
+        action.vectors["post_mlp"][3],
+        np.full(HIDDEN, 6.0, dtype=np.float32),  # steer(3) * gain(2)
+    )
+
+
+def test_per_request_steady_state_does_not_reemit(tmp: Path, probe: torch.Tensor):
+    ctrl = _make_controller(tmp, probe, probe)
+    assert len(ctrl.on_step(_view({"r1": _aligned(probe)}, step=1))) == 1
+    # Same engaged state, binary gain: silent.
+    assert ctrl.on_step(_view({"r1": _aligned(probe)}, step=2)) == []
+
+
+def test_per_request_disengage_emits_clear(tmp: Path, probe: torch.Tensor):
+    ctrl = _make_controller(tmp, probe, probe)
+    ctrl.on_step(_view({"r1": _aligned(probe)}, step=1))
+    actions = ctrl.on_step(_view({"r1": _aligned(probe, -1.0)}, step=2))
+    assert len(actions) == 1
+    assert actions[0].vectors is None  # clear → revert to admitted routing
+
+
+def test_per_request_prefill_observed_but_not_actuated(tmp: Path, probe: torch.Tensor):
+    ctrl = _make_controller(tmp, probe, probe)
+    actions = ctrl.on_step(
+        _view({"r1": _aligned(probe, n=4)}, phases={"r1": "prefill"}, step=1)
+    )
+    assert actions == []
+    # EMA primed during prefill: first decode step fires immediately.
+    actions = ctrl.on_step(_view({"r1": _aligned(probe)}, step=2))
+    assert len(actions) == 1
+    assert actions[0].vectors is not None
+
+
+def test_per_request_departed_state_pruned(tmp: Path, probe: torch.Tensor):
+    ctrl = _make_controller(tmp, probe, probe, forget_after_steps=2)
+    ctrl.on_step(_view({"r1": _aligned(probe)}, step=1))
+    assert ctrl._policy.score("r1") is not None
+    for step in range(2, 6):
+        ctrl.on_step(_view({"other": torch.zeros(1, HIDDEN)}, step=step))
+    assert ctrl._policy.score("r1") is None
+
+
+def test_no_monitor_tensor_is_noop(tmp: Path, probe: torch.Tensor):
+    ctrl = _make_controller(tmp, probe, probe)
+    view = StepCaptureView(step=1, tensors={}, requests=[])
+    assert ctrl.on_step(view) is None
+
+
+# ---------------------------------------------------------------------------
+# Controller: global actuation
+# ---------------------------------------------------------------------------
+
+
+def test_global_mode_emits_vector_update(tmp: Path, probe: torch.Tensor):
+    steer = torch.full((HIDDEN,), 3.0)
+    ctrl = _make_controller(tmp, probe, steer, actuation="global")
+    actions = ctrl.on_step(_view({"r1": _aligned(probe, 4.0)}, step=1))
+    assert len(actions) == 1
+    update = actions[0]
+    assert isinstance(update, SteeringVectorUpdate)
     assert update.phase == "decode"
-    assert update.source == "dynamic_steering"
-    assert set(update.vectors["post_mlp"].keys()) == {3, 5}
     np.testing.assert_allclose(
-        update.vectors["post_mlp"][3],
-        np.full(HIDDEN, 6.0, dtype=np.float32),  # steer(3.0) * gain(2.0)
+        update.vectors["post_mlp"][MONITOR[0]],
+        np.full(HIDDEN, 6.0, dtype=np.float32),
+    )
+    # Steady engagement: no re-emit.
+    assert ctrl.on_step(_view({"r1": _aligned(probe)}, step=2)) == []
+
+
+def test_global_mode_disengage_emits_zero_vector(tmp: Path, probe: torch.Tensor):
+    ctrl = _make_controller(tmp, probe, probe, actuation="global")
+    ctrl.on_step(_view({"r1": _aligned(probe)}, step=1))
+    actions = ctrl.on_step(_view({"r1": _aligned(probe, -1.0)}, step=2))
+    assert len(actions) == 1
+    np.testing.assert_allclose(
+        actions[0].vectors["post_mlp"][MONITOR[0]],
+        np.zeros(HIDDEN, dtype=np.float32),
     )
 
 
-def test_below_threshold_emits_nothing(tmp: Path, action_queue):
-    probe = torch.zeros(HIDDEN)
-    probe[0] = 1.0
-    ctrl = _make_controller(tmp, probe, probe)
-    orthogonal = torch.zeros(1, HIDDEN)
-    orthogonal[0, 1] = 5.0  # cosine with probe = 0.0
-    ctrl.submit_chunk(_chunk(orthogonal))
-    assert action_queue.drain() == []
-
-
-def test_steady_engagement_does_not_reemit(tmp: Path, action_queue):
-    probe = torch.zeros(HIDDEN)
-    probe[0] = 1.0
-    ctrl = _make_controller(tmp, probe, probe)
-    ctrl.submit_chunk(_chunk(_aligned_rows(probe), step=0))
-    assert len(action_queue.drain()) == 1
-    # Same engaged state, binary gain unchanged: no second update.
-    ctrl.submit_chunk(_chunk(_aligned_rows(probe), step=1))
-    assert action_queue.drain() == []
-
-
-def test_disengage_emits_zero_vector(tmp: Path, action_queue):
-    probe = torch.zeros(HIDDEN)
-    probe[0] = 1.0
-    ctrl = _make_controller(tmp, probe, probe)
-    ctrl.submit_chunk(_chunk(_aligned_rows(probe), step=0))
-    action_queue.drain()
-
-    anti = _aligned_rows(probe, scale=-1.0)  # cosine = -1.0 < disengage
-    ctrl.submit_chunk(_chunk(anti, step=1))
-    updates = action_queue.drain()
-    assert len(updates) == 1
-    np.testing.assert_allclose(
-        updates[0].vectors["post_mlp"][3], np.zeros(HIDDEN, dtype=np.float32)
-    )
-
-
-def test_finalize_forgets_request_and_disengages(tmp: Path, action_queue):
-    probe = torch.zeros(HIDDEN)
-    probe[0] = 1.0
-    ctrl = _make_controller(tmp, probe, probe)
-    ctrl.submit_chunk(_chunk(_aligned_rows(probe)))
-    action_queue.drain()
-
-    key = ("req-1", 3, "post_mlp")
-    ctrl.submit_finalize(CaptureFinalize(key=key))
-
-    # The only engaged request finished: a zeroing update is emitted.
-    updates = action_queue.drain()
-    assert len(updates) == 1
-    np.testing.assert_allclose(
-        updates[0].vectors["post_mlp"][3], np.zeros(HIDDEN, dtype=np.float32)
-    )
-
-    result = ctrl.get_result(key)
-    assert result is not None
-    assert result.status == "ok"
-    assert result.payload["updates_emitted"] == 2
-    assert result.payload["last_score"] == pytest.approx(1.0)
-
-
-def test_dot_score_mode(tmp: Path, action_queue):
-    probe = torch.zeros(HIDDEN)
-    probe[0] = 2.0  # normalized to unit at load
-    ctrl = _make_controller(tmp, probe, probe, score="dot", threshold=3.0)
+def test_dot_score_mode(tmp: Path, probe: torch.Tensor):
+    ctrl = _make_controller(
+        tmp, probe * 2.0, probe, score="dot", threshold=3.0
+    )  # probe normalized to unit at load
     rows = torch.zeros(1, HIDDEN)
-    rows[0, 0] = 2.5  # dot with unit probe = 2.5 < 3.0
-    ctrl.submit_chunk(_chunk(rows))
-    assert action_queue.drain() == []
-    rows[0, 0] = 3.5  # 3.5 >= 3.0
-    ctrl.submit_chunk(_chunk(rows, step=1))
-    assert len(action_queue.drain()) == 1
+    rows[0, 0] = 2.5  # dot 2.5 < 3.0
+    assert ctrl.on_step(_view({"r1": rows}, step=1)) == []
+    rows2 = torch.zeros(1, HIDDEN)
+    rows2[0, 0] = 3.5
+    assert len(ctrl.on_step(_view({"r1": rows2}, step=2))) == 1
 
 
-def test_no_queue_installed_is_graceful(tmp: Path):
-    install_steering_action_queue(None)
-    probe = torch.zeros(HIDDEN)
-    probe[0] = 1.0
+# ---------------------------------------------------------------------------
+# Packed banks + status
+# ---------------------------------------------------------------------------
+
+
+def _packed_hook(vectors: dict[int, np.ndarray]) -> dict:
+    layers = sorted(vectors.keys())
+    stacked = np.stack([vectors[i].astype(np.float32) for i in layers])
+    return {
+        "dtype": "float32",
+        "shape": list(stacked.shape),
+        "layer_indices": layers,
+        "data": base64.b64encode(np.ascontiguousarray(stacked).tobytes()).decode(
+            "ascii"
+        ),
+    }
+
+
+def test_packed_probe_and_steering_bank(tmp: Path, probe: torch.Tensor):
+    probe_np = probe.numpy().astype(np.float32)
+    steer_a = np.full(HIDDEN, 1.0, dtype=np.float32)
+    steer_b = np.full(HIDDEN, 2.0, dtype=np.float32)
+
+    probe_file = tmp / "probe.json"
+    probe_file.write_text(
+        json.dumps({"post_mlp": _packed_hook({MONITOR[0]: probe_np})})
+    )
+    steer_file = tmp / "steer.json"
+    steer_file.write_text(
+        json.dumps({"post_mlp": _packed_hook({3: steer_a, 5: steer_b})})
+    )
+
+    ctrl = DynamicSteeringController(
+        _mock_config(),
+        {
+            "monitor_layer": MONITOR[0],
+            "probe_packed_path": str(probe_file),
+            "steering_packed_path": str(steer_file),
+            "threshold": 0.5,
+            "ema_alpha": 1.0,
+            "gain": 2.0,
+        },
+    )
+    actions = ctrl.on_step(_view({"r1": _aligned(probe)}, step=1))
+    assert len(actions) == 1
+    vectors = actions[0].vectors["post_mlp"]
+    np.testing.assert_allclose(vectors[3], steer_a * 2.0)
+    np.testing.assert_allclose(vectors[5], steer_b * 2.0)
+
+
+def test_packed_probe_missing_row_rejected(tmp: Path, probe: torch.Tensor):
+    probe_file = tmp / "probe.json"
+    probe_file.write_text(
+        json.dumps({"post_mlp": _packed_hook({99: probe.numpy().astype(np.float32)})})
+    )
+    torch.save(probe, tmp / "steer.pt")
+    with pytest.raises(ValueError, match="no\\s+row"):
+        DynamicSteeringController(
+            _mock_config(),
+            {
+                "monitor_layer": MONITOR[0],
+                "probe_packed_path": str(probe_file),
+                "steering_vector_path": str(tmp / "steer.pt"),
+                "threshold": 0.5,
+            },
+        )
+
+
+def test_status_snapshot_is_plain_data(tmp: Path, probe: torch.Tensor):
+    import pickle
+
     ctrl = _make_controller(tmp, probe, probe)
-    # Must not raise; decision is computed but unapplied.
-    ctrl.submit_chunk(_chunk(_aligned_rows(probe)))
-
-
-def test_chunk_batch_path(tmp: Path, action_queue):
-    probe = torch.zeros(HIDDEN)
-    probe[0] = 1.0
-    ctrl = _make_controller(tmp, probe, probe, aggregate="mean")
-    chunks = [
-        _chunk(_aligned_rows(probe), req="req-a"),
-        _chunk(_aligned_rows(probe), req="req-b"),
-    ]
-    ctrl.submit_chunk_batch(chunks)
-    assert len(action_queue.drain()) == 1
+    ctrl.on_step(_view({"r1": _aligned(probe)}, step=1))
+    status = ctrl.status()
+    assert status["actuation"] == "per_request"
+    assert status["updates_emitted"] == 1
+    assert status["policy"]["r1"]["engaged"] is True
+    pickle.dumps(status)  # picklable for collective_rpc
 
 
 if __name__ == "__main__":

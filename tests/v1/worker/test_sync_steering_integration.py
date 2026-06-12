@@ -266,3 +266,108 @@ def test_apply_actions_mixes_good_and_bad():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Observability: ring buffer, budget warning, status RPC
+# ---------------------------------------------------------------------------
+
+
+class _SlowConsumer:
+    sync_budget_ms = 0.0  # everything is over budget
+
+    def on_step(self, view):
+        return None
+
+
+def test_ring_buffer_bounded_and_ordered():
+    stub = _RunnerStub(reqs=[{"req_id": "a", "num_computed": 8, "num_prompt": 8}])
+    stub._sync_consumers = [("idle", _ActionsConsumer(None))]
+    for _ in range(300):
+        stub._run_sync_consumers(_FakeSchedulerOutput({"a": 1}))
+    ring = stub._sync_consumer_stats["idle"]["ring"]
+    assert len(ring) == 256  # bounded
+    steps = [entry[0] for entry in ring]
+    assert steps == sorted(steps)
+    assert steps[-1] == 300
+
+
+def test_over_budget_steps_counted():
+    stub = _RunnerStub(reqs=[{"req_id": "a", "num_computed": 8, "num_prompt": 8}])
+    stub._sync_consumers = [("slow", _SlowConsumer())]
+    stub._run_sync_consumers(_FakeSchedulerOutput({"a": 1}))
+    stub._run_sync_consumers(_FakeSchedulerOutput({"a": 1}))
+    stats = stub._sync_consumer_stats["slow"]
+    assert stats["over_budget_steps"] == 2
+
+
+def test_dynamic_steering_status_is_picklable():
+    import pickle
+
+    class _StatusConsumer:
+        def on_step(self, view):
+            return None
+
+        def status(self):
+            return {"engaged": True, "gain": 1.5}
+
+    host = _MixinStub(
+        SteeringManager(max_steering_configs=4, device=None), {1: _Layer()}
+    )
+    # Graft the runner-side sync state the status method reads.
+    host._sync_consumers = [("probe", _StatusConsumer())]
+    host._sync_consumer_stats = {
+        "probe": {
+            "steps": 3,
+            "total_ms": 1.5,
+            "max_ms": 0.9,
+            "over_budget_steps": 1,
+            "ring": __import__("collections").deque(
+                [(1, 0.5, 0), (2, 0.4, 1)], maxlen=256
+            ),
+            "_last_budget_warn": 123.0,
+        }
+    }
+    host._req_dynamic_decode = {}
+
+    status = host.get_dynamic_steering_status()
+    blob = pickle.dumps(status)
+    assert blob
+    assert status["steering_initialized"] is True
+    assert status["sync_consumers"]["probe"]["steps"] == 3
+    assert status["sync_consumers"]["probe"]["ring"] == [[1, 0.5, 0], [2, 0.4, 1]]
+    assert status["sync_consumers"]["probe"]["status"] == {
+        "engaged": True,
+        "gain": 1.5,
+    }
+    assert status["dynamic_pool"] == {
+        "capacity": 0,
+        "in_use": 0,
+        "overrides": {},
+    }
+
+
+def test_dynamic_steering_status_consumer_error_isolated():
+    class _BoomStatus:
+        def on_step(self, view):
+            return None
+
+        def status(self):
+            raise RuntimeError("nope")
+
+    host = _MixinStub(
+        SteeringManager(max_steering_configs=4, device=None), {1: _Layer()}
+    )
+    host._sync_consumers = [("boom", _BoomStatus())]
+    host._sync_consumer_stats = {
+        "boom": {
+            "steps": 1,
+            "total_ms": 0.1,
+            "max_ms": 0.1,
+            "over_budget_steps": 0,
+            "ring": __import__("collections").deque(maxlen=256),
+            "_last_budget_warn": 0.0,
+        }
+    }
+    status = host.get_dynamic_steering_status()
+    assert "error" in status["sync_consumers"]["boom"]["status"]

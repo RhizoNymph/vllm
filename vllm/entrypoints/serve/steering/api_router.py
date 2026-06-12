@@ -481,6 +481,30 @@ async def get_steering_layers(raw_request: Request) -> JSONResponse:
         )
 
 
+@router.get("/v1/steering/dynamic")
+async def get_dynamic_steering(raw_request: Request) -> JSONResponse:
+    """Return dynamic-steering state from every worker.
+
+    Per-worker dicts are returned unaggregated (keyed into a list in
+    worker order): sync consumer decisions are supposed to be identical
+    across TP ranks within a stage, so surfacing each rank's recent
+    ring of (step, on_step_ms, n_actions) tuples and apply counters
+    side by side doubles as the cheap rank-divergence audit. See
+    docs/design/dynamic_steering.md §5.5.
+    """
+    engine = engine_client(raw_request)
+
+    try:
+        results = await engine.collective_rpc("get_dynamic_steering_status")
+        return JSONResponse(content={"workers": list(results)})
+    except Exception as err:
+        logger.exception("Failed to get dynamic steering status")
+        return JSONResponse(
+            content={"error": f"Failed to get dynamic steering status: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
 def attach_router(app: FastAPI):
     if not envs.VLLM_SERVER_DEV_MODE:
         return

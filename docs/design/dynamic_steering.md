@@ -1,6 +1,6 @@
 # Dynamic Steering — Design
 
-Status: Phase 0 implemented (this branch); Phases 1–2 proposed
+Status: Phases 0 and 1a implemented (this branch); 1b–2 proposed
 Branch: `feat/dynamic-steering`
 Audience: contributors familiar with the steering runtime
 ([steering_runtime.md](steering_runtime.md)) and the capture-consumer
@@ -83,7 +83,7 @@ Three loop latencies fall out:
 | Loop | Path | Latency | Phase |
 | --- | --- | --- | --- |
 | Async consumer | capture dispatch thread → action queue → next `_update_steering_buffers` | 1–3 decode steps | **0 (implemented)** |
-| Sync consumer | `on_step` on the model-runner thread post-forward, reading persistent capture buffers directly; actions applied inline before the next step | exactly 1 step | 1 |
+| Sync consumer | `on_step` on the model-runner thread post-forward, reading persistent capture buffers directly; actions applied inline before the next step | exactly 1 step | **1a (implemented)** |
 | In-graph conditional | monitor op at layer L writes per-token scales consumed by steering at layers > L, same forward; parameters tuned between steps by a consumer | 0 (same token) | 2 |
 
 All three are one mechanism at different depths: async consumers are
@@ -165,13 +165,23 @@ deterministic.
 
 Phase 1 ships in two sub-phases (decided 2026-06-11, see §11):
 
-- **Phase 1a — sync consumers + per-request actuation.** No kernel
-  changes: the `execution` axis (§5.1), per-request row swaps through
-  the existing config-hash machinery (§5.2), the budget metric, the
-  observability ring buffer, and `SteeringHookPacked` probe banks.
+- **Phase 1a — sync consumers + per-request actuation**
+  (**implemented on this branch**). No kernel changes: the `execution`
+  axis (§5.1), per-request actuation via a dynamic-override row pool
+  (§5.2), the budget metric, the observability ring buffer +
+  `GET /v1/steering/dynamic` (§5.5), `SteeringHookPacked` probe banks,
+  and the example plugin migrated to sync with per-request actuation
+  as its default.
 - **Phase 1b — gain primitives.** The kernel work: per-row scale
   tensor (§5.3) and the dynamic additive tier (§5.4), which is also
   the substrate Phase 2's per-token gating extends.
+
+Implementation note: the sync `on_step` hook runs inside
+`sample_tokens` (immediately after `_finalize_capture_step`, i.e.
+post-sampling), not in `execute_model` — `scheduler_output` is in
+scope there, all TP ranks execute it, and same-thread ordering with
+the next step's `_update_steering_buffers` preserves the
+single-mutator contract.
 
 ### 5.1 The `execution` axis: sync vs async consumers
 
@@ -262,37 +272,57 @@ construction, so the persistent-buffer `copy_` is baked into graphs
 exactly as today — sync consumers never touch the dispatch/chunk
 pipeline (no D2H of activations, no thread hop).
 
-### 5.2 Per-request actuation (Phase 1a)
+### 5.2 Per-request actuation (Phase 1a — implemented)
 
 The first actuation target (decided — it needs **no kernel changes**
 and is the mode that stays meaningful under data parallelism and
-multi-tenant serving). Per-request dynamic steering reuses the
-config/row machinery, following the earlier sketch's mutation sequence
-at the apply point:
+multi-tenant serving).
 
-1. merge the consumer's per-request delta into the request's
-   effective decode spec;
-2. recompute `hash_steering_config(...)` (same function as admission);
-3. no-op if unchanged, else `register_config(new_hash, "decode", ...)`
-   (row reuse via refcounts), update the request's tracked decode hash
-   so `_build_steering_index` maps its tokens to the new row,
-   `release_config(old_hash, "decode")`.
+**Implementation correction (supersedes the earlier sketch's §4.3
+hash-swap sequence).** Mid-flight swapping of a request's *admitted*
+config hash is unsafe, verified against the code: the scheduler builds
+`scheduled_steering_configs` fresh from its own `Request` objects each
+cycle with no worker feedback, so worker-side registrations of
+unreserved hashes can exhaust rows the scheduler believes are free —
+making `register_config` fail for a newly *admitted* request, which is
+a contract violation. Hash swaps also desynchronize
+`_req_steering_phase`, `steering_hash_to_request_ids`, and the
+scheduler-side `Request.block_hash_decode_steering_config_hash`.
 
-Guardrails: `max_steering_configs` capacity is checked first — a
-rejected update keeps the request's previous config (no silent fallback
-to unsteered); structured error surfaces via the apply-path stats and
-the owning consumer's `on_error`. Note the scheduler also tracks
-`scheduled_steering_configs` for admission; worker-side dynamic
-registration must stay within the already-reserved capacity, i.e.
-dynamic per-request updates should only ever *swap* a request's row,
-never grow the set beyond what admission allowed.
+What is implemented instead — **dynamic-override rows**
+(`vllm/v1/worker/steering_action_queue.py::RequestSteeringOverride`,
+`steering_manager.py` dynamic pool, mixin routing):
 
-In Phase 1a a gain change means re-registering the request's config
-with rescaled vectors (an H2D + repopulate per change — fine at
-engagement-flip frequency, wasteful for continuous modulation). The
-§5.3 scale tensor then makes the common special case free: modulating
-an *existing* per-request config's strength becomes `set_row_scale` on
-the request's current row, no hash churn at all.
+- A dedicated row pool above the static pool: `SteeringConfig.
+  max_dynamic_steering_configs` (default 4, `0` disables) extra table
+  rows, sized centrally via `get_steering_buffer_config` (zero
+  model-file edits). Dynamic registrations can never steal
+  scheduler-reserved rows — the pools share nothing.
+- `RequestSteeringOverride(req_id, vectors | None)` routes the
+  request's decode tokens to a dynamic row populated as
+  `global_decode_effective + override_vectors`. **Pure routing**: the
+  admitted config's registration, refcounts, prefill→decode
+  transition, and release-on-finish proceed exactly as if the override
+  didn't exist. `vectors=None` clears (idempotent).
+- Monotonic, never-reused `dyn_id`s keep ranks in lock-step (the
+  register/release sequence is identical on every rank).
+- Lifecycle: overrides are dropped automatically on request finish,
+  preemption-resumption into prefill, and streaming re-add. Rejected
+  actions (pool exhausted, request unknown/prefilling, bad vectors)
+  keep previous state and are counted per source.
+- Semantics: while active, the override *replaces* the request's
+  admitted per-request decode delta for routing purposes.
+
+Known limitation: scheduler-side steering-aware APC block hashes
+(`Request.block_hash_decode_steering_config_hash`) never see overrides
+— streaming-continuation cache keys reflect admitted steering only.
+Fixing this needs a worker→scheduler notification; deferred.
+
+In Phase 1a a gain change means re-registering the override's vectors
+(an H2D + repopulate per change — fine at engagement-flip frequency,
+wasteful for continuous modulation). The §5.3 scale tensor then makes
+the common special case free: modulating an *existing* override's
+strength becomes `set_row_scale` on its dynamic row.
 
 ### 5.3 Per-row scale tensor (Phase 1b)
 
@@ -518,15 +548,25 @@ steering).
   `tests/models/language/generation/test_steering.py` fixture tests).
   And a GPU smoke run (gemma-3-4b on a 3090 node) — see the validation
   recipe in the plugin README.
-- **Phase 1a**: registration-time validation tests for the `execution`
-  axis (sync ⇒ worker, sync ⇒ global spec); rank-replication test in
-  the TP/PP steering matrix (drive a sync consumer on all ranks,
-  assert identical tables and identical emitted actions — analogous to
-  the existing TP-divergence test for `set_steering_vectors`); an
-  `on_step` budget/metric test (a deliberately slow sync consumer is
-  visible in the per-consumer step-time metric); per-request swap leak
-  test (refcounts return to baseline after churn); ring-buffer
-  contents test.
+- **Phase 1a (on this branch, CPU)**: registration-time validation for
+  the `execution` axis (sync ⇒ worker / no client spec / global spec /
+  pp=1); slim-manager behavior; step-view construction
+  (spans/phase/token ids/zero-copy); the shared apply path; dynamic
+  pool mechanics + populate composition + indices-cache cycles;
+  override apply/validate matrix incl. pool-exhaustion-keeps-prior;
+  steering-index routing with admitted state untouched; cleanup hooks
+  + leak test; budget metric + bounded ring; status-RPC picklability;
+  plugin policy/actuation/packed banks
+  (`tests/v1/capture/test_sync_consumers.py`,
+  `tests/v1/worker/test_sync_steering_integration.py`,
+  `tests/v1/worker/test_steering_dynamic_override.py`, plugin
+  `test.py`).
+- **Phase 1a still missing**: engine-level fixture test (sync stub
+  consumer emits an override after step 0, assert step ≥1 logits shift
+  for the targeted request only) and GPU/distributed runs — tp=2
+  rank-replication smoke (identical tables and emitted actions across
+  ranks; cudagraph capture/replay with the all-rank slim manager) and
+  the plugin shadow-mode recipe from its README.
 - **Phase 1b**: kernel-level tests for the scale tensor and dynamic
   tier (row-scale/baked-scale composition, dynamic-tier additivity
   with operator-set vectors, any_active interaction, zero-gain

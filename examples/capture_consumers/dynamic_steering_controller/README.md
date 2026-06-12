@@ -1,80 +1,85 @@
-# Dynamic Steering Controller (Phase 0 prototype)
+# Dynamic Steering Controller (sync execution)
 
-A capture consumer that closes the activation→steering feedback loop in
-a single vLLM worker: observe the residual stream at one `(layer, hook)`
-site, project each generated token onto a probe direction, and modulate
-the **global decode** steering vector when the probe fires.
+A sync-execution capture consumer that closes the activation→steering
+feedback loop with **exactly-one-step latency**: probe the residual
+stream at one `(layer, hook)` site, and steer — per request or globally
+— when the probe fires.
 
-This is the Phase 0 prototype from
-[`docs/design/dynamic_steering.md`](../../../docs/design/dynamic_steering.md) —
-built to validate probes and policies on real traffic with minimal core
-surface, not to be the final architecture. Its feedback latency is one
-to a few decode steps (chunk delivery on the capture dispatch thread →
-action queue → next step's table rebuild).
+This is the Phase 1a controller from
+[`docs/design/dynamic_steering.md`](../../../docs/design/dynamic_steering.md).
 
 ## How it works
 
 ```
 forward step N
-  └─ residual at (monitor_layer, monitor_hook) captured via a *global*
-     capture spec — graph-safe persistent-buffer path, no eager forcing
-       └─ dispatch thread: controller receives per-step chunks
-            scores = activations · probe   (cosine or dot)
-            per-request EMA → aggregate (max/mean) → hysteresis gate
-            gain changed?  →  SteeringActionQueue.submit(...)
-step N+1 (model-runner step thread, _update_steering_buffers)
-  └─ queue drained → SteeringManager.update_global_vectors(phase="decode")
-       └─ tables repopulated; decode tokens now steered by vec * gain
+  └─ residual at (monitor_layer, monitor_hook) copied into a persistent
+     buffer inside the CUDA graph (global capture spec — never forces eager)
+step N, post-forward (model-runner step thread, every TP rank)
+  └─ on_step(view): probe GEMV on the GPU buffer → one tiny D2H of
+     per-token scores → per-request EMA + hysteresis policy
+       └─ returns RequestSteeringOverride / SteeringVectorUpdate actions,
+          applied inline through the engine's validation path
+step N+1
+  └─ _update_steering_buffers routes the firing request's decode tokens
+     to a dynamic-pool steering row (global + override vectors)
 ```
 
-The capture hook reads the residual *before* steering is added at that
-hook point, so the monitor always sees the model's un-steered state at
-the monitored site — the loop does not measure its own intervention
-(self-feedback through downstream layers on later tokens is inherent
-and intended).
+The capture hook reads the residual *before* steering is applied at
+that site, so the monitor never measures its own intervention.
 
-## Scope and limitations (deliberate, Phase 0)
+## Actuation modes
 
-- **`tp=1, pp=1` only.** Capture consumers are constructed on TP rank 0
-  only; pushing steering updates from one rank would diverge the
-  others' steering tables. The controller refuses to construct
-  otherwise, and the engine only installs the action queue for
-  single-rank topologies.
-- **Global decode tier only.** The policy aggregates across all active
-  requests and steers *everyone*. Per-request actuation needs table-row
-  machinery that is Phase 1. Decode-only keeps the prototype
-  prefix-cache-safe (base/prefill updates are rejected at drain time).
-- **Data parallelism**: each DP replica runs an independent controller
-  over its own traffic; replicas will not agree on steering state.
+- **`per_request`** (default): each request runs its own engagement
+  state machine; only firing requests are steered, via
+  `RequestSteeringOverride` → a dynamic-pool table row. Admission
+  state, scheduler accounting, and prefix caching are untouched
+  (requires `--enable-steering` and a non-zero
+  `--max-dynamic-steering-configs`, default 4).
+- **`global`**: scores aggregate (max/mean) into one engagement state
+  driving the global decode tier — steers every request.
+
+## Scope
+
+- **TP > 1 supported**: sync consumers are constructed on every TP rank
+  and compute identical decisions from the replicated residual (no
+  communication). `on_step` must stay a pure deterministic function of
+  the view + policy state.
+- **PP must be 1** (enforced at registration).
+- Decode-only by construction: per-request overrides are rejected for
+  prefilling requests; prefill scores still prime the EMA so engagement
+  can fire on the first decode step.
+- Known limitation: steering-aware APC block hashes for streaming
+  continuation reflect *admitted* steering only, never dynamic
+  overrides (`docs/design/dynamic_steering.md` §5.2).
 
 ## Usage
 
 ```bash
 vllm serve google/gemma-3-4b-it \
+  --enable-steering --max-dynamic-steering-configs 4 \
   --capture-consumers dynamic_steering:monitor_layer=15,probe_path=/data/probe.pt,steering_vector_path=/data/steer.pt,threshold=0.35,hysteresis=0.1,gain=4.0
 ```
 
-(Install this package first — `uv pip install -e .` from this directory —
-so the `dynamic_steering` entry point resolves. Richer params, e.g.
-multi-layer `steer_layers`, need the Python API's dict form; the CLI
-shorthand only takes flat scalars.)
+(Install this package first — `uv pip install -e .` from this directory.
+Richer params need the Python API's dict form; the CLI shorthand only
+takes flat scalars.)
 
 ```python
 from vllm import LLM
 
 llm = LLM(
     model="google/gemma-3-4b-it",
+    enable_steering=True,
+    max_dynamic_steering_configs=4,
     capture_consumers=[{
         "name": "dynamic_steering",
         "params": {
             "monitor_layer": 15,
-            "monitor_hook": "post_mlp",
             "probe_path": "/data/probe.pt",
-            "steering_vector_path": "/data/steer.pt",
-            "steer_layers": [15, 20],
+            "steering_packed_path": "/data/steer_bank.json",
+            "actuation": "per_request",
             "threshold": 0.35,
             "hysteresis": 0.10,
-            "ema_alpha": 0.25,
             "gain": 4.0,
             "gain_mode": "proportional",
         },
@@ -87,34 +92,42 @@ llm = LLM(
 | Param | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `monitor_layer` | int | required | Layer whose residual is probed. |
-| `monitor_hook` | str | `post_mlp` | Hook point to probe. |
-| `probe_path` | str | required | `torch.save`'d 1-D tensor; unit-normalized at load. |
-| `steering_vector_path` | str | required | `torch.save`'d 1-D tensor; applied scaled by gain. |
-| `steer_layers` | list[int] | `[monitor_layer]` | Layers receiving the steering vector. |
-| `steer_hook` | str | `monitor_hook` | Hook point steered. |
-| `score` | str | `cosine` | `cosine` (scale-invariant, in [-1,1]) or `dot` (raw projection onto the unit probe). |
-| `threshold` | float | required | Engage level on the aggregated score. |
-| `hysteresis` | float | `0.0` | Disengage at `threshold - hysteresis` (anti-flap). |
-| `ema_alpha` | float | `0.25` | Per-request EMA smoothing of per-token scores. |
+| `monitor_hook` | str | `post_mlp` | Hook point to probe (any capture hook). |
+| `probe_path` | str | — | `torch.save`'d 1-D tensor; unit-normalized at load. |
+| `probe_packed_path` | str | — | Packed-JSON (`SteeringHookPacked`) file; the `monitor_hook` entry must carry a row for `monitor_layer`. One of the two probe params is required. |
+| `steering_vector_path` | str | — | `torch.save`'d 1-D tensor applied (scaled by gain) at every `steer_layers` entry. |
+| `steering_packed_path` | str | — | Packed-JSON file; its `steer_hook` entry defines per-layer steering vectors (`layer_indices` = steer layers). One of the two steering params is required. |
+| `steer_layers` | list[int] | `[monitor_layer]` | Target layers (`.pt` path only). |
+| `steer_hook` | str | `monitor_hook` | Must be `pre_attn`/`post_attn`/`post_mlp`. |
+| `actuation` | str | `per_request` | `per_request` or `global`. |
+| `score` | str | `cosine` | `cosine` (scale-invariant) or `dot` (raw projection onto the unit probe). |
+| `threshold` | float | required | Engage level on the EMA-smoothed score. |
+| `hysteresis` | float | `0.0` | Disengage at `threshold - hysteresis`. |
+| `ema_alpha` | float | `0.25` | Per-request EMA smoothing. |
 | `gain` | float | `1.0` | Maximum steering scale. |
-| `gain_mode` | str | `binary` | `binary` (on/off) or `proportional` (ramps from 0 at disengage level to `gain` at threshold). |
-| `aggregate` | str | `max` | Cross-request aggregation: `max` (any request firing engages) or `mean`. |
-| `min_emit_delta` | float | `0.05` | Suppress updates whose gain moved less than this (flips always emit). |
+| `gain_mode` | str | `binary` | `binary` or `proportional`. |
+| `aggregate` | str | `max` | Cross-request aggregation (global mode only). |
+| `min_emit_delta` | float | `0.05` | Suppress emissions with smaller gain moves (flips always emit). |
+| `forget_after_steps` | int | `16` | Prune policy state for requests absent this many steps. |
+| `sync_budget_ms` | float | `5.0` | Soft per-step budget for the engine's over-budget warning. |
 
-## Diagnostics
+## Observability
 
-Each finished request's `capture_results["dynamic_steering"]` carries a
-payload: `last_score`, `engaged`, `gain` (last emitted), and cumulative
-`updates_emitted` / `updates_dropped`. Drain-side accept/reject counts
-live on the action queue (`stats()`), logged as warnings on rejection.
+`GET /v1/steering/dynamic` (dev mode) returns, per worker: the action
+queue counters, per-source apply/reject stats, dynamic-pool occupancy,
+and — per sync consumer — step timing, a ring of recent
+`(step, on_step_ms, n_actions)` tuples, and this controller's
+`status()` snapshot (per-request EMA / engaged / last emitted gain).
+Per-worker dicts are returned unaggregated, so comparing TP ranks'
+rings doubles as a rank-divergence audit.
 
-## Validating a probe offline
+## Validating a probe (shadow mode)
 
-Run traffic with the [`filesystem` consumer](../../../docs/features/capture_consumers.md)
-on the same `(layer, hook)`, fit the probe, then replay traffic with
-this controller at `gain=0.0` — decisions are computed and visible in
-payloads but no steering is applied. Raise the gain once the engagement
-trace looks right.
+Run with `gain=0.0`: decisions are computed and fully visible in
+`GET /v1/steering/dynamic` (engagement flips still emit, but the
+emitted vectors are zero), so you can watch the engagement trace on
+real traffic before letting it steer. Raise the gain when the trace
+looks right.
 
 ## Tests
 

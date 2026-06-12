@@ -582,6 +582,75 @@ class SteeringModelRunnerMixin:
                         result[layer_idx][hp_str][norm_key] = round(norm, 6)
         return result
 
+    def get_dynamic_steering_status(self) -> dict:
+        """Worker-side status for ``GET /v1/steering/dynamic``.
+
+        Everything returned is plain primitives (picklable across the
+        ``collective_rpc`` boundary). Per-worker dicts are surfaced
+        unaggregated by the router so TP-rank divergence in sync
+        consumer decisions is visible by inspection.
+        """
+        tp_rank, pp_rank = _get_steering_ranks()
+        mgr = self._steering_manager
+        status: dict = {
+            "tp_rank": tp_rank,
+            "pp_rank": pp_rank,
+            "steering_initialized": mgr is not None,
+        }
+
+        # Async transport (Phase 0 queue).
+        queue = get_steering_action_queue()
+        if queue is not None:
+            qstats = queue.stats()
+            status["action_queue"] = {
+                "submitted": qstats.submitted,
+                "dropped": qstats.dropped,
+                "applied": qstats.applied,
+                "rejected": qstats.rejected,
+            }
+        else:
+            status["action_queue"] = None
+
+        # Apply-path counters by source (both transports).
+        status["apply_stats"] = {
+            source: dict(counts)
+            for source, counts in getattr(
+                self, "_dynamic_steering_stats", {}
+            ).items()
+        }
+
+        # Dynamic-override pool occupancy.
+        if mgr is not None:
+            status["dynamic_pool"] = {
+                "capacity": mgr.max_dynamic_steering_configs,
+                "in_use": mgr.num_active_dynamic_configs,
+                "overrides": dict(getattr(self, "_req_dynamic_decode", {})),
+            }
+        else:
+            status["dynamic_pool"] = None
+
+        # Sync consumers: timing, ring of recent steps, optional
+        # consumer-provided policy status.
+        consumers = {name: c for name, c in getattr(self, "_sync_consumers", [])}
+        sync_status: dict = {}
+        for name, stats in getattr(self, "_sync_consumer_stats", {}).items():
+            entry = {
+                "steps": stats["steps"],
+                "total_ms": round(stats["total_ms"], 3),
+                "max_ms": round(stats["max_ms"], 3),
+                "over_budget_steps": stats.get("over_budget_steps", 0),
+                "ring": [list(item) for item in stats.get("ring", ())],
+            }
+            consumer = consumers.get(name)
+            if consumer is not None and hasattr(consumer, "status"):
+                try:
+                    entry["status"] = consumer.status()
+                except Exception as exc:  # noqa: BLE001 — consumer isolation
+                    entry["status"] = {"error": f"{type(exc).__name__}: {exc}"}
+            sync_status[name] = entry
+        status["sync_consumers"] = sync_status
+        return status
+
     # -----------------------------------------------------------------------
     # Worker-side named steering module registry
     # -----------------------------------------------------------------------
