@@ -116,10 +116,23 @@ def register_steering_buffers(
 
 
 def get_steering_buffer_config(vllm_config: "VllmConfig") -> tuple[int, int]:
-    """Return ``(max_tokens, max_configs)`` for steering buffers."""
+    """Return ``(max_tokens, max_configs)`` for steering buffers.
+
+    ``max_configs`` is the total row budget above the three reserved
+    rows: the scheduler-admitted per-request pool
+    (``max_steering_configs``) plus the dynamic-override pool
+    (``max_dynamic_steering_configs`` — rows allocated at runtime by
+    dynamic steering; see docs/design/dynamic_steering.md §5.2). Every
+    model sizes its tables through this single function, so the pool
+    split needs no model-file knowledge.
+    """
     max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     steering_config = getattr(vllm_config, "steering_config", None)
-    max_configs = steering_config.max_steering_configs if steering_config else 0
+    if steering_config is None:
+        return max_tokens, 0
+    max_configs = steering_config.max_steering_configs + getattr(
+        steering_config, "max_dynamic_steering_configs", 0
+    )
     return max_tokens, max_configs
 
 

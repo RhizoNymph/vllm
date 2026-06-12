@@ -27,11 +27,13 @@ from vllm.model_executor.layers.steering import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.steering_action_queue import (
+    RequestSteeringOverride,
     SteeringActionQueue,
     SteeringVectorUpdate,
     apply_steering_updates,
     get_steering_action_queue,
     install_steering_action_queue,
+    validate_steering_vectors,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
 
@@ -194,6 +196,12 @@ class SteeringModelRunnerMixin:
         # Per-source applied/rejected counters for dynamic steering
         # actions (both transports), keyed by submitting source name.
         self._dynamic_steering_stats: dict[str, dict[str, int]] = {}
+        # Live per-request dynamic decode overrides: req_id -> dyn_id in
+        # the manager's dynamic pool. Pure routing state on top of the
+        # admission machinery — admitted config hashes, refcounts, and
+        # scheduler accounting are never touched. Cleaned up on request
+        # finish, preemption resumption, and streaming re-add.
+        self._req_dynamic_decode: dict[str, int] = {}
 
         steering_config = getattr(self.vllm_config, "steering_config", None)
         if steering_config is None or not steerable:
@@ -220,6 +228,9 @@ class SteeringModelRunnerMixin:
         self._steering_manager = SteeringManager(
             steering_config.max_steering_configs,
             device=table_device,
+            max_dynamic_steering_configs=getattr(
+                steering_config, "max_dynamic_steering_configs", 0
+            ),
         )
 
         # Dynamic steering action queue (Phase 0). Installed only in
@@ -295,7 +306,11 @@ class SteeringModelRunnerMixin:
             )
             warmup_apply_steering_kernel(
                 hidden_size=hidden_size,
-                table_rows=steering_config.max_steering_configs + 3,
+                table_rows=(
+                    steering_config.max_steering_configs
+                    + getattr(steering_config, "max_dynamic_steering_configs", 0)
+                    + 3
+                ),
                 table_dtype=table_dtype,
                 compute_dtype=compute_dtype,
                 device=table_device,
@@ -916,6 +931,11 @@ class SteeringModelRunnerMixin:
         for action in actions:
             if isinstance(action, SteeringVectorUpdate):
                 updates.append(action)
+            elif isinstance(action, RequestSteeringOverride):
+                if self._apply_request_override(action, source=source):
+                    applied += 1
+                else:
+                    rejected += 1
             else:
                 rejected += 1
                 logger.warning(
@@ -950,6 +970,95 @@ class SteeringModelRunnerMixin:
         stats["applied"] += applied
         stats["rejected"] += rejected
         return applied, rejected
+
+    def _apply_request_override(
+        self,
+        action: "RequestSteeringOverride",
+        *,
+        source: str,
+    ) -> bool:
+        """Apply one per-request dynamic decode override. Returns success.
+
+        Routing-only mutation: allocates/updates/releases a dynamic-pool
+        row and records it in ``_req_dynamic_decode``; the request's
+        admitted config lifecycle (hashes, refcounts, transition,
+        release, scheduler accounting) is untouched. A rejected action
+        keeps the previous state — old override if any, else admitted
+        routing.
+
+        Known limitation (see docs/design/dynamic_steering.md §5.2):
+        scheduler-side steering-aware APC block hashes never see
+        overrides, so streaming-continuation cache keys reflect admitted
+        steering only.
+        """
+        mgr = self._steering_manager
+        req_id = action.req_id
+
+        def _reject(reason: str) -> bool:
+            logger.warning(
+                "rejected dynamic steering override (source=%s, req=%s): %s",
+                source,
+                req_id,
+                reason,
+            )
+            return False
+
+        if mgr is None or not self._steerable_layers_cache:
+            return _reject("steering is not initialized on this worker")
+        if mgr.max_dynamic_steering_configs <= 0:
+            return _reject(
+                "dynamic override pool is disabled "
+                "(max_dynamic_steering_configs=0)"
+            )
+
+        existing_dyn_id = self._req_dynamic_decode.get(req_id)
+
+        # Clear: revert to admitted routing. Clearing a request with no
+        # live override is a no-op success (idempotent disengage).
+        if action.vectors is None:
+            if existing_dyn_id is not None:
+                self._req_dynamic_decode.pop(req_id, None)
+                mgr.release_dynamic_config(existing_dyn_id)
+            return True
+
+        req_index = self.input_batch.req_id_to_index.get(req_id)
+        if req_index is None:
+            return _reject("request is not in the batch")
+        num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+        num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+        if num_computed < num_prompt:
+            return _reject(
+                "request is still prefilling (overrides are decode-only; "
+                "prefill steering feeds prefix-cache keys)"
+            )
+        try:
+            validate_steering_vectors(action.vectors, self._steerable_layers_cache)
+        except SteeringVectorError as exc:
+            return _reject(str(exc))
+
+        if existing_dyn_id is not None:
+            mgr.update_dynamic_config(
+                existing_dyn_id,
+                action.vectors,
+                locally_owned_layers=self._locally_owned_layers,
+            )
+            return True
+        try:
+            dyn_id, _row = mgr.register_dynamic_config(
+                action.vectors,
+                locally_owned_layers=self._locally_owned_layers,
+            )
+        except RuntimeError as exc:
+            # Pool exhausted: previous state (admitted routing) kept.
+            return _reject(str(exc))
+        self._req_dynamic_decode[req_id] = dyn_id
+        return True
+
+    def _drop_request_dynamic_override(self, req_id: str) -> None:
+        """Release ``req_id``'s dynamic override, if any. Idempotent."""
+        dyn_id = self._req_dynamic_decode.pop(req_id, None)
+        if dyn_id is not None and self._steering_manager is not None:
+            self._steering_manager.release_dynamic_config(dyn_id)
 
     def _update_steering_buffers(self, scheduler_output: "SchedulerOutput") -> None:
         """Update per-layer steering tables and the shared steering index.
@@ -1003,6 +1112,7 @@ class SteeringModelRunnerMixin:
         # ever active" case the index is already zero from initialization.
         if (
             not self._steering_manager.config_to_row
+            and not self._steering_manager.has_dynamic
             and not self._steering_manager.global_base_vectors
             and not self._steering_manager.global_prefill_vectors
             and not self._steering_manager.global_decode_vectors
@@ -1108,13 +1218,21 @@ class SteeringModelRunnerMixin:
                 if num_computed_after >= num_prompt:
                     self._handle_steering_transition(req_id, req_index, prefill_hash)
             else:
-                # Decode: use decode steering hash
-                decode_hash = int(
-                    self.input_batch.request_decode_steering_hash[req_index]
-                )
-                row = self._steering_manager.get_row_for_config(
-                    decode_hash, is_prefill=False
-                )
+                # Decode: a live dynamic override routes this request's
+                # tokens to its dynamic-pool row INSTEAD of the admitted
+                # config's row. Pure routing — the admitted config stays
+                # registered (refcounts, transition, release all proceed
+                # as if the override didn't exist).
+                dyn_id = self._req_dynamic_decode.get(req_id)
+                if dyn_id is not None:
+                    row = self._steering_manager.get_dynamic_row(dyn_id)
+                else:
+                    decode_hash = int(
+                        self.input_batch.request_decode_steering_hash[req_index]
+                    )
+                    row = self._steering_manager.get_row_for_config(
+                        decode_hash, is_prefill=False
+                    )
                 rows_scratch[active_count] = row
                 n_tokens_scratch[active_count] = n_tokens
 
@@ -1215,6 +1333,13 @@ class SteeringModelRunnerMixin:
         mgr = self._steering_manager
         if mgr is None:
             return
+        # A preempted request re-entering prefill loses any dynamic
+        # decode override — it is per-decode-run routing state, and the
+        # driving policy simply re-engages after resumption. Dropped
+        # unconditionally (before the phase checks) so the override
+        # cannot outlive phase-tracking drift.
+        if new_num_computed_tokens < req_state.num_prompt_tokens:
+            self._drop_request_dynamic_override(req_id)
         prev_phase = self._req_steering_phase.get(req_id)
         if prev_phase != "decode":
             return
@@ -1259,6 +1384,7 @@ class SteeringModelRunnerMixin:
             return
 
         for req_id in finished_req_ids:
+            self._drop_request_dynamic_override(req_id)
             phase = self._req_steering_phase.pop(req_id, None)
             if phase is not None:
                 req_state = self.requests.get(req_id)
@@ -1337,6 +1463,11 @@ class SteeringModelRunnerMixin:
         mgr = self._steering_manager
         if mgr is None:
             return
+
+        # Streaming re-adds go back through prefill: any dynamic decode
+        # override belongs to the finished decode run and is dropped
+        # (the driving policy re-engages on the continuation's decode).
+        self._drop_request_dynamic_override(req_id)
 
         # Release the old phase config.
         old_phase = self._req_steering_phase.get(req_id)

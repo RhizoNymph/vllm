@@ -69,14 +69,23 @@ class SteeringManager:
         Row 2: global decode effective (global_base + global_decode)
         Rows 3..max_steering_configs+2: phase-appropriate global
             + per_request combined
+        Rows max_steering_configs+3..+2+max_dynamic_steering_configs:
+            dynamic-override pool — runtime-registered decode rows
+            (global decode effective + override vectors), allocated by
+            dynamic steering and never by request admission. The two
+            pools share nothing: dynamic registrations can never
+            exhaust rows the scheduler reserved for admitted requests.
+            See docs/design/dynamic_steering.md §5.2.
     """
 
     def __init__(
         self,
         max_steering_configs: int,
         device: torch.device | None = None,
+        max_dynamic_steering_configs: int = 0,
     ):
         self.max_steering_configs = max_steering_configs
+        self.max_dynamic_steering_configs = max_dynamic_steering_configs
         self.device = device
         # (config_hash, phase) -> assigned table row index (3-based)
         self.config_to_row: dict[tuple[int, str], int] = {}
@@ -90,6 +99,24 @@ class SteeringManager:
         # Available row indices (rows 3 through max_steering_configs + 2)
         # Reversed so pop() gives lowest
         self.free_rows: list[int] = list(range(max_steering_configs + 2, 2, -1))
+
+        # Dynamic-override pool (rows above the static pool). Allocated
+        # and released only by the dynamic steering path; deterministic
+        # monotonically increasing ids keep ranks in lock-step because
+        # the register/release call sequence is identical on every rank
+        # (rank-replicated sync consumers). Ids are never reused.
+        self._dynamic_free_rows: list[int] = list(
+            range(
+                max_steering_configs + 2 + max_dynamic_steering_configs,
+                max_steering_configs + 2,
+                -1,
+            )
+        )
+        # dyn_id -> {hook_point_str: {layer_idx: tensor}} (override
+        # vectors only, not combined). Insertion-ordered.
+        self._dynamic_vectors: dict[int, dict[str, dict[int, torch.Tensor]]] = {}
+        self._dynamic_to_row: dict[int, int] = {}
+        self._next_dynamic_id: int = 1
 
         # Global vectors split into three tiers:
         #   base:    both-phases vectors (from global API)
@@ -123,6 +150,7 @@ class SteeringManager:
         self._cached_indices: torch.Tensor | None = None
         self._cached_zero_row: torch.Tensor | None = None
         self._cached_ordered_configs: list[tuple[tuple[int, str], int]] | None = None
+        self._cached_ordered_dynamic: list[tuple[int, int]] | None = None
         self._indices_dirty: bool = True
 
         # Reusable pinned-CPU staging ring for ``_stack_vectors_to_device``.
@@ -206,12 +234,30 @@ class SteeringManager:
         # Row allocation above is unconditional — the filter only
         # affects what tensors get constructed, not which row is
         # assigned.
-        # Per-layer vectors are batched into ONE stacked H2D copy per hook
-        # point. Building each row as its own ``torch.tensor(list,
-        # device=cuda)`` triggers a synchronous ``cudaMemcpy`` per layer,
-        # which dominates the phase-transition cost when many configs are
-        # registered at the start of a decode step. Stacking up front and
-        # transferring once amortizes the sync to a single cost per hook.
+        self.config_vectors[key] = self._store_vectors(vectors, locally_owned_layers)
+        # New row content needs to be written into the per-layer tables on
+        # the next populate call. (Refcount-hit path doesn't set this flag
+        # because the row's contents are already in the table.)
+        self._tables_dirty = True
+        # config_to_row changed; the cached indices/ordered_configs scratch
+        # is now stale and must be rebuilt on the next populate.
+        self._indices_dirty = True
+        return row
+
+    def _store_vectors(
+        self,
+        vectors: dict[str, dict[int, list[float] | np.ndarray]],
+        locally_owned_layers: frozenset[int] | None,
+    ) -> dict[str, dict[int, torch.Tensor]]:
+        """Materialize per-layer vectors as device tensors.
+
+        Per-layer vectors are batched into ONE stacked H2D copy per hook
+        point. Building each row as its own ``torch.tensor(list,
+        device=cuda)`` triggers a synchronous ``cudaMemcpy`` per layer,
+        which dominates the phase-transition cost when many configs are
+        registered at the start of a decode step. Stacking up front and
+        transferring once amortizes the sync to a single cost per hook.
+        """
         stored: dict[str, dict[int, torch.Tensor]] = {}
         for hook_point, layer_vecs in vectors.items():
             items = [
@@ -231,14 +277,93 @@ class SteeringManager:
             stored[hook_point] = {
                 layer_idx: stacked[i : i + 1] for i, layer_idx in enumerate(layer_idxs)
             }
-        self.config_vectors[key] = stored
-        # New row content needs to be written into the per-layer tables on
-        # the next populate call. (Refcount-hit path doesn't set this flag
-        # because the row's contents are already in the table.)
+        return stored
+
+    # ------------------------------------------------------------------
+    # Dynamic-override pool (docs/design/dynamic_steering.md §5.2)
+    # ------------------------------------------------------------------
+
+    @property
+    def has_dynamic(self) -> bool:
+        """True if any dynamic-override row is live."""
+        return bool(self._dynamic_to_row)
+
+    @property
+    def num_active_dynamic_configs(self) -> int:
+        return len(self._dynamic_to_row)
+
+    def register_dynamic_config(
+        self,
+        vectors: dict[str, dict[int, list[float] | np.ndarray]],
+        *,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> tuple[int, int]:
+        """Allocate a dynamic-override row; returns ``(dyn_id, row)``.
+
+        Rows come from the dedicated dynamic pool, never the
+        scheduler-reserved static pool. ``dyn_id`` is a monotonically
+        increasing id, never reused — identical across ranks because the
+        dynamic register/release sequence is rank-replicated. Raises
+        ``RuntimeError`` when the pool is exhausted (callers reject the
+        triggering action and keep previous state).
+        """
+        if not self._dynamic_free_rows:
+            raise RuntimeError(
+                f"No free dynamic steering rows. "
+                f"max_dynamic_steering_configs="
+                f"{self.max_dynamic_steering_configs}, active="
+                f"{len(self._dynamic_to_row)}"
+            )
+        dyn_id = self._next_dynamic_id
+        self._next_dynamic_id += 1
+        row = self._dynamic_free_rows.pop()
+        self._dynamic_to_row[dyn_id] = row
+        self._dynamic_vectors[dyn_id] = self._store_vectors(
+            vectors, locally_owned_layers
+        )
         self._tables_dirty = True
-        # config_to_row changed; the cached indices/ordered_configs scratch
-        # is now stale and must be rebuilt on the next populate.
         self._indices_dirty = True
+        return dyn_id, row
+
+    def update_dynamic_config(
+        self,
+        dyn_id: int,
+        vectors: dict[str, dict[int, list[float] | np.ndarray]],
+        *,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Replace a live dynamic config's vectors in place (same row).
+
+        The common re-emit path: gain/vector changes for an existing
+        override rewrite the row's content without free-list churn, so
+        the cached populate indices stay valid (``_tables_dirty`` only).
+        """
+        if dyn_id not in self._dynamic_to_row:
+            raise KeyError(f"dynamic steering config {dyn_id} is not registered")
+        self._dynamic_vectors[dyn_id] = self._store_vectors(
+            vectors, locally_owned_layers
+        )
+        self._tables_dirty = True
+
+    def release_dynamic_config(self, dyn_id: int) -> None:
+        """Free a dynamic-override row. No-op for unknown ids."""
+        row = self._dynamic_to_row.pop(dyn_id, None)
+        if row is None:
+            return
+        self._dynamic_vectors.pop(dyn_id, None)
+        self._dynamic_free_rows.append(row)
+        self._tables_dirty = True
+        self._indices_dirty = True
+
+    def get_dynamic_row(self, dyn_id: int) -> int:
+        """Return the table row for a live dynamic config."""
+        row = self._dynamic_to_row.get(dyn_id)
+        if row is None:
+            raise RuntimeError(
+                f"dynamic steering config {dyn_id} is not registered; "
+                f"the mixin's override bookkeeping must release stale "
+                f"ids before routing to them."
+            )
         return row
 
     def release_config(self, config_hash: int, phase: str) -> None:
@@ -573,11 +698,19 @@ class SteeringManager:
             or self._cached_indices is None
             or self._cached_zero_row is None
             or self._cached_ordered_configs is None
+            or self._cached_ordered_dynamic is None
         ):
             new_ordered_configs: list[tuple[tuple[int, str], int]] = list(
                 self.config_to_row.items()
             )
-            target_indices_list = [0, 1, 2] + [row for _, row in new_ordered_configs]
+            new_ordered_dynamic: list[tuple[int, int]] = list(
+                self._dynamic_to_row.items()
+            )
+            target_indices_list = (
+                [0, 1, 2]
+                + [row for _, row in new_ordered_configs]
+                + [row for _, row in new_ordered_dynamic]
+            )
             self._cached_indices = torch.tensor(
                 target_indices_list, dtype=torch.long, device=device
             )
@@ -585,18 +718,20 @@ class SteeringManager:
                 hidden_size, dtype=torch.float32, device=device
             )
             self._cached_ordered_configs = new_ordered_configs
+            self._cached_ordered_dynamic = new_ordered_dynamic
             self._indices_dirty = False
         indices: torch.Tensor = self._cached_indices
         zero_row: torch.Tensor = self._cached_zero_row
         ordered_configs: list[tuple[tuple[int, str], int]] = (
             self._cached_ordered_configs
         )
+        ordered_dynamic: list[tuple[int, int]] = self._cached_ordered_dynamic
 
         # Build all rows for all active tables in fp32. ``all_rows`` ends
         # up shape ``(num_active_tables, num_rows, hidden)``. We do ONE
         # ``.to(dtype=table.dtype)`` cast on the whole stack instead of
         # per-(hook, layer), then index_copy_ each layer's slice.
-        num_rows = 3 + len(ordered_configs)
+        num_rows = 3 + len(ordered_configs) + len(ordered_dynamic)
         per_table_rows: list[list[torch.Tensor]] = []
         for _table, hp_str, layer_idx, _mod in active_tables:
             base_vec = self._get_global_vec(hp_str, layer_idx, self.global_base_vectors)
@@ -655,6 +790,28 @@ class SteeringManager:
                     any_active = True
                 elif per_req is not None:
                     row_content = per_req.squeeze(0)
+                    any_active = True
+                else:
+                    row_content = zero_row
+                rows.append(row_content)
+
+            # Dynamic-override rows: composed exactly like a decode
+            # per-request row — global decode effective + override
+            # vectors. (Dynamic overrides are decode-only by design;
+            # see docs/design/dynamic_steering.md §7.)
+            for dyn_id, _row_idx in ordered_dynamic:
+                dyn_vec = (
+                    self._dynamic_vectors.get(dyn_id, {}).get(hp_str, {}).get(layer_idx)
+                )
+                if global_decode is not None and dyn_vec is not None:
+                    dyn_aligned = dyn_vec.squeeze(0).to(global_decode.device)
+                    row_content = global_decode + dyn_aligned
+                    any_active = True
+                elif global_decode is not None:
+                    row_content = global_decode
+                    any_active = True
+                elif dyn_vec is not None:
+                    row_content = dyn_vec.squeeze(0)
                     any_active = True
                 else:
                     row_content = zero_row

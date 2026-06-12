@@ -82,6 +82,35 @@ class SteeringVectorUpdate:
     source: str = ""
 
 
+@dataclass(frozen=True)
+class RequestSteeringOverride:
+    """Per-request decode-steering override (dynamic row routing).
+
+    Routes ``req_id``'s decode tokens to a dynamic-pool table row
+    holding ``global_decode_effective + vectors`` — pure routing on top
+    of admission state, which stays untouched (admitted config hashes,
+    refcounts, and scheduler accounting are never modified; see
+    docs/design/dynamic_steering.md §5.2). While active, the override
+    REPLACES the request's admitted per-request decode delta.
+
+    ``vectors`` shape matches :class:`SteeringVectorUpdate`;
+    ``vectors=None`` clears the override, reverting the request to its
+    admitted decode routing. Overrides end automatically when the
+    request finishes, is preempted, or is re-added by streaming
+    continuation.
+    """
+
+    req_id: str
+    vectors: dict[str, dict[int, np.ndarray]] | None
+    # Identifies the submitting observer in logs and stats.
+    source: str = ""
+
+
+# Everything the apply path accepts, from either transport (queue or
+# sync ``on_step`` returns).
+SteeringAction = SteeringVectorUpdate | RequestSteeringOverride
+
+
 @dataclass
 class SteeringActionQueueStats:
     submitted: int = 0
@@ -91,7 +120,7 @@ class SteeringActionQueueStats:
 
 
 class SteeringActionQueue:
-    """Bounded thread-safe FIFO of :class:`SteeringVectorUpdate`.
+    """Bounded thread-safe FIFO of :data:`SteeringAction`.
 
     ``submit`` may be called from any thread (in practice the capture
     dispatch thread). ``drain`` must only be called from the
@@ -103,11 +132,11 @@ class SteeringActionQueue:
             raise ValueError(f"maxsize must be positive, got {maxsize}")
         self._maxsize = maxsize
         self._lock = threading.Lock()
-        self._dq: deque[SteeringVectorUpdate] = deque()
+        self._dq: deque[SteeringAction] = deque()
         self._stats = SteeringActionQueueStats()
         self._overflow_logged = False
 
-    def submit(self, update: SteeringVectorUpdate) -> bool:
+    def submit(self, update: SteeringAction) -> bool:
         """Enqueue ``update``; returns ``False`` if dropped (queue full).
 
         Never raises. Overflow means the observer is producing updates
@@ -132,8 +161,8 @@ class SteeringActionQueue:
             self._dq.append(update)
             return True
 
-    def drain(self) -> list[SteeringVectorUpdate]:
-        """Pop and return all queued updates in submission order."""
+    def drain(self) -> list[SteeringAction]:
+        """Pop and return all queued actions in submission order."""
         with self._lock:
             if not self._dq:
                 return []
@@ -201,32 +230,20 @@ def get_steering_action_queue() -> SteeringActionQueue | None:
 # ---------------------------------------------------------------------------
 
 
-def _validate_update(
-    update: SteeringVectorUpdate,
+def validate_steering_vectors(
+    vectors: dict[str, dict[int, np.ndarray]],
     steerable_layers: dict,
-    *,
-    allow_cache_unsafe_phases: bool,
 ) -> None:
-    """Raise :class:`SteeringVectorError` if ``update`` cannot be applied.
+    """Raise :class:`SteeringVectorError` on an unappliable vector dict.
 
-    Mirrors the checks ``set_steering_vectors`` performs on the HTTP
-    path (hook validity, layer presence, hidden-size match, finite
-    values) plus the dynamic-path-specific phase restriction.
+    The vector-level subset of the checks ``set_steering_vectors``
+    performs on the HTTP path: hook validity, layer presence on this
+    worker, hidden-size match, finite values. Shared by the
+    global-update and per-request-override apply paths.
     """
-    if update.phase not in VALID_PHASES:
-        raise SteeringVectorError(
-            f"invalid phase {update.phase!r}; must be one of {sorted(VALID_PHASES)}"
-        )
-    if update.phase not in CACHE_SAFE_PHASES and not allow_cache_unsafe_phases:
-        raise SteeringVectorError(
-            f"dynamic updates to phase {update.phase!r} are rejected: "
-            f"global base/prefill vectors feed prefix-cache keys and this "
-            f"path performs no cache invalidation. Use phase='decode', or "
-            f"the /v1/steering/set HTTP path for base/prefill changes."
-        )
-    if not update.vectors:
+    if not vectors:
         raise SteeringVectorError("update contains no vectors")
-    for hook_name, layer_vecs in update.vectors.items():
+    for hook_name, layer_vecs in vectors.items():
         if hook_name not in VALID_HOOK_POINT_NAMES:
             raise SteeringVectorError(f"invalid hook point: {hook_name!r}")
         table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_name)]
@@ -252,6 +269,31 @@ def _validate_update(
                     f"layer {layer_idx} ({hook_name}): vector contains "
                     f"non-finite values"
                 )
+
+
+def _validate_update(
+    update: SteeringVectorUpdate,
+    steerable_layers: dict,
+    *,
+    allow_cache_unsafe_phases: bool,
+) -> None:
+    """Raise :class:`SteeringVectorError` if ``update`` cannot be applied.
+
+    Phase restriction (the dynamic-path-specific check) plus the shared
+    vector-level checks of :func:`validate_steering_vectors`.
+    """
+    if update.phase not in VALID_PHASES:
+        raise SteeringVectorError(
+            f"invalid phase {update.phase!r}; must be one of {sorted(VALID_PHASES)}"
+        )
+    if update.phase not in CACHE_SAFE_PHASES and not allow_cache_unsafe_phases:
+        raise SteeringVectorError(
+            f"dynamic updates to phase {update.phase!r} are rejected: "
+            f"global base/prefill vectors feed prefix-cache keys and this "
+            f"path performs no cache invalidation. Use phase='decode', or "
+            f"the /v1/steering/set HTTP path for base/prefill changes."
+        )
+    validate_steering_vectors(update.vectors, steerable_layers)
 
 
 def apply_steering_updates(

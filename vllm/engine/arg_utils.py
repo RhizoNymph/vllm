@@ -593,6 +593,7 @@ class EngineArgs:
     # Steering fields
     enable_steering: bool = False
     max_steering_configs: int = SteeringConfig.max_steering_configs
+    max_dynamic_steering_configs: int = SteeringConfig.max_dynamic_steering_configs
 
     # --capture-consumers is repeatable (action="append"); when unset the
     # whole capture-consumer pipeline stays disabled.
@@ -1388,6 +1389,10 @@ class EngineArgs:
             "--max-steering-configs",
             **steering_kwargs["max_steering_configs"],
         )
+        steering_group.add_argument(
+            "--max-dynamic-steering-configs",
+            **steering_kwargs["max_dynamic_steering_configs"],
+        )
 
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
@@ -2099,6 +2104,7 @@ class EngineArgs:
         steering_config = (
             SteeringConfig(
                 max_steering_configs=self.max_steering_configs,
+                max_dynamic_steering_configs=self.max_dynamic_steering_configs,
             )
             if self.enable_steering
             else None
