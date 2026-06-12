@@ -561,12 +561,28 @@ steering).
   `tests/v1/worker/test_sync_steering_integration.py`,
   `tests/v1/worker/test_steering_dynamic_override.py`, plugin
   `test.py`).
+- **Phase 1a GPU-validated (tp=1, 2026-06-11)**: gemma4-31B Q4_K_S
+  GGUF on an RTX 3090, real serving config (4096 ctx, 32 seqs, 0.95
+  util, chunked prefill). Verified: cudagraphs capture/replay normally
+  with the sync consumer active (no eager forcing); shadow mode
+  (threshold=-1, gain=0) shows per-request engagement with zero
+  emissions and baseline outputs; active mode (gain=6) emits exactly
+  one override per request, visibly changes greedy outputs starting
+  one step after engagement (the expected 1-step latency: "…is
+  Paris." then steered tokens), `/v1/steering/dynamic` shows
+  `dynamic_pool.in_use=1` + the request→dyn_id mapping mid-decode and
+  a clean drain to 0 on finish, `applied`/`rejected` counters correct.
+  **Finding**: reported `on_step` wall time (~30 ms ≈ the model's
+  decode step time) is dominated by the scores D2H acting as the
+  step's first CUDA sync point — it absorbs the forward's GPU drain
+  rather than adding cost. Needs a tokens/s A/B to quantify real
+  overhead, and possibly event-based timing so the metric reports
+  added time only.
 - **Phase 1a still missing**: engine-level fixture test (sync stub
   consumer emits an override after step 0, assert step ≥1 logits shift
-  for the targeted request only) and GPU/distributed runs — tp=2
-  rank-replication smoke (identical tables and emitted actions across
-  ranks; cudagraph capture/replay with the all-rank slim manager) and
-  the plugin shadow-mode recipe from its README.
+  for the targeted request only); tp=2 rank-replication smoke
+  (identical tables and emitted actions across ranks — needs a
+  2-GPU node); throughput A/B for the sync-consumer overhead.
 - **Phase 1b**: kernel-level tests for the scale tensor and dynamic
   tier (row-scale/baked-scale composition, dynamic-tier additivity
   with operator-set vectors, any_active interaction, zero-gain
