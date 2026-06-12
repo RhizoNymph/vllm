@@ -72,7 +72,8 @@ cheap/fast axis and an expressive/slow axis:
   proportional/PID (modulation), argmax over a bank (selection).
   Policies should be pure functions of rank-replicated inputs (see §6).
 - **Actuate** — decisions → steering state, in increasing cost:
-  1. **Scale a row** (Phase 1 primitive, no H2D vector traffic),
+  1. **Scale a row / the dynamic tier** (Phase 1b primitives, no H2D
+     vector traffic),
   2. **Gate a token** (Phase 2 in-graph per-token scale),
   3. **Rewrite vectors** (existing `update_global_vectors` /
      `register_config` machinery; one table repopulate).
@@ -162,6 +163,16 @@ deterministic.
 
 ## 5. Phase 1 — sync consumers + scale primitives
 
+Phase 1 ships in two sub-phases (decided 2026-06-11, see §11):
+
+- **Phase 1a — sync consumers + per-request actuation.** No kernel
+  changes: the `execution` axis (§5.1), per-request row swaps through
+  the existing config-hash machinery (§5.2), the budget metric, the
+  observability ring buffer, and `SteeringHookPacked` probe banks.
+- **Phase 1b — gain primitives.** The kernel work: per-row scale
+  tensor (§5.3) and the dynamic additive tier (§5.4), which is also
+  the substrate Phase 2's per-token gating extends.
+
 ### 5.1 The `execution` axis: sync vs async consumers
 
 The consumer framework today has two axes that are partially tangled:
@@ -191,10 +202,19 @@ surface:
 def on_step(self, view: StepCaptureView) -> list[SteeringVectorUpdate] | None:
     # view.tensors:  {(layer, hook): GPU tensor [n_tokens, hidden]} —
     #                zero-copy views into CaptureManager._global_buffers
-    # view.requests: rank-identical per-request token spans + phases
-    #                (derived from the broadcast scheduler_output)
+    # view.requests: rank-identical per-request metadata (derived from
+    #                the broadcast scheduler_output + sampled ids):
+    #                token spans into the buffer, prefill/decode phase,
+    #                request id, and the step window's token ids
     ...
 ```
+
+`StepCaptureView` v1 contents (decided): token spans + phase +
+request id + the window's token ids — everything trivially
+rank-identical. Token ids enable policies that react to emitted tokens
+(trigger phrases) alongside activation probes. Sampling params and
+richer metadata are deliberately excluded until a concrete policy needs
+them.
 
 Returned actions are validated and applied **inline** through the same
 `apply_steering_updates` path Phase 0 built (we are already on the
@@ -233,7 +253,48 @@ Score computation happens inside `on_step` on the compute stream:
 (segment means over each request's span) are fine here — this is
 off-graph, so variable shapes cost nothing.
 
-### 5.2 Per-row scale tensor (the key new primitive)
+The runner's hook point: sync consumers' `on_step` runs in
+`execute_model` right after the forward (next to
+`_finalize_capture_step`), so returned actions are in place before the
+next step's `_update_steering_buffers` builds tables and index. The
+monitor keys join the global-spec key set at `CaptureManager`
+construction, so the persistent-buffer `copy_` is baked into graphs
+exactly as today — sync consumers never touch the dispatch/chunk
+pipeline (no D2H of activations, no thread hop).
+
+### 5.2 Per-request actuation (Phase 1a)
+
+The first actuation target (decided — it needs **no kernel changes**
+and is the mode that stays meaningful under data parallelism and
+multi-tenant serving). Per-request dynamic steering reuses the
+config/row machinery, following the earlier sketch's mutation sequence
+at the apply point:
+
+1. merge the consumer's per-request delta into the request's
+   effective decode spec;
+2. recompute `hash_steering_config(...)` (same function as admission);
+3. no-op if unchanged, else `register_config(new_hash, "decode", ...)`
+   (row reuse via refcounts), update the request's tracked decode hash
+   so `_build_steering_index` maps its tokens to the new row,
+   `release_config(old_hash, "decode")`.
+
+Guardrails: `max_steering_configs` capacity is checked first — a
+rejected update keeps the request's previous config (no silent fallback
+to unsteered); structured error surfaces via the apply-path stats and
+the owning consumer's `on_error`. Note the scheduler also tracks
+`scheduled_steering_configs` for admission; worker-side dynamic
+registration must stay within the already-reserved capacity, i.e.
+dynamic per-request updates should only ever *swap* a request's row,
+never grow the set beyond what admission allowed.
+
+In Phase 1a a gain change means re-registering the request's config
+with rescaled vectors (an H2D + repopulate per change — fine at
+engagement-flip frequency, wasteful for continuous modulation). The
+§5.3 scale tensor then makes the common special case free: modulating
+an *existing* per-request config's strength becomes `set_row_scale` on
+the request's current row, no hash churn at all.
+
+### 5.3 Per-row scale tensor (Phase 1b)
 
 Today changing steering *strength* requires re-uploading vectors
 (`register_config` H2D + table repopulate). Add, per hook point,
@@ -253,51 +314,49 @@ buffer ⇒ graph-replay-visible, like the tables themselves.
 `set_global_scale(phase, scale)` (rows 1/2), surfaced to consumers as
 new action types flowing through the same apply path. Scale writes are
 a single-element `copy_` — no vector H2D, no repopulate. This gives a
-sync consumer a near-free "how much" knob over both global tiers and
-any registered per-request config.
+sync consumer a near-free "how much" knob over any row a dynamic
+config owns.
 
-Interaction to settle: scales compose multiplicatively *on top of* any
+Composition rule: scales compose multiplicatively *on top of* any
 scale baked into the row at registration (`{"vector": ..., "scale":
-...}` is pre-multiplied at `register_config`). Proposal: rows
-initialize to `1.0`; the dynamic scale is a separate, multiplicative,
-runtime-owned factor — never persisted into config hashes (it is not
-part of steering *identity*, see §7).
+...}` is pre-multiplied at `register_config`). Rows initialize to
+`1.0`; the dynamic scale is a separate, multiplicative, runtime-owned
+factor — never persisted into config hashes (it is not part of
+steering *identity*, see §7).
 
-The runner's hook point: sync consumers' `on_step` runs in
-`execute_model` right after the forward (next to
-`_finalize_capture_step`), so returned actions are in place before the
-next step's `_update_steering_buffers` builds tables and index. The
-monitor keys join the global-spec key set at `CaptureManager`
-construction, so the persistent-buffer `copy_` is baked into graphs
-exactly as today — sync consumers never touch the dispatch/chunk
-pipeline (no D2H of activations, no thread hop).
+Caveat: a per-row scale multiplies the row's **entire combined**
+vector. Rows 3+ are populated as global + per-request sums, so scaling
+a shared row scales both components. The scale knob is therefore only
+semantically clean on rows whose content the dynamic config owns
+outright — which per-request dynamic configs (§5.2) give us, and which
+the dynamic tier (§5.4) gives the global case.
 
-### 5.3 Per-request actuation
+### 5.4 Dynamic additive tier (Phase 1b)
 
-Per-request dynamic steering needs the config/row machinery, reusing
-the earlier sketch's mutation sequence at the apply point:
+Decided: dynamic steering must compose with, not clobber,
+operator-set steering (§11 Q7). Phase 0 overwrites the global decode
+tier — wrong whenever an operator also uses `/v1/steering/set`.
 
-1. merge the consumer's per-request delta into the request's
-   effective decode spec;
-2. recompute `hash_steering_config(...)` (same function as admission);
-3. no-op if unchanged, else `register_config(new_hash, "decode", ...)`
-   (row reuse via refcounts), update the request's tracked decode hash
-   so `_build_steering_index` maps its tokens to the new row,
-   `release_config(old_hash, "decode")`.
+A correction to an earlier note in this doc: this **cannot** be a
+"reserved row" in the existing tables. `steering_index` maps each
+token to exactly one row, so rows are exclusive — additivity across
+rows does not exist at the kernel level (rows 3+ are *pre-combined* at
+populate time instead). Two implementations, by phase:
 
-Guardrails: `max_steering_configs` capacity is checked first — a
-rejected update keeps the request's previous config (no silent fallback
-to unsteered); structured error surfaces via the apply-path stats and
-the owning consumer's `on_error`. Note the scheduler also tracks
-`scheduled_steering_configs` for admission; worker-side dynamic
-registration must stay within the already-reserved capacity, i.e.
-dynamic per-request updates should only ever *swap* a request's row,
-never grow the set beyond what admission allowed. With the §5.2 scale
-tensor, the cheap special case — modulating an *existing* per-request
-config's strength — needs no hash churn at all: `set_row_scale` on the
-request's current row.
+- **Populate-folding (no kernel change, available any time):** treat
+  the dynamic tier as a fourth vector source folded into
+  `populate_steering_tables` composition (rows 1/2 and 3+ all gain
+  `+ dynamic_vec * gain`). Gain changes mark `_tables_dirty` and cost
+  one repopulate — same price as today's global updates.
+- **Dedicated gather (Phase 1b, preferred):** per layer/hook, a single
+  dynamic vector buffer + scalar gain read unconditionally by the
+  kernel: `out += dynamic_vec * dynamic_gain`. Gain changes are a
+  single-element `copy_`; vector changes are one row's H2D. This is
+  exactly the substrate Phase 2 extends — replace the scalar
+  `dynamic_gain` with the per-token `steering_token_scales` and the
+  in-graph monitor writes it. Q7 and Phase 2 share machinery.
 
-### 5.4 Configuration surface
+### 5.5 Configuration surface
 
 - **No new plugin system.** Sync consumers register under the existing
   `vllm.capture_consumers` entry-point group and are configured via the
@@ -306,10 +365,21 @@ request's current row.
   plugin migrates by flipping `execution="sync"` and swapping its chunk
   plumbing for `on_step`; its `ProbePolicy` is already pure and carries
   over unchanged.
-- Read-only `GET /v1/steering/dynamic` reporting monitor sites, policy
-  state (engaged/gain per site), and queue/apply/reject counters.
+- **Probe/vector banks** use the `SteeringHookPacked` packed-JSON
+  shape (decided) — the same wire format as `--steering-modules`,
+  `/v1/steering/set`, and per-request steering, so the loaders already
+  exist. The Phase 0 plugin's `torch.save` single-vector convenience
+  path stays for one-probe prototyping.
+- **Observability (decided):** read-only `GET /v1/steering/dynamic`
+  reporting monitor sites, policy state (engaged/gain per site),
+  queue/apply/reject counters, **and a per-consumer ring buffer of
+  recent `(step, score, gain, action)` tuples** — closed-loop behavior
+  is time-dependent, and post-hoc debugging without a trace is painful.
 - Prometheus: applied/rejected/dropped update counters by source, plus
-  per-sync-consumer `on_step` wall-time (the §5.1 budget metric).
+  per-sync-consumer `on_step` wall-time (the §5.1 budget metric —
+  decided: metric + rate-limited warning only in v1, no automatic
+  disable; a hard kill is itself a rank-divergence hazard unless its
+  trigger is rank-replicated).
 
 ## 6. Distributed execution (the determinism problem)
 
@@ -379,14 +449,15 @@ not violate:
   scope for dynamic steering generally.
 - **Decode-tier mutation and APC are compatible** by construction; no
   cache interaction.
-- **Dynamic scale is runtime state, not identity.** The §5.2 scale
+- **Dynamic scale is runtime state, not identity.** The §5.3 scale
   tensor deliberately lives *outside* config hashes: two requests with
   the same vectors but different dynamic gains share a row whose scale
   is global... which is wrong for per-request gains. Resolution: row
-  scales apply at row granularity — global rows (1/2) carry the global
-  dynamic gain; a per-request gain requires the request to own a
-  distinct row (which per-request steering already gives it). Sharing a
-  row across requests with *different* dynamic gains is impossible by
+  scales apply at row granularity — a per-request gain requires the
+  request to own a distinct row (which per-request dynamic configs,
+  §5.2, give it), and the *global* dynamic gain lives in the §5.4
+  dynamic tier rather than on shared rows. Sharing a row across
+  requests with *different* dynamic gains is impossible by
   construction, matching the existing row-per-config-hash model. For
   decode-only scale changes this is cache-safe; we must simply ensure
   scale is excluded from block-hash computation (it is, trivially — it
@@ -404,9 +475,13 @@ The differentiated end state: detect at layer L, intervene at layers
 steering).
 
 - Add `steering_token_scales: float32[(max_tokens,)]`, shared across
-  layers like `steering_index`; kernel multiplies
-  `table[row] * scales_row[row] * token_scales[pid]`. All loads are
-  fixed-shape against persistent buffers — graph-safe.
+  layers like `steering_index`. The natural CAST shape gates the §5.4
+  dynamic tier per token — `out += dynamic_vec * token_scales[pid]` —
+  i.e. Phase 2 replaces that tier's scalar gain with a per-token one;
+  gating the row gather (`table[row] * scales_row[row] *
+  token_scales[pid]`) is the same mechanics if per-request configs
+  should also be token-gated. All loads are fixed-shape against
+  persistent buffers — graph-safe.
 - A **monitor custom op** registered at the probe site (inside
   `apply_layer_steering`, after `maybe_capture_residual`):
   `token_scales[:n] = g(hidden @ probe)` with `g` a fixed elementwise
@@ -443,16 +518,19 @@ steering).
   `tests/models/language/generation/test_steering.py` fixture tests).
   And a GPU smoke run (gemma-3-4b on a 3090 node) — see the validation
   recipe in the plugin README.
-- **Phase 1**: kernel-level tests for scale tensors (row/token scale
-  composition, any_active interaction); registration-time validation
-  tests for the `execution` axis (sync ⇒ worker, sync ⇒ global spec);
-  rank-replication test in the TP/PP steering matrix (drive a sync
-  consumer on all ranks, assert identical tables and identical emitted
-  actions — analogous to the existing TP-divergence test for
-  `set_steering_vectors`); an `on_step` budget/metric test (a
-  deliberately slow sync consumer is visible in the per-consumer
-  step-time metric); per-request swap leak test (refcounts return to
-  baseline after churn).
+- **Phase 1a**: registration-time validation tests for the `execution`
+  axis (sync ⇒ worker, sync ⇒ global spec); rank-replication test in
+  the TP/PP steering matrix (drive a sync consumer on all ranks,
+  assert identical tables and identical emitted actions — analogous to
+  the existing TP-divergence test for `set_steering_vectors`); an
+  `on_step` budget/metric test (a deliberately slow sync consumer is
+  visible in the per-consumer step-time metric); per-request swap leak
+  test (refcounts return to baseline after churn); ring-buffer
+  contents test.
+- **Phase 1b**: kernel-level tests for the scale tensor and dynamic
+  tier (row-scale/baked-scale composition, dynamic-tier additivity
+  with operator-set vectors, any_active interaction, zero-gain
+  equivalence with steering disabled).
 - **Phase 2**: graph-capture test asserting monitor op + scale reads
   replay correctly across batch sizes; eager-vs-graph equivalence on
   sums (pattern: the global-spec capture validation in
@@ -462,7 +540,7 @@ steering).
 
 Kept: the queue + step-thread drain point (its §4.2 reasoning is
 correct and is exactly what Phase 0 implements); the per-request
-mutation sequence via config hashes (§4.3 → our §5.3); non-throwing
+mutation sequence via config hashes (§4.3 → our §5.2); non-throwing
 observer isolation (§4.5); HTTP-path coexistence strategy (§4.6 option
 2 — the drain point and the HTTP RPC both mutate manager state on the
 step thread / under the engine's existing serialization, so no new
@@ -483,55 +561,47 @@ Changed:
   consumers a steering handle, it adds the `execution` axis so fast
   policies become *sync consumers* — the sketch's controller object
   disappears into the consumer framework entirely.
-- **New**: the sync/async execution axis (§5.1), scale-tensor
-  primitives (§5.2), in-graph Phase 2 (§8), and the
+- **New**: the sync/async execution axis (§5.1), scale-tensor and
+  dynamic-tier primitives (§5.3–5.4), in-graph Phase 2 (§8), and the
   decode-only/prefix-cache analysis (§7).
 
-## 11. Open questions (with recommendations)
+## 11. Decisions and open items
 
-Settled by the sync/async consumer decision (formerly open): fast
-policies become sync consumers rather than a separate controller
-plugin system, and the async consumer loop survives as the home for
-slow policies (driver-side, learned, I/O-bound) sharing the same
-action queue and validation path.
+All headline questions were settled on 2026-06-11:
 
-Still open:
+1. **Sync vs separate controller** → fast policies are **sync
+   consumers** (`execution` axis, §5.1); the async consumer loop
+   survives as the home for slow policies (driver-side, learned,
+   I/O-bound), sharing the action queue and validation path.
+2. **Actuation order** → **per-request first** (Phase 1a, §5.2): no
+   kernel changes, stays meaningful under DP and multi-tenant serving.
+   Gain primitives (scale tensor + dynamic tier) follow in Phase 1b.
+3. **Composition with operator-set steering** → **dynamic additive
+   tier** (§5.4), not overwriting the global decode tier. Note the
+   correction recorded there: this is a separate per-layer
+   vector+gain, not a "reserved row" — rows are exclusive via
+   `steering_index`, so cross-row additivity does not exist.
+4. **Sync budget** → **metric + rate-limited warning only** in v1; no
+   automatic disable (a hard kill is a rank-divergence hazard unless
+   its trigger is rank-replicated, e.g. step-counted — revisit after
+   real `on_step` timings exist).
+5. **`StepCaptureView` contents** → **minimal + token ids**: spans,
+   phase, request id, and the step window's token ids (all
+   rank-identical); enables token-trigger policies alongside probes.
+6. **Probe/vector bank format** → **`SteeringHookPacked`** packed JSON
+   everywhere; `torch.save` 1-D tensors remain as a single-probe
+   prototyping convenience.
+7. **Observability** → **ring buffer + counters** behind
+   `GET /v1/steering/dynamic` (§5.5).
 
-1. **Phase 1 actuation default: global rows vs per-request rows?**
-   Recommend shipping global-row scale modulation + the kernel scale
-   plumbing (§5.2) first; per-request row swap (§5.3) second.
-   Rationale: no scheduler-capacity interaction, and the
-   kernel/manager work is a prerequisite for both.
-2. **Probe/vector bank format.** Phase 0 uses `torch.save` 1-D tensors.
-   For banks, recommend reusing the steering-module packed-JSON shape
-   (`SteeringHookPacked`) so one format serves `--steering-modules`,
-   `/v1/steering/set`, and probe banks.
-3. **Sync budget enforcement**: metric-only, or a hard watchdog that
-   disables a consumer whose `on_step` repeatedly blows the budget?
-   Recommend metric + rate-limited warning in v1 — a hard kill creates
-   a rank-divergence hazard of its own (the disable decision must
-   itself be rank-replicated, e.g. triggered by a step counter rather
-   than wall time).
-4. **`StepCaptureView` contents**: exactly which per-request metadata
-   is exposed (token spans, phase, internal request ids, sampling
-   metadata?). Everything in it must be derivable from rank-identical
-   inputs (broadcast `scheduler_output` + consumer state). Recommend
-   starting minimal: spans + phase + request id.
-5. **Observability**: counters only, or a ring buffer of recent
-   (step, score, gain) tuples queryable via the debug endpoint?
-   Recommend the ring buffer — closing the loop makes behavior
-   time-dependent, and post-hoc debugging without a trace is painful.
-6. **`model_runner_v2`**: steering integration there is still pending
-   (dev-flag-gated upstream); dynamic steering inherits whatever lands.
-   No action now, but the sync `on_step` hook should live behind the
-   same mixin seam so it ports.
-7. **Eviction semantics on engagement flap**: should disengage *clear*
-   the global decode vector (current Phase 0: writes zeros) or restore
-   a pre-engagement baseline? Current behavior assumes the consumer
-   owns the decode tier exclusively; if operators also set decode
-   vectors via HTTP, the consumer will clobber them. Recommend Phase 1
-   give dynamic steering its own additive row instead of writing the
-   global tier (needs one reserved row: trivial with §5.2).
+Still open (non-blocking):
+
+- **`model_runner_v2`**: steering integration there is pending
+  (dev-flag-gated upstream); dynamic steering inherits whatever lands.
+  Keep the sync `on_step` hook behind the same mixin seam so it ports.
+- **Phase 2 in-graph details** (§8): token-scale reset discipline
+  (in-graph reset vs full overwrite by the monitor op), and whether
+  per-request rows also need token gating or only the dynamic tier.
 
 ## 12. References
 
