@@ -495,6 +495,26 @@ class DynamicSteeringController:
     # Sync execution
     # ------------------------------------------------------------------
 
+    def warmup(self, device: Any, dtype: Any) -> None:
+        """Pre-pay the first-GEMV init cost off the critical path.
+
+        Called by the model runner during cudagraph capture (full CUDA
+        context). Materializes the probe on-device and runs one GEMV
+        matching :meth:`on_step` so cuBLAS handle creation / lazy kernel
+        JIT happen here, not on the first served step. Touches no policy
+        state. Best-effort: the runner isolates exceptions.
+        """
+        probe = torch.from_numpy(self._probe).to(device)
+        self._probe_gpu = probe
+        dummy = torch.zeros((2, probe.shape[0]), device=device, dtype=dtype)
+        dummy_f32 = dummy.to(dtype=torch.float32)
+        proj = dummy_f32 @ probe
+        if self._score_mode == "cosine":
+            norms = torch.linalg.vector_norm(dummy_f32, dim=-1)
+            proj = proj / torch.clamp(norms, min=_EPS)
+        # Force completion so the init cost is realized here.
+        proj.cpu()
+
     def on_step(self, view: StepCaptureView) -> list[SteeringAction] | None:
         acts = view.tensors.get(self._monitor_key)
         if acts is None or acts.shape[0] == 0:

@@ -2157,6 +2157,35 @@ class GPUModelRunner(
             if actions:
                 self._apply_steering_actions(actions, source=name)
 
+    def _warmup_sync_consumers(self) -> None:
+        """Let each sync consumer warm device-side compute before the
+        first real ``on_step``.
+
+        A consumer's first ``on_step`` GEMV pays a one-time init cost
+        (cuBLAS handle creation, lazy kernel JIT) — measured at ~117 ms
+        for the example probe controller on a 3090. ``on_step`` runs on
+        the model-runner critical path, so that cost lands on the first
+        served step, skews the ``gpu_*`` timing average, and trips the
+        over-budget warning once. Running it here (during graph capture,
+        with the full runtime CUDA context) moves it off the hot path.
+
+        Optional and duck-typed (``warmup(device, dtype)``); isolated so
+        a consumer that raises cannot abort model setup. Skipped under
+        ``enforce_eager`` (no ``capture_model``); the one-time cost is
+        then paid on the first real step, which is acceptable for
+        eager/debug runs.
+        """
+        for name, consumer in self._sync_consumers:
+            warmup = getattr(consumer, "warmup", None)
+            if not callable(warmup):
+                continue
+            try:
+                warmup(self.device, self.dtype)
+            except Exception:
+                logger.exception(
+                    "sync capture consumer %s warmup failed; continuing", name
+                )
+
     def _finalize_capture_for_request_async(self, req_id: str) -> None:
         """Drive the capture manager to finalize *req_id* off the step thread.
 
@@ -7268,6 +7297,12 @@ class GPUModelRunner(
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+
+        # Warm sync-consumer device compute now (full CUDA context) so the
+        # first served step doesn't pay the one-time GEMV init cost.
+        if self._sync_consumers:
+            self._warmup_sync_consumers()
+
         return cuda_graph_size
 
     def _warmup_and_capture(

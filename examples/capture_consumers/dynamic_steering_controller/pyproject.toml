@@ -9,3 +9,4 @@ dependencies = ["vllm"]
 
 [project.entry-points."vllm.capture_consumers"]
 dynamic_steering = "dynamic_steering_controller:DynamicSteeringController"
+dynamic_steering_e2e = "dynamic_steering_controller.e2e_stub:DeterministicOverrideStub"
