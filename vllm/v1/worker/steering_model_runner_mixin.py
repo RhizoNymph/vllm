@@ -629,6 +629,20 @@ class SteeringModelRunnerMixin:
         else:
             status["dynamic_pool"] = None
 
+        # Dynamic additive tier (global decode steering that composes with
+        # operator-set steering, §5.4): which hooks/layers carry a tier
+        # vector right now.
+        if mgr is not None:
+            status["dynamic_tier"] = {
+                "active": mgr.has_dynamic_tier,
+                "hooks": {
+                    hook: sorted(layers)
+                    for hook, layers in mgr.dynamic_tier_vectors.items()
+                },
+            }
+        else:
+            status["dynamic_tier"] = None
+
         # Sync consumers: timing, ring of recent steps, optional
         # consumer-provided policy status.
         consumers = {name: c for name, c in getattr(self, "_sync_consumers", [])}

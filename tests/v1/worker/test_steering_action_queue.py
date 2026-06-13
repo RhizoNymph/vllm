@@ -37,14 +37,25 @@ class _FakeLayer:
 
 
 class _FakeManager:
-    """Records ``update_global_vectors`` calls like ``SteeringManager``."""
+    """Records ``SteeringManager`` apply calls.
+
+    ``calls`` tracks ``update_global_vectors`` (the base/prefill
+    cache-unsafe escape hatch); ``tier_calls`` tracks
+    ``update_dynamic_tier`` (the decode path, where dynamic updates now
+    land so they compose additively with operator-set decode steering).
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, int, torch.Tensor, str]] = []
+        self.tier_calls: list[tuple[str, int, torch.Tensor]] = []
         self._tables_dirty = False
 
     def update_global_vectors(self, hook_point, layer_idx, vector, phase="base"):
         self.calls.append((hook_point, layer_idx, vector.clone(), phase))
+        self._tables_dirty = True
+
+    def update_dynamic_tier(self, hook_point, layer_idx, vector):
+        self.tier_calls.append((hook_point, layer_idx, vector.clone()))
         self._tables_dirty = True
 
 
@@ -142,15 +153,18 @@ def test_install_and_get_roundtrip():
 # ---------------------------------------------------------------------------
 
 
-def test_apply_valid_decode_update():
+def test_apply_valid_decode_update_routes_to_tier():
     mgr = _FakeManager()
     layers = {0: _FakeLayer()}
     vec = np.arange(HIDDEN, dtype=np.float32)
     applied, rejected = apply_steering_updates([_update(vec=vec)], mgr, layers)
     assert (applied, rejected) == (1, 0)
-    assert len(mgr.calls) == 1
-    hook, layer, tensor, phase = mgr.calls[0]
-    assert (hook, layer, phase) == ("post_mlp", 0, "decode")
+    # Decode updates land on the dynamic tier (additive), not the global
+    # decode tier (overwrite).
+    assert mgr.calls == []
+    assert len(mgr.tier_calls) == 1
+    hook, layer, tensor = mgr.tier_calls[0]
+    assert (hook, layer) == ("post_mlp", 0)
     assert torch.equal(tensor, torch.from_numpy(vec))
     assert mgr._tables_dirty
 
@@ -164,7 +178,7 @@ def test_apply_multi_layer_update():
     )
     applied, rejected = apply_steering_updates([update], mgr, layers)
     assert (applied, rejected) == (1, 0)
-    assert {(c[0], c[1]) for c in mgr.calls} == {("post_mlp", 0), ("post_mlp", 1)}
+    assert {(c[0], c[1]) for c in mgr.tier_calls} == {("post_mlp", 0), ("post_mlp", 1)}
 
 
 @pytest.mark.parametrize("phase", ["base", "prefill"])
@@ -254,7 +268,7 @@ def test_bad_update_does_not_block_good_one():
     good = _update()
     applied, rejected = apply_steering_updates([bad, good], mgr, layers)
     assert (applied, rejected) == (1, 1)
-    assert len(mgr.calls) == 1
+    assert len(mgr.tier_calls) == 1  # decode update -> tier
 
 
 def test_drain_stats_recorded_on_queue():
@@ -273,7 +287,7 @@ def test_float64_input_cast_to_float32():
     vec = np.ones(HIDDEN, dtype=np.float64)
     applied, _ = apply_steering_updates([_update(vec=vec)], mgr, {0: _FakeLayer()})
     assert applied == 1
-    assert mgr.calls[0][2].dtype == torch.float32
+    assert mgr.tier_calls[0][2].dtype == torch.float32  # decode update -> tier
 
 
 # ---------------------------------------------------------------------------

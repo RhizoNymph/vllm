@@ -373,11 +373,26 @@ token to exactly one row, so rows are exclusive — additivity across
 rows does not exist at the kernel level (rows 3+ are *pre-combined* at
 populate time instead). Two implementations, by phase:
 
-- **Populate-folding (no kernel change, available any time):** treat
-  the dynamic tier as a fourth vector source folded into
-  `populate_steering_tables` composition (rows 1/2 and 3+ all gain
-  `+ dynamic_vec * gain`). Gain changes mark `_tables_dirty` and cost
-  one repopulate — same price as today's global updates.
+- **Populate-folding (no kernel change) — IMPLEMENTED.** A decode-only
+  `SteeringManager.dynamic_tier_vectors` store, folded into the
+  *decode-effective* vector at populate time:
+  `global_decode = global_base + global_decode + dynamic_tier`. That
+  single composition point propagates the tier to every decode-derived
+  row — row 2, decode per-request rows, and dynamic-override rows
+  (`global_decode_effective + override`) — and to **no** prefill row, so
+  the decode-only cache-safety constraint (§7) holds for free. (The
+  earlier "rows 1/2 and 3+" note was imprecise: folding into prefill
+  rows would steer prefill, which §7 forbids; only decode-effective rows
+  get the tier.) `update_dynamic_tier`/`clear_dynamic_tier`/
+  `has_dynamic_tier` on the manager; `apply_steering_updates` routes
+  decode-phase `SteeringVectorUpdate`s here (gain pre-applied by the
+  consumer) instead of overwriting `global_decode_vectors`, so dynamic
+  global steering now composes additively with operator-set
+  (`/v1/steering/set`) decode steering. Gain/vector changes mark
+  `_tables_dirty` and cost one repopulate — same price as Phase 0's
+  global updates. Surfaced in `GET /v1/steering/dynamic` as
+  `dynamic_tier: {active, hooks}`. Tests:
+  `tests/v1/worker/test_steering_dynamic_tier.py`.
 - **Dedicated gather (Phase 1b, preferred):** per layer/hook, a single
   dynamic vector buffer + scalar gain read unconditionally by the
   kernel: `out += dynamic_vec * dynamic_gain`. Gain changes are a

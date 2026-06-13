@@ -311,10 +311,17 @@ def apply_steering_updates(
     affect the others (observer-isolation contract). Must be called on
     the model-runner step thread.
 
-    Application goes through
-    :meth:`SteeringManager.update_global_vectors`, which sets
-    ``_tables_dirty`` so the caller's existing populate path uploads the
-    new state before the next forward.
+    Decode-phase updates (the only cache-safe phase, and the only one
+    accepted unless ``allow_cache_unsafe_phases``) are applied to the
+    **dynamic additive tier** via
+    :meth:`SteeringManager.update_dynamic_tier`, so dynamic global
+    steering composes additively with operator-set decode steering
+    instead of overwriting ``global_decode_vectors`` (§5.4). The rare
+    base/prefill escape hatch (only reachable with
+    ``allow_cache_unsafe_phases=True``) keeps its overwrite semantics on
+    :meth:`SteeringManager.update_global_vectors`. Either way the manager
+    sets ``_tables_dirty`` so the caller's populate path uploads the new
+    state before the next forward.
     """
     applied = 0
     rejected = 0
@@ -337,12 +344,19 @@ def apply_steering_updates(
         for hook_name, layer_vecs in update.vectors.items():
             for layer_idx, vec in layer_vecs.items():
                 tensor = torch.from_numpy(np.ascontiguousarray(vec, dtype=np.float32))
-                manager.update_global_vectors(
-                    hook_name,
-                    layer_idx,
-                    tensor,
-                    phase=update.phase,
-                )
+                if update.phase == "decode":
+                    # Additive tier — composes with operator-set decode
+                    # steering rather than clobbering it.
+                    manager.update_dynamic_tier(hook_name, layer_idx, tensor)
+                else:
+                    # base/prefill: cache-unsafe escape hatch only; keep
+                    # the historical overwrite-on-global-tier semantics.
+                    manager.update_global_vectors(
+                        hook_name,
+                        layer_idx,
+                        tensor,
+                        phase=update.phase,
+                    )
         applied += 1
     if queue is not None:
         if applied:

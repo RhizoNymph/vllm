@@ -66,7 +66,10 @@ class SteeringManager:
     Table layout (per hook point):
         Row 0: zeros sentinel (no steering)
         Row 1: global prefill effective (global_base + global_prefill)
-        Row 2: global decode effective (global_base + global_decode)
+        Row 2: global decode effective
+            (global_base + global_decode + dynamic_tier; the dynamic
+            additive tier is folded in here only — decode-derived rows
+            see it, prefill rows do not. See §5.4.)
         Rows 3..max_steering_configs+2: phase-appropriate global
             + per_request combined
         Rows max_steering_configs+3..+2+max_dynamic_steering_configs:
@@ -125,6 +128,18 @@ class SteeringManager:
         self.global_base_vectors: dict[str, dict[int, torch.Tensor]] = {}
         self.global_prefill_vectors: dict[str, dict[int, torch.Tensor]] = {}
         self.global_decode_vectors: dict[str, dict[int, torch.Tensor]] = {}
+
+        # Dynamic additive tier (decode-only): a global steering
+        # contribution owned by dynamic consumers, folded ADDITIVELY into
+        # the decode-effective vector at populate time rather than
+        # overwriting ``global_decode_vectors``. This is what lets dynamic
+        # global steering compose with operator-set (``/v1/steering/set``)
+        # decode steering instead of clobbering it. Decode-only by
+        # construction (§7): folded into ``global_decode`` only, so it
+        # reaches row 2, decode per-request rows, and dynamic-override
+        # rows, never prefill rows, and never feeds prefix-cache keys.
+        # See docs/design/dynamic_steering.md §5.4.
+        self.dynamic_tier_vectors: dict[str, dict[int, torch.Tensor]] = {}
 
         # When True, populate_steering_tables() needs to run to bring the
         # per-layer table buffers in sync with current state. Set by every
@@ -457,6 +472,50 @@ class SteeringManager:
         self.global_decode_vectors.clear()
         self._tables_dirty = True
 
+    def update_dynamic_tier(
+        self,
+        hook_point: str,
+        layer_idx: int,
+        vector: torch.Tensor,
+        *,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Set the dynamic additive-tier vector for a hook point and layer.
+
+        The tier is folded ADDITIVELY into the decode-effective vector at
+        populate time (so it reaches row 2, decode per-request rows, and
+        dynamic-override rows), letting dynamic global steering compose
+        with operator-set decode steering rather than overwriting
+        ``global_decode_vectors``. Decode-only (§7): it never touches
+        prefill rows and never feeds prefix-cache keys.
+
+        Args:
+            hook_point: Hook point string (e.g. ``"post_mlp"``).
+            layer_idx: Layer index.
+            vector: The (already gain-scaled) tier vector.
+            locally_owned_layers: If provided and ``layer_idx`` is not in
+                the set, this call is a no-op — the same
+                distributed-determinism guard as
+                :meth:`update_global_vectors`.
+        """
+        if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
+            return
+        if hook_point not in self.dynamic_tier_vectors:
+            self.dynamic_tier_vectors[hook_point] = {}
+        self.dynamic_tier_vectors[hook_point][layer_idx] = vector.clone()
+        self._tables_dirty = True
+
+    def clear_dynamic_tier(self) -> None:
+        """Clear all dynamic additive-tier vectors."""
+        if self.dynamic_tier_vectors:
+            self.dynamic_tier_vectors.clear()
+            self._tables_dirty = True
+
+    @property
+    def has_dynamic_tier(self) -> bool:
+        """True if any dynamic additive-tier vector is set."""
+        return bool(self.dynamic_tier_vectors)
+
     def _global_dict_for_phase(self, phase: str) -> dict[str, dict[int, torch.Tensor]]:
         """Return the global vector dict for the given phase."""
         if phase == "base":
@@ -634,11 +693,14 @@ class SteeringManager:
         """Write current state into each layer's per-hook steering_table
         buffers.
 
-        For each hook point that has a table buffer on a layer:
+        For each hook point that has a table buffer on a layer
+        (``global_decode`` below = global_base + global_decode +
+        dynamic_tier, the decode-effective vector):
             Row 0 = zeros (always)
             Row 1 = global_base + global_prefill (or zeros)
-            Row 2 = global_base + global_decode (or zeros)
+            Row 2 = global_decode effective (or zeros)
             Rows 3+ = phase-appropriate global + per_request
+            Dynamic-override rows = global_decode effective + override
 
         Optimizations vs. the naive per-(hook, layer) loop:
 
@@ -741,9 +803,17 @@ class SteeringManager:
             decode_vec = self._get_global_vec(
                 hp_str, layer_idx, self.global_decode_vectors
             )
+            # Dynamic additive tier (§5.4): folded into the decode-effective
+            # vector ONLY, so it composes additively with operator-set
+            # decode steering and reaches every decode-derived row (row 2,
+            # decode per-request rows, dynamic-override rows) but never
+            # prefill rows (decode-only cache safety, §7).
+            tier_vec = self._get_global_vec(
+                hp_str, layer_idx, self.dynamic_tier_vectors
+            )
 
             global_prefill = self._add_vecs(base_vec, prefill_vec)
-            global_decode = self._add_vecs(base_vec, decode_vec)
+            global_decode = self._add_vecs(base_vec, decode_vec, tier_vec)
 
             # ``any_active`` is True iff at least one row >= 1 carries a
             # non-zero contribution — equivalent to "not every row >= 1 is
