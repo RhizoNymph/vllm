@@ -606,11 +606,34 @@ steering).
   consumer active. Note: this node needs `VLLM_USE_FLASHINFER_SAMPLER=0`
   (its CUDA/CUB toolchain fails the flashinfer sampling-kernel JIT —
   unrelated to steering).
-- **Phase 1a still missing**: engine-level fixture test (sync stub
-  consumer emits an override after step 0, assert step ≥1 logits shift
-  for the targeted request only); tp=2 rank-replication smoke
-  (identical tables and emitted actions across ranks — needs a
-  2-GPU node).
+- **Sync-consumer warmup hook (GPU-validated, node2)**: the ~117 ms
+  first-`on_step` outlier above is a one-time cuBLAS/probe-H2D init paid
+  on the critical path. `GPUModelRunner._warmup_sync_consumers()` (called
+  at the end of `capture_model`, full CUDA context) gives each sync
+  consumer an optional `warmup(device, dtype)` to pre-pay it; the example
+  controller runs one GEMV matching `on_step`. After the hook the same
+  120-step run reported `gpu_max_ms=0.098` (was 117.22), `gpu_avg_ms=0.059`
+  (was 1.04 — now the true steady-state, no longer skewed by the outlier),
+  and `over_budget_steps=0` (was 1). Skipped under `enforce_eager` (no
+  `capture_model`); the one-time cost is then paid on the first step.
+- **Engine-level e2e test (GPU-validated, node2)**:
+  `tests/v1/worker/test_dynamic_steering_e2e.py` drives a real `LLM` with
+  a config-driven sync stub (`DeterministicOverrideStub`, a second entry
+  point in the example package) that steers exactly one of two identical
+  concurrent requests on its first decode step. Asserted *within the
+  steered run* (target vs. in-batch control) to dodge batched-FP
+  nondeterminism — two identical greedy prompts are NOT bitwise identical
+  deep in generation (they diverge from FP noise at ~token 22 on
+  gemma4-31B), so a cross-run "identical baseline" assumption is invalid.
+  Result: `first_diff=2` — token 0 (prefill) and token 1 (the emit step,
+  override not yet applied) match; divergence begins at token 2. This
+  proves, end to end, exactly-one-step actuation latency *and* per-request
+  targeting, cleanly separated from the FP-noise floor. Skip-marked
+  (needs CUDA + a tapped gemma4); model via `DYNSTEER_E2E_MODEL`
+  (defaults to the gated tiny HF gemma4 with dummy weights; point at a
+  local GGUF to run offline). Forces `VLLM_WORKER_MULTIPROC_METHOD=spawn`.
+- **Phase 1a still missing**: tp=2 rank-replication smoke (identical
+  tables and emitted actions across ranks — needs a 2-GPU node).
 - **Phase 1b**: kernel-level tests for the scale tensor and dynamic
   tier (row-scale/baked-scale composition, dynamic-tier additivity
   with operator-set vectors, any_active interaction, zero-gain
