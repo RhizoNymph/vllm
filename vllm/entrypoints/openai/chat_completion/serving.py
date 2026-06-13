@@ -80,6 +80,7 @@ from vllm.v1.capture import (
     CaptureConsumer,
     CaptureContext,
     CaptureValidationError,
+    build_hook_schema,
     capture_expert_parallel_size,
 )
 from vllm.v1.capture import registry as capture_registry
@@ -578,6 +579,9 @@ class OpenAIServingChat(OpenAIServing):
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             expert_parallel_size=capture_expert_parallel_size(parallel_config),
             data_parallel_size=parallel_config.data_parallel_size,
+            hook_schema=build_hook_schema(
+                hidden_size, dt, getattr(model_config.hf_config, "hc_mult", None)
+            ),
         )
 
         validated: dict[str, Any] = {}

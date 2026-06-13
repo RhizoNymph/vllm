@@ -21,6 +21,7 @@ from vllm.v1.capture.types import (
     CaptureKey,
     CaptureResult,
     CaptureSpec,
+    HookSchema,
     VllmInternalRequestId,
 )
 
@@ -411,6 +412,116 @@ class TestTwoConsumersOverlapping:
         masks = {e.layer: e.consumer_mask for e in plan.entries}
         assert masks[0] == 0b01  # only consumer 0
         assert masks[1] == 0b10  # only consumer 1
+
+
+# ---------------------------------------------------------------------------
+# Per-hook schema (mHC: wide bf16 streams + fp32 coefficient hooks)
+# ---------------------------------------------------------------------------
+
+
+class TestPerHookSchema:
+    """A model whose hooks vary in width and dtype (DeepSeek-V4 mHC).
+
+    The manager must size its global buffers and the per-key scratch dtype
+    from the supplied ``hook_schema`` rather than the single ``hidden_size``
+    / ``model_dtype``, and must stamp each chunk's ``row_shape`` so a
+    consumer can reshape the flat row back to its logical shape.
+    """
+
+    HC_MULT = 4
+    # bf16 multi-stream residual; fp32 Sinkhorn coefficient matrix.
+    STREAM_WIDTH = HC_MULT * HIDDEN_SIZE
+    RES_MIX_WIDTH = HC_MULT * HC_MULT
+
+    def _schema(self) -> dict[str, HookSchema]:
+        return {
+            "mhc_streams_pre_attn": HookSchema(
+                self.STREAM_WIDTH, torch.bfloat16, (self.HC_MULT, HIDDEN_SIZE)
+            ),
+            "mhc_attn_res_mix": HookSchema(
+                self.RES_MIX_WIDTH, torch.float32, (self.HC_MULT, self.HC_MULT)
+            ),
+        }
+
+    def _make(self, max_num_tokens: int = 16):
+        sink = _make_sink()
+        specs = (
+            CaptureSpec(
+                hooks={"mhc_streams_pre_attn": [0], "mhc_attn_res_mix": [0]},
+                positions="last_prompt",
+            ),
+        )
+        mgr = CaptureManager(
+            consumers=(sink,),
+            consumer_specs=specs,
+            num_hidden_layers=NUM_LAYERS,
+            hidden_size=HIDDEN_SIZE,
+            model_dtype=MODEL_DTYPE,
+            max_num_tokens=max_num_tokens,
+            hook_schema=self._schema(),
+        )
+        return mgr, sink
+
+    def test_global_buffers_sized_per_hook(self):
+        mgr, _ = self._make()
+        stream_buf = mgr._global_buffers[(0, "mhc_streams_pre_attn")]
+        assert stream_buf.shape == (16, self.STREAM_WIDTH)
+        assert stream_buf.dtype == torch.bfloat16
+        res_buf = mgr._global_buffers[(0, "mhc_attn_res_mix")]
+        assert res_buf.shape == (16, self.RES_MIX_WIDTH)
+        assert res_buf.dtype == torch.float32
+
+    def test_scratch_dtype_per_hook(self):
+        """fp32 coefficient hooks keep fp32; not downcast to the model dtype."""
+        mgr, _ = self._make()
+        # Use a client spec so the dynamic-gather path sets scratch_dtype.
+        sink = _make_sink()
+        mgr2 = CaptureManager(
+            consumers=(sink,),
+            consumer_specs=(None,),
+            num_hidden_layers=NUM_LAYERS,
+            hidden_size=HIDDEN_SIZE,
+            model_dtype=MODEL_DTYPE,
+            hook_schema=self._schema(),
+        )
+        client_spec = CaptureSpec(
+            hooks={"mhc_attn_res_mix": [0]}, positions="all_prompt"
+        )
+        mgr2.register_request("r1", client_specs={0: client_spec}, num_prompt_tokens=3)
+        plan = mgr2.build_step_plan(_batch_view(["r1"], [3], [0], [3]))
+        assert plan.scratch_dtype[(0, "mhc_attn_res_mix")] == torch.float32
+
+    def test_chunk_carries_row_shape_and_dtype(self):
+        mgr, sink = self._make()
+        mgr.register_request("r1", client_specs=None, num_prompt_tokens=10)
+        view = _batch_view(["r1"], [10], [0], [10])
+        plan = mgr.build_step_plan(view)
+
+        streams = torch.arange(10 * self.STREAM_WIDTH, dtype=torch.bfloat16).reshape(
+            10, self.STREAM_WIDTH
+        )
+        res_mix = torch.arange(10 * self.RES_MIX_WIDTH, dtype=torch.float32).reshape(
+            10, self.RES_MIX_WIDTH
+        )
+        mgr.on_hook(0, "mhc_streams_pre_attn", streams)
+        mgr.on_hook(0, "mhc_attn_res_mix", res_mix)
+
+        mgr.dispatch_step_captures(plan)
+        mgr._drain_dispatch_queue()
+
+        chunks = {c.args[0].key[2]: c.args[0] for c in sink.submit_chunk.call_args_list}
+        assert chunks["mhc_streams_pre_attn"].dtype == torch.bfloat16
+        assert chunks["mhc_streams_pre_attn"].metadata["row_shape"] == (
+            self.HC_MULT,
+            HIDDEN_SIZE,
+        )
+        assert chunks["mhc_attn_res_mix"].dtype == torch.float32
+        assert chunks["mhc_attn_res_mix"].metadata["row_shape"] == (
+            self.HC_MULT,
+            self.HC_MULT,
+        )
+        # The captured row is the last-prompt position (row 9), full width.
+        torch.testing.assert_close(chunks["mhc_attn_res_mix"].tensor[0], res_mix[9])
 
 
 # ---------------------------------------------------------------------------

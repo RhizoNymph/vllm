@@ -280,6 +280,11 @@ class FilesystemConsumer:
         # readers can ``np.frombuffer`` the .bin without recomputing
         # from filesize / hidden_size externally.
         self._key_shapes: dict[CaptureKey, list[int]] = {}
+        # Per-row logical shape per key (per_file), from chunk metadata, so
+        # the finalize sidecar tells readers how to reshape each row — e.g.
+        # ``[hc_mult, hidden]`` for an mHC stream hook. ``[width]`` (a no-op
+        # reshape) for standard residual hooks.
+        self._key_row_shape: dict[CaptureKey, list[int]] = {}
         # Per writer-key events set by _on_write_result when a result
         # goes terminal. Keyed by writer-side (str, int, str) tuples.
         self._wait_lock = threading.Lock()
@@ -425,6 +430,19 @@ class FilesystemConsumer:
         )
 
     @staticmethod
+    def _row_shape_of(chunk: CaptureChunk, hidden: int) -> list[int]:
+        """Per-row logical shape for a chunk, from its metadata.
+
+        Falls back to ``[hidden]`` (the flattened width — a no-op reshape)
+        when the manager did not annotate a ``row_shape``, so standard
+        residual hooks and any non-annotated path stay byte-identical.
+        """
+        rs = chunk.metadata.get("row_shape")
+        if rs:
+            return [int(x) for x in rs]
+        return [hidden]
+
+    @staticmethod
     def _tensor_to_bytes(tensor: Any) -> tuple[bytes, int, int, str]:
         """Return ``(raw_bytes, rows, hidden, logical_dtype_str)``.
 
@@ -494,6 +512,7 @@ class FilesystemConsumer:
             if key not in self._key_paths:
                 self._key_paths[key] = (tag_slug, request_id_slug)
             self._key_dtype.setdefault(key, dtype_str)
+            self._key_row_shape.setdefault(key, self._row_shape_of(chunk, hidden))
             existing = self._key_shapes.get(key)
             if existing is None:
                 self._key_shapes[key] = [rows, hidden]
@@ -544,15 +563,11 @@ class FilesystemConsumer:
                     expected_keys=set(),
                 )
                 self._packed_states[req_str] = state
+            # First-seen dtype is the index-level fallback; per-entry dtype
+            # (below) is authoritative, so mixed dtypes in one packed file
+            # (bf16 streams + fp32 coefficients) are supported, not an error.
             if state.dtype is None:
                 state.dtype = dtype_str
-            elif state.dtype != dtype_str:
-                logger.warning(
-                    "dtype mismatch in packed request %s: %s vs %s",
-                    req_str,
-                    state.dtype,
-                    dtype_str,
-                )
             state.entries.append(
                 {
                     "layer": layer_idx,
@@ -560,6 +575,11 @@ class FilesystemConsumer:
                     "offset": state.running_offset,
                     "nbytes": nbytes,
                     "shape": [rows, hidden],
+                    "row_shape": self._row_shape_of(chunk, hidden),
+                    # Per-entry dtype: a single request may pack hooks of
+                    # different dtypes (bf16 mHC streams + fp32 coefficients);
+                    # the index-level ``dtype`` is only a fallback default.
+                    "dtype": dtype_str,
                 }
             )
             state.running_offset += nbytes
@@ -591,11 +611,21 @@ class FilesystemConsumer:
         if not chunks:
             return
         # Serialize every chunk outside the lock (cheap; not the bottleneck).
-        serialized: list[tuple[int, str, bytes, int, int, str]] = []
+        serialized: list[tuple[int, str, bytes, int, int, str, list[int]]] = []
         for chunk in chunks:
             _request_id, layer_idx, hook_name = chunk.key
             payload, rows, hidden, dtype_str = self._tensor_to_bytes(chunk.tensor)
-            serialized.append((layer_idx, hook_name, payload, rows, hidden, dtype_str))
+            serialized.append(
+                (
+                    layer_idx,
+                    hook_name,
+                    payload,
+                    rows,
+                    hidden,
+                    dtype_str,
+                    self._row_shape_of(chunk, hidden),
+                )
+            )
 
         payloads: list[bytes] = []
         with self._lock:
@@ -613,16 +643,19 @@ class FilesystemConsumer:
                     expected_keys=set(),
                 )
                 self._packed_states[req_str] = state
-            for layer_idx, hook_name, payload, rows, hidden, dtype_str in serialized:
+            for (
+                layer_idx,
+                hook_name,
+                payload,
+                rows,
+                hidden,
+                dtype_str,
+                row_shape,
+            ) in serialized:
+                # First-seen dtype is the index-level fallback; per-entry
+                # dtype is authoritative (mixed dtypes per request are valid).
                 if state.dtype is None:
                     state.dtype = dtype_str
-                elif state.dtype != dtype_str:
-                    logger.warning(
-                        "dtype mismatch in packed request %s: %s vs %s",
-                        req_str,
-                        state.dtype,
-                        dtype_str,
-                    )
                 state.entries.append(
                     {
                         "layer": layer_idx,
@@ -630,6 +663,8 @@ class FilesystemConsumer:
                         "offset": state.running_offset,
                         "nbytes": len(payload),
                         "shape": [rows, hidden],
+                        "row_shape": row_shape,
+                        "dtype": dtype_str,
                     }
                 )
                 state.running_offset += len(payload)
@@ -696,6 +731,10 @@ class FilesystemConsumer:
                     "offset": shard.running_offset,
                     "nbytes": nbytes,
                     "shape": [rows, hidden],
+                    "row_shape": self._row_shape_of(chunk, hidden),
+                    # Per-entry dtype: shards interleave requests and hooks of
+                    # differing dtypes; the index-level ``dtype`` is fallback.
+                    "dtype": dtype_str,
                 }
             )
             shard.running_offset += nbytes
@@ -778,6 +817,7 @@ class FilesystemConsumer:
             path_info = self._key_paths.pop(key, None)
             shape_info = self._key_shapes.pop(key, None)
             dtype_str = self._key_dtype.pop(key, None)
+            row_shape = self._key_row_shape.pop(key, None)
             recorded = self._request_slugs.get(req_str)
 
         if path_info is not None:
@@ -805,6 +845,8 @@ class FilesystemConsumer:
             sidecar_payload["shape"] = list(shape_info)
         if dtype_str is not None:
             sidecar_payload["dtype"] = dtype_str
+        if row_shape is not None:
+            sidecar_payload["row_shape"] = list(row_shape)
 
         self._writer.submit(
             FinalizeTask(

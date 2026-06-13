@@ -571,6 +571,7 @@ class GPUModelRunner(
             if get_tp_group().rank_in_group != 0:
                 set_active_capture_manager(None)
             else:
+                from vllm.v1.capture import build_hook_schema
                 from vllm.v1.capture import registry as _capture_registry
                 from vllm.v1.capture.manager import CaptureManager
 
@@ -625,6 +626,14 @@ class GPUModelRunner(
                     overload_policy=getattr(cc_config, "overload_policy", "spill"),
                     spill_dir=getattr(cc_config, "spill_dir", None),
                     spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
+                    # Per-hook row geometry. Driven from ``hf_config`` (not
+                    # the model object, which is not yet loaded here): mHC
+                    # models expose ``hc_mult`` and get the wider/fp32 hooks.
+                    hook_schema=build_hook_schema(
+                        self.model_config.get_hidden_size(),
+                        self.model_config.dtype,
+                        getattr(self.model_config.hf_config, "hc_mult", None),
+                    ),
                 )
                 self._capture_validators = validators
                 self._capture_name_to_index = dict(name_to_index)
@@ -1715,6 +1724,7 @@ class GPUModelRunner(
             CaptureContext,
             CaptureSpec,
             VllmInternalRequestId,
+            build_hook_schema,
             capture_expert_parallel_size,
         )
 
@@ -1733,6 +1743,11 @@ class GPUModelRunner(
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             expert_parallel_size=capture_expert_parallel_size(parallel_config),
             data_parallel_size=parallel_config.data_parallel_size,
+            hook_schema=build_hook_schema(
+                self.model_config.get_hidden_size(),
+                self.model_config.dtype,
+                getattr(self.model_config.hf_config, "hc_mult", None),
+            ),
         )
 
         raw_client = getattr(sp, "capture", None)
