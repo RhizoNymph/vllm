@@ -31,6 +31,12 @@ from __future__ import annotations
 
 import os
 
+# The engine core spawns workers; this test touches CUDA in the parent
+# (the skipif below), so force spawn to avoid "Cannot re-initialize CUDA
+# in forked subprocess". vLLM's conftest normally sets this, but this
+# test is run standalone (it has no conftest dependencies).
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 import pytest
 import torch
 
