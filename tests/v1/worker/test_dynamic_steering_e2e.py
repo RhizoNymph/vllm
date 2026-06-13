@@ -92,25 +92,28 @@ def _token_ids(llm, prompts):
     IS_LOCAL and not os.path.exists(MODEL),
     reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
 )
+# Greedy decoding of two identical prompts in one batch is NOT bitwise
+# identical deep into generation: batched reductions use position-
+# dependent orders, so the two diverge from pure FP noise after many
+# tokens (~20+ observed on gemma4-31B). The test must therefore not
+# assume "identical prompt => identical baseline". Instead it compares
+# the two outputs *within the same steered run* (target vs. in-batch
+# control): real steering forces an EARLY divergence (~token 2), well
+# separated from the late FP-noise floor. This also needs only one model
+# load. ``NOISE_FLOOR`` is the margin between the two regimes.
+NOISE_FLOOR = 10
+
+
 def test_dynamic_override_one_step_latency_and_targeting():
-    """One emitted override shifts only the target request, one step late."""
+    """One emitted override shifts only the target request, one step late.
+
+    Asserted within a single steered batch of two identical requests:
+    the steered (target) and untouched (control) outputs must diverge
+    *early* (steering took effect — distinguishable from late FP-noise
+    divergence) but *not at token 0* (the override emitted at step N only
+    acts at step N+1).
+    """
     prompts = [PROMPT, PROMPT]  # two identical concurrent requests
-
-    # --- Baseline: no consumer -> identical greedy outputs. ---
-    llm = _build_llm(capture_consumers=None)
-    try:
-        base_a, base_b = _token_ids(llm, prompts)
-    finally:
-        del llm
-
-    assert base_a == base_b, (
-        "identical greedy prompts must produce identical baseline outputs; "
-        f"got {base_a!r} vs {base_b!r}"
-    )
-    baseline = base_a
-    assert len(baseline) >= 3, f"baseline too short to test latency: {baseline!r}"
-
-    # --- Steered: stub steers the first request it sees in decode. ---
     consumers = [
         {
             "name": "dynamic_steering_e2e",
@@ -124,25 +127,29 @@ def test_dynamic_override_one_step_latency_and_targeting():
     ]
     llm = _build_llm(capture_consumers=consumers)
     try:
-        steered = _token_ids(llm, prompts)
+        out_a, out_b = _token_ids(llm, prompts)
     finally:
         del llm
 
-    matches = [s == baseline for s in steered]
-    # Targeting: exactly one request (the control) reproduces baseline.
-    assert sum(matches) == 1, (
-        "exactly one of two identical requests must be steered; "
-        f"baseline={baseline!r} steered={steered!r}"
-    )
+    first_diff = _common_prefix_len(out_a, out_b)
+    print(f"first_diff={first_diff} a={out_a}\n           b={out_b}")
 
-    target = steered[matches.index(False)]
-    # Latency: the steered request diverges, but not on the first token(s)
-    # — the override emitted at step N only takes effect at step N+1.
-    assert target != baseline
-    prefix = _common_prefix_len(target, baseline)
-    assert prefix >= 1, (
-        "steered output diverged on the very first token; the override "
-        f"should lag by a step. target={target!r} baseline={baseline!r}"
+    # Targeting: exactly one request was steered, so the two diverge.
+    assert out_a != out_b, (
+        "the two requests are identical — the stub steered neither or both; "
+        f"a={out_a!r} b={out_b!r}"
+    )
+    # Latency: token 0 (from prefill, before any decode-step override) must
+    # match; divergence starts at step >= 1.
+    assert first_diff >= 1, (
+        "outputs diverged on the very first token; an override emitted at "
+        f"step N must only act at N+1. a={out_a!r} b={out_b!r}"
+    )
+    # Steering, not noise: real steering diverges early, far below the
+    # batched-FP-noise floor that identical prompts hit much later.
+    assert first_diff <= NOISE_FLOOR, (
+        f"divergence at token {first_diff} looks like FP noise, not "
+        f"steering (expected <= {NOISE_FLOOR}). a={out_a!r} b={out_b!r}"
     )
 
 
