@@ -10,6 +10,8 @@ methods against duck-typed stubs — no engine, no GPU. Covers:
 queue and sync returns).
 """
 
+import time
+
 import numpy as np
 import pytest
 import torch
@@ -192,6 +194,70 @@ def test_run_sync_consumers_skips_apply_when_no_actions():
     stub._sync_consumers = [("idle", _ActionsConsumer(None))]
     stub._run_sync_consumers(_FakeSchedulerOutput({"a": 1}))
     assert stub.applied_calls == []
+
+
+class _FakeEvent:
+    """Stand-in for ``torch.cuda.Event(enable_timing=True)``.
+
+    The start event of a pair carries the elapsed-ms reading so the
+    runner's ``events[0].elapsed_time(events[1])`` returns a fixed value.
+    """
+
+    def __init__(self, elapsed_ms: float = 0.0):
+        self._elapsed_ms = elapsed_ms
+        self.records = 0
+
+    def record(self):
+        self.records += 1
+
+    def elapsed_time(self, _other):
+        return self._elapsed_ms
+
+
+def test_gpu_event_timing_is_deferred_one_step():
+    # GPU work measured at 10 ms/step; wall is ~0.
+    stub = _RunnerStub(reqs=[{"req_id": "a", "num_computed": 8, "num_prompt": 8}])
+    stub._sync_consumers = [("probe", _ActionsConsumer(None))]
+    stub._sync_timing_events = {"probe": (_FakeEvent(10.0), _FakeEvent())}
+
+    # Step 1: events recorded but not yet readable -> no GPU sample.
+    stub._run_sync_consumers(_FakeSchedulerOutput({"a": 1}))
+    s = stub._sync_consumer_stats["probe"]
+    assert s["steps"] == 1
+    assert s["gpu_steps"] == 0
+    assert s["gpu_last_ms"] is None
+
+    # Steps 2,3: the prior step's events are read (one-step deferral).
+    stub._run_sync_consumers(_FakeSchedulerOutput({"a": 1}))
+    stub._run_sync_consumers(_FakeSchedulerOutput({"a": 1}))
+    s = stub._sync_consumer_stats["probe"]
+    assert s["gpu_steps"] == 2
+    assert s["gpu_total_ms"] == pytest.approx(20.0)
+    assert s["gpu_max_ms"] == pytest.approx(10.0)
+    assert s["gpu_last_ms"] == 10.0
+    # The start event was recorded once per step.
+    assert stub._sync_timing_events["probe"][0].records == 3
+
+
+def test_budget_charges_gpu_time_not_wall_time():
+    # Slow wall (5 ms) over a 1 ms budget, but cheap GPU work (0.1 ms):
+    # the budget must charge the GPU reading, so nothing is over budget.
+    class _SlowWall:
+        sync_budget_ms = 1.0
+
+        def on_step(self, view):
+            time.sleep(0.005)
+            return None
+
+    stub = _RunnerStub(reqs=[{"req_id": "a", "num_computed": 8, "num_prompt": 8}])
+    stub._sync_consumers = [("probe", _SlowWall())]
+    stub._sync_timing_events = {"probe": (_FakeEvent(0.1), _FakeEvent())}
+    for _ in range(3):
+        stub._run_sync_consumers(_FakeSchedulerOutput({"a": 1}))
+
+    s = stub._sync_consumer_stats["probe"]
+    assert s["total_ms"] > 1.0  # wall blew the budget...
+    assert s["over_budget_steps"] == 0  # ...but the GPU charge did not
 
 
 # ---------------------------------------------------------------------------

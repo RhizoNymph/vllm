@@ -634,10 +634,25 @@ class SteeringModelRunnerMixin:
         consumers = {name: c for name, c in getattr(self, "_sync_consumers", [])}
         sync_status: dict = {}
         for name, stats in getattr(self, "_sync_consumer_stats", {}).items():
+            gpu_steps = stats.get("gpu_steps", 0)
             entry = {
                 "steps": stats["steps"],
+                # Wall-clock span; absorbs the forward-pass GPU drain
+                # (the consumer's D2H is the step's first CUDA sync) and
+                # is a misleading proxy for added cost — diagnostic only.
                 "total_ms": round(stats["total_ms"], 3),
                 "max_ms": round(stats["max_ms"], 3),
+                # CUDA-event GPU time of only the consumer's own work —
+                # the honest added cost. Lags wall time by one step.
+                "gpu_steps": gpu_steps,
+                "gpu_total_ms": round(stats.get("gpu_total_ms", 0.0), 3),
+                "gpu_max_ms": round(stats.get("gpu_max_ms", 0.0), 3),
+                "gpu_avg_ms": (
+                    round(stats["gpu_total_ms"] / gpu_steps, 3)
+                    if gpu_steps
+                    else None
+                ),
+                "gpu_last_ms": stats.get("gpu_last_ms"),
                 "over_budget_steps": stats.get("over_budget_steps", 0),
                 "ring": [list(item) for item in stats.get("ring", ())],
             }

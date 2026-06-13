@@ -572,17 +572,28 @@ steering).
   Paris." then steered tokens), `/v1/steering/dynamic` shows
   `dynamic_pool.in_use=1` + the request→dyn_id mapping mid-decode and
   a clean drain to 0 on finish, `applied`/`rejected` counters correct.
-  **Finding**: reported `on_step` wall time (~30 ms ≈ the model's
-  decode step time) is dominated by the scores D2H acting as the
-  step's first CUDA sync point — it absorbs the forward's GPU drain
-  rather than adding cost. Needs a tokens/s A/B to quantify real
-  overhead, and possibly event-based timing so the metric reports
-  added time only.
+  **Finding (resolved)**: the original metric reported `on_step` wall
+  time (~30 ms ≈ the model's decode step time), because the consumer's
+  scores D2H is the step's *first* CUDA sync point and the
+  `perf_counter` span absorbs the forward pass's GPU drain rather than
+  measuring added cost. Fixed by adding CUDA-event timing: a per-consumer
+  event pair brackets `on_step`, and because both events sit behind the
+  forward in the stream queue, `start.elapsed_time(end)` measures only
+  the consumer's own enqueued GPU work (GEMV + D2H), excluding the drain.
+  The pair is read one step late (the prior step's events are guaranteed
+  complete), so the read never blocks and never forces a sync onto the
+  critical path; the GPU reading lags wall time by exactly one step. The
+  endpoint now reports both: `total_ms`/`max_ms` (wall, diagnostic) and
+  `gpu_total_ms`/`gpu_avg_ms`/`gpu_max_ms` (the honest added cost). The
+  budget check (`sync_budget_ms`) charges the GPU reading, not the
+  drain-inflated wall time, removing the spurious over-budget warnings.
+  A tokens/s A/B (consumer absent vs. shadow mode) corroborates the
+  event metric.
 - **Phase 1a still missing**: engine-level fixture test (sync stub
   consumer emits an override after step 0, assert step ≥1 logits shift
   for the targeted request only); tp=2 rank-replication smoke
   (identical tables and emitted actions across ranks — needs a
-  2-GPU node); throughput A/B for the sync-consumer overhead.
+  2-GPU node).
 - **Phase 1b**: kernel-level tests for the scale tensor and dynamic
   tier (row-scale/baked-scale composition, dynamic-tier additivity
   with operator-set vectors, any_active interaction, zero-gain

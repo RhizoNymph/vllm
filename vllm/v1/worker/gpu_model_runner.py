@@ -554,6 +554,16 @@ class GPUModelRunner(
         self._sync_monitor_keys: list[tuple[int, str]] = []
         self._sync_consumer_stats: dict[str, dict[str, Any]] = {}
         self._sync_step_counter = 0
+        # Per-consumer CUDA event pairs measuring the *added* GPU time of
+        # ``on_step`` — the GEMV + tiny D2H the consumer enqueues — rather
+        # than the wall-clock ``perf_counter`` span, which absorbs the
+        # forward-pass GPU drain (the consumer's D2H is the step's first
+        # CUDA sync point). ``None`` off CUDA (e.g. CPU tests); populated
+        # below once we know sync consumers are active on a CUDA device.
+        # See ``_run_sync_consumers`` and docs/design/dynamic_steering.md §9.
+        self._sync_timing_events: (
+            dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] | None
+        ) = None
         if self.vllm_config.capture_consumers_config is not None:
             from vllm.model_executor.layers.activation_capture import (
                 set_active_capture_manager,
@@ -721,6 +731,15 @@ class GPUModelRunner(
                     [name for name, _ in self._sync_consumers],
                     self._sync_monitor_keys,
                 )
+                # CUDA-event timers for the honest per-step added GPU cost.
+                if getattr(self.device, "type", None) == "cuda":
+                    self._sync_timing_events = {
+                        name: (
+                            torch.cuda.Event(enable_timing=True),
+                            torch.cuda.Event(enable_timing=True),
+                        )
+                        for name, _ in self._sync_consumers
+                    }
 
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
@@ -2035,18 +2054,65 @@ class GPUModelRunner(
         ``_apply_steering_actions`` so they are visible to the next
         step's ``_update_steering_buffers``.
 
-        Observability (docs/design/dynamic_steering.md §5.5): per
-        consumer, wall time is accumulated in ``_sync_consumer_stats``
-        and a bounded ring of recent ``(step, on_step_ms, n_actions)``
-        tuples is kept for the ``/v1/steering/dynamic`` endpoint. A
-        consumer whose ``on_step`` exceeds its budget (consumer attr
-        ``sync_budget_ms``, default 5.0) triggers a rate-limited
-        warning — metric + warning only, never an automatic disable
+        Observability (docs/design/dynamic_steering.md §5.5, §9): two
+        timings are kept per consumer in ``_sync_consumer_stats``.
+
+        - ``total_ms``/``max_ms`` are the wall-clock ``perf_counter``
+          span. The consumer's ``.cpu()`` D2H is the step's *first* CUDA
+          sync point, so this wall time absorbs the forward pass's GPU
+          drain — it is a misleading proxy for added cost and is kept
+          only as a diagnostic.
+        - ``gpu_total_ms``/``gpu_max_ms`` are the CUDA-event GPU time of
+          *only* the consumer's own enqueued work (the GEMV + D2H),
+          measured between two events that both sit behind the forward in
+          the stream queue, so the forward drain is excluded. This is the
+          honest added cost. The pair is read one step late (the prior
+          step's events are guaranteed complete by now), so the read
+          never blocks and never forces a sync onto the critical path;
+          ``gpu_*`` therefore lags wall time by exactly one step.
+
+        A bounded ring of recent ``(step, wall_ms, n_actions)`` tuples is
+        kept for the ``/v1/steering/dynamic`` endpoint. The budget check
+        (consumer attr ``sync_budget_ms``, default 5.0) charges the
+        CUDA-event GPU time when available — not the drain-inflated wall
+        time — and is metric + warning only, never an automatic disable
         (a disable trigger would itself need to be rank-replicated).
         """
         self._sync_step_counter += 1
         view = self._build_step_capture_view(scheduler_output)
+        events_by_name = getattr(self, "_sync_timing_events", None)
         for name, consumer in self._sync_consumers:
+            stats = self._sync_consumer_stats.setdefault(
+                name,
+                {
+                    "steps": 0,
+                    "total_ms": 0.0,
+                    "max_ms": 0.0,
+                    "gpu_steps": 0,
+                    "gpu_total_ms": 0.0,
+                    "gpu_max_ms": 0.0,
+                    "gpu_last_ms": None,
+                    "over_budget_steps": 0,
+                    "ring": deque(maxlen=256),
+                    "_gpu_armed": False,
+                    "_last_budget_warn": 0.0,
+                },
+            )
+            events = events_by_name.get(name) if events_by_name is not None else None
+
+            # Deferred read: events recorded on this consumer's PREVIOUS
+            # step are complete now (a full forward has run since), so
+            # ``elapsed_time`` never blocks and never forces a sync.
+            gpu_ms: float | None = None
+            if events is not None and stats["_gpu_armed"]:
+                gpu_ms = events[0].elapsed_time(events[1])
+                stats["gpu_steps"] += 1
+                stats["gpu_total_ms"] += gpu_ms
+                stats["gpu_max_ms"] = max(stats["gpu_max_ms"], gpu_ms)
+                stats["gpu_last_ms"] = round(gpu_ms, 3)
+
+            if events is not None:
+                events[0].record()
             t0 = time.perf_counter()
             try:
                 actions = consumer.on_step(view)
@@ -2057,37 +2123,34 @@ class GPUModelRunner(
                     name,
                 )
                 actions = None
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            stats = self._sync_consumer_stats.setdefault(
-                name,
-                {
-                    "steps": 0,
-                    "total_ms": 0.0,
-                    "max_ms": 0.0,
-                    "over_budget_steps": 0,
-                    "ring": deque(maxlen=256),
-                    "_last_budget_warn": 0.0,
-                },
-            )
+            wall_ms = (time.perf_counter() - t0) * 1000.0
+            if events is not None:
+                events[1].record()
+                stats["_gpu_armed"] = True
+
             stats["steps"] += 1
-            stats["total_ms"] += elapsed_ms
-            stats["max_ms"] = max(stats["max_ms"], elapsed_ms)
+            stats["total_ms"] += wall_ms
+            stats["max_ms"] = max(stats["max_ms"], wall_ms)
             n_actions = len(actions) if actions else 0
             stats["ring"].append(
-                (self._sync_step_counter, round(elapsed_ms, 3), n_actions)
+                (self._sync_step_counter, round(wall_ms, 3), n_actions)
             )
+
+            # Charge the honest added GPU cost when we have a CUDA-event
+            # reading; off CUDA (CPU tests) fall back to wall time.
+            charge_ms = gpu_ms if events is not None else wall_ms
             budget_ms = float(getattr(consumer, "sync_budget_ms", 5.0))
-            if elapsed_ms > budget_ms:
+            if charge_ms is not None and charge_ms > budget_ms:
                 stats["over_budget_steps"] += 1
                 now = time.monotonic()
                 if now - stats["_last_budget_warn"] >= 5.0:
                     stats["_last_budget_warn"] = now
                     logger.warning(
-                        "sync capture consumer %s on_step took %.2f ms "
-                        "(budget %.2f ms, %d over-budget steps so far); "
-                        "this time is on the model-runner critical path",
+                        "sync capture consumer %s on_step used %.2f ms of GPU "
+                        "time (budget %.2f ms, %d over-budget steps so far); "
+                        "this runs on the model-runner critical path",
                         name,
-                        elapsed_ms,
+                        charge_ms,
                         budget_ms,
                         stats["over_budget_steps"],
                     )
