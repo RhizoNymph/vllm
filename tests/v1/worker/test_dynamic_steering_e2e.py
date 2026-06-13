@@ -85,13 +85,6 @@ def _token_ids(llm, prompts):
     return [list(o.outputs[0].token_ids) for o in outs]
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="dynamic-steering e2e requires CUDA"
-)
-@pytest.mark.skipif(
-    IS_LOCAL and not os.path.exists(MODEL),
-    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
-)
 # Greedy decoding of two identical prompts in one batch is NOT bitwise
 # identical deep into generation: batched reductions use position-
 # dependent orders, so the two diverge from pure FP noise after many
@@ -104,6 +97,13 @@ def _token_ids(llm, prompts):
 NOISE_FLOOR = 10
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="dynamic-steering e2e requires CUDA"
+)
+@pytest.mark.skipif(
+    IS_LOCAL and not os.path.exists(MODEL),
+    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
+)
 def test_dynamic_override_one_step_latency_and_targeting():
     """One emitted override shifts only the target request, one step late.
 
