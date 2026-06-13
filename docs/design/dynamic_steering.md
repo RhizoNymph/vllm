@@ -587,8 +587,25 @@ steering).
   `gpu_total_ms`/`gpu_avg_ms`/`gpu_max_ms` (the honest added cost). The
   budget check (`sync_budget_ms`) charges the GPU reading, not the
   drain-inflated wall time, removing the spurious over-budget warnings.
-  A tokens/s A/B (consumer absent vs. shadow mode) corroborates the
-  event metric.
+- **Event metric GPU-validated (tp=1, 2026-06-13, node2)**: gemma4-31B
+  Q4_K_S on an RTX 3090, per-request actuation, threshold=-1/gain=6 so
+  every request engages (maximal consumer load), pool=32. Over a 120-step
+  run the endpoint reported wall ~31 ms/step (= the model's decode step
+  time, the old misleading figure) but `gpu_avg_ms=1.04`,
+  `gpu_last_ms=0.054`, `gpu_steps=119` (one fewer than 120 — the
+  one-step deferral). The 1.04 ms average is dominated by a single
+  ~117 ms first-step outlier (lazy cuBLAS / probe H2D init); steady-state
+  decode added cost is ~0.05 ms/step (~0.16% of a 31 ms step), and
+  `over_budget_steps` was 1 (the warmup outlier) rather than ~120 as the
+  wall-based check would have flagged. A throughput A/B corroborated:
+  16 concurrent × 256 tokens gave 96.67 tok/s baseline (no consumer) vs.
+  95.92 tok/s with the consumer active — a 0.78% difference, within
+  run-to-run noise and consistent with the event metric (the old 31 ms
+  wall figure would have implied a ~2× slowdown that plainly does not
+  occur). cudagraphs captured normally (PIECEWISE + FULL decode) with the
+  consumer active. Note: this node needs `VLLM_USE_FLASHINFER_SAMPLER=0`
+  (its CUDA/CUB toolchain fails the flashinfer sampling-kernel JIT —
+  unrelated to steering).
 - **Phase 1a still missing**: engine-level fixture test (sync stub
   consumer emits an override after step 0, assert step ≥1 logits shift
   for the targeted request only); tp=2 rank-replication smoke
