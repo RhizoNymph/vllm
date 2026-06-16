@@ -56,6 +56,15 @@ HOOK_POINT_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
     hp: f"{table_attr}_any_active" for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
 }
 
+# Per-hook dedicated dynamic-tier vector attribute names (§5.4). A single
+# fp32 ``(hidden,)`` buffer per hook point holding that hook's global
+# dynamic-tier vector; the apply kernel adds ``dynamic_vec * token_scales``
+# on top of the row gather, gated per token (decode-only). Derived from the
+# table attribute so the two are discoverable together.
+HOOK_POINT_DYNVEC_ATTR: dict[SteeringHookPoint, str] = {
+    hp: f"{table_attr}_dynvec" for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
+}
+
 # Valid hook point string values for validation.
 VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHookPoint)
 
@@ -107,10 +116,31 @@ def register_steering_buffers(
             torch.zeros(1, dtype=torch.bool),
             persistent=False,
         )
+        # Per-hook dedicated dynamic-tier vector (§5.4): fp32 (hidden,),
+        # default 0 ⇒ no tier. The manager writes it from
+        # ``dynamic_tier_vectors`` in populate; the kernel adds
+        # ``dynamic_vec * token_scales`` on top of the row gather.
+        module.register_buffer(
+            HOOK_POINT_DYNVEC_ATTR[hp],
+            torch.zeros(hidden_size, dtype=torch.float32),
+            persistent=False,
+        )
 
     module.register_buffer(
         "steering_index",
         torch.zeros(max_steering_tokens, dtype=torch.long),
+        persistent=False,
+    )
+
+    # Per-token dynamic-tier gate (§5.4): fp32 (max_tokens,), default 0,
+    # shared across layers like ``steering_index`` (shared in
+    # ``_init_steering_state``). The runner writes it each step —
+    # ``dynamic_tier_gain`` for decode tokens of a tier-active state, 0
+    # otherwise (so the tier stays decode-only). Phase 2 replaces the
+    # runner write with an in-graph monitor.
+    module.register_buffer(
+        "steering_token_scales",
+        torch.zeros(max_steering_tokens, dtype=torch.float32),
         persistent=False,
     )
 
@@ -170,6 +200,25 @@ def share_steering_index_across_layers(layers: list[nn.Module]) -> None:
         layer.steering_index = shared_index
 
 
+def share_steering_token_scales_across_layers(layers) -> None:
+    """Reuse one ``steering_token_scales`` tensor across all steerable layers.
+
+    The per-token dynamic-tier gate (§5.4) is layer-independent and
+    ``max_tokens``-sized, so it is shared (one per-step H2D, not per
+    layer) exactly like ``steering_index``. Called once from the mixin's
+    ``_init_steering_state`` (not per model file) since it has every
+    steerable layer in hand at that point.
+    """
+    shared: torch.Tensor | None = None
+    for layer in layers:
+        if not hasattr(layer, "steering_token_scales"):
+            continue
+        if shared is None:
+            shared = layer.steering_token_scales
+            continue
+        layer.steering_token_scales = shared
+
+
 def apply_layer_steering(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -198,6 +247,8 @@ def apply_layer_steering(
         module.steering_index,
         getattr(module, HOOK_POINT_ANY_ACTIVE_ATTR[hook_point]),
         module.steering_scales,
+        getattr(module, HOOK_POINT_DYNVEC_ATTR[hook_point]),
+        module.steering_token_scales,
     )
 
 
@@ -207,8 +258,14 @@ def apply_steering(
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
     steering_scales: torch.Tensor,
+    steering_dynamic_vec: torch.Tensor,
+    steering_token_scales: torch.Tensor,
 ) -> torch.Tensor:
     """Apply per-request activation steering via indexed gather.
+
+    Two additive terms: the per-row gather
+    ``table[index[i]] * scales[index[i]]`` plus the **dedicated dynamic
+    tier** ``dynamic_vec * token_scales[i]`` (§5.4).
 
     ``steering_scales`` is a shared buffer of shape ``(max_configs + 3,)``
     (fp32, default 1.0) holding a per-row strength multiplier — the
@@ -216,6 +273,13 @@ def apply_steering(
     ``scales[index[i]]`` before the add, so changing strength needs only
     a cheap scales write, no vector re-upload (see §5.3). A scale of 1.0
     reproduces the unscaled steering.
+
+    ``steering_dynamic_vec`` is this (layer, hook)'s dynamic-tier vector
+    (fp32, ``(hidden,)``, default 0); ``steering_token_scales`` is a
+    shared per-token gate (fp32, ``(max_tokens,)``, default 0, and 0 for
+    prefill tokens). The tier add ``dynamic_vec * token_scales[i]`` lets
+    global dynamic steering be modulated per token and stay decode-only;
+    with the default-0 gate it contributes nothing.
 
     ``steering_table`` is a per-layer buffer of shape
     ``(max_configs + 3, hidden_size)`` where row 0 is always zeros
@@ -259,7 +323,13 @@ def apply_steering(
         )
 
         return apply_steering_triton(
-            hidden_states, steering_table, steering_index, any_active, steering_scales
+            hidden_states,
+            steering_table,
+            steering_index,
+            any_active,
+            steering_scales,
+            steering_dynamic_vec,
+            steering_token_scales,
         )
     # CPU eager: short-circuit on the host so we don't even materialize
     # the gather. ``.item()`` synchronizes against the device producer
@@ -269,10 +339,14 @@ def apply_steering(
         # Match the freshly-allocated-output contract of the CUDA path so
         # callers never see an alias of ``hidden_states``.
         return hidden_states.clone()
-    rows = steering_index[: hidden_states.shape[0]]
+    n = hidden_states.shape[0]
+    rows = steering_index[:n]
     # Per-row scale (fp32, default 1.0); broadcast over hidden dim.
     scale = steering_scales[rows].unsqueeze(-1).to(steering_table.dtype)
-    return hidden_states + steering_table[rows] * scale
+    out = hidden_states + steering_table[rows] * scale
+    # Dedicated dynamic tier: dvec * per-token gate (0 ⇒ no-op).
+    tier = steering_dynamic_vec.unsqueeze(0) * steering_token_scales[:n].unsqueeze(-1)
+    return out + tier.to(out.dtype)
 
 
 def apply_steering_fake(
@@ -281,6 +355,8 @@ def apply_steering_fake(
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
     steering_scales: torch.Tensor,
+    steering_dynamic_vec: torch.Tensor,
+    steering_token_scales: torch.Tensor,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)

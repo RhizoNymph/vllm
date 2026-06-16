@@ -48,6 +48,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
+    HOOK_POINT_DYNVEC_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
@@ -140,6 +141,10 @@ class SteeringManager:
         # rows, never prefill rows, and never feeds prefix-cache keys.
         # See docs/design/dynamic_steering.md §5.4.
         self.dynamic_tier_vectors: dict[str, dict[int, torch.Tensor]] = {}
+        # Scalar strength for the dedicated dynamic tier (§5.4). The runner
+        # folds it into the per-token gate (``steering_token_scales``) each
+        # step, so changing it is free (no buffer rewrite of its own).
+        self.dynamic_tier_gain: float = 1.0
 
         # Per-row strength scales (the §5.3 "how much" knob), keyed by
         # LOGICAL owner so they survive row reassignment: phase->scale for
@@ -532,6 +537,14 @@ class SteeringManager:
         """True if any dynamic additive-tier vector is set."""
         return bool(self.dynamic_tier_vectors)
 
+    def set_dynamic_tier_gain(self, gain: float) -> None:
+        """Set the scalar strength of the dedicated dynamic tier (§5.4).
+
+        Cheap: the runner reads this when it rebuilds the per-token gate
+        each step, so no buffer write happens here.
+        """
+        self.dynamic_tier_gain = float(gain)
+
     # ------------------------------------------------------------------
     # Per-row strength scales (§5.3) — cheap "how much" knob
     # ------------------------------------------------------------------
@@ -864,6 +877,10 @@ class SteeringManager:
         # zero sentinel.  When the flag is False, the apply_steering
         # kernel skips the gather + add and just emits hidden_states.
         per_table_any_active: list[bool] = []
+        # Per active-table dynamic-tier vector (or None), captured during
+        # row assembly and written into each layer's ``dynamic_vec`` buffer
+        # at the end (dedicated-gather, §5.4).
+        per_table_tier_vec: list[torch.Tensor | None] = []
 
         # Snapshot config_to_row ordering. This is ALWAYS needed for the
         # row-assembly loop below, but ``indices`` only needs rebuilding
@@ -916,22 +933,25 @@ class SteeringManager:
             decode_vec = self._get_global_vec(
                 hp_str, layer_idx, self.global_decode_vectors
             )
-            # Dynamic additive tier (§5.4): folded into the decode-effective
-            # vector ONLY, so it composes additively with operator-set
-            # decode steering and reaches every decode-derived row (row 2,
-            # decode per-request rows, dynamic-override rows) but never
-            # prefill rows (decode-only cache safety, §7).
+            # Dynamic additive tier (§5.4, dedicated-gather): NOT folded
+            # into the rows. It lives in a per-(layer, hook) ``dynamic_vec``
+            # buffer the kernel adds on top of the row gather, gated
+            # per-token (decode-only). Captured here to write that buffer
+            # below and to flag ``any_active``.
             tier_vec = self._get_global_vec(
                 hp_str, layer_idx, self.dynamic_tier_vectors
             )
+            per_table_tier_vec.append(tier_vec)
 
             global_prefill = self._add_vecs(base_vec, prefill_vec)
-            global_decode = self._add_vecs(base_vec, decode_vec, tier_vec)
+            global_decode = self._add_vecs(base_vec, decode_vec)
 
             # ``any_active`` is True iff at least one row >= 1 carries a
             # non-zero contribution — equivalent to "not every row >= 1 is
-            # the ``zero_row`` sentinel".  Tracked as we append rows.
-            any_active = False
+            # the ``zero_row`` sentinel".  Tracked as we append rows. The
+            # dedicated tier also counts: the kernel must run to apply it
+            # even when no table row is active.
+            any_active = tier_vec is not None
 
             rows: list[torch.Tensor] = [zero_row]  # row 0: always zero
             if global_prefill is not None:
@@ -1044,6 +1064,22 @@ class SteeringManager:
             if flag_buf is None:
                 continue
             flag_buf.fill_(per_table_any_active[active_pos])
+
+        # Write each (hook, layer)'s dedicated dynamic-tier vector (§5.4)
+        # into its ``dynamic_vec`` buffer (or zero it when no tier is set).
+        for active_pos, (_table, hp_str, _layer_idx, mod) in enumerate(active_tables):
+            try:
+                hp_enum = SteeringHookPoint(hp_str)
+            except ValueError:
+                continue
+            dvec_buf = getattr(mod, HOOK_POINT_DYNVEC_ATTR[hp_enum], None)
+            if dvec_buf is None:
+                continue
+            tier_vec = per_table_tier_vec[active_pos]
+            if tier_vec is None:
+                dvec_buf.zero_()
+            else:
+                dvec_buf.copy_(tier_vec.squeeze(0).to(dvec_buf.device))
 
         # Write the per-row strength scales (§5.3) alongside the tables.
         # The scale vector is hook/layer-independent, so build it once and

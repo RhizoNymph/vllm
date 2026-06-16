@@ -278,6 +278,7 @@ class _Layer(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.register_buffer("steering_table_post_mlp", torch.zeros(7, HIDDEN))
+        self.register_buffer("steering_table_post_mlp_dynvec", torch.zeros(HIDDEN))
 
 
 def test_apply_actions_routes_vector_updates_to_manager():
@@ -294,8 +295,11 @@ def test_apply_actions_routes_vector_updates_to_manager():
     }
 
     mgr.populate_steering_tables(host._steerable_layers_cache)
-    table = host._steerable_layers_cache[1].steering_table_post_mlp
-    assert torch.all(table[2] == 2.0)  # global decode row
+    # Decode updates now land on the dedicated dynamic tier (§5.4), not
+    # the global-decode row — applied by the kernel via token_scales.
+    layer = host._steerable_layers_cache[1]
+    assert torch.all(layer.steering_table_post_mlp[2] == 0.0)
+    assert torch.all(layer.steering_table_post_mlp_dynvec == 2.0)
 
 
 def test_apply_actions_rejects_unknown_action_type():

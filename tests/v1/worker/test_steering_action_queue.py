@@ -299,12 +299,15 @@ def test_float64_input_cast_to_float32():
 
 
 class _RealSteerableLayer(torch.nn.Module):
-    """Layer with a real registered steering-table buffer."""
+    """Layer with real registered steering buffers (table + tier dynvec)."""
 
     def __init__(self, num_rows: int, hidden_size: int):
         super().__init__()
         self.register_buffer(
             "steering_table_post_mlp", torch.zeros(num_rows, hidden_size)
+        )
+        self.register_buffer(
+            "steering_table_post_mlp_dynvec", torch.zeros(hidden_size)
         )
 
 
@@ -316,10 +319,10 @@ def _real_setup():
     return mgr, layers
 
 
-def test_real_manager_decode_update_lands_in_row_2():
-    """Drained decode update must materialize in the global-decode row
-    (row 2) of the layer's table after the populate path runs — the
-    same sequence ``_update_steering_buffers`` performs each step."""
+def test_real_manager_decode_update_lands_in_dynamic_tier():
+    """A drained decode update now materializes in the dedicated dynamic
+    tier buffer (§5.4), NOT a table row — the kernel adds it per decode
+    token via ``token_scales``. Rows stay untouched."""
     mgr, layers = _real_setup()
     q = SteeringActionQueue()
     vec = np.linspace(0.0, 1.5, HIDDEN, dtype=np.float32)
@@ -330,33 +333,35 @@ def test_real_manager_decode_update_lands_in_row_2():
     assert mgr._tables_dirty
 
     mgr.populate_steering_tables(layers)
-    table = layers[0].steering_table_post_mlp
-    torch.testing.assert_close(table[2], torch.from_numpy(vec))
-    # Prefill row and sentinel untouched.
-    assert torch.all(table[0] == 0)
-    assert torch.all(table[1] == 0)
+    layer = layers[0]
+    torch.testing.assert_close(
+        layer.steering_table_post_mlp_dynvec, torch.from_numpy(vec)
+    )
+    # No table row carries the tier anymore.
+    assert torch.all(layer.steering_table_post_mlp == 0)
 
 
 def test_real_manager_zero_vector_disengages():
-    """A follow-up zero-vector update must zero the decode row (the
+    """A follow-up zero-vector update must zero the tier buffer (the
     plugin's disengage emission)."""
     mgr, layers = _real_setup()
     apply_steering_updates(
         [_update(vec=np.ones(HIDDEN, dtype=np.float32))], mgr, layers
     )
     mgr.populate_steering_tables(layers)
-    assert torch.all(layers[0].steering_table_post_mlp[2] == 1.0)
+    assert torch.all(layers[0].steering_table_post_mlp_dynvec == 1.0)
 
     apply_steering_updates(
         [_update(vec=np.zeros(HIDDEN, dtype=np.float32))], mgr, layers
     )
     mgr.populate_steering_tables(layers)
-    assert torch.all(layers[0].steering_table_post_mlp[2] == 0.0)
+    assert torch.all(layers[0].steering_table_post_mlp_dynvec == 0.0)
 
 
 def test_real_manager_decode_update_composes_with_per_request_config():
-    """Rows 3+ combine global decode + per-request vectors; a dynamic
-    global-decode update must flow into a decode-phase request row."""
+    """The tier composes additively with a per-request decode row at the
+    *kernel* level now: the row holds only the per-request vector, the
+    tier sits in the dynvec buffer, and the kernel sums them per token."""
     mgr, layers = _real_setup()
     req_vec = [2.0] * HIDDEN
     row = mgr.register_config(
@@ -366,9 +371,10 @@ def test_real_manager_decode_update_composes_with_per_request_config():
         [_update(vec=np.ones(HIDDEN, dtype=np.float32))], mgr, layers
     )
     mgr.populate_steering_tables(layers)
-    table = layers[0].steering_table_post_mlp
-    # Request row = global decode (1.0) + per-request (2.0).
-    assert torch.all(table[row] == 3.0)
+    layer = layers[0]
+    # Row = per-request only (2.0); tier (1.0) is the separate kernel term.
+    assert torch.all(layer.steering_table_post_mlp[row] == 2.0)
+    assert torch.all(layer.steering_table_post_mlp_dynvec == 1.0)
 
 
 # ---------------------------------------------------------------------------

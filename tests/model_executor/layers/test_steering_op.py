@@ -232,3 +232,54 @@ class TestPerRowScale:
         assert torch.allclose(result[0], torch.ones(4) * 6.0)  # 2.0 * 3.0
         assert torch.allclose(result[1], torch.zeros(4))  # 4.0 * 0.0
         assert torch.allclose(result[2], torch.zeros(4))  # row 0 sentinel
+
+
+def _apply_full(hidden, table, index, scales, dvec, tscales):
+    """Reference for the full kernel math (§5.3 row scale + §5.4 tier):
+    ``hidden + table[row]*scales[row] + dvec * tscales[token]``."""
+    n = hidden.shape[0]
+    rows = index[:n]
+    row_term = table[rows] * scales[rows].unsqueeze(-1)
+    tier_term = dvec.unsqueeze(0) * tscales[:n].unsqueeze(-1)
+    return hidden + row_term + tier_term
+
+
+class TestDynamicTierTerm:
+    """Dedicated-gather dynamic tier (§5.4): out += dvec * token_scale."""
+
+    def test_zero_gate_is_no_tier(self):
+        hidden = torch.randn(3, 4)
+        table = torch.randn(6, 4)
+        index = torch.tensor([1, 2, 0], dtype=torch.long)
+        scales = torch.ones(6)
+        dvec = torch.full((4,), 9.0)
+        tscales = torch.zeros(3)  # gate off everywhere
+        result = _apply_full(hidden, table, index, scales, dvec, tscales)
+        torch.testing.assert_close(
+            result, hidden + table[index] * scales[index].unsqueeze(-1)
+        )
+
+    def test_tier_added_per_gated_token(self):
+        hidden = torch.zeros(3, 4)
+        table = torch.zeros(6, 4)
+        index = torch.zeros(3, dtype=torch.long)  # sentinel rows
+        scales = torch.ones(6)
+        dvec = torch.full((4,), 2.0)
+        # Token 0 decode (gain 3), token 1 prefill (0), token 2 decode (3).
+        tscales = torch.tensor([3.0, 0.0, 3.0])
+        result = _apply_full(hidden, table, index, scales, dvec, tscales)
+        assert torch.allclose(result[0], torch.full((4,), 6.0))  # 2*3
+        assert torch.allclose(result[1], torch.zeros(4))  # gated off
+        assert torch.allclose(result[2], torch.full((4,), 6.0))
+
+    def test_tier_composes_with_row(self):
+        hidden = torch.zeros(2, 4)
+        table = torch.zeros(6, 4)
+        table[2] = torch.full((4,), 1.0)  # operator decode row
+        index = torch.full((2,), 2, dtype=torch.long)
+        scales = torch.ones(6)
+        dvec = torch.full((4,), 5.0)
+        tscales = torch.tensor([1.0, 1.0])
+        result = _apply_full(hidden, table, index, scales, dvec, tscales)
+        # row (1.0) + tier (5.0) = 6.0
+        assert torch.allclose(result, torch.full((2, 4), 6.0))

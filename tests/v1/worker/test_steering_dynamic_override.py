@@ -40,7 +40,11 @@ class _Layer(nn.Module):
         self.register_buffer(
             "steering_table_post_mlp_any_active", torch.zeros(1, dtype=torch.bool)
         )
+        self.register_buffer(
+            "steering_table_post_mlp_dynvec", torch.zeros(HIDDEN)
+        )
         self.register_buffer("steering_index", torch.zeros(16, dtype=torch.long))
+        self.register_buffer("steering_token_scales", torch.zeros(16))
 
 
 def _mgr() -> SteeringManager:
@@ -259,6 +263,8 @@ class _MixinHost(SteeringModelRunnerMixin):
         self._steering_rows_scratch = np.zeros(8, dtype=np.int64)
         self._steering_n_tokens_scratch = np.zeros(8, dtype=np.int64)
         self._steering_index_pinned = torch.zeros(16, dtype=torch.long)
+        self._steering_tier_gain_scratch = np.zeros(8, dtype=np.float32)
+        self._steering_token_scales_pinned = torch.zeros(16)
 
 
 def _override(req: str = "r1", value: float | None = 5.0) -> RequestSteeringOverride:
@@ -516,5 +522,66 @@ def test_scale_update_negative_rejected():
     host = _MixinHost([_decode_req("r1")])
     applied, rejected = host._apply_steering_actions(
         [SteeringScaleUpdate(scale=-1.0, source="s")], source="s"
+    )
+    assert (applied, rejected) == (0, 1)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic tier: per-token gate (token_scales) + short-circuit fix (§5.4)
+# ---------------------------------------------------------------------------
+
+
+def test_token_scales_gate_decode_gets_gain_prefill_zero():
+    """token_scales is the tier gain for decode tokens, 0 for prefill."""
+    host = _MixinHost(
+        [
+            _decode_req("r1"),  # 1 decode token
+            {"req_id": "p1", "num_computed": 0, "num_prompt": 8},  # prefill
+        ]
+    )
+    mgr = host._steering_manager
+    mgr.update_dynamic_tier(_HP, 0, torch.full((HIDDEN,), 1.0))
+    mgr.set_dynamic_tier_gain(2.0)
+
+    host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1, "p1": 3}))
+    tscales = host._steerable_layers_cache[0].steering_token_scales
+    assert float(tscales[0]) == 2.0  # r1 decode token → gain
+    assert torch.all(tscales[1:4] == 0.0)  # p1 prefill tokens → 0
+    # dvec buffer carries the tier vector.
+    assert torch.all(
+        host._steerable_layers_cache[0].steering_table_post_mlp_dynvec == 1.0
+    )
+
+
+def test_tier_only_state_defeats_nothing_active_short_circuit():
+    """A tier-only manager state (no operator/config/override) must NOT be
+    short-circuited — the latent bug this slice fixes."""
+    host = _MixinHost([_decode_req()])  # decode_hash=0, no config registered
+    mgr = host._steering_manager
+    mgr.update_dynamic_tier(_HP, 0, torch.full((HIDDEN,), 4.0))
+    mgr.set_dynamic_tier_gain(1.0)
+
+    host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
+    tscales = host._steerable_layers_cache[0].steering_token_scales
+    assert float(tscales[0]) == 1.0  # gate written → not short-circuited
+    assert torch.all(
+        host._steerable_layers_cache[0].steering_table_post_mlp_dynvec == 4.0
+    )
+
+
+def test_tier_gain_action_dispatches():
+    host = _MixinHost([_decode_req()])
+    applied, rejected = host._apply_steering_actions(
+        [SteeringScaleUpdate(scale=3.0, tier_gain=True, source="s")], source="s"
+    )
+    assert (applied, rejected) == (1, 0)
+    assert host._steering_manager.dynamic_tier_gain == 3.0
+
+
+def test_scale_update_rejects_multiple_targets():
+    host = _MixinHost([_decode_req()])
+    applied, rejected = host._apply_steering_actions(
+        [SteeringScaleUpdate(scale=1.0, dyn_id=1, tier_gain=True, source="s")],
+        source="s",
     )
     assert (applied, rejected) == (0, 1)

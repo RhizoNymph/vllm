@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the dynamic additive tier (Phase 1b, populate-folding).
+"""Tests for the dynamic additive tier (§5.4, dedicated-gather) — manager side.
 
-The dynamic tier is a decode-only global steering contribution that is
-folded ADDITIVELY into the decode-effective vector at populate time, so
-dynamic global steering composes with operator-set (``/v1/steering/set``)
-decode steering instead of overwriting ``global_decode_vectors``. It must
-reach every decode-derived row (row 2, decode per-request rows,
-dynamic-override rows) and NO prefill row (decode-only cache safety, §7).
+The tier is a decode-only global steering contribution. As of the
+dedicated-gather design it is NOT folded into table rows; instead the
+manager writes it into a per-(layer, hook) ``steering_table_{hook}_dynvec``
+buffer, and the kernel adds ``dynamic_vec * token_scales[token]`` on top
+of the row gather (the per-token gate is the runner's job, tested
+elsewhere). So at the manager level: a tier vector lands in the dynvec
+buffer, table rows (incl. row 2 / decode config / override rows) carry
+ONLY operator + per-request content, and the two compose at the kernel.
 CPU-only, no engine. See docs/design/dynamic_steering.md §5.4.
 """
 
@@ -35,6 +37,7 @@ class _Layer(nn.Module):
         self.register_buffer(
             "steering_table_post_mlp_any_active", torch.zeros(1, dtype=torch.bool)
         )
+        self.register_buffer("steering_table_post_mlp_dynvec", torch.zeros(HIDDEN))
 
 
 def _mgr() -> SteeringManager:
@@ -49,12 +52,16 @@ def _full(value: float) -> torch.Tensor:
     return torch.full((HIDDEN,), value)
 
 
+def _dynvec(layers, idx=0):
+    return layers[idx].steering_table_post_mlp_dynvec
+
+
 def _table(layers, idx=0):
     return layers[idx].steering_table_post_mlp
 
 
 # ---------------------------------------------------------------------------
-# Manager: tier store mechanics
+# Manager: tier store + gain
 # ---------------------------------------------------------------------------
 
 
@@ -63,13 +70,19 @@ def test_update_and_clear_dynamic_tier():
     assert not mgr.has_dynamic_tier
     mgr.update_dynamic_tier(_HP, 0, _full(3.0))
     assert mgr.has_dynamic_tier
-    assert mgr.dynamic_tier_vectors[_HP][0].sum().item() == 24.0
     assert mgr._tables_dirty
 
     mgr._tables_dirty = False
     mgr.clear_dynamic_tier()
     assert not mgr.has_dynamic_tier
     assert mgr._tables_dirty
+
+
+def test_set_dynamic_tier_gain():
+    mgr = _mgr()
+    assert mgr.dynamic_tier_gain == 1.0
+    mgr.set_dynamic_tier_gain(4.0)
+    assert mgr.dynamic_tier_gain == 4.0
 
 
 def test_update_dynamic_tier_respects_locally_owned_layers():
@@ -79,103 +92,87 @@ def test_update_dynamic_tier_respects_locally_owned_layers():
 
 
 # ---------------------------------------------------------------------------
-# Populate: tier folds into decode-effective rows only
+# Populate: tier lands in the dedicated buffer, NOT in rows
 # ---------------------------------------------------------------------------
 
 
-def test_tier_folds_into_row2_decode_not_row1_prefill():
+def test_tier_lands_in_dynvec_buffer_not_rows():
     mgr = _mgr()
     layers = {0: _Layer()}
     mgr.update_dynamic_tier(_HP, 0, _full(5.0))
     mgr.populate_steering_tables(layers)
-    table = _table(layers)
-    assert torch.all(table[2] == 5.0)  # row 2 (decode) gets the tier
-    assert torch.all(table[1] == 0.0)  # row 1 (prefill) does NOT
+    assert torch.all(_dynvec(layers) == 5.0)  # dedicated buffer holds the tier
+    assert torch.all(_table(layers) == 0.0)  # NO table row carries it
+    # Tier-only still marks the layer active so the kernel runs.
     assert bool(layers[0].steering_table_post_mlp_any_active.item())
 
 
-def test_tier_composes_additively_with_operator_decode():
-    """The core no-clobber property: operator decode + dynamic tier."""
+def test_tier_does_not_touch_operator_decode_row():
+    """Operator decode (row 2) and the tier are independent now."""
     mgr = _mgr()
     layers = {0: _Layer()}
     mgr.update_global_vectors(_HP, 0, _full(2.0), phase="decode")  # operator
     mgr.update_dynamic_tier(_HP, 0, _full(5.0))  # dynamic
     mgr.populate_steering_tables(layers)
-    # Row 2 = operator decode (2) + tier (5); the operator vector is NOT
-    # clobbered.
-    assert torch.all(_table(layers)[2] == 7.0)
-    # And the operator store is untouched by the tier write.
+    assert torch.all(_table(layers)[2] == 2.0)  # row 2 = operator only
+    assert torch.all(_dynvec(layers) == 5.0)  # tier in dedicated buffer
+    # Source state untouched on both sides.
     assert torch.all(mgr.global_decode_vectors[_HP][0] == 2.0)
     assert torch.all(mgr.dynamic_tier_vectors[_HP][0] == 5.0)
 
 
-def test_tier_excluded_from_prefill_rows_but_in_decode_rows():
+def test_tier_absent_from_decode_config_and_override_rows():
     mgr = _mgr()
     layers = {0: _Layer()}
-    mgr.update_global_vectors(_HP, 0, _full(1.0), phase="base")
+    mgr.update_global_vectors(_HP, 0, _full(1.0), phase="decode")
     mgr.update_dynamic_tier(_HP, 0, _full(4.0))
-    pre_row = mgr.register_config(
-        config_hash=11, vectors={_HP: {0: _full(2.0).tolist()}}, phase="prefill"
-    )
     dec_row = mgr.register_config(
         config_hash=22, vectors={_HP: {0: _full(3.0).tolist()}}, phase="decode"
     )
-    mgr.populate_steering_tables(layers)
-    table = _table(layers)
-    # Prefill config row = base(1) + per_req(2); NO tier.
-    assert torch.all(table[pre_row] == 3.0)
-    # Decode config row = base(1) + tier(4) + per_req(3).
-    assert torch.all(table[dec_row] == 8.0)
-
-
-def test_tier_reaches_dynamic_override_row():
-    mgr = _mgr()
-    layers = {0: _Layer()}
-    mgr.update_global_vectors(_HP, 0, _full(2.0), phase="decode")
-    mgr.update_dynamic_tier(_HP, 0, _full(4.0))
-    _dyn_id, row = mgr.register_dynamic_config(
+    _dyn_id, ovr_row = mgr.register_dynamic_config(
         {_HP: {0: np.full(HIDDEN, 5.0, np.float32)}}
     )
     mgr.populate_steering_tables(layers)
-    # Override row = global_decode_effective (operator 2 + tier 4) + override 5.
-    assert torch.all(_table(layers)[row] == 11.0)
+    table = _table(layers)
+    # Decode config row = operator decode (1) + per_req (3); NO tier.
+    assert torch.all(table[dec_row] == 4.0)
+    # Override row = operator decode (1) + override (5); NO tier.
+    assert torch.all(table[ovr_row] == 6.0)
+    # Tier lives only in the dedicated buffer.
+    assert torch.all(_dynvec(layers) == 4.0)
 
 
-def test_clear_tier_restores_rows():
+def test_clear_tier_zeros_dynvec_buffer():
     mgr = _mgr()
     layers = {0: _Layer()}
     mgr.update_dynamic_tier(_HP, 0, _full(6.0))
     mgr.populate_steering_tables(layers)
-    assert torch.all(_table(layers)[2] == 6.0)
+    assert torch.all(_dynvec(layers) == 6.0)
     mgr.clear_dynamic_tier()
     mgr.populate_steering_tables(layers)
-    assert torch.all(_table(layers)[2] == 0.0)
+    assert torch.all(_dynvec(layers) == 0.0)
 
 
 # ---------------------------------------------------------------------------
-# Apply path: decode updates route to the tier, not global_decode
+# Apply path: decode updates route to the tier buffer
 # ---------------------------------------------------------------------------
 
 
-def test_apply_decode_update_routes_to_tier_and_composes():
+def test_apply_decode_update_routes_to_tier_buffer():
     mgr = _mgr()
     layers = {0: _Layer()}
-    # Operator sets a global decode vector directly (the /v1/steering/set
-    # path, bypassing the action queue).
-    mgr.update_global_vectors(_HP, 0, _full(2.0), phase="decode")
-
+    mgr.update_global_vectors(_HP, 0, _full(2.0), phase="decode")  # operator
     update = SteeringVectorUpdate(
         vectors={_HP: {0: np.full(HIDDEN, 5.0, np.float32)}}, phase="decode"
     )
     applied, rejected = apply_steering_updates([update], mgr, layers)
     assert (applied, rejected) == (1, 0)
-    # The dynamic update landed on the tier, NOT on global_decode_vectors.
     assert mgr.has_dynamic_tier
-    assert torch.all(mgr.dynamic_tier_vectors[_HP][0] == 5.0)
     assert torch.all(mgr.global_decode_vectors[_HP][0] == 2.0)  # operator intact
 
     mgr.populate_steering_tables(layers)
-    assert torch.all(_table(layers)[2] == 7.0)  # composed, not clobbered
+    assert torch.all(_table(layers)[2] == 2.0)  # operator row unchanged
+    assert torch.all(_dynvec(layers) == 5.0)  # tier in dedicated buffer
 
 
 if __name__ == "__main__":

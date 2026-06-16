@@ -440,33 +440,35 @@ token to exactly one row, so rows are exclusive — additivity across
 rows does not exist at the kernel level (rows 3+ are *pre-combined* at
 populate time instead). Two implementations, by phase:
 
-- **Populate-folding (no kernel change) — IMPLEMENTED.** A decode-only
-  `SteeringManager.dynamic_tier_vectors` store, folded into the
-  *decode-effective* vector at populate time:
-  `global_decode = global_base + global_decode + dynamic_tier`. That
-  single composition point propagates the tier to every decode-derived
-  row — row 2, decode per-request rows, and dynamic-override rows
-  (`global_decode_effective + override`) — and to **no** prefill row, so
-  the decode-only cache-safety constraint (§7) holds for free. (The
-  earlier "rows 1/2 and 3+" note was imprecise: folding into prefill
-  rows would steer prefill, which §7 forbids; only decode-effective rows
-  get the tier.) `update_dynamic_tier`/`clear_dynamic_tier`/
-  `has_dynamic_tier` on the manager; `apply_steering_updates` routes
-  decode-phase `SteeringVectorUpdate`s here (gain pre-applied by the
-  consumer) instead of overwriting `global_decode_vectors`, so dynamic
-  global steering now composes additively with operator-set
-  (`/v1/steering/set`) decode steering. Gain/vector changes mark
-  `_tables_dirty` and cost one repopulate — same price as Phase 0's
-  global updates. Surfaced in `GET /v1/steering/dynamic` as
-  `dynamic_tier: {active, hooks}`. Tests:
-  `tests/v1/worker/test_steering_dynamic_tier.py`.
-- **Dedicated gather (Phase 1b, preferred):** per layer/hook, a single
-  dynamic vector buffer + scalar gain read unconditionally by the
-  kernel: `out += dynamic_vec * dynamic_gain`. Gain changes are a
-  single-element `copy_`; vector changes are one row's H2D. This is
-  exactly the substrate Phase 2 extends — replace the scalar
-  `dynamic_gain` with the per-token `steering_token_scales` and the
-  in-graph monitor writes it. Q7 and Phase 2 share machinery.
+- **Dedicated gather — IMPLEMENTED (replaces populate-folding).** The
+  tier is a separate additive kernel term, not folded into rows:
+  `out = hidden + table[row]*scale[row] + dynamic_vec * token_scales[t]`.
+  `steering_dynamic_vec_{hook}` is a per-(layer, hook) `(hidden,)` buffer
+  (the manager writes it from `dynamic_tier_vectors` in populate);
+  `steering_token_scales` is a shared `(max_tokens,)` per-token gate
+  (shared across layers in `_init_steering_state`, like `steering_index`)
+  the runner writes each step — `dynamic_tier_gain` for decode tokens of
+  a tier-active state, `0` for prefill / inactive (so the tier is
+  strictly decode-only by construction, §7, with no row-routing needed).
+  `update_dynamic_tier`/`clear_dynamic_tier`/`has_dynamic_tier` +
+  `dynamic_tier_gain`/`set_dynamic_tier_gain` on the manager; the tier
+  marks a (layer, hook) `any_active` so the kernel runs even with no row
+  steering. Composition is unchanged vs populate-folding —
+  `base + operator_decode + override + tier` — but decomposed: rows hold
+  `base+operator+override`, the tier sits in `dynamic_vec`, and the
+  kernel sums them per decode token. Wins over populate-folding: (a) the
+  tier can be modulated **per token** (the Phase 2 substrate — Phase 2
+  has an in-graph monitor write `token_scales` instead of the runner's
+  flat gate), and (b) tier strength changes are **free** (next step's
+  `token_scales` rebuild folds in `dynamic_tier_gain`; no buffer rewrite).
+  Driven by `SteeringScaleUpdate(tier_gain=True)`; surfaced in
+  `GET /v1/steering/dynamic` as `dynamic_tier: {active, gain, hooks}`.
+  **Latent bug fixed here:** the runner's nothing-active short-circuit
+  didn't check `has_dynamic_tier`, so a tier-only state (global-mode
+  consumer, no operator/override steering) was wrongly skipped; now
+  fixed. Tests: `tests/v1/worker/test_steering_dynamic_tier.py`,
+  `test_steering_op.py::TestDynamicTierTerm`, token-gate + short-circuit
+  tests in the override suite.
 
 ### 5.5 Configuration surface
 

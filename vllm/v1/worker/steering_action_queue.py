@@ -118,7 +118,9 @@ class SteeringScaleUpdate:
 
     - neither field set ⇒ the global decode row (row 2),
     - ``config_hash`` set ⇒ that static per-request *decode* config row,
-    - ``dyn_id`` set ⇒ that dynamic-override row.
+    - ``dyn_id`` set ⇒ that dynamic-override row,
+    - ``tier_gain=True`` ⇒ the dedicated dynamic-tier scalar gain (§5.4),
+      a free per-step knob independent of any row.
 
     ``scale`` is a non-negative multiplier (1.0 = unscaled, 0.0 = off).
     """
@@ -126,6 +128,7 @@ class SteeringScaleUpdate:
     scale: float
     config_hash: int | None = None
     dyn_id: int | None = None
+    tier_gain: bool = False
     source: str = ""
 
 
@@ -296,9 +299,13 @@ def validate_steering_vectors(
 
 def validate_steering_scale(action: SteeringScaleUpdate) -> None:
     """Raise :class:`SteeringVectorError` on an unappliable scale update."""
-    if action.config_hash is not None and action.dyn_id is not None:
+    targets = sum(
+        (action.config_hash is not None, action.dyn_id is not None, action.tier_gain)
+    )
+    if targets > 1:
         raise SteeringVectorError(
-            "scale update targets both config_hash and dyn_id; pick one"
+            "scale update must target at most one of config_hash / dyn_id / "
+            "tier_gain"
         )
     scale = action.scale
     if not np.isfinite(scale):
