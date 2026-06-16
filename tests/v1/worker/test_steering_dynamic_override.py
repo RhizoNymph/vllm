@@ -45,6 +45,16 @@ class _Layer(nn.Module):
         )
         self.register_buffer("steering_index", torch.zeros(16, dtype=torch.long))
         self.register_buffer("steering_token_scales", torch.zeros(16))
+        self.register_buffer(
+            "steering_table_post_mlp_monitor_probe", torch.zeros(HIDDEN)
+        )
+        self.register_buffer(
+            "steering_table_post_mlp_monitor_params",
+            torch.tensor([0.0, 1.0], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "steering_table_post_mlp_monitor_active", torch.zeros(1, dtype=torch.bool)
+        )
 
 
 def _mgr() -> SteeringManager:
@@ -423,6 +433,38 @@ def test_override_only_state_defeats_nothing_active_short_circuit():
     assert int(steering_index[0]) == dyn_row
     table = host._steerable_layers_cache[0].steering_table_post_mlp
     assert torch.all(table[dyn_row] == 5.0)
+
+
+def test_monitor_only_state_defeats_nothing_active_short_circuit():
+    """A monitor-only config (no operator/per-request/tier vectors) must
+    still populate so the monitor's active flag is written (Phase 2)."""
+    host = _MixinHost([_decode_req()])
+    host._steering_manager.set_monitor(
+        "post_mlp", 0, torch.ones(HIDDEN), threshold=0.0, sharpness=4.0
+    )
+    host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
+    layer = host._steerable_layers_cache[0]
+    assert bool(layer.steering_table_post_mlp_monitor_active.item())
+    torch.testing.assert_close(
+        layer.steering_table_post_mlp_monitor_params,
+        torch.tensor([0.0, 4.0], dtype=torch.float32),
+    )
+
+
+def test_clearing_monitor_deactivates_flag_on_transition():
+    """Once the monitor is the last active state and is cleared, the
+    nothing-active transition must zero its active flag."""
+    host = _MixinHost([_decode_req()])
+    host._steering_manager.set_monitor(
+        "post_mlp", 0, torch.ones(HIDDEN), 0.0, 4.0
+    )
+    host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
+    layer = host._steerable_layers_cache[0]
+    assert bool(layer.steering_table_post_mlp_monitor_active.item())
+    # Clear and step again → short-circuit transition deactivates.
+    host._steering_manager.clear_monitor()
+    host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
+    assert not bool(layer.steering_table_post_mlp_monitor_active.item())
 
 
 # ---------------------------------------------------------------------------

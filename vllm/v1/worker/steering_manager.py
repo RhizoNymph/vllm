@@ -49,6 +49,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
     HOOK_POINT_DYNVEC_ATTR,
+    HOOK_POINT_MONITOR_ACTIVE_ATTR,
+    HOOK_POINT_MONITOR_PARAMS_ATTR,
+    HOOK_POINT_MONITOR_PROBE_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
@@ -145,6 +148,17 @@ class SteeringManager:
         # folds it into the per-token gate (``steering_token_scales``) each
         # step, so changing it is free (no buffer rewrite of its own).
         self.dynamic_tier_gain: float = 1.0
+
+        # In-graph monitor configs (Phase 2, §8), keyed hook -> layer ->
+        # {"probe": fp32 (hidden,) tensor, "threshold": float,
+        # "sharpness": float}. At a probe site the runner's flat decode
+        # gain in ``steering_token_scales`` is modulated per token by
+        # ``sigmoid(sharpness*(residual@probe - threshold))``, conditioning
+        # the §5.4 dynamic tier at this and later hooks/layers within the
+        # same forward. Written into the per-layer monitor buffers at
+        # populate time (gated by ``_tables_dirty``); policy params then
+        # live in the persistent buffers, host-tunable without recapture.
+        self.monitor_configs: dict[str, dict[int, dict]] = {}
 
         # Per-row strength scales (the §5.3 "how much" knob), keyed by
         # LOGICAL owner so they survive row reassignment: phase->scale for
@@ -544,6 +558,76 @@ class SteeringManager:
         each step, so no buffer write happens here.
         """
         self.dynamic_tier_gain = float(gain)
+
+    # ------------------------------------------------------------------
+    # In-graph monitor (Phase 2, §8)
+    # ------------------------------------------------------------------
+
+    def set_monitor(
+        self,
+        hook_point: str,
+        layer_idx: int,
+        probe: torch.Tensor,
+        threshold: float,
+        sharpness: float,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Configure the in-graph monitor at ``(hook_point, layer_idx)``.
+
+        The probe is a 1-D detector vector; ``threshold``/``sharpness``
+        parameterize the fixed elementwise gate
+        ``sigmoid(sharpness*(residual@probe - threshold))`` the monitor op
+        writes into ``steering_token_scales``. Stored here and written to
+        the per-layer monitor buffers at the next populate; the policy
+        params then live host-tunable in the buffers (no recapture).
+
+        ``locally_owned_layers`` (TP/PP): if provided and ``layer_idx`` is
+        not owned by this worker, the call is a no-op so rank-replicated
+        callers stay in lock-step.
+        """
+        if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
+            return
+        self.monitor_configs.setdefault(hook_point, {})[layer_idx] = {
+            "probe": probe.detach().to(torch.float32).clone().reshape(-1),
+            "threshold": float(threshold),
+            "sharpness": float(sharpness),
+        }
+        self._tables_dirty = True
+
+    def clear_monitor(
+        self,
+        hook_point: str | None = None,
+        layer_idx: int | None = None,
+    ) -> None:
+        """Remove monitor configs.
+
+        No arguments clears every site; a ``hook_point`` clears that
+        hook's sites; both clear a single ``(hook, layer)`` site. Marks
+        tables dirty so the next populate deactivates the cleared buffers.
+        """
+        if not self.monitor_configs:
+            return
+        if hook_point is None:
+            self.monitor_configs.clear()
+            self._tables_dirty = True
+            return
+        layers = self.monitor_configs.get(hook_point)
+        if layers is None:
+            return
+        if layer_idx is None:
+            del self.monitor_configs[hook_point]
+            self._tables_dirty = True
+            return
+        if layer_idx in layers:
+            del layers[layer_idx]
+            if not layers:
+                del self.monitor_configs[hook_point]
+            self._tables_dirty = True
+
+    @property
+    def has_monitor(self) -> bool:
+        """True if any in-graph monitor site is configured."""
+        return any(layers for layers in self.monitor_configs.values())
 
     # ------------------------------------------------------------------
     # Per-row strength scales (§5.3) — cheap "how much" knob
@@ -1080,6 +1164,40 @@ class SteeringManager:
                 dvec_buf.zero_()
             else:
                 dvec_buf.copy_(tier_vec.squeeze(0).to(dvec_buf.device))
+
+        # Write each (hook, layer)'s in-graph monitor config (Phase 2, §8)
+        # into its probe / params / active buffers. A configured site sets
+        # the probe + [threshold, sharpness] and flips ``active`` True; an
+        # unconfigured site is deactivated (``active`` False ⇒ the monitor
+        # op is a no-op there, leaving the runner's flat gate intact). The
+        # site can move at runtime without recapture because the op is
+        # emitted at every hook and gated by this tensor flag.
+        for active_pos, (_table, hp_str, layer_idx, mod) in enumerate(active_tables):
+            try:
+                hp_enum = SteeringHookPoint(hp_str)
+            except ValueError:
+                continue
+            active_buf = getattr(mod, HOOK_POINT_MONITOR_ACTIVE_ATTR[hp_enum], None)
+            if active_buf is None:
+                continue
+            cfg = self.monitor_configs.get(hp_str, {}).get(layer_idx)
+            if cfg is None:
+                active_buf.fill_(False)
+                continue
+            probe_buf = getattr(mod, HOOK_POINT_MONITOR_PROBE_ATTR[hp_enum], None)
+            params_buf = getattr(mod, HOOK_POINT_MONITOR_PARAMS_ATTR[hp_enum], None)
+            if probe_buf is None or params_buf is None:
+                active_buf.fill_(False)
+                continue
+            probe_buf.copy_(cfg["probe"].to(probe_buf.device))
+            params_buf.copy_(
+                torch.tensor(
+                    [cfg["threshold"], cfg["sharpness"]],
+                    dtype=torch.float32,
+                    device=params_buf.device,
+                )
+            )
+            active_buf.fill_(True)
 
         # Write the per-row strength scales (§5.3) alongside the tables.
         # The scale vector is hook/layer-independent, so build it once and

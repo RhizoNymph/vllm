@@ -22,6 +22,7 @@ from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
+    HOOK_POINT_MONITOR_ACTIVE_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
     share_steering_token_scales_across_layers,
@@ -1288,6 +1289,7 @@ class SteeringModelRunnerMixin:
             not self._steering_manager.config_to_row
             and not self._steering_manager.has_dynamic
             and not self._steering_manager.has_dynamic_tier
+            and not self._steering_manager.has_monitor
             and not self._steering_manager.global_base_vectors
             and not self._steering_manager.global_prefill_vectors
             and not self._steering_manager.global_decode_vectors
@@ -1312,6 +1314,12 @@ class SteeringModelRunnerMixin:
                         flag_buf = getattr(mod, HOOK_POINT_ANY_ACTIVE_ATTR[hp], None)
                         if flag_buf is not None:
                             flag_buf.zero_()
+                        # Also deactivate any in-graph monitor (Phase 2) so a
+                        # stale probe doesn't gate a now-removed tier. Mirrors
+                        # the any-active zero-out; only paid on the transition.
+                        mon_buf = getattr(mod, HOOK_POINT_MONITOR_ACTIVE_ATTR[hp], None)
+                        if mon_buf is not None:
+                            mon_buf.zero_()
                 self._steering_index_dirty = False
             return
 
