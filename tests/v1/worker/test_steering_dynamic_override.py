@@ -20,6 +20,7 @@ import torch.nn as nn
 from vllm.model_executor.layers.steering import get_steering_buffer_config
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
+    SteeringScaleUpdate,
     SteeringVectorUpdate,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
@@ -476,3 +477,44 @@ def test_no_leaks_after_override_churn():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# SteeringScaleUpdate dispatch through the mixin apply path (§5.3)
+# ---------------------------------------------------------------------------
+
+
+def test_scale_update_global_decode_dispatches():
+    host = _MixinHost([_decode_req("r1")])
+    applied, rejected = host._apply_steering_actions(
+        [SteeringScaleUpdate(scale=0.5, source="s")], source="s"
+    )
+    assert (applied, rejected) == (1, 0)
+    assert host._steering_manager._global_scales == {"decode": 0.5}
+    assert host._steering_manager._scales_dirty
+
+
+def test_scale_update_dynamic_row_dispatches():
+    host = _MixinHost([_decode_req("r1")])
+    dyn_id, _row = host._steering_manager.register_dynamic_config(_vec(1.0))
+    applied, rejected = host._apply_steering_actions(
+        [SteeringScaleUpdate(scale=3.0, dyn_id=dyn_id, source="s")], source="s"
+    )
+    assert (applied, rejected) == (1, 0)
+    assert host._steering_manager._dynamic_scales[dyn_id] == 3.0
+
+
+def test_scale_update_unknown_dynamic_rejected():
+    host = _MixinHost([_decode_req("r1")])
+    applied, rejected = host._apply_steering_actions(
+        [SteeringScaleUpdate(scale=2.0, dyn_id=999, source="s")], source="s"
+    )
+    assert (applied, rejected) == (0, 1)
+
+
+def test_scale_update_negative_rejected():
+    host = _MixinHost([_decode_req("r1")])
+    applied, rejected = host._apply_steering_actions(
+        [SteeringScaleUpdate(scale=-1.0, source="s")], source="s"
+    )
+    assert (applied, rejected) == (0, 1)

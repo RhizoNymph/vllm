@@ -106,9 +106,32 @@ class RequestSteeringOverride:
     source: str = ""
 
 
+@dataclass(frozen=True)
+class SteeringScaleUpdate:
+    """Per-row strength scale change (the §5.3 "how much" knob).
+
+    A cheap decode-tier gain adjustment: the kernel multiplies the
+    gathered steering row by its scale, so changing strength needs only a
+    scales-buffer write — no vector re-upload, no table recompose. Targets
+    a single row, decode-only by construction (prefill rows are pinned to
+    1.0 for cache safety, §7):
+
+    - neither field set ⇒ the global decode row (row 2),
+    - ``config_hash`` set ⇒ that static per-request *decode* config row,
+    - ``dyn_id`` set ⇒ that dynamic-override row.
+
+    ``scale`` is a non-negative multiplier (1.0 = unscaled, 0.0 = off).
+    """
+
+    scale: float
+    config_hash: int | None = None
+    dyn_id: int | None = None
+    source: str = ""
+
+
 # Everything the apply path accepts, from either transport (queue or
 # sync ``on_step`` returns).
-SteeringAction = SteeringVectorUpdate | RequestSteeringOverride
+SteeringAction = SteeringVectorUpdate | RequestSteeringOverride | SteeringScaleUpdate
 
 
 @dataclass
@@ -269,6 +292,19 @@ def validate_steering_vectors(
                     f"layer {layer_idx} ({hook_name}): vector contains "
                     f"non-finite values"
                 )
+
+
+def validate_steering_scale(action: SteeringScaleUpdate) -> None:
+    """Raise :class:`SteeringVectorError` on an unappliable scale update."""
+    if action.config_hash is not None and action.dyn_id is not None:
+        raise SteeringVectorError(
+            "scale update targets both config_hash and dyn_id; pick one"
+        )
+    scale = action.scale
+    if not np.isfinite(scale):
+        raise SteeringVectorError(f"scale must be finite, got {scale!r}")
+    if scale < 0:
+        raise SteeringVectorError(f"scale must be non-negative, got {scale!r}")
 
 
 def _validate_update(

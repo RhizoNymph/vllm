@@ -54,7 +54,13 @@ class TestApplySteeringCPU:
         index = torch.full((4,), 5, dtype=torch.long)  # row 5 = NaN row
         any_active = torch.zeros(1, dtype=torch.bool)
 
-        result = apply_steering(hidden, table, index, any_active)
+        result = apply_steering(
+            hidden,
+            table,
+            index,
+            any_active,
+            torch.ones(table.shape[0], device=table.device),
+        )
 
         torch.testing.assert_close(result, hidden)
         # Output must be a fresh tensor, not an alias of ``hidden``.
@@ -68,7 +74,13 @@ class TestApplySteeringCPU:
         index = torch.tensor([0, 1, 2, 3, 0], dtype=torch.long)
         any_active = torch.ones(1, dtype=torch.bool)
 
-        result = apply_steering(hidden, table, index, any_active)
+        result = apply_steering(
+            hidden,
+            table,
+            index,
+            any_active,
+            torch.ones(table.shape[0], device=table.device),
+        )
         expected = hidden + table[index]
 
         torch.testing.assert_close(result, expected)
@@ -80,7 +92,13 @@ class TestApplySteeringCPU:
         index = torch.zeros(3, dtype=torch.long)
         any_active = torch.ones(1, dtype=torch.bool)
 
-        result = apply_steering(hidden, table, index, any_active)
+        result = apply_steering(
+            hidden,
+            table,
+            index,
+            any_active,
+            torch.ones(table.shape[0], device=table.device),
+        )
 
         torch.testing.assert_close(result, hidden)
 
@@ -96,7 +114,13 @@ class TestApplySteeringCPU:
         index[3:] = 999  # would be out-of-bounds on the active path
         any_active = torch.zeros(1, dtype=torch.bool)
 
-        result = apply_steering(hidden, table, index, any_active)
+        result = apply_steering(
+            hidden,
+            table,
+            index,
+            any_active,
+            torch.ones(table.shape[0], device=table.device),
+        )
         torch.testing.assert_close(result, hidden)
 
 
@@ -157,7 +181,13 @@ class TestApplySteeringCUDA:
         index = torch.full((4,), 5, dtype=torch.long, device=device)
         any_active = torch.zeros(1, dtype=torch.bool, device=device)
 
-        result = apply_steering(hidden, table, index, any_active)
+        result = apply_steering(
+            hidden,
+            table,
+            index,
+            any_active,
+            torch.ones(table.shape[0], device=table.device),
+        )
 
         torch.testing.assert_close(result, hidden)
         assert result.data_ptr() != hidden.data_ptr()
@@ -171,7 +201,13 @@ class TestApplySteeringCUDA:
         index = torch.tensor([0, 1, 2, 3, 0], dtype=torch.long, device=device)
         any_active = torch.ones(1, dtype=torch.bool, device=device)
 
-        result = apply_steering(hidden, table, index, any_active)
+        result = apply_steering(
+            hidden,
+            table,
+            index,
+            any_active,
+            torch.ones(table.shape[0], device=table.device),
+        )
         expected = hidden + table[index]
 
         torch.testing.assert_close(result, expected)
@@ -184,13 +220,25 @@ class TestApplySteeringCUDA:
         index = torch.full((3,), 4, dtype=torch.long, device=device)
         any_active = torch.zeros(1, dtype=torch.bool, device=device)
 
-        result = apply_steering(hidden, table, index, any_active)
+        result = apply_steering(
+            hidden,
+            table,
+            index,
+            any_active,
+            torch.ones(table.shape[0], device=table.device),
+        )
         torch.testing.assert_close(result, hidden)
 
         # And re-run with the flag on, replacing the table with sane values
         # so the sum is well-defined.
         table = torch.randn(6, 17, dtype=torch.float16, device=device)
         any_active.fill_(True)
-        result = apply_steering(hidden, table, index, any_active)
+        result = apply_steering(
+            hidden,
+            table,
+            index,
+            any_active,
+            torch.ones(table.shape[0], device=table.device),
+        )
         expected = hidden + table[index]
         torch.testing.assert_close(result, expected)

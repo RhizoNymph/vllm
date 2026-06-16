@@ -141,6 +141,22 @@ class SteeringManager:
         # See docs/design/dynamic_steering.md §5.4.
         self.dynamic_tier_vectors: dict[str, dict[int, torch.Tensor]] = {}
 
+        # Per-row strength scales (the §5.3 "how much" knob), keyed by
+        # LOGICAL owner so they survive row reassignment: phase->scale for
+        # the global rows 1/2, (config_hash, phase)->scale for static
+        # per-request rows, dyn_id->scale for dynamic-override rows. A
+        # missing key means the default 1.0 (unscaled). Decode-only by
+        # policy (prefill rows are forced to 1.0 at populate time, §7);
+        # the scale never enters config hashes (runtime state, not
+        # identity). See docs/design/dynamic_steering.md §5.3.
+        self._global_scales: dict[str, float] = {}
+        self._config_scales: dict[tuple[int, str], float] = {}
+        self._dynamic_scales: dict[int, float] = {}
+        # Set by any scale mutator; triggers a CHEAP scales-only buffer
+        # write (no table recompose, no vector H2D). Independent of
+        # ``_tables_dirty`` — that is the whole point of the scale knob.
+        self._scales_dirty: bool = True
+
         # When True, populate_steering_tables() needs to run to bring the
         # per-layer table buffers in sync with current state. Set by every
         # state mutator (register_config new-row path, release_config
@@ -515,6 +531,103 @@ class SteeringManager:
     def has_dynamic_tier(self) -> bool:
         """True if any dynamic additive-tier vector is set."""
         return bool(self.dynamic_tier_vectors)
+
+    # ------------------------------------------------------------------
+    # Per-row strength scales (§5.3) — cheap "how much" knob
+    # ------------------------------------------------------------------
+
+    def set_global_scale(self, phase: str, scale: float) -> None:
+        """Set the strength scale for the global prefill/decode row.
+
+        ``phase`` is ``"prefill"`` or ``"decode"`` (rows 1 / 2). Decode is
+        the cache-safe knob; a prefill scale is accepted and stored but
+        forced to 1.0 at populate time (§7) so it never takes effect —
+        callers should use decode.
+        """
+        if phase not in ("prefill", "decode"):
+            raise ValueError(
+                f"global scale phase must be prefill/decode, got {phase!r}"
+            )
+        self._global_scales[phase] = float(scale)
+        self._scales_dirty = True
+
+    def set_row_scale(self, config_hash: int, phase: str, scale: float) -> None:
+        """Set the strength scale for a static per-request config row."""
+        if phase not in ("prefill", "decode"):
+            raise ValueError(f"row scale phase must be prefill/decode, got {phase!r}")
+        self._config_scales[(config_hash, phase)] = float(scale)
+        self._scales_dirty = True
+
+    def set_dynamic_scale(self, dyn_id: int, scale: float) -> None:
+        """Set the strength scale for a dynamic-override row (by dyn_id)."""
+        self._dynamic_scales[dyn_id] = float(scale)
+        self._scales_dirty = True
+
+    def clear_scales(self) -> None:
+        """Reset every row's scale to the 1.0 default."""
+        if self._global_scales or self._config_scales or self._dynamic_scales:
+            self._global_scales.clear()
+            self._config_scales.clear()
+            self._dynamic_scales.clear()
+            self._scales_dirty = True
+
+    def _build_scales_vector(self, device: torch.device) -> torch.Tensor:
+        """Assemble the per-row scale vector in populate (row-position)
+        order ``[0, 1, 2, *config_rows, *dynamic_rows]`` — matching
+        ``_cached_indices`` — so it can be scattered with the same index
+        tensor the table write uses.
+
+        Row 0 (sentinel) and any prefill row are pinned to 1.0: scaling
+        them is meaningless (row 0) or cache-unsafe (prefill, §7).
+        """
+        ordered_configs = self._cached_ordered_configs or list(
+            self.config_to_row.items()
+        )
+        ordered_dynamic = self._cached_ordered_dynamic or list(
+            self._dynamic_to_row.items()
+        )
+        scales: list[float] = [
+            1.0,  # row 0 sentinel
+            1.0,  # row 1 global prefill — never scaled (cache safety)
+            self._global_scales.get("decode", 1.0),  # row 2 global decode
+        ]
+        for (config_hash, phase), _row in ordered_configs:
+            # Prefill rows pinned to 1.0; decode rows take their scale.
+            scale = (
+                self._config_scales.get((config_hash, phase), 1.0)
+                if phase == "decode"
+                else 1.0
+            )
+            scales.append(scale)
+        for dyn_id, _row in ordered_dynamic:
+            scales.append(self._dynamic_scales.get(dyn_id, 1.0))
+        return torch.tensor(scales, dtype=torch.float32, device=device)
+
+    def populate_steering_scales(
+        self, steerable_layers: dict[int, "torch.nn.Module"]
+    ) -> None:
+        """Cheap path: write ONLY the per-row scale buffers, no table
+        recompose. Called when ``_scales_dirty`` but not ``_tables_dirty``.
+
+        Writes the same per-row scale vector into every layer's
+        ``steering_scales`` buffer (each is tiny — ``num_rows`` floats).
+        """
+        if self._indices_dirty or self._cached_indices is None:
+            # Indices stale (config/dynamic membership changed) — fall back
+            # to a full populate which rebuilds indices and writes scales.
+            self._tables_dirty = True
+            self.populate_steering_tables(steerable_layers)
+            return
+        indices = self._cached_indices
+        written: set[int] = set()
+        for layer_idx, mod in steerable_layers.items():
+            scales_buf = getattr(mod, "steering_scales", None)
+            if scales_buf is None or id(scales_buf) in written:
+                continue
+            scales_vec = self._build_scales_vector(scales_buf.device)
+            scales_buf.index_copy_(0, indices, scales_vec)
+            written.add(id(scales_buf))
+        self._scales_dirty = False
 
     def _global_dict_for_phase(self, phase: str) -> dict[str, dict[int, torch.Tensor]]:
         """Return the global vector dict for the given phase."""
@@ -932,9 +1045,23 @@ class SteeringManager:
                 continue
             flag_buf.fill_(per_table_any_active[active_pos])
 
+        # Write the per-row strength scales (§5.3) alongside the tables.
+        # The scale vector is hook/layer-independent, so build it once and
+        # scatter into each distinct layer's ``steering_scales`` buffer with
+        # the same ``indices`` used for the table write.
+        scales_written: set[int] = set()
+        for _table, _hp_str, _layer_idx, mod in active_tables:
+            scales_buf = getattr(mod, "steering_scales", None)
+            if scales_buf is None or id(scales_buf) in scales_written:
+                continue
+            scales_vec = self._build_scales_vector(scales_buf.device)
+            scales_buf.index_copy_(0, indices, scales_vec)
+            scales_written.add(id(scales_buf))
+
         # All per-layer table buffers now reflect current state. Subsequent
         # calls can be skipped by the caller until a mutator sets dirty again.
         self._tables_dirty = False
+        self._scales_dirty = False
 
     @property
     def num_active_configs(self) -> int:

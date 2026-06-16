@@ -181,3 +181,54 @@ class TestIndexedGatherSteering:
         assert torch.allclose(result2[1], torch.ones(hidden_size) * 20.0)
         assert torch.allclose(result2[2], torch.zeros(hidden_size))
         assert torch.allclose(result2[3], torch.ones(hidden_size) * 20.0)
+
+
+def _apply_steering_scaled(
+    hidden_states: torch.Tensor,
+    steering_table: torch.Tensor,
+    steering_index: torch.Tensor,
+    steering_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Reference for the §5.3 per-row scale math the kernel computes:
+    ``hidden + table[index] * scales[index]``."""
+    N = hidden_states.shape[0]
+    rows = steering_index[:N]
+    return hidden_states + steering_table[rows] * steering_scales[rows].unsqueeze(-1)
+
+
+class TestPerRowScale:
+    """Per-row strength scale (§5.3) math."""
+
+    def test_scale_one_is_identity(self):
+        hidden = torch.randn(4, 8)
+        table = torch.randn(6, 8)
+        index = torch.tensor([1, 2, 3, 1], dtype=torch.long)
+        scales = torch.ones(6)
+        torch.testing.assert_close(
+            _apply_steering_scaled(hidden, table, index, scales),
+            _apply_steering(hidden, table, index),
+        )
+
+    def test_scale_multiplies_gathered_row(self):
+        hidden = torch.zeros(3, 4)
+        table = torch.zeros(6, 4)
+        table[2] = torch.ones(4) * 5.0
+        index = torch.full((3,), 2, dtype=torch.long)
+        scales = torch.ones(6)
+        scales[2] = 0.5
+        result = _apply_steering_scaled(hidden, table, index, scales)
+        assert torch.allclose(result, torch.ones(3, 4) * 2.5)  # 5.0 * 0.5
+
+    def test_per_row_scales_are_independent(self):
+        hidden = torch.zeros(3, 4)
+        table = torch.zeros(6, 4)
+        table[1] = torch.ones(4) * 2.0
+        table[2] = torch.ones(4) * 4.0
+        index = torch.tensor([1, 2, 0], dtype=torch.long)
+        scales = torch.ones(6)
+        scales[1] = 3.0  # row 1 tripled
+        scales[2] = 0.0  # row 2 disabled
+        result = _apply_steering_scaled(hidden, table, index, scales)
+        assert torch.allclose(result[0], torch.ones(4) * 6.0)  # 2.0 * 3.0
+        assert torch.allclose(result[1], torch.zeros(4))  # 4.0 * 0.0
+        assert torch.allclose(result[2], torch.zeros(4))  # row 0 sentinel

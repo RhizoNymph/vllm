@@ -114,6 +114,18 @@ def register_steering_buffers(
         persistent=False,
     )
 
+    # Per-row strength scale (the §5.3 "how much" knob): one fp32 buffer
+    # per layer, shared across that layer's hook points (the row index is
+    # hook-independent — row 3 = config X for every hook). Default 1.0 ⇒
+    # unscaled steering; the kernel multiplies the gathered row by
+    # ``scales[row]``. The manager writes the same per-row values into
+    # every layer's buffer during populate.
+    module.register_buffer(
+        "steering_scales",
+        torch.ones(max_steering_configs + 3, dtype=torch.float32),
+        persistent=False,
+    )
+
 
 def get_steering_buffer_config(vllm_config: "VllmConfig") -> tuple[int, int]:
     """Return ``(max_tokens, max_configs)`` for steering buffers.
@@ -185,6 +197,7 @@ def apply_layer_steering(
         getattr(module, table_attr),
         module.steering_index,
         getattr(module, HOOK_POINT_ANY_ACTIVE_ATTR[hook_point]),
+        module.steering_scales,
     )
 
 
@@ -193,8 +206,16 @@ def apply_steering(
     steering_table: torch.Tensor,
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
+    steering_scales: torch.Tensor,
 ) -> torch.Tensor:
     """Apply per-request activation steering via indexed gather.
+
+    ``steering_scales`` is a shared buffer of shape ``(max_configs + 3,)``
+    (fp32, default 1.0) holding a per-row strength multiplier — the
+    runtime "how much" knob. The gathered row is scaled by
+    ``scales[index[i]]`` before the add, so changing strength needs only
+    a cheap scales write, no vector re-upload (see §5.3). A scale of 1.0
+    reproduces the unscaled steering.
 
     ``steering_table`` is a per-layer buffer of shape
     ``(max_configs + 3, hidden_size)`` where row 0 is always zeros
@@ -238,7 +259,7 @@ def apply_steering(
         )
 
         return apply_steering_triton(
-            hidden_states, steering_table, steering_index, any_active
+            hidden_states, steering_table, steering_index, any_active, steering_scales
         )
     # CPU eager: short-circuit on the host so we don't even materialize
     # the gather. ``.item()`` synchronizes against the device producer
@@ -248,7 +269,10 @@ def apply_steering(
         # Match the freshly-allocated-output contract of the CUDA path so
         # callers never see an alias of ``hidden_states``.
         return hidden_states.clone()
-    return hidden_states + steering_table[steering_index[: hidden_states.shape[0]]]
+    rows = steering_index[: hidden_states.shape[0]]
+    # Per-row scale (fp32, default 1.0); broadcast over hidden dim.
+    scale = steering_scales[rows].unsqueeze(-1).to(steering_table.dtype)
+    return hidden_states + steering_table[rows] * scale
 
 
 def apply_steering_fake(
@@ -256,6 +280,7 @@ def apply_steering_fake(
     steering_table: torch.Tensor,
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
+    steering_scales: torch.Tensor,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)

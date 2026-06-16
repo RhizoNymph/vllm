@@ -356,11 +356,46 @@ wasteful for continuous modulation). The §5.3 scale tensor then makes
 the common special case free: modulating an *existing* override's
 strength becomes `set_row_scale` on its dynamic row.
 
-### 5.3 Per-row scale tensor (Phase 1b)
+### 5.3 Per-row scale tensor (Phase 1b) — IMPLEMENTED
 
-Today changing steering *strength* requires re-uploading vectors
-(`register_config` H2D + table repopulate). Add, per hook point,
-alongside each layer's table:
+Changing steering *strength* used to require re-uploading vectors
+(`register_config` H2D + table repopulate). Now a per-row scale the
+kernel multiplies the gathered vector by makes a strength change a cheap
+scales-buffer write.
+
+As built (differs slightly from the original sketch below): a **single
+shared** `steering_scales` buffer per layer (shape `(max_configs + 3,)`,
+fp32, default 1.0) — registered alongside `steering_index` in
+`register_steering_buffers`, used by every hook's kernel call (the row
+index is hook-independent). The kernel
+(`steering_kernel.py::_apply_steering_kernel`) and the eager path load
+`scale = scales[row]` and compute `out = hidden + table[row] * scale`;
+`apply_steering`/`apply_steering_fake`/`apply_layer_steering` and the
+warmup carry the new arg. The `SteeringManager` keys scales by *logical
+owner* (`_global_scales[phase]`, `_config_scales[(hash, phase)]`,
+`_dynamic_scales[dyn_id]`) so they survive row reuse, and writes them in
+`populate_steering_tables` (alongside the tables) plus a cheap
+scales-only path `populate_steering_scales` gated by `_scales_dirty`
+(separate from `_tables_dirty` — the whole point: a strength change costs
+no table recompose, no vector H2D). The mixin calls the cheap path from
+`_update_steering_buffers` when only scales are dirty. **Row 0 and all
+prefill rows are pinned to 1.0** at populate (scaling them is meaningless
+or cache-unsafe per §7). API: `SteeringManager.set_global_scale` /
+`set_row_scale` / `set_dynamic_scale` / `clear_scales`; driven at runtime
+by the `SteeringScaleUpdate` action (decode-only; `target` = global /
+config_hash / dyn_id) through the same `_apply_steering_actions` path,
+surfaced in `GET /v1/steering/dynamic` as `dynamic_scales`. Scale is
+runtime state — never in `compute_hash` / `hash_steering_config`. Tests:
+`tests/v1/worker/test_steering_scale.py`,
+`tests/model_executor/layers/test_steering_op.py::TestPerRowScale`, plus
+scale cases in the action-queue/override suites. Caveat (unchanged): a
+per-row scale multiplies the row's *entire combined* content (global +
+per-request), so it is cleanest on rows owned outright.
+
+---
+
+Original sketch (superseded by the shared-buffer design above): add, per
+hook point, alongside each layer's table:
 
 ```
 steering_scales_{hook}: float32[(max_configs + 3,)]   (persistent buffer)

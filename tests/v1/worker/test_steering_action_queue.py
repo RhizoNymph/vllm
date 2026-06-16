@@ -15,10 +15,13 @@ import torch
 
 from vllm.v1.worker.steering_action_queue import (
     SteeringActionQueue,
+    SteeringScaleUpdate,
+    SteeringVectorError,
     SteeringVectorUpdate,
     apply_steering_updates,
     get_steering_action_queue,
     install_steering_action_queue,
+    validate_steering_scale,
 )
 
 HIDDEN = 16
@@ -366,3 +369,26 @@ def test_real_manager_decode_update_composes_with_per_request_config():
     table = layers[0].steering_table_post_mlp
     # Request row = global decode (1.0) + per-request (2.0).
     assert torch.all(table[row] == 3.0)
+
+
+# ---------------------------------------------------------------------------
+# SteeringScaleUpdate validation (§5.3)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_scale_accepts_global_config_dynamic():
+    validate_steering_scale(SteeringScaleUpdate(scale=0.5))
+    validate_steering_scale(SteeringScaleUpdate(scale=2.0, config_hash=7))
+    validate_steering_scale(SteeringScaleUpdate(scale=0.0, dyn_id=3))
+
+
+def test_validate_scale_rejects_both_targets():
+    with pytest.raises(SteeringVectorError):
+        validate_steering_scale(SteeringScaleUpdate(scale=1.0, config_hash=7, dyn_id=3))
+
+
+def test_validate_scale_rejects_negative_and_nonfinite():
+    with pytest.raises(SteeringVectorError):
+        validate_steering_scale(SteeringScaleUpdate(scale=-1.0))
+    with pytest.raises(SteeringVectorError):
+        validate_steering_scale(SteeringScaleUpdate(scale=float("nan")))

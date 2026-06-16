@@ -29,10 +29,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
     SteeringActionQueue,
+    SteeringScaleUpdate,
     SteeringVectorUpdate,
     apply_steering_updates,
     get_steering_action_queue,
     install_steering_action_queue,
+    validate_steering_scale,
     validate_steering_vectors,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
@@ -643,6 +645,18 @@ class SteeringModelRunnerMixin:
         else:
             status["dynamic_tier"] = None
 
+        # Per-row strength scales (§5.3): non-default scales by owner.
+        if mgr is not None:
+            status["dynamic_scales"] = {
+                "global": dict(mgr._global_scales),
+                "config": {
+                    f"{h}:{p}": s for (h, p), s in mgr._config_scales.items()
+                },
+                "dynamic": {str(d): s for d, s in mgr._dynamic_scales.items()},
+            }
+        else:
+            status["dynamic_scales"] = None
+
         # Sync consumers: timing, ring of recent steps, optional
         # consumer-provided policy status.
         consumers = {name: c for name, c in getattr(self, "_sync_consumers", [])}
@@ -1034,6 +1048,11 @@ class SteeringModelRunnerMixin:
                     applied += 1
                 else:
                     rejected += 1
+            elif isinstance(action, SteeringScaleUpdate):
+                if self._apply_scale_update(action, source=source):
+                    applied += 1
+                else:
+                    rejected += 1
             else:
                 rejected += 1
                 logger.warning(
@@ -1152,6 +1171,44 @@ class SteeringModelRunnerMixin:
         self._req_dynamic_decode[req_id] = dyn_id
         return True
 
+    def _apply_scale_update(
+        self,
+        action: "SteeringScaleUpdate",
+        *,
+        source: str,
+    ) -> bool:
+        """Apply one per-row strength-scale change (§5.3). Returns success.
+
+        Decode-tier only and routing-light: it sets a manager scale (a
+        cheap scales-buffer write on the next step), never touches
+        vectors or admission state. A rejected action keeps the previous
+        scale.
+        """
+        mgr = self._steering_manager
+
+        def _reject(reason: str) -> bool:
+            logger.warning(
+                "rejected steering scale update (source=%s): %s", source, reason
+            )
+            return False
+
+        if mgr is None or not self._steerable_layers_cache:
+            return _reject("steering is not initialized on this worker")
+        try:
+            validate_steering_scale(action)
+        except SteeringVectorError as exc:
+            return _reject(str(exc))
+
+        if action.dyn_id is not None:
+            if action.dyn_id not in mgr._dynamic_to_row:
+                return _reject(f"unknown dynamic row dyn_id={action.dyn_id}")
+            mgr.set_dynamic_scale(action.dyn_id, action.scale)
+        elif action.config_hash is not None:
+            mgr.set_row_scale(action.config_hash, "decode", action.scale)
+        else:
+            mgr.set_global_scale("decode", action.scale)
+        return True
+
     def _drop_request_dynamic_override(self, req_id: str) -> None:
         """Release ``req_id``'s dynamic override, if any. Idempotent."""
         dyn_id = self._req_dynamic_decode.pop(req_id, None)
@@ -1242,6 +1299,13 @@ class SteeringModelRunnerMixin:
         # per step.
         if self._steering_manager._tables_dirty:
             self._steering_manager.populate_steering_tables(
+                self._steerable_layers_cache
+            )
+        elif self._steering_manager._scales_dirty:
+            # Cheap path (§5.3): a strength-scale change needs only the
+            # per-row scale buffers rewritten — no table recompose, no
+            # vector H2D.
+            self._steering_manager.populate_steering_scales(
                 self._steerable_layers_cache
             )
 

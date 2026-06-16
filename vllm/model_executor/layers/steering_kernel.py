@@ -41,6 +41,7 @@ def _apply_steering_kernel(
     table_ptr,
     index_ptr,
     active_ptr,
+    scales_ptr,
     out_ptr,
     N,
     H,
@@ -48,11 +49,16 @@ def _apply_steering_kernel(
     h_stride_h,
     t_stride_r,
     t_stride_h,
+    s_stride_r,
     o_stride_n,
     o_stride_h,
     BLOCK_H: tl.constexpr,
 ):
-    """Compute ``out[i, j] = hidden[i, j] + cast(table[index[i], j])``.
+    """Compute ``out[i, j] = hidden[i, j] + cast(table[index[i], j]) * scale``.
+
+    ``scales_ptr`` holds one float32 per table row; the gathered row is
+    scaled by ``scales[index[i]]`` before the add. A neutral scale of
+    ``1.0`` (the buffer default) reproduces the unscaled steering.
 
     When the byte at ``active_ptr`` is zero, the kernel skips the gather
     and emits ``out[i, j] = hidden[i, j]`` so the inactive-hook short
@@ -87,6 +93,8 @@ def _apply_steering_kernel(
 
     row = tl.load(index_ptr + pid_n)
     table_row_ptr = table_ptr + row * t_stride_r
+    # Per-row scale (runtime "how much" knob); fp32, default 1.0.
+    scale = tl.load(scales_ptr + row * s_stride_r)
 
     for h_off in range(0, H, BLOCK_H):
         h_idx = h_off + tl.arange(0, BLOCK_H)
@@ -95,7 +103,7 @@ def _apply_steering_kernel(
         t_vals = tl.load(table_row_ptr + h_idx * t_stride_h, mask=mask)
         # Cast table values to hidden dtype so dtype-mismatched tables
         # (fp32 table + bf16 hidden, common before PR 1 lands) work.
-        result = h_vals + t_vals.to(h_vals.dtype)
+        result = h_vals + t_vals.to(h_vals.dtype) * scale.to(h_vals.dtype)
         tl.store(out_row_ptr + h_idx * o_stride_h, result, mask=mask)
 
 
@@ -123,8 +131,9 @@ def apply_steering_triton(
     steering_table: torch.Tensor,
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
+    steering_scales: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute ``hidden_states + table[index[:N]].to(hidden_states.dtype)``.
+    """Compute ``hidden + (table[index[:N]] * scales[index[:N]]).to(dtype)``.
 
     Returns a freshly allocated output tensor with the same shape and
     dtype as ``hidden_states``. Empty batches (``N == 0``) short-circuit
@@ -147,6 +156,7 @@ def apply_steering_triton(
         steering_table,
         steering_index,
         any_active,
+        steering_scales,
         out,
         N,
         H,
@@ -154,6 +164,7 @@ def apply_steering_triton(
         hidden_states.stride(1),
         steering_table.stride(0),
         steering_table.stride(1),
+        steering_scales.stride(0),
         out.stride(0),
         out.stride(1),
         BLOCK_H=block_h,
@@ -280,6 +291,7 @@ def warmup_apply_steering_kernel(
     )
     index_buf = torch.zeros(max_n, dtype=torch.long, device=device)
     active_flag = torch.zeros(1, dtype=torch.bool, device=device)
+    scales_buf = torch.ones(max(table_rows, 1), dtype=torch.float32, device=device)
 
     t0 = time.perf_counter()
     for n in sizes:
@@ -287,10 +299,14 @@ def warmup_apply_steering_kernel(
         index_view = index_buf[:n]
         # Inactive path first — exercises the short-circuit branch.
         active_flag.fill_(False)
-        torch.ops.vllm.apply_steering(hidden_view, table_buf, index_view, active_flag)
+        torch.ops.vllm.apply_steering(
+            hidden_view, table_buf, index_view, active_flag, scales_buf
+        )
         # Active path — exercises the gather + add.
         active_flag.fill_(True)
-        torch.ops.vllm.apply_steering(hidden_view, table_buf, index_view, active_flag)
+        torch.ops.vllm.apply_steering(
+            hidden_view, table_buf, index_view, active_flag, scales_buf
+        )
     # Block until every JIT compile (and cuLibraryLoadData) has retired so
     # the wall-clock measurement and cache-size readback reflect reality.
     torch.accelerator.synchronize()
