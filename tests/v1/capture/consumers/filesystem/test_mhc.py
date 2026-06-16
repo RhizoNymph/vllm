@@ -113,6 +113,23 @@ class TestMhcValidation:
         spec = validate_filesystem_request(raw, MagicMock(), _ctx("r"))
         assert spec.hooks["mhc_attn_res_mix"] == [0]
 
+    @pytest.mark.parametrize("selector", ["all", [0], [3], {"layers": [1]}])
+    def test_model_level_hook_normalizes_to_last_layer(self, selector) -> None:
+        """``mhc_streams_final`` ignores its layer selector → last layer.
+
+        It is a model-tail hook, so any selector resolves to
+        ``num_hidden_layers - 1`` (4 layers in ``_ctx`` → layer 3); the
+        caller need not know the index.
+        """
+        raw = FilesystemCaptureRequest(
+            request_id="r",
+            tag="t",
+            hooks={"mhc_streams_final": selector},
+            positions="all",
+        )
+        spec = validate_filesystem_request(raw, MagicMock(), _ctx("r"))
+        assert spec.hooks["mhc_streams_final"] == [3]
+
 
 # ---------------------------------------------------------------------------
 # Round-trip

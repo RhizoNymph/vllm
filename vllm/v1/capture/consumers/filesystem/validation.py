@@ -38,6 +38,7 @@ import regex as re
 
 from vllm.v1.capture.errors import CaptureValidationError
 from vllm.v1.capture.types import (
+    MODEL_LEVEL_HOOKS,
     CaptureContext,
     CaptureSpec,
     HookName,
@@ -408,6 +409,13 @@ def validate_filesystem_request(
         )
     resolved_hooks: dict[HookName, list[int]] = {}
     for hook_name, selector in raw.hooks.items():
+        if hook_name in MODEL_LEVEL_HOOKS:
+            # Model-level hook: fires once at the model tail, keyed to the
+            # last layer. The layer selector is meaningless here, so accept
+            # any selector and normalize to that single index — callers need
+            # not know it (e.g. ``{"mhc_streams_final": "all"}``).
+            resolved_hooks[cast(HookName, hook_name)] = [ctx.num_hidden_layers - 1]
+            continue
         resolved = _expand_hook_layers(
             selector,
             ctx.num_hidden_layers,

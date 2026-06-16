@@ -83,6 +83,14 @@ WIRED_STANDARD_HOOKS: tuple[str, ...] = (
     "post_mlp",
 )
 
+# Hooks that fire once per request at the *model tail*, not per decoder
+# layer (DeepSeek-V4's final pre-``hc_head`` streams). They are keyed to the
+# last layer index (``num_hidden_layers - 1``), where the tap fires on the
+# last pipeline stage. Their layer selector is meaningless, so admission
+# ignores it and normalizes to that single index — a caller writes
+# ``{"mhc_streams_final": "all"}`` without needing to know the index.
+MODEL_LEVEL_HOOKS: frozenset[str] = frozenset({"mhc_streams_final"})
+
 PositionSelector = (
     Literal["last_prompt", "all_prompt", "all_generated", "all"] | list[int]
 )

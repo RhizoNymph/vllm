@@ -15,6 +15,7 @@ from vllm.v1.capture.errors import (
 )
 from vllm.v1.capture.sink import CaptureSink
 from vllm.v1.capture.types import (
+    MODEL_LEVEL_HOOKS,
     STANDARD_HOOKS,
     CaptureChunk,
     CaptureContext,
@@ -33,6 +34,7 @@ from vllm.v1.capture.types import (
 )
 
 __all__ = [
+    "MODEL_LEVEL_HOOKS",
     "STANDARD_HOOKS",
     "CaptureChunk",
     "CaptureConsumer",
