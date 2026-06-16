@@ -20,6 +20,7 @@ import torch.nn as nn
 from vllm.model_executor.layers.steering import get_steering_buffer_config
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
+    SteeringMonitorUpdate,
     SteeringScaleUpdate,
     SteeringVectorUpdate,
 )
@@ -449,6 +450,52 @@ def test_monitor_only_state_defeats_nothing_active_short_circuit():
         layer.steering_table_post_mlp_monitor_params,
         torch.tensor([0.0, 4.0], dtype=torch.float32),
     )
+
+
+def test_monitor_update_dispatches_through_apply_path():
+    """A SteeringMonitorUpdate routes to manager.set_monitor; probe=None
+    clears it. Exercises the _apply_steering_actions dispatch + validation."""
+    host = _MixinHost([_decode_req()])
+    probe = np.arange(HIDDEN, dtype=np.float32)
+    applied, rejected = host._apply_steering_actions(
+        [
+            SteeringMonitorUpdate(
+                hook="post_mlp",
+                layer=0,
+                probe=probe,
+                threshold=1.0,
+                sharpness=3.0,
+                source="s",
+            )
+        ],
+        source="s",
+    )
+    assert (applied, rejected) == (1, 0)
+    cfg = host._steering_manager.monitor_configs["post_mlp"][0]
+    assert cfg["threshold"] == 1.0 and cfg["sharpness"] == 3.0
+    # Clear.
+    host._apply_steering_actions(
+        [SteeringMonitorUpdate(hook="post_mlp", layer=0, probe=None, source="s")],
+        source="s",
+    )
+    assert not host._steering_manager.has_monitor
+
+
+def test_monitor_update_bad_probe_rejected():
+    host = _MixinHost([_decode_req()])
+    applied, rejected = host._apply_steering_actions(
+        [
+            SteeringMonitorUpdate(
+                hook="post_mlp",
+                layer=0,
+                probe=np.ones(HIDDEN + 5, np.float32),
+                source="s",
+            )
+        ],
+        source="s",
+    )
+    assert (applied, rejected) == (0, 1)
+    assert not host._steering_manager.has_monitor
 
 
 def test_clearing_monitor_deactivates_flag_on_transition():

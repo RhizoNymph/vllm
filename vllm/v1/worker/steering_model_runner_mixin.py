@@ -31,11 +31,13 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
     SteeringActionQueue,
+    SteeringMonitorUpdate,
     SteeringScaleUpdate,
     SteeringVectorUpdate,
     apply_steering_updates,
     get_steering_action_queue,
     install_steering_action_queue,
+    validate_steering_monitor,
     validate_steering_scale,
     validate_steering_vectors,
 )
@@ -331,6 +333,21 @@ class SteeringModelRunnerMixin:
                     + 3
                 ),
                 table_dtype=table_dtype,
+                compute_dtype=compute_dtype,
+                device=table_device,
+                capture_sizes=list(capture_sizes) if capture_sizes else None,
+            )
+
+            # Warm the in-graph monitor kernel (Phase 2, §8) too — the
+            # monitor op is emitted at every steered hook, so its Triton
+            # JIT must retire before CUDA-graph capture even when no probe
+            # is configured yet (the inactive branch shares the artifact).
+            from vllm.model_executor.layers.steering_monitor_kernel import (
+                warmup_steering_monitor_kernel,
+            )
+
+            warmup_steering_monitor_kernel(
+                hidden_size=hidden_size,
                 compute_dtype=compute_dtype,
                 device=table_device,
                 capture_sizes=list(capture_sizes) if capture_sizes else None,
@@ -662,6 +679,27 @@ class SteeringModelRunnerMixin:
             }
         else:
             status["dynamic_tier"] = None
+
+        # In-graph monitor (Phase 2, §8): configured probe sites and their
+        # policy params. The probe vectors themselves are omitted (large);
+        # only the site + threshold/sharpness are reported.
+        if mgr is not None:
+            status["monitor"] = {
+                "active": mgr.has_monitor,
+                "sites": {
+                    hook: {
+                        layer: {
+                            "threshold": cfg["threshold"],
+                            "sharpness": cfg["sharpness"],
+                        }
+                        for layer, cfg in layers.items()
+                    }
+                    for hook, layers in mgr.monitor_configs.items()
+                    if layers
+                },
+            }
+        else:
+            status["monitor"] = None
 
         # Per-row strength scales (§5.3): non-default scales by owner.
         if mgr is not None:
@@ -1071,6 +1109,11 @@ class SteeringModelRunnerMixin:
                     applied += 1
                 else:
                     rejected += 1
+            elif isinstance(action, SteeringMonitorUpdate):
+                if self._apply_monitor_update(action, source=source):
+                    applied += 1
+                else:
+                    rejected += 1
             else:
                 rejected += 1
                 logger.warning(
@@ -1227,6 +1270,50 @@ class SteeringModelRunnerMixin:
             mgr.set_row_scale(action.config_hash, "decode", action.scale)
         else:
             mgr.set_global_scale("decode", action.scale)
+        return True
+
+    def _apply_monitor_update(
+        self,
+        action: "SteeringMonitorUpdate",
+        *,
+        source: str,
+    ) -> bool:
+        """Configure/clear the in-graph monitor at a probe site (§8).
+
+        Decode-tier only and cache-safe by construction: the monitor only
+        scales the dynamic tier's per-token gate, which the runner zeroes
+        for prefill tokens (``0*gate==0``). A rejected action keeps the
+        previous monitor state. ``probe=None`` clears the site.
+        """
+        mgr = self._steering_manager
+
+        def _reject(reason: str) -> bool:
+            logger.warning(
+                "rejected steering monitor update (source=%s): %s", source, reason
+            )
+            return False
+
+        if mgr is None or not self._steerable_layers_cache:
+            return _reject("steering is not initialized on this worker")
+        try:
+            validate_steering_monitor(action, self._steerable_layers_cache)
+        except SteeringVectorError as exc:
+            return _reject(str(exc))
+
+        if action.probe is None:
+            mgr.clear_monitor(action.hook, action.layer)
+            return True
+        probe = torch.from_numpy(
+            np.ascontiguousarray(action.probe, dtype=np.float32)
+        )
+        mgr.set_monitor(
+            action.hook,
+            action.layer,
+            probe,
+            action.threshold,
+            action.sharpness,
+            locally_owned_layers=self._locally_owned_layers,
+        )
         return True
 
     def _drop_request_dynamic_override(self, req_id: str) -> None:

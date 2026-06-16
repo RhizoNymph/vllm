@@ -15,12 +15,14 @@ import torch
 
 from vllm.v1.worker.steering_action_queue import (
     SteeringActionQueue,
+    SteeringMonitorUpdate,
     SteeringScaleUpdate,
     SteeringVectorError,
     SteeringVectorUpdate,
     apply_steering_updates,
     get_steering_action_queue,
     install_steering_action_queue,
+    validate_steering_monitor,
     validate_steering_scale,
 )
 
@@ -398,3 +400,79 @@ def test_validate_scale_rejects_negative_and_nonfinite():
         validate_steering_scale(SteeringScaleUpdate(scale=-1.0))
     with pytest.raises(SteeringVectorError):
         validate_steering_scale(SteeringScaleUpdate(scale=float("nan")))
+
+
+# ---------------------------------------------------------------------------
+# SteeringMonitorUpdate validation (Phase 2, §8)
+# ---------------------------------------------------------------------------
+
+
+def _layers() -> dict:
+    return {0: _FakeLayer(("post_mlp",))}
+
+
+def test_validate_monitor_accepts_set_and_clear():
+    layers = _layers()
+    validate_steering_monitor(
+        SteeringMonitorUpdate(
+            hook="post_mlp",
+            layer=0,
+            probe=np.ones(HIDDEN, np.float32),
+            threshold=0.5,
+            sharpness=2.0,
+        ),
+        layers,
+    )
+    # Clear (probe=None) only needs a valid target.
+    validate_steering_monitor(
+        SteeringMonitorUpdate(hook="post_mlp", layer=0, probe=None), layers
+    )
+
+
+def test_validate_monitor_rejects_bad_hook_and_layer():
+    layers = _layers()
+    with pytest.raises(SteeringVectorError):
+        validate_steering_monitor(
+            SteeringMonitorUpdate(hook="bogus", layer=0, probe=None), layers
+        )
+    with pytest.raises(SteeringVectorError):
+        validate_steering_monitor(
+            SteeringMonitorUpdate(hook="post_mlp", layer=9, probe=None), layers
+        )
+
+
+def test_validate_monitor_rejects_bad_probe_and_params():
+    layers = _layers()
+    with pytest.raises(SteeringVectorError):  # wrong size
+        validate_steering_monitor(
+            SteeringMonitorUpdate(
+                hook="post_mlp", layer=0, probe=np.ones(HIDDEN + 1, np.float32)
+            ),
+            layers,
+        )
+    with pytest.raises(SteeringVectorError):  # non-finite probe
+        bad = np.ones(HIDDEN, np.float32)
+        bad[0] = np.inf
+        validate_steering_monitor(
+            SteeringMonitorUpdate(hook="post_mlp", layer=0, probe=bad), layers
+        )
+    with pytest.raises(SteeringVectorError):  # negative sharpness
+        validate_steering_monitor(
+            SteeringMonitorUpdate(
+                hook="post_mlp",
+                layer=0,
+                probe=np.ones(HIDDEN, np.float32),
+                sharpness=-1.0,
+            ),
+            layers,
+        )
+    with pytest.raises(SteeringVectorError):  # non-finite threshold
+        validate_steering_monitor(
+            SteeringMonitorUpdate(
+                hook="post_mlp",
+                layer=0,
+                probe=np.ones(HIDDEN, np.float32),
+                threshold=float("nan"),
+            ),
+            layers,
+        )

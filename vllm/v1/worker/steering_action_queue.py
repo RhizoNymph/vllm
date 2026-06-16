@@ -132,9 +132,38 @@ class SteeringScaleUpdate:
     source: str = ""
 
 
+@dataclass(frozen=True)
+class SteeringMonitorUpdate:
+    """Configure (or clear) the in-graph monitor at a probe site (§8).
+
+    Installs a probe at ``(hook, layer)`` so the monitor op modulates the
+    §5.4 dynamic tier's per-token gate by
+    ``sigmoid(sharpness*(residual@probe - threshold))`` in the same
+    forward — detection at this layer conditions steering at later
+    hooks/layers (Phase 2). ``probe=None`` clears the site.
+
+    Cache-safe by construction: the monitor only scales the decode tier
+    (prefill gate entries are zeroed by the runner, so ``0*gate==0``); it
+    never touches prefill rows or prefix-cache keys. The probe and params
+    are runtime state, never part of any config hash.
+    """
+
+    hook: str
+    layer: int
+    probe: np.ndarray | None
+    threshold: float = 0.0
+    sharpness: float = 1.0
+    source: str = ""
+
+
 # Everything the apply path accepts, from either transport (queue or
 # sync ``on_step`` returns).
-SteeringAction = SteeringVectorUpdate | RequestSteeringOverride | SteeringScaleUpdate
+SteeringAction = (
+    SteeringVectorUpdate
+    | RequestSteeringOverride
+    | SteeringScaleUpdate
+    | SteeringMonitorUpdate
+)
 
 
 @dataclass
@@ -312,6 +341,47 @@ def validate_steering_scale(action: SteeringScaleUpdate) -> None:
         raise SteeringVectorError(f"scale must be finite, got {scale!r}")
     if scale < 0:
         raise SteeringVectorError(f"scale must be non-negative, got {scale!r}")
+
+
+def validate_steering_monitor(
+    action: SteeringMonitorUpdate,
+    steerable_layers: dict,
+) -> None:
+    """Raise :class:`SteeringVectorError` on an unappliable monitor update.
+
+    A clear (``probe=None``) only needs a valid ``(hook, layer)`` target;
+    a set additionally validates the probe shape/finiteness and the
+    policy params.
+    """
+    if action.hook not in VALID_HOOK_POINT_NAMES:
+        raise SteeringVectorError(f"invalid hook point: {action.hook!r}")
+    table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(action.hook)]
+    mod = steerable_layers.get(action.layer)
+    if mod is None:
+        raise SteeringVectorError(
+            f"layer {action.layer} is not steerable on this worker"
+        )
+    if not hasattr(mod, table_attr):
+        raise SteeringVectorError(
+            f"hook point {action.hook!r} not active on layer {action.layer}"
+        )
+    if not np.isfinite(action.threshold) or not np.isfinite(action.sharpness):
+        raise SteeringVectorError("monitor threshold/sharpness must be finite")
+    if action.sharpness < 0:
+        raise SteeringVectorError(
+            f"monitor sharpness must be non-negative, got {action.sharpness!r}"
+        )
+    if action.probe is None:
+        return  # clear
+    expected = getattr(mod, table_attr).shape[1]
+    arr = np.asarray(action.probe)
+    if arr.ndim != 1 or arr.shape[0] != expected:
+        raise SteeringVectorError(
+            f"monitor probe for layer {action.layer} ({action.hook}): expected "
+            f"1-D vector of size {expected}, got shape {tuple(arr.shape)}"
+        )
+    if not np.isfinite(arr).all():
+        raise SteeringVectorError("monitor probe contains non-finite values")
 
 
 def _validate_update(
