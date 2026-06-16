@@ -93,6 +93,38 @@ policy whose parameters a consumer tunes. Phases 1 and 2 extend the
 existing capture-consumer framework rather than adding a parallel
 controller system — see §5.1.
 
+### 3.1 Policy expressiveness contract (locked)
+
+"Policy" is three separable components, and what each tier admits is a
+fixed contract — do not blur them:
+
+- **Probe** (detector: activations → score). A *pretrained* probe is
+  fixed weights at inference — a direction, linear classifier, MLP, or
+  SAE feature. **Usable on every tier**, in-graph included, as long as
+  its evaluation is per-token graph-safe tensor math. (The example
+  controller already loads one via `probe_path` / `probe_packed_path`.)
+- **Decision function** (score → gate/gain). In-graph: a fixed
+  elementwise map (sigmoid/step/affine) with parameters in persistent
+  buffers. Sync/async: arbitrary Python.
+- **Controller state** (anything aggregating across tokens, steps, or
+  requests: EMA, hysteresis, "engage N tokens", budget throttle, RL /
+  online learning). **Sync or async tier only** — *not* in-graph,
+  except simple state expressible as an in-graph persistent-buffer
+  read-modify-write (§8 reset-discipline territory).
+
+The in-graph tier (Phase 2) is bounded to ops that are **fixed-shape,
+collective-free, allocation-free, per-token** (no cross-token/cross-step
+reductions), with **no host sync and no data-dependent control flow**;
+tunable parameters live in small persistent buffers so a consumer can
+retune them between steps without recapture. A *learned controller is
+therefore not lost at the in-graph tier* — it runs one tier up (sync,
+1-step latency) and tunes the cheap per-token in-graph gate beneath it.
+
+Determinism (all worker-side tiers): every probe/policy must be a pure,
+deterministic function of the **rank-identical post-all-reduce
+residual**, so each TP rank computes the same decision with no
+communication (§6). Standard pretrained probes satisfy this trivially.
+
 ## 4. Phase 0 — consumer + action queue (implemented on this branch)
 
 Smallest core surface that lets a capture consumer drive steering, for
@@ -715,6 +747,15 @@ All headline questions were settled on 2026-06-11:
    prototyping convenience.
 7. **Observability** → **ring buffer + counters** behind
    `GET /v1/steering/dynamic` (§5.5).
+8. **Policy expressiveness across tiers** (settled 2026-06-13, §3.1):
+   probe / decision-function / controller-state are separate concerns.
+   A pretrained probe is usable on every tier (in-graph too, if its
+   per-token evaluation is graph-safe). Learned/stateful controllers
+   live on the sync or async tier — never in-graph — and tune a cheap
+   fixed per-token gate beneath them; the in-graph tier is bounded to
+   fixed-shape, collective-free, allocation-free, per-token ops with no
+   host sync or data-dependent control flow. All worker-side tiers must
+   be pure functions of the rank-identical post-all-reduce residual.
 
 Still open (non-blocking):
 
