@@ -48,6 +48,8 @@ from vllm.v1.capture.types import CaptureSpec
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
     SteeringAction,
+    SteeringMonitorUpdate,
+    SteeringScaleUpdate,
     SteeringVectorUpdate,
 )
 
@@ -64,6 +66,17 @@ _SCORE_MODES = frozenset({"cosine", "dot"})
 _GAIN_MODES = frozenset({"binary", "proportional"})
 _AGGREGATES = frozenset({"max", "mean"})
 _ACTUATIONS = frozenset({"per_request", "global"})
+# How a computed gain is actuated (orthogonal to the gain *value* knobs):
+# - "vectors": re-upload the steering bank scaled by gain each change
+#   (Phase 0/1a behaviour; an H2D + table repopulate per change).
+# - "scale":   upload the base bank ONCE, then modulate strength with the
+#   cheap per-step tier-gain knob (§5.4) — no re-upload. Global only.
+# - "monitor": install an in-graph probe ONCE and let the kernel gate the
+#   tier per token (Phase 2, §8); the controller stops emitting per step.
+#   Global only; the sync-tier EMA/hysteresis is bypassed (the gate is
+#   computed in-graph). The natural §3 hierarchy: the consumer configures
+#   the cheap in-graph gate instead of computing it.
+_EMIT_MODES = frozenset({"vectors", "scale", "monitor"})
 
 _EPS = 1e-8
 
@@ -271,6 +284,16 @@ class DynamicSteeringController:
       hook point). Ignored layer-wise when ``steering_packed_path``
       provides per-layer vectors.
     - ``actuation`` (``"per_request"`` default | ``"global"``).
+    - ``emit_mode`` (``"vectors"`` default | ``"scale"`` | ``"monitor"``):
+      how a gain is actuated. ``"vectors"`` re-uploads the scaled bank
+      each change; ``"scale"`` uploads the base bank once then rides the
+      cheap §5.4 tier-gain knob; ``"monitor"`` installs an in-graph probe
+      once (Phase 2, §8) and lets the kernel gate the tier per token.
+      ``"scale"``/``"monitor"`` are global-only. In ``"monitor"`` mode the
+      EMA/hysteresis policy is bypassed and the score is an in-graph dot
+      product (set ``threshold`` in dot units).
+    - ``monitor_sharpness`` (float, default ``8.0``): sigmoid sharpness of
+      the in-graph gate (``emit_mode='monitor'`` only).
     - ``score`` (``"cosine"`` default | ``"dot"``).
     - policy knobs: ``threshold`` (required), ``hysteresis``,
       ``ema_alpha``, ``gain``, ``gain_mode``, ``aggregate``,
@@ -325,6 +348,44 @@ class DynamicSteeringController:
                 f"actuation={self._actuation!r} not one of {sorted(_ACTUATIONS)}"
             )
 
+        self._emit_mode = str(params.get("emit_mode", "vectors"))
+        if self._emit_mode not in _EMIT_MODES:
+            raise ValueError(
+                f"emit_mode={self._emit_mode!r} not one of {sorted(_EMIT_MODES)}"
+            )
+        if self._emit_mode in ("scale", "monitor") and self._actuation != "global":
+            # "scale" targets the global tier-gain knob and "monitor"
+            # gates the global decode tier; both are global-only. (A
+            # per-request override row's scale is keyed by an internal
+            # dyn_id the consumer never sees, so a per-request scale would
+            # need a new req_id-keyed action — not wired.)
+            raise ValueError(
+                f"emit_mode={self._emit_mode!r} requires actuation='global' "
+                f"(got {self._actuation!r})."
+            )
+        # In-graph monitor sharpness for the sigmoid gate (only used when
+        # emit_mode='monitor'). Larger ⇒ closer to a hard step at threshold.
+        self._monitor_sharpness = float(params.get("monitor_sharpness", 8.0))
+        if self._emit_mode == "monitor":
+            if self._monitor_hook not in _STEER_HOOKS:
+                # The monitor op only runs where apply_layer_steering runs.
+                raise ValueError(
+                    f"emit_mode='monitor' requires monitor_hook in "
+                    f"{sorted(_STEER_HOOKS)} (got {self._monitor_hook!r})."
+                )
+            if self._monitor_sharpness < 0.0:
+                raise ValueError("monitor_sharpness must be >= 0")
+            if str(params.get("score", "cosine")) == "cosine":
+                # The in-graph monitor kernel computes a raw dot product
+                # (no per-token norm), so 'cosine' thresholds don't carry
+                # over. Set 'threshold' in dot-score units for monitor mode.
+                logger.warning(
+                    "DynamicSteeringController: emit_mode='monitor' uses an "
+                    "in-graph dot-product score (the kernel does not "
+                    "normalize); score='cosine' is ignored in-graph. Set "
+                    "'threshold' in dot units."
+                )
+
         self._score_mode = str(params.get("score", "cosine"))
         if self._score_mode not in _SCORE_MODES:
             raise ValueError(
@@ -347,11 +408,22 @@ class DynamicSteeringController:
         )
         self._forget_after_steps = int(params.get("forget_after_steps", 16))
         self.sync_budget_ms = float(params.get("sync_budget_ms", 5.0))
+        # Mirror the engagement scalars for the in-graph monitor install
+        # (threshold + max strength), so monitor mode needn't reach into
+        # the policy's config.
+        self._threshold = float(params["threshold"])
+        self._max_gain = float(params.get("gain", 1.0))
 
         # Device-side probe cache, materialized lazily on first on_step
         # from the view tensor's device.
         self._probe_gpu: torch.Tensor | None = None
         self._updates_emitted = 0
+        # One-time install latches for the cheap emit modes: the base tier
+        # vector (scale + monitor modes) and the in-graph probe (monitor
+        # mode) are uploaded once, then strength rides the cheap knob / the
+        # kernel gates per token.
+        self._tier_installed = False
+        self._monitor_installed = False
 
     # ------------------------------------------------------------------
     # Vector / bank loading
@@ -481,7 +553,10 @@ class DynamicSteeringController:
         """Policy snapshot for ``GET /v1/steering/dynamic``."""
         return {
             "actuation": self._actuation,
+            "emit_mode": self._emit_mode,
             "monitor": [self._monitor_layer, self._monitor_hook],
+            "monitor_installed": self._monitor_installed,
+            "tier_installed": self._tier_installed,
             "steer_hook": self._bank.hook,
             "steer_layers": sorted(self._bank.vectors.keys()),
             "updates_emitted": self._updates_emitted,
@@ -520,6 +595,12 @@ class DynamicSteeringController:
         if acts is None or acts.shape[0] == 0:
             return None
 
+        # Monitor mode hands per-token gating to the in-graph kernel, so
+        # the controller does no scoring here — it just installs the probe
+        # + tier once. (No GEMV / D2H on the sync tier: that's the point.)
+        if self._emit_mode == "monitor":
+            return self._monitor_install_actions()
+
         if self._probe_gpu is None or self._probe_gpu.device != acts.device:
             self._probe_gpu = torch.from_numpy(self._probe).to(acts.device)
 
@@ -535,6 +616,8 @@ class DynamicSteeringController:
 
         if self._actuation == "per_request":
             return self._per_request_actions(view, scores)
+        if self._emit_mode == "scale":
+            return self._global_scale_actions(view, scores)
         return self._global_actions(view, scores)
 
     # ------------------------------------------------------------------
@@ -598,6 +681,89 @@ class DynamicSteeringController:
                 phase="decode",
                 source="dynamic_steering",
             )
+        ]
+
+    def _global_scale_actions(
+        self, view: StepCaptureView, scores: np.ndarray
+    ) -> list[SteeringAction]:
+        """Global tier via the cheap §5.4 gain knob.
+
+        Uploads the *base* (unit-gain) tier vector once, then modulates
+        strength with ``SteeringScaleUpdate(tier_gain=...)`` — a per-step
+        scalar write, no vector re-upload or table recompose. The policy
+        (EMA/hysteresis/gain_mode) still computes the gain; only the
+        transport is cheaper than ``emit_mode='vectors'``.
+        """
+        for req in view.requests:
+            self._policy.observe(req.req_id, scores[req.start : req.end], view.step)
+        self._policy.prune_unseen(view.step, self._forget_after_steps)
+
+        gain = self._policy.current_global_gain(view.step)
+        actions: list[SteeringAction] = []
+        if not self._tier_installed:
+            # Upload the tier vector once; set its initial strength
+            # explicitly (``dynamic_tier_gain`` defaults to 1.0, so it must
+            # be pinned to ``gain`` immediately or the tier would apply at
+            # full strength for one step before the gate catches up).
+            actions.append(
+                SteeringVectorUpdate(
+                    vectors=self._scaled_vectors(1.0),
+                    phase="decode",
+                    source="dynamic_steering",
+                )
+            )
+            actions.append(
+                SteeringScaleUpdate(
+                    scale=gain, tier_gain=True, source="dynamic_steering"
+                )
+            )
+            self._tier_installed = True
+            self._policy.mark_emitted("__global__", gain)
+            self._updates_emitted += 1
+        elif self._policy.should_emit("__global__", gain):
+            actions.append(
+                SteeringScaleUpdate(
+                    scale=gain, tier_gain=True, source="dynamic_steering"
+                )
+            )
+            self._policy.mark_emitted("__global__", gain)
+            self._updates_emitted += 1
+        return actions
+
+    def _monitor_install_actions(self) -> list[SteeringAction]:
+        """Install the in-graph monitor (Phase 2, §8) once.
+
+        Uploads the base tier vector, pins the tier-gain to the policy's
+        max ``gain``, and installs the probe at the monitored site. After
+        that the kernel computes the per-token gate
+        ``sigmoid(sharpness*(residual@probe - threshold))`` in-graph and
+        the controller emits nothing further — the sync-tier EMA/hysteresis
+        is bypassed by design.
+        """
+        if self._monitor_installed:
+            return []
+        self._monitor_installed = True
+        self._tier_installed = True
+        self._updates_emitted += 1
+        return [
+            SteeringVectorUpdate(
+                vectors=self._scaled_vectors(1.0),
+                phase="decode",
+                source="dynamic_steering",
+            ),
+            SteeringScaleUpdate(
+                scale=self._max_gain,
+                tier_gain=True,
+                source="dynamic_steering",
+            ),
+            SteeringMonitorUpdate(
+                hook=self._monitor_hook,
+                layer=self._monitor_layer,
+                probe=self._probe,
+                threshold=self._threshold,
+                sharpness=self._monitor_sharpness,
+                source="dynamic_steering",
+            ),
         ]
 
 

@@ -36,6 +36,8 @@ from vllm.v1.capture.step_view import (  # noqa: E402
 )
 from vllm.v1.worker.steering_action_queue import (  # noqa: E402
     RequestSteeringOverride,
+    SteeringMonitorUpdate,
+    SteeringScaleUpdate,
     SteeringVectorUpdate,
 )
 
@@ -400,6 +402,101 @@ def test_dot_score_mode(tmp: Path, probe: torch.Tensor):
     rows2 = torch.zeros(1, HIDDEN)
     rows2[0, 0] = 3.5
     assert len(ctrl.on_step(_view({"r1": rows2}, step=2))) == 1
+
+
+# ---------------------------------------------------------------------------
+# emit_mode = "scale": base vector once, then cheap tier-gain modulation
+# ---------------------------------------------------------------------------
+
+
+def test_scale_mode_installs_base_then_modulates(tmp: Path, probe: torch.Tensor):
+    steer = torch.full((HIDDEN,), 3.0)
+    ctrl = _make_controller(
+        tmp, probe, steer, actuation="global", emit_mode="scale"
+    )
+    # First engaged step: upload base (unit-gain) vector + set tier-gain.
+    actions = ctrl.on_step(_view({"r1": _aligned(probe, 4.0)}, step=1))
+    assert len(actions) == 2
+    vec_update = next(a for a in actions if isinstance(a, SteeringVectorUpdate))
+    scale_update = next(a for a in actions if isinstance(a, SteeringScaleUpdate))
+    # Base vector is unscaled (gain folded into the tier-gain knob, not here).
+    np.testing.assert_allclose(
+        vec_update.vectors["post_mlp"][MONITOR[0]],
+        np.full(HIDDEN, 3.0, dtype=np.float32),
+    )
+    assert scale_update.tier_gain is True
+    assert scale_update.scale == 2.0  # gain
+    # Steady engagement: nothing re-emitted (no vector re-upload).
+    assert ctrl.on_step(_view({"r1": _aligned(probe)}, step=2)) == []
+
+
+def test_scale_mode_disengage_emits_zero_gain_not_vector(
+    tmp: Path, probe: torch.Tensor
+):
+    ctrl = _make_controller(tmp, probe, probe, actuation="global", emit_mode="scale")
+    ctrl.on_step(_view({"r1": _aligned(probe)}, step=1))  # install + engage
+    actions = ctrl.on_step(_view({"r1": _aligned(probe, -1.0)}, step=2))
+    assert len(actions) == 1
+    assert isinstance(actions[0], SteeringScaleUpdate)
+    assert actions[0].tier_gain is True
+    assert actions[0].scale == 0.0  # disengaged ⇒ gain 0, no vector touched
+
+
+def test_scale_mode_rejected_for_per_request(tmp: Path, probe: torch.Tensor):
+    with pytest.raises(ValueError):
+        _make_controller(
+            tmp, probe, probe, actuation="per_request", emit_mode="scale"
+        )
+
+
+# ---------------------------------------------------------------------------
+# emit_mode = "monitor": install the in-graph probe once (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def test_monitor_mode_installs_probe_tier_once(tmp: Path, probe: torch.Tensor):
+    steer = torch.full((HIDDEN,), 3.0)
+    ctrl = _make_controller(
+        tmp,
+        probe,
+        steer,
+        actuation="global",
+        emit_mode="monitor",
+        score="dot",
+        threshold=1.5,
+        monitor_sharpness=12.0,
+    )
+    actions = ctrl.on_step(_view({"r1": _aligned(probe, 4.0)}, step=1))
+    kinds = {type(a) for a in actions}
+    assert kinds == {SteeringVectorUpdate, SteeringScaleUpdate, SteeringMonitorUpdate}
+    mon = next(a for a in actions if isinstance(a, SteeringMonitorUpdate))
+    assert mon.hook == MONITOR[1] and mon.layer == MONITOR[0]
+    assert mon.threshold == 1.5 and mon.sharpness == 12.0
+    np.testing.assert_allclose(mon.probe, ctrl._probe)  # unit-normalized probe
+    tier_gain = next(a for a in actions if isinstance(a, SteeringScaleUpdate))
+    assert tier_gain.tier_gain is True and tier_gain.scale == 2.0
+    # Installed once: subsequent steps emit nothing (the kernel gates).
+    assert ctrl.on_step(_view({"r1": _aligned(probe, 9.0)}, step=2)) == []
+    assert ctrl.status()["monitor_installed"] is True
+
+
+def test_monitor_mode_requires_steer_hook(tmp: Path, probe: torch.Tensor):
+    with pytest.raises(ValueError):
+        _make_controller(
+            tmp,
+            probe,
+            probe,
+            actuation="global",
+            emit_mode="monitor",
+            monitor_hook="mlp_in",  # capture-only, no steering op there
+        )
+
+
+def test_monitor_mode_rejected_for_per_request(tmp: Path, probe: torch.Tensor):
+    with pytest.raises(ValueError):
+        _make_controller(
+            tmp, probe, probe, actuation="per_request", emit_mode="monitor"
+        )
 
 
 # ---------------------------------------------------------------------------
