@@ -65,6 +65,26 @@ HOOK_POINT_DYNVEC_ATTR: dict[SteeringHookPoint, str] = {
     hp: f"{table_attr}_dynvec" for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
 }
 
+# Per-hook in-graph monitor buffers (Phase 2, §8). At a probe site one
+# ``(layer, hook)`` carries a probe vector ``(hidden,)``, a ``(2,)`` param
+# buffer ``[threshold, sharpness]``, and a single-element bool ``active``
+# flag. The monitor op reads the residual at this hook and writes a
+# per-token gate into the shared ``steering_token_scales`` buffer, which
+# the §5.4 dynamic tier then multiplies by. Derived from the table
+# attribute so they are discoverable together.
+HOOK_POINT_MONITOR_PROBE_ATTR: dict[SteeringHookPoint, str] = {
+    hp: f"{table_attr}_monitor_probe"
+    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
+}
+HOOK_POINT_MONITOR_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
+    hp: f"{table_attr}_monitor_params"
+    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
+}
+HOOK_POINT_MONITOR_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
+    hp: f"{table_attr}_monitor_active"
+    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
+}
+
 # Valid hook point string values for validation.
 VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHookPoint)
 
@@ -123,6 +143,30 @@ def register_steering_buffers(
         module.register_buffer(
             HOOK_POINT_DYNVEC_ATTR[hp],
             torch.zeros(hidden_size, dtype=torch.float32),
+            persistent=False,
+        )
+        # Per-hook in-graph monitor buffers (Phase 2, §8). The probe is a
+        # fp32 (hidden,) detector vector; params is [threshold, sharpness];
+        # active is a bool flag the monitor op reads at launch and uses to
+        # short-circuit (a tensor, not a Python bool, so the compiled graph
+        # topology stays stable). All default to the inactive/no-op state —
+        # ``register_steering_buffers`` registers them on every layer, but
+        # the monitor only runs where the manager set a probe and flipped
+        # ``active`` (one site). Sharpness default 1.0 keeps the sigmoid
+        # finite if ever read while inactive.
+        module.register_buffer(
+            HOOK_POINT_MONITOR_PROBE_ATTR[hp],
+            torch.zeros(hidden_size, dtype=torch.float32),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_MONITOR_PARAMS_ATTR[hp],
+            torch.tensor([0.0, 1.0], dtype=torch.float32),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_MONITOR_ACTIVE_ATTR[hp],
+            torch.zeros(1, dtype=torch.bool),
             persistent=False,
         )
 
@@ -241,6 +285,20 @@ def apply_layer_steering(
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
     if not hasattr(module, table_attr):
         return hidden_states
+    # In-graph monitor (Phase 2, §8): at a probe site this reads the
+    # pre-steering residual and writes a per-token gate into the shared
+    # ``steering_token_scales`` buffer that the dynamic tier (below, and at
+    # later hooks/layers) multiplies by. It mutates the gate in place and
+    # is a no-op unless its ``active`` flag is set, so emitting it at every
+    # hook keeps the compiled topology stable while only the configured
+    # site does work (detect at L, steer at layers > L, same forward).
+    torch.ops.vllm.steering_monitor(
+        hidden_states,
+        getattr(module, HOOK_POINT_MONITOR_PROBE_ATTR[hook_point]),
+        getattr(module, HOOK_POINT_MONITOR_PARAMS_ATTR[hook_point]),
+        getattr(module, HOOK_POINT_MONITOR_ACTIVE_ATTR[hook_point]),
+        module.steering_token_scales,
+    )
     return torch.ops.vllm.apply_steering(
         hidden_states,
         getattr(module, table_attr),
@@ -367,4 +425,78 @@ direct_register_custom_op(
     op_func=apply_steering,
     fake_impl=apply_steering_fake,
     mutates_args=[],
+)
+
+
+def steering_monitor(
+    hidden_states: torch.Tensor,
+    probe: torch.Tensor,
+    params: torch.Tensor,
+    monitor_active: torch.Tensor,
+    steering_token_scales: torch.Tensor,
+) -> None:
+    """In-graph monitor (Phase 2, §8): per-token gate into ``token_scales``.
+
+    Reads the pre-steering residual at a probe site, computes a per-token
+    score against ``probe``, maps it through the fixed elementwise policy
+    ``gate = sigmoid(sharpness * (score - threshold))`` (``params =
+    [threshold, sharpness]``), and **multiplies** the gate into
+    ``steering_token_scales[:n]`` in place. The §5.4 dynamic tier at this
+    and later hooks/layers reads that gate, so detection at layer L
+    conditions steering at layers > L within the same forward pass.
+
+    The multiply (not overwrite) is deliberate: the runner writes
+    ``token_scales`` fresh each step (``gain`` for decode tokens, ``0`` for
+    prefill — the per-step reset), and the monitor modulates within the
+    step. Prefill cache-safety (§7) holds because ``0 * gate == 0``
+    regardless of the probe.
+
+    ``monitor_active`` is a single-element bool tensor; when ``False`` this
+    is a no-op (the gate stays as the runner wrote it ⇒ Phase-1b flat
+    gain). It is a tensor, not a Python bool, so the configured site can
+    move at runtime without changing the compiled graph topology.
+
+    The op mutates ``steering_token_scales`` and returns ``None``.
+    """
+    if hidden_states.is_cuda:
+        from vllm.model_executor.layers.steering_monitor_kernel import (
+            steering_monitor_triton,
+        )
+
+        steering_monitor_triton(
+            hidden_states, probe, params, monitor_active, steering_token_scales
+        )
+        return
+    # CPU eager: short-circuit on the host (the flag is written from the
+    # same thread before this op runs, so ``.item()`` never blocks).
+    if not bool(monitor_active.item()):
+        return
+    n = hidden_states.shape[0]
+    if n == 0:
+        return
+    threshold = params[0]
+    sharpness = params[1]
+    score = hidden_states.to(torch.float32) @ probe.to(torch.float32)
+    gate = torch.sigmoid(sharpness * (score - threshold))
+    steering_token_scales[:n] = steering_token_scales[:n] * gate.to(
+        steering_token_scales.dtype
+    )
+
+
+def steering_monitor_fake(
+    hidden_states: torch.Tensor,
+    probe: torch.Tensor,
+    params: torch.Tensor,
+    monitor_active: torch.Tensor,
+    steering_token_scales: torch.Tensor,
+) -> None:
+    """FX-tracing fake — declares the mutation, computes nothing."""
+    return None
+
+
+direct_register_custom_op(
+    op_name="steering_monitor",
+    op_func=steering_monitor,
+    fake_impl=steering_monitor_fake,
+    mutates_args=["steering_token_scales"],
 )
