@@ -753,10 +753,34 @@ rides the existing `apply_layer_steering` call at every hook.
   tier (row-scale/baked-scale composition, dynamic-tier additivity
   with operator-set vectors, any_active interaction, zero-gain
   equivalence with steering disabled).
-- **Phase 2**: graph-capture test asserting monitor op + scale reads
-  replay correctly across batch sizes; eager-vs-graph equivalence on
-  sums (pattern: the global-spec capture validation in
-  `capture-global-spec-cudagraph`).
+- **Phase 2 (CPU)**: the monitor op math + CPU eager (gate =
+  `sigmoid(sharpness*(h@probe - thr))`, in-place multiply on `[:n]`,
+  inactive no-op, prefill-zero preserved, composition into the tier);
+  manager `set/clear/has_monitor` + populate into the per-layer
+  monitor buffers + unconfigured-site deactivation; the runner
+  short-circuit/transition (a monitor-only state defeats the
+  nothing-active short circuit; clearing deactivates on the transition);
+  `SteeringMonitorUpdate` validation + dispatch through the shared apply
+  path (`tests/model_executor/layers/test_steering_monitor_op.py`,
+  `tests/v1/worker/test_steering_monitor.py`, additions to
+  `test_steering_dynamic_override.py` and `test_steering_action_queue.py`).
+- **Phase 2 GPU-validated (tp=1, 2026-06-16, node2)**: gemma4-31B
+  Q4_K_S on an RTX 3090. (a) **Standalone**: the real Triton monitor
+  kernel matches the fp32 eager reference across batch sizes 1–256 in
+  bf16 (max|Δ| ≤ 4e-5) and fp32, with prefill-zero preserved; a
+  **hand-built CUDA graph** capturing `steering_monitor` →
+  `apply_steering` and replayed across three steps with different
+  runner gains (6/2/9) reproduces eager (rel ≤ 5e-3) — proving the
+  monitor's in-place `token_scales` mutation is visible to the later
+  steer op *within the same graph*, that the runner's per-step
+  overwrite is the reset (no cross-step accumulation), and that a
+  0-gate (prefill) token stays tier-free; inactive monitor is a no-op.
+  (b) **Engine**: booting with `enforce_eager=False` captured CUDA
+  graphs normally with the monitor op emitted at every steered hook
+  (PIECEWISE 11/11 + FULL 7/7, 7 s, 0.28 GiB) and produced coherent
+  greedy output (no probe configured ⇒ the always-emitted monitor is a
+  true no-op). The monitor kernel warmup retired before capture
+  (`shapes=11`, ~4 ms). Needs `VLLM_USE_FLASHINFER_SAMPLER=0`.
 
 ## 10. Relationship to the earlier sketch
 
