@@ -634,7 +634,11 @@ On finalize:
   *request*, all `(layer, hook)` tensors concatenated. The consumer
   routes every chunk of a request to a single writer key (one fd, one
   file), records a per-chunk index entry `{layer, hook, offset, nbytes,
-  shape}`, and — because per-key finalizes arrive in one synchronous
+  shape, row_shape, dtype, positions}` (`row_shape` is the per-row
+  logical shape for reshaping e.g. mHC `(hc_mult, hidden)` rows;
+  per-entry `dtype` lets one request mix dtypes such as bf16 streams and
+  fp32 mHC coefficients; `positions` is the per-row absolute token
+  position), and — because per-key finalizes arrive in one synchronous
   burst after the dispatch-drain barrier — publishes the file only once
   **all** expected `(layer, hook)` keys have finalized. Every key's
   `CaptureResult` then maps to the single packed `WriteResult`. Cuts
@@ -767,6 +771,24 @@ worth tightening:
   `finalized_at`, `finish_reason` are not yet populated by the
   runner — consumers that want them will need the runner to plumb
   them through.
+- **Speculative decoding over-captures generated positions.** The
+  capture path is spec-decode-unaware and purely position-based, and
+  rejection sampling runs *after* the target forward. So in a verify
+  step the taps gather hidden states for *all* candidate positions —
+  including draft tokens that are rejected and re-forwarded in a later
+  step. A generated position therefore appears in multiple rows (the
+  stale rejected draft, then the accepted re-forward), so an
+  `all_generated` / `all` capture has more rows than the request
+  generated. The accepted token's hidden state is always present (the
+  last row written for its position); to recover one row per token, the
+  consumer records each row's absolute logical position in the sidecar
+  (`positions`) and the reader exposes `latest_per_position(entry)`,
+  which keeps the last row per position. Prompt selectors
+  (`last_prompt` / `all_prompt`) are unaffected — prefill is not
+  speculative. A fuller fix (emit rows only for accepted positions,
+  which requires deferring dispatch until the accept mask is known) is
+  not implemented. The behavior is hook-agnostic — it affects standard
+  residual hooks and mHC hooks identically.
 - **Shutdown sequencing.** Consumers are shut down when the runner
   tears down, but there is no explicit LIFO ordering or per-consumer
   budget propagation — each consumer's `shutdown(timeout)` default

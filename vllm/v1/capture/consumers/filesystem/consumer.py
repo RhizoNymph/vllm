@@ -285,6 +285,12 @@ class FilesystemConsumer:
         # ``[hc_mult, hidden]`` for an mHC stream hook. ``[width]`` (a no-op
         # reshape) for standard residual hooks.
         self._key_row_shape: dict[CaptureKey, list[int]] = {}
+        # Per-row absolute logical token positions per key (per_file),
+        # accumulated across chunks in write order. ``None`` disables the
+        # field for a key once any chunk lacks positions, so it is never
+        # written partial. Lets readers map rows to positions and dedup
+        # speculative-decode duplicates (see ``_positions_of``).
+        self._key_positions: dict[CaptureKey, list[int] | None] = {}
         # Per writer-key events set by _on_write_result when a result
         # goes terminal. Keyed by writer-side (str, int, str) tuples.
         self._wait_lock = threading.Lock()
@@ -443,6 +449,25 @@ class FilesystemConsumer:
         return [hidden]
 
     @staticmethod
+    def _positions_of(chunk: CaptureChunk, rows: int) -> list[int] | None:
+        """Per-row absolute logical token positions for a chunk, if available.
+
+        The manager stamps ``metadata["positions"]`` (one entry per row).
+        Persisting it lets a reader recover which sequence position each row
+        belongs to — and, under speculative decoding, dedup rows: a verify
+        step captures all candidate positions including drafts that are
+        rejected and re-forwarded in a later step, so a generated position
+        can appear in several chunks. Rows are written in step order, so the
+        last row for a position is the canonical (accepted) one. Returns
+        ``None`` when absent or length-mismatched (hand-built chunks), so
+        the position list is never written half-populated.
+        """
+        pos = chunk.metadata.get("positions")
+        if pos is not None and len(pos) == rows:
+            return [int(p) for p in pos]
+        return None
+
+    @staticmethod
     def _tensor_to_bytes(tensor: Any) -> tuple[bytes, int, int, str]:
         """Return ``(raw_bytes, rows, hidden, logical_dtype_str)``.
 
@@ -513,11 +538,21 @@ class FilesystemConsumer:
                 self._key_paths[key] = (tag_slug, request_id_slug)
             self._key_dtype.setdefault(key, dtype_str)
             self._key_row_shape.setdefault(key, self._row_shape_of(chunk, hidden))
+            chunk_positions = self._positions_of(chunk, rows)
             existing = self._key_shapes.get(key)
             if existing is None:
                 self._key_shapes[key] = [rows, hidden]
+                # First chunk seeds the position list (or ``None`` to disable).
+                self._key_positions[key] = chunk_positions
             else:
                 existing[0] += rows
+                # Extend in write order; disable for the key if any chunk
+                # lacks positions, so the list never goes half-populated.
+                acc = self._key_positions.get(key)
+                if acc is not None and chunk_positions is not None:
+                    acc.extend(chunk_positions)
+                else:
+                    self._key_positions[key] = None
                 if hidden != existing[1]:
                     logger.warning(
                         "hidden-size mismatch across chunks for key=%s: "
@@ -568,20 +603,22 @@ class FilesystemConsumer:
             # (bf16 streams + fp32 coefficients) are supported, not an error.
             if state.dtype is None:
                 state.dtype = dtype_str
-            state.entries.append(
-                {
-                    "layer": layer_idx,
-                    "hook": hook_name,
-                    "offset": state.running_offset,
-                    "nbytes": nbytes,
-                    "shape": [rows, hidden],
-                    "row_shape": self._row_shape_of(chunk, hidden),
-                    # Per-entry dtype: a single request may pack hooks of
-                    # different dtypes (bf16 mHC streams + fp32 coefficients);
-                    # the index-level ``dtype`` is only a fallback default.
-                    "dtype": dtype_str,
-                }
-            )
+            entry: dict[str, Any] = {
+                "layer": layer_idx,
+                "hook": hook_name,
+                "offset": state.running_offset,
+                "nbytes": nbytes,
+                "shape": [rows, hidden],
+                "row_shape": self._row_shape_of(chunk, hidden),
+                # Per-entry dtype: a single request may pack hooks of
+                # different dtypes (bf16 mHC streams + fp32 coefficients);
+                # the index-level ``dtype`` is only a fallback default.
+                "dtype": dtype_str,
+            }
+            positions = self._positions_of(chunk, rows)
+            if positions is not None:
+                entry["positions"] = positions
+            state.entries.append(entry)
             state.running_offset += nbytes
             # Use the state's slugs (recorded at admission) so chunk
             # writes and the finalize index land in the same directory.
@@ -611,7 +648,9 @@ class FilesystemConsumer:
         if not chunks:
             return
         # Serialize every chunk outside the lock (cheap; not the bottleneck).
-        serialized: list[tuple[int, str, bytes, int, int, str, list[int]]] = []
+        serialized: list[
+            tuple[int, str, bytes, int, int, str, list[int], list[int] | None]
+        ] = []
         for chunk in chunks:
             _request_id, layer_idx, hook_name = chunk.key
             payload, rows, hidden, dtype_str = self._tensor_to_bytes(chunk.tensor)
@@ -624,6 +663,7 @@ class FilesystemConsumer:
                     hidden,
                     dtype_str,
                     self._row_shape_of(chunk, hidden),
+                    self._positions_of(chunk, rows),
                 )
             )
 
@@ -651,22 +691,24 @@ class FilesystemConsumer:
                 hidden,
                 dtype_str,
                 row_shape,
+                positions,
             ) in serialized:
                 # First-seen dtype is the index-level fallback; per-entry
                 # dtype is authoritative (mixed dtypes per request are valid).
                 if state.dtype is None:
                     state.dtype = dtype_str
-                state.entries.append(
-                    {
-                        "layer": layer_idx,
-                        "hook": hook_name,
-                        "offset": state.running_offset,
-                        "nbytes": len(payload),
-                        "shape": [rows, hidden],
-                        "row_shape": row_shape,
-                        "dtype": dtype_str,
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "layer": layer_idx,
+                    "hook": hook_name,
+                    "offset": state.running_offset,
+                    "nbytes": len(payload),
+                    "shape": [rows, hidden],
+                    "row_shape": row_shape,
+                    "dtype": dtype_str,
+                }
+                if positions is not None:
+                    entry["positions"] = positions
+                state.entries.append(entry)
                 state.running_offset += len(payload)
                 payloads.append(payload)
             if state.bin_path is None:
@@ -723,20 +765,22 @@ class FilesystemConsumer:
             if shard.dtype is None:
                 shard.dtype = dtype_str
 
-            shard.entries.append(
-                {
-                    "request_id": req_str,
-                    "layer": layer_idx,
-                    "hook": hook_name,
-                    "offset": shard.running_offset,
-                    "nbytes": nbytes,
-                    "shape": [rows, hidden],
-                    "row_shape": self._row_shape_of(chunk, hidden),
-                    # Per-entry dtype: shards interleave requests and hooks of
-                    # differing dtypes; the index-level ``dtype`` is fallback.
-                    "dtype": dtype_str,
-                }
-            )
+            shard_entry: dict[str, Any] = {
+                "request_id": req_str,
+                "layer": layer_idx,
+                "hook": hook_name,
+                "offset": shard.running_offset,
+                "nbytes": nbytes,
+                "shape": [rows, hidden],
+                "row_shape": self._row_shape_of(chunk, hidden),
+                # Per-entry dtype: shards interleave requests and hooks of
+                # differing dtypes; the index-level ``dtype`` is fallback.
+                "dtype": dtype_str,
+            }
+            shard_positions = self._positions_of(chunk, rows)
+            if shard_positions is not None:
+                shard_entry["positions"] = shard_positions
+            shard.entries.append(shard_entry)
             shard.running_offset += nbytes
             bin_name = shard_bin_name(shard.shard_idx, shard.seq, self._file_pp_rank)
             bin_path = self._root / req.tag_slug / bin_name
@@ -818,6 +862,7 @@ class FilesystemConsumer:
             shape_info = self._key_shapes.pop(key, None)
             dtype_str = self._key_dtype.pop(key, None)
             row_shape = self._key_row_shape.pop(key, None)
+            positions = self._key_positions.pop(key, None)
             recorded = self._request_slugs.get(req_str)
 
         if path_info is not None:
@@ -847,6 +892,8 @@ class FilesystemConsumer:
             sidecar_payload["dtype"] = dtype_str
         if row_shape is not None:
             sidecar_payload["row_shape"] = list(row_shape)
+        if positions is not None:
+            sidecar_payload["positions"] = positions
 
         self._writer.submit(
             FinalizeTask(
