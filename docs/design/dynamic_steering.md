@@ -582,38 +582,69 @@ not violate:
   per-request actuation (Phase 1), and recording emitted updates
   (timestamped) so a run can be replayed.
 
-## 8. Phase 2 — in-graph same-token conditional steering
+## 8. Phase 2 — in-graph same-token conditional steering — IMPLEMENTED
 
 The differentiated end state: detect at layer L, intervene at layers
 > L, *same token*, full cudagraph speed (CAST-style conditional
 steering).
 
-- Add `steering_token_scales: float32[(max_tokens,)]`, shared across
-  layers like `steering_index`. The natural CAST shape gates the §5.4
-  dynamic tier per token — `out += dynamic_vec * token_scales[pid]` —
-  i.e. Phase 2 replaces that tier's scalar gain with a per-token one;
-  gating the row gather (`table[row] * scales_row[row] *
-  token_scales[pid]`) is the same mechanics if per-request configs
-  should also be token-gated. All loads are fixed-shape against
-  persistent buffers — graph-safe.
-- A **monitor custom op** registered at the probe site (inside
-  `apply_layer_steering`, after `maybe_capture_residual`):
-  `token_scales[:n] = g(hidden @ probe)` with `g` a fixed elementwise
-  policy (sigmoid/step with constant parameters). Fixed shapes,
+As built (replaces the open design notes that follow):
+
+- The §5.4 substrate already carries `steering_token_scales:
+  float32[(max_tokens,)]`, shared across layers like `steering_index`,
+  and the kernel adds `dynamic_vec * token_scales[pid]`. Phase 2 keeps
+  exactly that gate buffer and kernel term — it only changes *who writes
+  the gate*. v1 gates **only the dynamic tier** (the substrate term);
+  gating the row gather (per-request configs) is the same mechanics and
+  is left as future work (resolves the §11 open item).
+- A **monitor custom op** (`torch.ops.vllm.steering_monitor`) registered
+  at the probe site, called inside `apply_layer_steering` right after
+  `maybe_capture_residual` and before the steer op. It computes per
+  token `score = hidden @ probe`,
+  `gate = sigmoid(sharpness * (score - threshold))`, and **multiplies**
+  it into `steering_token_scales[:n]` in place (read-modify-write). `g`
+  is a fixed elementwise policy with constant params; fixed shapes,
   collective-free, no allocation ⇒ recordable into the graph. Every TP
-  rank records it (inputs replicated ⇒ outputs identical).
+  rank records it — the residual is rank-identical post-all-reduce and
+  the probe is replicated, so every rank computes the same gate (§3.1).
+- **Reset discipline (resolved):** the runner overwrites
+  `token_scales[:n]` fresh every step — `gain` for decode tokens, `0`
+  for prefill, then zeros the tail. *That per-step overwrite is the
+  reset.* The monitor read-modify-writes (multiplies) within the step,
+  so there is no cross-step accumulation and no separate in-graph reset
+  is needed. Decode-only cache-safety (§7) falls out of `0 * gate == 0`
+  regardless of what the probe outputs, so a probe can never engage a
+  prefill token.
+- The monitor is the cheap per-token gate beneath the sync/async tier:
+  the operator/consumer sets the tier vector (`dynamic_vec`) and the max
+  strength (`dynamic_tier_gain`), and the in-graph monitor scales it per
+  token in [0, 1] — completing the §3 hierarchy (async → sync →
+  in-graph, each configuring the layer below). Policy parameters
+  (threshold, sharpness, probe weights) live in small persistent buffers
+  (`*_monitor_probe`, `*_monitor_params`, `*_monitor_active` per
+  `(layer, hook)`), host-tunable between steps without recapture; the
+  natural tuner is a sync consumer. The op is emitted at *every* steered
+  hook (stable graph topology) but is a no-op unless its `active` flag is
+  set, so only the configured site does work and the site can move at
+  runtime without recapture.
 - Constraints: per-token decisions only (no cross-token reductions
-  in-graph); policy parameters (threshold, gain, probe weights) live in
-  small persistent buffers so they remain host-tunable between steps
-  without recapture — the natural tuner is a sync consumer, completing
-  the hierarchy of §3 (async → sync → in-graph, each configuring the
-  layer below); layers ≤ L are unaffected (scales default 1.0 and are
-  reset off-graph each step... note: reset must also be in-graph or the
-  buffer must be written *by* the monitor op for all n each step —
-  design detail to settle in implementation).
+  in-graph); no data-dependent control flow beyond the tensor `active`
+  flag; layers/hooks before the monitor site read the runner's flat gate
+  (so dynamic-tier vectors are expected at sites ≥ the monitor — detect
+  at L, steer at layers > L).
 - Ordering caveat: hook execution order within a layer is pre_attn →
   post_attn → post_mlp; "later sites" includes later hooks of the same
   layer.
+
+**Wiring:** `vllm/model_executor/layers/steering_monitor_kernel.py`
+(Triton), `steering.py` (op + per-hook buffers + `apply_layer_steering`
+call + warmup), `steering_manager.py` (`set_monitor`/`clear_monitor`/
+`has_monitor` + populate writes the monitor buffers),
+`steering_model_runner_mixin.py` (short-circuit + transition deactivation
++ `SteeringMonitorUpdate` dispatch + status + warmup),
+`steering_action_queue.py` (`SteeringMonitorUpdate` +
+`validate_steering_monitor`). The gemma4 taps are unchanged — the monitor
+rides the existing `apply_layer_steering` call at every hook.
 
 ## 9. Test plan
 
@@ -799,9 +830,12 @@ Still open (non-blocking):
 - **`model_runner_v2`**: steering integration there is pending
   (dev-flag-gated upstream); dynamic steering inherits whatever lands.
   Keep the sync `on_step` hook behind the same mixin seam so it ports.
-- **Phase 2 in-graph details** (§8): token-scale reset discipline
-  (in-graph reset vs full overwrite by the monitor op), and whether
-  per-request rows also need token gating or only the dynamic tier.
+- ~~**Phase 2 in-graph details** (§8): token-scale reset discipline,
+  and whether per-request rows also need token gating.~~ **Resolved
+  (implemented, §8):** the runner's per-step overwrite of `token_scales`
+  is the reset; the monitor op read-modify-writes (multiplies) within the
+  step. v1 gates only the dynamic tier; per-request-row token gating is
+  deferred (same mechanics, additive when needed).
 
 ## 12. References
 
