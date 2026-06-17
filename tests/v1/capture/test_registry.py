@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,7 @@ from vllm.v1.capture import CaptureConsumer, UnknownCaptureConsumerError
 from vllm.v1.capture.registry import (
     ENTRY_POINT_GROUP,
     _reset_cache_for_testing,
+    build_admission_validators,
     build_consumer,
     load_consumer_class,
 )
@@ -133,3 +135,62 @@ def test_registry_cache_reset_between_tests_allows_re_patching():
         assert load_consumer_class("beta") is _FakeConsumer
         with pytest.raises(UnknownCaptureConsumerError):
             load_consumer_class("alpha")
+
+
+class _DriverInstance(CaptureConsumer):
+    """Pre-built instance-form consumer (``LLM(capture_consumers=[obj])``)."""
+
+    location = "driver"
+
+    def __init__(self) -> None:
+        pass  # bypass the base init; admission never dispatches to it
+
+    def on_capture(self, key, tensor, sidecar):  # type: ignore[override]
+        pass
+
+
+def _vllm_config_with(capture_config: Any) -> Any:
+    cfg = MagicMock()
+    cfg.capture_consumers_config = capture_config
+    return cfg
+
+
+class TestBuildAdmissionValidators:
+    """``build_admission_validators`` keys validators exactly as the runner's
+    ``name_to_index``, so a client's ``capture={<name>: ...}`` resolves to the
+    same consumer at admission and at the worker."""
+
+    def test_empty_without_capture_config(self) -> None:
+        assert build_admission_validators(_vllm_config_with(None)) == {}
+
+    def test_spec_form_keyed_by_instance_name_or_name(self) -> None:
+        capture_config = SimpleNamespace(
+            consumers=[
+                SimpleNamespace(name="fake", instance_name=None, params={}),
+                SimpleNamespace(name="fake", instance_name="second", params={"k": 1}),
+            ],
+            instances=[],
+        )
+        cfg = _vllm_config_with(capture_config)
+        with _patch_entry_points([_FakeEntryPoint("fake", _FakeConsumer)]):
+            validators = build_admission_validators(cfg)
+
+        assert set(validators) == {"fake", "second"}
+        assert all(isinstance(v, _FakeConsumer) for v in validators.values())
+        assert validators["second"].params == {"k": 1}
+
+    def test_includes_instances_keyed_by_class_name(self) -> None:
+        inst = _DriverInstance()
+        cfg = _vllm_config_with(SimpleNamespace(consumers=[], instances=[inst]))
+        validators = build_admission_validators(cfg)
+        # The instance is used directly (not rebuilt) and keyed by class name.
+        assert validators == {"_DriverInstance": inst}
+
+    def test_suffixes_instance_class_collisions(self) -> None:
+        first, second = _DriverInstance(), _DriverInstance()
+        cfg = _vllm_config_with(
+            SimpleNamespace(consumers=[], instances=[first, second])
+        )
+        validators = build_admission_validators(cfg)
+        # Same class name → ``_insert_unique`` suffixes the second with ``#2``.
+        assert validators == {"_DriverInstance": first, "_DriverInstance#2": second}

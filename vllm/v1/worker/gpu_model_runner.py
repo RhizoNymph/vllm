@@ -637,6 +637,23 @@ class GPUModelRunner(
                 # the compiled forward graph.
                 set_active_capture_manager(self._capture_manager)
 
+            # Install the activation store (prefix-cache/capture reuse layer)
+            # when a budget is configured. Same process as the scheduler under
+            # the TP1/PP1 UniProcExecutor, so one shared instance bridges the
+            # scheduler's reuse decision and the worker's write-through/serve.
+            budget = self.vllm_config.capture_consumers_config.activation_cache_bytes
+            if budget > 0:
+                from vllm.v1.capture.activation_store import (
+                    ActivationStore,
+                    set_active_activation_store,
+                )
+
+                set_active_activation_store(ActivationStore(max_bytes=budget))
+                logger.info(
+                    "Capture activation store enabled: budget=%.3f GB",
+                    budget / 1_000_000_000,
+                )
+
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
@@ -1710,6 +1727,7 @@ class GPUModelRunner(
         except Exception:
             element_size_bytes = 2
 
+        from vllm.v1.capture.activation_store import pop_pending_serve
         from vllm.v1.capture.errors import CaptureValidationError
         from vllm.v1.capture.types import (
             CaptureContext,
@@ -1718,11 +1736,23 @@ class GPUModelRunner(
             capture_expert_parallel_size,
         )
 
+        # Step A serve: when the scheduler reserved a whole-prefix store
+        # serve, the prompt prefix was reused from the KV cache (num_computed
+        # advanced over it) and its residuals come from the store, not the
+        # forward. Validate against num_computed=0 so the validator does not
+        # reject those positions; the forward then naturally captures only the
+        # positions inside its step window (the generated tail), and the
+        # served prompt rows are injected after registration.
+        served_rows = pop_pending_serve(new_req_data.req_id)
+        ctx_num_computed = (
+            0 if served_rows is not None else new_req_data.num_computed_tokens
+        )
+
         parallel_config = self.vllm_config.parallel_config
         ctx = CaptureContext(
             vllm_internal_request_id=VllmInternalRequestId(new_req_data.req_id),
             num_prompt_tokens=prompt_len,
-            num_computed_tokens=new_req_data.num_computed_tokens,
+            num_computed_tokens=ctx_num_computed,
             # Global layer count: client specs reference global layer
             # indices, so admission must validate against the full layer
             # space even on a pipeline stage that owns only a slice.
@@ -1816,7 +1846,11 @@ class GPUModelRunner(
                 client_specs=client_specs,
                 num_prompt_tokens=prompt_len,
                 sidecar_fields=sidecar_fields,
+                block_hashes=new_req_data.capture_block_hashes,
+                hash_block_size=new_req_data.capture_hash_block_size,
             )
+            if served_rows is not None:
+                mgr.serve_from_store(new_req_data.req_id, served_rows)
         except ValueError as exc:
             mgr.record_request_error(new_req_data.req_id, str(exc))
             logger.warning(

@@ -84,6 +84,73 @@ class CaptureSpec:
     positions: PositionSelector
 
 
+def min_captured_prompt_position(
+    spec: CaptureSpec, num_prompt_tokens: int
+) -> int | None:
+    """Lowest prompt-range position ``spec`` captures, or ``None``.
+
+    A capture tap only produces a residual for a token position that is
+    actually forwarded through the model. Prefix-cache reuse skips the
+    forward pass for cached prompt positions, so a request must re-forward
+    from its lowest captured prompt position onward; everything strictly
+    below that position can still be served from cache. This function
+    returns that floor — the value prefix-cache hits are clamped to
+    (:meth:`vllm.v1.request.Request.get_capture_prefix_cache_limit`) — or
+    ``None`` when the spec captures no prompt position (generated-only),
+    which never conflicts with prefix caching.
+
+    Called at admission (the OpenAI entrypoint's ``_admit_capture``) on
+    each consumer's resolved :class:`CaptureSpec`. By that point
+    ``positions`` is consumer-resolved: ``"last_prompt"`` / ``"all_prompt"``
+    and explicit lists have become concrete index lists, while
+    ``"all_generated"`` and ``"all"`` stay symbolic. Unrecognized symbols
+    are treated conservatively as tapping the whole prompt (floor ``0``).
+    """
+    positions = spec.positions
+    if positions == "all_generated":
+        return None
+    if positions == "all" or positions == "all_prompt":
+        return 0
+    if positions == "last_prompt":
+        return num_prompt_tokens - 1 if num_prompt_tokens > 0 else None
+    if isinstance(positions, list):
+        prompt_positions = [p for p in positions if 0 <= p < num_prompt_tokens]
+        return min(prompt_positions) if prompt_positions else None
+    # Unrecognized symbolic selector → conservative: re-forward whole prompt.
+    return 0
+
+
+def spec_touches_prompt(spec: CaptureSpec, num_prompt_tokens: int) -> bool:
+    """Whether ``spec`` captures any position in the prompt range.
+
+    Thin predicate over :func:`min_captured_prompt_position`: a spec taps
+    the prompt iff it has a captured prompt position to re-forward from.
+    """
+    return min_captured_prompt_position(spec, num_prompt_tokens) is not None
+
+
+def captured_prompt_positions(spec: CaptureSpec, num_prompt_tokens: int) -> list[int]:
+    """The prompt-range positions ``spec`` captures (sorted, deduped).
+
+    Empty for generated-only specs. Used at admission to record which
+    positions a whole-prefix activation-store serve must cover, and by the
+    worker to assemble served chunks per consumer. ``"all"`` is treated as
+    covering the whole prompt here (its generated half is captured by the
+    normal forward path, not served).
+    """
+    positions = spec.positions
+    if num_prompt_tokens <= 0 or positions == "all_generated":
+        return []
+    if positions == "all" or positions == "all_prompt":
+        return list(range(num_prompt_tokens))
+    if positions == "last_prompt":
+        return [num_prompt_tokens - 1]
+    if isinstance(positions, list):
+        return sorted({p for p in positions if 0 <= p < num_prompt_tokens})
+    # Unrecognized symbolic selector → conservative: whole prompt.
+    return list(range(num_prompt_tokens))
+
+
 # ---------------------------------------------------------------------------
 # CaptureChunk and CaptureFinalize
 # ---------------------------------------------------------------------------

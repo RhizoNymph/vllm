@@ -8,6 +8,10 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.capture.activation_store import (
+    get_active_activation_store,
+    try_reserve_store_serve,
+)
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -132,6 +136,9 @@ class KVCacheManager:
         self.enable_caching = enable_caching
         self.use_eagle = use_eagle
         self.log_stats = log_stats
+        # Granularity ``Request.block_hashes`` is computed at; used to
+        # compose activation-store keys when serving captures from the store.
+        self.hash_block_size = hash_block_size
         self.metrics_collector = metrics_collector
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
@@ -217,6 +224,32 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+
+        # A prompt-touching capture request caps the hit at its lowest
+        # captured prompt position so that position (and everything after) is
+        # re-forwarded and its residual can be captured; lower positions still
+        # reuse the cache. find_longest_cache_hit() block-aligns the cap down,
+        # so the request stays block-size aligned. None means no clamp.
+        capture_limit = request.get_capture_prefix_cache_limit()
+        if capture_limit is not None:
+            # Step A: if the whole captured prompt prefix is already in the
+            # activation store, serve it from there (the worker injects the
+            # rows) and reuse the full KV prefix instead of re-forwarding. The
+            # snapshot is taken atomically under the store lock, so it cannot
+            # race concurrent eviction. On any miss this is a no-op and the C
+            # clamp below applies, so a captured position is never served from
+            # the KV cache without its residual being available.
+            sp = request.sampling_params
+            served = sp is not None and try_reserve_store_serve(
+                request.request_id,
+                request.block_hashes,
+                self.hash_block_size,
+                sp.capture_store_hook_layers or [],
+                sp.capture_store_positions or [],
+            )
+            if not served:
+                max_cache_hit_length = min(max_cache_hit_length, capture_limit)
+
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -468,6 +501,25 @@ class KVCacheManager:
         """
         if not self.block_pool.reset_prefix_cache():
             return False
+        # The activation store is keyed by prefix-block content under the
+        # current weights; a reset (notably an RLHF weight update) invalidates
+        # that premise, so drop it alongside the prefix cache. Same process as
+        # the runner under TP1/PP1, so the global store is visible here.
+        store = get_active_activation_store()
+        if store is not None:
+            stats = store.stats()
+            store.invalidate_all()
+            if stats.entries:
+                logger.info(
+                    "Capture activation store invalidated on prefix-cache "
+                    "reset: dropped entries=%d bytes=%d (lifetime hits=%d "
+                    "puts=%d evictions=%d)",
+                    stats.entries,
+                    stats.resident_bytes,
+                    stats.hits,
+                    stats.puts,
+                    stats.evictions,
+                )
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True

@@ -242,10 +242,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         """LLM constructor."""
 
         # -- capture consumers: split into config dicts vs instances --------
-        # Dict entries become ``CaptureConsumerSpec``s that flow into a
-        # ``CaptureConsumersConfig`` on ``VllmConfig``; pre-constructed
-        # instances (driver-side only) ride on a transient attribute that
-        # the runner reads at init time.
+        # Dict entries become ``CaptureConsumerSpec``s; pre-constructed
+        # instances (driver-side only) are kept as-is. Both ride on the
+        # ``CaptureConsumersConfig`` (``.consumers`` / ``.instances``) that
+        # flows onto ``VllmConfig`` and reaches the runner.
         from vllm.v1.capture.config import (
             CaptureConsumersConfig,
             CaptureConsumerSpec,

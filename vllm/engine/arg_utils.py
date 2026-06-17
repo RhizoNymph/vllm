@@ -598,6 +598,11 @@ class EngineArgs:
     # whole capture-consumer pipeline stays disabled.
     capture_consumers: list[str] | None = None
 
+    # Byte budget (expressed in GB on the CLI) for the activation store that
+    # lets repeated captures over a shared prefix be served from RAM instead
+    # of re-forwarded. 0 disables it; only meaningful with --capture-consumers.
+    capture_activation_cache_gb: float = 0.0
+
     # Capture-manager backpressure / overload controls (server-start tunable).
     capture_dispatch_queue_size: int = 256
     capture_overload_policy: str = "spill"
@@ -1340,6 +1345,16 @@ class EngineArgs:
             "consumers (e.g. --capture-consumers filesystem:root=/tmp "
             "--capture-consumers logging). Use YAML config for complex "
             "parameter values.",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-activation-cache-gb",
+            type=float,
+            default=EngineArgs.capture_activation_cache_gb,
+            metavar="GB",
+            help="CPU-RAM budget (in GB) for the activation store, which "
+            "serves repeated captures over a shared prefix from RAM instead "
+            "of re-forwarding them. 0 (default) disables it. Only takes "
+            "effect together with --capture-consumers.",
         )
         capture_consumers_group.add_argument(
             "--capture-dispatch-queue-size",
@@ -2338,6 +2353,14 @@ class EngineArgs:
                 overload_policy=self.capture_overload_policy,
                 spill_dir=self.capture_spill_dir,
                 spill_max_bytes=self.capture_spill_max_bytes,
+            )
+
+        # Apply the activation-store budget to whichever config we ended up
+        # with (CLI- or override-built). Capture must be active for it to
+        # matter; a budget with no consumers is a harmless no-op.
+        if capture_consumers_config is not None and self.capture_activation_cache_gb:
+            capture_consumers_config.activation_cache_bytes = int(
+                self.capture_activation_cache_gb * 1_000_000_000
             )
 
         config = VllmConfig(
