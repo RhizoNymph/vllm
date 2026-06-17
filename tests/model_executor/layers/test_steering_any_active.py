@@ -62,6 +62,7 @@ class TestApplySteeringCPU:
             torch.ones(table.shape[0], device=table.device),
             torch.zeros(table.shape[1], device=table.device),
             torch.zeros(hidden.shape[0], device=table.device),
+            torch.ones(hidden.shape[0], device=table.device),
         )
 
         torch.testing.assert_close(result, hidden)
@@ -84,6 +85,7 @@ class TestApplySteeringCPU:
             torch.ones(table.shape[0], device=table.device),
             torch.zeros(table.shape[1], device=table.device),
             torch.zeros(hidden.shape[0], device=table.device),
+            torch.ones(hidden.shape[0], device=table.device),
         )
         expected = hidden + table[index]
 
@@ -104,6 +106,7 @@ class TestApplySteeringCPU:
             torch.ones(table.shape[0], device=table.device),
             torch.zeros(table.shape[1], device=table.device),
             torch.zeros(hidden.shape[0], device=table.device),
+            torch.ones(hidden.shape[0], device=table.device),
         )
 
         torch.testing.assert_close(result, hidden)
@@ -128,6 +131,7 @@ class TestApplySteeringCPU:
             torch.ones(table.shape[0], device=table.device),
             torch.zeros(table.shape[1], device=table.device),
             torch.zeros(hidden.shape[0], device=table.device),
+            torch.ones(hidden.shape[0], device=table.device),
         )
         torch.testing.assert_close(result, hidden)
 
@@ -197,6 +201,7 @@ class TestApplySteeringCUDA:
             torch.ones(table.shape[0], device=table.device),
             torch.zeros(table.shape[1], device=table.device),
             torch.zeros(hidden.shape[0], device=table.device),
+            torch.ones(hidden.shape[0], device=table.device),
         )
 
         torch.testing.assert_close(result, hidden)
@@ -219,6 +224,7 @@ class TestApplySteeringCUDA:
             torch.ones(table.shape[0], device=table.device),
             torch.zeros(table.shape[1], device=table.device),
             torch.zeros(hidden.shape[0], device=table.device),
+            torch.ones(hidden.shape[0], device=table.device),
         )
         expected = hidden + table[index]
 
@@ -240,6 +246,7 @@ class TestApplySteeringCUDA:
             torch.ones(table.shape[0], device=table.device),
             torch.zeros(table.shape[1], device=table.device),
             torch.zeros(hidden.shape[0], device=table.device),
+            torch.ones(hidden.shape[0], device=table.device),
         )
         torch.testing.assert_close(result, hidden)
 
@@ -255,6 +262,7 @@ class TestApplySteeringCUDA:
             torch.ones(table.shape[0], device=table.device),
             torch.zeros(table.shape[1], device=table.device),
             torch.zeros(hidden.shape[0], device=table.device),
+            torch.ones(hidden.shape[0], device=table.device),
         )
         expected = hidden + table[index]
         torch.testing.assert_close(result, expected)

@@ -188,6 +188,19 @@ def register_steering_buffers(
         persistent=False,
     )
 
+    # Per-token row gate (Phase 2 row gating): fp32 (max_tokens,), default
+    # 1.0 ⇒ rows apply at full strength. Shared across layers like
+    # ``steering_index``. The kernel multiplies the gathered row by
+    # ``row_gate[token]``; the runner resets it to 1.0 each step and the
+    # in-graph monitor reduces it for decode tokens (prefill stays 1.0, so
+    # prefill rows — which feed prefix-cache keys — are never gated). See
+    # docs/design/dynamic_steering_row_gating.md.
+    module.register_buffer(
+        "steering_row_gate",
+        torch.ones(max_steering_tokens, dtype=torch.float32),
+        persistent=False,
+    )
+
     # Per-row strength scale (the §5.3 "how much" knob): one fp32 buffer
     # per layer, shared across that layer's hook points (the row index is
     # hook-independent — row 3 = config X for every hook). Default 1.0 ⇒
@@ -263,6 +276,23 @@ def share_steering_token_scales_across_layers(layers) -> None:
         layer.steering_token_scales = shared
 
 
+def share_steering_row_gate_across_layers(layers) -> None:
+    """Reuse one ``steering_row_gate`` tensor across all steerable layers.
+
+    Per-token row gate (Phase 2 row gating), ``max_tokens``-sized and
+    layer-independent — shared like ``steering_token_scales`` (one per-step
+    H2D). Called once from the mixin's ``_init_steering_state``.
+    """
+    shared: torch.Tensor | None = None
+    for layer in layers:
+        if not hasattr(layer, "steering_row_gate"):
+            continue
+        if shared is None:
+            shared = layer.steering_row_gate
+            continue
+        layer.steering_row_gate = shared
+
+
 def apply_layer_steering(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -307,6 +337,7 @@ def apply_layer_steering(
         module.steering_scales,
         getattr(module, HOOK_POINT_DYNVEC_ATTR[hook_point]),
         module.steering_token_scales,
+        module.steering_row_gate,
     )
 
 
@@ -318,12 +349,20 @@ def apply_steering(
     steering_scales: torch.Tensor,
     steering_dynamic_vec: torch.Tensor,
     steering_token_scales: torch.Tensor,
+    steering_row_gate: torch.Tensor,
 ) -> torch.Tensor:
     """Apply per-request activation steering via indexed gather.
 
     Two additive terms: the per-row gather
-    ``table[index[i]] * scales[index[i]]`` plus the **dedicated dynamic
-    tier** ``dynamic_vec * token_scales[i]`` (§5.4).
+    ``table[index[i]] * scales[index[i]] * row_gate[i]`` plus the
+    **dedicated dynamic tier** ``dynamic_vec * token_scales[i]`` (§5.4).
+
+    ``steering_row_gate`` is a shared per-token gate (fp32,
+    ``(max_tokens,)``, default 1.0) on the row term — the Phase 2 row-gating
+    knob. 1.0 ⇒ the row applies at full strength (and prefill tokens stay
+    1.0, so prefill rows are never gated); the in-graph monitor reduces it
+    for decode tokens to make per-request steering token-conditional. See
+    docs/design/dynamic_steering_row_gating.md.
 
     ``steering_scales`` is a shared buffer of shape ``(max_configs + 3,)``
     (fp32, default 1.0) holding a per-row strength multiplier — the
@@ -388,6 +427,7 @@ def apply_steering(
             steering_scales,
             steering_dynamic_vec,
             steering_token_scales,
+            steering_row_gate,
         )
     # CPU eager: short-circuit on the host so we don't even materialize
     # the gather. ``.item()`` synchronizes against the device producer
@@ -399,9 +439,12 @@ def apply_steering(
         return hidden_states.clone()
     n = hidden_states.shape[0]
     rows = steering_index[:n]
-    # Per-row scale (fp32, default 1.0); broadcast over hidden dim.
+    # Per-row scale (fp32, default 1.0) × per-token row gate (default 1.0);
+    # both broadcast over hidden dim. The row gate keeps prefill rows at
+    # full strength (1.0) and lets the monitor gate decode rows per token.
     scale = steering_scales[rows].unsqueeze(-1).to(steering_table.dtype)
-    out = hidden_states + steering_table[rows] * scale
+    rgate = steering_row_gate[:n].unsqueeze(-1).to(steering_table.dtype)
+    out = hidden_states + steering_table[rows] * scale * rgate
     # Dedicated dynamic tier: dvec * per-token gate (0 ⇒ no-op).
     tier = steering_dynamic_vec.unsqueeze(0) * steering_token_scales[:n].unsqueeze(-1)
     return out + tier.to(out.dtype)
@@ -415,6 +458,7 @@ def apply_steering_fake(
     steering_scales: torch.Tensor,
     steering_dynamic_vec: torch.Tensor,
     steering_token_scales: torch.Tensor,
+    steering_row_gate: torch.Tensor,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)

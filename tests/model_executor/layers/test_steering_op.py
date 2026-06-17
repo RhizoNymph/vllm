@@ -234,14 +234,76 @@ class TestPerRowScale:
         assert torch.allclose(result[2], torch.zeros(4))  # row 0 sentinel
 
 
-def _apply_full(hidden, table, index, scales, dvec, tscales):
-    """Reference for the full kernel math (§5.3 row scale + §5.4 tier):
-    ``hidden + table[row]*scales[row] + dvec * tscales[token]``."""
+def _apply_full(hidden, table, index, scales, dvec, tscales, row_gate=None):
+    """Reference for the full kernel math (§5.3 row scale + §5.4 tier +
+    Phase-2 row gate): ``hidden + table[row]*scales[row]*row_gate[token]
+    + dvec * tscales[token]``. ``row_gate`` defaults to 1.0 (rows full)."""
     n = hidden.shape[0]
     rows = index[:n]
-    row_term = table[rows] * scales[rows].unsqueeze(-1)
+    if row_gate is None:
+        row_gate = torch.ones(n)
+    row_term = table[rows] * scales[rows].unsqueeze(-1) * row_gate[:n].unsqueeze(-1)
     tier_term = dvec.unsqueeze(0) * tscales[:n].unsqueeze(-1)
     return hidden + row_term + tier_term
+
+
+class TestRowGate:
+    """Phase-2 per-token row gate: row term *= row_gate[token]."""
+
+    def test_gate_one_is_identity(self):
+        hidden = torch.randn(3, 4)
+        table = torch.randn(6, 4)
+        index = torch.tensor([1, 2, 3], dtype=torch.long)
+        scales = torch.ones(6)
+        dvec = torch.zeros(4)
+        tscales = torch.zeros(3)
+        rgate = torch.ones(3)
+        torch.testing.assert_close(
+            _apply_full(hidden, table, index, scales, dvec, tscales, rgate),
+            _apply_full(hidden, table, index, scales, dvec, tscales),
+        )
+
+    def test_gate_scales_the_row_per_token(self):
+        hidden = torch.zeros(3, 4)
+        table = torch.zeros(6, 4)
+        table[2] = torch.full((4,), 4.0)  # decode row
+        index = torch.full((3,), 2, dtype=torch.long)
+        scales = torch.ones(6)
+        dvec = torch.zeros(4)
+        tscales = torch.zeros(3)
+        # Token 0 full (1.0), token 1 prefill (1.0 — never gated), token 2 half.
+        rgate = torch.tensor([1.0, 1.0, 0.5])
+        result = _apply_full(hidden, table, index, scales, dvec, tscales, rgate)
+        assert torch.allclose(result[0], torch.full((4,), 4.0))
+        assert torch.allclose(result[1], torch.full((4,), 4.0))
+        assert torch.allclose(result[2], torch.full((4,), 2.0))  # 4 * 0.5
+
+    def test_gate_zero_disables_the_row(self):
+        hidden = torch.zeros(2, 4)
+        table = torch.zeros(6, 4)
+        table[3] = torch.full((4,), 7.0)
+        index = torch.full((2,), 3, dtype=torch.long)
+        scales = torch.ones(6)
+        rgate = torch.tensor([0.0, 1.0])
+        result = _apply_full(hidden, table, index, scales, torch.zeros(4),
+                             torch.zeros(2), rgate)
+        assert torch.allclose(result[0], torch.zeros(4))   # gated off
+        assert torch.allclose(result[1], torch.full((4,), 7.0))
+
+    def test_gate_and_scale_and_tier_compose(self):
+        hidden = torch.zeros(1, 4)
+        table = torch.zeros(6, 4)
+        table[2] = torch.full((4,), 2.0)
+        index = torch.zeros(1, dtype=torch.long)
+        index[0] = 2
+        scales = torch.ones(6)
+        scales[2] = 3.0  # row scale ×3
+        dvec = torch.full((4,), 5.0)
+        tscales = torch.tensor([1.0])  # tier ×1
+        rgate = torch.tensor([0.5])    # row gate ×0.5
+        result = _apply_full(hidden, table, index, scales, dvec, tscales, rgate)
+        # row: 2*3*0.5 = 3 ; tier: 5*1 = 5 ; total 8
+        assert torch.allclose(result, torch.full((1, 4), 8.0))
 
 
 class TestDynamicTierTerm:

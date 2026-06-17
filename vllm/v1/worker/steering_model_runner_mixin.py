@@ -25,6 +25,7 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_MONITOR_ACTIVE_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
+    share_steering_row_gate_across_layers,
     share_steering_token_scales_across_layers,
 )
 from vllm.sampling_params import SamplingParams
@@ -201,6 +202,7 @@ class SteeringModelRunnerMixin:
         # H2D, like steering_index) — done here, the single site with all
         # steerable layers, to avoid per-model-file share calls.
         share_steering_token_scales_across_layers(steerable.values())
+        share_steering_row_gate_across_layers(steerable.values())
         self._locally_owned_layers = frozenset(steerable.keys())
         self._req_steering_phase = {}
         self._steering_index_dirty = False

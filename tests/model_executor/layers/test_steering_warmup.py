@@ -144,7 +144,12 @@ class TestWarmupCUDA:
             index = torch.zeros(n, dtype=torch.long, device=device)
             active = torch.ones(1, dtype=torch.bool, device=device)
             scales = torch.ones(8, dtype=torch.float32, device=device)
-            torch.ops.vllm.apply_steering(hidden, table, index, active, scales)
+            dvec = torch.zeros(128, dtype=torch.float32, device=device)
+            tscale = torch.zeros(n, dtype=torch.float32, device=device)
+            rgate = torch.ones(n, dtype=torch.float32, device=device)
+            torch.ops.vllm.apply_steering(
+                hidden, table, index, active, scales, dvec, tscale, rgate
+            )
 
         torch.accelerator.synchronize()
         assert _kernel_cache_size() == baseline, (
