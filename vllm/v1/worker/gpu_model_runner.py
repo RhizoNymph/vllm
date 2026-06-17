@@ -2101,10 +2101,17 @@ class GPUModelRunner(
             events = events_by_name.get(name) if events_by_name is not None else None
 
             # Deferred read: events recorded on this consumer's PREVIOUS
-            # step are complete now (a full forward has run since), so
-            # ``elapsed_time`` never blocks and never forces a sync.
+            # step are *usually* complete now (a full forward has run
+            # since), so ``elapsed_time`` normally neither blocks nor forces
+            # a sync. But "a forward has run" only guarantees CPU-side
+            # enqueue, not GPU-side completion: a consumer whose ``on_step``
+            # does no D2H (so never forces a sync) lets the CPU race ahead
+            # of the GPU, leaving the end event incomplete. Reading
+            # ``elapsed_time`` then raises and would crash the engine.
+            # Guard with a non-blocking ``query()`` and just drop the
+            # sample when not ready — this is a best-effort metric.
             gpu_ms: float | None = None
-            if events is not None and stats["_gpu_armed"]:
+            if events is not None and stats["_gpu_armed"] and events[1].query():
                 gpu_ms = events[0].elapsed_time(events[1])
                 stats["gpu_steps"] += 1
                 stats["gpu_total_ms"] += gpu_ms
