@@ -64,6 +64,21 @@ per-block keying + chain sensitivity), `TestSchedulerAPCDecodeSignatures`
 in `tests/v1/test_request_steering.py` (scheduler glue), plus the
 `_MixinHost` reporting path in `test_steering_dynamic_override.py`.
 
+GPU validation (2026-06-16): APC correctness at tp=1 (a continuation of a
+steered request reused 0 tokens vs 64 for an unsteered one), plus tp=2 and
+pp=2 cross-node smokes. **A pre-existing, unrelated bug was found and fixed
+during this validation** (commit f7afef9531): per-request *static*
+`decode_steering_vectors` for a **decode-only** request (prefill_hash == 0)
+was silently dropped — the nothing-active short-circuit in
+`_update_steering_buffers` returned before the prefill→decode transition
+that registers the decode config, and nothing primed `config_to_row`. The
+fix makes a pending per-request steering hash in the batch defeat the
+short-circuit. The APC notification paths are independent of this fix
+(dynamic override/tier/monitor set their own active flags). Method note:
+verify steering via logprobs or direct state inspection, never
+output-token equality (ambiguous on confident prompts) or capture (records
+the pre-steering residual).
+
 ## 1. Problem
 
 Steering-aware prefix caching keys decode KV blocks by
