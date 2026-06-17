@@ -16,6 +16,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from dynamic_steering_controller.e2e_stub import (  # noqa: E402
+    ConfigurableOverrideStub,
+)
 from dynamic_steering_controller.minimal_examples import (  # noqa: E402
     AsyncTierExample,
     GlobalTierExample,
@@ -139,6 +142,37 @@ def test_async_example_noop_without_queue():
         assert ex.status()["submitted"] == 0
     finally:
         install_steering_action_queue(prev)
+
+
+def _stub(**kw):
+    p = {"steer_layer": LAYER, "steer_hook": "post_mlp", "steer_norm": 8.0}
+    p.update(kw)
+    return ConfigurableOverrideStub(_cfg(), p)
+
+
+def test_cfg_stub_override_mode_emits_only_override():
+    acts = _stub(mode="override").on_step(_decode_view())
+    assert len(acts) == 1 and isinstance(acts[0], RequestSteeringOverride)
+
+
+def test_cfg_stub_rowgate_emits_override_then_gate_rows_monitor():
+    for gate_on, sign in ((True, -1.0), (False, 1.0)):
+        acts = _stub(mode="rowgate", gate_on=gate_on).on_step(_decode_view())
+        assert [type(a) for a in acts] == [
+            RequestSteeringOverride, SteeringMonitorUpdate]
+        mon = acts[1]
+        assert mon.gate_rows is True
+        # Threshold saturated in the gate direction.
+        assert (mon.threshold < 0) is (sign < 0)
+
+
+def test_cfg_stub_reqscale_emits_override_then_req_id_scale():
+    acts = _stub(mode="reqscale", scale=0.0).on_step(_decode_view(req_id="r1"))
+    assert [type(a) for a in acts] == [
+        RequestSteeringOverride, SteeringScaleUpdate]
+    assert acts[1].req_id == "r1" and acts[1].scale == 0.0
+    # Override is first so the req_id scale can resolve the fresh dyn_id.
+    assert acts[0].req_id == "r1"
 
 
 if __name__ == "__main__":

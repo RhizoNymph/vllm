@@ -10,6 +10,7 @@ dependencies = ["vllm"]
 [project.entry-points."vllm.capture_consumers"]
 dynamic_steering = "dynamic_steering_controller:DynamicSteeringController"
 dynamic_steering_e2e = "dynamic_steering_controller.e2e_stub:DeterministicOverrideStub"
+dynamic_steering_e2e_cfg = "dynamic_steering_controller.e2e_stub:ConfigurableOverrideStub"
 # Minimal single-purpose examples — one per configuration (see
 # minimal_examples.py).
 steering_ex_override = "dynamic_steering_controller.minimal_examples:OverrideExample"
