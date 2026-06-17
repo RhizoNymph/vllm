@@ -781,6 +781,34 @@ rides the existing `apply_layer_steering` call at every hook.
   greedy output (no probe configured ⇒ the always-emitted monitor is a
   true no-op). The monitor kernel warmup retired before capture
   (`shapes=11`, ~4 ms). Needs `VLLM_USE_FLASHINFER_SAMPLER=0`.
+- **Engine-level e2e for row-gate / req_id-scale / async transport
+  (GPU-validated, tp=1, 2026-06-17, node2)**: gemma4-31B Q4_K_S, layer
+  30, `enforce_eager=True`. Three skip-marked tests, each driving a real
+  `LLM` + a config-driven consumer; the two per-request paths use the
+  within-run target-vs-control technique (robust to the batched-FP noise
+  floor `NOISE_FLOOR=10`).
+  - **Row gating** (`test_steering_gating_e2e.py::test_row_gate_*`,
+    `ConfigurableOverrideStub` mode `rowgate`): an override row plus a
+    `gate_rows=True` monitor whose threshold is saturated (±1e6) to force
+    the per-token gate fully on/off. Gate ON ⇒ the target's per-request
+    row is applied (early divergence in `[1,10]`); gate OFF ⇒ the row is
+    suppressed (target tracks the control past the noise floor). Proves
+    the in-graph monitor gates the **per-request row term**, not just the
+    §5.4 tier, end to end.
+  - **req_id scale** (`..::test_req_id_scale_*`, mode `reqscale`): an
+    override row plus `SteeringScaleUpdate(req_id=, scale=0)` emitted in
+    the same step (override first so the runner resolves the fresh
+    `req_id → dyn_id`). `scale=0` suppresses exactly the target's row
+    (≈control past the floor); the unscaled override diverges early.
+    Proves the cheap per-request strength knob routes correctly.
+  - **Async transport** (`test_async_steering_e2e.py`, `AsyncTierExample`):
+    a global-tier `SteeringVectorUpdate` submitted through the action
+    queue from `on_capture`. **Finding**: `on_capture` runs at request
+    *finalize*, so the update never steers its own request — it steers a
+    *subsequent* one. Modelled by repeating the prompt in one engine:
+    `gen[0]` is the baseline; `gen[1..]` are steered (the strong tier
+    collapses them to a repeat), proving the queue → drain →
+    `_apply_steering_actions` path delivers across requests.
 
 ## 10. Relationship to the earlier sketch
 

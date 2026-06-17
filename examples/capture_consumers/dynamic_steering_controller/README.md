@@ -144,7 +144,7 @@ each emit exactly one kind of action (or use one transport):
 | `steering_ex_per_request_scale` | sync | `SteeringScaleUpdate(req_id=)` (per-request strength, resolved req_id→dyn_id) |
 | `steering_ex_monitor_tier` | sync | `SteeringMonitorUpdate` (in-graph per-token gate on the tier) |
 | `steering_ex_monitor_rowgate` | sync | `SteeringMonitorUpdate(gate_rows=True)` (in-graph per-token gate on per-request rows) |
-| `steering_ex_async_tier` | async | `SteeringVectorUpdate` via the action queue (`on_capture`, 1–3 step latency) |
+| `steering_ex_async_tier` | async | `SteeringVectorUpdate` via the action queue (`on_capture` fires at request finalize, so it steers a *subsequent* request) |
 
 Other reachable targets via the same actions: `SteeringScaleUpdate()` with
 no field set scales the global decode row; `config_hash=` scales a static

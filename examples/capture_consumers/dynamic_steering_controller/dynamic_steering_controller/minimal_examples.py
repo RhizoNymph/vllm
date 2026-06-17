@@ -231,10 +231,16 @@ class MonitorRowGateExample(_SyncBase):
 
 class AsyncTierExample(CaptureConsumer):
     """ASYNC transport: a worker-side capture consumer that submits a global
-    tier update through the action queue (drained on a later step — the
-    1–3-step async latency). Unlike the sync examples it implements
-    ``on_capture`` (delivered post-D2H on the dispatch thread at finalize),
-    not ``on_step``; the update it submits steers *subsequent* decode steps.
+    tier update through the action queue. Unlike the sync examples it
+    implements ``on_capture`` (delivered post-D2H on the dispatch thread),
+    not ``on_step``.
+
+    Timing note: ``on_capture`` runs when a request *finalizes* (after its
+    output is emitted), so the update a request triggers cannot steer that
+    same request — it is drained at the top of a *later* request's step and
+    steers that one onward. (For same-request, exactly-one-step latency use
+    a sync ``on_step`` consumer instead.) Validated end to end in
+    ``tests/v1/worker/test_async_steering_e2e.py``.
 
     Must run worker-side (``location='worker'``) so the process-global
     action queue is reachable; ``get_steering_action_queue()`` returns
