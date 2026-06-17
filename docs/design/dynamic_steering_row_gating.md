@@ -1,8 +1,28 @@
 # Plan: per-request-row token gating (Phase 2 follow-up)
 
-Status: **PLAN.** Extends the Phase 2 in-graph monitor (§8 of
-`dynamic_steering.md`) to gate **per-request rows** per token, not just the
-§5.4 dynamic tier.
+Status: **IMPLEMENTED + GPU-validated (2026-06-17).** Extends the Phase 2
+in-graph monitor (§8 of `dynamic_steering.md`) to gate **per-request rows**
+per token, not just the §5.4 dynamic tier.
+
+As built (matches the plan below):
+- **M1**: `steering_row_gate` buffer (fp32, default 1.0, shared) + kernel
+  term `table[r]·scale[r]·row_gate[t]`; op `apply_steering` 7→8 args;
+  warmup + share helper. Tests in `test_steering_op.py::TestRowGate`,
+  `test_steering_any_active.py`, `test_steering_warmup.py`.
+- **M2**: `steering_decode_mask` buffer (fp32, default 0.0, shared) + a
+  `gate_rows` flag folded into the monitor params (`[threshold, sharpness,
+  gate_rows]`); the monitor op (5→7 args, mutates `token_scales` **and**
+  `row_gate`) does `row_gate[t] *= mask[t]·g[t] + (1−mask[t])` when
+  `gate_rows`; manager `set_monitor(..., gate_rows=)`; runner writes the
+  decode mask (1.0 decode / 0.0 prefill) and resets `row_gate` to 1.0 each
+  step (+ on the nothing-active transition); `SteeringMonitorUpdate.gate_rows`.
+  Tests in `test_steering_monitor_op.py::TestMonitorRowGating`,
+  `test_steering_monitor.py`.
+- **M3 (GPU)**: kernel row-gate term matches eager (bf16 ≤6e-3, fp32 ~1e-7
+  across sizes); monitor `gate_rows` gates decode rows and leaves prefill
+  rows at exactly 1.0; CUDA-graph capture/replay of monitor→apply_steering
+  with row gating matches eager across steps with prefill ungated; engine
+  cudagraph boot captures the 8-arg apply + 7-arg monitor.
 
 ## 1. What exists vs. what this adds
 
