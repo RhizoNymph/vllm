@@ -655,6 +655,27 @@ def test_scale_update_unknown_dynamic_rejected():
     assert (applied, rejected) == (0, 1)
 
 
+def test_scale_update_by_req_id_resolves_to_override_row():
+    """A consumer scales a per-request override by req_id (never sees the
+    internal dyn_id); the mixin resolves req_id -> dyn_id -> set_dynamic_scale."""
+    host = _MixinHost([_decode_req("r1")])
+    host._apply_steering_actions([_override(value=5.0)], source="s")
+    dyn_id = host._req_dynamic_decode["r1"]
+    applied, rejected = host._apply_steering_actions(
+        [SteeringScaleUpdate(scale=0.25, req_id="r1", source="s")], source="s"
+    )
+    assert (applied, rejected) == (1, 0)
+    assert host._steering_manager._dynamic_scales[dyn_id] == 0.25
+
+
+def test_scale_update_by_req_id_without_override_rejected():
+    host = _MixinHost([_decode_req("r1")])
+    applied, rejected = host._apply_steering_actions(
+        [SteeringScaleUpdate(scale=0.5, req_id="r1", source="s")], source="s"
+    )
+    assert (applied, rejected) == (0, 1)  # no live override to scale
+
+
 def test_scale_update_negative_rejected():
     host = _MixinHost([_decode_req("r1")])
     applied, rejected = host._apply_steering_actions(

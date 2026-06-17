@@ -1291,6 +1291,16 @@ class SteeringModelRunnerMixin:
             if action.dyn_id not in mgr._dynamic_to_row:
                 return _reject(f"unknown dynamic row dyn_id={action.dyn_id}")
             mgr.set_dynamic_scale(action.dyn_id, action.scale)
+        elif action.req_id is not None:
+            # Resolve req_id -> the request's live dynamic-override row.
+            # Lets a sync consumer modulate a per-request override's
+            # strength cheaply without ever seeing the internal dyn_id.
+            dyn_id = self._req_dynamic_decode.get(action.req_id)
+            if dyn_id is None:
+                return _reject(
+                    f"request {action.req_id} has no live dynamic override to scale"
+                )
+            mgr.set_dynamic_scale(dyn_id, action.scale)
         elif action.config_hash is not None:
             mgr.set_row_scale(action.config_hash, "decode", action.scale)
         else:
