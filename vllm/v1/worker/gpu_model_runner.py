@@ -5359,6 +5359,9 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
                 capture_results=capture_results_for_step,
+                steering_decode_signatures=(
+                    getattr(self, "_pending_decode_sigs", None) or None
+                ),
             )
 
         if not self.use_async_scheduling:

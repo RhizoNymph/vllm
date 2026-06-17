@@ -216,6 +216,14 @@ class SteeringModelRunnerMixin:
         # scheduler accounting are never touched. Cleaned up on request
         # finish, preemption resumption, and streaming re-add.
         self._req_dynamic_decode: dict[str, int] = {}
+        # APC steering-signature reporting (see
+        # docs/design/dynamic_steering_apc_notification.md). Last effective
+        # decode signature reported to the scheduler per request, so each
+        # step only the *changed* signatures ride ``ModelRunnerOutput``.
+        # ``_pending_decode_sigs`` holds the current step's delta for the
+        # model runner to attach; recomputed every ``_update_steering_buffers``.
+        self._req_decode_sig_reported: dict[str, int] = {}
+        self._pending_decode_sigs: dict[str, int] = {}
 
         steering_config = getattr(self.vllm_config, "steering_config", None)
         if steering_config is None or not steerable:
@@ -1322,6 +1330,62 @@ class SteeringModelRunnerMixin:
         if dyn_id is not None and self._steering_manager is not None:
             self._steering_manager.release_dynamic_config(dyn_id)
 
+    def _compute_decode_signature_deltas(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> dict[str, int]:
+        """Per-request effective-decode-signature *deltas* for the scheduler.
+
+        For each request in decode this step, compute its effective decode
+        steering signature (admitted config folded with any override / tier
+        / monitor; see the manager). Report only requests whose signature
+        changed since the last report — a request reverting to admitted
+        steering reports its plain admitted hash so the scheduler keys its
+        future decode blocks back to the admitted config. The result rides
+        ``ModelRunnerOutput.steering_decode_signatures`` to
+        ``Scheduler.update_from_output`` (rank 0's output is canonical; the
+        signature is rank-identical). See
+        docs/design/dynamic_steering_apc_notification.md.
+        """
+        mgr = self._steering_manager
+        if mgr is None:
+            return {}
+        deltas: dict[str, int] = {}
+        seen: set[str] = set()
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids
+        for i in range(num_reqs):
+            req_id = req_ids[i]
+            if req_id is None:
+                continue
+            if scheduler_output.num_scheduled_tokens.get(req_id, 0) == 0:
+                continue
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+            if num_computed < num_prompt:
+                # Prefill: decode steering (and its signature) does not apply;
+                # prefill cache keys are admission-fixed and already correct.
+                continue
+            seen.add(req_id)
+            base = int(self.input_batch.request_decode_steering_hash[req_index])
+            dyn_id = self._req_dynamic_decode.get(req_id)
+            sig = mgr.effective_decode_signature(dyn_id, base)
+            report_val = base if sig is None else sig
+            if self._req_decode_sig_reported.get(req_id) != report_val:
+                deltas[req_id] = report_val
+                self._req_decode_sig_reported[req_id] = report_val
+        # Drop reported state for requests no longer in the decode batch
+        # (bounded memory; a re-appearing request simply re-reports — the
+        # scheduler applies it idempotently).
+        if self._req_decode_sig_reported:
+            for rid in [
+                r for r in self._req_decode_sig_reported if r not in seen
+            ]:
+                self._req_decode_sig_reported.pop(rid, None)
+        return deltas
+
     def _update_steering_buffers(self, scheduler_output: "SchedulerOutput") -> None:
         """Update per-layer steering tables and the shared steering index.
 
@@ -1337,7 +1401,12 @@ class SteeringModelRunnerMixin:
         path stays branch-free.
         """
         if self._steering_manager is None or not self._steerable_layers_cache:
+            self._pending_decode_sigs = {}
             return
+
+        # Fresh each step; populated at the exits below so the model runner
+        # attaches this step's effective-decode-signature deltas (APC).
+        self._pending_decode_sigs = {}
 
         # Dynamic steering, async transport: drain the in-process action
         # queue before anything else so updates submitted during step N
@@ -1408,6 +1477,11 @@ class SteeringModelRunnerMixin:
                         if mon_buf is not None:
                             mon_buf.zero_()
                 self._steering_index_dirty = False
+            # Nothing dynamic is active; revert any request still reported as
+            # dynamically steered back to its admitted decode key.
+            self._pending_decode_sigs = self._compute_decode_signature_deltas(
+                scheduler_output
+            )
             return
 
         # 1. Populate steering tables — but only if state has changed since
@@ -1596,6 +1670,13 @@ class SteeringModelRunnerMixin:
         # no-active-state short-circuit on a future step will zero the index
         # if needed when transitioning back to "nothing active".
         self._steering_index_dirty = True
+
+        # Effective-decode-signature deltas for APC (computed from the
+        # steering state as applied THIS step — before any sync consumer
+        # mutates it for the next step).
+        self._pending_decode_sigs = self._compute_decode_signature_deltas(
+            scheduler_output
+        )
 
     def _handle_steering_transition(
         self,

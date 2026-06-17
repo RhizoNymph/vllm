@@ -276,6 +276,9 @@ class _MixinHost(SteeringModelRunnerMixin):
         self._steering_index_pinned = torch.zeros(16, dtype=torch.long)
         self._steering_tier_gain_scratch = np.zeros(8, dtype=np.float32)
         self._steering_token_scales_pinned = torch.zeros(16)
+        # APC effective-decode-signature reporting state.
+        self._req_decode_sig_reported = {}
+        self._pending_decode_sigs = {}
 
 
 def _override(req: str = "r1", value: float | None = 5.0) -> RequestSteeringOverride:

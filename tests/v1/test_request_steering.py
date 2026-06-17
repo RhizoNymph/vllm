@@ -459,3 +459,59 @@ class TestSchedulerSteeringHashOrdering(unittest.TestCase):
         scheduler._update_request_as_session(session, update)
 
         assert session.skip_reading_prefix_cache is True
+
+
+class TestSchedulerAPCDecodeSignatures(unittest.TestCase):
+    """Worker->scheduler effective-decode-signature glue (APC correctness).
+
+    See docs/design/dynamic_steering_apc_notification.md.
+    """
+
+    SIG = 0x1234ABCD
+
+    def _decode_request(self, scheduler, rid="r"):
+        req = _make_request(request_id=rid, prompt_token_ids=[1, 2, 3])
+        req.num_computed_tokens = len(req.prompt_token_ids)  # decode phase
+        scheduler.requests[rid] = req
+        return req
+
+    def test_apply_sets_and_reverts(self):
+        sched = _create_scheduler()
+        req = self._decode_request(sched)
+        admitted = req.decode_steering_config_hash
+
+        sched._apply_steering_decode_signatures({"r": self.SIG})
+        self.assertEqual(sched._req_decode_signature.get("r"), self.SIG)
+        self.assertEqual(req.block_hash_decode_steering_config_hash, self.SIG)
+
+        # Reporting the admitted hash reverts (drops tracking, restores key).
+        sched._apply_steering_decode_signatures({"r": admitted})
+        self.assertNotIn("r", sched._req_decode_signature)
+        self.assertEqual(req.block_hash_decode_steering_config_hash, admitted)
+
+    def test_apply_is_forward_only_no_clear(self):
+        # The dynamic path must NOT clear already-computed block hashes.
+        sched = _create_scheduler()
+        req = self._decode_request(sched)
+        req.block_hashes.extend([b"old0", b"old1"])  # pretend prior blocks
+        sched._apply_steering_decode_signatures({"r": self.SIG})
+        self.assertEqual(req.block_hashes, [b"old0", b"old1"])  # untouched
+
+    def test_schedule_hook_skips_dynamic_request(self):
+        # A request under a dynamic signature keeps its forward-only decode
+        # key; the schedule-time hook must not reset it to the admitted hash.
+        sched = _create_scheduler()
+        req = self._decode_request(sched)
+        sched._req_decode_signature["r"] = self.SIG
+        req.block_hash_decode_steering_config_hash = self.SIG
+        sched._set_request_block_hash_steering_overrides(req, set())
+        self.assertEqual(req.block_hash_decode_steering_config_hash, self.SIG)
+
+    def test_unknown_request_ignored(self):
+        sched = _create_scheduler()
+        sched._apply_steering_decode_signatures({"ghost": self.SIG})
+        self.assertNotIn("ghost", sched._req_decode_signature)
+
+
+if __name__ == "__main__":
+    unittest.main()

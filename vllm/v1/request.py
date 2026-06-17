@@ -264,6 +264,20 @@ class Request:
         self.block_hashes.clear()
         self.update_block_hashes()
 
+    def update_decode_steering_signature(self, decode_hash: int) -> None:
+        """Forward-only update of the decode steering key for block hashing.
+
+        Unlike :meth:`set_block_hash_steering_overrides`, this does NOT
+        clear already-computed ``block_hashes``: blocks produced under the
+        previous signature keep their key (they *were* produced under that
+        steering), and only blocks hashed from now on pick up
+        ``decode_hash``. This is the per-block keying the dynamic-steering
+        path needs for mid-stream steering changes (overrides / tier /
+        monitor engaging during decode). Prefill keys are untouched. See
+        docs/design/dynamic_steering_apc_notification.md.
+        """
+        self.block_hash_decode_steering_config_hash = decode_hash
+
     @property
     def use_structured_output(self) -> bool:
         return self.structured_output_request is not None
