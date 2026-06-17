@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.layers.steering import get_steering_buffer_config
+from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
     SteeringMonitorUpdate,
@@ -391,6 +392,46 @@ def test_mixed_update_and_override_in_one_batch():
 class _FakeSchedulerOutput:
     def __init__(self, scheduled: dict[str, int]):
         self.num_scheduled_tokens = dict(scheduled)
+
+
+def test_decode_only_request_defeats_nothing_active_short_circuit():
+    """Regression: a decode-only per-request steered request (prefill_hash=0,
+    decode_hash != 0) must NOT be dropped by the nothing-active short-circuit.
+
+    Its decode config is registered lazily at the prefill->decode transition
+    inside ``_update_steering_buffers``; if the short-circuit returns first
+    (empty manager state, no globals), that transition never runs and the
+    steering is silently dropped forever. The batch-pending-steering guard
+    must keep the loop alive so the config registers.
+    """
+    from types import SimpleNamespace
+
+    decode_hash = 4242
+    host = _MixinHost(
+        [
+            {
+                "req_id": "r1",
+                "num_computed": 6,
+                "num_prompt": 8,
+                "prefill_hash": 0,
+                "decode_hash": decode_hash,
+            }
+        ]
+    )
+    sp = SamplingParams(
+        max_tokens=4,
+        decode_steering_vectors={_HP: {0: [1.0] * HIDDEN}},
+    )
+    host.requests = {"r1": SimpleNamespace(sampling_params=sp)}
+    # Nothing registered yet — pre-fix this short-circuits and never registers.
+    assert not host._steering_manager.config_to_row
+    # 6 + 2 >= 8 ⇒ prefill completes this step ⇒ transition fires.
+    host._update_steering_buffers(_FakeSchedulerOutput({"r1": 2}))
+    assert (decode_hash, "decode") in host._steering_manager.config_to_row, (
+        "decode-only request's config was never registered — the short-circuit "
+        "swallowed the prefill->decode transition"
+    )
+    assert host._req_steering_phase.get("r1") == "decode"
 
 
 def test_decode_routing_uses_dynamic_row_and_admitted_state_untouched():
