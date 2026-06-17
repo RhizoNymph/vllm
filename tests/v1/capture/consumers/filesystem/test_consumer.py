@@ -106,6 +106,26 @@ def _make_consumer(
     )
 
 
+def test_root_expanduser(tmp_path, monkeypatch) -> None:
+    """A ``~`` in the configured root expands to ``$HOME``.
+
+    The shell does not expand ``~`` in
+    ``--capture-consumers filesystem:root=~/path`` (it is not at a word
+    boundary), so the consumer must ``expanduser`` it — otherwise captures
+    land in a literal ``~`` directory under the server's cwd.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    consumer = FilesystemConsumer(
+        vllm_config=_make_vllm_config(),
+        params={"root": "~/caps"},
+    )
+    try:
+        assert consumer._root == tmp_path / "caps"
+        assert "~" not in str(consumer._root)
+    finally:
+        consumer.shutdown(timeout=5.0)
+
+
 def _wait_for_result(
     consumer: FilesystemConsumer,
     key: CaptureKey,

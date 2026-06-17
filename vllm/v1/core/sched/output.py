@@ -47,13 +47,26 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Capture activation-store write-through (None unless the request
+    # carries a capture spec): the request's prompt block hashes and the
+    # granularity they were computed at. Lets the worker content-address
+    # captured prompt residuals into the activation store. The hash block
+    # size travels with the hashes because it can differ from the
+    # scheduler's KV block size (hybrid / context-parallel configs).
+    capture_block_hashes: list[bytes] | None = None
+    capture_hash_block_size: int = 0
+
     @classmethod
     def from_request(
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
+        hash_block_size: int = 0,
     ) -> "NewRequestData":
+        has_capture = request.sampling_params is not None and bool(
+            request.sampling_params.capture
+        )
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -68,6 +81,8 @@ class NewRequestData:
             prefill_steering_config_hash=request.prefill_steering_config_hash,
             decode_steering_config_hash=request.decode_steering_config_hash,
             prefill_token_ids=prefill_token_ids,
+            capture_block_hashes=(list(request.block_hashes) if has_capture else None),
+            capture_hash_block_size=hash_block_size if has_capture else 0,
         )
 
     def __repr__(self) -> str:

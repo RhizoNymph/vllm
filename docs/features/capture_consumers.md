@@ -573,9 +573,22 @@ and [Backpressure & overload](#backpressure--overload).
 
 - **Prefix-cache hits**: positions below
   `CaptureContext.num_computed_tokens` were served from the prefix
-  cache and never forwarded through the model. Consumers reject such
-  positions at admission; enforcement is the consumer's
-  responsibility.
+  cache and never forwarded through the model, so their residuals
+  cannot be captured. To guarantee captured positions are forwarded, a
+  request whose capture taps a **prompt-range** position reuses the
+  prefix cache only up to its lowest captured prompt position and
+  re-forwards from there (`last_prompt` keeps almost the whole prompt
+  cached; `all_prompt` reuses nothing); a capture of **generated-only**
+  positions keeps full prefix caching. Other requests are never
+  affected. The clamp uses the resolved capture positions, computed by a
+  shared admission step on **both** paths: the served (OpenAI API) path
+  resolves in `_admit_capture`, and the offline `LLM` path resolves in the
+  `InputProcessor` before the request reaches the scheduler. Both dict/spec
+  form and pre-built instance-form consumers
+  (`LLM(capture_consumers=[obj])`) resolve, keyed identically to the
+  worker. Consumers also reject cached positions at admission as a
+  backstop. See "Prefix-Cache Interaction" in
+  `docs/design/capture_consumers.md`.
 - **Hook coverage**: only the decoder architectures that wire the
   `apply_layer_steering` / `maybe_capture_residual` pair fire hooks.
   See [Activation Steering](steering.md) for the list of covered

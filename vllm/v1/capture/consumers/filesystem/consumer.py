@@ -220,7 +220,11 @@ class FilesystemConsumer:
     ) -> None:
         self._vllm_config = vllm_config
         self._params = _parse_params(params)
-        self._root = pathlib.Path(self._params.root)
+        # ``expanduser`` so ``root=~/path`` works: a shell does not expand the
+        # ``~`` in ``--capture-consumers filesystem:root=~/path`` (it is not at
+        # a word boundary), so the literal ``~`` would otherwise become a
+        # directory under the server's cwd.
+        self._root = pathlib.Path(self._params.root).expanduser()
         # Pipeline-parallel geometry. Under PP each stage owns a disjoint
         # global layer slice and writes its own packed/sharded files keyed
         # by stage rank (``_file_pp_rank``); completion is tracked against

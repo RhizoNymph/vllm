@@ -30,7 +30,10 @@ from vllm.v1.capture.types import (
     VllmInternalRequestId,
     build_hook_schema,
     capture_expert_parallel_size,
+    captured_prompt_positions,
     default_hook_schema,
+    min_captured_prompt_position,
+    spec_touches_prompt,
 )
 
 __all__ = [
@@ -53,5 +56,8 @@ __all__ = [
     "VllmInternalRequestId",
     "build_hook_schema",
     "capture_expert_parallel_size",
+    "captured_prompt_positions",
     "default_hook_schema",
+    "min_captured_prompt_position",
+    "spec_touches_prompt",
 ]

@@ -45,6 +45,10 @@ from typing import Any, cast
 
 import torch
 
+from vllm.v1.capture.activation_store import (
+    activation_key,
+    get_active_activation_store,
+)
 from vllm.v1.capture.plan import (
     CaptureBatchView,
     CapturePositionEntry,
@@ -61,6 +65,7 @@ from vllm.v1.capture.types import (
     HookName,
     HookSchema,
     VllmInternalRequestId,
+    captured_prompt_positions,
     default_hook_schema,
 )
 
@@ -94,6 +99,10 @@ class _RequestCaptureState:
     position_kind: dict[int, str]
     static_positions: dict[int, list[int] | None]
     num_prompt_tokens: int
+    # Prompt block hashes + the granularity they were computed at, for
+    # activation-store write-through. ``None`` disables it for this request.
+    block_hashes: list[bytes] | None = None
+    hash_block_size: int = 0
     steps_seen: int = 0
     error: str | None = None
     sidecar_fields: dict[str, Any] = field(default_factory=dict)
@@ -534,6 +543,8 @@ class CaptureManager:
         client_specs: dict[int, CaptureSpec] | None,
         num_prompt_tokens: int,
         sidecar_fields: dict[str, Any] | None = None,
+        block_hashes: list[bytes] | None = None,
+        hash_block_size: int = 0,
     ) -> None:
         """Register a request for capture.
 
@@ -541,6 +552,10 @@ class CaptureManager:
         These are merged with the global specs: a client spec overrides
         the global spec for that consumer.  A consumer is active for this
         request if it has either a global spec or a client spec.
+
+        ``block_hashes`` (the request's prompt block hashes) and
+        ``hash_block_size`` (their granularity) enable activation-store
+        write-through for this request; omitting them disables it.
         """
         if req_id in self._requests:
             msg = f"capture request {req_id!r} is already registered"
@@ -609,6 +624,8 @@ class CaptureManager:
             position_kind=position_kind,
             static_positions=static_positions,
             num_prompt_tokens=num_prompt_tokens,
+            block_hashes=block_hashes,
+            hash_block_size=hash_block_size,
             sidecar_fields=dict(sidecar_fields) if sidecar_fields else {},
         )
         self._requests[req_id] = state
@@ -1212,6 +1229,7 @@ class CaptureManager:
             if packet.cuda_event is not None:
                 packet.cuda_event.synchronize()
             self._fan_out_to_consumers(packet)
+            self._write_through_to_store(packet)
         except Exception:
             logger.exception("capture dispatch loop error")
         finally:
@@ -1220,6 +1238,110 @@ class CaptureManager:
                 self._pending_dispatches -= 1
                 if self._pending_dispatches == 0:
                     self._pending_cond.notify_all()
+
+    def serve_from_store(
+        self, req_id: str, payload: dict[tuple[int, str, int], torch.Tensor]
+    ) -> None:
+        """Inject store-served prompt residuals as capture chunks.
+
+        Called once at registration when the scheduler reserved a
+        whole-prefix store serve: the prompt positions were reused from the
+        KV cache and not forwarded, so for each consumer active for ``req_id``
+        we assemble its requested ``(layer, hook)`` rows from ``payload``
+        (keyed by ``(layer, hook, position)``) and submit them to its sink
+        exactly like a forward-path chunk. Generated positions still flow
+        through the normal forward path. Runs on the registration (main)
+        thread; sinks lock ``submit_chunk``, and a request's serve precedes
+        its own forward dispatch, so there is no same-request race.
+        """
+        state = self._requests.get(req_id)
+        if state is None:
+            return
+        rid = VllmInternalRequestId(req_id)
+        for consumer_idx, spec in state.consumer_specs.items():
+            positions = captured_prompt_positions(spec, state.num_prompt_tokens)
+            if not positions:
+                continue
+            sink = self._consumers[consumer_idx]
+            try:
+                for hook, layers in spec.hooks.items():
+                    for layer in layers:
+                        rows: list[torch.Tensor] = []
+                        kept: list[int] = []
+                        for pos in positions:
+                            row = payload.get((layer, hook, pos))
+                            if row is not None:
+                                rows.append(row)
+                                kept.append(pos)
+                        if not rows:
+                            continue
+                        tensor = torch.stack(rows, dim=0)
+                        sink.submit_chunk(
+                            CaptureChunk(
+                                key=(rid, layer, hook),
+                                tensor=tensor,
+                                dtype=tensor.dtype,
+                                row_offset=0,
+                                step_index=0,
+                                metadata={
+                                    "consumer_index": consumer_idx,
+                                    "positions": kept,
+                                    "served_from_store": True,
+                                },
+                            )
+                        )
+            except Exception:
+                logger.exception(
+                    "Consumer %d raised during store serve; other consumers "
+                    "are unaffected.",
+                    consumer_idx,
+                )
+                if state.error is None:
+                    state.error = f"consumer {consumer_idx} store serve failed"
+
+    def _write_through_to_store(self, packet: _DispatchPacket) -> None:
+        """Populate the activation store with freshly-captured prompt rows.
+
+        Runs once per packet on the dispatch thread, after fan-out and
+        before the pinned buffers are recycled. The pristine residual at a
+        prompt position is content-addressable (a pure function of the
+        prefix), so storing it lets a later request sharing the prefix serve
+        it without re-forwarding. Only prompt positions are stored —
+        generated positions are not shared across requests — and each
+        ``(request, layer, hook, position)`` is stored once regardless of
+        how many consumers wanted it, since the residual is
+        consumer-independent. Rows are cloned off the recycled pinned
+        buffer. A no-op when no store is installed.
+        """
+        store = get_active_activation_store()
+        if store is None:
+            return
+        seen: set[tuple[str, int, str, int]] = set()
+        for entry in packet.entries:
+            pos = entry.logical_pos
+            dedup = (entry.request_id, entry.layer, entry.hook, pos)
+            if dedup in seen:
+                continue
+            seen.add(dedup)
+            state = self._requests.get(entry.request_id)
+            if state is None or state.block_hashes is None:
+                continue
+            if pos >= state.num_prompt_tokens:
+                continue
+            key = activation_key(
+                state.block_hashes,
+                state.hash_block_size,
+                pos,
+                entry.layer,
+                entry.hook,
+            )
+            if key is None:
+                continue
+            pinned_view = packet.scratch_pinned.get((entry.layer, entry.hook))
+            if pinned_view is None:
+                continue
+            _pinned, view = pinned_view
+            store.put(key, view[entry.scratch_row].clone())
 
     def _fan_out_to_consumers(self, packet: _DispatchPacket) -> None:
         """Walk consumers and submit chunks for ``packet`` (dispatch thread).
