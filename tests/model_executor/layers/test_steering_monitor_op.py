@@ -40,8 +40,17 @@ def _monitor_gate(
     return torch.sigmoid(sharpness * (score - threshold))
 
 
-def _params(threshold: float, sharpness: float) -> torch.Tensor:
-    return torch.tensor([threshold, sharpness], dtype=torch.float32)
+def _params(threshold: float, sharpness: float, gate_rows: float = 0.0) -> torch.Tensor:
+    return torch.tensor([threshold, sharpness, gate_rows], dtype=torch.float32)
+
+
+def _run(hidden, probe, params, active, token_scales, *, decode_mask=None,
+         row_gate=None):
+    """Call the op with default (no-op) row-gating buffers unless given."""
+    dm = torch.zeros(token_scales.shape[0]) if decode_mask is None else decode_mask
+    rg = torch.ones(token_scales.shape[0]) if row_gate is None else row_gate
+    steering_monitor(hidden, probe, params, active, token_scales, dm, rg)
+    return rg
 
 
 class TestMonitorGateMath:
@@ -84,7 +93,7 @@ class TestMonitorOpCpuEager:
         expected = token_scales.clone()
         expected[:3] = expected[:3] * _monitor_gate(hidden, probe, 0.0, 1.5)
 
-        steering_monitor(
+        _run(
             hidden, probe, params, torch.tensor([True]), token_scales
         )
         torch.testing.assert_close(token_scales, expected)
@@ -94,7 +103,7 @@ class TestMonitorOpCpuEager:
         probe = torch.randn(8)
         token_scales = torch.full((6,), 4.0)
         before = token_scales.clone()
-        steering_monitor(
+        _run(
             hidden, probe, _params(0.0, 1.0), torch.tensor([False]), token_scales
         )
         torch.testing.assert_close(token_scales, before)
@@ -105,7 +114,7 @@ class TestMonitorOpCpuEager:
         hidden = torch.randn(4, 8) * 50.0
         probe = torch.randn(8)
         token_scales = torch.tensor([0.0, 6.0, 0.0, 6.0])
-        steering_monitor(
+        _run(
             hidden, probe, _params(0.0, 3.0), torch.tensor([True]), token_scales
         )
         assert token_scales[0].item() == 0.0
@@ -117,7 +126,7 @@ class TestMonitorOpCpuEager:
         hidden = torch.randn(2, 8)
         probe = torch.randn(8)
         token_scales = torch.tensor([5.0, 5.0, 9.0, 9.0])
-        steering_monitor(
+        _run(
             hidden, probe, _params(0.0, 1.0), torch.tensor([True]), token_scales
         )
         torch.testing.assert_close(token_scales[2:], torch.tensor([9.0, 9.0]))
@@ -135,12 +144,67 @@ class TestMonitorOpCpuEager:
         token_scales = torch.full((3,), gain)
         gate = _monitor_gate(hidden, probe, 0.1, 2.0)
 
-        steering_monitor(
+        _run(
             hidden, probe, _params(0.1, 2.0), torch.tensor([True]), token_scales
         )
         tier = dvec.unsqueeze(0) * token_scales.unsqueeze(-1)
         expected = dvec.unsqueeze(0) * (gain * gate).unsqueeze(-1)
         torch.testing.assert_close(tier, expected)
+
+
+class TestMonitorRowGating:
+    """gate_rows: the monitor also gates the per-request row term, decode-only.
+
+    Row gate update: ``row_gate[t] *= mask[t]*gate[t] + (1-mask[t])`` —
+    decode (mask=1) → ``*gate``, prefill (mask=0) → unchanged.
+    """
+
+    def test_row_gate_untouched_when_gate_rows_off(self):
+        hidden = torch.randn(3, 8)
+        probe = torch.randn(8)
+        token_scales = torch.zeros(3)
+        rgate = torch.ones(3)
+        # params gate_rows=0 ⇒ row gate must stay 1.0.
+        _run(
+            hidden, probe, _params(0.0, 1.0, gate_rows=0.0),
+            torch.tensor([True]), token_scales,
+            decode_mask=torch.ones(3), row_gate=rgate,
+        )
+        torch.testing.assert_close(rgate, torch.ones(3))
+
+    def test_row_gate_gates_decode_preserves_prefill(self):
+        probe = torch.ones(8)
+        # token 0 decode + high score (gate~1), token 1 prefill (mask 0),
+        # token 2 decode + very negative score (gate~0).
+        hidden = torch.stack([
+            torch.full((8,), 10.0),
+            torch.full((8,), 10.0),   # prefill — must stay 1.0 regardless
+            torch.full((8,), -10.0),
+        ])
+        token_scales = torch.zeros(3)
+        rgate = torch.ones(3)
+        decode_mask = torch.tensor([1.0, 0.0, 1.0])  # token 1 is prefill
+        _run(
+            hidden, probe, _params(0.0, 10.0, gate_rows=1.0),
+            torch.tensor([True]), token_scales,
+            decode_mask=decode_mask, row_gate=rgate,
+        )
+        assert rgate[0] > 0.99            # decode, engaged ⇒ ~1
+        assert rgate[1].item() == 1.0     # prefill ⇒ exactly 1 (never gated)
+        assert rgate[2] < 0.01            # decode, disengaged ⇒ ~0
+
+    def test_row_gate_composes_with_prior_value(self):
+        # row_gate starts <1 (e.g. a runner-set per-request gate); the
+        # monitor multiplies, so decode positions compound.
+        probe = torch.ones(8)
+        rgate = torch.full((1,), 0.5)
+        _run(
+            torch.full((1, 8), -10.0),  # gate ~0
+            probe, _params(0.0, 10.0, gate_rows=1.0),
+            torch.tensor([True]), torch.zeros(1),
+            decode_mask=torch.ones(1), row_gate=rgate,
+        )
+        assert rgate[0] < 0.01  # 0.5 * ~0 ⇒ ~0
 
 
 if __name__ == "__main__":

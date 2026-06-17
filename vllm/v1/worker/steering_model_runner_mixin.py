@@ -25,6 +25,7 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_MONITOR_ACTIVE_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
+    share_steering_decode_mask_across_layers,
     share_steering_row_gate_across_layers,
     share_steering_token_scales_across_layers,
 )
@@ -158,6 +159,10 @@ class SteeringModelRunnerMixin:
     # (§5.4); mirror the index scratches above.
     _steering_tier_gain_scratch: np.ndarray | None = None
     _steering_token_scales_pinned: torch.Tensor | None = None
+    # Per-request decode mask scratch + pinned per-token staging for the
+    # Phase 2 row gate; mirror the gate scratches above.
+    _steering_decode_mask_scratch: np.ndarray | None = None
+    _steering_decode_mask_pinned: torch.Tensor | None = None
 
     # Attributes provided by the concrete model runner that mixes this
     # class in.  Declared here purely so static type checking can see
@@ -203,6 +208,7 @@ class SteeringModelRunnerMixin:
         # steerable layers, to avoid per-model-file share calls.
         share_steering_token_scales_across_layers(steerable.values())
         share_steering_row_gate_across_layers(steerable.values())
+        share_steering_decode_mask_across_layers(steerable.values())
         self._locally_owned_layers = frozenset(steerable.keys())
         self._req_steering_phase = {}
         self._steering_index_dirty = False
@@ -295,6 +301,9 @@ class SteeringModelRunnerMixin:
             self._steering_rows_scratch = np.zeros(max_seqs, dtype=np.int64)
             self._steering_n_tokens_scratch = np.zeros(max_seqs, dtype=np.int64)
             self._steering_tier_gain_scratch = np.zeros(max_seqs, dtype=np.float32)
+            # Per-request decode mask (1.0 decode / 0.0 prefill) for Phase 2
+            # row gating; expanded per-token and H2D'd into steering_decode_mask.
+            self._steering_decode_mask_scratch = np.zeros(max_seqs, dtype=np.float32)
             try:
                 self._steering_index_pinned = torch.zeros(
                     max_tokens, dtype=torch.long, pin_memory=True
@@ -302,11 +311,17 @@ class SteeringModelRunnerMixin:
                 self._steering_token_scales_pinned = torch.zeros(
                     max_tokens, dtype=torch.float32, pin_memory=True
                 )
+                self._steering_decode_mask_pinned = torch.zeros(
+                    max_tokens, dtype=torch.float32, pin_memory=True
+                )
             except RuntimeError:
                 # Pinned memory unavailable (e.g. CPU-only test
                 # environment); fall back to a regular CPU tensor.
                 self._steering_index_pinned = torch.zeros(max_tokens, dtype=torch.long)
                 self._steering_token_scales_pinned = torch.zeros(
+                    max_tokens, dtype=torch.float32
+                )
+                self._steering_decode_mask_pinned = torch.zeros(
                     max_tokens, dtype=torch.float32
                 )
 
@@ -1322,6 +1337,7 @@ class SteeringModelRunnerMixin:
             probe,
             action.threshold,
             action.sharpness,
+            gate_rows=action.gate_rows,
             locally_owned_layers=self._locally_owned_layers,
         )
         return True
@@ -1480,6 +1496,15 @@ class SteeringModelRunnerMixin:
                 tscales = getattr(any_layer, "steering_token_scales", None)
                 if tscales is not None:
                     tscales.zero_()
+                # Reset the Phase 2 row gate to 1.0 and clear the decode
+                # mask so a stale monitor reduction doesn't gate now-removed
+                # steering rows.
+                rgate = getattr(any_layer, "steering_row_gate", None)
+                if rgate is not None:
+                    rgate.fill_(1.0)
+                dmask = getattr(any_layer, "steering_decode_mask", None)
+                if dmask is not None:
+                    dmask.zero_()
                 # Nothing-active transition: clear every per-layer
                 # ``_any_active`` flag so apply_steering short-circuits on
                 # this and subsequent steps.  Mirrors the index zero-out
@@ -1544,11 +1569,15 @@ class SteeringModelRunnerMixin:
         index_pinned = self._steering_index_pinned
         tier_gain_scratch = self._steering_tier_gain_scratch
         token_scales_pinned = self._steering_token_scales_pinned
+        decode_mask_scratch = self._steering_decode_mask_scratch
+        decode_mask_pinned = self._steering_decode_mask_pinned
         assert rows_scratch is not None
         assert n_tokens_scratch is not None
         assert index_pinned is not None
         assert tier_gain_scratch is not None
         assert token_scales_pinned is not None
+        assert decode_mask_scratch is not None
+        assert decode_mask_pinned is not None
 
         # Grow per-request scratches if the batch ever exceeds the
         # initial sizing.  This is defensive — ``max_num_seqs`` should
@@ -1557,9 +1586,11 @@ class SteeringModelRunnerMixin:
             rows_scratch = np.zeros(num_reqs, dtype=np.int64)
             n_tokens_scratch = np.zeros(num_reqs, dtype=np.int64)
             tier_gain_scratch = np.zeros(num_reqs, dtype=np.float32)
+            decode_mask_scratch = np.zeros(num_reqs, dtype=np.float32)
             self._steering_rows_scratch = rows_scratch
             self._steering_n_tokens_scratch = n_tokens_scratch
             self._steering_tier_gain_scratch = tier_gain_scratch
+            self._steering_decode_mask_scratch = decode_mask_scratch
 
         # Per-token dynamic-tier gate (§5.4): the gain for decode tokens of
         # a tier-active state, 0 otherwise (so the tier stays decode-only).
@@ -1583,6 +1614,7 @@ class SteeringModelRunnerMixin:
                 rows_scratch[active_count] = 0
                 n_tokens_scratch[active_count] = n_tokens
                 tier_gain_scratch[active_count] = 0.0
+                decode_mask_scratch[active_count] = 0.0
                 active_count += 1
                 continue
 
@@ -1603,6 +1635,8 @@ class SteeringModelRunnerMixin:
                 n_tokens_scratch[active_count] = n_tokens
                 # Prefill tokens never get the dynamic tier (cache safety).
                 tier_gain_scratch[active_count] = 0.0
+                # Prefill rows are never row-gated (cache safety).
+                decode_mask_scratch[active_count] = 0.0
 
                 # Check if this request will transition to decode after
                 # this step's tokens are processed. Must happen in this
@@ -1631,6 +1665,8 @@ class SteeringModelRunnerMixin:
                 n_tokens_scratch[active_count] = n_tokens
                 # Decode tokens carry the dynamic-tier gate.
                 tier_gain_scratch[active_count] = tier_gain
+                # Decode tokens are eligible for in-graph row gating.
+                decode_mask_scratch[active_count] = 1.0
 
             active_count += 1
 
@@ -1686,6 +1722,36 @@ class SteeringModelRunnerMixin:
             n_gate = 0
         if n_gate < token_scales.shape[0]:
             token_scales[n_gate:].zero_()
+
+        # Phase 2 row gating: reset the per-token row gate to 1.0 (rows at
+        # full strength) so any monitor reduction from the previous step is
+        # cleared — the in-graph monitor reduces it again this forward. And
+        # write the decode mask (1.0 decode / 0.0 prefill) so the monitor
+        # only gates decode rows. Both are no-ops downstream unless a
+        # row-gating monitor is active. Mirrors the token_scales expand+H2D.
+        row_gate = cast(torch.Tensor, any_layer.steering_row_gate)
+        decode_mask = cast(torch.Tensor, any_layer.steering_decode_mask)
+        row_gate.fill_(1.0)
+        if active_count > 0:
+            mask_expanded = np.repeat(
+                decode_mask_scratch[:active_count],
+                n_tokens_scratch[:active_count],
+            )
+            n_mask = min(
+                int(mask_expanded.shape[0]),
+                decode_mask_pinned.shape[0],
+                decode_mask.shape[0],
+            )
+            decode_mask_pinned[:n_mask].copy_(
+                torch.from_numpy(mask_expanded[:n_mask])
+            )
+            decode_mask[:n_mask].copy_(
+                decode_mask_pinned[:n_mask], non_blocking=True
+            )
+        else:
+            n_mask = 0
+        if n_mask < decode_mask.shape[0]:
+            decode_mask[n_mask:].zero_()
 
         # Mark the index as having non-zero row references this step. The
         # no-active-state short-circuit on a future step will zero the index

@@ -47,12 +47,14 @@ class _Layer(nn.Module):
         )
         self.register_buffer("steering_index", torch.zeros(16, dtype=torch.long))
         self.register_buffer("steering_token_scales", torch.zeros(16))
+        self.register_buffer("steering_row_gate", torch.ones(16))
+        self.register_buffer("steering_decode_mask", torch.zeros(16))
         self.register_buffer(
             "steering_table_post_mlp_monitor_probe", torch.zeros(HIDDEN)
         )
         self.register_buffer(
             "steering_table_post_mlp_monitor_params",
-            torch.tensor([0.0, 1.0], dtype=torch.float32),
+            torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32),
         )
         self.register_buffer(
             "steering_table_post_mlp_monitor_active", torch.zeros(1, dtype=torch.bool)
@@ -277,6 +279,8 @@ class _MixinHost(SteeringModelRunnerMixin):
         self._steering_index_pinned = torch.zeros(16, dtype=torch.long)
         self._steering_tier_gain_scratch = np.zeros(8, dtype=np.float32)
         self._steering_token_scales_pinned = torch.zeros(16)
+        self._steering_decode_mask_scratch = np.zeros(8, dtype=np.float32)
+        self._steering_decode_mask_pinned = torch.zeros(16)
         # APC effective-decode-signature reporting state.
         self._req_decode_sig_reported = {}
         self._pending_decode_sigs = {}
@@ -492,7 +496,7 @@ def test_monitor_only_state_defeats_nothing_active_short_circuit():
     assert bool(layer.steering_table_post_mlp_monitor_active.item())
     torch.testing.assert_close(
         layer.steering_table_post_mlp_monitor_params,
-        torch.tensor([0.0, 4.0], dtype=torch.float32),
+        torch.tensor([0.0, 4.0, 0.0], dtype=torch.float32),
     )
 
 

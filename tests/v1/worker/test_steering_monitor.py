@@ -36,7 +36,7 @@ class _Layer(nn.Module):
         )
         self.register_buffer(
             "steering_table_post_mlp_monitor_params",
-            torch.tensor([0.0, 1.0], dtype=torch.float32),
+            torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32),
         )
         self.register_buffer(
             "steering_table_post_mlp_monitor_active", torch.zeros(1, dtype=torch.bool)
@@ -117,8 +117,17 @@ def test_populate_writes_probe_params_active():
     assert _active(layers)
     torch.testing.assert_close(_probe(layers), probe)
     torch.testing.assert_close(
-        _params(layers), torch.tensor([1.5, 3.0], dtype=torch.float32)
+        _params(layers), torch.tensor([1.5, 3.0, 0.0], dtype=torch.float32)
     )
+
+
+def test_populate_writes_gate_rows_flag():
+    mgr = _mgr()
+    layers = {0: _Layer()}
+    mgr.set_monitor(_HP, 0, torch.ones(HIDDEN), 0.5, 2.0, gate_rows=True)
+    mgr.populate_steering_tables(layers)
+    # params[2] == 1.0 ⇒ the monitor op will also gate per-request rows.
+    assert _params(layers)[2].item() == 1.0
 
 
 def test_populate_deactivates_unconfigured_site():

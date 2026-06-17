@@ -50,19 +50,25 @@ def _steering_monitor_kernel(
     params_ptr,
     active_ptr,
     tscale_ptr,
+    dmask_ptr,
+    rgate_ptr,
     N,
     H,
     h_stride_n,
     h_stride_h,
     p_stride_h,
     ts_stride_n,
+    dm_stride_n,
+    rg_stride_n,
     BLOCK_H: tl.constexpr,
 ):
-    """Compute ``token_scales[i] *= sigmoid(sharp*(hidden[i]@probe - thr))``.
+    """Per-token gate: ``token_scales[i] *= g`` (tier) and, when
+    ``params[2]`` (gate_rows) is set, ``row_gate[i] *= mask[i]·g + (1−mask[i])``
+    (per-request row term, decode-only via the mask). ``g = sigmoid(sharp·
+    (hidden[i]@probe − thr))``.
 
     One program per token row. When the byte at ``active_ptr`` is zero the
-    kernel returns immediately, leaving ``token_scales`` exactly as the
-    runner wrote it (so a probe-less state keeps the Phase-1b flat gain).
+    kernel returns immediately, leaving both gates as the runner wrote them.
     """
     pid_n = tl.program_id(axis=0)
     if pid_n >= N:
@@ -85,11 +91,17 @@ def _steering_monitor_kernel(
 
     threshold = tl.load(params_ptr + 0)
     sharpness = tl.load(params_ptr + 1)
+    gate_rows = tl.load(params_ptr + 2)
     gate = tl.sigmoid(sharpness * (acc - threshold))
 
     ts_ptr = tscale_ptr + pid_n * ts_stride_n
-    old = tl.load(ts_ptr)
-    tl.store(ts_ptr, old * gate)
+    tl.store(ts_ptr, tl.load(ts_ptr) * gate)
+
+    if gate_rows != 0.0:
+        # decode → ·gate ; prefill (mask 0) → ·1 (row stays full strength).
+        dm = tl.load(dmask_ptr + pid_n * dm_stride_n)
+        rg_ptr = rgate_ptr + pid_n * rg_stride_n
+        tl.store(rg_ptr, tl.load(rg_ptr) * (dm * gate + (1.0 - dm)))
 
 
 def _choose_block_h(hidden_size: int) -> int:
@@ -107,13 +119,17 @@ def steering_monitor_triton(
     params: torch.Tensor,
     monitor_active: torch.Tensor,
     steering_token_scales: torch.Tensor,
+    steering_decode_mask: torch.Tensor,
+    steering_row_gate: torch.Tensor,
 ) -> None:
-    """In-place per-token gate write into ``steering_token_scales[:N]``.
+    """In-place per-token gate write into ``steering_token_scales[:N]`` and,
+    when ``params[2]`` is set, ``steering_row_gate[:N]`` (decode-only via
+    ``steering_decode_mask``).
 
     Empty batches (``N == 0``) short-circuit — Triton can fail on
     zero-sized grids. ``monitor_active`` is a single-element bool tensor;
-    when ``False`` the kernel launches but returns without touching the
-    gate (Phase-1b flat-gain behaviour preserved).
+    when ``False`` the kernel launches but returns without touching either
+    gate.
     """
     N = hidden_states.shape[0]
     if N == 0:
@@ -127,12 +143,16 @@ def steering_monitor_triton(
         params,
         monitor_active,
         steering_token_scales,
+        steering_decode_mask,
+        steering_row_gate,
         N,
         H,
         hidden_states.stride(0),
         hidden_states.stride(1),
         probe.stride(0),
         steering_token_scales.stride(0),
+        steering_decode_mask.stride(0),
+        steering_row_gate.stride(0),
         BLOCK_H=block_h,
     )
 
@@ -163,21 +183,29 @@ def warmup_steering_monitor_kernel(
     max_n = max(sizes)
     hidden_buf = torch.zeros(max_n, hidden_size, dtype=compute_dtype, device=device)
     probe_buf = torch.zeros(hidden_size, dtype=torch.float32, device=device)
-    params_buf = torch.tensor([0.0, 1.0], dtype=torch.float32, device=device)
+    # [threshold, sharpness, gate_rows]; gate_rows=1 so the row-gating
+    # branch is compiled too (the active/inactive flag shares the artifact).
+    params_buf = torch.tensor([0.0, 1.0, 1.0], dtype=torch.float32, device=device)
     active_flag = torch.zeros(1, dtype=torch.bool, device=device)
     tscale_buf = torch.zeros(max_n, dtype=torch.float32, device=device)
+    dmask_buf = torch.zeros(max_n, dtype=torch.float32, device=device)
+    rgate_buf = torch.ones(max_n, dtype=torch.float32, device=device)
 
     t0 = time.perf_counter()
     for n in sizes:
         hidden_view = hidden_buf[:n]
         tscale_view = tscale_buf[:n]
+        dmask_view = dmask_buf[:n]
+        rgate_view = rgate_buf[:n]
         active_flag.fill_(False)
         torch.ops.vllm.steering_monitor(
-            hidden_view, probe_buf, params_buf, active_flag, tscale_view
+            hidden_view, probe_buf, params_buf, active_flag, tscale_view,
+            dmask_view, rgate_view,
         )
         active_flag.fill_(True)
         torch.ops.vllm.steering_monitor(
-            hidden_view, probe_buf, params_buf, active_flag, tscale_view
+            hidden_view, probe_buf, params_buf, active_flag, tscale_view,
+            dmask_view, rgate_view,
         )
     torch.accelerator.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0

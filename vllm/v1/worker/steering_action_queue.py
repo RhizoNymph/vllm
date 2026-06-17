@@ -153,6 +153,9 @@ class SteeringMonitorUpdate:
     probe: np.ndarray | None
     threshold: float = 0.0
     sharpness: float = 1.0
+    # When True the monitor also gates the per-request row term (not just
+    # the §5.4 tier), decode-only. See dynamic_steering_row_gating.md.
+    gate_rows: bool = False
     source: str = ""
 
 

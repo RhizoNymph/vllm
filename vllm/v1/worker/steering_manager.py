@@ -591,6 +591,7 @@ class SteeringManager:
         probe: torch.Tensor,
         threshold: float,
         sharpness: float,
+        gate_rows: bool = False,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> None:
         """Configure the in-graph monitor at ``(hook_point, layer_idx)``.
@@ -612,6 +613,7 @@ class SteeringManager:
             "probe": probe.detach().to(torch.float32).clone().reshape(-1),
             "threshold": float(threshold),
             "sharpness": float(sharpness),
+            "gate_rows": bool(gate_rows),
         }
         self._monitor_sig_cache = None  # monitor changed → APC signature stale
         self._tables_dirty = True
@@ -684,6 +686,7 @@ class SteeringManager:
                     )
                     h.update(np.float64(cfg["threshold"]).tobytes())
                     h.update(np.float64(cfg["sharpness"]).tobytes())
+                    h.update(b"\x01" if cfg.get("gate_rows") else b"\x00")
             self._monitor_sig_cache = (
                 int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
             )
@@ -1304,7 +1307,11 @@ class SteeringManager:
             probe_buf.copy_(cfg["probe"].to(probe_buf.device))
             params_buf.copy_(
                 torch.tensor(
-                    [cfg["threshold"], cfg["sharpness"]],
+                    [
+                        cfg["threshold"],
+                        cfg["sharpness"],
+                        1.0 if cfg.get("gate_rows") else 0.0,
+                    ],
                     dtype=torch.float32,
                     device=params_buf.device,
                 )
