@@ -10,3 +10,12 @@ dependencies = ["vllm"]
 [project.entry-points."vllm.capture_consumers"]
 dynamic_steering = "dynamic_steering_controller:DynamicSteeringController"
 dynamic_steering_e2e = "dynamic_steering_controller.e2e_stub:DeterministicOverrideStub"
+# Minimal single-purpose examples — one per configuration (see
+# minimal_examples.py).
+steering_ex_override = "dynamic_steering_controller.minimal_examples:OverrideExample"
+steering_ex_global_tier = "dynamic_steering_controller.minimal_examples:GlobalTierExample"
+steering_ex_tier_scale = "dynamic_steering_controller.minimal_examples:TierScaleExample"
+steering_ex_per_request_scale = "dynamic_steering_controller.minimal_examples:PerRequestScaleExample"
+steering_ex_monitor_tier = "dynamic_steering_controller.minimal_examples:MonitorTierExample"
+steering_ex_monitor_rowgate = "dynamic_steering_controller.minimal_examples:MonitorRowGateExample"
+steering_ex_async_tier = "dynamic_steering_controller.minimal_examples:AsyncTierExample"

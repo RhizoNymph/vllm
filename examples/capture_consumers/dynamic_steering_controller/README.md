@@ -129,6 +129,30 @@ emitted vectors are zero), so you can watch the engagement trace on
 real traffic before letting it steer. Raise the gain when the trace
 looks right.
 
+## Minimal examples — one per configuration
+
+`DynamicSteeringController` is the kitchen-sink, probe-gated policy. For
+clear copy-paste templates of each individual way the runtime can be
+driven, see `minimal_examples.py` — small, deterministic consumers that
+each emit exactly one kind of action (or use one transport):
+
+| entry point | transport | action |
+|---|---|---|
+| `steering_ex_override` | sync | `RequestSteeringOverride` (per-request) |
+| `steering_ex_global_tier` | sync | `SteeringVectorUpdate` (global decode tier) |
+| `steering_ex_tier_scale` | sync | `SteeringScaleUpdate(tier_gain=)` (cheap strength knob) |
+| `steering_ex_per_request_scale` | sync | `SteeringScaleUpdate(req_id=)` (per-request strength, resolved req_id→dyn_id) |
+| `steering_ex_monitor_tier` | sync | `SteeringMonitorUpdate` (in-graph per-token gate on the tier) |
+| `steering_ex_monitor_rowgate` | sync | `SteeringMonitorUpdate(gate_rows=True)` (in-graph per-token gate on per-request rows) |
+| `steering_ex_async_tier` | async | `SteeringVectorUpdate` via the action queue (`on_capture`, 1–3 step latency) |
+
+Other reachable targets via the same actions: `SteeringScaleUpdate()` with
+no field set scales the global decode row; `config_hash=` scales a static
+admitted config's decode row; the base/prefill escape hatch
+(`SteeringVectorUpdate(phase="base"/"prefill")`) is cache-unsafe and
+requires the caller to own invalidation.
+
 ## Tests
 
 `python test.py` (or `pytest test.py`) — pure CPU, no engine needed.
+`pytest test_minimal_examples.py` covers the minimal examples.
