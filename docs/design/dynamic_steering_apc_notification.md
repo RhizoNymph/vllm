@@ -1,6 +1,12 @@
 # Plan: worker→scheduler steering notification for APC correctness
 
-Status: **IMPLEMENTED (CPU; GPU validation pending).** Companion to
+Status: **IMPLEMENTED + GPU-validated (tp=1, 2026-06-16, localhost RTX
+3090, gemma4-31B Q4_K_S).** A continuation of a dynamically-steered
+request (override via the e2e stub) reused **0** of its prior sequence's
+KV, while a continuation of an unsteered request reused 64/75 tokens
+(prompt + generated) — i.e. steered decode blocks are not falsely reused,
+unsteered prefix reuse is preserved (`/tmp` test `apc_correctness.py`,
+mirrored as a skip-marked repo test). Companion to
 `docs/design/dynamic_steering.md` (this resolves the §5.2 "known
 limitation" and the analogous holes for the §5.4 tier and §8 monitor).
 See "As built" below for how the final mechanism differs from (and
