@@ -18,6 +18,10 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
+from vllm.model_executor.layers.activation_capture import (
+    get_active_capture_manager,
+    maybe_capture_residual,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
@@ -1013,6 +1017,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        # Global decoder-layer index, for activation-capture taps.
+        self.layer_idx = extract_layer_index(prefix)
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4Attention(
@@ -1107,6 +1113,48 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         return self.mhc_post(x, residual, post, comb)
 
+    def _capture_mhc(
+        self,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        layer_input: torch.Tensor,
+        sublayer: str,
+    ) -> None:
+        """Tap this sublayer's mHC activations for the capture framework.
+
+        Gated on the active capture manager so that, with capture disabled,
+        the whole body — including the ``flatten`` of the multi-stream
+        residual and the fp32 coefficients — constant-folds out of the
+        compiled graph (spec invariant 3), exactly like
+        :func:`maybe_capture_residual`'s own ``None`` gate.
+
+        ``residual`` is ``(num_tokens, hc_mult, hidden)``; ``post_mix`` is
+        ``(num_tokens, hc_mult, 1)``; ``res_mix`` is
+        ``(num_tokens, hc_mult, hc_mult)``; all are flattened to 2D for the
+        2D-only capture op. ``layer_input`` is already ``(num_tokens, hidden)``.
+        """
+        if get_active_capture_manager() is None:
+            return
+        if sublayer == "attn":
+            stream_hook = "mhc_streams_pre_attn"
+            post_hook, res_hook, in_hook = (
+                "mhc_attn_post_mix",
+                "mhc_attn_res_mix",
+                "pre_attn",
+            )
+        else:
+            stream_hook = "mhc_streams_pre_mlp"
+            post_hook, res_hook, in_hook = (
+                "mhc_ffn_post_mix",
+                "mhc_ffn_res_mix",
+                "mlp_in",
+            )
+        maybe_capture_residual(residual.flatten(1), self.layer_idx, stream_hook)
+        maybe_capture_residual(post_mix.flatten(1), self.layer_idx, post_hook)
+        maybe_capture_residual(res_mix.flatten(1), self.layer_idx, res_hook)
+        maybe_capture_residual(layer_input, self.layer_idx, in_hook)
+
     def _forward_cuda(
         self,
         x: torch.Tensor,
@@ -1138,8 +1186,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
 
+        # mHC capture taps (no-op when no capture manager is installed; the
+        # gate constant-folds out of the compiled graph). ``residual`` is the
+        # multi-stream residual entering this layer; ``post_mix`` / ``res_mix``
+        # are the attention sublayer's hyperconnection mixing coefficients;
+        # ``x`` is the single-stream pre-mixed attention input. Streams and
+        # coefficients are flattened to 2D ``(num_tokens, width)`` for the op.
+        self._capture_mhc(residual, post_mix, res_mix, x, "attn")
+
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
+        maybe_capture_residual(x, self.layer_idx, "post_attn")
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
@@ -1155,9 +1212,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
         )
+        self._capture_mhc(residual, post_mix, res_mix, x, "ffn")
         # ffn_norm is now folded into self.ffn.norm_gate; ffn() takes
         # the pre-norm activation directly.
         x = self.ffn(x, input_ids)
+        maybe_capture_residual(x, self.layer_idx, "mlp_out")
         return x, residual, post_mix, res_mix
 
     def _forward_native(
@@ -1175,17 +1234,21 @@ class DeepseekV4DecoderLayer(nn.Module):
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
+        self._capture_mhc(residual, post, comb, x, "attn")
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
+        maybe_capture_residual(x, self.layer_idx, "post_attn")
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
+        self._capture_mhc(residual, post, comb, x, "ffn")
         # ffn_norm is now folded into self.ffn.norm_gate; ffn() takes
         # the pre-norm activation directly.
         x = self.ffn(x, input_ids)
+        maybe_capture_residual(x, self.layer_idx, "mlp_out")
         x = self.hc_post(x, residual, post, comb)
         return x, None, None, None
 
@@ -1373,8 +1436,15 @@ class DeepseekV4Model(nn.Module):
             return IntermediateTensors({"hidden_states": hidden_states})
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
+        # ``flat`` is the final multi-stream residual flattened to 2D; it
+        # feeds both the MTP buffer and the ``mhc_streams_final`` capture
+        # tap (keyed to the last layer; no-op when capture is disabled).
         num_tokens = hidden_states.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        flat = hidden_states.flatten(1)
+        maybe_capture_residual(
+            flat, self.config.num_hidden_layers - 1, "mhc_streams_final"
+        )
+        self._mtp_hidden_buffer[:num_tokens].copy_(flat)
 
         hidden_states = self.hc_head_op(
             hidden_states,

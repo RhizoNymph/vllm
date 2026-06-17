@@ -117,11 +117,28 @@ VllmInternalRequestId = NewType("VllmInternalRequestId", str)
 CaptureKey = tuple[VllmInternalRequestId, int, str]
 # (request id, layer index, hook name)
 
-HookName = Literal["pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"]
+HookName = Literal[
+    # Standard residual hooks (every model): full residual, model dtype.
+    "pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out",
+    # DeepSeek-V4 mHC: multi-stream residual (hc_mult * hidden, bf16).
+    "mhc_streams_pre_attn", "mhc_streams_pre_mlp", "mhc_streams_final",
+    # DeepSeek-V4 mHC: stream-mixing coefficients (fp32).
+    "mhc_attn_post_mix", "mhc_ffn_post_mix",
+    "mhc_attn_res_mix", "mhc_ffn_res_mix",
+]
 PositionSelector = (
     Literal["last_prompt", "all_prompt", "all_generated", "all"]
     | list[int]
 )
+
+# Per-hook row geometry. Standard hooks are (hidden_size, model_dtype,
+# (hidden_size,)); mHC hooks vary in width and dtype (e.g. an attn res_mix
+# row is (hc_mult * hc_mult,) fp32, reshaped back to (hc_mult, hc_mult)).
+@dataclass(frozen=True)
+class HookSchema:
+    width: int                  # flattened per-row element count
+    dtype: torch.dtype
+    logical_shape: tuple[int, ...]   # per-row shape; prod == width
 
 @dataclass(frozen=True)
 class CaptureSpec:
@@ -131,11 +148,11 @@ class CaptureSpec:
 @dataclass
 class CaptureChunk:
     key: CaptureKey
-    tensor: torch.Tensor        # CPU, shape (num_rows, hidden_size)
+    tensor: torch.Tensor        # CPU, shape (num_rows, width)
     dtype: torch.dtype
     row_offset: int
     step_index: int
-    metadata: dict[str, Any]
+    metadata: dict[str, Any]    # incl. "row_shape" and per-row "positions"
 
 @dataclass
 class CaptureFinalize:
@@ -161,10 +178,28 @@ class CaptureContext:
     element_size_bytes: int
     tensor_parallel_size: int
     pipeline_parallel_size: int
+    hook_schema: dict[str, HookSchema]   # which hooks the model taps + geometry
 ```
 
 `HookName` must stay in lockstep with `_HOOK_NAME_TO_ID` in
 `vllm/model_executor/layers/activation_capture.py`.
+
+**Per-hook schema.** `build_hook_schema(hidden_size, dtype, hc_mult)` (in
+`types.py`) returns the hooks a model taps, keyed by name, each with its
+`HookSchema`. Without `hc_mult` it is the standard wired residual hooks
+(`pre_attn` / `post_attn` / `post_mlp`); a model exposing `hf_config.hc_mult`
+(DeepSeek-V4) gets the mHC hooks instead, sized from `hc_mult`. The runner
+and the OpenAI entrypoints build it from `model_config` and pass it on
+`CaptureContext` (admission) and to the `CaptureManager` (buffer sizing /
+scratch dtype). The schema is the source of truth for *which hooks are
+tapped*: admission rejects any hook not in it, so `mlp_in` / `mlp_out` /
+`mhc_*` are accepted only on models that wire them.
+
+**Model-level hooks.** `MODEL_LEVEL_HOOKS` (currently `{mhc_streams_final}`)
+fire once per request at the model tail rather than per decoder layer. They
+are keyed to the last layer (`num_hidden_layers - 1`); admission ignores
+their layer selector and normalizes to that index, so a caller writes
+`{"mhc_streams_final": "all"}` without knowing it.
 
 ## Sinks and Consumers
 
@@ -634,7 +669,11 @@ On finalize:
   *request*, all `(layer, hook)` tensors concatenated. The consumer
   routes every chunk of a request to a single writer key (one fd, one
   file), records a per-chunk index entry `{layer, hook, offset, nbytes,
-  shape}`, and — because per-key finalizes arrive in one synchronous
+  shape, row_shape, dtype, positions}` (`row_shape` is the per-row
+  logical shape for reshaping e.g. mHC `(hc_mult, hidden)` rows;
+  per-entry `dtype` lets one request mix dtypes such as bf16 streams and
+  fp32 mHC coefficients; `positions` is the per-row absolute token
+  position), and — because per-key finalizes arrive in one synchronous
   burst after the dispatch-drain barrier — publishes the file only once
   **all** expected `(layer, hook)` keys have finalized. Every key's
   `CaptureResult` then maps to the single packed `WriteResult`. Cuts
@@ -678,11 +717,16 @@ Writer details (`writer.py`):
 - TP / PP / EP / DP are all accepted for the replicated residual hooks
   (no parallel-size rejection). See
   [Capture Consumers under Parallelism](capture_parallelism.md).
-- Every hook name is in `{pre_attn, post_attn, post_mlp, mlp_in,
-  mlp_out}`.
+- Every hook name is one the model taps, i.e. present in
+  `ctx.hook_schema` (falls back to `{pre_attn, post_attn, post_mlp}` when
+  no schema is supplied). On a DeepSeek-V4 model this also accepts the
+  `mhc_*` hooks and `mlp_in` / `mlp_out`; on a standard model those are
+  rejected.
 - Every resolved layer is in `[0, num_hidden_layers)`, the **global**
   layer count (admission validates the full layer space; the runner then
-  filters each pipeline stage's spec to its owned slice).
+  filters each pipeline stage's spec to its owned slice). Exception:
+  model-level hooks (`MODEL_LEVEL_HOOKS`, e.g. `mhc_streams_final`) ignore
+  their layer selector and normalize to `num_hidden_layers - 1`.
 - Tag / request_id: non-empty, ≤256 chars, no `..`, no leading `/`;
   characters outside `[a-zA-Z0-9._-]` become `_`.
 - Explicit positions ≥ `num_computed_tokens` (reject prefix-cache
@@ -767,6 +811,24 @@ worth tightening:
   `finalized_at`, `finish_reason` are not yet populated by the
   runner — consumers that want them will need the runner to plumb
   them through.
+- **Speculative decoding over-captures generated positions.** The
+  capture path is spec-decode-unaware and purely position-based, and
+  rejection sampling runs *after* the target forward. So in a verify
+  step the taps gather hidden states for *all* candidate positions —
+  including draft tokens that are rejected and re-forwarded in a later
+  step. A generated position therefore appears in multiple rows (the
+  stale rejected draft, then the accepted re-forward), so an
+  `all_generated` / `all` capture has more rows than the request
+  generated. The accepted token's hidden state is always present (the
+  last row written for its position); to recover one row per token, the
+  consumer records each row's absolute logical position in the sidecar
+  (`positions`) and the reader exposes `latest_per_position(entry)`,
+  which keeps the last row per position. Prompt selectors
+  (`last_prompt` / `all_prompt`) are unaffected — prefill is not
+  speculative. A fuller fix (emit rows only for accepted positions,
+  which requires deferring dispatch until the accept mask is known) is
+  not implemented. The behavior is hook-agnostic — it affects standard
+  residual hooks and mHC hooks identically.
 - **Shutdown sequencing.** Consumers are shut down when the runner
   tears down, but there is no explicit LIFO ordering or per-consumer
   budget propagation — each consumer's `shutdown(timeout)` default

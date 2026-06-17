@@ -15,6 +15,8 @@ from vllm.v1.capture.errors import (
 )
 from vllm.v1.capture.sink import CaptureSink
 from vllm.v1.capture.types import (
+    MODEL_LEVEL_HOOKS,
+    STANDARD_HOOKS,
     CaptureChunk,
     CaptureContext,
     CaptureFinalize,
@@ -23,12 +25,17 @@ from vllm.v1.capture.types import (
     CaptureSpec,
     CaptureStatus,
     HookName,
+    HookSchema,
     PositionSelector,
     VllmInternalRequestId,
+    build_hook_schema,
     capture_expert_parallel_size,
+    default_hook_schema,
 )
 
 __all__ = [
+    "MODEL_LEVEL_HOOKS",
+    "STANDARD_HOOKS",
     "CaptureChunk",
     "CaptureConsumer",
     "CaptureContext",
@@ -40,8 +47,11 @@ __all__ = [
     "CaptureStatus",
     "CaptureValidationError",
     "HookName",
+    "HookSchema",
     "PositionSelector",
     "UnknownCaptureConsumerError",
     "VllmInternalRequestId",
+    "build_hook_schema",
     "capture_expert_parallel_size",
+    "default_hook_schema",
 ]
