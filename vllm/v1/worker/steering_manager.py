@@ -40,11 +40,13 @@ Supports phase-aware (prefill vs decode) steering with separate global
 effective vectors for each phase.
 """
 
+import hashlib
 from collections import defaultdict
 
 import numpy as np
 import torch
 
+from vllm.config.steering_types import hash_steering_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
@@ -159,6 +161,18 @@ class SteeringManager:
         # populate time (gated by ``_tables_dirty``); policy params then
         # live in the persistent buffers, host-tunable without recapture.
         self.monitor_configs: dict[str, dict[int, dict]] = {}
+
+        # APC steering-signature caches (see
+        # docs/design/dynamic_steering_apc_notification.md). The worker
+        # reports a per-request *effective decode steering signature* to the
+        # scheduler so steered decode KV blocks are keyed by the steering
+        # that produced them (not the admitted config). Component hashes are
+        # cached and only recomputed when their source state mutates:
+        # per-dyn_id override-vector hash, and lazily-recomputed global
+        # tier / monitor hashes (``None`` ⇒ stale, recompute on next read).
+        self._dynamic_sig: dict[int, int] = {}
+        self._tier_sig_cache: int | None = None
+        self._monitor_sig_cache: int | None = None
 
         # Per-row strength scales (the §5.3 "how much" knob), keyed by
         # LOGICAL owner so they survive row reassignment: phase->scale for
@@ -371,6 +385,9 @@ class SteeringManager:
         self._dynamic_vectors[dyn_id] = self._store_vectors(
             vectors, locally_owned_layers
         )
+        # Cache the override-vector hash for the APC decode signature. Hash
+        # the raw input vectors (np/list) — no device sync, rank-identical.
+        self._dynamic_sig[dyn_id] = hash_steering_config(vectors)
         self._tables_dirty = True
         self._indices_dirty = True
         return dyn_id, row
@@ -393,6 +410,7 @@ class SteeringManager:
         self._dynamic_vectors[dyn_id] = self._store_vectors(
             vectors, locally_owned_layers
         )
+        self._dynamic_sig[dyn_id] = hash_steering_config(vectors)
         self._tables_dirty = True
 
     def release_dynamic_config(self, dyn_id: int) -> None:
@@ -401,6 +419,7 @@ class SteeringManager:
         if row is None:
             return
         self._dynamic_vectors.pop(dyn_id, None)
+        self._dynamic_sig.pop(dyn_id, None)
         self._dynamic_free_rows.append(row)
         self._tables_dirty = True
         self._indices_dirty = True
@@ -538,12 +557,14 @@ class SteeringManager:
         if hook_point not in self.dynamic_tier_vectors:
             self.dynamic_tier_vectors[hook_point] = {}
         self.dynamic_tier_vectors[hook_point][layer_idx] = vector.clone()
+        self._tier_sig_cache = None  # tier changed → APC signature stale
         self._tables_dirty = True
 
     def clear_dynamic_tier(self) -> None:
         """Clear all dynamic additive-tier vectors."""
         if self.dynamic_tier_vectors:
             self.dynamic_tier_vectors.clear()
+            self._tier_sig_cache = None
             self._tables_dirty = True
 
     @property
@@ -592,6 +613,7 @@ class SteeringManager:
             "threshold": float(threshold),
             "sharpness": float(sharpness),
         }
+        self._monitor_sig_cache = None  # monitor changed → APC signature stale
         self._tables_dirty = True
 
     def clear_monitor(
@@ -609,6 +631,7 @@ class SteeringManager:
             return
         if hook_point is None:
             self.monitor_configs.clear()
+            self._monitor_sig_cache = None
             self._tables_dirty = True
             return
         layers = self.monitor_configs.get(hook_point)
@@ -616,18 +639,107 @@ class SteeringManager:
             return
         if layer_idx is None:
             del self.monitor_configs[hook_point]
+            self._monitor_sig_cache = None
             self._tables_dirty = True
             return
         if layer_idx in layers:
             del layers[layer_idx]
             if not layers:
                 del self.monitor_configs[hook_point]
+            self._monitor_sig_cache = None
             self._tables_dirty = True
 
     @property
     def has_monitor(self) -> bool:
         """True if any in-graph monitor site is configured."""
         return any(layers for layers in self.monitor_configs.values())
+
+    # ------------------------------------------------------------------
+    # APC effective-decode-steering signature (see
+    # docs/design/dynamic_steering_apc_notification.md)
+    # ------------------------------------------------------------------
+
+    def _tier_signature(self) -> int:
+        """Cached hash of the global dynamic-tier vectors (gain excluded —
+        the gain is folded per-call since it is a cheap scalar that the
+        caller reads fresh)."""
+        if self._tier_sig_cache is None:
+            self._tier_sig_cache = self._hash_tensor_vectors(
+                self.dynamic_tier_vectors
+            )
+        return self._tier_sig_cache
+
+    def _monitor_signature(self) -> int:
+        """Cached hash of the global monitor configs (probe + params)."""
+        if self._monitor_sig_cache is None:
+            h = hashlib.sha256(b"dynsteer-monitor")
+            for hook in sorted(self.monitor_configs.keys()):
+                layers = self.monitor_configs[hook]
+                for layer_idx in sorted(layers.keys()):
+                    cfg = layers[layer_idx]
+                    h.update(hook.encode())
+                    h.update(int(layer_idx).to_bytes(4, "little", signed=True))
+                    h.update(
+                        cfg["probe"].detach().cpu().to(torch.float32).numpy().tobytes()
+                    )
+                    h.update(np.float64(cfg["threshold"]).tobytes())
+                    h.update(np.float64(cfg["sharpness"]).tobytes())
+            self._monitor_sig_cache = (
+                int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+            )
+        return self._monitor_sig_cache
+
+    @staticmethod
+    def _hash_tensor_vectors(
+        vectors: dict[str, dict[int, torch.Tensor]],
+    ) -> int:
+        """Deterministic, rank-identical hash of a hook→layer→tensor dict,
+        routed through :func:`hash_steering_config` (fp32 ``tobytes``)."""
+        if not vectors:
+            return 0
+        converted = {
+            hook: {
+                layer: t.detach().cpu().to(torch.float32).numpy()
+                for layer, t in layers.items()
+            }
+            for hook, layers in vectors.items()
+        }
+        return hash_steering_config(converted)
+
+    def effective_decode_signature(
+        self, dyn_id: int | None, base_decode_hash: int
+    ) -> int | None:
+        """Per-request effective decode steering signature, or ``None``.
+
+        Returns ``None`` when no dynamic decode steering applies to the
+        request (admitted ``base_decode_hash`` already identifies the KV).
+        Otherwise returns a deterministic hash folding the admitted decode
+        config with whatever dynamic steering shaped the decode KV — a
+        per-request override, the global dynamic tier (+ gain), and/or the
+        global in-graph monitor — so steered decode blocks are keyed by the
+        steering that produced them (and only reused by requests under the
+        identical effective steering). Rank-identical: all inputs are
+        rank-replicated, hashed with the same ``hash_steering_config``.
+        """
+        has_override = dyn_id is not None and dyn_id in self._dynamic_sig
+        has_tier = self.has_dynamic_tier
+        has_monitor = self.has_monitor
+        if not (has_override or has_tier or has_monitor):
+            return None
+        h = hashlib.sha256(b"dynsteer-decode-sig")
+        h.update(int(base_decode_hash).to_bytes(8, "little", signed=False))
+        if has_override:
+            h.update(b"\x01ovr")
+            h.update(int(self._dynamic_sig[dyn_id]).to_bytes(8, "little"))
+        if has_tier:
+            h.update(b"\x02tier")
+            h.update(int(self._tier_signature()).to_bytes(8, "little"))
+            # No quantization (decision locked): any gain change ⇒ new key.
+            h.update(np.float64(self.dynamic_tier_gain).tobytes())
+        if has_monitor:
+            h.update(b"\x03mon")
+            h.update(int(self._monitor_signature()).to_bytes(8, "little"))
+        return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
     # ------------------------------------------------------------------
     # Per-row strength scales (§5.3) — cheap "how much" knob
