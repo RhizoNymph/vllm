@@ -1,8 +1,62 @@
 # Plan: worker→scheduler steering notification for APC correctness
 
-Status: **PLAN — not yet implemented.** Companion to
+Status: **IMPLEMENTED (CPU; GPU validation pending).** Companion to
 `docs/design/dynamic_steering.md` (this resolves the §5.2 "known
 limitation" and the analogous holes for the §5.4 tier and §8 monitor).
+See "As built" below for how the final mechanism differs from (and
+simplifies) the strategy survey that follows.
+
+## 0. As built
+
+The implementation is simpler than Strategy A (§6) feared, because the
+block hasher is already **incremental and per-block**: `update_block_hashes`
+only appends hashes for newly-full blocks
+(`request_block_hasher`, kv_cache_utils.py), and each block's steering
+key is read from `request.block_hash_decode_steering_config_hash` at
+append time (`_gen_steering_extra_hash_keys`). So per-block keying needs
+**no hasher-core change** — only a *forward-only* update of that field
+(never the retroactive `clear()` in `set_block_hash_steering_overrides`).
+
+Final mechanism:
+- **Signature (worker, `SteeringManager.effective_decode_signature`)**: a
+  per-request `int` folding the admitted decode hash with the override-vec
+  hash, the tier-vec hash + gain (no quantization), and the monitor-param
+  hash. Component hashes are cached and invalidated on mutation
+  (`_dynamic_sig[dyn_id]`, `_tier_sig_cache`, `_monitor_sig_cache`).
+  Returns `None` when nothing dynamic applies. Rank-identical
+  (`hash_steering_config` over rank-replicated state).
+- **Worker reporting (mixin `_compute_decode_signature_deltas`)**: computed
+  at the end of `_update_steering_buffers` — i.e. from the steering state
+  *as applied this step*, before the sync consumer mutates state for the
+  next step. Delta-only (`_req_decode_sig_reported`): a request reverting
+  to admitted reports its plain admitted hash. Stashed on
+  `_pending_decode_sigs`, attached to `ModelRunnerOutput.steering_decode_signatures`
+  by the model runner (rank 0 canonical).
+- **Scheduler (`update_from_output` → `_apply_steering_decode_signatures`)**:
+  applies the deltas forward-only via `Request.update_decode_steering_signature`
+  *before* the per-request output loop appends this step's token (so the
+  block hashed in `_update_request_with_output` — sync and async schedulers
+  alike — gets the right key, then `cache_blocks` commits it correctly).
+  `_set_request_block_hash_steering_overrides` early-returns for requests
+  in `_req_decode_signature` (their key is forward-only owned; admission
+  capacity-fallback doesn't apply to dynamic-pool routing). Tracking is
+  cleared on finish (`_free_request`) and preemption (`_preempt_request`).
+- **Chain sensitivity (correctness bonus)**: block hashes chain through
+  the parent, so a block's key already reflects the *entire steering
+  history* of the prefix, not just the current block — a request that was
+  steered earlier in its decode and a request that wasn't get distinct
+  keys for every subsequent block automatically.
+
+Tier/monitor coverage shipped together with overrides (one signature
+function), so the M0/M1/M2 split below collapsed into a single correct
+implementation. The conservative "non-shareable poison" fallback (M0) was
+not needed.
+
+Tests: `tests/v1/worker/test_steering_apc_signature.py` (manager
+signature), `tests/v1/test_steering_apc_block_keys.py` (forward-only
+per-block keying + chain sensitivity), `TestSchedulerAPCDecodeSignatures`
+in `tests/v1/test_request_steering.py` (scheduler glue), plus the
+`_MixinHost` reporting path in `test_steering_dynamic_override.py`.
 
 ## 1. Problem
 
@@ -118,11 +172,13 @@ sig = hash_steering_config(admitted_decode_effective_vectors)         # base
 ```
 
 - **Tier**: hash the per-(layer,hook) tier vectors and fold the gain.
-  The gain is continuous; quantize (e.g. round to a fixed grid) so tiny
-  float drift doesn't explode the keyspace, and document that
-  sub-grid gain changes are treated as the same signature (a deliberate,
-  safe-direction approximation only if the grid is fine enough — else
-  treat any gain change as a new signature).
+  **Decision (locked): no quantization.** Any gain change ⇒ a new
+  signature, because KV at gain G1 is not byte-identical to KV at G2 and
+  bucketing would hand back wrong KV. This is correctness-exact. In
+  practice a steering configuration sits at a *fixed* gain for a given
+  vector, so the keyspace stays small; the only case that forgoes decode
+  reuse is a *continuously-modulating* (proportional) gain — see §8.1,
+  documented as intended behavior, not a regression.
 - **Override**: hash the override delta vectors (the consumer-supplied
   arrays), composed identically to how the row is populated
   (`global_decode_effective + override`).
@@ -193,6 +249,23 @@ for the existing capacity-fallback (admission-time) use.
   monitor into the signature (M0/M1 can start with overrides only, since
   that is the user's headline case, but the tier hole is real and should
   not ship half-fixed — call this out in the M0 PR).
+
+### 8.1 Gain modulation and reuse (intended behavior)
+
+With no quantization, the reusability of a steered decode block is decided
+by how the gain moves:
+
+- **Fixed gain** (a configuration pinned to one strength — the common
+  case): the signature is stable, so blocks under that config are
+  reusable across requests with the identical config + tokens.
+- **Binary engage** (gain ∈ {0, G}): two signatures; reuse works within
+  engaged and within disengaged spans.
+- **Continuously-modulating (proportional) gain**: the signature changes
+  most steps, so decode blocks produced while it is active are effectively
+  non-reusable — and because the *tier* is global, a proportional global
+  tier forgoes decode reuse for every request while active. This is
+  **intended**: returning KV from a different gain would be incorrect.
+  Document it so it reads as a policy consequence, not a cache regression.
 
 ## 8. Timing / latency analysis
 
