@@ -889,8 +889,27 @@ class SteeringModelRunnerMixin:
         # We must zero it before returning to ensure all gathers point to
         # row 0. We only do this on the transition; in the steady "nothing
         # ever active" case the index is already zero from initialization.
+        # A request carrying a per-request steering hash whose config is not
+        # yet registered must defeat the short-circuit. The decode-only case
+        # (prefill_hash == 0, decode_hash != 0) registers its decode config
+        # lazily at the prefill->decode transition in the loop below; if the
+        # short-circuit returns first, that transition never runs, the config
+        # is never registered, and the steering is silently dropped forever
+        # (config_to_row stays empty, so the short-circuit keeps firing). The
+        # admitted prefill config is registered at admission and shows up in
+        # config_to_row, but a decode-only request has none — hence the
+        # explicit batch scan here.
+        n_active = self.input_batch.num_reqs
+        batch_has_per_request_steering = bool(
+            n_active > 0
+            and (
+                self.input_batch.request_prefill_steering_hash[:n_active].any()
+                or self.input_batch.request_decode_steering_hash[:n_active].any()
+            )
+        )
         if (
-            not self._steering_manager.config_to_row
+            not batch_has_per_request_steering
+            and not self._steering_manager.config_to_row
             and not self._steering_manager.global_base_vectors
             and not self._steering_manager.global_prefill_vectors
             and not self._steering_manager.global_decode_vectors
