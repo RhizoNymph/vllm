@@ -39,12 +39,52 @@ class SteeringHookPoint(str, Enum):
     POST_MLP = "post_mlp"
     """Steer the residual skip tensor in the post-MLP region."""
 
+    # --- mHC (manifold-constrained hyper-connection) hook points ---
+    # These are only registered on mHC models (e.g. DeepSeek-V4) via the
+    # ``hook_widths`` argument to :func:`register_steering_buffers`; standard
+    # decoder layers register only the three single-stream hooks above
+    # (see ``STANDARD_STEERING_HOOKS``).  The string values match the capture
+    # framework's hook names so a tensor can be both captured and steered
+    # under one identifier.
+
+    MLP_IN = "mlp_in"
+    """Steer the single-stream pre-mixed FFN input (mHC models)."""
+
+    MLP_OUT = "mlp_out"
+    """Steer the single-stream FFN output (mHC models)."""
+
+    MHC_STREAMS_PRE_ATTN = "mhc_streams_pre_attn"
+    """Steer the multi-stream residual entering the attention sublayer."""
+
+    MHC_STREAMS_PRE_MLP = "mhc_streams_pre_mlp"
+    """Steer the multi-stream residual entering the FFN sublayer."""
+
+    MHC_STREAMS_FINAL = "mhc_streams_final"
+    """Steer the final multi-stream residual before the head fold."""
+
+
+# The single-stream residual hook points wired into every standard decoder
+# architecture. :func:`register_steering_buffers` registers exactly these
+# (each at the model ``hidden_size``) unless a model passes an explicit
+# ``hook_widths`` map. Adding new ``SteeringHookPoint`` members above does
+# NOT change what standard models register.
+STANDARD_STEERING_HOOKS: tuple[SteeringHookPoint, ...] = (
+    SteeringHookPoint.PRE_ATTN,
+    SteeringHookPoint.POST_ATTN,
+    SteeringHookPoint.POST_MLP,
+)
+
 
 # Buffer attribute names on decoder layer modules, keyed by hook point.
 HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "steering_table_pre_attn",
     SteeringHookPoint.POST_ATTN: "steering_table_post_attn",
     SteeringHookPoint.POST_MLP: "steering_table_post_mlp",
+    SteeringHookPoint.MLP_IN: "steering_table_mlp_in",
+    SteeringHookPoint.MLP_OUT: "steering_table_mlp_out",
+    SteeringHookPoint.MHC_STREAMS_PRE_ATTN: "steering_table_mhc_streams_pre_attn",
+    SteeringHookPoint.MHC_STREAMS_PRE_MLP: "steering_table_mhc_streams_pre_mlp",
+    SteeringHookPoint.MHC_STREAMS_FINAL: "steering_table_mhc_streams_final",
 }
 
 # Per-hook ``any-active`` flag attribute names. The flag is a single-element
@@ -69,6 +109,7 @@ def register_steering_buffers(
     max_steering_tokens: int,
     max_steering_configs: int,
     dtype: torch.dtype | None = None,
+    hook_widths: dict[SteeringHookPoint, int] | None = None,
 ) -> None:
     """Attach per-hook steering buffers to a decoder layer.
 
@@ -78,6 +119,16 @@ def register_steering_buffers(
     model's compute dtype (typically bf16) so the indexed gather in
     :func:`apply_steering` returns rows already aligned with the residual
     tensor and no dtype cast is required at the gather site.
+
+    ``hook_widths`` selects which hook points get a table and, for each,
+    the per-row width of that table. When ``None`` (the default for every
+    standard decoder architecture) exactly the three
+    :data:`STANDARD_STEERING_HOOKS` are registered, each ``hidden_size``
+    wide — historical behaviour. mHC models (e.g. DeepSeek-V4) pass an
+    explicit map so multi-stream residual hooks get ``num_streams *
+    hidden_size``-wide tables while single-stream hooks stay
+    ``hidden_size`` wide. The per-row gather in :func:`apply_steering`
+    reads each table's own width, so mixed widths coexist on one layer.
 
     When ``max_steering_configs == 0`` (steering disabled at the engine
     level — ``vllm_config.steering_config is None``), this is a no-op.
@@ -89,10 +140,12 @@ def register_steering_buffers(
     if max_steering_configs == 0:
         return
     table_dtype = dtype if dtype is not None else torch.float32
-    for hp in SteeringHookPoint:
+    if hook_widths is None:
+        hook_widths = {hp: hidden_size for hp in STANDARD_STEERING_HOOKS}
+    for hp, width in hook_widths.items():
         module.register_buffer(
             HOOK_POINT_TABLE_ATTR[hp],
-            torch.zeros(max_steering_configs + 3, hidden_size, dtype=table_dtype),
+            torch.zeros(max_steering_configs + 3, width, dtype=table_dtype),
             persistent=False,
         )
         # Per-hook activity flag.  A single-element bool tensor that the
@@ -173,6 +226,41 @@ def apply_layer_steering(
         module.steering_index,
         getattr(module, HOOK_POINT_ANY_ACTIVE_ATTR[hook_point]),
     )
+
+
+def apply_layer_steering_streams(
+    module: nn.Module,
+    streams: torch.Tensor,
+    hook_point: SteeringHookPoint,
+) -> torch.Tensor:
+    """Apply the steering table for ``hook_point`` to a multi-stream residual.
+
+    ``streams`` is ``(num_tokens, num_streams, hidden)`` — the mHC residual
+    carried as ``num_streams`` parallel hidden-size streams. The per-stream
+    steering vector is stored flattened as a ``(num_streams * hidden,)``
+    table row, so the tensor is flattened to ``(num_tokens, num_streams *
+    hidden)`` for both the capture tap and the indexed gather/add, then
+    reshaped back to the original 3-D shape.
+
+    This mirrors :func:`apply_layer_steering` exactly — capture-then-steer,
+    with the disabled path (no table buffer registered for this hook)
+    decided once at ``__init__`` so ``torch.compile`` traces it as a static
+    branch. When steering is disabled the flattened view is dead and folds
+    out of the compiled graph, leaving the capture tap's own ``None`` gate
+    as the only residual cost.
+    """
+    flat = streams.flatten(1)
+    maybe_capture_residual(flat, module.layer_idx, hook_point.value)
+    table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
+    if not hasattr(module, table_attr):
+        return streams
+    steered = torch.ops.vllm.apply_steering(
+        flat,
+        getattr(module, table_attr),
+        module.steering_index,
+        getattr(module, HOOK_POINT_ANY_ACTIVE_ATTR[hook_point]),
+    )
+    return steered.view_as(streams)
 
 
 def apply_steering(

@@ -195,17 +195,19 @@ class SteeringModelRunnerMixin:
         # avoiding CPU->GPU copies each step.
         table_device: torch.device | None = None
         table_dtype: torch.dtype | None = None
-        hidden_size: int | None = None
+        # All distinct table widths across this worker's steerable layers.
+        # mHC models register multi-stream residual hooks wider than the
+        # single-stream hooks, so the kernel must be warmed at each width to
+        # cover every gather shape the served window will hit.
+        table_widths: set[int] = set()
         for mod in steerable.values():
             for attr in HOOK_POINT_TABLE_ATTR.values():
                 if hasattr(mod, attr):
                     table_buf = getattr(mod, attr)
-                    table_device = table_buf.device
-                    table_dtype = table_buf.dtype
-                    hidden_size = table_buf.shape[1]
-                    break
-            if table_device is not None:
-                break
+                    if table_device is None:
+                        table_device = table_buf.device
+                        table_dtype = table_buf.dtype
+                    table_widths.add(table_buf.shape[1])
 
         self._steering_manager = SteeringManager(
             steering_config.max_steering_configs,
@@ -247,7 +249,7 @@ class SteeringModelRunnerMixin:
             table_device is not None
             and table_device.type == "cuda"
             and table_dtype is not None
-            and hidden_size is not None
+            and table_widths
         ):
             from vllm.model_executor.layers.steering_kernel import (
                 warmup_apply_steering_kernel,
@@ -260,14 +262,15 @@ class SteeringModelRunnerMixin:
                 if compilation_config is not None
                 else None
             )
-            warmup_apply_steering_kernel(
-                hidden_size=hidden_size,
-                table_rows=steering_config.max_steering_configs + 3,
-                table_dtype=table_dtype,
-                compute_dtype=compute_dtype,
-                device=table_device,
-                capture_sizes=list(capture_sizes) if capture_sizes else None,
-            )
+            for width in sorted(table_widths):
+                warmup_apply_steering_kernel(
+                    hidden_size=width,
+                    table_rows=steering_config.max_steering_configs + 3,
+                    table_dtype=table_dtype,
+                    compute_dtype=compute_dtype,
+                    device=table_device,
+                    capture_sizes=list(capture_sizes) if capture_sizes else None,
+                )
 
     # -----------------------------------------------------------------------
     # Steerable-layer discovery and vector-spec validation
