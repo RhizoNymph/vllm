@@ -79,10 +79,47 @@ class FilesystemCaptureRequest:
     layout: str | None = None     # "per_file" | "packed" | "sharded" (else default)
 ```
 
-Client `hooks` values may be a list of ints, the literal string
-`"all"`, or a dict `{"layers": [...], "ranges": [[a, b], ...]}`.
-`positions` accepts `"last_prompt"`, `"all_prompt"`,
-`"all_generated"`, `"all"`, or an explicit `list[int]`.
+Client `hooks` keys are hook-point names; values are layer selectors —
+a list of ints, the literal string `"all"`, or a dict
+`{"layers": [...], "ranges": [[a, b], ...]}`. `positions` accepts
+`"last_prompt"`, `"all_prompt"`, `"all_generated"`, `"all"`, or an
+explicit `list[int]`.
+
+**Available hooks** depend on the model — admission accepts only the
+hooks the model actually taps (its hook schema):
+
+- **Every model** (residual stream, `(hidden_size,)`, model dtype):
+  `pre_attn`, `post_attn`, `post_mlp`.
+- **DeepSeek-V4 (mHC)** instead taps: `pre_attn`, `post_attn`, `mlp_in`,
+  `mlp_out` (single-stream attention/FFN in-out, `(hidden_size,)` bf16);
+  `mhc_streams_pre_attn`, `mhc_streams_pre_mlp`, `mhc_streams_final`
+  (the multi-stream residual, reshaped to `(hc_mult, hidden_size)` bf16);
+  and the stream-mixing coefficients `mhc_attn_post_mix` /
+  `mhc_ffn_post_mix` (`(hc_mult,)` fp32) and `mhc_attn_res_mix` /
+  `mhc_ffn_res_mix` (the Sinkhorn matrix, `(hc_mult, hc_mult)` fp32).
+
+`mhc_streams_final` is a **model-level hook** — it fires once at the
+model tail, not per layer, so its layer selector is ignored; just write
+`{"mhc_streams_final": "all"}`.
+
+Example DeepSeek-V4 request capturing the FFN routing matrix and the
+entry streams on a couple of layers, last prompt token only:
+
+```python
+sampling_params.capture = {
+    "filesystem": {
+        "request_id": "probe-1",
+        "tag": "mhc-routing",
+        "hooks": {
+            "mhc_ffn_res_mix": [10, 20],       # (hc_mult, hc_mult) fp32
+            "mhc_streams_pre_attn": [10, 20],  # (hc_mult, hidden) bf16
+            "mhc_streams_final": "all",        # tail; selector ignored
+        },
+        "positions": "last_prompt",
+        "layout": "packed",
+    }
+}
+```
 
 **Layout** (`layout`, else the consumer's `default_layout`):
 
@@ -134,27 +171,48 @@ Client `hooks` values may be a list of ints, the literal string
 validator — characters outside `[a-zA-Z0-9._-]` are replaced with
 `_`, and `..` / leading `/` are rejected outright.
 
-**Payload**: raw tensor bytes in the model's residual dtype. `bf16`
-is stored as raw uint16 bytes; readers should round-trip through
-`torch.uint16.view(torch.bfloat16)`.
+**Payload**: raw tensor bytes in the hook's dtype. `bf16` is stored as
+raw uint16 bytes; readers round-trip through
+`torch.uint16.view(torch.bfloat16)`. fp32 hooks (mHC coefficients) are
+stored as native float32 — a single request may mix dtypes (bf16 streams
++ fp32 coefficients), so dtype is recorded **per entry**, not per file.
 
 **Sidecar JSON**: written atomically alongside the `.bin` on finalize.
 `per_file` sidecars carry `request_id`, `layer`, `hook`, `shape`,
 `dtype`, plus framework-propagated fields. `packed` sidecars carry
-`request_id`, `layout: "packed"`, `dtype`, and an `entries` list of
-`{layer, hook, offset, nbytes, shape}` indexing the `packed.bin`.
+`request_id`, `layout: "packed"`, a fallback `dtype`, and an `entries`
+list of `{layer, hook, offset, nbytes, shape}` indexing the `packed.bin`.
 `sharded` shard indexes carry `layout: "sharded"`, `shard_idx`, `seq`,
 `dtype`, and per-chunk `entries` that additionally include `request_id`
-(shards interleave many requests).
+(shards interleave many requests). Entries/sidecars also carry, when
+available:
+
+- `row_shape` — the per-row logical shape (e.g. `[hc_mult, hidden]` for an
+  mHC stream hook); the reader reshapes the flat `(rows, width)` tensor to
+  `(rows, *row_shape)`. Absent (a no-op) for standard residual hooks.
+- per-entry `dtype` (packed/sharded) — authoritative over the file-level
+  fallback, so mixed-dtype requests round-trip correctly.
+- `positions` — the absolute logical token position of each row. See dedup
+  below.
 
 **Reading**: `vllm.v1.capture.consumers.filesystem.reader` (NumPy-only)
 provides `read_per_file`, `read_packed`, `read_request` (auto-detects
 per_file/packed), and `read_sharded(tag_dir)` → `{request_id:
-{(layer, hook): array}}` (scans a tag's sealed shard indexes). Under
-pipeline parallelism, pointing `read_packed`/`read_request` at a request
-directory merges all per-stage `packed-pp{RR}` files, and `read_sharded`
-merges per-stage `shard-pp{RR}` files by request — callers get the full
-layer set transparently regardless of how many stages wrote it.
+{(layer, hook): CaptureEntry}}` (scans a tag's sealed shard indexes).
+A `CaptureEntry` carries `array` (reshaped per `row_shape`), `dtype`, and
+`positions`. Under pipeline parallelism, pointing
+`read_packed`/`read_request` at a request directory merges all per-stage
+`packed-pp{RR}` files, and `read_sharded` merges per-stage `shard-pp{RR}`
+files by request — callers get the full layer set transparently regardless
+of how many stages wrote it.
+
+**Speculative decoding** over-captures generated positions: a verify step
+records every candidate position, including draft tokens that are later
+rejected and re-forwarded, so an `all_generated` / `all` capture has more
+rows than the request generated (the accepted row for each position is the
+last one written). `reader.latest_per_position(entry)` collapses to one
+row per position, keeping the last — the canonical (accepted) value.
+Prompt selectors (`last_prompt` / `all_prompt`) are unaffected.
 
 #### Throughput tuning
 
