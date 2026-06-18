@@ -42,12 +42,23 @@ if TYPE_CHECKING:
 # ``(layer_idx, hook_name)`` so the lookup tables below translate
 # between the two representations.
 
+# Ids are baked into compiled graphs, so existing entries must keep their
+# values; new hooks append. Mirrors ``HookName`` in
+# ``vllm/v1/capture/types.py``.
 _HOOK_NAME_TO_ID: dict[str, int] = {
     "pre_attn": 0,
     "post_attn": 1,
     "post_mlp": 2,
     "mlp_in": 3,
     "mlp_out": 4,
+    # DeepSeek-V4 mHC targets (multi-stream residual + mixing coefficients).
+    "mhc_streams_pre_attn": 5,
+    "mhc_streams_pre_mlp": 6,
+    "mhc_streams_final": 7,
+    "mhc_attn_post_mix": 8,
+    "mhc_ffn_post_mix": 9,
+    "mhc_attn_res_mix": 10,
+    "mhc_ffn_res_mix": 11,
 }
 _HOOK_ID_TO_NAME: dict[int, str] = {v: k for k, v in _HOOK_NAME_TO_ID.items()}
 

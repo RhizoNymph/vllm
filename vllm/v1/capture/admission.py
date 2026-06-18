@@ -27,6 +27,7 @@ from vllm.v1.capture.errors import (
 from vllm.v1.capture.types import (
     CaptureContext,
     VllmInternalRequestId,
+    build_hook_schema,
     capture_expert_parallel_size,
     captured_prompt_positions,
     min_captured_prompt_position,
@@ -73,6 +74,11 @@ def build_capture_context(
         pipeline_parallel_size=parallel_config.pipeline_parallel_size,
         expert_parallel_size=capture_expert_parallel_size(parallel_config),
         data_parallel_size=parallel_config.data_parallel_size,
+        hook_schema=build_hook_schema(
+            hidden_size,
+            dt,
+            getattr(getattr(model_config, "hf_config", None), "hc_mult", None),
+        ),
     )
 
 
