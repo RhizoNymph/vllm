@@ -121,7 +121,13 @@ class SteeringManager:
         # global-vector update sets ``_tables_dirty`` (forcing a populate)
         # but does NOT need to rebuild the scratch tensors.
         self._cached_indices: torch.Tensor | None = None
-        self._cached_zero_row: torch.Tensor | None = None
+        # Zero-row sentinel per table width. mHC models register tables of
+        # more than one width on a single layer (single-stream hooks at
+        # ``hidden`` and multi-stream residual hooks at ``num_streams *
+        # hidden``), so the no-vector fallback row is cached per width
+        # rather than as one fixed-width tensor. Device-fixed, so entries
+        # never need invalidation.
+        self._cached_zero_rows: dict[int, torch.Tensor] = {}
         self._cached_ordered_configs: list[tuple[tuple[int, str], int]] | None = None
         self._indices_dirty: bool = True
 
@@ -549,12 +555,12 @@ class SteeringManager:
             self._tables_dirty = False
             return
 
-        # Derive device and hidden_size from the first active table.
-        # All tables registered through ``register_steering_buffers`` share
-        # the same device and hidden_size by construction.
-        first_table = active_tables[0][0]
-        device = first_table.device
-        hidden_size = first_table.shape[1]
+        # Derive device from the first active table; all tables share one
+        # device by construction. Widths may differ (mHC multi-stream
+        # residual hooks are ``num_streams * hidden`` wide while single-stream
+        # hooks are ``hidden`` wide), so per-width state — the zero sentinel
+        # row and the final stacked cast — is grouped by width below.
+        device = active_tables[0][0].device
 
         # Per-(hook, layer) "any non-zero row" tracking.  Filled in during
         # row assembly below and written into each layer's ``_any_active``
@@ -571,7 +577,6 @@ class SteeringManager:
         if (
             self._indices_dirty
             or self._cached_indices is None
-            or self._cached_zero_row is None
             or self._cached_ordered_configs is None
         ):
             new_ordered_configs: list[tuple[tuple[int, str], int]] = list(
@@ -581,16 +586,20 @@ class SteeringManager:
             self._cached_indices = torch.tensor(
                 target_indices_list, dtype=torch.long, device=device
             )
-            self._cached_zero_row = torch.zeros(
-                hidden_size, dtype=torch.float32, device=device
-            )
             self._cached_ordered_configs = new_ordered_configs
             self._indices_dirty = False
         indices: torch.Tensor = self._cached_indices
-        zero_row: torch.Tensor = self._cached_zero_row
         ordered_configs: list[tuple[tuple[int, str], int]] = (
             self._cached_ordered_configs
         )
+
+        def zero_row_for(width: int) -> torch.Tensor:
+            """Return a cached fp32 zero sentinel row of the given width."""
+            cached = self._cached_zero_rows.get(width)
+            if cached is None:
+                cached = torch.zeros(width, dtype=torch.float32, device=device)
+                self._cached_zero_rows[width] = cached
+            return cached
 
         # Build all rows for all active tables in fp32. ``all_rows`` ends
         # up shape ``(num_active_tables, num_rows, hidden)``. We do ONE
@@ -598,7 +607,8 @@ class SteeringManager:
         # per-(hook, layer), then index_copy_ each layer's slice.
         num_rows = 3 + len(ordered_configs)
         per_table_rows: list[list[torch.Tensor]] = []
-        for _table, hp_str, layer_idx, _mod in active_tables:
+        for table, hp_str, layer_idx, _mod in active_tables:
+            zero_row = zero_row_for(table.shape[1])
             base_vec = self._get_global_vec(hp_str, layer_idx, self.global_base_vectors)
             prefill_vec = self._get_global_vec(
                 hp_str, layer_idx, self.global_prefill_vectors
@@ -664,28 +674,28 @@ class SteeringManager:
             per_table_rows.append(rows)
             per_table_any_active.append(any_active)
 
-        # Stack all rows into one fp32 tensor of shape
-        # ``(num_active_tables, num_rows, hidden)`` and split by dtype.
-        # The vast majority of deployments use a single dtype across all
-        # tables, so the dtype loop is one iteration in the common case.
-        flat_rows: list[torch.Tensor] = [
-            r for table_rows in per_table_rows for r in table_rows
-        ]
-        stacked_fp32 = torch.stack(flat_rows).reshape(
-            len(active_tables), num_rows, hidden_size
-        )
-
-        # Group by dtype so we can do one cast per dtype.
-        dtype_to_indices: dict[torch.dtype, list[int]] = defaultdict(list)
+        # Group active tables by ``(width, dtype)``. Tables sharing a group
+        # stack into one ``(num_tables, num_rows, width)`` fp32 tensor and
+        # cast in a single launch; mixing widths in one stack is impossible,
+        # so width is the primary key. Both width and dtype are uniform
+        # across tables in the common (non-mHC) deployment, so this collapses
+        # to a single group and a single cast there.
+        group_to_positions: dict[tuple[int, torch.dtype], list[int]] = defaultdict(list)
         for i, (table, _hp, _layer, _mod) in enumerate(active_tables):
-            dtype_to_indices[table.dtype].append(i)
+            group_to_positions[(table.shape[1], table.dtype)].append(i)
 
-        for dtype, table_indices_in_active in dtype_to_indices.items():
-            # One batched cast covering every table that uses this dtype.
-            casted = stacked_fp32[table_indices_in_active].to(dtype=dtype)
-            for casted_pos, active_pos in enumerate(table_indices_in_active):
+        for (width, dtype), positions in group_to_positions.items():
+            group_rows: list[torch.Tensor] = [
+                r for pos in positions for r in per_table_rows[pos]
+            ]
+            stacked = (
+                torch.stack(group_rows)
+                .reshape(len(positions), num_rows, width)
+                .to(dtype=dtype)
+            )
+            for stacked_pos, active_pos in enumerate(positions):
                 table = active_tables[active_pos][0]
-                table.index_copy_(0, indices, casted[casted_pos])
+                table.index_copy_(0, indices, stacked[stacked_pos])
 
         # Write the per-(hook, layer) any-active flags into each layer's
         # bool buffer so the apply_steering kernel can short-circuit when

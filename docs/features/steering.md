@@ -45,12 +45,18 @@ End-to-end tested with real weights:
 Other listed architectures have hook wiring and pass small-decoder fixture
 tests but have not been validated against released checkpoints.
 
+Manifold-constrained hyper-connection (mHC) steering is wired for
+DeepSeek-V4 (`deepseek_v4`), which carries a multi-stream residual rather
+than a single residual. See [mHC Steering](#mhc-steering) for the extra
+hook points and the per-stream vector format.
+
 Also supported:
 
 - Global steering through HTTP endpoints
 - Per-request steering through `SamplingParams`
 - Three additive tiers (base / prefill-specific / decode-specific)
-- Three hook points: `pre_attn`, `post_attn`, `post_mlp`
+- Three hook points on standard models: `pre_attn`, `post_attn`, `post_mlp`
+  (mHC models expose a different hook set — see [mHC Steering](#mhc-steering))
 - Phase-aware scheduler admission for per-request steering
 - Prefix-cache separation for different prefill steering configs
 - Continuous batching
@@ -113,6 +119,52 @@ activation that is discarded immediately afterward.
 
 For supported models, these hooks are wired directly into each decoder
 layer's forward path. Unused hook points are zero-valued no-ops.
+
+## mHC Steering
+
+DeepSeek-V4 uses manifold-constrained hyper-connections (mHC): instead of
+one residual stream it carries `hc_mult` parallel hidden-size streams that
+are mixed per token. Steering is wired at both the single-stream sublayer
+boundaries and the multi-stream residual. The hook names are shared with
+the activation-capture framework (on branches that include it), so a
+tensor can be both captured and steered under one identifier.
+
+| Hook Point | Tensor | Vector shape | Width |
+| --- | --- | --- | --- |
+| `pre_attn` | single-stream pre-mixed attention input | `(hidden,)` | `hidden` |
+| `post_attn` | single-stream attention output | `(hidden,)` | `hidden` |
+| `mlp_in` | single-stream pre-mixed FFN input | `(hidden,)` | `hidden` |
+| `mlp_out` | single-stream FFN output | `(hidden,)` | `hidden` |
+| `mhc_streams_pre_attn` | multi-stream residual entering attention | `(hc_mult, hidden)` | `hc_mult * hidden` |
+| `mhc_streams_pre_mlp` | multi-stream residual entering the FFN | `(hc_mult, hidden)` | `hc_mult * hidden` |
+| `mhc_streams_final` | final multi-stream residual before the head fold | `(hc_mult, hidden)` | `hc_mult * hidden` |
+
+DeepSeek-V4 has no single-stream `post_mlp` hook — its end-of-layer
+residual is the multi-stream tensor, so steer `mhc_streams_pre_mlp` of the
+next layer (or `mhc_streams_final` at the tail) instead.
+
+Multi-stream hooks take an **independent vector per stream**. The vector is
+supplied flattened to `hc_mult * hidden` values in stream-major order
+(stream 0's full hidden vector, then stream 1's, …); to steer every stream
+identically, repeat the same `hidden`-length block `hc_mult` times. The
+wire format is unchanged from single-stream steering — the packed
+`(num_layers, width)` blob and the `SamplingParams` list-of-floats both
+just carry the wider row:
+
+```python
+import numpy as np
+
+# Steer stream 1 only, on mhc_streams_pre_attn of layer 20.
+hc_mult, hidden = 4, 4096
+row = np.zeros((hc_mult, hidden), dtype=np.float32)
+row[1] = my_direction  # (hidden,)
+params = SamplingParams(
+    steering_vectors={"mhc_streams_pre_attn": {20: row.reshape(-1).tolist()}},
+)
+```
+
+`mhc_streams_final` is a model-level hook: it is keyed to the last decoder
+layer index, so request it on that layer.
 
 ## Global Steering API
 
