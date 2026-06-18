@@ -118,6 +118,30 @@ points reuse the same row mapping but look up different per-hook tables.
 That is why steering supports multiple hook points without multiplying the
 per-token bookkeeping cost.
 
+### Per-hook table width
+
+A hook point's table is `(max_configs + 3, width)`. Standard decoder
+layers register exactly the three single-stream hooks (`pre_attn`,
+`post_attn`, `post_mlp`), all `width = hidden_size`. mHC models
+(DeepSeek-V4) instead pass an explicit `hook_widths` map to
+`register_steering_buffers`, registering single-stream sublayer hooks at
+`hidden_size` and multi-stream residual hooks at `hc_mult * hidden_size`
+on the same layer.
+
+The apply path stays uniform: `apply_layer_steering_streams` flattens a
+`(tokens, hc_mult, hidden)` residual to 2-D, runs the same indexed
+`apply_steering` gather/add (the kernel's hidden dim is a runtime arg), and
+reshapes back. The per-token row index, the row layout, and the
+`any_active` short-circuit are all width-agnostic. `SteeringManager`'s
+table population groups active tables by `(width, dtype)` so each width is
+stacked and cast in one launch — a single group in the non-mHC case.
+
+Because a multi-stream row is just the per-stream vectors concatenated,
+the wire format (`(num_layers, width)` packed blob; `SamplingParams`
+list-of-floats) needs no change: the row is simply `hc_mult * hidden` long.
+`mhc_streams_final` is model-level — it is registered only on the last
+decoder layer and keyed to that layer's index.
+
 ## Phase Semantics
 
 The critical invariant is:
@@ -228,6 +252,17 @@ To add steering to another model family, contributors need to wire:
 - per-hook steering tables
 - the shared steering index
 - `apply_steering` calls at the intended residual-stream hook points
+
+The standard wiring uses `apply_layer_steering(self, residual, hook_point)`
+at the three single-stream hooks (see `deepseek_v2.py` for a MoE reference).
+
+For a multi-stream (mHC) residual, pass an explicit `hook_widths` map to
+`register_steering_buffers` (single-stream hooks at `hidden_size`,
+multi-stream hooks at `hc_mult * hidden_size`) and apply with
+`apply_layer_steering_streams(self, streams, hook_point)`, which handles the
+flatten/reshape. `deepseek_v4` is the reference; its decoder layer routes
+the steerable tensors through these helpers while the fp32 mixing
+coefficients remain capture-only.
 
 The extension work is model-specific, but the runtime invariants above do not
 change.
