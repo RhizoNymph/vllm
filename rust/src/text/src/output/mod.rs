@@ -8,9 +8,11 @@ pub use logprobs::{
 mod decoded;
 mod logprobs;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{StreamExt as _, pin_mut};
+use vllm_engine_core_client::protocol::CaptureResult;
 
 use crate::{Error, FinishReason, Result, TextOutputStream};
 
@@ -25,6 +27,9 @@ pub struct CollectedTextOutput {
     pub finish_reason: FinishReason,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Per-consumer activation-capture results, keyed by consumer name. Empty
+    /// unless the request opted into capture.
+    pub capture_results: HashMap<String, CaptureResult>,
 }
 
 #[allow(clippy::manual_async_fn, reason = "specify `Send` bound")]
@@ -75,6 +80,7 @@ impl<T: TextOutputStream> T {
                                 token_ids: delta_token_ids,
                                 finish_reason: FinishReason::Error,
                                 kv_transfer_params: None,
+                                capture_results: HashMap::new(),
                             })
                         };
 
@@ -82,6 +88,7 @@ impl<T: TextOutputStream> T {
                             let mut collected = collected.unwrap();
                             collected.finish_reason = finished.finish_reason;
                             collected.kv_transfer_params = finished.kv_transfer_params;
+                            collected.capture_results = finished.capture_results;
                             return Ok(collected);
                         }
                     }
@@ -150,6 +157,7 @@ mod tests {
                     output_token_count: 2,
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);
@@ -264,6 +272,7 @@ mod tests {
                     output_token_count: 5,
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);

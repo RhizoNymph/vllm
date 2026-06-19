@@ -36,6 +36,7 @@ fn is_false(v: &bool) -> bool {
     !v
 }
 
+pub mod capture;
 mod classified_outputs;
 pub mod dtype;
 pub mod handshake;
@@ -45,6 +46,7 @@ pub mod stats;
 pub mod steering;
 pub mod tensor;
 pub mod utility;
+pub use capture::CaptureResult;
 pub use classified_outputs::{
     ClassifiedEngineCoreOutputs, DpControlMessage, RequestBatchOutputs, UtilityCallOutput,
 };
@@ -423,6 +425,13 @@ pub struct EngineCoreOutput {
     pub finish_reason: Option<EngineCoreFinishReason>,
     #[serde(default)]
     pub stop_reason: Option<StopReason>,
+    /// Per-request activation-capture results, keyed by consumer name. Populated
+    /// by engine-core for requests that opted into capture; empty otherwise.
+    ///
+    /// MUST stay positioned between `stop_reason` and `events` to match the
+    /// Python `EngineCoreOutput` tuple layout (`array_like`).
+    #[serde(default)]
+    pub capture_results: HashMap<String, CaptureResult>,
     #[serde(default)]
     pub events: Option<Vec<EngineCoreEvent>>,
     #[serde(default)]
@@ -611,6 +620,50 @@ mod tests {
     }
 
     #[test]
+    fn engine_core_output_capture_results_sit_at_tuple_index_7() {
+        let output = EngineCoreOutput {
+            request_id: "r".to_string(),
+            new_token_ids: vec![1],
+            stop_reason: Some(StopReason::Text("x".to_string())),
+            capture_results: HashMap::from([(
+                "filesystem".to_string(),
+                CaptureResult {
+                    key: None,
+                    status: "ok".to_string(),
+                    error: None,
+                    payload: Some(serde_json::json!({ "paths": ["/a.bin"] })),
+                },
+            )]),
+            events: Some(vec![EngineCoreEvent {
+                r#type: EngineCoreEventType::Queued,
+                timestamp: 1.0,
+            }]),
+            num_nans_in_logits: 3,
+            ..EngineCoreOutput::default()
+        };
+
+        // The output is an `array_like` tuple; capture_results MUST land at index
+        // 7 (between stop_reason and events) to match Python's layout.
+        let encoded = encode_msgpack(&output).unwrap();
+        let array = match decode_value(&encoded).unwrap() {
+            Value::Array(array) => array,
+            other => panic!("expected array, got {other:?}"),
+        };
+        assert!(
+            array[7].is_map(),
+            "capture_results must be at index 7, got {:?}",
+            array[7]
+        );
+
+        // Round-trip preserves capture_results AND every field after it — proving
+        // the tuple stays aligned for capture-enabled outputs.
+        let decoded: EngineCoreOutput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded.capture_results["filesystem"].status, "ok");
+        assert!(decoded.events.is_some());
+        assert_eq!(decoded.num_nans_in_logits, 3);
+    }
+
+    #[test]
     fn engine_core_outputs_roundtrip_finished_fields() {
         let outputs = EngineCoreOutputs {
             outputs: vec![EngineCoreOutput {
@@ -626,6 +679,7 @@ mod tests {
                 trace_headers: None,
                 prefill_stats: None,
                 routed_experts: None,
+                capture_results: Default::default(),
                 num_nans_in_logits: 0,
             }],
             finished_requests: Some(BTreeSet::from(["req-1".to_string()])),

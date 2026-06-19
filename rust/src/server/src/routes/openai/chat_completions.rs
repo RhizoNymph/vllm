@@ -30,6 +30,7 @@ use crate::routes::openai::chat_completions::types::{
     ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse,
     ChatMessageDelta,
 };
+use crate::routes::openai::utils::capture::build_capture_results_response;
 use crate::routes::openai::utils::logprobs::{
     decoded_logprobs_to_openai_chat, decoded_prompt_logprobs_to_maps,
 };
@@ -158,6 +159,7 @@ async fn collect_chat_completion(
         output_token_count,
         finish_reason,
         kv_transfer_params,
+        capture_results,
     } = collected;
     let stop_reason = finish_reason.as_stop_reason().map(stop_reason_to_json);
     let saw_tool_calls = message.tool_calls().next().is_some();
@@ -223,6 +225,7 @@ async fn collect_chat_completion(
         prompt_logprobs,
         prompt_token_ids: return_token_ids.then(|| prompt_token_ids.to_vec()),
         kv_transfer_params,
+        capture_results: build_capture_results_response(&capture_results),
     })
 }
 
@@ -888,6 +891,7 @@ mod tests {
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -951,6 +955,7 @@ mod tests {
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -1010,6 +1015,7 @@ mod tests {
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 

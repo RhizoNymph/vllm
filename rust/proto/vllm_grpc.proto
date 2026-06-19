@@ -209,6 +209,11 @@ message FinishInfo {
 
   google.protobuf.Struct kv_transfer_params = 6;
   //uint64 seed = 7;
+
+  // Per-consumer activation-capture results, keyed by consumer name. Present
+  // only when the request opted into capture. Each value is an object with
+  // `status`, optional `error`, and a consumer-specific `payload` object.
+  google.protobuf.Struct capture_results = 8;
 }
 
 // Info for candidate tokens other than the input/sampled

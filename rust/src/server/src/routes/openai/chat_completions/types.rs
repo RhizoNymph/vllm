@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -7,6 +7,7 @@ use serde_with::SerializeDisplay;
 use validator::Validate;
 use vllm_chat::ReasoningEffort;
 
+use crate::routes::openai::utils::capture::CaptureResultResponse;
 use crate::routes::openai::utils::steering::SteeringSpecPacked;
 use crate::routes::openai::utils::structured_outputs::ResponseFormat;
 use crate::routes::openai::utils::types::{
@@ -365,6 +366,9 @@ pub(super) struct ChatCompletionResponse {
     pub prompt_logprobs: Option<Vec<Option<HashMap<String, f32>>>>,
     pub prompt_token_ids: Option<Vec<u32>>,
     pub kv_transfer_params: Option<Value>,
+    /// Per-consumer activation-capture results, omitted when the request did
+    /// not capture.
+    pub capture_results: Option<BTreeMap<String, CaptureResultResponse>>,
 }
 
 /// Mirrors the Python vLLM `ChatCompletionResponseChoice` class.

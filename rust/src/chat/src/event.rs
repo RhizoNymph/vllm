@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use vllm_engine_core_client::protocol::CaptureResult;
 use vllm_text::{DecodedLogprobs, DecodedPromptLogprobs};
 
 use crate::FinishReason;
@@ -179,5 +181,7 @@ pub enum ChatEvent {
         finish_reason: FinishReason,
         /// Connector-specific KV transfer parameters for disaggregated serving.
         kv_transfer_params: Option<serde_json::Value>,
+        /// Per-consumer activation-capture results, keyed by consumer name.
+        capture_results: HashMap<String, CaptureResult>,
     },
 }

@@ -12,6 +12,7 @@ use vllm_text::{
 };
 
 use super::pb;
+use crate::routes::openai::utils::capture::build_capture_results_response;
 use crate::routes::openai::utils::steering::unpack_steering_hook;
 
 // ========================================================================================
@@ -366,11 +367,17 @@ fn to_finish_info(finished: &Finished, token_ids: &[u32]) -> pb::FinishInfo {
         }
     };
 
+    let capture_results = build_capture_results_response(&finished.capture_results)
+        .and_then(|results| serde_json::to_value(results).ok())
+        .as_ref()
+        .and_then(json_to_proto_struct);
+
     pb::FinishInfo {
         num_output_tokens: finished.output_token_count as u32,
         finish_reason,
         stop_reason,
         kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_proto_struct),
+        capture_results,
     }
 }
 
@@ -723,6 +730,7 @@ mod tests {
             output_token_count: 0,
             finish_reason: reason,
             kv_transfer_params: None,
+            capture_results: Default::default(),
         }
     }
 

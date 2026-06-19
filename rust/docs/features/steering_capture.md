@@ -26,10 +26,15 @@ performs all resolution, admission, and execution.
   model-dtype arrays and capture prefix-cache admission live in the Python
   engine-core. The frontend only decodes the wire format and forwards. (Capture
   admission is the engine-core's idempotent "offline" path in
-  `vllm/v1/engine/input_processor.py`.)
-- **Capture results are fire-and-forget.** The frontend does not surface
-  `capture_results` in responses; consumers (e.g. filesystem) write out of band.
-  See *Follow-ups* below.
+  `vllm/v1/engine/input_processor.py`.) Note: the Python OpenAI entrypoint's
+  `_admit_capture` ALSO validates each consumer spec synchronously (clean `400`
+  on a bad spec); the Rust frontend defers that validation to the engine-core,
+  so a malformed capture spec surfaces as an engine error rather than up front.
+- **Capture results only on non-streaming responses.** Mirroring Python, the
+  `capture_results` field is returned on the non-streaming completion/chat
+  responses (and the gRPC `FinishInfo`), not in SSE stream chunks. Capture still
+  executes for streaming requests — consumers write activations out of band; the
+  results are simply not echoed in the stream.
 
 ## Data / control flow
 
@@ -58,6 +63,28 @@ HTTP CompletionRequest / ChatCompletionRequest        gRPC pb::GenerateRequest
                                   ▼
                   Python engine-core SamplingParams (ZMQ msgpack)
 ```
+
+### Capture results (return path)
+
+For a capturing request, engine-core attaches `capture_results` (keyed by
+consumer name) to its output. That value rides back up alongside
+`kv_transfer_params`:
+
+```
+EngineCoreOutput.capture_results        # msgpack tuple index 7 (CaptureResult map)
+  → GenerateOutput / CollectedGenerateOutput   (llm)
+  → Finished / CollectedTextOutput             (text)
+  → ChatEvent::Done / CollectedAssistantMessage (chat)
+  → build_capture_results_response()           (coerce payload, omit when empty)
+  → CompletionResponse.capture_results / ChatCompletionResponse.capture_results
+    (and gRPC FinishInfo.capture_results)
+```
+
+`EngineCoreOutput.capture_results` MUST stay at tuple index 7 (between
+`stop_reason` and `events`) to match Python's `array_like` layout — a wire test
+pins this, and the `python_compat.py` fixture mirror carries the same field.
+Each result is coerced to `{status, error?, payload}` where `payload` is always
+an object (mirroring Python's `_capture_result_to_response_payload`).
 
 The packed → inline decode is the only transformation; everything else is
 pass-through field threading.
@@ -139,7 +166,11 @@ validation.
 | `src/cmd/src/cli.rs` | `--steering-modules name=path` flag + `parse_steering_module` |
 | `src/server/src/state.rs` | `AppState.steering_module_names` (RwLock), `steering_module_error`, registry mutators, `lock_steering_mutations` |
 | `src/engine-core-client/src/protocol/steering.rs` | inline types `SteeringLayerEntry`, `SteeringVectorSpec` |
-| `src/engine-core-client/src/protocol/mod.rs` | `EngineCoreSamplingParams` southbound fields (`steering_vectors`, `prefill_steering_vectors`, `decode_steering_vectors`, `steering_module_ref`, `capture`) |
+| `src/engine-core-client/src/protocol/mod.rs` | `EngineCoreSamplingParams` southbound fields; `EngineCoreOutput.capture_results` (tuple index 7) |
+| `src/engine-core-client/src/protocol/capture.rs` | `CaptureResult` wire type (`{key, status, error, payload}`) |
+| `src/server/src/routes/openai/utils/capture.rs` | `CaptureResultResponse` + `build_capture_results_response` (payload coercion) |
+| `src/{llm,text,chat}` output structs | `capture_results` threaded alongside `kv_transfer_params` to the terminal/collected output |
+| `src/server/src/routes/openai/{completions,chat_completions}` | surface `capture_results` on non-streaming responses |
 | `src/text/src/request.rs` | `SamplingParams` user-facing fields (incl. `steering_name`, `capture`) |
 | `src/text/src/lower.rs` | `lower_sampling_params` — threads fields; `steering_name → steering_module_ref` |
 | `src/server/src/routes/openai/utils/steering.rs` | `SteeringHookPacked` HTTP DTO, `SteeringSpecPacked`, `SteeringDecodeError`, `unpack_steering_hook`, `unpack_steering_spec` |
@@ -163,11 +194,14 @@ validation.
   capture dict matches the HTTP/JSON path (layer/position indices stay ints).
 - **`steering_name` → `(name, 1.0)`**: matches the Python OpenAI entrypoint; the
   worker applies the request scale.
+- **`EngineCoreOutput.capture_results` at tuple index 7**: must stay between
+  `stop_reason` and `events` to match Python's `array_like` layout. A wire test
+  and the `python_compat.py` fixture mirror both pin this.
 
 ## Follow-ups (TODO)
 
-- Surface `capture_results` in responses. The Python `EngineCoreOutput` carries
-  `capture_results` at tuple index 7 (between `stop_reason` and `events`); the
-  Rust `EngineCoreOutput` tuple in `protocol/mod.rs` predates that field and is
-  therefore misaligned for capture-enabled engines. Returning results requires
-  inserting the field at the correct position and threading it to the responses.
+- Capture-spec validation parity: replicate the Python entrypoint's synchronous
+  `_admit_capture` consumer-spec validation in the Rust frontend so malformed
+  specs are rejected with a `400` up front rather than as an engine error.
+- Surface `capture_results` in streaming responses (Python does not today, so
+  this would be an extension beyond parity).

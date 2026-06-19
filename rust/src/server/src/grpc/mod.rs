@@ -81,6 +81,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
             output_token_count: collected.token_ids.len(),
             finish_reason: collected.finish_reason,
             kv_transfer_params: collected.kv_transfer_params,
+            capture_results: collected.capture_results,
         };
 
         let outputs = convert::to_sequence_output(
