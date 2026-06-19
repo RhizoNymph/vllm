@@ -14,9 +14,11 @@ IS_ROCM = current_platform.is_rocm()
 """ROCm needs shape normalization before calling some vLLM C kernels."""
 
 rms_no_var_size = lambda x, weight, epsilon, variance_size=None: (
-    variance_size is None and (weight is None or weight.dtype == x.dtype)
+    variance_size is None and weight is not None and weight.dtype == x.dtype
 )
-"""vLLM kernel requires no variance_size override and matching input/weight dtype."""
+"""vLLM kernel requires no variance_size override, a real weight (the C op
+cannot take a None/undefined weight — weightless norms like Gemma4's v_norm
+must fall back to the native impl), and matching input/weight dtype."""
 
 
 @ir.ops.rms_norm.register_impl(
@@ -42,9 +44,10 @@ def rms_norm(
 
 
 rms_add_no_var_size = lambda x, x_residual, weight, epsilon, variance_size=None: (
-    variance_size is None and (weight is None or weight.dtype == x.dtype)
+    variance_size is None and weight is not None and weight.dtype == x.dtype
 )
-"""vLLM Kernel does not support variance_size parameter and requires
+"""vLLM Kernel does not support the variance_size parameter, cannot take a
+None/undefined weight (weightless norms fall back to native), and requires
 matching input/weight dtype."""
 
 
