@@ -16,7 +16,8 @@ performs all resolution, admission, and execution.
   dict, verbatim southbound.
 - **Named steering modules**: load module JSON files at startup
   (`--steering-modules name=path`), broadcast them to the engine workers, and
-  validate per-request `steering_name` against the registry. See
+  validate per-request `steering_name` against the registry. Also manage the
+  registry at runtime via `GET`/`POST`/`DELETE /v1/steering/modules`. See
   *Named steering modules* below.
 
 ### Non-scope
@@ -29,9 +30,6 @@ performs all resolution, admission, and execution.
 - **Capture results are fire-and-forget.** The frontend does not surface
   `capture_results` in responses; consumers (e.g. filesystem) write out of band.
   See *Follow-ups* below.
-- **No runtime steering-module mutation.** Modules are loaded once at startup;
-  there is no add/remove/list HTTP endpoint (the `unregister_steering_modules`
-  worker RPC exists but is not wired). See *Follow-ups* below.
 
 ## Data / control flow
 
@@ -110,15 +108,36 @@ before forwarding: an unknown name is rejected up front (HTTP
 `invalid_request` on `steering_name`; gRPC `NotFound`) rather than failing later
 in the worker.
 
+### Runtime registry endpoints
+
+The registry can also be managed at runtime (the counterpart of the startup
+load), re-broadcasting on every change:
+
+- `GET /v1/steering/modules` — list registered names → `{ "modules": [...] }`.
+- `POST /v1/steering/modules` — register/replace. Body:
+  `{ "modules": { "<name>": { "vectors": ..., "prefill_vectors": ..., "decode_vectors": ... } }, "replace": false }`
+  (tiers inline or packed, same shapes as the module file). `replace: true`
+  makes the provided set the entire registry; `false` adds/overrides. Calls
+  `register_modules` (broadcast + pre-materialize) then updates the name set.
+- `DELETE /v1/steering/modules/{name}` — unregister one module
+  (`unregister_steering_modules` worker RPC, releasing its pinned rows). Unknown
+  name → `400`.
+
+Mutations are serialized by `AppState.lock_steering_mutations()` so concurrent
+register/unregister requests cannot interleave their broadcasts. The name set is
+an `RwLock<HashSet<String>>` read on every request for `steering_name`
+validation.
+
 ## Related files
 
 | file | role / key exports |
 | ---- | ------------------ |
 | `rust/proto/vllm_grpc.proto` | `SteeringHookPacked`, `Steering`, and `GenerateRequest.steering` / `.capture` (`google.protobuf.Struct`) |
-| `src/server/src/steering_modules.rs` | `load_steering_module`, `load_and_broadcast_steering_modules` (startup registry broadcast) |
+| `src/server/src/steering_modules.rs` | `load_steering_module`, `parse_module`, `load_and_broadcast_steering_modules`, `register_modules`, `unregister_modules` |
+| `src/server/src/routes/steering.rs` | runtime endpoints: list / register / unregister |
 | `src/server/src/config.rs` | `SteeringModulePath`, `Config.steering_modules` |
 | `src/cmd/src/cli.rs` | `--steering-modules name=path` flag + `parse_steering_module` |
-| `src/server/src/state.rs` | `AppState.steering_module_names`, `steering_module_error` (request validation) |
+| `src/server/src/state.rs` | `AppState.steering_module_names` (RwLock), `steering_module_error`, registry mutators, `lock_steering_mutations` |
 | `src/engine-core-client/src/protocol/steering.rs` | inline types `SteeringLayerEntry`, `SteeringVectorSpec` |
 | `src/engine-core-client/src/protocol/mod.rs` | `EngineCoreSamplingParams` southbound fields (`steering_vectors`, `prefill_steering_vectors`, `decode_steering_vectors`, `steering_module_ref`, `capture`) |
 | `src/text/src/request.rs` | `SamplingParams` user-facing fields (incl. `steering_name`, `capture`) |
@@ -152,6 +171,3 @@ in the worker.
   Rust `EngineCoreOutput` tuple in `protocol/mod.rs` predates that field and is
   therefore misaligned for capture-enabled engines. Returning results requires
   inserting the field at the correct position and threading it to the responses.
-- Runtime steering-module mutation: add/remove/list HTTP endpoints that
-  re-broadcast via `register_steering_modules` / `unregister_steering_modules`
-  (the worker RPCs already exist; only startup load is wired today).

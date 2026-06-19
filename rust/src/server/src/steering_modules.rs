@@ -88,6 +88,15 @@ pub fn load_steering_module(
         });
     };
 
+    parse_module(&obj)
+}
+
+/// Parse one module's `{vectors, prefill_vectors, decode_vectors}` object into
+/// the broadcast form. Shared by the file loader and the runtime register
+/// endpoint (which receives the same shape inline in the request body).
+pub fn parse_module(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<SteeringModuleBroadcast, SteeringModuleLoadError> {
     Ok(SteeringModuleBroadcast {
         vectors: load_tier(obj.get("vectors"), "vectors")?,
         prefill_vectors: load_tier(obj.get("prefill_vectors"), "prefill_vectors")?,
@@ -117,33 +126,8 @@ pub async fn load_and_broadcast_steering_modules(
         payload.insert(module.name.clone(), loaded);
     }
 
-    // Push the full registry to every worker, replacing any prior state.
-    client
-        .collective_rpc(
-            "register_steering_modules",
-            None,
-            Vec::<Value>::new(),
-            RegisterKwargs {
-                modules: &payload,
-                replace: true,
-            },
-        )
-        .await
-        .context("failed to broadcast steering modules to engine workers")?;
-
-    // Eagerly materialize each module's rows so the first request resolving to
-    // one hits the warm cache instead of paying the cold-path upload.
-    for name in payload.keys() {
-        client
-            .collective_rpc(
-                "pre_materialize_steering_module",
-                None,
-                Vec::<Value>::new(),
-                PreMaterializeKwargs { name },
-            )
-            .await
-            .with_context(|| format!("failed to pre-materialize steering module '{name}'"))?;
-    }
+    // Startup pushes the full registry, replacing any prior state.
+    register_modules(client, &payload, true).await?;
 
     let names: HashSet<String> = payload.into_keys().collect();
     let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -152,17 +136,68 @@ pub async fn load_and_broadcast_steering_modules(
     Ok(names)
 }
 
-/// `kwargs` for the worker's `register_steering_modules(modules, replace)`.
-#[derive(Debug, Serialize)]
-struct RegisterKwargs<'a> {
-    modules: &'a HashMap<String, SteeringModuleBroadcast>,
+/// Broadcast a set of modules to every engine worker and pre-materialize them.
+///
+/// With `replace = true` the worker registry is cleared first (the modules
+/// become the entire registry); with `replace = false` they are added to /
+/// override the existing entries. Shared by startup and the runtime register
+/// endpoint.
+pub async fn register_modules(
+    client: &EngineCoreClient,
+    payload: &HashMap<String, SteeringModuleBroadcast>,
     replace: bool,
+) -> anyhow::Result<()> {
+    // Worker `kwargs` must reach Python as a msgpack *map*. The utility-call
+    // path encodes args with `rmpv::ext::to_value`, which serializes Rust
+    // structs as arrays — so the kwargs (and the nested module specs) are built
+    // as `serde_json::Value` maps instead. Layer keys become strings here; the
+    // worker's `_module_payload_to_specs` coerces them back to int.
+    let modules = serde_json::to_value(payload).context("encode steering module payload")?;
+    let kwargs = serde_json::json!({ "modules": modules, "replace": replace });
+    client
+        .collective_rpc(
+            "register_steering_modules",
+            None,
+            Vec::<Value>::new(),
+            kwargs,
+        )
+        .await
+        .context("failed to broadcast steering modules to engine workers")?;
+
+    // Eagerly materialize each module's rows so the first request resolving to
+    // one hits the warm cache instead of paying the cold-path upload.
+    for name in payload.keys() {
+        let kwargs = serde_json::json!({ "name": name });
+        client
+            .collective_rpc(
+                "pre_materialize_steering_module",
+                None,
+                Vec::<Value>::new(),
+                kwargs,
+            )
+            .await
+            .with_context(|| format!("failed to pre-materialize steering module '{name}'"))?;
+    }
+    Ok(())
 }
 
-/// `kwargs` for the worker's `pre_materialize_steering_module(name)`.
-#[derive(Debug, Serialize)]
-struct PreMaterializeKwargs<'a> {
-    name: &'a str,
+/// Drop the named modules from every engine worker's registry, releasing the
+/// pre-materialized row pins they held.
+pub async fn unregister_modules(client: &EngineCoreClient, names: &[String]) -> anyhow::Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let kwargs = serde_json::json!({ "names": names });
+    client
+        .collective_rpc(
+            "unregister_steering_modules",
+            None,
+            Vec::<Value>::new(),
+            kwargs,
+        )
+        .await
+        .context("failed to unregister steering modules on engine workers")?;
+    Ok(())
 }
 
 /// Decode one tier value into the inline spec, or `None` when absent/empty.
