@@ -23,9 +23,9 @@ from vllm.v1.worker.gpu.steering_runner_mixin import SteeringRunnerMixin
 
 
 class _FakeManager:
-    def __init__(self):
+    def __init__(self, has_globals=False):
         self.config_to_row: dict = {}
-        self.global_base_vectors: dict = {}
+        self.global_base_vectors: dict = {"pre_attn": {0: [1.0]}} if has_globals else {}
         self.global_prefill_vectors: dict = {}
         self.global_decode_vectors: dict = {}
         self._tables_dirty = False
@@ -41,7 +41,14 @@ class _FakeManager:
         self.released.append((h, phase))
 
     def get_row_for_config(self, h, is_prefill):
-        return int(h)  # row == hash keeps the expected index readable
+        # Mirror SteeringManager: a per-request hash maps to its own row; hash 0
+        # maps to the global prefill (1) / decode (2) row when globals are set,
+        # else to the row-0 no-steer sentinel.
+        if h != 0:
+            return int(h)
+        if self.global_base_vectors:
+            return 1 if is_prefill else 2
+        return 0
 
     def populate_steering_tables(self, layers):
         self.populated += 1
@@ -55,9 +62,11 @@ def _layer(num_tokens=16):
     return layer
 
 
-def _make_glue(num_computed, max_tokens=16, max_seqs=8):
+def _make_glue(
+    num_computed, prompt_len=None, has_globals=False, max_tokens=16, max_seqs=8
+):
     glue = SteeringRunnerMixin.__new__(SteeringRunnerMixin)
-    glue._steering_manager = _FakeManager()
+    glue._steering_manager = _FakeManager(has_globals=has_globals)
     glue._steerable_layers_cache = {0: _layer(max_tokens)}
     glue._steering_reqs = {}
     glue._steering_index_dirty = False
@@ -65,8 +74,11 @@ def _make_glue(num_computed, max_tokens=16, max_seqs=8):
     glue._steering_rows_scratch = np.zeros(max_seqs, dtype=np.int64)
     glue._steering_n_tokens_scratch = np.zeros(max_seqs, dtype=np.int64)
     glue._steering_index_pinned = torch.zeros(max_tokens, dtype=torch.long)
+    if prompt_len is None:
+        prompt_len = [0] * len(num_computed)
     glue.req_states = SimpleNamespace(
-        num_computed_tokens_np=np.asarray(num_computed, dtype=np.int32)
+        num_computed_tokens_np=np.asarray(num_computed, dtype=np.int32),
+        prompt_len=SimpleNamespace(np=np.asarray(prompt_len, dtype=np.int32)),
     )
     # Avoid building real SamplingParams: the resolve step just needs to be truthy.
     glue._resolve_request_steering = lambda sp, phase: {"pre_attn": {0: [1.0]}}
@@ -175,6 +187,23 @@ def test_update_buffers_builds_per_token_index_and_transition():
     assert (7, "prefill") in glue._steering_manager.released
     assert (9, "decode") in glue._steering_manager.registered
     assert glue._steering_reqs["p"].phase == "decode"
+
+
+def test_global_steering_applies_to_untracked_request():
+    # Globals are set but the request carries no per-request config (untracked);
+    # it must still pick up the global row, not the no-steer sentinel.
+    glue = _make_glue(num_computed=[0], prompt_len=[5], has_globals=True)
+    input_batch = SimpleNamespace(
+        num_reqs=1, req_ids=["g"], idx_mapping_np=np.asarray([0], dtype=np.int32)
+    )
+    sched = SimpleNamespace(num_scheduled_tokens={"g": 5})
+
+    glue._update_steering_buffers_v2(sched, input_batch)
+
+    steering_index = glue._steerable_layers_cache[0].steering_index
+    # Prefilling (computed 0 < prompt 5) with globals -> global prefill row 1.
+    assert steering_index[:5].tolist() == [1, 1, 1, 1, 1]
+    assert steering_index[5:].sum().item() == 0
 
 
 def test_update_buffers_short_circuit_zeroes_dirty_index():

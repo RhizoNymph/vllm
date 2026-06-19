@@ -509,10 +509,6 @@ class VllmConfig:
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
-            # An explicit opt-in still runs through _validate_v2_model_runner(),
-            # which fails closed on _get_v2_model_runner_unsupported_features()
-            # (steering/capture included), so the override can't silently land
-            # on a runner that would no-op those features.
             return use_v2_model_runner
 
         if not self._is_default_v2_model_runner_model():
@@ -2072,26 +2068,7 @@ class VllmConfig:
             # Will be added by https://github.com/vllm-project/vllm/pull/38390
             unsupported.append("EC transfer")
 
-        unsupported.extend(self._v2_model_runner_silently_broken_features())
-
         return unsupported
-
-    def _v2_model_runner_silently_broken_features(self) -> list[str]:
-        """Features the v2 model runner would silently no-op rather than fail on.
-
-        The activation steering and capture control planes are only wired into
-        the v1 model runner. The v2 runner loads the same model (so the layer
-        hooks exist) but never populates the steering tables or installs a
-        capture manager, so these features would silently do nothing instead of
-        raising. Callers must treat them as unsupported until the control plane
-        is ported to v2.
-        """
-        features: list[str] = []
-        if self.steering_config is not None:
-            features.append("activation steering")
-        if self.capture_consumers_config is not None:
-            features.append("activation capture")
-        return features
 
     def _validate_v2_model_runner(self) -> None:
         """Check for features not yet supported by the V2 model runner."""

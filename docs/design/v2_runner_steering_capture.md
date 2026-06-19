@@ -119,11 +119,23 @@ only rank-identical inputs.
    already forwards the RPCs to `self.model_runner.*`.
    Tests: `tests/v1/worker/test_gpu_v2_steering_glue.py`.
 
-### Known gaps to confirm on GPU
+### Validation
 
-- Capture: streaming re-add (manager re-register may error) and preemption resume.
-- Steering: preemption resume assumes the request re-enters via `add_requests`
-  (not `update_requests`); spec-decode + steering token layout not yet exercised.
+GPU-validated on Qwen3-0.6B (RTX 3090, TP1/PP1), forcing
+`VLLM_USE_V2_MODEL_RUNNER=1`:
+
+- Steering (eager **and** cudagraph): global `set_steering_vectors` shifts the
+  output and `clear_steering_vectors` restores the exact baseline — confirming
+  the persistent-buffer path is cudagraph-safe (no force-eager).
+- Capture (eager): a client-spec request (`post_attn`, layer 5, `last_prompt`)
+  delivers one `(1, hidden)` bf16 row to a driver consumer's `on_capture`.
+
+Once validated, the interim Phase-1 fallback guard was removed so v2 actually
+runs these features (auto-selected for Qwen3, or via the env override).
+
+Not yet exercised on GPU (mirrors v1, but unverified here): TP>1 / PP>1,
+per-request inline steering and named modules, capture prefix-cache reuse,
+preemption resume, and spec-decode token layout.
 
 ## Validation
 

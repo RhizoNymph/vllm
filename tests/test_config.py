@@ -148,41 +148,6 @@ def test_is_default_v2_model_runner_model(model_config, expected):
     assert VllmConfig._is_default_v2_model_runner_model(config) is expected
 
 
-# A non-None sentinel stands in for a configured SteeringConfig /
-# CaptureConsumersConfig; the predicate only checks ``is not None``.
-_ENABLED = object()
-
-
-@pytest.mark.parametrize(
-    ("steering_config", "capture_config", "expected"),
-    [
-        (None, None, []),
-        (_ENABLED, None, ["activation steering"]),
-        (None, _ENABLED, ["activation capture"]),
-        (_ENABLED, _ENABLED, ["activation steering", "activation capture"]),
-    ],
-)
-def test_v2_silently_broken_features(steering_config, capture_config, expected):
-    config = SimpleNamespace(
-        steering_config=steering_config,
-        capture_consumers_config=capture_config,
-    )
-
-    assert VllmConfig._v2_model_runner_silently_broken_features(config) == expected
-
-
-def test_validate_v2_model_runner_fails_closed_on_silently_broken(monkeypatch):
-    # An explicit VLLM_USE_V2_MODEL_RUNNER opt-in is enforced here: a config the
-    # v2 runner would silently no-op must raise rather than be honored.
-    monkeypatch.setattr(vllm_config_module, "HAS_TRITON", True)
-    config = SimpleNamespace(
-        _get_v2_model_runner_unsupported_features=lambda: ["activation steering"],
-    )
-
-    with pytest.raises(ValueError, match="activation steering"):
-        VllmConfig._validate_v2_model_runner(config)
-
-
 @pytest.mark.skip_global_cleanup
 def test_with_hf_config_populates_missing_architectures_from_causal_lm_mapping(
     monkeypatch,

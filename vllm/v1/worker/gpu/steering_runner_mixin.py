@@ -260,6 +260,7 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
             self._steering_n_tokens_scratch = n_tokens_scratch
 
         num_computed_np = self.req_states.num_computed_tokens_np
+        prompt_len_np = self.req_states.prompt_len.np
         active_count = 0
         for i in range(num_reqs):
             req_id = req_ids[i]
@@ -267,26 +268,30 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
             if n_tokens == 0:
                 continue
 
+            req_idx = int(idx_np[i])
+            num_computed = int(num_computed_np[req_idx])
+            # Untracked requests (no per-request config) still pass through
+            # get_row_for_config with hash 0 so any global vectors apply — the
+            # manager maps hash 0 to the global prefill/decode row (or to the
+            # row-0 no-steer sentinel when no globals are set).
             rs = reqs.get(req_id)
-            if rs is None:
-                # No steering for this request — row 0 is the no-steer sentinel.
-                rows_scratch[active_count] = 0
-                n_tokens_scratch[active_count] = n_tokens
-                active_count += 1
-                continue
+            if rs is not None:
+                num_prompt = rs.num_prompt_tokens
+                prefill_hash = rs.prefill_hash
+                decode_hash = rs.decode_hash
+            else:
+                num_prompt = int(prompt_len_np[req_idx])
+                prefill_hash = 0
+                decode_hash = 0
 
-            num_computed = int(num_computed_np[int(idx_np[i])])
-            num_prompt = rs.num_prompt_tokens
             if num_computed < num_prompt:
-                row = mgr.get_row_for_config(rs.prefill_hash, is_prefill=True)
-                rows_scratch[active_count] = row
-                n_tokens_scratch[active_count] = n_tokens
-                if num_computed + n_tokens >= num_prompt:
+                row = mgr.get_row_for_config(prefill_hash, is_prefill=True)
+                if rs is not None and num_computed + n_tokens >= num_prompt:
                     self._steering_transition(rs)
             else:
-                row = mgr.get_row_for_config(rs.decode_hash, is_prefill=False)
-                rows_scratch[active_count] = row
-                n_tokens_scratch[active_count] = n_tokens
+                row = mgr.get_row_for_config(decode_hash, is_prefill=False)
+            rows_scratch[active_count] = row
+            n_tokens_scratch[active_count] = n_tokens
             active_count += 1
 
         if active_count > 0:
