@@ -62,7 +62,20 @@ def _load_entry_points() -> dict[str, type[CaptureConsumer]]:
         resolved: dict[str, type[CaptureConsumer]] = {}
         entry_points = importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
         for ep in entry_points:
-            cls = ep.load()
+            # A broken third-party plugin (e.g. one importing a module that
+            # isn't installed) must not take down capture for every other
+            # consumer. Skip it with a warning instead of crashing.
+            try:
+                cls = ep.load()
+            except Exception as exc:
+                logger.warning(
+                    "Skipping capture consumer entry point %r in group %r: "
+                    "failed to load (%s)",
+                    ep.name,
+                    ENTRY_POINT_GROUP,
+                    exc,
+                )
+                continue
             if not isinstance(cls, type):
                 raise TypeError(
                     f"Entry point {ep.name!r} in group "
