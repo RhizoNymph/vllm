@@ -52,12 +52,28 @@ class TestSetSteeringRequest:
         assert req.decode_vectors is None
 
     def test_string_keys_coerced_to_int(self):
-        """JSON dict keys are strings; Pydantic should coerce to int."""
+        """JSON dict keys are strings; coerce_steering_spec normalizes them.
+
+        ``SetSteeringRequest.vectors`` is intentionally typed ``dict[str, Any]``
+        (to also admit the packed binary-wire shape pydantic can't
+        disambiguate), so the model deliberately passes inner layer maps
+        through untouched. Int-key coercion is delegated to
+        ``coerce_steering_spec``, which the API handler calls on the request
+        before use.
+        """
+        from vllm.config.steering_types import coerce_steering_spec
+
+        # Model preserves the raw (string-keyed) inner map by design.
         req = SetSteeringRequest.model_validate(
             {"vectors": {"post_mlp": {"0": [1.0, 2.0]}}}
         )
         assert req.vectors is not None
-        assert 0 in req.vectors["post_mlp"]
+
+        # The coercion seam normalizes JSON string keys to int layer indices.
+        spec = coerce_steering_spec(req.vectors)
+        assert spec is not None
+        assert 0 in spec["post_mlp"]
+        assert spec["post_mlp"][0] == [1.0, 2.0]
 
     def test_full_request(self):
         req = SetSteeringRequest(
