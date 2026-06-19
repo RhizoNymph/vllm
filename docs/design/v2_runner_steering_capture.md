@@ -133,9 +133,67 @@ GPU-validated on Qwen3-0.6B (RTX 3090, TP1/PP1), forcing
 Once validated, the interim Phase-1 fallback guard was removed so v2 actually
 runs these features (auto-selected for Qwen3, or via the env override).
 
-Not yet exercised on GPU (mirrors v1, but unverified here): TP>1 / PP>1,
-per-request inline steering and named modules, capture prefix-cache reuse,
-preemption resume, and spec-decode token layout.
+Expanded GPU matrix (Qwen3-0.6B unless noted):
+
+- Steering: global (eager + cudagraph); per-request inline; **mixed batch** (a
+  steered and an unsteered request together — the unsteered output is
+  byte-identical to baseline, so per-request rows don't cross-contaminate);
+  decode-only (lazy decode-config registration at the prefill→decode boundary);
+  per-request under cudagraph; chunked prefill (multi-step prefill).
+- Capture: client-spec eager; client-spec **under cudagraph** (the force-eager
+  gate fires for that step); `all_generated` positions (multi-step decode);
+  global-spec under cudagraph (persistent-buffer path, no force-eager).
+- Cross-node (2×3090, Ray): steering under TP=2 and PP=2 (rank-replication and
+  `locally_owned_layers` confirmed).
+- Model coverage: gemma-3-4b-it runs on v2 with steering (hidden 2560 / 34
+  layers) — the port is not Qwen3-specific.
+
+Additional GPU coverage:
+
+- Steering: named-module (`register_steering_modules` + `steering_module_ref`)
+  and per-request scale (scale 0 → baseline, scale 1 → steered); async
+  scheduling.
+- Capture: filesystem consumer (worker-location, files read back); multiple
+  consumers (filesystem + global logging); activation-store **write** path
+  (64 prompt rows written with prefix caching on — block-hash wiring works);
+  async scheduling.
+- Capture under **TP=2** (exactly one rank — TP rank 0 — writes; the other
+  writes nothing) and **PP=2** (stage 0 captures its layer 5, stage 1 captures
+  its layer 20 — per-stage `local_layer_range` filtering correct), via the
+  worker-location filesystem consumer.
+
+- Capture + prefix caching via the **OpenAI server** (v2, activation store on):
+  a repeated prefix reuses under `all_generated` (32-token prefix-cache hit on
+  the 2nd request) and recaptures under `all_prompt` (0 hits, full re-forward) —
+  identical to the documented v1 behavior. Store write validated separately
+  (64 rows). The Step-A store *serve* path (`pop_pending_serve` /
+  `serve_from_store`) was not observed to trigger, consistent with v1's
+  "all_prompt → full recapture", so those two lines stay formally unexercised.
+
+- **Preemption resume**: under a tiny KV cache, the worker observed 248
+  preemption events; all 16 steered requests still produced the correct steered
+  output (no config leak). Capture under preemption: 72 preemption events, all
+  24/24 capturing requests still delivered — preempted capturing requests resume
+  and capture cleanly (no lost/double captures).
+- **Steering hook points**: pre_attn and post_mlp both shift/clear correctly
+  (post_attn was already covered); the prefill-only tier
+  (`prefill_steering_vectors`) steers.
+- **Capture positions**: `all` (prompt+generated rows) and an explicit index
+  list (`[0, 2]` → exactly 2 rows), in addition to `last_prompt`/`all_generated`.
+
+- **Streaming re-add**: an async streaming-input session (prompt fed in chunks
+  via `AsyncLLM.generate(prompt=<async generator of StreamingInput>)`) with
+  steering produced steered output, and the port's re-add branch fired
+  (`_steering_add_request` saw an already-tracked req_id → released the old
+  config + registered the new one). No crash.
+
+Still unverified: spec-decode; DP; the async-dispatch overload policies
+(`spill`/`drop`/`block`); the store *serve* path (doesn't trigger for
+`all_prompt` even on v1 — full recapture by design); and capture under streaming
+re-add specifically (steering's re-add is validated; capture's
+`register_request` on a re-added id is the narrow analog). (The capture-consumer
+entry points were missing from one prebuilt install's metadata — a stale
+dist-info issue fixed by reinstalling; pyproject already declares them.)
 
 ## Validation
 
