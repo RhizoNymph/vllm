@@ -61,6 +61,7 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+from vllm.v1.worker.gpu.capture_runner_mixin import CaptureRunnerMixin
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -101,13 +102,14 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.gpu.steering_runner_mixin import SteeringRunnerMixin
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 logger = init_logger(__name__)
 
 
-class GPUModelRunner(LoRAModelRunnerMixin):
+class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -326,6 +328,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=self.model_config.dtype,
                 device=self.device,
             )
+
+        # Activation-capture control plane. The data-plane hooks already live in
+        # the loaded model; this installs the managers/gate/store that drive them.
+        self._init_capture_state()
+        # Activation-steering control plane. Discovers steerable layers on the
+        # loaded model and builds the SteeringManager (no-op when disabled).
+        self._init_steering_state()
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -677,9 +686,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
+        # Finalize capture only for genuinely finished requests; preempted
+        # requests resume later and must not have their capture closed.
+        if self._capture_feature_enabled:
+            for req_id in finished_req_ids:
+                self._capture_finish_request(req_id)
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        # Release steering configs for finished AND preempted requests; a
+        # resumed request re-registers a fresh prefill config via add_requests.
+        if self._steering_manager is not None:
+            self._steering_finish_requests(finished_req_ids)
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 
@@ -726,6 +744,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.prompt_logprobs_worker.add_request(
                     req_id, req_index, new_req_data.sampling_params
                 )
+
+            # Register the request with the capture control plane (every rank
+            # registers with the gate; the capturer rank also registers with
+            # the manager). Runs on all PP ranks since capturer layers may live
+            # on any stage.
+            self._capture_add_request(new_req_data)
+            # Register the request's steering config (rank-local; deterministic
+            # across the TP/PP topology from the broadcast scheduler output).
+            self._steering_add_request(new_req_data)
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
@@ -1014,6 +1041,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        capture_pending = False
         if not dummy_run:
             # Update the request states.
             self.finish_requests(scheduler_output)
@@ -1025,6 +1053,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
+            # Rank-replicated force-eager decision: a per-request client capture
+            # spec uses a dynamic gather that cannot be recorded into a CUDA
+            # graph, so this step must run eager. Computed from scheduler_output
+            # (not InputBatch) because the batch descriptor is resolved below,
+            # before prepare_inputs runs.
+            capture_pending = self._capture_gate_decision(scheduler_output)
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1046,7 +1080,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or capture_pending,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1059,6 +1093,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+
+            # Build the capture gather plan (capturer rank only) from the final
+            # batch layout; the in-forward capture_residual op populates it.
+            if self._capture_manager is not None:
+                self._capture_build_plan(input_batch)
+
+            # Populate steering tables + per-token index before the forward.
+            # The buffers are persistent, so a FULL cudagraph replay reads this
+            # step's values — no force-eager needed.
+            if self._steering_manager is not None:
+                self._update_steering_buffers_v2(scheduler_output, input_batch)
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1192,6 +1237,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
 
+        # Dispatch the rows the in-forward capture op gathered this step. Runs
+        # on every PP stage (each capturer rank owns its stage's layers) and
+        # before non-last stages return their intermediate tensors below.
+        if self._capture_manager is not None:
+            self._finalize_capture_step()
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -1281,6 +1332,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             kv_connector_output=kv_connector_output,
+            # Capture results finalized (off-thread) since the last step.
+            capture_results=self._drain_capture_results(),
         )
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
