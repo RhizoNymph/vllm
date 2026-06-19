@@ -343,22 +343,17 @@ def apply_layer_steering(
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
     if not hasattr(module, table_attr):
         return hidden_states
-    # In-graph monitor (Phase 2, §8): at a probe site this reads the
-    # pre-steering residual and writes a per-token gate into the shared
-    # ``steering_token_scales`` buffer that the dynamic tier (below, and at
-    # later hooks/layers) multiplies by. It mutates the gate in place and
-    # is a no-op unless its ``active`` flag is set, so emitting it at every
-    # hook keeps the compiled topology stable while only the configured
-    # site does work (detect at L, steer at layers > L, same forward).
-    torch.ops.vllm.steering_monitor(
-        hidden_states,
-        getattr(module, HOOK_POINT_MONITOR_PROBE_ATTR[hook_point]),
-        getattr(module, HOOK_POINT_MONITOR_PARAMS_ATTR[hook_point]),
-        getattr(module, HOOK_POINT_MONITOR_ACTIVE_ATTR[hook_point]),
-        module.steering_token_scales,
-        module.steering_decode_mask,
-        module.steering_row_gate,
-    )
+    # In-graph monitor (Phase 2, §8) is **fused into** ``apply_steering``:
+    # at a probe site the kernel computes the per-token gate from the
+    # pre-steering residual and folds it into the tier/row terms in
+    # registers — never writing it to a shared buffer. This keeps the op
+    # non-mutating (cudagraph-fusable) and the gate same-hook (it gates
+    # only this ``(layer, hook)``). The monitor buffers are passed
+    # unconditionally and the kernel skips the gate reduction unless the
+    # ``active`` flag is set, so the compiled topology stays stable and an
+    # unconfigured monitor costs nothing. (The standalone mutating
+    # ``steering_monitor`` op is retained for cross-layer gating; it is not
+    # emitted on this hot path.)
     return torch.ops.vllm.apply_steering(
         hidden_states,
         getattr(module, table_attr),
@@ -368,6 +363,10 @@ def apply_layer_steering(
         getattr(module, HOOK_POINT_DYNVEC_ATTR[hook_point]),
         module.steering_token_scales,
         module.steering_row_gate,
+        getattr(module, HOOK_POINT_MONITOR_PROBE_ATTR[hook_point]),
+        getattr(module, HOOK_POINT_MONITOR_PARAMS_ATTR[hook_point]),
+        getattr(module, HOOK_POINT_MONITOR_ACTIVE_ATTR[hook_point]),
+        module.steering_decode_mask,
     )
 
 
@@ -380,8 +379,13 @@ def apply_steering(
     steering_dynamic_vec: torch.Tensor,
     steering_token_scales: torch.Tensor,
     steering_row_gate: torch.Tensor,
+    steering_monitor_probe: torch.Tensor,
+    steering_monitor_params: torch.Tensor,
+    steering_monitor_active: torch.Tensor,
+    steering_decode_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply per-request activation steering via indexed gather.
+    """Apply per-request activation steering via indexed gather, with the
+    in-graph monitor gate fused in (non-mutating, same-hook).
 
     Two additive terms: the per-row gather
     ``table[index[i]] * scales[index[i]] * row_gate[i]`` plus the
@@ -458,6 +462,10 @@ def apply_steering(
             steering_dynamic_vec,
             steering_token_scales,
             steering_row_gate,
+            steering_monitor_probe,
+            steering_monitor_params,
+            steering_monitor_active,
+            steering_decode_mask,
         )
     # CPU eager: short-circuit on the host so we don't even materialize
     # the gather. ``.item()`` synchronizes against the device producer
@@ -469,14 +477,31 @@ def apply_steering(
         return hidden_states.clone()
     n = hidden_states.shape[0]
     rows = steering_index[:n]
+    tscale = steering_token_scales[:n]
+    rgate_t = steering_row_gate[:n]
+    # Fused in-graph monitor gate (same-hook): fold the per-token gate
+    # ``sigmoid(sharp·(hidden@probe − thr))`` into tscale (tier) and, when
+    # gate_rows, rgate (decode-only via the mask) — locally, no buffer write.
+    if bool(steering_monitor_active.item()):
+        score = hidden_states.to(torch.float32) @ steering_monitor_probe.to(
+            torch.float32
+        )
+        threshold = steering_monitor_params[0]
+        sharpness = steering_monitor_params[1]
+        gate_rows = steering_monitor_params[2]
+        gate = torch.sigmoid(sharpness * (score - threshold))
+        tscale = tscale * gate
+        if bool(gate_rows.item() != 0.0):
+            dm = steering_decode_mask[:n]
+            rgate_t = rgate_t * (dm * gate + (1.0 - dm))
     # Per-row scale (fp32, default 1.0) × per-token row gate (default 1.0);
     # both broadcast over hidden dim. The row gate keeps prefill rows at
     # full strength (1.0) and lets the monitor gate decode rows per token.
     scale = steering_scales[rows].unsqueeze(-1).to(steering_table.dtype)
-    rgate = steering_row_gate[:n].unsqueeze(-1).to(steering_table.dtype)
+    rgate = rgate_t.unsqueeze(-1).to(steering_table.dtype)
     out = hidden_states + steering_table[rows] * scale * rgate
     # Dedicated dynamic tier: dvec * per-token gate (0 ⇒ no-op).
-    tier = steering_dynamic_vec.unsqueeze(0) * steering_token_scales[:n].unsqueeze(-1)
+    tier = steering_dynamic_vec.unsqueeze(0) * tscale.unsqueeze(-1)
     return out + tier.to(out.dtype)
 
 
@@ -489,6 +514,10 @@ def apply_steering_fake(
     steering_dynamic_vec: torch.Tensor,
     steering_token_scales: torch.Tensor,
     steering_row_gate: torch.Tensor,
+    steering_monitor_probe: torch.Tensor,
+    steering_monitor_params: torch.Tensor,
+    steering_monitor_active: torch.Tensor,
+    steering_decode_mask: torch.Tensor,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)

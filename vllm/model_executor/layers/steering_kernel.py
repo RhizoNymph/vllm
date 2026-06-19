@@ -45,6 +45,10 @@ def _apply_steering_kernel(
     dvec_ptr,
     tscale_ptr,
     rgate_ptr,
+    probe_ptr,
+    mparams_ptr,
+    mactive_ptr,
+    dmask_ptr,
     out_ptr,
     N,
     H,
@@ -56,27 +60,31 @@ def _apply_steering_kernel(
     dv_stride_h,
     ts_stride_n,
     rg_stride_n,
+    p_stride_h,
+    dm_stride_n,
     o_stride_n,
     o_stride_h,
     BLOCK_H: tl.constexpr,
 ):
-    """Compute ``out = hidden + table[index]*scale + dvec*token_scale``.
+    """Compute ``out = hidden + table[index]*scale*row_gate + dvec*token_scale``
+    with the in-graph monitor gate **fused in** (non-mutating).
 
-    Two additive terms:
-    - the per-row gather ``table[index[i]] * scales[index[i]]`` (the §5.3
-      per-row scale; ``1.0`` default reproduces unscaled steering), and
+    - the per-row gather ``table[index[i]] * scales[index[i]] * row_gate[i]``
+      (§5.3 per-row scale + Phase-2 row gate), plus
     - the **dedicated dynamic tier** ``dvec * token_scales[i]`` (§5.4):
-      ``dvec_ptr`` is this (layer, hook)'s tier vector and
-      ``tscale_ptr`` a per-token gate. ``token_scales[i] = 0`` (the
-      default, and always for prefill tokens) makes the tier contribute
-      nothing, keeping it strictly decode-only.
+      ``token_scales[i] = 0`` (default / prefill) ⇒ no tier, and
+    - the **fused monitor gate**: when ``mactive`` is set, compute
+      ``g = sigmoid(sharp·(hidden[i]@probe − thr))`` from the *pre-steering*
+      residual and fold it into ``token_scale`` (always) and ``row_gate``
+      (when ``params[2]`` gate_rows, decode-only via ``dmask``) — locally,
+      in registers. Nothing is written back to the shared
+      ``token_scales``/``row_gate`` buffers, so the op stays non-mutating
+      (cudagraph-fusable). The gate affects only this ``(layer, hook)``
+      (same-hook gating); cross-layer gating is handled separately.
 
     When the byte at ``active_ptr`` is zero, the kernel skips the gather
-    and emits ``out[i, j] = hidden[i, j]`` so the inactive-hook short
-    circuit keeps the same output-tensor contract as the active path.
-    The active-flag is a tensor (not a Python branch) so the compiled
-    graph topology stays stable across batches whose active-hook set
-    differs.
+    and emits ``out[i, j] = hidden[i, j]``. The ``mactive`` reduction is
+    also skipped when inactive, so an unconfigured monitor costs nothing.
     """
     pid_n = tl.program_id(axis=0)
     if pid_n >= N:
@@ -110,10 +118,30 @@ def _apply_steering_kernel(
     # (and 0.0 for prefill tokens) ⇒ the tier add is a no-op.
     tscale = tl.load(tscale_ptr + pid_n * ts_stride_n)
     # Per-token row gate (Phase 2 row gating): fp32, default 1.0 (and 1.0
-    # for prefill tokens) ⇒ the row applies at full strength. The monitor
-    # reduces it for decode tokens to make per-request steering
-    # token-conditional.
+    # for prefill tokens) ⇒ the row applies at full strength.
     rgate = tl.load(rgate_ptr + pid_n * rg_stride_n)
+
+    # Fused in-graph monitor (§8): gate from the pre-steering residual,
+    # folded into tscale/rgate locally (never written back ⇒ non-mutating).
+    # Skipped entirely when inactive, so it's free unless a probe is set here.
+    mactive = tl.load(mactive_ptr)
+    if mactive != 0:
+        acc = tl.zeros((), dtype=tl.float32)
+        for h_off in range(0, H, BLOCK_H):
+            h_idx = h_off + tl.arange(0, BLOCK_H)
+            mask = h_idx < H
+            h_vals = tl.load(hidden_row_ptr + h_idx * h_stride_h, mask=mask, other=0.0)
+            p_vals = tl.load(probe_ptr + h_idx * p_stride_h, mask=mask, other=0.0)
+            acc += tl.sum(h_vals.to(tl.float32) * p_vals.to(tl.float32))
+        threshold = tl.load(mparams_ptr + 0)
+        sharpness = tl.load(mparams_ptr + 1)
+        gate_rows = tl.load(mparams_ptr + 2)
+        gate = tl.sigmoid(sharpness * (acc - threshold))
+        tscale = tscale * gate
+        if gate_rows != 0.0:
+            # decode → ·gate ; prefill (mask 0) → ·1 (row stays full strength).
+            dm = tl.load(dmask_ptr + pid_n * dm_stride_n)
+            rgate = rgate * (dm * gate + (1.0 - dm))
 
     for h_off in range(0, H, BLOCK_H):
         h_idx = h_off + tl.arange(0, BLOCK_H)
@@ -161,8 +189,18 @@ def apply_steering_triton(
     steering_dynamic_vec: torch.Tensor,
     steering_token_scales: torch.Tensor,
     steering_row_gate: torch.Tensor,
+    steering_monitor_probe: torch.Tensor,
+    steering_monitor_params: torch.Tensor,
+    steering_monitor_active: torch.Tensor,
+    steering_decode_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute ``hidden + table[idx]*scales[idx]*row_gate[:N] + dvec*token_scales[:N]``.
+    """Compute the steered output with the fused in-graph monitor gate.
+
+    ``hidden + table[idx]*scales[idx]*row_gate[:N] + dvec*token_scales[:N]``,
+    with ``row_gate``/``token_scales`` modulated per token by the monitor
+    gate ``sigmoid(sharp·(hidden@probe − thr))`` when
+    ``steering_monitor_active`` is set (computed in-kernel, never written
+    back ⇒ non-mutating).
 
     Returns a freshly allocated output tensor with the same shape and
     dtype as ``hidden_states``. Empty batches (``N == 0``) short-circuit
@@ -189,6 +227,10 @@ def apply_steering_triton(
         steering_dynamic_vec,
         steering_token_scales,
         steering_row_gate,
+        steering_monitor_probe,
+        steering_monitor_params,
+        steering_monitor_active,
+        steering_decode_mask,
         out,
         N,
         H,
@@ -200,6 +242,8 @@ def apply_steering_triton(
         steering_dynamic_vec.stride(0),
         steering_token_scales.stride(0),
         steering_row_gate.stride(0),
+        steering_monitor_probe.stride(0),
+        steering_decode_mask.stride(0),
         out.stride(0),
         out.stride(1),
         BLOCK_H=block_h,
@@ -330,6 +374,12 @@ def warmup_apply_steering_kernel(
     dvec_buf = torch.zeros(hidden_size, dtype=torch.float32, device=device)
     tscale_buf = torch.zeros(max_n, dtype=torch.float32, device=device)
     rgate_buf = torch.ones(max_n, dtype=torch.float32, device=device)
+    # Fused in-graph monitor buffers (inactive during warmup; the GEMV
+    # branch is in the same compiled artifact regardless of the flag).
+    probe_buf = torch.zeros(hidden_size, dtype=torch.float32, device=device)
+    mparams_buf = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=device)
+    mactive_flag = torch.zeros(1, dtype=torch.bool, device=device)
+    dmask_buf = torch.zeros(max_n, dtype=torch.float32, device=device)
 
     t0 = time.perf_counter()
     for n in sizes:
@@ -337,17 +387,20 @@ def warmup_apply_steering_kernel(
         index_view = index_buf[:n]
         tscale_view = tscale_buf[:n]
         rgate_view = rgate_buf[:n]
+        dmask_view = dmask_buf[:n]
         # Inactive path first — exercises the short-circuit branch.
         active_flag.fill_(False)
         torch.ops.vllm.apply_steering(
             hidden_view, table_buf, index_view, active_flag, scales_buf,
             dvec_buf, tscale_view, rgate_view,
+            probe_buf, mparams_buf, mactive_flag, dmask_view,
         )
         # Active path — exercises the gather + add.
         active_flag.fill_(True)
         torch.ops.vllm.apply_steering(
             hidden_view, table_buf, index_view, active_flag, scales_buf,
             dvec_buf, tscale_view, rgate_view,
+            probe_buf, mparams_buf, mactive_flag, dmask_view,
         )
     # Block until every JIT compile (and cuLibraryLoadData) has retired so
     # the wall-clock measurement and cache-size readback reflect reality.

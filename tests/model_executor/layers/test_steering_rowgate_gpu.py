@@ -46,8 +46,13 @@ def test_kernel_row_gate_matches_eager(dtype, n):
     dvec = torch.randn(H, dtype=torch.float32, device=dev)
     tscale = torch.zeros(n, dtype=torch.float32, device=dev)
     rgate = torch.rand(n, dtype=torch.float32, device=dev)  # varied gates
+    probe = torch.zeros(H, dtype=torch.float32, device=dev)
+    mparams = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=dev)
+    mactive = torch.zeros(1, dtype=torch.bool, device=dev)  # monitor off
+    dmask = torch.zeros(n, dtype=torch.float32, device=dev)
     out = torch.ops.vllm.apply_steering(
-        hidden, table, index, any_active, scales, dvec, tscale, rgate
+        hidden, table, index, any_active, scales, dvec, tscale, rgate,
+        probe, mparams, mactive, dmask,
     )
     exp = _eager(hidden, table, index, scales, dvec, tscale, rgate)
     rel = (out.to(torch.float32) - exp).abs().max() / (exp.abs().max() + 1e-6)
