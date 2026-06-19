@@ -23,7 +23,7 @@ use vllm_managed_engine::ManagedEngineConfig;
 use vllm_managed_engine::cli::{ManagedEngineArgs, repartition_managed_engine_args};
 use vllm_server::{
     ChatTemplateContentFormatOption, Config, CoordinatorMode, HttpListenerMode, ParserSelection,
-    RendererSelection,
+    RendererSelection, SteeringModulePath,
 };
 
 use crate::cli::unsupported::UnsupportedArgs;
@@ -182,6 +182,14 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub served_model_name: Vec<String>,
 
+    /// Named steering modules to load at startup, each as `name=path` where
+    /// `path` is a JSON file defining the module's steering vectors. Loaded
+    /// modules are broadcast to the engine workers so requests can reference
+    /// them via the `steering_name` field.
+    #[arg(long = "steering-modules", value_parser = parse_steering_module, num_args = 0..)]
+    #[serde(default)]
+    pub steering_modules: Vec<SteeringModulePath>,
+
     /// Unsupported Python vLLM frontend arguments recognized but not yet
     /// implemented in Rust.
     #[educe(Debug(ignore))]
@@ -241,6 +249,7 @@ impl SharedRuntimeArgs {
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
+            steering_modules: self.steering_modules,
         }
     }
 
@@ -281,6 +290,7 @@ impl SharedRuntimeArgs {
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
+            steering_modules: self.steering_modules,
         }
     }
 }
@@ -291,6 +301,29 @@ fn default_engine_ready_timeout_secs() -> u64 {
 
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
+}
+
+/// Parse a `--steering-modules` entry of the form `name=path` into a
+/// [`SteeringModulePath`]. The split is on the first `=` so paths may contain
+/// further `=` characters.
+fn parse_steering_module(value: &str) -> Result<SteeringModulePath, String> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected `name=path`, got `{value}`"))?;
+    if name.is_empty() {
+        return Err(format!(
+            "steering module name must not be empty in `{value}`"
+        ));
+    }
+    if path.is_empty() {
+        return Err(format!(
+            "steering module path must not be empty in `{value}`"
+        ));
+    }
+    Ok(SteeringModulePath {
+        name: name.to_owned(),
+        path: path.to_owned(),
+    })
 }
 
 fn parse_runtime_args_json(value: &str) -> Result<SharedRuntimeArgs, String> {

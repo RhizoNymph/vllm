@@ -42,6 +42,7 @@ pub mod handshake;
 pub mod logprobs;
 pub mod multimodal;
 pub mod stats;
+pub mod steering;
 pub mod tensor;
 pub mod utility;
 pub use classified_outputs::{
@@ -49,6 +50,7 @@ pub use classified_outputs::{
 };
 pub use dtype::ModelDtype;
 pub use logprobs::decode_engine_core_outputs;
+pub use steering::{SteeringLayerEntry, SteeringVectorSpec};
 
 /// Request types are encoded as single-byte protocol constants so they can be
 /// sent over the ZMQ socket without an extra encoding step.
@@ -270,6 +272,25 @@ pub struct EngineCoreSamplingParams {
     /// Additional request parameters for custom extensions (from `vllm_xargs`).
     #[serde(default)]
     pub extra_args: Option<HashMap<String, serde_json::Value>>,
+    /// Base steering vectors applied to both prefill and decode phases, in the
+    /// inline form engine-core resolves. `None` means no steering.
+    #[serde(default)]
+    pub steering_vectors: Option<SteeringVectorSpec>,
+    /// Phase-specific steering vectors added to the base during prefill only.
+    #[serde(default)]
+    pub prefill_steering_vectors: Option<SteeringVectorSpec>,
+    /// Phase-specific steering vectors added to the base during decode only.
+    #[serde(default)]
+    pub decode_steering_vectors: Option<SteeringVectorSpec>,
+    /// Reference to a pre-registered named steering module as `(name, scale)`.
+    /// The worker resolves the named module and merges any inline overrides.
+    #[serde(default)]
+    pub steering_module_ref: Option<(String, f32)>,
+    /// Per-request opt-in for activation-capture consumers, keyed by consumer
+    /// name. Forwarded verbatim; engine-core's input processor resolves the raw
+    /// spec into prefix-cache flags (offline admission).
+    #[serde(default)]
+    pub capture: Option<serde_json::Value>,
 }
 
 impl EngineCoreSamplingParams {
@@ -298,6 +319,11 @@ impl EngineCoreSamplingParams {
             logprob_token_ids: None,
             skip_reading_prefix_cache: None,
             extra_args: None,
+            steering_vectors: None,
+            prefill_steering_vectors: None,
+            decode_steering_vectors: None,
+            steering_module_ref: None,
+            capture: None,
         }
     }
 }
@@ -521,6 +547,67 @@ mod tests {
         assert_eq!(array[4], Value::Nil);
         assert_eq!(array[10], Value::Nil);
         assert_eq!(array[11], Value::from(7));
+    }
+
+    #[test]
+    fn steering_and_capture_use_python_field_names_and_int_layer_keys() {
+        let mut hook = HashMap::new();
+        hook.insert(
+            7u32,
+            SteeringLayerEntry {
+                vector: vec![1.0, 2.0],
+                scale: 0.5,
+            },
+        );
+        let spec = HashMap::from([("pre_attn".to_string(), hook)]);
+
+        let params = EngineCoreSamplingParams {
+            steering_vectors: Some(spec),
+            steering_module_ref: Some(("creativity".to_string(), 1.0)),
+            capture: Some(serde_json::json!({
+                "filesystem": {"tag": "t", "positions": "last_prompt"}
+            })),
+            ..EngineCoreSamplingParams::for_test()
+        };
+
+        // The sampling params serialize as a field-name map (`to_vec_named`).
+        let value = decode_value(&encode_msgpack(&params).unwrap()).unwrap();
+        let map = match value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let get = |key: &str| map.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v);
+
+        // `steering_module_ref` is a 2-element `(name, scale)` array.
+        match get("steering_module_ref").expect("steering_module_ref present") {
+            Value::Array(a) => {
+                assert_eq!(a.len(), 2);
+                assert_eq!(a[0].as_str(), Some("creativity"));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+
+        // `capture` is forwarded verbatim as a map.
+        assert!(matches!(get("capture"), Some(Value::Map(_))));
+
+        // `steering_vectors` is {hook: {layer_idx: entry}}; the layer key MUST be
+        // a msgpack integer so Python decodes it into `dict[int, ...]`.
+        let hooks = match get("steering_vectors").expect("steering_vectors present") {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let (hook_name, layers) = &hooks[0];
+        assert_eq!(hook_name.as_str(), Some("pre_attn"));
+        let layers = match layers {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let (layer_key, _) = &layers[0];
+        assert!(
+            layer_key.is_i64() || layer_key.is_u64(),
+            "layer key must be an integer, got {layer_key:?}"
+        );
+        assert_eq!(layer_key.as_u64(), Some(7));
     }
 
     #[test]

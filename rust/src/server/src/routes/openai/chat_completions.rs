@@ -54,6 +54,11 @@ pub async fn chat_completions(
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
+    if let Some(message) =
+        state.steering_module_error(prepared.chat_request.sampling_params.steering_name.as_deref())
+    {
+        return ApiError::invalid_request(message, Some("steering_name")).into_response();
+    }
     let request_span = tracing::info_span!(
         "chat_completions",
         request_id = %prepared.request_id,

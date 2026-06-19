@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,6 +18,9 @@ pub struct AppState {
     pub chat: ChatLlm,
     /// Whether to log a summary line for each completed request.
     pub enable_log_requests: bool,
+    /// Names of steering modules registered with the engine workers at startup.
+    /// Requests referencing an unknown `steering_name` are rejected up front.
+    steering_module_names: HashSet<String>,
     /// Number of in-flight inference requests currently owned by this frontend.
     server_load: AtomicU64,
 }
@@ -39,6 +43,7 @@ impl AppState {
             served_model_names,
             chat,
             enable_log_requests: false,
+            steering_module_names: HashSet::new(),
             server_load: AtomicU64::new(0),
         }
     }
@@ -47,6 +52,31 @@ impl AppState {
     pub fn with_log_requests(mut self, enabled: bool) -> Self {
         self.enable_log_requests = enabled;
         self
+    }
+
+    /// Set the names of steering modules registered with the engine workers.
+    pub fn with_steering_module_names(mut self, names: HashSet<String>) -> Self {
+        self.steering_module_names = names;
+        self
+    }
+
+    /// Validate a request's `steering_name` against the registered modules.
+    ///
+    /// Returns a human-readable error message when the name is present but not
+    /// registered (listing the available modules), or `None` when the request
+    /// omits `steering_name` or references a known module.
+    pub fn steering_module_error(&self, steering_name: Option<&str>) -> Option<String> {
+        let name = steering_name?;
+        if self.steering_module_names.contains(name) {
+            return None;
+        }
+        let mut available: Vec<&str> =
+            self.steering_module_names.iter().map(String::as_str).collect();
+        available.sort_unstable();
+        Some(format!(
+            "Unknown steering module '{name}'. Available: [{}]",
+            available.join(", ")
+        ))
     }
 
     /// The primary model name echoed back in API responses (the first served

@@ -42,6 +42,42 @@ message GenerateRequest {
   uint32 truncate_prompt_tokens = 11;
 
   int32 priority = 12;
+
+  // Per-request activation steering (optional)
+  Steering steering = 13;
+
+  // Per-request activation capture, keyed by consumer name (optional).
+  // Forwarded verbatim to engine-core for offline admission.
+  google.protobuf.Struct capture = 14;
+}
+
+// One hook point's steering blob in the packed wire format: a single contiguous
+// little-endian tensor of shape [num_rows, hidden_size] where row `i` is the
+// steering vector for layer `layer_indices[i]`.
+message SteeringHookPacked {
+  // Numpy dtype string: "float32" | "float16" | "bfloat16" | "float64".
+  string dtype = 1;
+  // Tensor shape as [num_rows, hidden_size].
+  repeated uint32 shape = 2;
+  // Layer index for each row, in row order. Length must equal shape[0].
+  repeated uint32 layer_indices = 3;
+  // Contiguous little-endian tensor bytes (row-major).
+  bytes data = 4;
+  // Optional per-row scalar multipliers. Empty means scale 1.0 for every row;
+  // otherwise length must equal shape[0].
+  repeated float scales = 5;
+}
+
+// Per-request activation steering. Each map is keyed by hook-point name.
+message Steering {
+  // Base steering applied to both prefill and decode phases.
+  map<string, SteeringHookPacked> steering_vectors = 1;
+  // Steering added to the base during prefill only.
+  map<string, SteeringHookPacked> prefill_steering_vectors = 2;
+  // Steering added to the base during decode only.
+  map<string, SteeringHookPacked> decode_steering_vectors = 3;
+  // Name of a pre-registered steering module to apply ("" means none).
+  string name = 4;
 }
 
 message RandomSampling {

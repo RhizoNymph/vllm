@@ -7,13 +7,14 @@ mod listener;
 mod middleware;
 mod routes;
 mod state;
+mod steering_modules;
 mod utils;
 
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result};
 use axum::serve::ListenerExt as _;
-pub use config::{Config, CoordinatorMode, HttpListenerMode};
+pub use config::{Config, CoordinatorMode, HttpListenerMode, SteeringModulePath};
 use tokio::net::TcpListener;
 use tokio::time::{Instant, sleep_until};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -69,6 +70,13 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     .await
     .context("failed to connect to engine core")?;
 
+    // Load and broadcast named steering modules before serving, so the workers
+    // hold the registry by the time any request references one by name.
+    let steering_module_names =
+        steering_modules::load_and_broadcast_steering_modules(&client, &config.steering_modules)
+            .await
+            .context("failed to load steering modules")?;
+
     let llm = Llm::new(client).with_log_stats(!config.disable_log_stats);
     let text = TextLlm::new(llm, text_backend);
 
@@ -85,7 +93,9 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     };
 
     Ok(Arc::new(
-        AppState::new(served_model_names, chat).with_log_requests(config.enable_log_requests),
+        AppState::new(served_model_names, chat)
+            .with_log_requests(config.enable_log_requests)
+            .with_steering_module_names(steering_module_names),
     ))
 }
 
