@@ -187,11 +187,31 @@ Additional GPU coverage:
   (`_steering_add_request` saw an already-tracked req_id → released the old
   config + registered the new one). No crash.
 
+- **Capture re-add / preemption resume** (the asymmetry steering already
+  handled): `add_requests` calls `_remove_request` first, which does *not* touch
+  capture state, so a re-admitted request would re-register an already-registered
+  id. The capture manager raises on duplicate ids (`already registered`), caught
+  as a request error. Two paths reach this:
+    - *Streaming re-add* — the request is still live (`_remove_request` returns
+      `True`); the grown prompt makes the prior chunk's registration stale, so
+      `_capture_add_request` now discards it (gate `drop` + `unregister_request`,
+      no finalize) and re-registers against the new prompt.
+    - *Preemption resume* — on v2 the scheduler folds `scheduled_resumed_reqs`
+      into `scheduled_new_reqs`, so a resumed request flows through
+      `_capture_add_request` with `was_present=False` while its registration
+      survived (capture is intentionally not finalized on preempt). It is kept
+      as-is (skip re-registration), preserving rows captured before preemption.
+  GPU-validated on Qwen3-0.6B with a clean before/after: pre-fix, a streaming
+  session logged `capture request '...' is already registered` on each re-add,
+  and the preemption scenario (24 capturing requests, 64-block KV cache) logged
+  20 such rejections; post-fix, both paths log zero rejections and deliver all
+  captures (24/24 under preemption). CPU glue tests cover the three branches
+  (fresh / streaming re-add / preemption resume) plus the non-capturer rank.
+
 Still unverified: spec-decode; DP; the async-dispatch overload policies
-(`spill`/`drop`/`block`); the store *serve* path (doesn't trigger for
-`all_prompt` even on v1 — full recapture by design); and capture under streaming
-re-add specifically (steering's re-add is validated; capture's
-`register_request` on a re-added id is the narrow analog). (The capture-consumer
+(`spill`/`drop`/`block` — runner-agnostic transport code shared with v1, not
+touched by the port); and the store *serve* path (doesn't trigger for
+`all_prompt` even on v1 — full recapture by design). (The capture-consumer
 entry points were missing from one prebuilt install's metadata — a stale
 dist-info issue fixed by reinstalling; pyproject already declares them.)
 

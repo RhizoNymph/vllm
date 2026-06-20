@@ -145,20 +145,46 @@ class CaptureRunnerMixin:
 
     # ---- request lifecycle -------------------------------------------------
 
-    def _capture_add_request(self, new_req_data: NewRequestData) -> None:
+    def _capture_add_request(
+        self, new_req_data: NewRequestData, was_present: bool
+    ) -> None:
         """Hook a newly admitted request into capture tracking.
 
         ``register`` runs on every rank (the gate is rank-replicated);
         manager registration runs only on the capturer rank.
+
+        ``was_present`` is ``True`` only for a **streaming re-add** — a still
+        live request re-admitted with a grown prompt. In that case the prior
+        chunk's gate selector and manager registration are stale and must be
+        discarded (without finalizing — a partial first-chunk capture is
+        dropped, not emitted) before re-registering against the new prompt.
+        This mirrors the steering control plane's re-add handling.
+
+        A **preemption resume** reaches this path too (the v2 scheduler folds
+        ``scheduled_resumed_reqs`` into ``scheduled_new_reqs``), but with
+        ``was_present`` ``False`` because ``finish_requests`` removed the
+        request on preemption while intentionally leaving its capture
+        registration open. Such a request is re-prefilled (recompute) into the
+        existing registration, so we keep it and skip re-registration — both
+        avoiding the manager's duplicate-register error and preserving any
+        rows already captured before preemption.
         """
         if not self._capture_feature_enabled:
             return
+        req_id = new_req_data.req_id
+        mgr = self._capture_manager
+        if was_present:
+            # Streaming re-add: prior chunk's capture state is stale.
+            if self._capture_step_gate is not None:
+                self._capture_step_gate.drop(req_id)
+            if mgr is not None:
+                mgr.unregister_request(req_id)
         sp = new_req_data.sampling_params
         if self._capture_step_gate is not None:
-            self._capture_step_gate.register(
-                new_req_data.req_id, getattr(sp, "capture", None)
-            )
-        if self._capture_manager is not None:
+            self._capture_step_gate.register(req_id, getattr(sp, "capture", None))
+        # Skip re-registration if the request is already registered (a
+        # preemption resume whose registration survived); otherwise admit it.
+        if mgr is not None and not mgr.has_request(req_id):
             self._register_capture_request(new_req_data)
 
     def _capture_finish_request(self, req_id: str) -> None:

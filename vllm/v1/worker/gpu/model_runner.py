@@ -714,8 +714,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
-            # with the updated prompt_token_ids and mm_features.
-            self._remove_request(req_id)
+            # with the updated prompt_token_ids and mm_features. The return
+            # value distinguishes a streaming re-add (request was still live)
+            # from a fresh admit / preemption resume (already gone) so the
+            # capture control plane can refresh stale registrations correctly.
+            was_present = self._remove_request(req_id)
 
             prompt_len = len(new_req_data.prompt_token_ids)
             self.req_states.add_request(
@@ -749,7 +752,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
             # registers with the gate; the capturer rank also registers with
             # the manager). Runs on all PP ranks since capturer layers may live
             # on any stage.
-            self._capture_add_request(new_req_data)
+            self._capture_add_request(new_req_data, was_present)
             # Register the request's steering config (rank-local; deterministic
             # across the TP/PP topology from the broadcast scheduler output).
             self._steering_add_request(new_req_data)

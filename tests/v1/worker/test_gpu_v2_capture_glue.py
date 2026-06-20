@@ -120,3 +120,127 @@ def test_drain_disabled_returns_empty():
     glue._pending_capture_results = {"a": {"c": object()}}
 
     assert glue._drain_capture_results() == {}
+
+
+# ---- re-add / preemption-resume admission ---------------------------------
+
+
+class _FakeGate:
+    def __init__(self):
+        self.registered = {}
+        self.dropped = []
+
+    def register(self, req_id, raw):
+        self.registered[req_id] = raw
+
+    def drop(self, req_id):
+        self.dropped.append(req_id)
+        self.registered.pop(req_id, None)
+
+
+class _FakeManager:
+    def __init__(self):
+        self._reqs = set()
+        self.unregistered = []
+
+    def has_request(self, req_id):
+        return req_id in self._reqs
+
+    def unregister_request(self, req_id):
+        self.unregistered.append(req_id)
+        self._reqs.discard(req_id)
+
+
+class _AddGlue(CaptureRunnerMixin):
+    """Host that records admissions and isolates the re-add branching."""
+
+    def __init__(self, gate, mgr):
+        self._capture_feature_enabled = True
+        self._capture_step_gate = gate
+        self._capture_manager = mgr
+        self.registered_calls = []
+
+    # Stub the full registration machinery; only the branching is under test.
+    def _register_capture_request(self, new_req_data):
+        self.registered_calls.append(new_req_data.req_id)
+        if self._capture_manager is not None:
+            self._capture_manager._reqs.add(new_req_data.req_id)
+
+
+def _new_req(req_id, capture):
+    return SimpleNamespace(
+        req_id=req_id,
+        sampling_params=SimpleNamespace(capture=capture),
+    )
+
+
+def test_capture_add_fresh_request_registers():
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _AddGlue(gate, mgr)
+
+    glue._capture_add_request(_new_req("a", {"c": {}}), was_present=False)
+
+    assert glue.registered_calls == ["a"]
+    assert gate.registered == {"a": {"c": {}}}
+    assert gate.dropped == []
+    assert mgr.unregistered == []
+
+
+def test_capture_add_streaming_readd_discards_and_reregisters():
+    gate, mgr = _FakeGate(), _FakeManager()
+    # Prior chunk already admitted.
+    mgr._reqs.add("a")
+    gate.registered["a"] = {"c": {"positions": "last_prompt"}}
+    glue = _AddGlue(gate, mgr)
+
+    # Re-add (still live) with a different capture spec.
+    glue._capture_add_request(
+        _new_req("a", {"c": {"positions": "all_generated"}}), was_present=True
+    )
+
+    # Stale registration dropped, then re-registered against the new prompt.
+    assert gate.dropped == ["a"]
+    assert mgr.unregistered == ["a"]
+    assert glue.registered_calls == ["a"]
+    assert gate.registered["a"] == {"c": {"positions": "all_generated"}}
+
+
+def test_capture_add_preemption_resume_keeps_registration():
+    gate, mgr = _FakeGate(), _FakeManager()
+    # Registration survived preemption (finish_requests did not finalize it).
+    mgr._reqs.add("a")
+    gate.registered["a"] = {"c": {}}
+    glue = _AddGlue(gate, mgr)
+
+    # Resumed req is folded into scheduled_new_reqs on v2, but was_present is
+    # False because finish_requests removed it from req_states on preempt.
+    glue._capture_add_request(_new_req("a", {"c": {}}), was_present=False)
+
+    # No discard, no re-registration — the open registration is reused.
+    assert gate.dropped == []
+    assert mgr.unregistered == []
+    assert glue.registered_calls == []
+
+
+def test_capture_add_readd_on_non_capturer_rank_no_manager():
+    gate = _FakeGate()
+    gate.registered["a"] = {"c": {}}
+    glue = _AddGlue(gate, None)  # non-capturer rank: no manager
+
+    # Streaming re-add still refreshes the rank-replicated gate, no crash.
+    glue._capture_add_request(_new_req("a", {"c": {"positions": "all"}}), True)
+
+    assert gate.dropped == ["a"]
+    assert gate.registered["a"] == {"c": {"positions": "all"}}
+    assert glue.registered_calls == []
+
+
+def test_capture_add_disabled_is_noop():
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _AddGlue(gate, mgr)
+    glue._capture_feature_enabled = False
+
+    glue._capture_add_request(_new_req("a", {"c": {}}), was_present=True)
+
+    assert gate.registered == {} and gate.dropped == []
+    assert glue.registered_calls == []
