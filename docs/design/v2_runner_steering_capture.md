@@ -1,0 +1,251 @@
+# Steering + Capture on the V2 Model Runner
+
+Design/implementation contract for porting the **activation steering** and
+**activation capture** control planes from the v1 GPU model runner
+(`vllm/v1/worker/gpu_model_runner.py`) to the experimental v2 runner
+(`vllm/v1/worker/gpu/model_runner.py`).
+
+## Scope
+
+In scope:
+
+- Wiring the runner-agnostic steering/capture subsystems into the v2 runner's
+  lifecycle so both features behave identically to v1.
+- A v2-native control plane (new modules under `vllm/v1/worker/gpu/`) that keeps
+  its own per-request state, since v2 does not retain a `CachedRequestState`
+  dict the way v1 does.
+
+Out of scope:
+
+- The data plane (model-side custom ops, layer buffers, Triton kernels). These
+  live in `vllm/model_executor/` and are **already shared** by both runners.
+- Refactoring the v1 mixins. The v1 path is validated/production; we leave it
+  untouched and write v2-native modules instead.
+- Dynamic-steering (steer-from-capture feedback) and routed-experts capture
+  (tracked separately).
+
+## Key architectural fact
+
+The activation read/write mechanism is **not** in either model runner. Decoder
+layers in `vllm/model_executor/models/*.py` call `apply_layer_steering()` and
+`maybe_capture_residual()`; `register_steering_buffers()` runs in the model's
+`__init__`. Both runners load the *same* model object via
+`model_loader.load_model()`, so in v2 the buffers already exist, the custom ops
+(`torch.ops.vllm.apply_steering`, `torch.ops.vllm.capture_residual`) already
+fire, and they safely no-op when no control plane drives them (steering tables
+stay zero → `any_active=False`; `get_active_capture_manager()` is `None` →
+constant-folds under `torch.compile`).
+
+The split is therefore:
+
+| Plane | Location | Status in v2 |
+| --- | --- | --- |
+| Data plane (ops, buffers, kernels, store, managers, gate, types) | `model_executor/`, `v1/capture/`, `v1/worker/steering_manager.py` | shared, reused unchanged |
+| Scheduler handoff (`NewRequestData.{prefill,decode}_steering_config_hash`, `capture_block_hashes`, `sampling_params.capture`; `ModelRunnerOutput.capture_results`) | `v1/core/sched/output.py`, `v1/outputs.py` | shared, already present |
+| Control plane (init, per-step buffer fill / plan build, force-eager, request lifecycle, output drain) | runner | **absent — this port** |
+
+## V2 runner seams
+
+The v2 runner splits the monolithic v1 `execute_model` into discrete methods.
+The port attaches to these (all in `gpu/model_runner.py`):
+
+- `load_model` (266): construct managers/gate/store; init steerable-layer
+  discovery. Buffers are already registered model-side.
+- `add_requests` (691): per `new_req_data` in `scheduled_new_reqs` — register
+  steering config + track phase; `gate.register` (all ranks) + capture
+  `register_request` (TP0). Note `add_requests` calls `_remove_request` first
+  for streaming re-adds, so refresh state accordingly.
+- `update_requests` (736): prefill→decode transition / resumption bookkeeping.
+- `finish_requests` (678): use `scheduler_output.finished_req_ids` for steering
+  release + capture finalize + `gate.drop`; `preempted_req_ids` → steering
+  reset, **not** capture finalize.
+- `execute_model` (1009):
+  - Force-eager seam at the `dispatch_cg_and_sync_dp(..., need_eager=...)` call
+    (1042–1050): OR in `capture_pending` (client-spec captures only; global
+    specs ride the cudagraph-safe persistent-buffer path). **Steering needs no
+    force-eager** — its tables/index are persistent buffers written before the
+    forward, so graph replay reads them correctly.
+  - After `prepare_inputs` (1060) and before the model forward (1167): build the
+    per-step view, `_update_steering_buffers(view)`, and
+    `capture_manager.build_step_plan(view)` (TP0).
+  - After the forward (after 1210, before non-last-PP return at 1220):
+    `_finalize_capture_step()` (consume plan, async dispatch).
+- `sample_tokens` (1229): attach drained `_pending_capture_results` to the
+  `ModelRunnerOutput` (1276); `_finalize_capture_for_request_async` results land
+  here, same as v1's `get_output`.
+
+### Per-request state ownership
+
+v2's `RequestState` (`gpu/states.py`) holds only tokens/lengths — not
+`sampling_params` or steering hashes. The control plane therefore keeps its own
+dicts (`req_id → (prefill_hash, decode_hash, phase)` for steering;
+gate selectors + manager registration for capture), populated from
+`NewRequestData` in `add_requests`. The per-step view is built from v2's
+`InputBatch` (`req_ids` ordering + `idx_mapping_np` + `num_scheduled_tokens`)
+plus `req_states` (`num_computed_tokens_np`, `prefill_len`, `prompt_len`).
+
+## Rank-replication invariant
+
+Preserved exactly as in v1: the force-eager decision (`CaptureStepGate`) and
+steering-manager row allocation are rank-local and deterministic, fed by the
+broadcast `scheduler_output`. No hot-path collectives. Every new seam must read
+only rank-identical inputs.
+
+## CUDA-graph interaction
+
+- Steering: persistent buffers (`steering_table_*`, `steering_index`) written
+  in-place before the forward → FULL-graph replay reads them. Safe.
+- Capture global specs: fixed-shape full-residual copy into persistent
+  `_global_buffers`, baked at warmup. Safe (no force-eager).
+- Capture client specs: dynamic `index_select` → not graph-capturable → gate
+  forces eager for that step only.
+
+## Workstreams
+
+1. **Capture control plane** — DONE (CPU-tested, GPU pending).
+   `gpu/capture_runner_mixin.py` (`CaptureRunnerMixin`): init, gate,
+   force-eager seam, `_build_capture_{gate,batch}_view`,
+   `_register_capture_request`, `_finalize_capture_step`,
+   `_finalize_capture_for_request_async`, output drain, activation store.
+   Tests: `tests/v1/worker/test_gpu_v2_capture_glue.py`.
+2. **Steering control plane** — DONE (CPU-tested, GPU pending).
+   `gpu/steering_runner_mixin.py` (`SteeringRunnerMixin`, a subclass of
+   `SteeringModelRunnerMixin` that reuses init / discovery / validation / the
+   public RPC API / `_resolve_request_steering` and overrides only the three
+   v1-state-coupled paths). Keeps its own `_steering_reqs` per-request state;
+   `_steering_add_request` (register + streaming re-add), `_steering_finish_requests`
+   (release on finish/preempt), `_update_steering_buffers_v2` (transition +
+   per-token index). No force-eager seam (persistent buffers). `gpu_worker.py`
+   already forwards the RPCs to `self.model_runner.*`.
+   Tests: `tests/v1/worker/test_gpu_v2_steering_glue.py`.
+
+### Validation
+
+GPU-validated on Qwen3-0.6B (RTX 3090, TP1/PP1), forcing
+`VLLM_USE_V2_MODEL_RUNNER=1`:
+
+- Steering (eager **and** cudagraph): global `set_steering_vectors` shifts the
+  output and `clear_steering_vectors` restores the exact baseline — confirming
+  the persistent-buffer path is cudagraph-safe (no force-eager).
+- Capture (eager): a client-spec request (`post_attn`, layer 5, `last_prompt`)
+  delivers one `(1, hidden)` bf16 row to a driver consumer's `on_capture`.
+
+Once validated, the interim Phase-1 fallback guard was removed so v2 actually
+runs these features (auto-selected for Qwen3, or via the env override).
+
+Expanded GPU matrix (Qwen3-0.6B unless noted):
+
+- Steering: global (eager + cudagraph); per-request inline; **mixed batch** (a
+  steered and an unsteered request together — the unsteered output is
+  byte-identical to baseline, so per-request rows don't cross-contaminate);
+  decode-only (lazy decode-config registration at the prefill→decode boundary);
+  per-request under cudagraph; chunked prefill (multi-step prefill).
+- Capture: client-spec eager; client-spec **under cudagraph** (the force-eager
+  gate fires for that step); `all_generated` positions (multi-step decode);
+  global-spec under cudagraph (persistent-buffer path, no force-eager).
+- Cross-node (2×3090, Ray): steering under TP=2 and PP=2 (rank-replication and
+  `locally_owned_layers` confirmed).
+- Model coverage: gemma-3-4b-it runs on v2 with steering (hidden 2560 / 34
+  layers) — the port is not Qwen3-specific.
+
+Additional GPU coverage:
+
+- Steering: named-module (`register_steering_modules` + `steering_module_ref`)
+  and per-request scale (scale 0 → baseline, scale 1 → steered); async
+  scheduling.
+- Capture: filesystem consumer (worker-location, files read back); multiple
+  consumers (filesystem + global logging); activation-store **write** path
+  (64 prompt rows written with prefix caching on — block-hash wiring works);
+  async scheduling.
+- Capture under **TP=2** (exactly one rank — TP rank 0 — writes; the other
+  writes nothing) and **PP=2** (stage 0 captures its layer 5, stage 1 captures
+  its layer 20 — per-stage `local_layer_range` filtering correct), via the
+  worker-location filesystem consumer.
+- Capture under **TP=2 and PP=2 *with cudagraph*** (cross-node, 2×3090 Ray;
+  `enforce_eager=False`, FULL_AND_PIECEWISE graphs compiled): mixing plain
+  (cudagraph) and client-spec capturing (force-eager gate) requests in the same
+  run does not hang — the force-eager decision stays rank-replicated across
+  ranks/stages so every rank toggles eager↔graph in lockstep (including the PP
+  P2P send/recv between stages). TP rank 0 / each PP stage wrote exactly its own
+  30720-byte (`15 gen tokens × 1024 × bf16`) capture and no other rank did.
+- Steering **under prefix caching**: a steered request whose prompt is largely
+  served from the KV cache (partial hit — the scheduler always reserves the last
+  block to recompute logits) still steers correctly (degenerate `οοο` output vs
+  the unsteered baseline of the same tokens). KV block hashes are steering-aware,
+  so a steered request does not reuse an unsteered cache. The narrower
+  *admit-straight-to-decode* branch (`_steering_add_request`, `num_computed >=
+  num_prompt`) is **not reachable under single-engine APC** — the scheduler caps
+  `num_computed` at `num_prompt − block_size`, never `>= num_prompt`; that branch
+  is only reachable when an external mechanism (KV connector / disaggregated
+  prefill) sets `num_computed_tokens` to the full prompt at admission. It mirrors
+  the v1 mixin's identical defensive branch and stays formally unexercised
+  without a connector. (Reminder: inline `SamplingParams.steering_vectors`
+  requires `enable_steering=True` at engine init — otherwise the worker steering
+  manager is `None` and steering silently no-ops; the per-request hash is still
+  packed host-side.)
+
+- Capture + prefix caching via the **OpenAI server** (v2, activation store on):
+  a repeated prefix reuses under `all_generated` (32-token prefix-cache hit on
+  the 2nd request) and recaptures under `all_prompt` (0 hits, full re-forward) —
+  identical to the documented v1 behavior. Store write validated separately
+  (64 rows). The Step-A store *serve* path (`pop_pending_serve` /
+  `serve_from_store`) was not observed to trigger, consistent with v1's
+  "all_prompt → full recapture", so those two lines stay formally unexercised.
+
+- **Preemption resume**: under a tiny KV cache, the worker observed 248
+  preemption events; all 16 steered requests still produced the correct steered
+  output (no config leak). Capture under preemption: 72 preemption events, all
+  24/24 capturing requests still delivered — preempted capturing requests resume
+  and capture cleanly (no lost/double captures).
+- **Steering hook points**: pre_attn and post_mlp both shift/clear correctly
+  (post_attn was already covered); the prefill-only tier
+  (`prefill_steering_vectors`) steers.
+- **Capture positions**: `all` (prompt+generated rows) and an explicit index
+  list (`[0, 2]` → exactly 2 rows), in addition to `last_prompt`/`all_generated`.
+
+- **Streaming re-add**: an async streaming-input session (prompt fed in chunks
+  via `AsyncLLM.generate(prompt=<async generator of StreamingInput>)`) with
+  steering produced steered output, and the port's re-add branch fired
+  (`_steering_add_request` saw an already-tracked req_id → released the old
+  config + registered the new one). No crash.
+
+- **Capture re-add / preemption resume** (the asymmetry steering already
+  handled): `add_requests` calls `_remove_request` first, which does *not* touch
+  capture state, so a re-admitted request would re-register an already-registered
+  id. The capture manager raises on duplicate ids (`already registered`), caught
+  as a request error. Two paths reach this:
+    - *Streaming re-add* — the request is still live (`_remove_request` returns
+      `True`); the grown prompt makes the prior chunk's registration stale, so
+      `_capture_add_request` now discards it (gate `drop` + `unregister_request`,
+      no finalize) and re-registers against the new prompt.
+    - *Preemption resume* — on v2 the scheduler folds `scheduled_resumed_reqs`
+      into `scheduled_new_reqs`, so a resumed request flows through
+      `_capture_add_request` with `was_present=False` while its registration
+      survived (capture is intentionally not finalized on preempt). It is kept
+      as-is (skip re-registration), preserving rows captured before preemption.
+  GPU-validated on Qwen3-0.6B with a clean before/after: pre-fix, a streaming
+  session logged `capture request '...' is already registered` on each re-add,
+  and the preemption scenario (24 capturing requests, 64-block KV cache) logged
+  20 such rejections; post-fix, both paths log zero rejections and deliver all
+  captures (24/24 under preemption). CPU glue tests cover the three branches
+  (fresh / streaming re-add / preemption resume) plus the non-capturer rank.
+
+Still unverified: spec-decode; DP; combined 2-D parallelism (TP *and* PP on the
+same request, and TP/PP > 2 — each validated independently, intersection needs
+≥4 GPUs); the async-dispatch overload policies (`spill`/`drop`/`block` —
+runner-agnostic transport code shared with v1, not touched by the port); the
+store *serve* path (doesn't trigger for `all_prompt` even on v1 — full recapture
+by design); and the steering *admit-straight-to-decode* branch (needs a KV
+connector / disaggregated prefill — unreachable under single-engine APC, see
+above). (The capture-consumer entry points were missing from one prebuilt
+install's metadata — a stale dist-info issue fixed by reinstalling; pyproject
+already declares them.)
+
+## Validation
+
+- CPU unit tests for the v2 control-plane glue (state bookkeeping, view
+  construction, gate decisions) where the data plane can be exercised via the
+  python fns (the CUDA ops are dispatch-only on GPU).
+- GPU end-to-end on node2 (gemma + qwen3): steering eager-vs-cudagraph parity,
+  capture client-spec (`all_prompt` → recapture) and `all_generated` → reuse,
+  TP/PP rank agreement. Mirrors the v1 validation matrix.
