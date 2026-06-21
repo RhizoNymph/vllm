@@ -161,6 +161,28 @@ Additional GPU coverage:
   writes nothing) and **PP=2** (stage 0 captures its layer 5, stage 1 captures
   its layer 20 — per-stage `local_layer_range` filtering correct), via the
   worker-location filesystem consumer.
+- Capture under **TP=2 and PP=2 *with cudagraph*** (cross-node, 2×3090 Ray;
+  `enforce_eager=False`, FULL_AND_PIECEWISE graphs compiled): mixing plain
+  (cudagraph) and client-spec capturing (force-eager gate) requests in the same
+  run does not hang — the force-eager decision stays rank-replicated across
+  ranks/stages so every rank toggles eager↔graph in lockstep (including the PP
+  P2P send/recv between stages). TP rank 0 / each PP stage wrote exactly its own
+  30720-byte (`15 gen tokens × 1024 × bf16`) capture and no other rank did.
+- Steering **under prefix caching**: a steered request whose prompt is largely
+  served from the KV cache (partial hit — the scheduler always reserves the last
+  block to recompute logits) still steers correctly (degenerate `οοο` output vs
+  the unsteered baseline of the same tokens). KV block hashes are steering-aware,
+  so a steered request does not reuse an unsteered cache. The narrower
+  *admit-straight-to-decode* branch (`_steering_add_request`, `num_computed >=
+  num_prompt`) is **not reachable under single-engine APC** — the scheduler caps
+  `num_computed` at `num_prompt − block_size`, never `>= num_prompt`; that branch
+  is only reachable when an external mechanism (KV connector / disaggregated
+  prefill) sets `num_computed_tokens` to the full prompt at admission. It mirrors
+  the v1 mixin's identical defensive branch and stays formally unexercised
+  without a connector. (Reminder: inline `SamplingParams.steering_vectors`
+  requires `enable_steering=True` at engine init — otherwise the worker steering
+  manager is `None` and steering silently no-ops; the per-request hash is still
+  packed host-side.)
 
 - Capture + prefix caching via the **OpenAI server** (v2, activation store on):
   a repeated prefix reuses under `all_generated` (32-token prefix-cache hit on
@@ -208,12 +230,16 @@ Additional GPU coverage:
   captures (24/24 under preemption). CPU glue tests cover the three branches
   (fresh / streaming re-add / preemption resume) plus the non-capturer rank.
 
-Still unverified: spec-decode; DP; the async-dispatch overload policies
-(`spill`/`drop`/`block` — runner-agnostic transport code shared with v1, not
-touched by the port); and the store *serve* path (doesn't trigger for
-`all_prompt` even on v1 — full recapture by design). (The capture-consumer
-entry points were missing from one prebuilt install's metadata — a stale
-dist-info issue fixed by reinstalling; pyproject already declares them.)
+Still unverified: spec-decode; DP; combined 2-D parallelism (TP *and* PP on the
+same request, and TP/PP > 2 — each validated independently, intersection needs
+≥4 GPUs); the async-dispatch overload policies (`spill`/`drop`/`block` —
+runner-agnostic transport code shared with v1, not touched by the port); the
+store *serve* path (doesn't trigger for `all_prompt` even on v1 — full recapture
+by design); and the steering *admit-straight-to-decode* branch (needs a KV
+connector / disaggregated prefill — unreachable under single-engine APC, see
+above). (The capture-consumer entry points were missing from one prebuilt
+install's metadata — a stale dist-info issue fixed by reinstalling; pyproject
+already declares them.)
 
 ## Validation
 
