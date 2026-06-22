@@ -95,6 +95,19 @@ class SteeringModelRunnerMixin:
     _steerable_layers_cache: dict[int, nn.Module] | None = None
     _req_steering_phase: dict[str, str]
     _steering_index_dirty: bool
+    # Steady-state buffer-rebuild skip cache (perf). Class-level defaults cover
+    # the pre-init window (unit tests that construct the mixin without
+    # _init_steering_state); _update_steering_buffers manages them at runtime.
+    _steering_buf_cache_valid = False
+    _steering_prev_active_count = -1
+    _steering_prev_tier_gain = float("nan")
+    _steering_prev_rows = None
+    _steering_prev_ntok = None
+    _steering_prev_dmask = None
+    # Diagnostic counters for the buffer-rebuild skip (how many active-path
+    # steps reused the cached device buffers vs rebuilt them).
+    _steering_buf_skip_count = 0
+    _steering_buf_rebuild_count = 0
     # Worker-side mirror of the API server's named steering module
     # registry.  Populated via ``register_steering_modules`` RPC during
     # API server bootstrap and on every /v1/steering/modules/{register,
@@ -212,6 +225,21 @@ class SteeringModelRunnerMixin:
         self._locally_owned_layers = frozenset(steerable.keys())
         self._req_steering_phase = {}
         self._steering_index_dirty = False
+        # Steady-state buffer-rebuild skip (perf). When no in-graph monitor
+        # mutates the gate buffers during the forward, the
+        # index/token_scales/row_gate/decode_mask device buffers are written
+        # ONLY by ``_update_steering_buffers``. If a step's per-token layout
+        # matches the previous write, the device buffers already hold the
+        # right values and the per-step H2D copies + fills can be skipped —
+        # those eager launches dominate steering's bs>16 cudagraph overhead.
+        # Invalidated on the nothing-active transition and whenever a monitor
+        # is active. See docs/design/dynamic_steering.md.
+        self._steering_buf_cache_valid = False
+        self._steering_prev_active_count = -1
+        self._steering_prev_tier_gain = float("nan")
+        self._steering_prev_rows: np.ndarray | None = None
+        self._steering_prev_ntok: np.ndarray | None = None
+        self._steering_prev_dmask: np.ndarray | None = None
         self._steering_module_registry = {}
         self._steering_module_resolved_cache = {}
         self._steering_module_pinned_rows = {}
@@ -1546,6 +1574,9 @@ class SteeringModelRunnerMixin:
                         if mon_buf is not None:
                             mon_buf.zero_()
                 self._steering_index_dirty = False
+                # Buffers were just reset; invalidate the rebuild-skip cache
+                # so re-activation rewrites them.
+                self._steering_buf_cache_valid = False
             # Nothing dynamic is active; revert any request still reported as
             # dynamically steered back to its admitted decode key.
             self._pending_decode_sigs = self._compute_decode_signature_deltas(
@@ -1693,6 +1724,40 @@ class SteeringModelRunnerMixin:
 
             active_count += 1
 
+        # Steady-state skip (perf): when no in-graph monitor mutates the gate
+        # buffers during the forward, the index/token_scales/row_gate/
+        # decode_mask device buffers are written ONLY below. If this step's
+        # per-token layout matches the last write, those buffers already hold
+        # the correct values — skip the H2D copies + fills entirely (the eager
+        # per-step launches that dominate steering's bs>16 cudagraph overhead).
+        # The loop above still ran (its config register/release/transition
+        # side effects are not skippable) and the APC signature + index-dirty
+        # bookkeeping below still run; only the device writes are elided. A
+        # monitor read-modify-writes the gates in-graph each step, so it forces
+        # a rewrite (cache invalid); so does any layout change (rows / token
+        # counts / tier gain / decode mask) or the nothing-active transition.
+        if (
+            not self._steering_manager.has_monitor
+            and self._steering_buf_cache_valid
+            and active_count == self._steering_prev_active_count
+            and tier_gain == self._steering_prev_tier_gain
+            and np.array_equal(
+                rows_scratch[:active_count], self._steering_prev_rows
+            )
+            and np.array_equal(
+                n_tokens_scratch[:active_count], self._steering_prev_ntok
+            )
+            and np.array_equal(
+                decode_mask_scratch[:active_count], self._steering_prev_dmask
+            )
+        ):
+            self._steering_buf_skip_count += 1
+            self._steering_index_dirty = True
+            self._pending_decode_sigs = self._compute_decode_signature_deltas(
+                scheduler_output
+            )
+            return
+
         # Single non-blocking H2D copy: expand per-request rows into
         # the per-token row array (written into the pre-allocated
         # pinned-memory scratch), then copy that prefix to the GPU
@@ -1775,6 +1840,18 @@ class SteeringModelRunnerMixin:
             n_mask = 0
         if n_mask < decode_mask.shape[0]:
             decode_mask[n_mask:].zero_()
+
+        # Cache this step's per-token layout so the next step can skip the
+        # rebuild above when nothing changed. Valid only when no monitor is
+        # active (a monitor mutates token_scales/row_gate in-graph, so the
+        # device buffers diverge from what was written here).
+        self._steering_buf_rebuild_count += 1
+        self._steering_buf_cache_valid = not self._steering_manager.has_monitor
+        self._steering_prev_active_count = active_count
+        self._steering_prev_tier_gain = tier_gain
+        self._steering_prev_rows = rows_scratch[:active_count].copy()
+        self._steering_prev_ntok = n_tokens_scratch[:active_count].copy()
+        self._steering_prev_dmask = decode_mask_scratch[:active_count].copy()
 
         # Mark the index as having non-zero row references this step. The
         # no-active-state short-circuit on a future step will zero the index

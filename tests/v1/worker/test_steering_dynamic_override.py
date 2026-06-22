@@ -743,3 +743,61 @@ def test_scale_update_rejects_multiple_targets():
         source="s",
     )
     assert (applied, rejected) == (0, 1)
+
+
+# ---------------------------------------------------------------------------
+# Steady-state buffer-rebuild skip (perf)
+# ---------------------------------------------------------------------------
+
+
+def test_buffer_rebuild_skipped_when_unchanged_no_monitor():
+    """A second step with an identical per-token layout and no in-graph
+    monitor must NOT rewrite the index/gate device buffers — they already
+    hold the right values. Proven by poisoning the buffers after the first
+    write: an identical step leaves the poison untouched (skip taken)."""
+    host = _MixinHost([_decode_req()])
+    host._steering_manager.update_dynamic_tier(_HP, 0, torch.ones(HIDDEN))
+    sched = _FakeSchedulerOutput({"r1": 1})
+
+    host._update_steering_buffers(sched)
+    assert host._steering_buf_cache_valid
+    layer = host._steerable_layers_cache[0]
+    layer.steering_index.fill_(999)
+    layer.steering_token_scales.fill_(7.0)
+    layer.steering_row_gate.fill_(0.5)
+
+    host._update_steering_buffers(sched)  # identical -> skip
+    assert (layer.steering_index == 999).all()
+    assert (layer.steering_token_scales == 7.0).all()
+    assert (layer.steering_row_gate == 0.5).all()
+
+
+def test_buffer_rebuild_runs_when_layout_changes():
+    """A change in the per-token layout (here: token count) must defeat the
+    skip and rewrite the buffers."""
+    host = _MixinHost([_decode_req()])
+    host._steering_manager.update_dynamic_tier(_HP, 0, torch.ones(HIDDEN))
+    host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
+    layer = host._steerable_layers_cache[0]
+    layer.steering_index.fill_(999)
+
+    host._update_steering_buffers(_FakeSchedulerOutput({"r1": 2}))  # layout differs
+    assert not bool((layer.steering_index == 999).all())
+
+
+def test_buffer_rebuild_runs_when_monitor_active():
+    """An active in-graph monitor read-modify-writes the gates each forward,
+    so the runner must rewrite them every step (cache stays invalid)."""
+    host = _MixinHost([_decode_req()])
+    mgr = host._steering_manager
+    mgr.update_dynamic_tier(_HP, 0, torch.ones(HIDDEN))
+    mgr.set_monitor(_HP, 0, torch.zeros(HIDDEN), threshold=0.0, sharpness=1.0)
+    sched = _FakeSchedulerOutput({"r1": 1})
+
+    host._update_steering_buffers(sched)
+    assert not host._steering_buf_cache_valid  # monitor -> never cache
+    layer = host._steerable_layers_cache[0]
+    layer.steering_row_gate.fill_(0.5)
+
+    host._update_steering_buffers(sched)  # monitor active -> rewrite
+    assert (layer.steering_row_gate == 1.0).all()  # reset by the runner
