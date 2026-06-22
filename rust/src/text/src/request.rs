@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 use vllm_engine_core_client::protocol::{SteeringVectorSpec, StructuredOutputsParams};
 
@@ -185,6 +186,9 @@ pub struct TextRequest {
     /// Override data parallel rank.
     #[serde(default)]
     pub data_parallel_rank: Option<u32>,
+    /// LoRA adapter selected for this request.
+    #[serde(default)]
+    pub lora_request: Option<LoraRequest>,
 }
 
 impl TextRequest {
@@ -201,6 +205,7 @@ impl TextRequest {
             cache_salt: None,
             add_special_tokens: false,
             data_parallel_rank: None,
+            lora_request: None,
         }
     }
 
