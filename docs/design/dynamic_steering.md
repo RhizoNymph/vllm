@@ -636,6 +636,33 @@ As built (replaces the open design notes that follow):
   post_attn → post_mlp; "later sites" includes later hooks of the same
   layer.
 
+**Update (2026-06-21) — same-hook fusion default + opt-in cross-layer.**
+The monitor now has two modes, selected by
+`SteeringConfig.enable_cross_layer_monitor` (default `False`):
+
+- **Same-hook (default):** the gate is **fused into `apply_steering`** —
+  computed in-kernel from the pre-steering residual and folded into the
+  tier/row terms in registers, never writing a shared buffer. The op stays
+  **non-mutating** and the standalone `steering_monitor` op is *not* emitted.
+  This gates only the probe's own `(layer, hook)`.
+- **Cross-layer (opt-in):** `apply_layer_steering` emits the standalone
+  *mutating* `steering_monitor` op at every steered hook (writing the shared
+  `token_scales`/`row_gate` that later sites read — the "detect at L, gate at
+  layers ≥ L" behaviour described above) and passes the always-False
+  `steering_monitor_off` flag to `apply_steering` so the fused gate is bypassed
+  (the per-token gate is applied exactly once, not twice at L). The opt-in is
+  stamped onto each steerable layer as `module._cross_layer_monitor` in
+  `_init_steering_state`, a torch.compile-time constant ⇒ stable graph topology
+  per process; the flag is part of `SteeringConfig.compute_hash`.
+
+The mutating op was originally suspected of a bs>16 cudagraph regression and
+was fused away on that basis; nsys on the 60-layer gemma-4-31B (the reproducing
+model) later showed the mutating monitor adds **zero** launches/syncs — 1 op or
+60 ops are byte-identical to plain steering (the host-side cost is the 8-arg
+`apply_steering` op itself, present with no monitor). So the cross-layer mutating
+path is cudagraph-safe; it ships opt-in to keep the default path byte-identical.
+See `steering-bench/docs/dynamic_steering_cudagraph_finding.md`.
+
 **Wiring:** `vllm/model_executor/layers/steering_monitor_kernel.py`
 (Triton), `steering.py` (op + per-hook buffers + `apply_layer_steering`
 call + warmup), `steering_manager.py` (`set_monitor`/`clear_monitor`/

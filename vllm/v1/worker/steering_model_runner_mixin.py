@@ -238,6 +238,19 @@ class SteeringModelRunnerMixin:
             self._steering_manager = None
             return
 
+        # Stamp the cross-layer-monitor opt-in onto every steerable layer as a
+        # plain Python attribute, so ``apply_layer_steering`` branches on it as
+        # a torch.compile-time constant. Set once here (before any forward /
+        # graph trace) and constant for the model's lifetime. When False
+        # (default) the monitor is the same-hook fused gate; when True the
+        # mutating cross-layer ``steering_monitor`` op is emitted at every
+        # steered hook. See docs/design/dynamic_steering.md §8.
+        cross_layer = bool(
+            getattr(steering_config, "enable_cross_layer_monitor", False)
+        )
+        for mod in steerable.values():
+            mod._cross_layer_monitor = cross_layer
+
         # Resolve device from the first steerable layer's table buffer
         # so per-request vectors are allocated on the same device,
         # avoiding CPU->GPU copies each step.

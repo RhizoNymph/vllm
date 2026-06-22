@@ -213,6 +213,19 @@ def register_steering_buffers(
         persistent=False,
     )
 
+    # Always-False monitor flag. When the cross-layer monitor is enabled
+    # (``enable_cross_layer_monitor``), ``apply_layer_steering`` emits the
+    # standalone mutating ``steering_monitor`` op and passes THIS flag (never
+    # written) as ``apply_steering``'s monitor-active arg, so the same-hook
+    # fused gate is bypassed and the per-token gate is applied exactly once via
+    # the shared ``token_scales``/``row_gate`` buffers the standalone op writes
+    # (avoids double-gating at the probe site). See docs/design/dynamic_steering.md §8.
+    module.register_buffer(
+        "steering_monitor_off",
+        torch.zeros(1, dtype=torch.bool),
+        persistent=False,
+    )
+
     # Per-row strength scale (the §5.3 "how much" knob): one fp32 buffer
     # per layer, shared across that layer's hook points (the row index is
     # hook-independent — row 3 = config X for every hook). Default 1.0 ⇒
@@ -343,17 +356,41 @@ def apply_layer_steering(
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
     if not hasattr(module, table_attr):
         return hidden_states
-    # In-graph monitor (Phase 2, §8) is **fused into** ``apply_steering``:
-    # at a probe site the kernel computes the per-token gate from the
-    # pre-steering residual and folds it into the tier/row terms in
-    # registers — never writing it to a shared buffer. This keeps the op
-    # non-mutating (cudagraph-fusable) and the gate same-hook (it gates
-    # only this ``(layer, hook)``). The monitor buffers are passed
-    # unconditionally and the kernel skips the gate reduction unless the
-    # ``active`` flag is set, so the compiled topology stays stable and an
-    # unconfigured monitor costs nothing. (The standalone mutating
-    # ``steering_monitor`` op is retained for cross-layer gating; it is not
-    # emitted on this hot path.)
+    monitor_active = getattr(module, HOOK_POINT_MONITOR_ACTIVE_ATTR[hook_point])
+    # Cross-layer monitor (Phase 2, §8): when enabled, emit the standalone
+    # *mutating* ``steering_monitor`` op at this hook — it reads the
+    # pre-steering residual and writes a per-token gate into the SHARED
+    # ``steering_token_scales``/``steering_row_gate`` buffers, which every
+    # later layer/hook's ``apply_steering`` then reads ("detect at L, gate at
+    # layers ≥ L"). The op is a no-op unless the manager activated a probe at
+    # this site, so the compiled topology stays stable and unconfigured sites
+    # cost nothing (the mutating op is cudagraph-free — measured, see
+    # docs/design/dynamic_steering.md §8). The same-hook fused gate is then
+    # bypassed (pass the always-False ``steering_monitor_off`` flag) so the
+    # gate is applied exactly once via the shared buffers, not twice at L.
+    # ``module._cross_layer_monitor`` is stamped once at steering init, so
+    # torch.compile traces this as a static branch (stable per process).
+    if getattr(module, "_cross_layer_monitor", False):
+        torch.ops.vllm.steering_monitor(
+            hidden_states,
+            getattr(module, HOOK_POINT_MONITOR_PROBE_ATTR[hook_point]),
+            getattr(module, HOOK_POINT_MONITOR_PARAMS_ATTR[hook_point]),
+            monitor_active,
+            module.steering_token_scales,
+            module.steering_decode_mask,
+            module.steering_row_gate,
+        )
+        fused_active = module.steering_monitor_off
+    else:
+        # Default: the in-graph monitor is **fused into** ``apply_steering`` —
+        # the kernel computes the per-token gate from the pre-steering residual
+        # and folds it into the tier/row terms in registers, never writing a
+        # shared buffer. Non-mutating (cudagraph-fusable) and same-hook (it
+        # gates only this ``(layer, hook)``). Buffers are passed
+        # unconditionally; the kernel skips the gate reduction unless the
+        # ``active`` flag is set, so the topology stays stable and an
+        # unconfigured monitor costs nothing.
+        fused_active = monitor_active
     return torch.ops.vllm.apply_steering(
         hidden_states,
         getattr(module, table_attr),
@@ -365,7 +402,7 @@ def apply_layer_steering(
         module.steering_row_gate,
         getattr(module, HOOK_POINT_MONITOR_PROBE_ATTR[hook_point]),
         getattr(module, HOOK_POINT_MONITOR_PARAMS_ATTR[hook_point]),
-        getattr(module, HOOK_POINT_MONITOR_ACTIVE_ATTR[hook_point]),
+        fused_active,
         module.steering_decode_mask,
     )
 
