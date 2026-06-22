@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
         },
         coordinator_mode: CoordinatorMode::MaybeInProc,
         model: args.model,
+        tokenizer: None,
         served_model_name: vec![],
         listener_mode: HttpListenerMode::BindTcp {
             host: "127.0.0.1".to_string(),
@@ -71,6 +72,7 @@ async fn main() -> Result<()> {
         disable_log_stats: false,
         grpc_port: None,
         shutdown_timeout: Duration::ZERO,
+        steering_modules: Vec::new(),
     };
 
     let bind_address = format!("127.0.0.1:{port}");

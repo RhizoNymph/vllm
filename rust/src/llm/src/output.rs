@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use futures::stream::FusedStream;
 use futures::{Stream, StreamExt as _, pin_mut};
 use serde::{Deserialize, Serialize};
 use vllm_engine_core_client::protocol::logprobs::Logprobs;
-use vllm_engine_core_client::protocol::{EngineCoreFinishReason, StopReason};
+use vllm_engine_core_client::protocol::{CaptureResult, EngineCoreFinishReason, StopReason};
 use vllm_engine_core_client::{AbortCause, EngineCoreOutputStream};
 
 use crate::error::Result;
@@ -25,6 +26,9 @@ pub struct CollectedGenerateOutput {
     pub finish_reason: FinishReason,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Per-consumer activation-capture results, keyed by consumer name. Empty
+    /// unless the request opted into capture.
+    pub capture_results: HashMap<String, CaptureResult>,
 }
 
 /// Prompt-scoped metadata emitted only once on the first [`GenerateOutput`] for
@@ -129,6 +133,9 @@ pub struct GenerateOutput {
     pub finish_reason: Option<FinishReason>,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Per-consumer activation-capture results, keyed by consumer name. Empty
+    /// unless the request opted into capture; populated on the terminal output.
+    pub capture_results: HashMap<String, CaptureResult>,
 }
 
 impl GenerateOutput {
@@ -174,6 +181,7 @@ impl GenerateOutput {
             logprobs: None,
             finish_reason,
             kv_transfer_params: None,
+            capture_results: HashMap::new(),
         }
     }
 }
@@ -254,6 +262,7 @@ impl Stream for GenerateOutputStream {
             logprobs,
             finish_reason,
             kv_transfer_params: raw.kv_transfer_params,
+            capture_results: raw.capture_results,
         };
 
         Poll::Ready(Some(Ok(output)))
@@ -329,6 +338,7 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                         logprobs: output.logprobs,
                         finish_reason: FinishReason::Error,
                         kv_transfer_params: None,
+                        capture_results: HashMap::new(),
                     });
                 }
 
@@ -336,6 +346,7 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                     let mut collected = collected.expect("terminal output must exist");
                     collected.finish_reason = finish_reason;
                     collected.kv_transfer_params = output.kv_transfer_params;
+                    collected.capture_results = output.capture_results;
                     return Ok(collected);
                 }
             }

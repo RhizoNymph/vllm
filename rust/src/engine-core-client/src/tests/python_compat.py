@@ -86,6 +86,7 @@ class EngineCoreOutput(
     pooling_output: object | None = None
     finish_reason: FinishReason | None = None
     stop_reason: int | str | None = None
+    capture_results: dict = msgspec.field(default_factory=dict)
     events: object | None = None
     kv_transfer_params: object | None = None
     trace_headers: object | None = None

@@ -5,8 +5,11 @@
 //! parsing are handled earlier by their own adapters. This stage consumes those
 //! parsed deltas and assembles higher-level assistant content blocks.
 
+use std::collections::HashMap;
+
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
+use vllm_engine_core_client::protocol::CaptureResult;
 use vllm_text::DecodedLogprobs;
 
 use super::{AssistantEvent, AssistantEventStream};
@@ -131,6 +134,7 @@ impl StructuredEventState {
         output_token_count: usize,
         finish_reason: FinishReason,
         kv_transfer_params: Option<serde_json::Value>,
+        capture_results: HashMap<String, CaptureResult>,
     ) -> Result<Vec<ChatEvent>> {
         let mut events = Vec::new();
         self.close_open_text_block(&mut events);
@@ -141,6 +145,7 @@ impl StructuredEventState {
             output_token_count,
             finish_reason,
             kv_transfer_params,
+            capture_results,
         });
         Ok(events)
     }
@@ -277,12 +282,14 @@ pub(crate) async fn structured_chat_event_stream(
                 output_token_count,
                 finish_reason,
                 kv_transfer_params,
+                capture_results,
             } => {
                 for next in state.finish(
                     prompt_token_count,
                     output_token_count,
                     finish_reason,
                     kv_transfer_params,
+                    capture_results,
                 )? {
                     y.yield_ok(next).await;
                 }
@@ -317,6 +324,7 @@ mod tests {
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -368,6 +376,7 @@ mod tests {
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -416,6 +425,7 @@ mod tests {
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -464,6 +474,7 @@ mod tests {
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 

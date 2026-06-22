@@ -110,7 +110,11 @@ pub(super) async fn load_model_backends(
     model_id: &str,
     options: LoadModelBackendsOptions,
 ) -> Result<LoadedModelBackends> {
-    let files = ResolvedModelFiles::new(model_id).await?;
+    // Resolve backend files from the tokenizer override when provided, so the
+    // public model id can differ from the tokenizer source (e.g. a GGUF model
+    // whose tokenizer lives in a separate directory).
+    let resolve_from = options.tokenizer.as_deref().unwrap_or(model_id);
+    let files = ResolvedModelFiles::new(resolve_from).await?;
     let text_backend =
         HfTextBackend::from_resolved_model_files(files.clone(), model_id.to_string())?;
     let tokenizer = text_backend.tokenizer();
@@ -224,6 +228,7 @@ mod tests {
             resolved_files(config_json, tokenizer_config_json),
             "test-model".to_string(),
             LoadModelBackendsOptions {
+                tokenizer: None,
                 renderer,
                 chat_template_content_format: Default::default(),
                 chat_template: None,

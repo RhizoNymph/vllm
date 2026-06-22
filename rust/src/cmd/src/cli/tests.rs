@@ -1,8 +1,61 @@
 use expect_test::expect;
 use vllm_engine_core_client::TransportMode;
-use vllm_server::{Config, HttpListenerMode, ParserSelection, RendererSelection};
+use vllm_server::{
+    Config, HttpListenerMode, ParserSelection, RendererSelection, SteeringModulePath,
+};
 
-use super::{Cli, Command};
+use super::{Cli, Command, parse_steering_module};
+
+#[test]
+fn parse_steering_module_splits_on_first_equals() {
+    assert_eq!(
+        parse_steering_module("creativity=/models/creativity.json").unwrap(),
+        SteeringModulePath {
+            name: "creativity".to_string(),
+            path: "/models/creativity.json".to_string(),
+        }
+    );
+    // Paths may contain further `=` characters.
+    assert_eq!(
+        parse_steering_module("m=/a=b.json").unwrap().path,
+        "/a=b.json"
+    );
+    assert!(parse_steering_module("no-equals").is_err());
+    assert!(parse_steering_module("=/path.json").is_err());
+    assert!(parse_steering_module("name=").is_err());
+}
+
+#[test]
+fn serve_parses_steering_modules_into_config() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--steering-modules",
+        "creativity=/models/creativity.json",
+        "formality=/models/formality.json",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    let config = args.to_frontend_config("tcp://127.0.0.1:29550".to_string());
+
+    assert_eq!(
+        config.steering_modules,
+        vec![
+            SteeringModulePath {
+                name: "creativity".to_string(),
+                path: "/models/creativity.json".to_string(),
+            },
+            SteeringModulePath {
+                name: "formality".to_string(),
+                path: "/models/formality.json".to_string(),
+            },
+        ]
+    );
+}
 
 #[test]
 fn serve_args_forward_python_flags_with_separator() {
@@ -30,6 +83,7 @@ fn serve_args_forward_python_flags_with_separator() {
                     uds: None,
                     runtime: SharedRuntimeArgs {
                         model: "Qwen/Qwen3-0.6B",
+                        tokenizer: None,
                         engine_ready_timeout_secs: 600,
                         tool_call_parser: Auto,
                         reasoning_parser: Auto,
@@ -45,6 +99,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         enable_log_requests: false,
                         disable_log_stats: false,
                         served_model_name: [],
+                        steering_modules: [],
                     },
                     managed_engine: ManagedEngineArgs {
                         python: "../vllm/.venv/bin/python",
@@ -207,6 +262,7 @@ fn frontend_args_accept_json() {
                     engine_count: 1,
                     runtime: SharedRuntimeArgs {
                         model: "Qwen/Qwen3-0.6B",
+                        tokenizer: None,
                         engine_ready_timeout_secs: 600,
                         tool_call_parser: Auto,
                         reasoning_parser: Auto,
@@ -220,6 +276,7 @@ fn frontend_args_accept_json() {
                         enable_log_requests: false,
                         disable_log_stats: false,
                         served_model_name: [],
+                        steering_modules: [],
                     },
                 },
             ),
@@ -605,6 +662,7 @@ fn serve_args_accept_handshake_aliases() {
                     uds: None,
                     runtime: SharedRuntimeArgs {
                         model: "Qwen/Qwen3-0.6B",
+                        tokenizer: None,
                         engine_ready_timeout_secs: 600,
                         tool_call_parser: Auto,
                         reasoning_parser: Auto,
@@ -618,6 +676,7 @@ fn serve_args_accept_handshake_aliases() {
                         enable_log_requests: false,
                         disable_log_stats: false,
                         served_model_name: [],
+                        steering_modules: [],
                     },
                     managed_engine: ManagedEngineArgs {
                         python: "python3",
@@ -721,6 +780,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             },
             coordinator_mode: MaybeInProc,
             model: "Qwen/Qwen3-0.6B",
+            tokenizer: None,
             served_model_name: [],
             listener_mode: BindTcp {
                 host: "127.0.0.1",
@@ -736,6 +796,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             disable_log_stats: false,
             grpc_port: None,
             shutdown_timeout: 0ns,
+            steering_modules: [],
         }
     "#]]
     .assert_debug_eq(&Config {
@@ -783,6 +844,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             },
             coordinator_mode: MaybeInProc,
             model: "Qwen/Qwen3-0.6B",
+            tokenizer: None,
             served_model_name: [],
             listener_mode: BindTcp {
                 host: "127.0.0.1",
@@ -798,6 +860,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             disable_log_stats: false,
             grpc_port: None,
             shutdown_timeout: 0ns,
+            steering_modules: [],
         }
     "#]]
     .assert_debug_eq(&config);
@@ -861,6 +924,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
                 address: "tcp://127.0.0.1:7000",
             },
             model: "Qwen/Qwen3-0.6B",
+            tokenizer: None,
             served_model_name: [],
             listener_mode: InheritedFd {
                 fd: 3,
@@ -875,6 +939,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             disable_log_stats: false,
             grpc_port: None,
             shutdown_timeout: 0ns,
+            steering_modules: [],
         }
     "#]]
     .assert_debug_eq(&config);

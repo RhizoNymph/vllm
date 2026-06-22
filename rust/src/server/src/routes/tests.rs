@@ -74,6 +74,7 @@ fn request_output_with_stop_reason(
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
+        capture_results: Default::default(),
         num_nans_in_logits: 0,
     }
 }
@@ -99,6 +100,7 @@ fn request_output_with_logprobs(
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
+        capture_results: Default::default(),
         num_nans_in_logits: 0,
     }
 }
@@ -125,6 +127,7 @@ fn request_output_with_logprobs_and_kv(
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
+        capture_results: Default::default(),
         num_nans_in_logits: 0,
     }
 }
@@ -3183,6 +3186,115 @@ async fn collective_rpc_route_sends_expected_utility_call_and_returns_results() 
             }]
         })
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn steering_modules_register_broadcasts_and_lists() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            // First collective_rpc: register_steering_modules.
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("collective_rpc"));
+            let inner = array[3].as_array().expect("collective_rpc args");
+            assert_eq!(inner[0], Value::from("register_steering_modules"));
+            // kwargs carries the module registry keyed by name.
+            let kwargs = inner[3].as_map().expect("kwargs map");
+            let modules = kwargs
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("modules"))
+                .map(|(_, v)| v)
+                .expect("modules kwarg");
+            assert!(
+                modules
+                    .as_map()
+                    .expect("modules map")
+                    .iter()
+                    .any(|(k, _)| k.as_str() == Some("creativity"))
+            );
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+
+            // Second collective_rpc: pre_materialize_steering_module.
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            let inner = array[3].as_array().expect("collective_rpc args");
+            assert_eq!(inner[0], Value::from("pre_materialize_steering_module"));
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/steering/modules")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"modules":{"creativity":{"vectors":{"post_mlp":{"14":[0.1,0.2]}}}}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({ "modules": ["creativity"] })
+    );
+
+    // The registered module is now visible to GET (no engine round-trip).
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/steering/modules")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({ "modules": ["creativity"] })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn steering_modules_delete_unknown_returns_bad_request() {
+    // Deleting an unregistered module is rejected before any engine round-trip,
+    // so the mock engine script does nothing.
+    let (app, engine_task) =
+        test_admin_app_with_engine_script(|_dealer, _push| boxed_test_future(async move {})).await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/steering/modules/nope")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    engine_task.await.expect("mock engine task");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

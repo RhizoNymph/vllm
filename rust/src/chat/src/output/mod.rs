@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -5,6 +6,7 @@ use futures::Stream;
 use subenum::subenum;
 use trait_set::trait_set;
 use uuid::Uuid;
+use vllm_engine_core_client::protocol::CaptureResult;
 use vllm_text::output::{DecodedLogprobs, DecodedPromptLogprobs, DecodedTextEvent};
 
 use crate::FinishReason;
@@ -54,6 +56,8 @@ pub(crate) enum AssistantEvent {
         finish_reason: FinishReason,
         /// Connector-specific KV transfer parameters for disaggregated serving.
         kv_transfer_params: Option<serde_json::Value>,
+        /// Per-consumer activation-capture results, keyed by consumer name.
+        capture_results: HashMap<String, CaptureResult>,
     },
 }
 
@@ -94,6 +98,7 @@ impl ContentEvent {
                         output_token_count: finished.output_token_count,
                         finish_reason: finished.finish_reason,
                         kv_transfer_params: finished.kv_transfer_params,
+                        capture_results: finished.capture_results,
                     });
                 }
                 events

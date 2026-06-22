@@ -6,12 +6,13 @@ mod load;
 mod metrics;
 pub(crate) mod openai;
 mod sleep;
+mod steering;
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::middleware::{from_fn, from_fn_with_state};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use tower_http::trace::TraceLayer;
 
 use crate::middleware;
@@ -39,6 +40,15 @@ fn build_router_with_dev_mode(state: Arc<AppState>, dev_mode_enabled: bool) -> R
         .route("/v1/models", get(openai::list_models))
         .route("/v1/completions", post(openai::completions))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        // Named steering module registry management
+        .route(
+            "/v1/steering/modules",
+            get(steering::list_steering_modules).post(steering::register_steering_modules),
+        )
+        .route(
+            "/v1/steering/modules/{name}",
+            delete(steering::unregister_steering_module),
+        )
         // vLLM specific inference endpoints
         .route("/inference/v1/generate", post(inference::generate));
 

@@ -370,6 +370,7 @@ async fn harmony_assistant_event_stream(
                         output_token_count: finished.output_token_count,
                         finish_reason: finished.finish_reason,
                         kv_transfer_params: finished.kv_transfer_params,
+                        capture_results: finished.capture_results,
                     })
                     .await;
                 }

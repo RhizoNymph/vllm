@@ -51,6 +51,12 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let text_request =
             convert::to_text_request(proto_req, false, self.state.served_model_names())?;
+        if let Some(message) = self
+            .state
+            .steering_module_error(text_request.sampling_params.steering_name.as_deref())
+        {
+            return Err(Status::not_found(message));
+        }
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (unary)");
@@ -75,6 +81,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
             output_token_count: collected.token_ids.len(),
             finish_reason: collected.finish_reason,
             kv_transfer_params: collected.kv_transfer_params,
+            capture_results: collected.capture_results,
         };
 
         let outputs = convert::to_sequence_output(
@@ -100,6 +107,12 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let text_request =
             convert::to_text_request(proto_req, true, self.state.served_model_names())?;
+        if let Some(message) = self
+            .state
+            .steering_module_error(text_request.sampling_params.steering_name.as_deref())
+        {
+            return Err(Status::not_found(message));
+        }
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (stream)");

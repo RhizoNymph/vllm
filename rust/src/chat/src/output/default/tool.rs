@@ -234,6 +234,7 @@ pub(crate) async fn tool_event_stream(
                 output_token_count,
                 finish_reason,
                 kv_transfer_params,
+                capture_results,
             } => {
                 for next in state.finish()? {
                     y.yield_ok(next).await;
@@ -244,6 +245,7 @@ pub(crate) async fn tool_event_stream(
                     output_token_count,
                     finish_reason,
                     kv_transfer_params,
+                    capture_results,
                 })
                 .await;
             }
@@ -338,6 +340,7 @@ mod tests {
                 output_token_count: 0,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -371,6 +374,7 @@ mod tests {
                     output_token_count: 0,
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 },
             ]
         );
@@ -413,6 +417,7 @@ mod tests {
                 output_token_count: 0,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
         let events = tool_event_stream(events, Some(Box::new(FailingParser { fail_next: false })))
@@ -447,6 +452,7 @@ mod tests {
                     output_token_count: 0,
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 },
             ]
         );
@@ -464,6 +470,7 @@ mod tests {
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -569,6 +576,7 @@ mod tests {
                 output_token_count: 1,
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 

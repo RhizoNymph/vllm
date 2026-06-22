@@ -93,6 +93,11 @@ pub fn lower_sampling_params(
         structured_outputs,
         skip_reading_prefix_cache,
         vllm_xargs,
+        steering_vectors,
+        prefill_steering_vectors,
+        decode_steering_vectors,
+        steering_name,
+        capture,
     } = sampling_params;
 
     // Mirrors the model-generation-config inheritance used by vLLM's OpenAI chat
@@ -144,6 +149,13 @@ pub fn lower_sampling_params(
         logprob_token_ids,
         skip_reading_prefix_cache,
         extra_args: vllm_xargs,
+        steering_vectors,
+        prefill_steering_vectors,
+        decode_steering_vectors,
+        // Mirror the Python OpenAI entrypoint: a named steering module is
+        // forwarded as `(name, 1.0)`; the worker applies the request scale.
+        steering_module_ref: steering_name.map(|name| (name, 1.0)),
+        capture,
     })
 }
 
@@ -334,6 +346,11 @@ mod tests {
                 logprob_token_ids: None,
                 skip_reading_prefix_cache: None,
                 extra_args: None,
+                steering_vectors: None,
+                prefill_steering_vectors: None,
+                decode_steering_vectors: None,
+                steering_module_ref: None,
+                capture: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -380,6 +397,11 @@ mod tests {
                 logprob_token_ids: None,
                 skip_reading_prefix_cache: None,
                 extra_args: None,
+                steering_vectors: None,
+                prefill_steering_vectors: None,
+                decode_steering_vectors: None,
+                steering_module_ref: None,
+                capture: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -518,6 +540,11 @@ mod tests {
                 logprob_token_ids: None,
                 skip_reading_prefix_cache: None,
                 extra_args: None,
+                steering_vectors: None,
+                prefill_steering_vectors: None,
+                decode_steering_vectors: None,
+                steering_module_ref: None,
+                capture: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -576,6 +603,11 @@ mod tests {
                 logprob_token_ids: None,
                 skip_reading_prefix_cache: None,
                 extra_args: None,
+                steering_vectors: None,
+                prefill_steering_vectors: None,
+                decode_steering_vectors: None,
+                steering_module_ref: None,
+                capture: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -655,9 +687,57 @@ mod tests {
                 logprob_token_ids: None,
                 skip_reading_prefix_cache: None,
                 extra_args: None,
+                steering_vectors: None,
+                prefill_steering_vectors: None,
+                decode_steering_vectors: None,
+                steering_module_ref: None,
+                capture: None,
             }
         "#]]
         .assert_debug_eq(&params);
+    }
+
+    #[test]
+    fn lower_sampling_params_threads_steering_and_capture() {
+        use std::collections::HashMap;
+
+        use vllm_engine_core_client::protocol::SteeringLayerEntry;
+
+        let spec = HashMap::from([(
+            "pre_attn".to_string(),
+            HashMap::from([(
+                3u32,
+                SteeringLayerEntry {
+                    vector: vec![1.0, 2.0],
+                    scale: 0.5,
+                },
+            )]),
+        )]);
+        let sampling_params = SamplingParams {
+            steering_vectors: Some(spec.clone()),
+            steering_name: Some("creativity".to_string()),
+            capture: Some(serde_json::json!({"filesystem": {"tag": "t"}})),
+            ..SamplingParams::default()
+        };
+
+        let params = lower_sampling_params(
+            sampling_params,
+            sample_sampling_hints(),
+            3,
+            &stub_tokenizer(),
+        )
+        .unwrap();
+
+        assert_eq!(params.steering_vectors, Some(spec));
+        // A named module is forwarded as `(name, 1.0)`.
+        assert_eq!(
+            params.steering_module_ref,
+            Some(("creativity".to_string(), 1.0))
+        );
+        assert_eq!(
+            params.capture,
+            Some(serde_json::json!({"filesystem": {"tag": "t"}}))
+        );
     }
 
     #[test]
