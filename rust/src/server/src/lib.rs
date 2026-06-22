@@ -39,6 +39,7 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let loaded = load_model_backends(
         &config.model,
         LoadModelBackendsOptions {
+            tokenizer: config.tokenizer.clone(),
             renderer: config.renderer,
             chat_template: config.chat_template.clone(),
             chat_template_content_format: config.chat_template_content_format,

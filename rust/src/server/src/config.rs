@@ -51,6 +51,9 @@ pub struct Config {
     pub coordinator_mode: CoordinatorMode,
     /// Backend model identifier used for engine-core loading.
     pub model: String,
+    /// Optional tokenizer source overriding `model` for frontend backend file
+    /// resolution. When `None`, the tokenizer is resolved from `model`.
+    pub tokenizer: Option<String>,
     /// Model name(s) exposed to clients via the OpenAI API. When non-empty,
     /// the first entry is used as the primary ID in responses and all entries
     /// are accepted in requests. When empty, falls back to `model`.

@@ -92,6 +92,15 @@ pub struct SharedRuntimeArgs {
     /// public model ID.
     pub model: String,
 
+    /// Name or path of the tokenizer to use for the frontend. When unspecified,
+    /// `--model` is used. Useful when `--model` points at a format without a
+    /// loadable `tokenizer.json` (e.g. a GGUF file): point this at a directory
+    /// that contains the tokenizer (and sibling config) files while the engine
+    /// loads the original model.
+    #[arg(long)]
+    #[serde(default)]
+    pub tokenizer: Option<String>,
+
     /// Maximum time to wait for the expected engines to register on the
     /// frontend transport.
     #[arg(
@@ -237,6 +246,7 @@ impl SharedRuntimeArgs {
                 None => CoordinatorMode::None,
             },
             model: self.model,
+            tokenizer: self.tokenizer,
             served_model_name: self.served_model_name,
             listener_mode: HttpListenerMode::InheritedFd { fd: listen_fd },
             tool_call_parser: self.tool_call_parser,
@@ -278,6 +288,7 @@ impl SharedRuntimeArgs {
             },
             coordinator_mode: CoordinatorMode::MaybeInProc,
             model: self.model,
+            tokenizer: self.tokenizer,
             served_model_name: self.served_model_name,
             listener_mode,
             tool_call_parser: self.tool_call_parser,

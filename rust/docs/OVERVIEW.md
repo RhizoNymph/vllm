@@ -20,6 +20,15 @@ data_flow: |
   Python engine-core. Outputs return as EngineCoreOutputs over ZMQ and are decoded
   back up to the response DTOs.
 
+  Backend file resolution: the frontend loads the tokenizer + config + chat
+  template from `--model` by default. `--tokenizer <path>` overrides only the
+  frontend's resolution source (LoadModelBackendsOptions.tokenizer →
+  ResolvedModelFiles::new), so the public model id / engine model can differ from
+  where the frontend reads its tokenizer. This decouples the two for formats
+  without a loadable `tokenizer.json` (e.g. a GGUF model whose tokenizer the Rust
+  `tokenizers` crate cannot extract, unlike the Python engine which reads it from
+  the GGUF metadata).
+
 # Features Index
 
 features:
