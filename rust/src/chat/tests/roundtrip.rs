@@ -515,6 +515,7 @@ fn decoded_completion_stream(
                     },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }
         });
@@ -529,6 +530,7 @@ fn decoded_completion_stream(
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             });
             events.push(DecodedTextEvent::TextDelta {
                 delta: chunk,

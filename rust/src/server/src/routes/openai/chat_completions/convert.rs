@@ -13,7 +13,9 @@ use crate::routes::openai::utils::structured_outputs::convert_from_response_form
 use crate::routes::openai::utils::types::{
     ChatMessage, ContentPart, MessageContent, Tool, ToolChoice, ToolChoiceValue,
 };
-use crate::utils::{ResolvedRequestContext, convert_logit_bias, merge_kv_transfer_params};
+use crate::utils::{
+    ResolvedRequestContext, convert_logit_bias, merge_kv_transfer_params, unpack_steering_field,
+};
 
 /// Lowered chat request plus the public response metadata carried by every SSE
 /// chunk.
@@ -105,6 +107,12 @@ pub(super) fn prepare_chat_request(
         &request.structured_outputs,
     )?;
 
+    let steering_vectors = unpack_steering_field(request.steering_vectors, "steering_vectors")?;
+    let prefill_steering_vectors =
+        unpack_steering_field(request.prefill_steering_vectors, "prefill_steering_vectors")?;
+    let decode_steering_vectors =
+        unpack_steering_field(request.decode_steering_vectors, "decode_steering_vectors")?;
+
     let chat_request = ChatRequest {
         request_id: request_id.clone(),
         messages,
@@ -133,6 +141,11 @@ pub(super) fn prepare_chat_request(
                 request.vllm_xargs,
                 request.kv_transfer_params.as_ref(),
             ),
+            steering_vectors,
+            prefill_steering_vectors,
+            decode_steering_vectors,
+            steering_name: request.steering_name,
+            capture: request.capture,
         },
         chat_options: ChatOptions {
             generation_prompt_mode,

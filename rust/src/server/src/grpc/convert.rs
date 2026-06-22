@@ -1,15 +1,19 @@
 //! Conversion between gRPC protobuf types and internal `vllm-text`
 //! request/response types.
 
+use std::collections::HashMap;
+
 use tonic::Status;
 use uuid::Uuid;
-use vllm_engine_core_client::protocol::{StopReason, StructuredOutputsParams};
+use vllm_engine_core_client::protocol::{SteeringVectorSpec, StopReason, StructuredOutputsParams};
 use vllm_text::{
     DecodedLogprobs, DecodedPromptLogprobs, FinishReason, Finished, Prompt, SamplingParams,
     TextDecodeOptions, TextRequest,
 };
 
 use super::pb;
+use crate::routes::openai::utils::capture::build_capture_results_response;
+use crate::routes::openai::utils::steering::unpack_steering_hook;
 
 // ========================================================================================
 // Request conversion
@@ -71,6 +75,21 @@ pub fn to_text_request(
         if kv.bypass_prefix_cache {
             sampling_params.skip_reading_prefix_cache = Some(true);
         }
+    }
+
+    // Thread per-request steering and capture.
+    if let Some(steering) = req.steering {
+        sampling_params.steering_vectors = convert_packed_steering(steering.steering_vectors)?;
+        sampling_params.prefill_steering_vectors =
+            convert_packed_steering(steering.prefill_steering_vectors)?;
+        sampling_params.decode_steering_vectors =
+            convert_packed_steering(steering.decode_steering_vectors)?;
+        if !steering.name.is_empty() {
+            sampling_params.steering_name = Some(steering.name);
+        }
+    }
+    if let Some(capture) = req.capture.as_ref() {
+        sampling_params.capture = Some(proto_struct_to_json_prefer_int(capture));
     }
 
     let decode_options = TextDecodeOptions {
@@ -349,11 +368,17 @@ fn to_finish_info(finished: &Finished, token_ids: &[u32]) -> pb::FinishInfo {
         }
     };
 
+    let capture_results = build_capture_results_response(&finished.capture_results)
+        .and_then(|results| serde_json::to_value(results).ok())
+        .as_ref()
+        .and_then(json_to_proto_struct);
+
     pb::FinishInfo {
         num_output_tokens: finished.usage.output_token_count as u32,
         finish_reason,
         stop_reason,
         kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_proto_struct),
+        capture_results,
     }
 }
 
@@ -415,6 +440,72 @@ fn positions_to_proto(
     }
 
     (logprobs, ranks, candidates)
+}
+
+// ========================================================================================
+// Steering / capture conversion
+// ========================================================================================
+
+/// Convert one proto packed-steering map (hook name → blob) into the inline
+/// [`SteeringVectorSpec`] forwarded southbound. An empty map yields `None`.
+fn convert_packed_steering(
+    map: HashMap<String, pb::SteeringHookPacked>,
+) -> Result<Option<SteeringVectorSpec>, Status> {
+    if map.is_empty() {
+        return Ok(None);
+    }
+    let mut spec = SteeringVectorSpec::with_capacity(map.len());
+    for (hook, blob) in map {
+        // Proto3 repeated fields have no presence: an empty `scales` means
+        // "unset" (scale 1.0 for every row).
+        let scales = (!blob.scales.is_empty()).then_some(blob.scales.as_slice());
+        let entries = unpack_steering_hook(
+            &blob.dtype,
+            &blob.shape,
+            &blob.layer_indices,
+            scales,
+            &blob.data,
+        )
+        .map_err(|err| Status::invalid_argument(format!("{err}")))?;
+        spec.insert(hook, entries);
+    }
+    Ok(Some(spec))
+}
+
+/// Convert a proto `Struct` into JSON, preferring integer JSON numbers for
+/// whole-valued `NumberValue`s.
+///
+/// Protobuf `Struct` encodes every number as a `double`, but capture specs use
+/// integer layer/position indices that engine-core validates as ints. Coerce
+/// whole numbers back to integers so the forwarded capture dict matches what
+/// the HTTP (JSON) path produces.
+fn proto_struct_to_json_prefer_int(s: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        s.fields
+            .iter()
+            .map(|(k, v)| (k.clone(), proto_value_to_json_prefer_int(v)))
+            .collect(),
+    )
+}
+
+fn proto_value_to_json_prefer_int(v: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match v.kind.as_ref() {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(Kind::NumberValue(n)) => {
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                serde_json::Value::Number((*n as i64).into())
+            } else {
+                serde_json::json!(*n)
+            }
+        }
+        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(Kind::ListValue(list)) => serde_json::Value::Array(
+            list.values.iter().map(proto_value_to_json_prefer_int).collect(),
+        ),
+        Some(Kind::StructValue(s)) => proto_struct_to_json_prefer_int(s),
+    }
 }
 
 // ========================================================================================
@@ -517,6 +608,52 @@ mod tests {
     }
 
     #[test]
+    fn steering_and_capture_thread_into_sampling_params() {
+        use prost_types::value::Kind;
+
+        let data: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let req = pb::GenerateRequest {
+            steering: Some(pb::Steering {
+                steering_vectors: std::collections::HashMap::from([(
+                    "pre_attn".to_string(),
+                    pb::SteeringHookPacked {
+                        dtype: "float32".to_string(),
+                        shape: vec![1, 2],
+                        layer_indices: vec![4],
+                        data,
+                        scales: vec![],
+                    },
+                )]),
+                prefill_steering_vectors: std::collections::HashMap::new(),
+                decode_steering_vectors: std::collections::HashMap::new(),
+                name: "creativity".to_string(),
+            }),
+            capture: Some(prost_types::Struct {
+                fields: std::collections::BTreeMap::from([(
+                    "min_position".to_string(),
+                    prost_types::Value {
+                        kind: Some(Kind::NumberValue(2.0)),
+                    },
+                )]),
+            }),
+            ..base_request()
+        };
+
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        let sp = &text.sampling_params;
+
+        let spec = sp.steering_vectors.as_ref().expect("steering decoded");
+        assert_eq!(spec["pre_attn"][&4].vector, vec![1.0, 2.0]);
+        assert_eq!(sp.steering_name.as_deref(), Some("creativity"));
+
+        // Whole-valued proto numbers are coerced to JSON integers so the
+        // forwarded capture dict matches what the HTTP/JSON path produces.
+        let capture = sp.capture.as_ref().expect("capture present");
+        assert_eq!(capture["min_position"], serde_json::json!(2));
+        assert!(capture["min_position"].is_i64());
+    }
+
+    #[test]
     fn temperature_propagates_from_top_level_request_field() {
         let req = pb::GenerateRequest {
             temperature: Some(0.7),
@@ -597,6 +734,7 @@ mod tests {
             },
             finish_reason: reason,
             kv_transfer_params: None,
+            capture_results: Default::default(),
         }
     }
 

@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::Stream;
 use trait_set::trait_set;
+use vllm_engine_core_client::protocol::CaptureResult;
 use vllm_text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs};
 
 use crate::FinishReason;
@@ -22,6 +24,8 @@ pub struct CollectedAssistantMessage {
     pub finish_reason: FinishReason,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Per-consumer activation-capture results, keyed by consumer name.
+    pub capture_results: HashMap<String, CaptureResult>,
 }
 
 /// Per-request stream of chat events.
@@ -77,6 +81,7 @@ impl ChatEventStream {
                     usage,
                     finish_reason,
                     kv_transfer_params,
+                    capture_results,
                 } => {
                     return Ok(CollectedAssistantMessage {
                         message: done,
@@ -89,6 +94,7 @@ impl ChatEventStream {
                         usage,
                         finish_reason,
                         kv_transfer_params,
+                        capture_results,
                     });
                 }
                 ChatEvent::ToolCallEnd { call, .. } => {
@@ -194,6 +200,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             ]),
         );
@@ -234,6 +241,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }
         );
     }

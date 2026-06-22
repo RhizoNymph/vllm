@@ -101,6 +101,7 @@ fn request_output(
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
+        capture_results: Default::default(),
         num_nans_in_logits: 0,
     }
 }

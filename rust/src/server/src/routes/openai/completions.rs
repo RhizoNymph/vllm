@@ -23,6 +23,7 @@ use vllm_text::{
 };
 
 use self::convert::{ResponseOptions, prepare_completion_request};
+use super::utils::capture::build_capture_results_response;
 use super::utils::logprobs::{
     collected_logprobs_to_openai, decoded_logprobs_to_openai, decoded_prompt_logprobs_to_maps,
     decoded_prompt_logprobs_to_openai, text_len,
@@ -55,6 +56,11 @@ pub async fn completions(
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
+    if let Some(message) =
+        state.steering_module_error(prepared.text_request.sampling_params.steering_name.as_deref())
+    {
+        return ApiError::invalid_request(message, Some("steering_name")).into_response();
+    }
     let request_span = tracing::info_span!(
         "completions",
         request_id = %prepared.request_id,
@@ -206,6 +212,7 @@ async fn collect_completion(
         usage: Some(usage),
         system_fingerprint: None,
         kv_transfer_params: collected.kv_transfer_params,
+        capture_results: build_capture_results_response(&collected.capture_results),
     })
 }
 
@@ -577,8 +584,64 @@ mod tests {
     };
 
     use super::{
-        ApiServerOptions, CompletionSseChunk, ResponseOptions, completion_chunk_stream, final_chunk,
+        ApiServerOptions, CompletionSseChunk, ResponseOptions, collect_completion,
+        completion_chunk_stream, final_chunk,
     };
+
+    #[tokio::test]
+    async fn collect_completion_surfaces_capture_results() {
+        use std::collections::HashMap;
+
+        use vllm_engine_core_client::protocol::CaptureResult;
+
+        let stream = stream::iter(vec![
+            Ok(DecodedTextEvent::Start {
+                prompt_token_ids: vec![1, 2].into(),
+                prompt_logprobs: None,
+            }),
+            Ok(DecodedTextEvent::TextDelta {
+                delta: "hi".to_string(),
+                token_ids: vec![5],
+                logprobs: None,
+                finished: Some(Finished {
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 2,
+                        output_token_count: 1,
+                        cached_token_count: 0,
+                    },
+                    finish_reason: FinishReason::stop_eos(),
+                    kv_transfer_params: None,
+                    capture_results: HashMap::from([(
+                        "filesystem".to_string(),
+                        CaptureResult {
+                            key: None,
+                            status: "ok".to_string(),
+                            error: None,
+                            payload: Some(serde_json::json!({ "paths": ["/a.bin"] })),
+                        },
+                    )]),
+                }),
+            }),
+        ]);
+
+        let response = collect_completion(
+            stream,
+            "cmpl-1".to_string(),
+            "m".to_string(),
+            0,
+            ApiServerOptions::default(),
+            ResponseOptions::default(),
+        )
+        .await
+        .expect("collect");
+
+        let caps = response.capture_results.expect("capture_results surfaced");
+        assert_eq!(caps["filesystem"].status, "ok");
+        assert_eq!(
+            caps["filesystem"].payload,
+            serde_json::json!({ "paths": ["/a.bin"] })
+        );
+    }
 
     #[test]
     fn final_chunk_maps_stop_finish_reason() {
@@ -666,6 +729,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);
@@ -756,6 +820,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);
@@ -807,6 +872,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);
@@ -861,6 +927,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);
@@ -932,6 +999,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);
@@ -1005,6 +1073,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);

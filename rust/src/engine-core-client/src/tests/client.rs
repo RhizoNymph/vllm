@@ -226,6 +226,7 @@ fn request_output(
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
+        capture_results: Default::default(),
         num_nans_in_logits: 0,
     }
 }
@@ -2518,6 +2519,11 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             logprob_token_ids: None,
             skip_reading_prefix_cache: None,
             extra_args: None,
+            steering_vectors: None,
+            prefill_steering_vectors: None,
+            decode_steering_vectors: None,
+            steering_module_ref: None,
+            capture: None,
         },
     );
 
@@ -2559,6 +2565,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
                         Length,
                     ),
                     stop_reason: None,
+                    capture_results: {},
                     events: None,
                     kv_transfer_params: None,
                     trace_headers: None,

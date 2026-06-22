@@ -24,7 +24,7 @@ use vllm_managed_engine::ManagedEngineConfig;
 use vllm_managed_engine::cli::{ManagedEngineArgs, repartition_managed_engine_args};
 use vllm_server::{
     ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, CorsConfig,
-    HttpListenerMode, ParserSelection, RendererSelection,
+    HttpListenerMode, ParserSelection, RendererSelection, SteeringModulePath,
 };
 
 use crate::cli::unsupported::UnsupportedArgs;
@@ -100,6 +100,15 @@ pub struct SharedRuntimeArgs {
     /// Model identifier or local model directory used for backend loading and
     /// public model ID.
     pub model: String,
+
+    /// Name or path of the tokenizer to use for the frontend. When unspecified,
+    /// `--model` is used. Useful when `--model` points at a format without a
+    /// loadable `tokenizer.json` (e.g. a GGUF file): point this at a directory
+    /// that contains the tokenizer (and sibling config) files while the engine
+    /// loads the original model.
+    #[arg(long)]
+    #[serde(default)]
+    pub tokenizer: Option<String>,
 
     /// Maximum time to wait for the expected engines to register on the
     /// frontend transport.
@@ -251,6 +260,14 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub allow_credentials: bool,
 
+    /// Named steering modules to load at startup, each as `name=path` where
+    /// `path` is a JSON file defining the module's steering vectors. Loaded
+    /// modules are broadcast to the engine workers so requests can reference
+    /// them via the `steering_name` field.
+    #[arg(long = "steering-modules", value_parser = parse_steering_module, num_args = 0..)]
+    #[serde(default)]
+    pub steering_modules: Vec<SteeringModulePath>,
+
     /// Unsupported Python vLLM frontend arguments recognized but not yet
     /// implemented in Rust.
     #[educe(Debug(ignore))]
@@ -311,6 +328,7 @@ impl SharedRuntimeArgs {
                 None => CoordinatorMode::None,
             },
             model: self.model,
+            tokenizer: self.tokenizer,
             served_model_name: self.served_model_name,
             listener_mode: HttpListenerMode::InheritedFd { fd: listen_fd },
             tool_call_parser: self.tool_call_parser,
@@ -327,6 +345,7 @@ impl SharedRuntimeArgs {
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
+            steering_modules: self.steering_modules,
         }
     }
 
@@ -357,6 +376,7 @@ impl SharedRuntimeArgs {
             },
             coordinator_mode: CoordinatorMode::MaybeInProc,
             model: self.model,
+            tokenizer: self.tokenizer,
             served_model_name: self.served_model_name,
             listener_mode,
             tool_call_parser: self.tool_call_parser,
@@ -373,6 +393,7 @@ impl SharedRuntimeArgs {
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
+            steering_modules: self.steering_modules,
         }
     }
 
@@ -404,6 +425,29 @@ fn default_cors_wildcard() -> JsonStringList {
 
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
+}
+
+/// Parse a `--steering-modules` entry of the form `name=path` into a
+/// [`SteeringModulePath`]. The split is on the first `=` so paths may contain
+/// further `=` characters.
+fn parse_steering_module(value: &str) -> Result<SteeringModulePath, String> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected `name=path`, got `{value}`"))?;
+    if name.is_empty() {
+        return Err(format!(
+            "steering module name must not be empty in `{value}`"
+        ));
+    }
+    if path.is_empty() {
+        return Err(format!(
+            "steering module path must not be empty in `{value}`"
+        ));
+    }
+    Ok(SteeringModulePath {
+        name: name.to_owned(),
+        path: path.to_owned(),
+    })
 }
 
 fn parse_runtime_args_json(value: &str) -> Result<SharedRuntimeArgs, String> {

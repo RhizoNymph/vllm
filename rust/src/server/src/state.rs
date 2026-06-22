@@ -1,8 +1,10 @@
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing::warn;
 use vllm_chat::ChatLlm;
@@ -36,6 +38,13 @@ pub struct AppState {
     server_info: Option<ServerInfoSnapshot>,
     /// SHA-256 hashes of API keys accepted as bearer tokens for guarded routes.
     api_key_hashes: Vec<ApiKeyHash>,
+    /// Names of steering modules currently registered with the engine workers.
+    /// Seeded at startup and mutated by the runtime steering endpoints; requests
+    /// referencing an unknown `steering_name` are rejected up front.
+    steering_module_names: RwLock<HashSet<String>>,
+    /// Serializes runtime steering-registry mutations so concurrent
+    /// register/unregister requests cannot interleave their broadcasts.
+    steering_mutation_lock: Mutex<()>,
     /// Number of in-flight inference requests currently owned by this frontend.
     server_load: AtomicU64,
     /// Dynamic LoRA adapter registry.
@@ -63,6 +72,8 @@ impl AppState {
             cors: CorsConfig::default(),
             server_info: None,
             api_key_hashes: Vec::new(),
+            steering_module_names: RwLock::new(HashSet::new()),
+            steering_mutation_lock: Mutex::new(()),
             server_load: AtomicU64::new(0),
             lora_manager: LoraManager::new(),
         }
@@ -110,6 +121,65 @@ impl AppState {
 
     pub(crate) fn api_key_hashes(&self) -> &[ApiKeyHash] {
         &self.api_key_hashes
+    }
+
+    /// Seed the set of steering modules registered with the engine workers.
+    pub fn with_steering_module_names(mut self, names: HashSet<String>) -> Self {
+        self.steering_module_names = RwLock::new(names);
+        self
+    }
+
+    /// Validate a request's `steering_name` against the registered modules.
+    ///
+    /// Returns a human-readable error message when the name is present but not
+    /// registered (listing the available modules), or `None` when the request
+    /// omits `steering_name` or references a known module.
+    pub fn steering_module_error(&self, steering_name: Option<&str>) -> Option<String> {
+        let name = steering_name?;
+        let registered = self.steering_module_names.read().expect("registry lock");
+        if registered.contains(name) {
+            return None;
+        }
+        let mut available: Vec<&str> = registered.iter().map(String::as_str).collect();
+        available.sort_unstable();
+        Some(format!(
+            "Unknown steering module '{name}'. Available: [{}]",
+            available.join(", ")
+        ))
+    }
+
+    /// Return the sorted names of currently registered steering modules.
+    pub fn list_steering_modules(&self) -> Vec<String> {
+        let registered = self.steering_module_names.read().expect("registry lock");
+        let mut names: Vec<String> = registered.iter().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Whether a steering module is currently registered.
+    pub fn is_steering_module_registered(&self, name: &str) -> bool {
+        self.steering_module_names.read().expect("registry lock").contains(name)
+    }
+
+    /// Replace the entire registered-name set (after a `replace=true` register).
+    pub fn set_steering_module_names(&self, names: HashSet<String>) {
+        *self.steering_module_names.write().expect("registry lock") = names;
+    }
+
+    /// Add names to the registered set (after a `replace=false` register).
+    pub fn extend_steering_module_names(&self, names: impl IntoIterator<Item = String>) {
+        self.steering_module_names.write().expect("registry lock").extend(names);
+    }
+
+    /// Remove one name from the registered set, returning whether it was present.
+    pub fn remove_steering_module_name(&self, name: &str) -> bool {
+        self.steering_module_names.write().expect("registry lock").remove(name)
+    }
+
+    /// Acquire the registry-mutation lock, serializing runtime register and
+    /// unregister operations against each other.
+    pub async fn lock_steering_mutations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.steering_mutation_lock.lock().await
     }
 
     /// The primary model name echoed back in API responses (the first served

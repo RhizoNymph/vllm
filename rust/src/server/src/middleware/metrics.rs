@@ -24,6 +24,8 @@ const EXCLUDED_HANDLERS: &[&str] = &[
     "/sleep",
     "/wake_up",
     "/is_sleeping",
+    "/v1/steering/modules",
+    "/v1/steering/modules/{name}",
 ];
 
 /// Record API-server HTTP metrics with Python-compatible

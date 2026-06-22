@@ -5,7 +5,9 @@ use crate::error::ApiError;
 use crate::lora::LoraModelResolution;
 use crate::routes::openai::completions::validate;
 use crate::routes::openai::utils::structured_outputs::convert_from_response_format_value;
-use crate::utils::{ResolvedRequestContext, convert_logit_bias, merge_kv_transfer_params};
+use crate::utils::{
+    ResolvedRequestContext, convert_logit_bias, merge_kv_transfer_params, unpack_steering_field,
+};
 
 /// Lowered completion request plus the public response metadata carried by
 /// every SSE chunk.
@@ -97,6 +99,12 @@ pub(super) fn prepare_completion_request(
     let structured_outputs =
         convert_from_response_format_value(&request.response_format, &request.structured_outputs)?;
 
+    let steering_vectors = unpack_steering_field(request.steering_vectors, "steering_vectors")?;
+    let prefill_steering_vectors =
+        unpack_steering_field(request.prefill_steering_vectors, "prefill_steering_vectors")?;
+    let decode_steering_vectors =
+        unpack_steering_field(request.decode_steering_vectors, "decode_steering_vectors")?;
+
     let text_request = TextRequest {
         request_id: request_id.clone(),
         prompt: request.prompt,
@@ -126,6 +134,11 @@ pub(super) fn prepare_completion_request(
                 request.vllm_xargs,
                 request.kv_transfer_params.as_ref(),
             ),
+            steering_vectors,
+            prefill_steering_vectors,
+            decode_steering_vectors,
+            steering_name: request.steering_name,
+            capture: request.capture,
         },
         decode_options: TextDecodeOptions {
             skip_special_tokens: request.skip_special_tokens,
@@ -454,6 +467,69 @@ mod tests {
         assert_eq!(
             prepared.text_request.sampling_params.prompt_logprobs,
             Some(2)
+        );
+    }
+
+    #[test]
+    fn prepare_completion_request_decodes_packed_steering_and_capture() {
+        use base64::Engine as _;
+
+        let data = base64::engine::general_purpose::STANDARD
+            .encode([1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hi",
+            "steering_vectors": {
+                "pre_attn": {
+                    "dtype": "float32",
+                    "shape": [1, 3],
+                    "layer_indices": [5],
+                    "data": data,
+                }
+            },
+            "steering_name": "creativity",
+            "capture": {"filesystem": {"tag": "t", "positions": "last_prompt"}}
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+        )
+        .expect("prepare");
+
+        let sp = &prepared.text_request.sampling_params;
+        let spec = sp.steering_vectors.as_ref().expect("steering decoded");
+        assert_eq!(spec["pre_attn"][&5].vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(spec["pre_attn"][&5].scale, 1.0);
+        assert_eq!(sp.steering_name.as_deref(), Some("creativity"));
+        assert!(sp.capture.is_some());
+    }
+
+    #[test]
+    fn prepare_completion_request_rejects_malformed_steering() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hi",
+            "steering_vectors": {
+                "pre_attn": {
+                    "dtype": "float32",
+                    "shape": [2, 3],
+                    "layer_indices": [0],
+                    "data": "",
+                }
+            }
+        }))
+        .expect("parse request");
+
+        assert!(
+            prepare_completion_request(
+                request,
+                &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+                ResolvedRequestContext::default(),
+            )
+            .is_err()
         );
     }
 

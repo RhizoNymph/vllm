@@ -243,6 +243,7 @@ pub(crate) async fn tool_event_stream(
                 usage,
                 finish_reason,
                 kv_transfer_params,
+                capture_results,
             } => {
                 for next in state.finish()? {
                     y.yield_ok(next).await;
@@ -252,6 +253,7 @@ pub(crate) async fn tool_event_stream(
                     usage,
                     finish_reason,
                     kv_transfer_params,
+                    capture_results,
                 })
                 .await;
             }
@@ -470,6 +472,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             })));
         let parser = DeepSeekV4ToolParser::create(&deepseek_v4_test_tools()).unwrap();
         let assistant_events = tool_event_stream(stream::iter(events), Some(parser));
@@ -514,6 +517,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -670,6 +674,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -711,6 +716,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 },
             ]
         );
@@ -757,6 +763,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
         let events = tool_event_stream(
@@ -800,6 +807,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 },
             ]
         );
@@ -820,6 +828,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 
@@ -928,6 +937,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }),
         ]);
 

@@ -58,6 +58,7 @@ fn finished() -> Finished {
         },
         finish_reason: FinishReason::stop_eos(),
         kv_transfer_params: None,
+        capture_results: Default::default(),
     }
 }
 
@@ -122,6 +123,7 @@ fn interrupted_final_message_is_preserved() {
             },
             finish_reason: FinishReason::stop_eos(),
             kv_transfer_params: None,
+            capture_results: Default::default(),
         })
     );
 }
@@ -184,6 +186,7 @@ fn interrupted_analysis_message_is_preserved() {
             },
             finish_reason: FinishReason::stop_eos(),
             kv_transfer_params: None,
+            capture_results: Default::default(),
         })
     );
 }

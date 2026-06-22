@@ -9,6 +9,7 @@ mod middleware;
 mod routes;
 mod server_info;
 mod state;
+mod steering_modules;
 mod utils;
 
 use std::sync::{Arc, OnceLock};
@@ -16,7 +17,9 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context as _, Result};
 use axum::Router;
 use axum::serve::ListenerExt as _;
-pub use config::{ApiServerOptions, Config, CoordinatorMode, CorsConfig, HttpListenerMode};
+pub use config::{
+    ApiServerOptions, Config, CoordinatorMode, CorsConfig, HttpListenerMode, SteeringModulePath,
+};
 use tokio::net::TcpListener;
 use tokio::time::{Instant, sleep_until};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -57,6 +60,7 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let loaded = load_model_backends(
         &config.model,
         LoadModelBackendsOptions {
+            tokenizer: config.tokenizer.clone(),
             renderer: config.renderer,
             language_model_only: config.language_model_only,
             chat_template: config.chat_template.clone(),
@@ -89,6 +93,13 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     .await
     .context("failed to connect to engine core")?;
 
+    // Load and broadcast named steering modules before serving, so the workers
+    // hold the registry by the time any request references one by name.
+    let steering_module_names =
+        steering_modules::load_and_broadcast_steering_modules(&client, &config.steering_modules)
+            .await
+            .context("failed to load steering modules")?;
+
     let llm = Llm::new(client).with_log_stats(!config.disable_log_stats);
     let text = TextLlm::new(llm, text_backend).with_max_logprobs(config.max_logprobs);
 
@@ -101,7 +112,8 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_api_server_options(config.api_server_options)
             .with_server_info(ServerInfoSnapshot::from_config(config))
             .with_api_keys(config.api_keys.clone())
-            .with_cors(config.cors.clone()),
+            .with_cors(config.cors.clone())
+            .with_steering_module_names(steering_module_names),
     ))
 }
 

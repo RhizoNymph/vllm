@@ -52,6 +52,7 @@ fn request_output_with_events(
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
+        capture_results: Default::default(),
         num_nans_in_logits: 0,
     }
 }
@@ -76,6 +77,7 @@ fn request_output_with_logprobs(
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
+        capture_results: Default::default(),
         num_nans_in_logits: 0,
     }
 }
@@ -101,6 +103,7 @@ fn request_output_with_logprobs_and_kv(
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
+        capture_results: Default::default(),
         num_nans_in_logits: 0,
     }
 }

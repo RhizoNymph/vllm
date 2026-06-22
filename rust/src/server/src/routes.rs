@@ -10,6 +10,7 @@ pub(crate) mod openai;
 mod pause;
 mod server_info;
 mod sleep;
+mod steering;
 mod tokenize;
 mod version;
 
@@ -17,7 +18,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::middleware::{from_fn, from_fn_with_state};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use tower_http::trace::TraceLayer;
 
 use crate::middleware;
@@ -77,6 +78,15 @@ fn build_router_with_options(
         // vLLM specific endpoints
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
+        // Named steering module registry management
+        .route(
+            "/v1/steering/modules",
+            get(steering::list_steering_modules).post(steering::register_steering_modules),
+        )
+        .route(
+            "/v1/steering/modules/{name}",
+            delete(steering::unregister_steering_module),
+        )
         .route("/inference/v1/generate", post(inference::generate));
 
     if runtime_lora_updating_enabled {

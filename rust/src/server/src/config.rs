@@ -5,10 +5,20 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use axum::http::{HeaderName, HeaderValue, Method};
 use educe::Educe;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vllm_chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
 use vllm_engine_core_client::{CoordinatorMode as EngineCoreCoordinatorMode, TransportMode};
+
+/// One named steering module to load at startup and broadcast to the engine
+/// workers, as a `name` paired with the JSON file `path` defining its vectors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteeringModulePath {
+    /// Name clients reference via the `steering_name` request field.
+    pub name: String,
+    /// Filesystem path to the module's JSON definition.
+    pub path: String,
+}
 
 /// How the HTTP server obtains its listening socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -109,6 +119,9 @@ pub struct Config {
     pub coordinator_mode: CoordinatorMode,
     /// Backend model identifier used for engine-core loading.
     pub model: String,
+    /// Optional tokenizer source overriding `model` for frontend backend file
+    /// resolution. When `None`, the tokenizer is resolved from `model`.
+    pub tokenizer: Option<String>,
     /// Model name(s) exposed to clients via the OpenAI API. When non-empty,
     /// the first entry is used as the primary ID in responses and all entries
     /// are accepted in requests. When empty, falls back to `model`.
@@ -150,6 +163,9 @@ pub struct Config {
     pub grpc_port: Option<u16>,
     /// Maximum time to wait for active HTTP/gRPC requests to drain on shutdown.
     pub shutdown_timeout: Duration,
+    /// Named steering modules to load at startup and broadcast to the engine
+    /// workers, so requests can reference them by `steering_name`.
+    pub steering_modules: Vec<SteeringModulePath>,
 }
 
 impl Config {
