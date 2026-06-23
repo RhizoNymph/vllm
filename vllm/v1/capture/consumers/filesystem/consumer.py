@@ -18,7 +18,7 @@ import logging
 import pathlib
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from vllm.v1.capture.consumers.filesystem.types import (
     VALID_LAYOUTS,
@@ -45,7 +45,7 @@ from vllm.v1.capture.types import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.capture.types import CaptureContext
+    from vllm.v1.capture.types import CaptureContext, HookName, PositionSelector
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,7 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
             f"default_layout must be one of {sorted(VALID_LAYOUTS)}, "
             f"got {default_layout!r}"
         )
+    global_hooks = _parse_global_hooks(params.get("global_hooks"))
     return FilesystemConsumerParams(
         root=str(params["root"]),
         writer_threads=int(params.get("writer_threads", 4)),
@@ -80,7 +81,65 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
         coalesce_max_bytes=int(params.get("coalesce_max_bytes", 1 << 20)),
         num_shards=int(params.get("num_shards", 8)),
         shard_max_bytes=int(params.get("shard_max_bytes", 256 << 20)),
+        global_hooks=global_hooks,
+        global_positions=params.get("global_positions", "last_prompt"),
+        default_tag=str(params.get("default_tag", "default")),
     )
+
+
+# Hook points that have a real model forward tap; mirrors
+# ``filesystem.validation._VALID_HOOK_NAMES``. Redeclared here (not
+# imported) to keep ``_parse_params`` torch/pydantic-free.
+_VALID_GLOBAL_HOOK_NAMES: frozenset[str] = frozenset(
+    ("pre_attn", "post_attn", "post_mlp")
+)
+
+
+def _parse_global_hooks(raw: Any) -> dict[str, list[int]] | None:
+    """Validate the ``global_hooks`` param into ``{hook: [layers]}`` or None.
+
+    ``None``/empty disables the global spec (legacy per-request-only
+    behavior). Each value must be a non-empty list of non-negative int
+    layer indices; layer bounds are re-checked against the model in
+    :meth:`CaptureManager.register_request`, so only structural validation
+    happens here.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"global_hooks must be a dict mapping hook name to layer list, "
+            f"got {type(raw).__name__}"
+        )
+    if not raw:
+        return None
+    parsed: dict[str, list[int]] = {}
+    for hook_name, layers in raw.items():
+        if hook_name not in _VALID_GLOBAL_HOOK_NAMES:
+            raise ValueError(
+                f"global_hooks key {hook_name!r} is not a valid hook point; "
+                f"valid names: {sorted(_VALID_GLOBAL_HOOK_NAMES)}"
+            )
+        if not isinstance(layers, (list, tuple)) or not layers:
+            raise ValueError(
+                f"global_hooks[{hook_name!r}] must be a non-empty list of "
+                f"layer indices, got {layers!r}"
+            )
+        resolved: list[int] = []
+        for layer in layers:
+            if isinstance(layer, bool) or not isinstance(layer, int):
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] entries must be ints, "
+                    f"got {type(layer).__name__}"
+                )
+            if layer < 0:
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] layer {layer} must be "
+                    f"non-negative"
+                )
+            resolved.append(layer)
+        parsed[hook_name] = sorted(set(resolved))
+    return parsed
 
 
 def _pp_geometry(
@@ -220,6 +279,18 @@ class FilesystemConsumer:
     ) -> None:
         self._vllm_config = vllm_config
         self._params = _parse_params(params)
+        # Consumer-level global capture spec (CUDA-graph-safe path). Built
+        # once at construction from ``global_hooks``/``global_positions``;
+        # ``None`` keeps the legacy per-request-only behavior. When set, the
+        # manager captures every request uniformly via the persistent-buffer
+        # path and files are named by the engine request id under
+        # ``default_tag`` (see :meth:`_resolve_chunk_slugs`).
+        self._global_spec: CaptureSpec | None = None
+        if self._params.global_hooks is not None:
+            self._global_spec = CaptureSpec(
+                hooks=cast("dict[HookName, list[int]]", self._params.global_hooks),
+                positions=cast("PositionSelector", self._params.global_positions),
+            )
         # ``expanduser`` so ``root=~/path`` works: a shell does not expand the
         # ``~`` in ``--capture-consumers filesystem:root=~/path`` (it is not at
         # a word boundary), so the literal ``~`` would otherwise become a
@@ -294,9 +365,16 @@ class FilesystemConsumer:
     # CaptureSink protocol
     # ------------------------------------------------------------------
 
-    def global_capture_spec(self) -> None:
-        """Filesystem consumer has no global spec — capture is per-request."""
-        return None
+    def global_capture_spec(self) -> CaptureSpec | None:
+        """Return the consumer-level global capture spec, if configured.
+
+        When ``global_hooks`` is set the consumer advertises a uniform
+        ``CaptureSpec`` so every request is captured via the manager's
+        CUDA-graph-safe persistent-buffer path (no force-eager). Returns
+        ``None`` otherwise, preserving the legacy per-request behavior where
+        capture is driven only by ``SamplingParams.capture``.
+        """
+        return self._global_spec
 
     def validate_client_spec(
         self,
@@ -419,10 +497,15 @@ class FilesystemConsumer:
         self, req_str: str, chunk: CaptureChunk
     ) -> tuple[str, str]:
         """Slug priority: chunk.metadata override → admission record →
-        ``("default", req)`` fallback."""
+        ``(default_tag, req)`` fallback.
+
+        The fallback path is what global-driven (non-validated) requests
+        take: no ``FilesystemCaptureRequest`` was admitted, so the consumer
+        names files by the engine request id under the consumer's
+        ``default_tag``."""
         with self._lock:
             recorded = self._request_slugs.get(req_str)
-        fallback_tag, fallback_req = recorded or ("default", req_str)
+        fallback_tag, fallback_req = recorded or (self._params.default_tag, req_str)
         return (
             chunk.metadata.get("tag_slug", fallback_tag),
             chunk.metadata.get("request_id_slug", fallback_req),
@@ -609,7 +692,10 @@ class FilesystemConsumer:
                 # lock we already hold); they're fixed for the request, so
                 # this avoids a per-batch _resolve_chunk_slugs lock round-trip.
                 recorded = self._request_slugs.get(req_str)
-                fallback_tag, fallback_req = recorded or ("default", req_str)
+                fallback_tag, fallback_req = recorded or (
+                    self._params.default_tag,
+                    req_str,
+                )
                 meta = chunks[0].metadata
                 state = _PackedState(
                     tag_slug=meta.get("tag_slug", fallback_tag),
@@ -789,7 +875,7 @@ class FilesystemConsumer:
         elif recorded is not None:
             tag_slug, request_id_slug = recorded
         else:
-            tag_slug, request_id_slug = "default", req_str
+            tag_slug, request_id_slug = self._params.default_tag, req_str
 
         tag_slug = finalize.sidecar.get("tag_slug", tag_slug)
         request_id_slug = finalize.sidecar.get("request_id_slug", request_id_slug)
