@@ -44,6 +44,7 @@ class CaptureRunnerMixin:
 
     # ---- state (set by _init_capture_state) -------------------------------
     _capture_feature_enabled: bool = False
+    _capture_piecewise_fallback_enabled: bool = False
     _capture_manager: Any = None
     _capture_step_gate: Any = None
     _capture_validators: list[Any]
@@ -73,6 +74,15 @@ class CaptureRunnerMixin:
 
         cc_config = self.vllm_config.capture_consumers_config
         self._capture_feature_enabled = cc_config is not None
+        # Capture-aware piecewise cudagraph fallback (opt-in). When enabled,
+        # the capture op is a graph split point (registered at config time) so
+        # a per-request capture step replays the piecewise cudagraph instead of
+        # forcing the whole step eager. The runtime fallback in the model
+        # runner is gated on this flag for soundness — without the split op the
+        # dynamic gather would land inside a cudagraphed segment.
+        self._capture_piecewise_fallback_enabled = (
+            cc_config is not None and cc_config.piecewise_capture_fallback
+        )
         if cc_config is None:
             return
 

@@ -93,8 +93,34 @@ def dispatch_cg_and_sync_dp(
     dp_size: int,
     dp_rank: int,
     need_eager: bool = False,
+    capture_piecewise: bool = False,
     num_active_loras: int = 0,
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
+    # Capture-aware piecewise fallback: a per-request capture would otherwise
+    # force the whole step eager (need_eager). Instead, replay the piecewise
+    # cudagraph and let the model break only at the capture split op. If no
+    # piecewise descriptor matches this shape, fall through to eager.
+    if need_eager and capture_piecewise and cudagraph_manager is not None:
+        pw_desc = cudagraph_manager.dispatch_piecewise(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras=num_active_loras,
+        )
+        if pw_desc is not None:
+            if dp_size == 1:
+                return pw_desc, None
+            return sync_cudagraph_and_dp_padding(
+                cudagraph_manager,
+                pw_desc,
+                num_tokens,
+                num_reqs,
+                uniform_token_count,
+                dp_size,
+                dp_rank,
+                num_active_loras=num_active_loras,
+            )
+
     if need_eager:
         batch_desc = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,

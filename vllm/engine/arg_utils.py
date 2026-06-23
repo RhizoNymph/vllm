@@ -612,6 +612,10 @@ class EngineArgs:
     capture_spill_dir: str | None = None
     capture_spill_max_bytes: int = 4 << 30
 
+    # Opt-in: replay the piecewise cudagraph on per-request capture steps
+    # (breaking only at the tapped op) instead of forcing the whole step eager.
+    capture_piecewise_fallback: bool = False
+
     # Programmatic override: Python callers (``LLM(capture_consumers=[...])``)
     # pre-build a ``CaptureConsumersConfig`` directly and skip the CLI
     # shorthand parser. When set, takes precedence over ``capture_consumers``.
@@ -1399,6 +1403,17 @@ class EngineArgs:
             default=4 << 30,
             help="Cap on bytes buffered in the spill area; once exceeded, "
             "'spill' degrades to 'block' (no loss).",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-piecewise-fallback",
+            action="store_true",
+            help="On a per-request capture step, replay the piecewise cudagraph "
+            "and break only at the tapped capture op instead of forcing the whole "
+            "step eager. Makes the capture op a graph split point (a break at "
+            "every layer hook), so it adds host-side overhead on non-capturing "
+            "decode steps too; enable only for high client-capture-density "
+            "workloads. Requires piecewise cudagraphs (the default "
+            "FULL_AND_PIECEWISE/PIECEWISE modes).",
         )
 
         # Steering related configs
@@ -2387,6 +2402,7 @@ class EngineArgs:
                 overload_policy=self.capture_overload_policy,
                 spill_dir=self.capture_spill_dir,
                 spill_max_bytes=self.capture_spill_max_bytes,
+                piecewise_capture_fallback=self.capture_piecewise_fallback,
             )
 
         # Apply the activation-store budget to whichever config we ended up
