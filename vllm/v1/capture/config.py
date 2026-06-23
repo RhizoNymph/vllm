@@ -264,6 +264,37 @@ def expand_graphsafe_keys(
     return sorted(keys)
 
 
+def resolve_graphsafe_shorthands(
+    consumer_specs: list[CaptureConsumerSpec],
+    cli_keys: list[str] | None,
+) -> tuple[list[str], str]:
+    """Resolve the graph-safe key shorthands (pre-expansion) for a run.
+
+    An explicit ``cli_keys`` (``--capture-graphsafe-key`` /
+    ``capture_graphsafe_keys``) OVERRIDES; otherwise the default is the union
+    of what each registered consumer declares via
+    :meth:`CaptureConsumer.declared_graphsafe_keys`.
+
+    Returns ``(shorthands, source)`` where ``source`` is a short human label
+    for logging. A consumer whose class fails to load is skipped here (the
+    later ``build_consumers`` reports it with a clearer error).
+    """
+    if cli_keys:
+        return list(cli_keys), "--capture-graphsafe-key"
+
+    # Imported lazily to avoid a config<->registry import cycle.
+    from vllm.v1.capture.registry import load_consumer_class
+
+    shorthands: list[str] = []
+    for spec in consumer_specs:
+        try:
+            consumer_cls = load_consumer_class(spec.name)
+        except Exception:
+            continue
+        shorthands.extend(consumer_cls.declared_graphsafe_keys(spec.params))
+    return shorthands, "registered consumer(s)"
+
+
 def graphsafe_buffer_bytes(
     num_keys: int, max_num_tokens: int, hidden_size: int, dtype_bytes: int
 ) -> int:

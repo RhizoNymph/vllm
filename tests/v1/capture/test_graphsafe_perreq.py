@@ -31,7 +31,10 @@ from vllm.v1.capture.config import (
     expand_graphsafe_keys,
     graphsafe_buffer_bytes,
     parse_graphsafe_key,
+    resolve_graphsafe_shorthands,
 )
+from vllm.v1.capture.consumer import CaptureConsumer
+from vllm.v1.capture.consumers.filesystem import FilesystemConsumer
 from vllm.v1.capture.manager import CaptureManager
 from vllm.v1.capture.plan import CaptureBatchView
 from vllm.v1.capture.step_gate import CaptureStepGate
@@ -157,6 +160,77 @@ class TestExpandShorthands:
     def test_buffer_bytes_estimate(self):
         # 2 keys x 8192 tokens x 1024 hidden x 2 bytes (bf16) = 32 MiB.
         assert graphsafe_buffer_bytes(2, 8192, 1024, 2) == 2 * 8192 * 1024 * 2
+
+
+class TestConsumerDeclaredKeys:
+    def test_base_consumer_declares_nothing(self):
+        assert CaptureConsumer.declared_graphsafe_keys({}) == []
+
+    def test_filesystem_declares_from_list_param(self):
+        assert FilesystemConsumer.declared_graphsafe_keys(
+            {"root": "/x", "graphsafe_keys": ["12:post_mlp", "all:post_attn"]}
+        ) == ["12:post_mlp", "all:post_attn"]
+
+    def test_filesystem_declares_from_cli_style_string(self):
+        # ',' separates CLI params, so the list uses ';'.
+        assert FilesystemConsumer.declared_graphsafe_keys(
+            {"root": "/x", "graphsafe_keys": "12:post_mlp;20:post_mlp"}
+        ) == ["12:post_mlp", "20:post_mlp"]
+
+    def test_filesystem_declares_nothing_without_param(self):
+        assert FilesystemConsumer.declared_graphsafe_keys({"root": "/x"}) == []
+
+
+class TestResolveShorthands:
+    def test_cli_overrides_consumer_declarations(self):
+        specs = [
+            CaptureConsumerSpec(
+                name="filesystem",
+                params={"root": "/x", "graphsafe_keys": ["12:post_mlp"]},
+            )
+        ]
+        keys, source = resolve_graphsafe_shorthands(specs, cli_keys=["5:post_mlp"])
+        assert keys == ["5:post_mlp"]
+        assert source == "--capture-graphsafe-key"
+
+    def test_default_is_union_of_consumer_declarations(self):
+        specs = [
+            CaptureConsumerSpec(
+                name="filesystem",
+                params={"root": "/a", "graphsafe_keys": ["12:post_mlp"]},
+            ),
+            CaptureConsumerSpec(
+                name="filesystem",
+                params={"root": "/b", "graphsafe_keys": ["20:post_mlp"]},
+            ),
+        ]
+        keys, source = resolve_graphsafe_shorthands(specs, cli_keys=None)
+        assert keys == ["12:post_mlp", "20:post_mlp"]
+        assert source == "registered consumer(s)"
+
+    def test_empty_when_nothing_declared(self):
+        specs = [CaptureConsumerSpec(name="filesystem", params={"root": "/x"})]
+        keys, _ = resolve_graphsafe_shorthands(specs, cli_keys=None)
+        assert keys == []
+
+    def test_union_then_expand_dedups(self):
+        # End-to-end: overlapping consumer declarations expand+dedup cleanly.
+        specs = [
+            CaptureConsumerSpec(
+                name="filesystem",
+                params={"root": "/a", "graphsafe_keys": ["5:post_mlp"]},
+            ),
+            CaptureConsumerSpec(
+                name="filesystem",
+                params={"root": "/b", "graphsafe_keys": ["5:all"]},
+            ),
+        ]
+        raw, _ = resolve_graphsafe_shorthands(specs, cli_keys=None)
+        assert expand_graphsafe_keys(raw, num_layers=32) == [
+            (5, "post_attn"),
+            (5, "post_mlp"),
+            (5, "pre_attn"),
+        ]
 
 
 # ---------------------------------------------------------------------------

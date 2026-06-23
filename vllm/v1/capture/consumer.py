@@ -87,6 +87,20 @@ class CaptureConsumer(ABC):
     def global_capture_spec(self) -> CaptureSpec | None:
         return None
 
+    @classmethod
+    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
+        """Graph-safe ``layer:hook`` keys this consumer wants pre-buffered for
+        per-request capture, derived from its ``params``.
+
+        Shorthands are allowed (``"N:hook"``, ``"N:all"``, ``"all:hook"``,
+        ``"all:all"``). The union across all registered consumers forms the
+        DEFAULT graph-safe allowlist; an explicit ``--capture-graphsafe-key`` /
+        ``capture_graphsafe_keys`` overrides it. Resolved at config-build time
+        from the class + params (no instance is constructed), so this must not
+        depend on runtime state. Default: none.
+        """
+        return []
+
     def validate_client_spec(
         self,
         raw_spec: Any,

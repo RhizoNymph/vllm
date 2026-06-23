@@ -2397,70 +2397,96 @@ class EngineArgs:
         # programmatic override (``LLM(capture_consumers=[...])``) or the
         # repeatable ``--capture-consumers`` CLI flag.  The override takes
         # precedence when both are set.
-        # Expand graph-safe key shorthands (``L:hook``, ``L:all``,
-        # ``all:hook``, ``all:all``) into concrete (layer, hook) keys now that
-        # the model's layer count is known, and surface the persistent-VRAM
-        # cost they imply (one ``[max_num_tokens, hidden]`` buffer per key).
-        expanded_graphsafe_keys: list[tuple[int, str]] = []
-        if self.capture_graphsafe_keys:
-            import torch
-
-            from vllm.v1.capture.config import (
-                expand_graphsafe_keys,
-                graphsafe_buffer_bytes,
-            )
-
-            num_layers = model_config.hf_text_config.num_hidden_layers
-            expanded_graphsafe_keys = expand_graphsafe_keys(
-                self.capture_graphsafe_keys, num_layers
-            )
-            if expanded_graphsafe_keys and self.max_num_batched_tokens:
-                hidden = model_config.get_hidden_size()
-                dtype_bytes = torch.empty(0, dtype=model_config.dtype).element_size()
-                est_bytes = graphsafe_buffer_bytes(
-                    len(expanded_graphsafe_keys),
-                    self.max_num_batched_tokens,
-                    hidden,
-                    dtype_bytes,
-                )
-                log = logger.warning if est_bytes >= (1 << 30) else logger.info
-                log(
-                    "capture: %d graph-safe key(s) reserve ~%.1f MiB persistent "
-                    "VRAM (%d tokens x %d hidden x %d B, summed across ranks)",
-                    len(expanded_graphsafe_keys),
-                    est_bytes / (1 << 20),
-                    self.max_num_batched_tokens,
-                    hidden,
-                    dtype_bytes,
-                )
-
         capture_consumers_config = None
-        if self.capture_consumers_config_override is not None:
-            capture_consumers_config = self.capture_consumers_config_override
-            # The programmatic override (``LLM(capture_consumers=[...])``)
-            # builds the config without graphsafe keys, so fold in
-            # ``--capture-graphsafe-key`` / ``capture_graphsafe_keys`` here too;
-            # otherwise the offline ``LLM`` path can never reach the graph-safe
-            # per-request capture path.
-            if expanded_graphsafe_keys and not capture_consumers_config.graphsafe_keys:
-                capture_consumers_config.graphsafe_keys = expanded_graphsafe_keys
-        elif self.capture_consumers:
+        if (
+            self.capture_consumers_config_override is not None
+            or self.capture_consumers
+            or self.capture_graphsafe_keys
+        ):
             from vllm.v1.capture.config import (
                 CaptureConsumersConfig,
+                expand_graphsafe_keys,
+                graphsafe_buffer_bytes,
                 parse_consumer_spec,
+                resolve_graphsafe_shorthands,
                 validate_consumer_specs,
             )
 
-            specs = [parse_consumer_spec(s) for s in self.capture_consumers]
-            validate_consumer_specs(specs)
-            capture_consumers_config = CaptureConsumersConfig(
-                consumers=specs,
-                dispatch_queue_size=self.capture_dispatch_queue_size,
-                overload_policy=self.capture_overload_policy,
-                spill_dir=self.capture_spill_dir,
-                spill_max_bytes=self.capture_spill_max_bytes,
-                graphsafe_keys=expanded_graphsafe_keys,
+            # Resolve the consumer specs in play (from the override config or
+            # the CLI strings).
+            override_cfg = self.capture_consumers_config_override
+            if override_cfg is not None:
+                consumer_specs = list(override_cfg.consumers)
+            elif self.capture_consumers:
+                consumer_specs = [
+                    parse_consumer_spec(s) for s in self.capture_consumers
+                ]
+                validate_consumer_specs(consumer_specs)
+            else:
+                consumer_specs = []
+
+            # Graph-safe shorthands: an explicit ``--capture-graphsafe-key`` /
+            # ``capture_graphsafe_keys`` OVERRIDES; otherwise the default is the
+            # union of what each registered consumer declares in code via
+            # ``CaptureConsumer.declared_graphsafe_keys(params)``.
+            raw_graphsafe_shorthands, graphsafe_source = resolve_graphsafe_shorthands(
+                consumer_specs, self.capture_graphsafe_keys
             )
+
+            # Expand shorthands (``L:hook``/``L:all``/``all:hook``/``all:all``)
+            # into concrete (layer, hook) keys now that the layer count is
+            # known, and surface the persistent-VRAM cost (one
+            # ``[max_num_tokens, hidden]`` buffer per key).
+            expanded_graphsafe_keys: list[tuple[int, str]] = []
+            if raw_graphsafe_shorthands:
+                num_layers = model_config.hf_text_config.num_hidden_layers
+                expanded_graphsafe_keys = expand_graphsafe_keys(
+                    raw_graphsafe_shorthands, num_layers
+                )
+                if expanded_graphsafe_keys and self.max_num_batched_tokens:
+                    import torch
+
+                    hidden = model_config.get_hidden_size()
+                    dtype_bytes = torch.empty(
+                        0, dtype=model_config.dtype
+                    ).element_size()
+                    est_bytes = graphsafe_buffer_bytes(
+                        len(expanded_graphsafe_keys),
+                        self.max_num_batched_tokens,
+                        hidden,
+                        dtype_bytes,
+                    )
+                    log = logger.warning if est_bytes >= (1 << 30) else logger.info
+                    log(
+                        "capture: %d graph-safe key(s) from %s reserve ~%.1f "
+                        "MiB persistent VRAM (%d tokens x %d hidden x %d B, "
+                        "summed across ranks)",
+                        len(expanded_graphsafe_keys),
+                        graphsafe_source,
+                        est_bytes / (1 << 20),
+                        self.max_num_batched_tokens,
+                        hidden,
+                        dtype_bytes,
+                    )
+
+            if override_cfg is not None:
+                capture_consumers_config = override_cfg
+                # The programmatic override builds the config without graphsafe
+                # keys; fold in the resolved set (CLI or consumer-derived).
+                if (
+                    expanded_graphsafe_keys
+                    and not capture_consumers_config.graphsafe_keys
+                ):
+                    capture_consumers_config.graphsafe_keys = expanded_graphsafe_keys
+            elif consumer_specs:
+                capture_consumers_config = CaptureConsumersConfig(
+                    consumers=consumer_specs,
+                    dispatch_queue_size=self.capture_dispatch_queue_size,
+                    overload_policy=self.capture_overload_policy,
+                    spill_dir=self.capture_spill_dir,
+                    spill_max_bytes=self.capture_spill_max_bytes,
+                    graphsafe_keys=expanded_graphsafe_keys,
+                )
 
         # Apply the activation-store budget to whichever config we ended up
         # with (CLI- or override-built). Capture must be active for it to
