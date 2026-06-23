@@ -51,6 +51,24 @@ class CaptureConsumersConfig:
     instances: list[Any] = field(default_factory=list)
     activation_cache_bytes: int = 0
 
+    # ---- Graph-safe per-request capture allowlist ----
+    # Startup-configured ``(layer, hook)`` keys for which the manager
+    # pre-allocates persistent capture buffers, so a *per-request* (client)
+    # spec that taps only these keys is served by the CUDA-graph-safe
+    # persistent-buffer path (a fixed-shape full-residual ``copy_`` baked into
+    # the graph at warmup + a post-forward host slice) instead of the dynamic
+    # in-hook ``index_select`` that forces the whole step eager. A client spec
+    # that taps any key outside this allowlist still forces eager (graceful
+    # fallback).
+    #
+    # Memory trade-off: one persistent buffer per covered key, sized
+    # ``max_num_tokens × hidden × dtype``, plus a fixed full-residual copy on
+    # every forward step at each covered layer regardless of whether any
+    # in-flight request currently taps it (so the graph stays static).
+    #
+    # Empty (default) leaves per-request capture on the eager path.
+    graphsafe_keys: list[tuple[int, str]] = field(default_factory=list)
+
     # ---- Backpressure / overload control (capture-manager level) ----
     # The dispatch queue is the single GPU-facing backpressure point.
     # ``dispatch_queue_size <= 0`` keeps the legacy unbounded behaviour
@@ -78,6 +96,11 @@ class CaptureConsumersConfig:
                 h.update(spec.instance_name.encode())
             for k in sorted(spec.params):
                 h.update(f"{k}={spec.params[k]}".encode())
+        # The graph-safe allowlist changes which persistent buffers and
+        # full-residual copies get baked into the CUDA graph, so it is a
+        # compile-cache input.
+        for layer, hook in sorted(self.graphsafe_keys):
+            h.update(f"gs={layer}:{hook}".encode())
         # Backpressure settings are runtime behaviour, not compile-cache
         # inputs, so they are intentionally excluded from the hash.
         return h.hexdigest()[:16]
@@ -126,6 +149,43 @@ def parse_consumer_spec(shorthand: str) -> CaptureConsumerSpec:
             params[key] = value.strip()
 
     return CaptureConsumerSpec(name=name, params=params)
+
+
+_VALID_HOOK_NAMES = frozenset(
+    {"pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"}
+)
+
+
+def parse_graphsafe_key(shorthand: str) -> tuple[int, str]:
+    """Parse a graph-safe key shorthand ``'layer:hook'`` into ``(layer, hook)``.
+
+    Raises:
+        ValueError: If *shorthand* is malformed or names an unknown hook.
+    """
+    text = shorthand.strip()
+    if ":" not in text:
+        raise ValueError(
+            f"graph-safe capture key {shorthand!r} must be 'layer:hook' "
+            f"(e.g. '12:post_mlp')"
+        )
+    layer_str, hook = text.split(":", 1)
+    hook = hook.strip()
+    try:
+        layer = int(layer_str.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"graph-safe capture key {shorthand!r} has a non-integer layer"
+        ) from exc
+    if layer < 0:
+        raise ValueError(
+            f"graph-safe capture key {shorthand!r} has a negative layer"
+        )
+    if hook not in _VALID_HOOK_NAMES:
+        raise ValueError(
+            f"graph-safe capture key {shorthand!r} names unknown hook "
+            f"{hook!r}; valid hooks: {sorted(_VALID_HOOK_NAMES)}"
+        )
+    return (layer, hook)
 
 
 def validate_consumer_specs(specs: list[CaptureConsumerSpec]) -> None:

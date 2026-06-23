@@ -612,6 +612,12 @@ class EngineArgs:
     capture_spill_dir: str | None = None
     capture_spill_max_bytes: int = 4 << 30
 
+    # Graph-safe per-request capture allowlist: repeatable ``layer:hook`` keys
+    # (e.g. --capture-graphsafe-key 12:post_mlp). A per-request capture spec
+    # tapping only these keys runs at full cudagraph speed via persistent
+    # buffers; tapping any other key falls back to forcing the step eager.
+    capture_graphsafe_keys: list[str] | None = None
+
     # Programmatic override: Python callers (``LLM(capture_consumers=[...])``)
     # pre-build a ``CaptureConsumersConfig`` directly and skip the CLI
     # shorthand parser. When set, takes precedence over ``capture_consumers``.
@@ -1399,6 +1405,21 @@ class EngineArgs:
             default=4 << 30,
             help="Cap on bytes buffered in the spill area; once exceeded, "
             "'spill' degrades to 'block' (no loss).",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-graphsafe-key",
+            dest="capture_graphsafe_keys",
+            action="append",
+            default=None,
+            metavar="LAYER:HOOK",
+            help="Allowlist a (layer, hook) for graph-safe per-request "
+            "capture (e.g. --capture-graphsafe-key 12:post_mlp). A per-request "
+            "capture spec tapping only allowlisted keys runs at full cudagraph "
+            "speed via a persistent buffer instead of forcing the step eager; "
+            "tapping any non-allowlisted key still forces eager. Repeat the "
+            "flag for multiple keys. Costs one persistent buffer "
+            "(max_num_tokens x hidden x dtype) per key plus a fixed copy per "
+            "step at each key's layer.",
         )
 
         # Steering related configs
@@ -2376,17 +2397,22 @@ class EngineArgs:
             from vllm.v1.capture.config import (
                 CaptureConsumersConfig,
                 parse_consumer_spec,
+                parse_graphsafe_key,
                 validate_consumer_specs,
             )
 
             specs = [parse_consumer_spec(s) for s in self.capture_consumers]
             validate_consumer_specs(specs)
+            graphsafe_keys = [
+                parse_graphsafe_key(k) for k in (self.capture_graphsafe_keys or [])
+            ]
             capture_consumers_config = CaptureConsumersConfig(
                 consumers=specs,
                 dispatch_queue_size=self.capture_dispatch_queue_size,
                 overload_policy=self.capture_overload_policy,
                 spill_dir=self.capture_spill_dir,
                 spill_max_bytes=self.capture_spill_max_bytes,
+                graphsafe_keys=graphsafe_keys,
             )
 
         # Apply the activation-store budget to whichever config we ended up
