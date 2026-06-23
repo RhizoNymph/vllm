@@ -23,6 +23,17 @@ class SteeringConfig:
     ``0`` disables per-request dynamic overrides. See
     docs/design/dynamic_steering.md §5.2."""
 
+    enable_cross_layer_monitor: bool = Field(default=False)
+    """Opt in to the cross-layer in-graph monitor (Phase 2, §8): a probe at
+    layer L writes a per-token gate that steering at layers > L reads, same
+    forward ("detect at L, gate at layers ≥ L"). When ``True``,
+    ``apply_layer_steering`` emits the mutating ``steering_monitor`` op at every
+    steered hook (no-op unless the manager activated a probe there) and the
+    same-hook fused gate is bypassed. When ``False`` (default) the monitor is
+    the same-hook non-mutating fused gate only. This flips the compiled graph
+    topology, so it is part of ``compute_hash``. See
+    docs/design/dynamic_steering.md §8."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -40,6 +51,9 @@ class SteeringConfig:
         # Dynamic pool size changes the steering-table buffer shape,
         # which is baked into compiled graphs.
         factors.append(self.max_dynamic_steering_configs)
+        # Cross-layer monitor changes the compiled graph topology (emits the
+        # mutating steering_monitor op at every steered hook).
+        factors.append(self.enable_cross_layer_monitor)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
