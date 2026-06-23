@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use vllm_engine_core_client::TransportMode;
 use vllm_server::{
-    ChatTemplateContentFormatOption, Config, CoordinatorMode, HttpListenerMode, ParserSelection,
-    RendererSelection, serve,
+    ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, CorsConfig,
+    HttpListenerMode, ParserSelection, RendererSelection, serve,
 };
 
 #[derive(Debug, Parser)]
@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
         },
         coordinator_mode: CoordinatorMode::MaybeInProc,
         model: args.model,
+        tokenizer: None,
         served_model_name: vec![],
         listener_mode: HttpListenerMode::BindTcp {
             host: "127.0.0.1".to_string(),
@@ -64,13 +65,18 @@ async fn main() -> Result<()> {
         tool_call_parser: ParserSelection::Auto,
         reasoning_parser: ParserSelection::Auto,
         renderer: RendererSelection::Auto,
+        language_model_only: false,
         chat_template: None,
         default_chat_template_kwargs: None,
         chat_template_content_format: ChatTemplateContentFormatOption::Auto,
-        enable_log_requests: false,
+        max_logprobs: None,
+        api_server_options: ApiServerOptions::default(),
+        cors: CorsConfig::default(),
+        api_keys: Vec::new(),
         disable_log_stats: false,
         grpc_port: None,
         shutdown_timeout: Duration::ZERO,
+        steering_modules: Vec::new(),
     };
 
     let bind_address = format!("127.0.0.1:{port}");

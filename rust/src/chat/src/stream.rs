@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::Stream;
 use trait_set::trait_set;
+use vllm_engine_core_client::protocol::CaptureResult;
 use vllm_text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs};
 
 use crate::FinishReason;
@@ -14,15 +16,16 @@ use crate::event::{AssistantContentBlock, AssistantMessage, ChatEvent};
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectedAssistantMessage {
     pub message: AssistantMessage,
-    pub prompt_token_count: usize,
     pub prompt_token_ids: Arc<[u32]>,
     pub prompt_logprobs: Option<DecodedPromptLogprobs>,
     pub logprobs: Option<DecodedLogprobs>,
     pub token_ids: Vec<u32>,
-    pub output_token_count: usize,
+    pub usage: vllm_llm::TokenUsage,
     pub finish_reason: FinishReason,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Per-consumer activation-capture results, keyed by consumer name.
+    pub capture_results: HashMap<String, CaptureResult>,
 }
 
 /// Per-request stream of chat events.
@@ -75,23 +78,23 @@ impl ChatEventStream {
                 }
                 ChatEvent::Done {
                     message: done,
-                    prompt_token_count,
-                    output_token_count,
+                    usage,
                     finish_reason,
                     kv_transfer_params,
+                    capture_results,
                 } => {
                     return Ok(CollectedAssistantMessage {
                         message: done,
-                        prompt_token_count,
                         prompt_token_ids,
                         prompt_logprobs,
                         logprobs: (!logprob_positions.is_empty()).then_some(DecodedLogprobs {
                             positions: logprob_positions,
                         }),
                         token_ids,
-                        output_token_count,
+                        usage,
                         finish_reason,
                         kv_transfer_params,
+                        capture_results,
                     });
                 }
                 ChatEvent::ToolCallEnd { call, .. } => {
@@ -190,10 +193,14 @@ mod tests {
                 }),
                 Ok(ChatEvent::Done {
                     message: Default::default(),
-                    prompt_token_count: 2,
-                    output_token_count: 1,
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 2,
+                        output_token_count: 1,
+                        cached_token_count: 0,
+                    },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             ]),
         );
@@ -203,7 +210,6 @@ mod tests {
             collected,
             CollectedAssistantMessage {
                 message: Default::default(),
-                prompt_token_count: 2,
                 prompt_token_ids: vec![10, 11].into(),
                 prompt_logprobs: Some(DecodedPromptLogprobs {
                     first_token_id: 0,
@@ -228,9 +234,14 @@ mod tests {
                     }],
                 }),
                 token_ids: vec![],
-                output_token_count: 1,
+                usage: vllm_llm::TokenUsage {
+                    prompt_token_count: 2,
+                    output_token_count: 1,
+                    cached_token_count: 0,
+                },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                capture_results: Default::default(),
             }
         );
     }

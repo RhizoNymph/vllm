@@ -58,8 +58,18 @@ pub type DynChatTextBackend = Arc<dyn ChatTextBackend>;
 /// Frontend-side chat backend loading options.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LoadModelBackendsOptions {
+    /// Optional tokenizer source overriding the model id for backend file
+    /// resolution. When set, the tokenizer (and sibling config files) are
+    /// resolved from this path instead of the model id. Useful when the model
+    /// id points at a format without a loadable `tokenizer.json` (e.g. a GGUF
+    /// file), so the frontend tokenizer can be sourced from a directory that
+    /// has one while the engine loads the original model.
+    pub tokenizer: Option<String>,
     /// Which chat renderer implementation to use.
     pub renderer: RendererSelection,
+    /// Disable frontend-side multimodal preprocessing and render the model as
+    /// language-only.
+    pub language_model_only: bool,
     /// How to serialize `message.content` when rendering the chat template.
     pub chat_template_content_format: ChatTemplateContentFormatOption,
     /// Optional server-default chat template override, provided either as an

@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 use vllm_text::Prompt;
 
+use crate::routes::openai::utils::capture::CaptureResultResponse;
+use crate::routes::openai::utils::steering::SteeringSpecPacked;
 use crate::routes::openai::utils::types::{
     LogProbs, Normalizable, StreamOptions, StringOrArray, Usage, default_true, validate_stop,
 };
@@ -169,6 +171,24 @@ pub struct CompletionRequest {
     /// extensions
     pub vllm_xargs: Option<HashMap<String, Value>>,
 
+    // -------- Steering / Capture Parameters --------
+    /// Base steering vectors (packed wire format) applied to both prefill and
+    /// decode phases
+    pub steering_vectors: Option<SteeringSpecPacked>,
+
+    /// Steering vectors added to the base during prefill only
+    pub prefill_steering_vectors: Option<SteeringSpecPacked>,
+
+    /// Steering vectors added to the base during decode only
+    pub decode_steering_vectors: Option<SteeringSpecPacked>,
+
+    /// Name of a pre-registered steering module to apply
+    pub steering_name: Option<String>,
+
+    /// Per-request opt-in for activation-capture consumers, keyed by consumer
+    /// name
+    pub capture: Option<Value>,
+
     /// Additional fields
     #[serde(flatten)]
     pub other: Map<String, Value>,
@@ -188,6 +208,9 @@ pub(super) struct CompletionResponse {
     pub usage: Option<Usage>,
     pub system_fingerprint: Option<String>,
     pub kv_transfer_params: Option<Value>,
+    /// Per-consumer activation-capture results, omitted when the request did
+    /// not capture.
+    pub capture_results: Option<BTreeMap<String, CaptureResultResponse>>,
 }
 
 /// Mirrors the Python vLLM `CompletionResponseChoice` class.

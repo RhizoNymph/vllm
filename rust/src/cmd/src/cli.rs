@@ -16,14 +16,15 @@ use educe::Educe;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use serde_with::{DefaultOnNull, OneOrMany, serde_as};
 use thiserror_ext::AsReport as _;
 use uuid::Uuid;
 use vllm_engine_core_client::TransportMode;
 use vllm_managed_engine::ManagedEngineConfig;
 use vllm_managed_engine::cli::{ManagedEngineArgs, repartition_managed_engine_args};
 use vllm_server::{
-    ChatTemplateContentFormatOption, Config, CoordinatorMode, HttpListenerMode, ParserSelection,
-    RendererSelection,
+    ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, CorsConfig,
+    HttpListenerMode, ParserSelection, RendererSelection, SteeringModulePath,
 };
 
 use crate::cli::unsupported::UnsupportedArgs;
@@ -83,7 +84,15 @@ pub enum Command {
     Serve(ServeArgs),
 }
 
+/// A JSON-encoded list of strings, matching Python's `json.loads` CLI type for
+/// the CORS list arguments (e.g. `--allowed-origins '["*"]'`). Parsing the whole
+/// value as one item keeps clap from treating the field as a repeated flag.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct JsonStringList(pub Vec<String>);
+
 /// Runtime arguments shared by the external-engine and managed-engine paths.
+#[serde_as]
 #[derive(Educe, Clone, Args, PartialEq, Eq, Deserialize)]
 #[educe(Debug)]
 pub struct SharedRuntimeArgs {
@@ -91,6 +100,15 @@ pub struct SharedRuntimeArgs {
     /// Model identifier or local model directory used for backend loading and
     /// public model ID.
     pub model: String,
+
+    /// Name or path of the tokenizer to use for the frontend. When unspecified,
+    /// `--model` is used. Useful when `--model` points at a format without a
+    /// loadable `tokenizer.json` (e.g. a GGUF file): point this at a directory
+    /// that contains the tokenizer (and sibling config) files while the engine
+    /// loads the original model.
+    #[arg(long)]
+    #[serde(default)]
+    pub tokenizer: Option<String>,
 
     /// Maximum time to wait for the expected engines to register on the
     /// frontend transport.
@@ -116,11 +134,20 @@ pub struct SharedRuntimeArgs {
     #[arg(long = "tokenizer-mode", default_value_t)]
     #[serde(default, rename = "tokenizer_mode")]
     pub renderer: RendererSelection,
+    /// Disable multimodal inputs and treat the model as language-only.
+    #[arg(long)]
+    #[serde(default)]
+    pub language_model_only: bool,
     /// Override the maximum model context length. When set, the frontend uses
     /// this value instead of the model's `max_position_embeddings` from
     /// `config.json`.
     #[arg(long)]
     pub max_model_len: Option<u32>,
+    /// Maximum number of log probabilities to return when `logprobs` is
+    /// specified in sampling parameters. `-1` means no cap.
+    #[arg(long, value_parser = clap::value_parser!(i32).range(-1..), allow_negative_numbers = true)]
+    #[serde(default)]
+    pub max_logprobs: Option<i32>,
     /// TCP port for the gRPC Generate service. When not set, no gRPC server is
     /// started.
     #[arg(long)]
@@ -165,6 +192,33 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub enable_log_requests: bool,
 
+    /// Include prompt_tokens_details in usage when cached prompt tokens are
+    /// present.
+    #[arg(
+        long,
+        default_missing_value = "true",
+        num_args = 0..=1
+    )]
+    #[serde(default)]
+    pub enable_prompt_tokens_details: bool,
+
+    /// If specified, API server will add X-Request-Id header to responses.
+    #[arg(
+        long,
+        default_missing_value = "true",
+        num_args = 0..=1
+    )]
+    #[serde(default)]
+    pub enable_request_id_headers: bool,
+
+    /// If provided, the server will require one of these keys to be presented
+    /// in the Authorization header.
+    #[educe(Debug(ignore))]
+    #[arg(long, env = "VLLM_API_KEY", value_delimiter = ' ')]
+    #[serde_as(as = "DefaultOnNull<OneOrMany<_>>")]
+    #[serde(default)]
+    pub api_key: Vec<String>,
+
     /// Disable periodic logging of engine statistics (throughput, queue depth,
     /// cache usage).
     #[arg(long)]
@@ -181,6 +235,38 @@ pub struct SharedRuntimeArgs {
     #[arg(long, num_args = 0..)]
     #[serde(default)]
     pub served_model_name: Vec<String>,
+
+    /// CORS allowed origins as a JSON list. `["*"]` allows any origin.
+    #[arg(long, value_parser = parse_json::<JsonStringList>, value_name = "JSON", default_value = r#"["*"]"#)]
+    #[serde(default = "default_cors_wildcard")]
+    pub allowed_origins: JsonStringList,
+
+    /// CORS allowed methods as a JSON list. `["*"]` allows the standard set.
+    #[arg(long, value_parser = parse_json::<JsonStringList>, value_name = "JSON", default_value = r#"["*"]"#)]
+    #[serde(default = "default_cors_wildcard")]
+    pub allowed_methods: JsonStringList,
+
+    /// CORS allowed request headers as a JSON list. `["*"]` mirrors the request.
+    #[arg(long, value_parser = parse_json::<JsonStringList>, value_name = "JSON", default_value = r#"["*"]"#)]
+    #[serde(default = "default_cors_wildcard")]
+    pub allowed_headers: JsonStringList,
+
+    /// Allow CORS credentials (cookies, authorization headers).
+    #[arg(
+        long,
+        default_missing_value = "true",
+        num_args = 0..=1
+    )]
+    #[serde(default)]
+    pub allow_credentials: bool,
+
+    /// Named steering modules to load at startup, each as `name=path` where
+    /// `path` is a JSON file defining the module's steering vectors. Loaded
+    /// modules are broadcast to the engine workers so requests can reference
+    /// them via the `steering_name` field.
+    #[arg(long = "steering-modules", value_parser = parse_steering_module, num_args = 0..)]
+    #[serde(default)]
+    pub steering_modules: Vec<SteeringModulePath>,
 
     /// Unsupported Python vLLM frontend arguments recognized but not yet
     /// implemented in Rust.
@@ -202,6 +288,15 @@ impl SharedRuntimeArgs {
         Duration::from_secs(self.shutdown_timeout)
     }
 
+    /// Apply fallback logic for API key configuration from env variables.
+    fn apply_env_api_key_fallback(&mut self) {
+        if self.api_key.is_empty()
+            && let Ok(api_key) = std::env::var("VLLM_API_KEY")
+        {
+            self.api_key.push(api_key);
+        }
+    }
+
     /// Build the OpenAI-server config for the Python-bootstrap worker contract.
     ///
     /// The resulting config binds the Python-supplied transport addresses and
@@ -212,15 +307,19 @@ impl SharedRuntimeArgs {
         input_address: String,
         output_address: String,
         coordinator_address: Option<String>,
+        engine_start_index: u32,
         engine_count: usize,
     ) -> Config {
         let ready_timeout = self.ready_timeout();
         let shutdown_timeout = self.shutdown_timeout();
+        let api_server_options = self.api_server_options();
+        let cors = self.cors_config();
 
         Config {
             transport_mode: TransportMode::Bootstrapped {
                 input_address,
                 output_address,
+                engine_start_index,
                 engine_count,
                 ready_timeout,
             },
@@ -229,18 +328,24 @@ impl SharedRuntimeArgs {
                 None => CoordinatorMode::None,
             },
             model: self.model,
+            tokenizer: self.tokenizer,
             served_model_name: self.served_model_name,
             listener_mode: HttpListenerMode::InheritedFd { fd: listen_fd },
             tool_call_parser: self.tool_call_parser,
             reasoning_parser: self.reasoning_parser,
             renderer: self.renderer,
+            language_model_only: self.language_model_only,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             chat_template_content_format: self.chat_template_content_format,
-            enable_log_requests: self.enable_log_requests,
+            max_logprobs: self.max_logprobs,
+            api_server_options,
+            cors,
+            api_keys: self.api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
+            steering_modules: self.steering_modules,
         }
     }
 
@@ -257,6 +362,8 @@ impl SharedRuntimeArgs {
     ) -> Config {
         let ready_timeout = self.ready_timeout();
         let shutdown_timeout = self.shutdown_timeout();
+        let api_server_options = self.api_server_options();
+        let cors = self.cors_config();
 
         Config {
             transport_mode: TransportMode::HandshakeOwner {
@@ -269,18 +376,41 @@ impl SharedRuntimeArgs {
             },
             coordinator_mode: CoordinatorMode::MaybeInProc,
             model: self.model,
+            tokenizer: self.tokenizer,
             served_model_name: self.served_model_name,
             listener_mode,
             tool_call_parser: self.tool_call_parser,
             reasoning_parser: self.reasoning_parser,
             renderer: self.renderer,
+            language_model_only: self.language_model_only,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             chat_template_content_format: self.chat_template_content_format,
-            enable_log_requests: self.enable_log_requests,
+            max_logprobs: self.max_logprobs,
+            api_server_options,
+            cors,
+            api_keys: self.api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
+            steering_modules: self.steering_modules,
+        }
+    }
+
+    fn api_server_options(&self) -> ApiServerOptions {
+        ApiServerOptions {
+            enable_log_requests: self.enable_log_requests,
+            enable_prompt_tokens_details: self.enable_prompt_tokens_details,
+            enable_request_id_headers: self.enable_request_id_headers,
+        }
+    }
+
+    fn cors_config(&self) -> CorsConfig {
+        CorsConfig {
+            allow_origins: self.allowed_origins.0.clone(),
+            allow_methods: self.allowed_methods.0.clone(),
+            allow_headers: self.allowed_headers.0.clone(),
+            allow_credentials: self.allow_credentials,
         }
     }
 }
@@ -289,13 +419,43 @@ fn default_engine_ready_timeout_secs() -> u64 {
     600
 }
 
+fn default_cors_wildcard() -> JsonStringList {
+    JsonStringList(vec!["*".to_string()])
+}
+
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
 }
 
+/// Parse a `--steering-modules` entry of the form `name=path` into a
+/// [`SteeringModulePath`]. The split is on the first `=` so paths may contain
+/// further `=` characters.
+fn parse_steering_module(value: &str) -> Result<SteeringModulePath, String> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected `name=path`, got `{value}`"))?;
+    if name.is_empty() {
+        return Err(format!(
+            "steering module name must not be empty in `{value}`"
+        ));
+    }
+    if path.is_empty() {
+        return Err(format!(
+            "steering module path must not be empty in `{value}`"
+        ));
+    }
+    Ok(SteeringModulePath {
+        name: name.to_owned(),
+        path: path.to_owned(),
+    })
+}
+
 fn parse_runtime_args_json(value: &str) -> Result<SharedRuntimeArgs, String> {
-    let args: SharedRuntimeArgs = serde_json::from_str(value)
+    let mut args: SharedRuntimeArgs = serde_json::from_str(value)
         .map_err(|e| format!("invalid JSON arguments: {}", e.as_report()))?;
+    // --args-json is parsed with serde, so clap's env support does not run for
+    // the Python-supervised frontend path.
+    args.apply_env_api_key_fallback();
     args.unsupported.check()?;
     Ok(args)
 }
@@ -321,6 +481,10 @@ pub struct FrontendArgs {
     /// `stats_update_address`.
     #[arg(long)]
     pub coordinator_address: Option<String>,
+    /// First data-parallel engine rank expected to register with this
+    /// bootstrapped frontend.
+    #[arg(long, default_value_t = 0)]
+    pub engine_start_index: u32,
     /// Total number of data-parallel engines expected for this frontend.
     #[arg(long, default_value_t = 1)]
     pub engine_count: usize,
@@ -338,6 +502,7 @@ impl FrontendArgs {
             self.input_address,
             self.output_address,
             self.coordinator_address,
+            self.engine_start_index,
             self.engine_count,
         )
     }
@@ -408,6 +573,10 @@ impl ServeArgs {
         self.managed_engine.clone().into_config(
             self.runtime.model.clone(),
             self.runtime.max_model_len,
+            self.runtime.max_logprobs,
+            self.runtime.language_model_only,
+            self.runtime.disable_log_stats,
+            self.runtime.shutdown_timeout,
             handshake_port,
         )
     }
