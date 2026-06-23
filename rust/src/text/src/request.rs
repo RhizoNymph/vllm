@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use vllm_engine_core_client::protocol::StructuredOutputsParams;
+use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::multimodal::MmFeatures;
+use vllm_engine_core_client::protocol::{SteeringVectorSpec, StructuredOutputsParams};
 
 use crate::error::{Error, Result};
 use crate::output::TextDecodeOptions;
@@ -103,6 +104,20 @@ pub struct SamplingParams {
     pub skip_reading_prefix_cache: Option<bool>,
     /// Additional request parameters for custom extensions.
     pub vllm_xargs: Option<HashMap<String, Value>>,
+    /// Base steering vectors applied to both prefill and decode phases, already
+    /// decoded into the inline form engine-core resolves. `None` means no
+    /// steering.
+    pub steering_vectors: Option<SteeringVectorSpec>,
+    /// Phase-specific steering vectors added to the base during prefill only.
+    pub prefill_steering_vectors: Option<SteeringVectorSpec>,
+    /// Phase-specific steering vectors added to the base during decode only.
+    pub decode_steering_vectors: Option<SteeringVectorSpec>,
+    /// Name of a pre-registered steering module to apply. Lowered into
+    /// `steering_module_ref = (name, 1.0)` on the engine-core request.
+    pub steering_name: Option<String>,
+    /// Per-request opt-in for activation-capture consumers, keyed by consumer
+    /// name. Forwarded verbatim to engine-core for offline admission.
+    pub capture: Option<Value>,
 }
 
 #[allow(clippy::derivable_impls)] // more explicit
@@ -130,6 +145,11 @@ impl Default for SamplingParams {
             structured_outputs: None,
             skip_reading_prefix_cache: None,
             vllm_xargs: None,
+            steering_vectors: None,
+            prefill_steering_vectors: None,
+            decode_steering_vectors: None,
+            steering_name: None,
+            capture: None,
         }
     }
 }
@@ -166,6 +186,9 @@ pub struct TextRequest {
     /// Override data parallel rank.
     #[serde(default)]
     pub data_parallel_rank: Option<u32>,
+    /// LoRA adapter selected for this request.
+    #[serde(default)]
+    pub lora_request: Option<LoraRequest>,
 }
 
 impl TextRequest {
@@ -182,6 +205,7 @@ impl TextRequest {
             cache_salt: None,
             add_special_tokens: false,
             data_parallel_rank: None,
+            lora_request: None,
         }
     }
 

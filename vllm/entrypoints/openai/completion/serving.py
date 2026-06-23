@@ -7,14 +7,13 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.chat_completion.protocol import (
     CaptureResultResponse,
 )
@@ -39,9 +38,11 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
     clamp_prompt_logprobs,
+    format_token_id_placeholder,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
@@ -53,11 +54,14 @@ from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
 from vllm.v1.capture import (
     CaptureConsumer,
-    CaptureContext,
     CaptureValidationError,
-    capture_expert_parallel_size,
+    UnknownCaptureConsumerError,
 )
 from vllm.v1.capture import registry as capture_registry
+from vllm.v1.capture.admission import (
+    build_capture_context,
+    resolve_capture_prefix_flags,
+)
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -109,20 +113,11 @@ class OpenAIServingCompletion(OpenAIServing):
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
 
-        # Capture-consumer instance cache — mirrors
+        # Capture-consumer validator cache — mirrors
         # ``OpenAIServingChat.__init__``.
-        self._capture_consumers: dict[str, CaptureConsumer] = {}
-        capture_config = getattr(
-            self.engine_client.vllm_config, "capture_consumers_config", None
+        self._capture_consumers: dict[str, CaptureConsumer] = (
+            capture_registry.build_admission_validators(self.engine_client.vllm_config)
         )
-        if capture_config is not None:
-            for spec in capture_config.consumers:
-                key = spec.instance_name or spec.name
-                self._capture_consumers[key] = capture_registry.build_consumer(
-                    spec.name,
-                    self.engine_client.vllm_config,
-                    spec.params,
-                )
 
     def _admit_capture(
         self,
@@ -138,10 +133,6 @@ class OpenAIServingCompletion(OpenAIServing):
         if sampling_params.capture is None:
             return None
 
-        vllm_config = self.engine_client.vllm_config
-        parallel_config = vllm_config.parallel_config
-        model_config = vllm_config.model_config
-
         try:
             num_prompt_tokens = self._extract_prompt_len(engine_input)
         except Exception as exc:
@@ -152,14 +143,9 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
         try:
-            num_hidden_layers = model_config.get_total_num_hidden_layers()
-            hidden_size = model_config.get_hidden_size()
-            dt = model_config.dtype
-            element_size_bytes = getattr(dt, "itemsize", None)
-            if element_size_bytes is None:
-                import torch
-
-                element_size_bytes = torch.tensor([], dtype=dt).element_size()
+            ctx = build_capture_context(
+                self.engine_client.vllm_config, num_prompt_tokens, request_id
+            )
         except Exception as exc:
             return self.create_error_response(
                 f"capture: failed to read model shape: {exc}",
@@ -167,50 +153,19 @@ class OpenAIServingCompletion(OpenAIServing):
                 param="capture",
             )
 
-        ctx = CaptureContext(
-            vllm_internal_request_id=request_id,  # type: ignore[arg-type]
-            num_prompt_tokens=num_prompt_tokens,
-            num_computed_tokens=0,
-            num_hidden_layers=num_hidden_layers,
-            hidden_size=hidden_size,
-            element_size_bytes=int(element_size_bytes),
-            tensor_parallel_size=parallel_config.tensor_parallel_size,
-            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
-            expert_parallel_size=capture_expert_parallel_size(parallel_config),
-            data_parallel_size=parallel_config.data_parallel_size,
-        )
-
-        validated: dict[str, Any] = {}
-        for name, raw_spec in sampling_params.capture.items():
-            consumer = self._capture_consumers.get(name)
-            if consumer is None:
-                available = sorted(self._capture_consumers.keys())
-                return self.create_error_response(
-                    (
-                        f"capture: no consumer named {name!r} is registered. "
-                        f"Available consumers: {available}."
-                    ),
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    param=f"capture.{name}",
-                )
-            try:
-                validated[name] = consumer.validate_client_spec(raw_spec, ctx)
-            except CaptureValidationError as exc:
-                return self.create_error_response(
-                    str(exc),
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    param=f"capture.{name}",
-                )
-
-        # NOTE: We intentionally do NOT overwrite ``sampling_params.capture``
-        # with the validated ``CaptureSpec`` dict. ``CaptureSpec`` is not
-        # serializable across the engine IPC boundary (see
-        # ``vllm/v1/capture/types.py``), so the worker would receive a plain
-        # ``{hooks, positions}`` dict missing the consumer-specific fields
-        # (request_id, tag, ...) and re-validation would fail. Leaving the
-        # original raw dict in place lets the worker's own validator
-        # reconstruct the consumer request type cleanly.
-        del validated
+        # Resolve every per-request spec and stamp the prefix-cache reuse
+        # flags onto ``sampling_params`` (shared with the offline
+        # ``InputProcessor`` path). The raw ``capture`` dict is left in place:
+        # ``CaptureSpec`` is not IPC-serializable, so the worker re-validates
+        # from the original dict after scheduling.
+        try:
+            resolve_capture_prefix_flags(self._capture_consumers, sampling_params, ctx)
+        except (UnknownCaptureConsumerError, CaptureValidationError) as exc:
+            return self.create_error_response(
+                str(exc),
+                status_code=HTTPStatus.BAD_REQUEST,
+                param=getattr(exc, "capture_param", "capture"),
+            )
         return None
 
     async def render_completion_request(
@@ -622,7 +577,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 total_tokens=total_prompt_tokens + total_completion_tokens,
             )
 
-            if self.enable_prompt_tokens_details and num_cached_tokens:
+            if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
                     cached_tokens=num_cached_tokens
                 )
@@ -762,7 +717,7 @@ class OpenAIServingCompletion(OpenAIServing):
         if (
             self.enable_prompt_tokens_details
             and last_final_res
-            and last_final_res.num_cached_tokens
+            and last_final_res.num_cached_tokens is not None
         ):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=last_final_res.num_cached_tokens
@@ -812,7 +767,7 @@ class OpenAIServingCompletion(OpenAIServing):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None:
                 if should_return_as_token_id:
-                    token = f"token_id:{token_id}"
+                    token = format_token_id_placeholder(token_id)
                 else:
                     if tokenizer is None:
                         raise VLLMValidationError(

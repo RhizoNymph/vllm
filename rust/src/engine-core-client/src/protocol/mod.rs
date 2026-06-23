@@ -36,19 +36,41 @@ fn is_false(v: &bool) -> bool {
     !v
 }
 
+pub mod capture;
+
+fn default_top_p() -> f32 {
+    1.0
+}
+
+fn default_repetition_penalty() -> f32 {
+    1.0
+}
+
+fn default_temperature() -> f32 {
+    1.0
+}
+
+fn default_max_tokens() -> u32 {
+    16
+}
+
 mod classified_outputs;
 pub mod dtype;
 pub mod handshake;
 pub mod logprobs;
+pub mod lora;
 pub mod multimodal;
 pub mod stats;
+pub mod steering;
 pub mod tensor;
 pub mod utility;
+pub use capture::CaptureResult;
 pub use classified_outputs::{
     ClassifiedEngineCoreOutputs, DpControlMessage, RequestBatchOutputs, UtilityCallOutput,
 };
 pub use dtype::ModelDtype;
 pub use logprobs::decode_engine_core_outputs;
+pub use steering::{SteeringLayerEntry, SteeringVectorSpec};
 
 /// Request types are encoded as single-byte protocol constants so they can be
 /// sent over the ZMQ socket without an extra encoding step.
@@ -65,6 +87,24 @@ pub enum EngineCoreRequestType {
 }
 
 impl EngineCoreRequestType {
+    /// Decode the single-byte request type frame used on the engine input
+    /// socket. Returns `None` for unrecognized values.
+    pub fn from_frame(frame: &[u8]) -> Option<Self> {
+        let [value] = frame else {
+            return None;
+        };
+
+        match value {
+            0 => Some(Self::Add),
+            1 => Some(Self::Abort),
+            2 => Some(Self::StartDpWave),
+            3 => Some(Self::Utility),
+            _ => None,
+        }
+    }
+
+    /// Encode the request type as the single-byte frame used on the engine
+    /// input socket.
     pub fn to_frame(self) -> Bytes {
         Bytes::from_static(match self {
             Self::Add => b"\x00",
@@ -135,6 +175,21 @@ pub enum RequestOutputKind {
     FinalOnly = 2,
 }
 
+/// Structured-output backend selected for EngineCore grammar compilation.
+///
+/// Python vLLM stores this in `StructuredOutputsParams._backend` after request
+/// validation. The Rust frontend currently always lowers structured-output
+/// requests to guidance, while ignoring any user-supplied `_backend` value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StructuredOutputBackend {
+    Xgrammar,
+    #[default]
+    Guidance,
+    Outlines,
+    LmFormatEnforcer,
+}
+
 /// The stop reason associated with a finished output.
 ///
 /// Python models this as the union-typed `stop_reason: int | str | None`
@@ -182,6 +237,17 @@ pub struct StructuredOutputsParams {
     pub whitespace_pattern: Option<String>,
     /// Structural tag configuration (JSON-encoded string).
     pub structural_tag: Option<String>,
+    /// Structured-output backend, mirroring Python's internal `_backend`.
+    ///
+    /// User-supplied values are ignored during deserialization. This matches
+    /// Python's request boundary, where `_backend` is set by validation rather
+    /// than accepted as a request-level backend selector.
+    #[serde(
+        default,
+        rename = "_backend",
+        deserialize_with = "serde_with::rust::deserialize_ignore_any"
+    )]
+    pub backend: StructuredOutputBackend,
 }
 
 /// Engine-core-facing sampling parameters for text generation.
@@ -193,19 +259,26 @@ pub struct StructuredOutputsParams {
 ///
 /// Original Python definition:
 /// <https://github.com/vllm-project/vllm/blob/f22d6e026798a74e6542a52ef776c054f2de572a/vllm/sampling_params.py#L155-L291>
+// Python's SamplingParams is `omit_defaults=True`, so msgpack drops
+// default-valued keys; default the whole struct. Per-field fns cover the
+// non-zero defaults.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, DefaultFromSerde)]
+#[serde(default)]
 pub struct EngineCoreSamplingParams {
     /// Controls randomness. Lower values are more deterministic; zero means
     /// greedy sampling.
+    #[serde(default = "default_temperature")]
     pub temperature: f32,
     /// Cumulative probability threshold for nucleus sampling.
+    #[serde(default = "default_top_p")]
     pub top_p: f32,
     /// Maximum number of top tokens to consider. `0` means all tokens.
     pub top_k: u32,
     /// Random seed used by the sampler when present.
     pub seed: Option<i64>,
     /// Maximum number of tokens to generate per output sequence.
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     /// Minimum number of tokens to generate before EOS or stop-token handling.
     pub min_tokens: u32,
@@ -224,6 +297,7 @@ pub struct EngineCoreSamplingParams {
     /// Presence penalty applied by the sampler.
     pub presence_penalty: f32,
     /// Repetition penalty applied by the sampler.
+    #[serde(default = "default_repetition_penalty")]
     pub repetition_penalty: f32,
     /// Token IDs that stop generation.
     pub stop_token_ids: Vec<u32>,
@@ -243,16 +317,13 @@ pub struct EngineCoreSamplingParams {
     pub all_stop_token_ids: BTreeSet<u32>,
     /// Logit biases to apply during sampling.
     /// Keys are token IDs
-    #[serde(default)]
     pub logit_bias: Option<HashMap<u32, f32>>,
     /// Restrict output to these token IDs only.
-    #[serde(default)]
     pub allowed_token_ids: Option<Vec<u32>>,
     /// Tokenized bad words to avoid during generation.
-    #[serde(default, rename = "_bad_words_token_ids")]
+    #[serde(rename = "_bad_words_token_ids")]
     pub bad_words_token_ids: Option<Vec<Vec<u32>>>,
     /// Parameters for configuring structured outputs (guided decoding).
-    #[serde(default)]
     pub structured_outputs: Option<StructuredOutputsParams>,
     /// Specific token IDs for which log probabilities should be returned at
     /// each position.
@@ -260,16 +331,32 @@ pub struct EngineCoreSamplingParams {
     /// When set, the engine returns logprobs for exactly these tokens in
     /// addition to the sampled/scored token. Mutually exclusive with the
     /// `logprobs` count field in practice.
-    #[serde(default)]
     pub logprob_token_ids: Option<Vec<u32>>,
     /// If `Some(true)`, the request will not attempt to read from the prefix
     /// cache; newly computed blocks may still populate the cache. `None`
     /// defers to engine-core defaults.
-    #[serde(default)]
     pub skip_reading_prefix_cache: Option<bool>,
     /// Additional request parameters for custom extensions (from `vllm_xargs`).
-    #[serde(default)]
     pub extra_args: Option<HashMap<String, serde_json::Value>>,
+    /// Base steering vectors applied to both prefill and decode phases, in the
+    /// inline form engine-core resolves. `None` means no steering.
+    #[serde(default)]
+    pub steering_vectors: Option<SteeringVectorSpec>,
+    /// Phase-specific steering vectors added to the base during prefill only.
+    #[serde(default)]
+    pub prefill_steering_vectors: Option<SteeringVectorSpec>,
+    /// Phase-specific steering vectors added to the base during decode only.
+    #[serde(default)]
+    pub decode_steering_vectors: Option<SteeringVectorSpec>,
+    /// Reference to a pre-registered named steering module as `(name, scale)`.
+    /// The worker resolves the named module and merges any inline overrides.
+    #[serde(default)]
+    pub steering_module_ref: Option<(String, f32)>,
+    /// Per-request opt-in for activation-capture consumers, keyed by consumer
+    /// name. Forwarded verbatim; engine-core's input processor resolves the raw
+    /// spec into prefix-cache flags (offline admission).
+    #[serde(default)]
+    pub capture: Option<serde_json::Value>,
 }
 
 impl EngineCoreSamplingParams {
@@ -298,6 +385,11 @@ impl EngineCoreSamplingParams {
             logprob_token_ids: None,
             skip_reading_prefix_cache: None,
             extra_args: None,
+            steering_vectors: None,
+            prefill_steering_vectors: None,
+            decode_steering_vectors: None,
+            steering_module_ref: None,
+            capture: None,
         }
     }
 }
@@ -318,7 +410,7 @@ pub struct EngineCoreRequest {
     pub pooling_params: Option<OpaqueValue>,
     pub arrival_time: f64,
     #[serde(default)]
-    pub lora_request: Option<OpaqueValue>,
+    pub lora_request: Option<lora::LoraRequest>,
     #[serde(default)]
     pub cache_salt: Option<String>,
     #[serde(default)]
@@ -397,6 +489,13 @@ pub struct EngineCoreOutput {
     pub finish_reason: Option<EngineCoreFinishReason>,
     #[serde(default)]
     pub stop_reason: Option<StopReason>,
+    /// Per-request activation-capture results, keyed by consumer name. Populated
+    /// by engine-core for requests that opted into capture; empty otherwise.
+    ///
+    /// MUST stay positioned between `stop_reason` and `events` to match the
+    /// Python `EngineCoreOutput` tuple layout (`array_like`).
+    #[serde(default)]
+    pub capture_results: HashMap<String, CaptureResult>,
     #[serde(default)]
     pub events: Option<Vec<EngineCoreEvent>>,
     #[serde(default)]
@@ -524,6 +623,111 @@ mod tests {
     }
 
     #[test]
+    fn steering_and_capture_use_python_field_names_and_int_layer_keys() {
+        let mut hook = HashMap::new();
+        hook.insert(
+            7u32,
+            SteeringLayerEntry {
+                vector: vec![1.0, 2.0],
+                scale: 0.5,
+            },
+        );
+        let spec = HashMap::from([("pre_attn".to_string(), hook)]);
+
+        let params = EngineCoreSamplingParams {
+            steering_vectors: Some(spec),
+            steering_module_ref: Some(("creativity".to_string(), 1.0)),
+            capture: Some(serde_json::json!({
+                "filesystem": {"tag": "t", "positions": "last_prompt"}
+            })),
+            ..EngineCoreSamplingParams::for_test()
+        };
+
+        // The sampling params serialize as a field-name map (`to_vec_named`).
+        let value = decode_value(&encode_msgpack(&params).unwrap()).unwrap();
+        let map = match value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let get = |key: &str| map.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v);
+
+        // `steering_module_ref` is a 2-element `(name, scale)` array.
+        match get("steering_module_ref").expect("steering_module_ref present") {
+            Value::Array(a) => {
+                assert_eq!(a.len(), 2);
+                assert_eq!(a[0].as_str(), Some("creativity"));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+
+        // `capture` is forwarded verbatim as a map.
+        assert!(matches!(get("capture"), Some(Value::Map(_))));
+
+        // `steering_vectors` is {hook: {layer_idx: entry}}; the layer key MUST be
+        // a msgpack integer so Python decodes it into `dict[int, ...]`.
+        let hooks = match get("steering_vectors").expect("steering_vectors present") {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let (hook_name, layers) = &hooks[0];
+        assert_eq!(hook_name.as_str(), Some("pre_attn"));
+        let layers = match layers {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let (layer_key, _) = &layers[0];
+        assert!(
+            layer_key.is_i64() || layer_key.is_u64(),
+            "layer key must be an integer, got {layer_key:?}"
+        );
+        assert_eq!(layer_key.as_u64(), Some(7));
+    }
+
+    #[test]
+    fn engine_core_output_capture_results_sit_at_tuple_index_7() {
+        let output = EngineCoreOutput {
+            request_id: "r".to_string(),
+            new_token_ids: vec![1],
+            stop_reason: Some(StopReason::Text("x".to_string())),
+            capture_results: HashMap::from([(
+                "filesystem".to_string(),
+                CaptureResult {
+                    key: None,
+                    status: "ok".to_string(),
+                    error: None,
+                    payload: Some(serde_json::json!({ "paths": ["/a.bin"] })),
+                },
+            )]),
+            events: Some(vec![EngineCoreEvent {
+                r#type: EngineCoreEventType::Queued,
+                timestamp: 1.0,
+            }]),
+            num_nans_in_logits: 3,
+            ..EngineCoreOutput::default()
+        };
+
+        // The output is an `array_like` tuple; capture_results MUST land at index
+        // 7 (between stop_reason and events) to match Python's layout.
+        let encoded = encode_msgpack(&output).unwrap();
+        let array = match decode_value(&encoded).unwrap() {
+            Value::Array(array) => array,
+            other => panic!("expected array, got {other:?}"),
+        };
+        assert!(
+            array[7].is_map(),
+            "capture_results must be at index 7, got {:?}",
+            array[7]
+        );
+
+        // Round-trip preserves capture_results AND every field after it — proving
+        // the tuple stays aligned for capture-enabled outputs.
+        let decoded: EngineCoreOutput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded.capture_results["filesystem"].status, "ok");
+        assert!(decoded.events.is_some());
+        assert_eq!(decoded.num_nans_in_logits, 3);
+    }
+
+    #[test]
     fn engine_core_outputs_roundtrip_finished_fields() {
         let outputs = EngineCoreOutputs {
             outputs: vec![EngineCoreOutput {
@@ -539,6 +743,7 @@ mod tests {
                 trace_headers: None,
                 prefill_stats: None,
                 routed_experts: None,
+                capture_results: Default::default(),
                 num_nans_in_logits: 0,
             }],
             finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
@@ -567,5 +772,73 @@ mod tests {
         .unwrap_err();
 
         expect_test::expect![[r#"messagepack decode failed for u64: wrong msgpack marker FixMap(1); value fallback: {"status": "READY"}"#]].assert_eq(&error.to_report_string());
+    }
+
+    #[test]
+    fn structured_outputs_backend_ignores_deserialized_value() {
+        let params: StructuredOutputsParams = serde_json::from_value(serde_json::json!({
+            "json_object": true,
+            "_backend": "xgrammar",
+        }))
+        .unwrap();
+
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
+
+        let value = serde_json::to_value(params).unwrap();
+        assert_eq!(value["_backend"], "guidance");
+    }
+
+    /// A real `sampling_params` is a sparse `omit_defaults` map; absent fields
+    /// must fall back to defaults. `python_compat` can't catch this since Rust
+    /// encodes full maps (see `engine_core_request_serializes_as_full_array`).
+    #[test]
+    fn decodes_sampling_params_with_omitted_defaults() {
+        let sampling_params = Value::Map(vec![
+            (
+                Value::from("stop_token_ids"),
+                Value::Array(vec![Value::from(151643u32)]),
+            ),
+            (Value::from("skip_reading_prefix_cache"), Value::from(false)),
+        ]);
+        let request = Value::Array(vec![
+            Value::from("req-omit-defaults"),
+            Value::Array(vec![
+                Value::from(1u32),
+                Value::from(2u32),
+                Value::from(3u32),
+            ]),
+            Value::Nil,
+            sampling_params,
+            Value::Nil,
+            Value::from(1.0f64),
+        ]);
+
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &request).unwrap();
+
+        let decoded: EngineCoreRequest = decode_msgpack(&bytes)
+            .expect("a real omit_defaults request must decode (regression: missing field)");
+
+        assert_eq!(decoded.request_id, "req-omit-defaults");
+        let sampling = decoded.sampling_params.expect("sampling params present");
+
+        assert_eq!(sampling.stop_token_ids, vec![151643]);
+        assert_eq!(sampling.skip_reading_prefix_cache, Some(false));
+
+        // Omitted fields -> Python defaults.
+        assert_eq!(sampling.temperature, 1.0);
+        assert_eq!(sampling.top_p, 1.0);
+        assert_eq!(sampling.top_k, 0);
+        assert_eq!(sampling.seed, None);
+        assert_eq!(sampling.max_tokens, 16);
+        assert_eq!(sampling.min_tokens, 0);
+        assert_eq!(sampling.min_p, 0.0);
+        assert_eq!(sampling.frequency_penalty, 0.0);
+        assert_eq!(sampling.presence_penalty, 0.0);
+        assert_eq!(sampling.repetition_penalty, 1.0);
+        assert_eq!(sampling.logprobs, None);
+        assert_eq!(sampling.prompt_logprobs, None);
+        assert_eq!(sampling.eos_token_id, None);
+        assert!(sampling.all_stop_token_ids.is_empty());
     }
 }

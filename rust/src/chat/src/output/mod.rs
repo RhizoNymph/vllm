@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -5,6 +6,8 @@ use futures::Stream;
 use subenum::subenum;
 use trait_set::trait_set;
 use uuid::Uuid;
+use vllm_engine_core_client::protocol::CaptureResult;
+use vllm_llm::TokenUsage;
 use vllm_text::output::{DecodedLogprobs, DecodedPromptLogprobs, DecodedTextEvent};
 
 use crate::FinishReason;
@@ -49,11 +52,12 @@ pub(crate) enum AssistantEvent {
     ToolCallArgumentsDelta { delta: String },
     #[subenum(ContentEvent)]
     Done {
-        prompt_token_count: usize,
-        output_token_count: usize,
+        usage: TokenUsage,
         finish_reason: FinishReason,
         /// Connector-specific KV transfer parameters for disaggregated serving.
         kv_transfer_params: Option<serde_json::Value>,
+        /// Per-consumer activation-capture results, keyed by consumer name.
+        capture_results: HashMap<String, CaptureResult>,
     },
 }
 
@@ -90,10 +94,10 @@ impl ContentEvent {
                 }
                 if let Some(finished) = finished {
                     events.push(Self::Done {
-                        prompt_token_count: finished.prompt_token_count,
-                        output_token_count: finished.output_token_count,
+                        usage: finished.usage,
                         finish_reason: finished.finish_reason,
                         kv_transfer_params: finished.kv_transfer_params,
+                        capture_results: finished.capture_results,
                     });
                 }
                 events
@@ -128,8 +132,6 @@ trait_set! {
 
 /// Generate the northbound tool-call ID using the OpenAI-style `call_<id>`
 /// format.
-// TODO: support other ID scheme like Kimi-K2's
-// `functions.{name}:{global_index}`.
 pub(crate) fn generate_tool_call_id() -> String {
     format!("call_{}", &Uuid::new_v4().simple().to_string()[..24])
 }

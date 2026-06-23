@@ -8,9 +8,11 @@ pub use logprobs::{
 mod decoded;
 mod logprobs;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{StreamExt as _, pin_mut};
+use vllm_engine_core_client::protocol::CaptureResult;
 
 use crate::{Error, FinishReason, Result, TextOutputStream};
 
@@ -23,8 +25,12 @@ pub struct CollectedTextOutput {
     pub logprobs: Option<DecodedLogprobs>,
     pub token_ids: Vec<u32>,
     pub finish_reason: FinishReason,
+    pub usage: vllm_llm::TokenUsage,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Per-consumer activation-capture results, keyed by consumer name. Empty
+    /// unless the request opted into capture.
+    pub capture_results: HashMap<String, CaptureResult>,
 }
 
 #[allow(clippy::manual_async_fn, reason = "specify `Send` bound")]
@@ -74,14 +80,18 @@ impl<T: TextOutputStream> T {
                                 logprobs: delta_logprobs,
                                 token_ids: delta_token_ids,
                                 finish_reason: FinishReason::Error,
+                                usage: vllm_llm::TokenUsage::default(),
                                 kv_transfer_params: None,
+                                capture_results: HashMap::new(),
                             })
                         };
 
                         if let Some(finished) = finished {
                             let mut collected = collected.unwrap();
                             collected.finish_reason = finished.finish_reason;
+                            collected.usage = finished.usage;
                             collected.kv_transfer_params = finished.kv_transfer_params;
+                            collected.capture_results = finished.capture_results;
                             return Ok(collected);
                         }
                     }
@@ -146,10 +156,14 @@ mod tests {
                     ],
                 }),
                 finished: Some(Finished {
-                    prompt_token_count: 2,
-                    output_token_count: 2,
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 2,
+                        output_token_count: 2,
+                        cached_token_count: 0,
+                    },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);
@@ -260,10 +274,14 @@ mod tests {
                     ],
                 }),
                 finished: Some(Finished {
-                    prompt_token_count: 2,
-                    output_token_count: 5,
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 2,
+                        output_token_count: 5,
+                        cached_token_count: 0,
+                    },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    capture_results: Default::default(),
                 }),
             }),
         ]);

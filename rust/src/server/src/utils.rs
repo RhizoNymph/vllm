@@ -70,6 +70,22 @@ pub fn convert_logit_bias(
         .transpose()
 }
 
+/// Decode one optional packed steering field (`steering_vectors`,
+/// `prefill_steering_vectors`, or `decode_steering_vectors`) into the inline
+/// [`SteeringVectorSpec`] forwarded southbound, mapping decode failures to an
+/// invalid-request error tagged with the offending field name.
+pub fn unpack_steering_field(
+    field: Option<crate::routes::openai::utils::steering::SteeringSpecPacked>,
+    field_name: &'static str,
+) -> Result<Option<vllm_engine_core_client::protocol::SteeringVectorSpec>, ApiError> {
+    field
+        .map(|packed| {
+            crate::routes::openai::utils::steering::unpack_steering_spec(&packed)
+                .map_err(|err| ApiError::invalid_request(format!("{err}"), Some(field_name)))
+        })
+        .transpose()
+}
+
 /// Extract common request metadata from HTTP headers: the external request ID
 /// and the optional data-parallel rank used for engine routing.
 pub fn resolve_request_context(

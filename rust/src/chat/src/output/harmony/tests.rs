@@ -51,10 +51,14 @@ fn decoded_start() -> DecodedTextEvent {
 
 fn finished() -> Finished {
     Finished {
-        prompt_token_count: 0,
-        output_token_count: 0,
+        usage: vllm_llm::TokenUsage {
+            prompt_token_count: 0,
+            output_token_count: 0,
+            cached_token_count: 0,
+        },
         finish_reason: FinishReason::stop_eos(),
         kv_transfer_params: None,
+        capture_results: Default::default(),
     }
 }
 
@@ -112,10 +116,14 @@ fn interrupted_final_message_is_preserved() {
                     text: "hello".to_string(),
                 }],
             },
-            prompt_token_count: 0,
-            output_token_count: 0,
+            usage: vllm_llm::TokenUsage {
+                prompt_token_count: 0,
+                output_token_count: 0,
+                cached_token_count: 0,
+            },
             finish_reason: FinishReason::stop_eos(),
             kv_transfer_params: None,
+            capture_results: Default::default(),
         })
     );
 }
@@ -171,10 +179,14 @@ fn interrupted_analysis_message_is_preserved() {
                     text: "think".to_string(),
                 }],
             },
-            prompt_token_count: 0,
-            output_token_count: 0,
+            usage: vllm_llm::TokenUsage {
+                prompt_token_count: 0,
+                output_token_count: 0,
+                cached_token_count: 0,
+            },
             finish_reason: FinishReason::stop_eos(),
             kv_transfer_params: None,
+            capture_results: Default::default(),
         })
     );
 }

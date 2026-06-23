@@ -8,10 +8,11 @@ import math
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import Any
+from typing import Annotated, Any
 
 import msgspec
 import numpy as np
+from pydantic import BeforeValidator
 from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
@@ -38,6 +39,35 @@ _MAX_TEMP = 1e-2
 MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
 the per-request row width allocated by the sampler's `LogprobTokenIdsState`."""
+
+
+def validate_thinking_token_budget(value: int | float | bool | None) -> int | None:
+    """Validate ``thinking_token_budget``; return ``None`` if unset."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, float)) or not isinstance(value, int):
+        raise VLLMValidationError(
+            "`thinking_token_budget` must be a non-negative integer "
+            "or -1 for unlimited.",
+            parameter="thinking_token_budget",
+            value=value,
+        )
+    if value == -1:
+        return None
+    if value < 0:
+        raise VLLMValidationError(
+            "`thinking_token_budget` must be a non-negative integer "
+            "or -1 for unlimited.",
+            parameter="thinking_token_budget",
+            value=value,
+        )
+    return value
+
+
+ThinkingTokenBudget = Annotated[
+    int | None,
+    BeforeValidator(validate_thinking_token_budget),
+]
 
 
 class SamplingType(IntEnum):
@@ -336,9 +366,54 @@ class SamplingParams(
     byte-budget, prefix-cache positions — runs at the OpenAI entrypoint
     against the active consumer registry and is *not* performed here.
 
-    The entrypoint mutates this dict in place after validation, replacing
-    each raw value with the consumer-produced :class:`CaptureSpec`. The
-    runner tolerates both shapes."""
+    The entrypoint validates each value at admission but leaves the raw
+    payload in place: :class:`CaptureSpec` is not serializable across the
+    engine IPC boundary, so the worker re-validates from this raw dict.
+    Admission instead records the resolved prompt-overlap on
+    ``capture_touches_prompt``."""
+
+    capture_touches_prompt: bool | None = None
+    """Whether this request's capture spec taps any prompt-range position.
+
+    Resolved by the OpenAI entrypoint's ``_admit_capture`` once the
+    consumer specs are validated (it is the only place the resolved
+    positions exist at admission). Drives prefix-cache reuse via
+    :meth:`vllm.v1.request.Request.get_skip_reading_prefix_cache`:
+
+    - ``True``  — a prompt position is captured; the prefix must be
+      re-forwarded, so prefix-cache reuse is skipped for this request.
+    - ``False`` — only generated positions are captured; prefix caching
+      is safe and kept.
+    - ``None``  — unclassified (e.g. the offline ``LLM`` path, which does
+      not resolve specs at admission). Treated conservatively as
+      prompt-touching.
+
+    Not client-settable; ignore any value supplied at construction."""
+
+    capture_min_prompt_position: int | None = None
+    """Lowest prompt position this request's capture taps, or ``None``.
+
+    Set by ``_admit_capture`` alongside ``capture_touches_prompt`` when the
+    latter is ``True``. Prefix-cache reuse is clamped to this position so
+    it (and every later position) is re-forwarded and its residual can be
+    captured; positions strictly below it may still be served from cache.
+    See :meth:`vllm.v1.request.Request.get_capture_prefix_cache_limit`.
+    ``None`` when no capture clamp applies (no capture, generated-only, or
+    unclassified). Not client-settable."""
+
+    capture_store_hook_layers: list[tuple[str, int]] | None = None
+    """Union of ``(hook, layer)`` pairs this request's capture taps.
+
+    Set by ``_admit_capture`` for prompt-touching captures. Used by the
+    scheduler with ``capture_store_positions`` and the request's block
+    hashes to test whether the captured prompt prefix is wholly resident in
+    the activation store (and serve it from there instead of re-forwarding).
+    Not client-settable."""
+
+    capture_store_positions: list[int] | None = None
+    """Union of captured prompt positions (sorted) for activation-store
+    serve. Set by ``_admit_capture`` alongside ``capture_store_hook_layers``.
+    Not client-settable."""
 
     steering_vectors: SteeringVectorSpec | None = None
     """Base steering vectors applied to both prefill and decode phases.
@@ -501,6 +576,10 @@ class SamplingParams(
         if self.seed == -1:
             self.seed = None
 
+        self.thinking_token_budget = validate_thinking_token_budget(
+            self.thinking_token_budget
+        )
+
         if self.stop is None:
             self.stop = []
         elif isinstance(self.stop, str):
@@ -537,19 +616,18 @@ class SamplingParams(
         self._all_stop_token_ids.update(self.stop_token_ids)
 
         if self.skip_reading_prefix_cache is None:
-            # Disable prefix-cache reuse for this request when:
-            # - prompt_logprobs is requested: with caching the output of
-            #   prompt logprobs may be less than n_prompt_tokens
-            # - a per-request capture spec is attached: prefix-cache hits
-            #   skip the forward pass for the cached prefix, so the hook
-            #   taps that produce captured residuals never fire on those
-            #   positions and the capture admission validator rejects the
-            #   request. Disabling cache reuse for this request only is
-            #   the minimal fix; it does not invalidate the cache for
-            #   other concurrent requests, which still benefit normally.
-            self.skip_reading_prefix_cache = self.prompt_logprobs is not None or (
-                self.capture is not None and len(self.capture) > 0
-            )
+            # Disable prefix-cache reuse for this request when prompt_logprobs
+            # is requested: with caching the number of returned prompt
+            # logprobs may be less than n_prompt_tokens.
+            #
+            # The capture case is handled separately, not here: a prefix-cache
+            # hit skips the forward pass for the cached prefix, so the hook
+            # taps never fire on those positions. But that only conflicts when
+            # the capture actually taps a prompt position. Whether it does is
+            # not known until the consumer specs are resolved at admission, so
+            # the decision lives in ``Request.get_skip_reading_prefix_cache``
+            # via ``capture_touches_prompt`` rather than in this constructor.
+            self.skip_reading_prefix_cache = self.prompt_logprobs is not None
 
     def _validate_capture(self) -> None:
         """Structural check on ``capture``.
@@ -596,14 +674,31 @@ class SamplingParams(
             raise ValueError(
                 f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
             )
+        if not math.isfinite(self.repetition_penalty):
+            raise ValueError(
+                "repetition_penalty must be a finite number, "
+                f"got {self.repetition_penalty}."
+            )
         if self.repetition_penalty <= 0.0:
             raise ValueError(
                 "repetition_penalty must be greater than zero, got "
                 f"{self.repetition_penalty}."
             )
+        if not math.isfinite(self.temperature):
+            raise VLLMValidationError(
+                f"temperature must be a finite number, got {self.temperature}.",
+                parameter="temperature",
+                value=self.temperature,
+            )
         if self.temperature < 0.0:
             raise VLLMValidationError(
                 f"temperature must be non-negative, got {self.temperature}.",
+                parameter="temperature",
+                value=self.temperature,
+            )
+        if self.temperature > 2.0:
+            raise VLLMValidationError(
+                f"temperature must be in [0, 2], got {self.temperature}.",
                 parameter="temperature",
                 value=self.temperature,
             )
@@ -1098,7 +1193,9 @@ class SamplingParams(
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(tokenizer)
         self._validate_spec_decode(speculative_config)
-        self._validate_structured_outputs(structured_outputs_config, tokenizer)
+        self._validate_structured_outputs(
+            model_config, structured_outputs_config, tokenizer
+        )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs
@@ -1126,6 +1223,20 @@ class SamplingParams(
                     f"which is greater than max allowed: {MAX_LOGPROB_TOKEN_IDS}",
                     parameter="logprob_token_ids",
                     value=n,
+                )
+            vocab_size = model_config.get_vocab_size()
+            invalid_token_ids = [
+                token_id
+                for token_id in self.logprob_token_ids
+                if token_id < 0 or token_id >= vocab_size
+            ]
+            if invalid_token_ids:
+                raise VLLMValidationError(
+                    f"token_id(s) {invalid_token_ids} in logprob_token_ids "
+                    f"contain out-of-vocab token ids. Vocabulary size: "
+                    f"{vocab_size}",
+                    parameter="logprob_token_ids",
+                    value=invalid_token_ids,
                 )
             if self.logprobs is not None and self.logprobs != n:
                 raise VLLMValidationError(
@@ -1217,11 +1328,24 @@ class SamplingParams(
 
     def _validate_structured_outputs(
         self,
+        model_config: ModelConfig,
         structured_outputs_config: StructuredOutputsConfig | None,
         tokenizer: TokenizerLike | None,
     ) -> None:
         if structured_outputs_config is None or self.structured_outputs is None:
             return
+
+        if model_config.is_diffusion:
+            # Diffusion LLMs denoise a whole canvas of tokens in parallel
+            # rather than sampling left-to-right, which the grammar FSM
+            # requires. Without this check, requests fail mid-generation
+            # with an FSM rejection (HTTP 500). See issue #45436.
+            raise ValueError(
+                "Structured outputs are not yet supported for diffusion "
+                "language models. Remove the structured output constraint "
+                "(e.g. `response_format`, `structured_outputs`) from the "
+                "request."
+            )
 
         if tokenizer is None:
             raise ValueError(
@@ -1412,3 +1536,4 @@ class BeamSearchParams(
     temperature: float = 0.0
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
+    structured_outputs: StructuredOutputsParams | None = None

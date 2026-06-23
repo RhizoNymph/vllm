@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
+from copy import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 
@@ -295,6 +296,19 @@ class ModelRunnerOutput:
     # canonical (rank-identical). See
     # docs/design/dynamic_steering_apc_notification.md.
     steering_decode_signatures: dict[str, int] | None = None
+
+    @staticmethod
+    def with_kv_conn_output_only(
+        kv_connector_output: KVConnectorOutput | None,
+    ) -> "ModelRunnerOutput":
+        """Return ModelRunnerOutput containing the provided KVConnectorOutput,
+        otherwise empty. Returns None if kv_connector_output is passed as None.
+        """
+        if kv_connector_output is None or kv_connector_output.is_empty():
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.kv_connector_output = kv_connector_output
+        return output
 
 
 # ModelRunnerOutput wrapper for async scheduling.
