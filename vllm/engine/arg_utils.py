@@ -2393,6 +2393,17 @@ class EngineArgs:
         capture_consumers_config = None
         if self.capture_consumers_config_override is not None:
             capture_consumers_config = self.capture_consumers_config_override
+            # The programmatic override (``LLM(capture_consumers=[...])``)
+            # builds the config without graphsafe keys, so fold in
+            # ``--capture-graphsafe-key`` / ``capture_graphsafe_keys`` here too;
+            # otherwise the offline ``LLM`` path can never reach the graph-safe
+            # per-request capture path.
+            if self.capture_graphsafe_keys and not capture_consumers_config.graphsafe_keys:
+                from vllm.v1.capture.config import parse_graphsafe_key
+
+                capture_consumers_config.graphsafe_keys = [
+                    parse_graphsafe_key(k) for k in self.capture_graphsafe_keys
+                ]
         elif self.capture_consumers:
             from vllm.v1.capture.config import (
                 CaptureConsumersConfig,
