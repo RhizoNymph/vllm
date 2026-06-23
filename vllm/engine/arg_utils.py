@@ -2387,6 +2387,12 @@ class EngineArgs:
         capture_consumers_config = None
         if self.capture_consumers_config_override is not None:
             capture_consumers_config = self.capture_consumers_config_override
+            # The programmatic override (``LLM(capture_consumers=[...])``)
+            # builds the config without the piecewise-fallback flag, so fold in
+            # ``--capture-piecewise-fallback`` / ``capture_piecewise_fallback``
+            # here too; otherwise the offline ``LLM`` path can never enable it.
+            if self.capture_piecewise_fallback:
+                capture_consumers_config.piecewise_capture_fallback = True
         elif self.capture_consumers:
             from vllm.v1.capture.config import (
                 CaptureConsumersConfig,
