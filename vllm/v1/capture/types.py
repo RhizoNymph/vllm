@@ -26,9 +26,12 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 # The unique identifier vLLM assigns internally to a request. Always
-# available; never client-controlled; opaque string. Consumers that want
-# to correlate with external identity should declare the appropriate
-# optional sidecar field (e.g., ``client_request_id``, ``tag``).
+# available; never client-controlled; opaque string. To correlate a
+# capture back to the original client request, consumers can read the
+# always-present ``client_request_id`` sidecar field (the id the API
+# returned; falls back to the internal id when request id randomization is
+# disabled). Other external-identity fields (e.g. ``tag``) remain opt-in
+# via ``required_sidecar_fields``.
 VllmInternalRequestId = NewType("VllmInternalRequestId", str)
 
 

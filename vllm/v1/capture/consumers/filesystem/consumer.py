@@ -801,6 +801,11 @@ class FilesystemConsumer:
 
         sidecar_payload: dict[str, Any] = {
             "request_id": req_str,
+            # Client-supplied request id (always present in the sidecar):
+            # makes every written file mappable to the client's request even
+            # when no custom per-request request_id slug was set. Falls back
+            # to the internal id if unavailable.
+            "client_request_id": finalize.sidecar.get("client_request_id", req_str),
             "layer": layer_idx,
             "hook": hook_name,
         }
