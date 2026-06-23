@@ -28,6 +28,8 @@ import torch
 from vllm.v1.capture.config import (
     CaptureConsumersConfig,
     CaptureConsumerSpec,
+    expand_graphsafe_keys,
+    graphsafe_buffer_bytes,
     parse_graphsafe_key,
 )
 from vllm.v1.capture.manager import CaptureManager
@@ -100,6 +102,61 @@ class TestConfig:
             graphsafe_keys=[(1, "post_mlp")],
         )
         assert base.compute_hash() != with_keys.compute_hash()
+
+
+class TestExpandShorthands:
+    def test_concrete_key(self):
+        assert expand_graphsafe_keys(["12:post_mlp"], num_layers=32) == [
+            (12, "post_mlp")
+        ]
+
+    def test_layer_all_fans_out_standard_hooks(self):
+        assert expand_graphsafe_keys(["5:all"], num_layers=32) == [
+            (5, "post_attn"),
+            (5, "post_mlp"),
+            (5, "pre_attn"),
+        ]
+
+    def test_all_layers_one_hook(self):
+        assert expand_graphsafe_keys(["all:post_mlp"], num_layers=4) == [
+            (0, "post_mlp"),
+            (1, "post_mlp"),
+            (2, "post_mlp"),
+            (3, "post_mlp"),
+        ]
+
+    def test_all_all(self):
+        keys = expand_graphsafe_keys(["all:all"], num_layers=2)
+        assert len(keys) == 2 * 3
+        assert (0, "pre_attn") in keys and (1, "post_mlp") in keys
+
+    def test_dedup_overlapping_shorthands(self):
+        # "5:all" already covers "5:post_mlp" -> no duplicate.
+        keys = expand_graphsafe_keys(["5:post_mlp", "5:all"], num_layers=32)
+        assert keys == [(5, "post_attn"), (5, "post_mlp"), (5, "pre_attn")]
+
+    def test_all_forms_does_not_include_unwired_hooks(self):
+        # mlp_in/mlp_out are valid to name explicitly but excluded from :all.
+        keys = expand_graphsafe_keys(["3:all"], num_layers=8)
+        assert all(h not in ("mlp_in", "mlp_out") for _, h in keys)
+        # ...but explicit naming still works.
+        assert expand_graphsafe_keys(["3:mlp_in"], num_layers=8) == [(3, "mlp_in")]
+
+    def test_layer_out_of_range_rejected(self):
+        with pytest.raises(ValueError, match="outside the model's"):
+            expand_graphsafe_keys(["40:post_mlp"], num_layers=32)
+
+    def test_unknown_hook_rejected(self):
+        with pytest.raises(ValueError, match="unknown hook"):
+            expand_graphsafe_keys(["3:nope"], num_layers=32)
+
+    def test_missing_colon_rejected(self):
+        with pytest.raises(ValueError, match="must be 'layer:hook'"):
+            expand_graphsafe_keys(["12"], num_layers=32)
+
+    def test_buffer_bytes_estimate(self):
+        # 2 keys x 8192 tokens x 1024 hidden x 2 bytes (bf16) = 32 MiB.
+        assert graphsafe_buffer_bytes(2, 8192, 1024, 2) == 2 * 8192 * 1024 * 2
 
 
 # ---------------------------------------------------------------------------

@@ -613,9 +613,13 @@ class EngineArgs:
     capture_spill_max_bytes: int = 4 << 30
 
     # Graph-safe per-request capture allowlist: repeatable ``layer:hook`` keys
-    # (e.g. --capture-graphsafe-key 12:post_mlp). A per-request capture spec
-    # tapping only these keys runs at full cudagraph speed via persistent
-    # buffers; tapping any other key falls back to forcing the step eager.
+    # (e.g. --capture-graphsafe-key 12:post_mlp). ``layer`` and/or ``hook`` may
+    # be ``all`` (``12:all`` = every standard hook at layer 12; ``all:post_mlp``
+    # = that hook on every layer; ``all:all`` = everything). A per-request
+    # capture spec tapping only allowlisted keys runs at full cudagraph speed
+    # via persistent buffers; tapping any other key falls back to forcing the
+    # step eager. Each key reserves one ``[max_num_tokens, hidden]`` buffer, so
+    # ``all`` forms can reserve a lot of VRAM (logged at startup).
     capture_graphsafe_keys: list[str] | None = None
 
     # Programmatic override: Python callers (``LLM(capture_consumers=[...])``)
@@ -1413,13 +1417,16 @@ class EngineArgs:
             default=None,
             metavar="LAYER:HOOK",
             help="Allowlist a (layer, hook) for graph-safe per-request "
-            "capture (e.g. --capture-graphsafe-key 12:post_mlp). A per-request "
-            "capture spec tapping only allowlisted keys runs at full cudagraph "
-            "speed via a persistent buffer instead of forcing the step eager; "
-            "tapping any non-allowlisted key still forces eager. Repeat the "
-            "flag for multiple keys. Costs one persistent buffer "
-            "(max_num_tokens x hidden x dtype) per key plus a fixed copy per "
-            "step at each key's layer.",
+            "capture (e.g. --capture-graphsafe-key 12:post_mlp). LAYER and/or "
+            "HOOK may be 'all': '12:all' = every standard hook at layer 12, "
+            "'all:post_mlp' = that hook on every layer, 'all:all' = everything. "
+            "A per-request capture spec tapping only allowlisted keys runs at "
+            "full cudagraph speed via a persistent buffer instead of forcing "
+            "the step eager; tapping any non-allowlisted key still forces "
+            "eager. Repeat the flag for multiple keys. Costs one persistent "
+            "buffer (max_num_tokens x hidden x dtype) per expanded key plus a "
+            "fixed copy per step at each key's layer; the total VRAM is logged "
+            "at startup.",
         )
 
         # Steering related configs
@@ -2390,6 +2397,43 @@ class EngineArgs:
         # programmatic override (``LLM(capture_consumers=[...])``) or the
         # repeatable ``--capture-consumers`` CLI flag.  The override takes
         # precedence when both are set.
+        # Expand graph-safe key shorthands (``L:hook``, ``L:all``,
+        # ``all:hook``, ``all:all``) into concrete (layer, hook) keys now that
+        # the model's layer count is known, and surface the persistent-VRAM
+        # cost they imply (one ``[max_num_tokens, hidden]`` buffer per key).
+        expanded_graphsafe_keys: list[tuple[int, str]] = []
+        if self.capture_graphsafe_keys:
+            import torch
+
+            from vllm.v1.capture.config import (
+                expand_graphsafe_keys,
+                graphsafe_buffer_bytes,
+            )
+
+            num_layers = model_config.hf_text_config.num_hidden_layers
+            expanded_graphsafe_keys = expand_graphsafe_keys(
+                self.capture_graphsafe_keys, num_layers
+            )
+            if expanded_graphsafe_keys and self.max_num_batched_tokens:
+                hidden = model_config.get_hidden_size()
+                dtype_bytes = torch.empty(0, dtype=model_config.dtype).element_size()
+                est_bytes = graphsafe_buffer_bytes(
+                    len(expanded_graphsafe_keys),
+                    self.max_num_batched_tokens,
+                    hidden,
+                    dtype_bytes,
+                )
+                log = logger.warning if est_bytes >= (1 << 30) else logger.info
+                log(
+                    "capture: %d graph-safe key(s) reserve ~%.1f MiB persistent "
+                    "VRAM (%d tokens x %d hidden x %d B, summed across ranks)",
+                    len(expanded_graphsafe_keys),
+                    est_bytes / (1 << 20),
+                    self.max_num_batched_tokens,
+                    hidden,
+                    dtype_bytes,
+                )
+
         capture_consumers_config = None
         if self.capture_consumers_config_override is not None:
             capture_consumers_config = self.capture_consumers_config_override
@@ -2398,32 +2442,24 @@ class EngineArgs:
             # ``--capture-graphsafe-key`` / ``capture_graphsafe_keys`` here too;
             # otherwise the offline ``LLM`` path can never reach the graph-safe
             # per-request capture path.
-            if self.capture_graphsafe_keys and not capture_consumers_config.graphsafe_keys:
-                from vllm.v1.capture.config import parse_graphsafe_key
-
-                capture_consumers_config.graphsafe_keys = [
-                    parse_graphsafe_key(k) for k in self.capture_graphsafe_keys
-                ]
+            if expanded_graphsafe_keys and not capture_consumers_config.graphsafe_keys:
+                capture_consumers_config.graphsafe_keys = expanded_graphsafe_keys
         elif self.capture_consumers:
             from vllm.v1.capture.config import (
                 CaptureConsumersConfig,
                 parse_consumer_spec,
-                parse_graphsafe_key,
                 validate_consumer_specs,
             )
 
             specs = [parse_consumer_spec(s) for s in self.capture_consumers]
             validate_consumer_specs(specs)
-            graphsafe_keys = [
-                parse_graphsafe_key(k) for k in (self.capture_graphsafe_keys or [])
-            ]
             capture_consumers_config = CaptureConsumersConfig(
                 consumers=specs,
                 dispatch_queue_size=self.capture_dispatch_queue_size,
                 overload_policy=self.capture_overload_policy,
                 spill_dir=self.capture_spill_dir,
                 spill_max_bytes=self.capture_spill_max_bytes,
-                graphsafe_keys=graphsafe_keys,
+                graphsafe_keys=expanded_graphsafe_keys,
             )
 
         # Apply the activation-store budget to whichever config we ended up

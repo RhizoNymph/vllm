@@ -188,6 +188,93 @@ def parse_graphsafe_key(shorthand: str) -> tuple[int, str]:
     return (layer, hook)
 
 
+# Hooks that ``:all`` fans out to. Restricted to the standard residual-stream
+# taps that are actually wired; ``mlp_in``/``mlp_out`` are valid to name
+# explicitly but excluded here so ``:all`` never reserves buffers for taps
+# that never fire.
+_GRAPHSAFE_ALL_HOOKS: tuple[str, ...] = ("pre_attn", "post_attn", "post_mlp")
+
+
+def expand_graphsafe_keys(
+    shorthands: list[str], num_layers: int
+) -> list[tuple[int, str]]:
+    """Expand graph-safe key shorthands into concrete ``(layer, hook)`` keys.
+
+    Supported forms (``L`` is a layer index, ``hook`` a wired hook name):
+
+    - ``"L:hook"``   — a single ``(L, hook)`` key.
+    - ``"L:all"``    — every standard hook (``pre_attn``/``post_attn``/
+      ``post_mlp``) at layer ``L``.
+    - ``"all:hook"`` — ``hook`` on every layer in ``[0, num_layers)``.
+    - ``"all:all"``  — every standard hook on every layer.
+
+    The result is sorted and de-duplicated, so overlapping shorthands (e.g.
+    ``"5:post_mlp"`` and ``"5:all"``) collapse cleanly.
+
+    Args:
+        shorthands: Raw ``layer:hook`` strings (``layer``/``hook`` may be
+            ``all``).
+        num_layers: Total decoder layers, used to expand ``all`` layers.
+
+    Raises:
+        ValueError: If a shorthand is malformed, names an unknown hook, or
+            references a layer outside ``[0, num_layers)``.
+    """
+    keys: set[tuple[int, str]] = set()
+    for shorthand in shorthands:
+        text = shorthand.strip()
+        if ":" not in text:
+            raise ValueError(
+                f"graph-safe capture key {shorthand!r} must be 'layer:hook' "
+                f"(e.g. '12:post_mlp', '12:all', 'all:post_mlp', 'all:all')"
+            )
+        layer_str, hook_str = (part.strip() for part in text.split(":", 1))
+
+        if hook_str == "all":
+            hooks: tuple[str, ...] = _GRAPHSAFE_ALL_HOOKS
+        elif hook_str in _VALID_HOOK_NAMES:
+            hooks = (hook_str,)
+        else:
+            raise ValueError(
+                f"graph-safe capture key {shorthand!r} names unknown hook "
+                f"{hook_str!r}; valid hooks: {sorted(_VALID_HOOK_NAMES)} or 'all'"
+            )
+
+        if layer_str == "all":
+            layers: range = range(num_layers)
+        else:
+            try:
+                layer = int(layer_str)
+            except ValueError as exc:
+                raise ValueError(
+                    f"graph-safe capture key {shorthand!r} has a non-integer "
+                    f"layer (use an int or 'all')"
+                ) from exc
+            if not 0 <= layer < num_layers:
+                raise ValueError(
+                    f"graph-safe capture key {shorthand!r} references layer "
+                    f"{layer} outside the model's [0, {num_layers}) layers"
+                )
+            layers = range(layer, layer + 1)
+
+        for layer in layers:
+            for hook in hooks:
+                keys.add((layer, hook))
+
+    return sorted(keys)
+
+
+def graphsafe_buffer_bytes(
+    num_keys: int, max_num_tokens: int, hidden_size: int, dtype_bytes: int
+) -> int:
+    """Estimate persistent VRAM (bytes) for ``num_keys`` graph-safe buffers.
+
+    Each key holds one ``[max_num_tokens, hidden_size]`` buffer of the model
+    dtype, reserved for the lifetime of the engine.
+    """
+    return num_keys * max_num_tokens * hidden_size * dtype_bytes
+
+
 def validate_consumer_specs(specs: list[CaptureConsumerSpec]) -> None:
     """Validate consumer specs: non-empty names, unique instance names.
 
