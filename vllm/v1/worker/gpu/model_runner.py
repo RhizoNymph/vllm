@@ -1445,6 +1445,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             # Capture results finalized (off-thread) since the last step.
             capture_results=self._drain_capture_results(),
+            # Dynamic-steering APC: effective-decode-signature deltas computed
+            # in ``_update_steering_buffers_v2`` this step (None when steering
+            # is inactive).
+            steering_decode_signatures=(
+                getattr(self, "_pending_decode_sigs", None) or None
+            ),
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(

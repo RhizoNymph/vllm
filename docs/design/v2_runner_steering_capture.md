@@ -111,13 +111,40 @@ only rank-identical inputs.
 2. **Steering control plane** — DONE (CPU-tested, GPU pending).
    `gpu/steering_runner_mixin.py` (`SteeringRunnerMixin`, a subclass of
    `SteeringModelRunnerMixin` that reuses init / discovery / validation / the
-   public RPC API / `_resolve_request_steering` and overrides only the three
+   public RPC API / `_resolve_request_steering` and overrides only the
    v1-state-coupled paths). Keeps its own `_steering_reqs` per-request state;
    `_steering_add_request` (register + streaming re-add), `_steering_finish_requests`
    (release on finish/preempt), `_update_steering_buffers_v2` (transition +
    per-token index). No force-eager seam (persistent buffers). `gpu_worker.py`
    already forwards the RPCs to `self.model_runner.*`.
    Tests: `tests/v1/worker/test_gpu_v2_steering_glue.py`.
+
+   **Dynamic-steering parity (v1 → v2).** `_update_steering_buffers_v2` is at full
+   parity with v1's `_update_steering_buffers`. Beyond the per-token
+   `steering_index` it now builds, every step:
+   - **§5.4 dynamic tier** — `steering_token_scales` (gain for decode tokens of a
+     tier-active state, `0` for prefill = §7 cache safety) via the same
+     per-request → `np.repeat` → pinned-H2D pattern as the index.
+   - **Phase 2 row gating** — resets `steering_row_gate` to `1.0` each step and
+     writes `steering_decode_mask` (`1.0` decode / `0.0` prefill) so an in-graph
+     monitor only gates decode rows.
+   - **Dynamic override pool** — a live `_req_dynamic_decode[req_id]` routes that
+     request's decode tokens to its pool row (`get_dynamic_row`) instead of the
+     admitted decode row; overrides drop on finish / preempt / streaming re-add.
+     `_apply_request_override` is overridden to read the decode-only phase guard
+     from v2's `req_states` (`req_id_to_index` + `num_computed_tokens_np` /
+     `prompt_len.np`).
+   - **Async transport** — drains the in-process `SteeringActionQueue` at the top
+     (before the nothing-active short-circuit, so a drained update can activate
+     steering) via the shared `_apply_steering_actions`.
+   - **APC notification** — `_compute_decode_signature_deltas_v2` folds admitted
+     decode config + override / tier / monitor into an effective signature and
+     reports only changed signatures; the v2 runner attaches them on
+     `ModelRunnerOutput.steering_decode_signatures`.
+   - **Short-circuit predicates** — extended to `has_dynamic` / `has_dynamic_tier`
+     / `has_monitor` (the tier-only latent bug fix) and the active→inactive
+     transition resets `token_scales` / `row_gate` / `decode_mask` / monitor-active
+     flags. The cheap `_scales_dirty` populate path (§5.3) is wired too.
 
 ### Validation
 

@@ -38,6 +38,13 @@ class _Layer(nn.Module):
             "steering_table_post_mlp_any_active", torch.zeros(1, dtype=torch.bool)
         )
         self.register_buffer("steering_index", torch.zeros(16, dtype=torch.long))
+        self.register_buffer(
+            "steering_token_scales", torch.zeros(16, dtype=torch.float32)
+        )
+        self.register_buffer("steering_row_gate", torch.zeros(16, dtype=torch.float32))
+        self.register_buffer(
+            "steering_decode_mask", torch.zeros(16, dtype=torch.float32)
+        )
 
 
 class _FakeInputBatch:
@@ -75,9 +82,16 @@ class _Host(SteeringModelRunnerMixin):
         self._steering_index_dirty = False
         self.input_batch = _FakeInputBatch(reqs)
         self.requests = {}
+        self._req_dynamic_decode = {}
+        self._req_decode_sig_reported = {}
+        self._pending_decode_sigs = {}
         self._steering_rows_scratch = np.zeros(8, dtype=np.int64)
         self._steering_n_tokens_scratch = np.zeros(8, dtype=np.int64)
         self._steering_index_pinned = torch.zeros(16, dtype=torch.long)
+        self._steering_tier_gain_scratch = np.zeros(8, dtype=np.float32)
+        self._steering_token_scales_pinned = torch.zeros(16, dtype=torch.float32)
+        self._steering_decode_mask_scratch = np.zeros(8, dtype=np.float32)
+        self._steering_decode_mask_pinned = torch.zeros(16, dtype=torch.float32)
 
 
 def test_decode_only_request_defeats_nothing_active_short_circuit():
