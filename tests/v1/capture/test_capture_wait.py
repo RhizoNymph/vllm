@@ -36,7 +36,7 @@ from vllm.v1.engine.output_processor import OutputProcessor
 
 def _result(req_id: str = "r1") -> CaptureResult:
     return CaptureResult(
-        key=(req_id, 0, "post_mlp"),
+        key=(req_id, 0, "post_block"),
         status="ok",
         error=None,
         payload=["/tmp/a.bin", "/tmp/a.json"],

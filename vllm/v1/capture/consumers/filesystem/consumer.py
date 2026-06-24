@@ -90,9 +90,10 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
 
 # Hook points that have a real model forward tap; mirrors
 # ``filesystem.validation._VALID_HOOK_NAMES``. Redeclared here (not
-# imported) to keep ``_parse_params`` torch/pydantic-free.
+# imported) to keep ``_parse_params`` torch/pydantic-free. Keep this set in
+# sync with ``_VALID_HOOK_NAMES`` -- they must list the same hook points.
 _VALID_GLOBAL_HOOK_NAMES: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_mlp")
+    ("pre_attn", "post_attn", "post_block")
 )
 
 
@@ -167,7 +168,7 @@ def _resolve_global_hooks(
     - a **dict** ``{hook: layers}`` where ``layers`` is a list of ints or a
       layer-spec string (``"all"`` / ``"0-17"`` / ``"1.5.9"``); or
     - a **string** in the CLI-safe DSL ``"<hook>:<layers>[;<hook>:<layers>]"``
-      (e.g. ``"post_mlp:all"`` or ``"pre_attn:0-17;post_mlp:20"``).
+      (e.g. ``"post_block:all"`` or ``"pre_attn:0-17;post_block:20"``).
 
     ``None``/empty disables the global spec (legacy per-request-only
     behavior). ``num_layers`` is the model's total decoder-layer count, used

@@ -185,7 +185,7 @@ def test_global_spec_drives_per_request_files(tmp_path: pathlib.Path) -> None:
         params={
             "root": str(tmp_path),
             "writer_threads": 2,
-            "global_hooks": {"post_mlp": [1]},
+            "global_hooks": {"post_block": [1]},
             "global_positions": "last_prompt",
             "default_tag": "run-global",
         },
@@ -210,7 +210,7 @@ def test_global_spec_drives_per_request_files(tmp_path: pathlib.Path) -> None:
 
     # The global key gets a persistent buffer (the graph-safe path), and
     # routes to the global gather (not the dynamic index_select).
-    assert mgr._global_keys == frozenset({(1, "post_mlp")})
+    assert mgr._global_keys == frozenset({(1, "post_block")})
 
     req_id = "req-global-1"
     # No client_specs and no admission slugs — purely global-driven.
@@ -230,23 +230,23 @@ def test_global_spec_drives_per_request_files(tmp_path: pathlib.Path) -> None:
     )
     plan = mgr.build_step_plan(batch_view)
     # Global key routed to the buffer path, not the dynamic gather.
-    assert (1, "post_mlp") in plan.global_gather_indices
-    assert (1, "post_mlp") not in plan.gather_indices
+    assert (1, "post_block") in plan.global_gather_indices
+    assert (1, "post_block") not in plan.gather_indices
 
     # Simulate the graph-recorded full-residual copy into the persistent
     # buffer (what on_hook does for a global key).
     hidden = torch.arange(24, dtype=torch.float32).reshape(3, 8)
-    mgr.on_hook(1, "post_mlp", hidden)
+    mgr.on_hook(1, "post_block", hidden)
 
     mgr.dispatch_step_captures(plan)
     results = mgr.finalize_request(req_id)
     assert list(results.keys()) == [0]
 
-    _wait_for_status(consumer, (req_id, 1, "post_mlp"))
+    _wait_for_status(consumer, (req_id, 1, "post_block"))
     consumer.shutdown()
 
     # File named by the engine request id under the configured tag.
-    bin_path = tmp_path / "run-global" / req_id / "1_post_mlp.bin"
+    bin_path = tmp_path / "run-global" / req_id / "1_post_block.bin"
     sidecar_path = bin_path.with_suffix(".json")
     assert bin_path.exists(), f"missing bin file {bin_path}"
     assert sidecar_path.exists(), f"missing sidecar {sidecar_path}"
@@ -254,7 +254,7 @@ def test_global_spec_drives_per_request_files(tmp_path: pathlib.Path) -> None:
     sidecar = json.loads(sidecar_path.read_text())
     assert sidecar["request_id"] == req_id
     assert sidecar["layer"] == 1
-    assert sidecar["hook"] == "post_mlp"
+    assert sidecar["hook"] == "post_block"
 
     # The captured row is the last prompt position of the residual.
     captured = torch.frombuffer(bytearray(bin_path.read_bytes()), dtype=torch.float32)
@@ -268,7 +268,7 @@ def test_global_spec_two_requests_distinct_dirs(tmp_path: pathlib.Path) -> None:
         params={
             "root": str(tmp_path),
             "writer_threads": 2,
-            "global_hooks": {"post_mlp": [0]},
+            "global_hooks": {"post_block": [0]},
             "global_positions": "last_prompt",
         },
     )
@@ -298,17 +298,17 @@ def test_global_spec_two_requests_distinct_dirs(tmp_path: pathlib.Path) -> None:
         )
         plan = mgr.build_step_plan(batch_view)
         hidden = torch.arange(base, base + 8, dtype=torch.float32).reshape(2, 4)
-        mgr.on_hook(0, "post_mlp", hidden)
+        mgr.on_hook(0, "post_block", hidden)
         mgr.dispatch_step_captures(plan)
         mgr.finalize_request(req_id)
-        _wait_for_status(consumer, (req_id, 0, "post_mlp"))
+        _wait_for_status(consumer, (req_id, 0, "post_block"))
 
     consumer.shutdown()
 
     # Default tag is "default" (legacy fallback name); each request gets its
     # own directory keyed by the engine request id.
-    assert (tmp_path / "default" / "req-A" / "0_post_mlp.bin").exists()
-    assert (tmp_path / "default" / "req-B" / "0_post_mlp.bin").exists()
+    assert (tmp_path / "default" / "req-A" / "0_post_block.bin").exists()
+    assert (tmp_path / "default" / "req-B" / "0_post_block.bin").exists()
 
 
 # ---------------------------------------------------------------------------

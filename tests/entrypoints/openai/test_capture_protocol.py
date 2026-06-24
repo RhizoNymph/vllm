@@ -332,7 +332,7 @@ class TestPendingCaptureResults:
         req = ChatCompletionRequest(
             model="m",
             messages=[{"role": "user", "content": "x"}],
-            capture={"fs": {"hooks": {"post_mlp": [0]}}},
+            capture={"fs": {"hooks": {"post_block": [0]}}},
         )
         result = _build_capture_results_response(
             req, _FakeFinal(capture_results={})  # type: ignore[arg-type]
