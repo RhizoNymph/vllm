@@ -60,6 +60,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -710,7 +711,7 @@ class AXK1DecoderLayer(nn.Module):
             # The scaling of AXK1MOE output would be done in the forward
             # of AXK1MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 
         return hidden_states, residual
 
