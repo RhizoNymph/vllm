@@ -67,6 +67,45 @@ else:
 
 logger = init_logger(__name__)
 
+# Qualified name of the activation-capture custom op. Registered as a graph
+# split point when capture is configured so a per-request capture forces only
+# the tapped region eager, keeping the rest of the model on piecewise cudagraphs.
+CAPTURE_RESIDUAL_SPLIT_OP = "vllm::capture_residual"
+
+
+def maybe_add_capture_split_op(
+    compilation_config: CompilationConfig,
+    capture_enabled: bool,
+) -> None:
+    """Register ``vllm::capture_residual`` as a graph split point when capture
+    is configured, enabling the capture-aware piecewise cudagraph fallback.
+
+    A per-request (client-spec) capture on a decode step runs a dynamic,
+    variable-size ``index_select`` gather that cannot be recorded into a
+    cudagraph, so its enclosing region must run eager. Making the capture op a
+    split point isolates that region: only the tapped segment breaks out of the
+    piecewise cudagraph while every other segment keeps replaying, instead of
+    forcing the whole step eager (``CUDAGraphMode.NONE``).
+
+    This is a no-op unless capture is configured AND piecewise cudagraphs are
+    actually built via the FX-level split path. Inductor-partition mode
+    (``use_inductor_graph_partition=True``) drives partitioning through Inductor
+    rules rather than ``splitting_ops``, so registering the op there would have
+    no effect; that path is left to a follow-up (it needs the op added as an
+    inductor partition rule, see perf/capture-piecewise-eager notes).
+    """
+    if not capture_enabled:
+        return
+    if not compilation_config.cudagraph_mode.has_piecewise_cudagraphs():
+        return
+    if compilation_config.use_inductor_graph_partition:
+        return
+    splitting_ops = compilation_config.splitting_ops
+    if splitting_ops is None:
+        return
+    if CAPTURE_RESIDUAL_SPLIT_OP not in splitting_ops:
+        splitting_ops.append(CAPTURE_RESIDUAL_SPLIT_OP)
+
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "Qwen3ForCausalLM",
@@ -1384,6 +1423,14 @@ class VllmConfig:
         self.compilation_config.set_splitting_ops_for_v1(
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
+        )
+
+        maybe_add_capture_split_op(
+            self.compilation_config,
+            capture_enabled=(
+                self.capture_consumers_config is not None
+                and self.capture_consumers_config.piecewise_capture_fallback
+            ),
         )
 
         if self.compilation_config.pass_config.enable_sp:

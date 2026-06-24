@@ -51,6 +51,20 @@ class CaptureConsumersConfig:
     instances: list[Any] = field(default_factory=list)
     activation_cache_bytes: int = 0
 
+    # ---- Capture-aware piecewise cudagraph fallback ----
+    # When True, a per-request (client-spec) capture on a decode step replays
+    # the piecewise cudagraph (breaking only at the tapped ``capture_residual``
+    # split op) instead of forcing the whole step eager. This requires the
+    # capture op to be registered as a graph split point, which adds a break at
+    # *every* steering/capture hook in *every* layer (per-request taps are not
+    # known at compile time, so all hooks must be splittable). That increases
+    # the piecewise segment count on every decode step — a steady-state
+    # host-side cost — so the fallback is opt-in: enable it only for workloads
+    # with high client-capture density, where the per-captured-step win
+    # (~4x -> ~1.x) outweighs the extra graph launches on non-capturing steps.
+    # Part of ``compute_hash`` because it changes ``splitting_ops`` and thus
+    # the compiled graph.
+    piecewise_capture_fallback: bool = False
     # ---- Graph-safe per-request capture allowlist ----
     # Startup-configured ``(layer, hook)`` keys for which the manager
     # pre-allocates persistent capture buffers, so a *per-request* (client)
@@ -96,6 +110,11 @@ class CaptureConsumersConfig:
                 h.update(spec.instance_name.encode())
             for k in sorted(spec.params):
                 h.update(f"{k}={spec.params[k]}".encode())
+        # The piecewise fallback changes splitting_ops (the compiled graph),
+        # so it must participate in the compile-cache key.
+        h.update(
+            f"piecewise_capture_fallback={self.piecewise_capture_fallback}".encode()
+        )
         # The graph-safe allowlist changes which persistent buffers and
         # full-residual copies get baked into the CUDA graph, so it is a
         # compile-cache input.

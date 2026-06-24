@@ -357,6 +357,41 @@ class CudaGraphManager:
             num_active_loras=effective_loras,
         )
 
+    def dispatch_piecewise(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+    ) -> BatchExecutionDescriptor | None:
+        """Find a matching PIECEWISE descriptor, or ``None`` if none applies.
+
+        Unlike :meth:`dispatch` (which may return a FULL or NONE descriptor),
+        this restricts the search to piecewise candidates. Used by the
+        capture-aware fallback: a per-request capture step keeps its dynamic
+        gather off-graph but can still replay the per-segment piecewise graphs,
+        which break around the ``vllm::capture_residual`` split op. Returns
+        ``None`` when no piecewise graph was captured for this shape (e.g.
+        FULL-only mode, or an uncaptured batch size), so the caller falls back
+        to eager.
+        """
+        if not (self._graphs_captured and num_tokens > 0):
+            return None
+        effective_loras = self._resolve_effective_loras(num_active_loras)
+        key = (num_tokens, effective_loras)
+        for desc in self._candidates.get(key, ()):
+            if desc.cg_mode != CUDAGraphMode.PIECEWISE:
+                continue
+            if _is_compatible(
+                desc,
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                effective_loras,
+            ):
+                return desc
+        return None
+
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""
         assert desc.cg_mode == CUDAGraphMode.FULL, (

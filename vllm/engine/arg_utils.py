@@ -612,6 +612,9 @@ class EngineArgs:
     capture_spill_dir: str | None = None
     capture_spill_max_bytes: int = 4 << 30
 
+    # Opt-in: replay the piecewise cudagraph on per-request capture steps
+    # (breaking only at the tapped op) instead of forcing the whole step eager.
+    capture_piecewise_fallback: bool = False
     # Graph-safe per-request capture allowlist: repeatable ``layer:hook`` keys
     # (e.g. --capture-graphsafe-key 12:post_mlp). ``layer`` and/or ``hook`` may
     # be ``all`` (``12:all`` = every standard hook at layer 12; ``all:post_mlp``
@@ -1409,6 +1412,17 @@ class EngineArgs:
             default=4 << 30,
             help="Cap on bytes buffered in the spill area; once exceeded, "
             "'spill' degrades to 'block' (no loss).",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-piecewise-fallback",
+            action="store_true",
+            help="On a per-request capture step, replay the piecewise cudagraph "
+            "and break only at the tapped capture op instead of forcing the whole "
+            "step eager. Makes the capture op a graph split point (a break at "
+            "every layer hook), so it adds host-side overhead on non-capturing "
+            "decode steps too; enable only for high client-capture-density "
+            "workloads. Requires piecewise cudagraphs (the default "
+            "FULL_AND_PIECEWISE/PIECEWISE modes).",
         )
         capture_consumers_group.add_argument(
             "--capture-graphsafe-key",
@@ -2402,6 +2416,7 @@ class EngineArgs:
             self.capture_consumers_config_override is not None
             or self.capture_consumers
             or self.capture_graphsafe_keys
+            or self.capture_piecewise_fallback
         ):
             from vllm.v1.capture.config import (
                 CaptureConsumersConfig,
@@ -2478,6 +2493,10 @@ class EngineArgs:
                     and not capture_consumers_config.graphsafe_keys
                 ):
                     capture_consumers_config.graphsafe_keys = expanded_graphsafe_keys
+                # Likewise fold in the piecewise-fallback flag so the offline
+                # ``LLM`` path can enable it.
+                if self.capture_piecewise_fallback:
+                    capture_consumers_config.piecewise_capture_fallback = True
             elif consumer_specs:
                 capture_consumers_config = CaptureConsumersConfig(
                     consumers=consumer_specs,
@@ -2486,6 +2505,7 @@ class EngineArgs:
                     spill_dir=self.capture_spill_dir,
                     spill_max_bytes=self.capture_spill_max_bytes,
                     graphsafe_keys=expanded_graphsafe_keys,
+                    piecewise_capture_fallback=self.capture_piecewise_fallback,
                 )
 
         # Apply the activation-store budget to whichever config we ended up
