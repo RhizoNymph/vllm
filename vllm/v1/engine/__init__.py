@@ -239,6 +239,12 @@ class EngineCoreOutputs(
     timestamp: float = 0.0
 
     utility_output: UtilityOutput | None = None
+    # Capture results that finalized AFTER their request finished (writes are
+    # asynchronous). Keyed by request_id; routed by the output processor to
+    # ``capture_wait`` waiters since the per-request output stream is closed.
+    late_capture_results: dict[str, dict[str, CaptureResult]] = msgspec.field(
+        default_factory=dict
+    )
     finished_requests: set[str] | None = None
 
     # In DP case, used to signal that the current wave of requests
