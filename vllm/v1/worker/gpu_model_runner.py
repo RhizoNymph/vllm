@@ -561,7 +561,19 @@ class GPUModelRunner(
             # therefore forces eager only when a per-request *client* spec
             # captures this step; global-only and plain steps keep full
             # cudagraph speed.
-            self._capture_step_gate = CaptureStepGate()
+            # The graph-safe per-request allowlist (a rank-identical config
+            # value) lets a client spec tapping only allowlisted keys ride the
+            # persistent-buffer path and skip eager too. Built with the global,
+            # unfiltered key set so every rank reaches the same decision.
+            _gs_keys = frozenset(
+                getattr(
+                    self.vllm_config.capture_consumers_config,
+                    "graphsafe_keys",
+                    None,
+                )
+                or ()
+            )
+            self._capture_step_gate = CaptureStepGate(graphsafe_keys=_gs_keys)
 
             # Capturer-rank gate. The replicated residual hooks
             # (pre_attn/post_attn/post_mlp) read the residual stream after
@@ -631,6 +643,7 @@ class GPUModelRunner(
                     overload_policy=getattr(cc_config, "overload_policy", "spill"),
                     spill_dir=getattr(cc_config, "spill_dir", None),
                     spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
+                    graphsafe_keys=getattr(cc_config, "graphsafe_keys", None),
                 )
                 self._capture_validators = validators
                 self._capture_name_to_index = dict(name_to_index)

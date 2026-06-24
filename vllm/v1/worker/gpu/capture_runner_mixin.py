@@ -93,7 +93,11 @@ class CaptureRunnerMixin:
 
         # Global capture specs ride a CUDA-graph-safe persistent-buffer path, so
         # the gate forces eager only when a per-request *client* spec captures.
-        self._capture_step_gate = CaptureStepGate()
+        # The graph-safe allowlist (a rank-identical config value) further lets
+        # a client spec tapping only allowlisted keys skip eager too; the gate
+        # is built with the global, unfiltered key set so every rank agrees.
+        graphsafe_keys = frozenset(getattr(cc_config, "graphsafe_keys", None) or ())
+        self._capture_step_gate = CaptureStepGate(graphsafe_keys=graphsafe_keys)
 
         if get_tp_group().rank_in_group != 0:
             # Non-capturer rank: no manager, cold-path custom op.
@@ -132,6 +136,7 @@ class CaptureRunnerMixin:
                 overload_policy=getattr(cc_config, "overload_policy", "spill"),
                 spill_dir=getattr(cc_config, "spill_dir", None),
                 spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
+                graphsafe_keys=getattr(cc_config, "graphsafe_keys", None),
             )
             self._capture_validators = validators
             self._capture_name_to_index = dict(name_to_index)
@@ -322,6 +327,14 @@ class CaptureRunnerMixin:
 
         sidecar_fields: dict[str, Any] = {
             "vllm_internal_request_id": new_req_data.req_id,
+            # Client-supplied request id for universal attribution. Falls
+            # back to the internal id if randomization was disabled / the
+            # client id is unavailable (None-safe).
+            "client_request_id": (
+                new_req_data.client_request_id
+                if new_req_data.client_request_id is not None
+                else new_req_data.req_id
+            ),
             "prompt_token_ids": (
                 list(new_req_data.prompt_token_ids)
                 if new_req_data.prompt_token_ids is not None

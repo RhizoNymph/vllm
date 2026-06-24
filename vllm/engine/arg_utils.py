@@ -615,6 +615,15 @@ class EngineArgs:
     # Opt-in: replay the piecewise cudagraph on per-request capture steps
     # (breaking only at the tapped op) instead of forcing the whole step eager.
     capture_piecewise_fallback: bool = False
+    # Graph-safe per-request capture allowlist: repeatable ``layer:hook`` keys
+    # (e.g. --capture-graphsafe-key 12:post_mlp). ``layer`` and/or ``hook`` may
+    # be ``all`` (``12:all`` = every standard hook at layer 12; ``all:post_mlp``
+    # = that hook on every layer; ``all:all`` = everything). A per-request
+    # capture spec tapping only allowlisted keys runs at full cudagraph speed
+    # via persistent buffers; tapping any other key falls back to forcing the
+    # step eager. Each key reserves one ``[max_num_tokens, hidden]`` buffer, so
+    # ``all`` forms can reserve a lot of VRAM (logged at startup).
+    capture_graphsafe_keys: list[str] | None = None
 
     # Programmatic override: Python callers (``LLM(capture_consumers=[...])``)
     # pre-build a ``CaptureConsumersConfig`` directly and skip the CLI
@@ -1414,6 +1423,24 @@ class EngineArgs:
             "decode steps too; enable only for high client-capture-density "
             "workloads. Requires piecewise cudagraphs (the default "
             "FULL_AND_PIECEWISE/PIECEWISE modes).",
+        )
+        capture_consumers_group.add_argument(
+            "--capture-graphsafe-key",
+            dest="capture_graphsafe_keys",
+            action="append",
+            default=None,
+            metavar="LAYER:HOOK",
+            help="Allowlist a (layer, hook) for graph-safe per-request "
+            "capture (e.g. --capture-graphsafe-key 12:post_mlp). LAYER and/or "
+            "HOOK may be 'all': '12:all' = every standard hook at layer 12, "
+            "'all:post_mlp' = that hook on every layer, 'all:all' = everything. "
+            "A per-request capture spec tapping only allowlisted keys runs at "
+            "full cudagraph speed via a persistent buffer instead of forcing "
+            "the step eager; tapping any non-allowlisted key still forces "
+            "eager. Repeat the flag for multiple keys. Costs one persistent "
+            "buffer (max_num_tokens x hidden x dtype) per expanded key plus a "
+            "fixed copy per step at each key's layer; the total VRAM is logged "
+            "at startup.",
         )
 
         # Steering related configs
@@ -2385,31 +2412,101 @@ class EngineArgs:
         # repeatable ``--capture-consumers`` CLI flag.  The override takes
         # precedence when both are set.
         capture_consumers_config = None
-        if self.capture_consumers_config_override is not None:
-            capture_consumers_config = self.capture_consumers_config_override
-            # The programmatic override (``LLM(capture_consumers=[...])``)
-            # builds the config without the piecewise-fallback flag, so fold in
-            # ``--capture-piecewise-fallback`` / ``capture_piecewise_fallback``
-            # here too; otherwise the offline ``LLM`` path can never enable it.
-            if self.capture_piecewise_fallback:
-                capture_consumers_config.piecewise_capture_fallback = True
-        elif self.capture_consumers:
+        if (
+            self.capture_consumers_config_override is not None
+            or self.capture_consumers
+            or self.capture_graphsafe_keys
+            or self.capture_piecewise_fallback
+        ):
             from vllm.v1.capture.config import (
                 CaptureConsumersConfig,
+                expand_graphsafe_keys,
+                graphsafe_buffer_bytes,
                 parse_consumer_spec,
+                resolve_graphsafe_shorthands,
                 validate_consumer_specs,
             )
 
-            specs = [parse_consumer_spec(s) for s in self.capture_consumers]
-            validate_consumer_specs(specs)
-            capture_consumers_config = CaptureConsumersConfig(
-                consumers=specs,
-                dispatch_queue_size=self.capture_dispatch_queue_size,
-                overload_policy=self.capture_overload_policy,
-                spill_dir=self.capture_spill_dir,
-                spill_max_bytes=self.capture_spill_max_bytes,
-                piecewise_capture_fallback=self.capture_piecewise_fallback,
+            # Resolve the consumer specs in play (from the override config or
+            # the CLI strings).
+            override_cfg = self.capture_consumers_config_override
+            if override_cfg is not None:
+                consumer_specs = list(override_cfg.consumers)
+            elif self.capture_consumers:
+                consumer_specs = [
+                    parse_consumer_spec(s) for s in self.capture_consumers
+                ]
+                validate_consumer_specs(consumer_specs)
+            else:
+                consumer_specs = []
+
+            # Graph-safe shorthands: an explicit ``--capture-graphsafe-key`` /
+            # ``capture_graphsafe_keys`` OVERRIDES; otherwise the default is the
+            # union of what each registered consumer declares in code via
+            # ``CaptureConsumer.declared_graphsafe_keys(params)``.
+            raw_graphsafe_shorthands, graphsafe_source = resolve_graphsafe_shorthands(
+                consumer_specs, self.capture_graphsafe_keys
             )
+
+            # Expand shorthands (``L:hook``/``L:all``/``all:hook``/``all:all``)
+            # into concrete (layer, hook) keys now that the layer count is
+            # known, and surface the persistent-VRAM cost (one
+            # ``[max_num_tokens, hidden]`` buffer per key).
+            expanded_graphsafe_keys: list[tuple[int, str]] = []
+            if raw_graphsafe_shorthands:
+                num_layers = model_config.hf_text_config.num_hidden_layers
+                expanded_graphsafe_keys = expand_graphsafe_keys(
+                    raw_graphsafe_shorthands, num_layers
+                )
+                if expanded_graphsafe_keys and self.max_num_batched_tokens:
+                    import torch
+
+                    hidden = model_config.get_hidden_size()
+                    dtype_bytes = torch.empty(
+                        0, dtype=model_config.dtype
+                    ).element_size()
+                    est_bytes = graphsafe_buffer_bytes(
+                        len(expanded_graphsafe_keys),
+                        self.max_num_batched_tokens,
+                        hidden,
+                        dtype_bytes,
+                    )
+                    log = logger.warning if est_bytes >= (1 << 30) else logger.info
+                    log(
+                        "capture: %d graph-safe key(s) from %s reserve ~%.1f "
+                        "MiB persistent VRAM (%d tokens x %d hidden x %d B, "
+                        "summed across ranks)",
+                        len(expanded_graphsafe_keys),
+                        graphsafe_source,
+                        est_bytes / (1 << 20),
+                        self.max_num_batched_tokens,
+                        hidden,
+                        dtype_bytes,
+                    )
+
+            if override_cfg is not None:
+                capture_consumers_config = override_cfg
+                # The programmatic override builds the config without graphsafe
+                # keys; fold in the resolved set (CLI or consumer-derived).
+                if (
+                    expanded_graphsafe_keys
+                    and not capture_consumers_config.graphsafe_keys
+                ):
+                    capture_consumers_config.graphsafe_keys = expanded_graphsafe_keys
+                # Likewise fold in the piecewise-fallback flag so the offline
+                # ``LLM`` path can enable it.
+                if self.capture_piecewise_fallback:
+                    capture_consumers_config.piecewise_capture_fallback = True
+            elif consumer_specs:
+                capture_consumers_config = CaptureConsumersConfig(
+                    consumers=consumer_specs,
+                    dispatch_queue_size=self.capture_dispatch_queue_size,
+                    overload_policy=self.capture_overload_policy,
+                    spill_dir=self.capture_spill_dir,
+                    spill_max_bytes=self.capture_spill_max_bytes,
+                    graphsafe_keys=expanded_graphsafe_keys,
+                    piecewise_capture_fallback=self.capture_piecewise_fallback,
+                )
 
         # Apply the activation-store budget to whichever config we ended up
         # with (CLI- or override-built). Capture must be active for it to

@@ -40,6 +40,11 @@ class NewRequestData:
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
 
+    # The original client-supplied request id (the id the API returned).
+    # ``req_id`` is the vLLM-internal id; this carries the client id so the
+    # worker (e.g. capture) can surface it for attribution. Optional/None-safe.
+    client_request_id: str | None = None
+
     # Per-request steering config hashes (0 = no per-request steering)
     prefill_steering_config_hash: int = 0
     decode_steering_config_hash: int = 0
@@ -78,6 +83,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
+            client_request_id=request.external_req_id,
             prefill_steering_config_hash=request.prefill_steering_config_hash,
             decode_steering_config_hash=request.decode_steering_config_hash,
             prefill_token_ids=prefill_token_ids,

@@ -298,6 +298,23 @@ class FilesystemConsumer:
         """Filesystem consumer has no global spec — capture is per-request."""
         return None
 
+    @classmethod
+    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
+        """Graph-safe keys declared via the ``graphsafe_keys`` param.
+
+        Accepts a list of ``layer:hook`` shorthands or a single
+        ``';'``-separated string (``,`` already separates CLI params), e.g.
+        ``filesystem:root=/x,graphsafe_keys=12:post_mlp;20:post_mlp`` or
+        ``{"graphsafe_keys": ["all:post_mlp"]}``. These per-request taps then
+        run graph-safe without a separate ``--capture-graphsafe-key`` flag.
+        """
+        raw = params.get("graphsafe_keys")
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            return [part.strip() for part in raw.split(";") if part.strip()]
+        return [str(part).strip() for part in raw if str(part).strip()]
+
     def validate_client_spec(
         self,
         raw_spec: Any,
@@ -801,6 +818,11 @@ class FilesystemConsumer:
 
         sidecar_payload: dict[str, Any] = {
             "request_id": req_str,
+            # Client-supplied request id (always present in the sidecar):
+            # makes every written file mappable to the client's request even
+            # when no custom per-request request_id slug was set. Falls back
+            # to the internal id if unavailable.
+            "client_request_id": finalize.sidecar.get("client_request_id", req_str),
             "layer": layer_idx,
             "hook": hook_name,
         }

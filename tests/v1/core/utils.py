@@ -12,6 +12,7 @@ from vllm.config import (
     ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
+    SteeringConfig,
     VllmConfig,
 )
 from vllm.multimodal.inputs import (
@@ -58,6 +59,7 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    max_steering_configs: int | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -138,6 +140,12 @@ def create_scheduler(
         else None
     )
 
+    steering_config = (
+        SteeringConfig(max_steering_configs=max_steering_configs)
+        if max_steering_configs is not None
+        else None
+    )
+
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
@@ -146,6 +154,7 @@ def create_scheduler(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
+        steering_config=steering_config,
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
