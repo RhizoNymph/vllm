@@ -462,8 +462,6 @@ class CaptureRunnerMixin:
             return
 
         index_to_name = self._capture_index_to_name
-        pending = self._pending_capture_results
-        lock = self._pending_capture_results_lock
 
         def _on_complete(indexed: dict[int, CaptureResult]) -> None:
             if not indexed:
@@ -472,8 +470,17 @@ class CaptureRunnerMixin:
                 index_to_name.get(idx, f"consumer_{idx}"): result
                 for idx, result in indexed.items()
             }
-            with lock:
-                pending.setdefault(req_id, {}).update(named)
+            # Resolve the stash dict at CALL time, not closure-creation time:
+            # ``_drain_capture_results`` / ``drain_pending_capture_results``
+            # swap ``self._pending_capture_results`` for a fresh dict, so a
+            # reference captured here would be orphaned by the time the
+            # finalize thread fires (~seconds later, after writer fsync) and
+            # the results would silently vanish -- the request would never
+            # report capture results (and ``capture_wait`` would hang).
+            with self._pending_capture_results_lock:
+                self._pending_capture_results.setdefault(req_id, {}).update(
+                    named
+                )
 
         mgr.finalize_request_async(req_id, _on_complete)
 
@@ -485,3 +492,17 @@ class CaptureRunnerMixin:
             results = self._pending_capture_results
             self._pending_capture_results = {}
         return results
+
+    def drain_pending_capture_results(
+        self,
+    ) -> dict[str, dict[str, CaptureResult]]:
+        """collective_rpc target for the ``capture_wait`` idle-loop drain.
+
+        The engine core's idle loop calls this (via the worker's
+        ``drain_pending_capture_results``) so capture results that finalize
+        after a request's final step still reach ``capture_wait`` clients,
+        even when no further ``ModelRunnerOutput`` is produced. Mirrors the
+        v1 ``GPUModelRunner`` method; shares the per-step swap buffer with
+        :meth:`_drain_capture_results`.
+        """
+        return self._drain_capture_results()

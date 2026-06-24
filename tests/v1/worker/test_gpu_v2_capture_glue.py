@@ -122,6 +122,48 @@ def test_drain_disabled_returns_empty():
     assert glue._drain_capture_results() == {}
 
 
+def test_drain_pending_capture_results_public_target():
+    # ``capture_wait``'s idle-loop drains via the public method (collective_rpc
+    # target on the v2 runner); it must exist and surface buffered results.
+    glue = _Glue(_req_states([1], [0], {"a": 0}))
+    glue._pending_capture_results = {"a": {"c": object()}}
+
+    drained = glue.drain_pending_capture_results()
+
+    assert set(drained) == {"a"}
+    assert glue.drain_pending_capture_results() == {}  # buffer cleared
+
+
+class _CaptureCB:
+    """Fake manager that captures the finalize callback to fire it late."""
+
+    def __init__(self):
+        self.cb = None
+
+    def finalize_request_async(self, req_id, on_complete):
+        self.cb = on_complete
+
+
+def test_late_finalize_not_orphaned_by_drain():
+    # Regression for the capture_wait hang on v2: the finalize-thread callback
+    # must stash into the LIVE _pending_capture_results, not a reference
+    # captured at closure-creation time that an intervening drain has already
+    # swapped away.
+    glue = _Glue(_req_states([1], [0], {"r1": 0}))
+    mgr = _CaptureCB()
+    glue._capture_manager = mgr
+    glue._capture_index_to_name = {0: "filesystem"}
+
+    glue._finalize_capture_for_request_async("r1")
+    # An idle-loop drain swaps the buffer BEFORE the finalize thread fires.
+    assert glue.drain_pending_capture_results() == {}
+    # Finalize thread fires late (after writer fsync).
+    sentinel = object()
+    mgr.cb({0: sentinel})
+    # The next drain must surface it — not lose it in an orphaned dict.
+    assert glue.drain_pending_capture_results() == {"r1": {"filesystem": sentinel}}
+
+
 # ---- re-add / preemption-resume admission ---------------------------------
 
 
