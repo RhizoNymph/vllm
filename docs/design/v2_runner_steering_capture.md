@@ -197,7 +197,7 @@ Additional GPU coverage:
   output (no config leak). Capture under preemption: 72 preemption events, all
   24/24 capturing requests still delivered — preempted capturing requests resume
   and capture cleanly (no lost/double captures).
-- **Steering hook points**: pre_attn and post_mlp both shift/clear correctly
+- **Steering hook points**: pre_attn and post_block both shift/clear correctly
   (post_attn was already covered); the prefill-only tier
   (`prefill_steering_vectors`) steers.
 - **Capture positions**: `all` (prompt+generated rows) and an explicit index

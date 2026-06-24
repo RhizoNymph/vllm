@@ -36,7 +36,7 @@ class SteeringHookPoint(str, Enum):
     POST_ATTN = "post_attn"
     """Steer the residual skip tensor in the post-attention region."""
 
-    POST_MLP = "post_mlp"
+    POST_BLOCK = "post_block"
     """Steer the residual skip tensor in the post-MLP region."""
 
 
@@ -44,7 +44,7 @@ class SteeringHookPoint(str, Enum):
 HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "steering_table_pre_attn",
     SteeringHookPoint.POST_ATTN: "steering_table_post_attn",
-    SteeringHookPoint.POST_MLP: "steering_table_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "steering_table_post_block",
 }
 
 # Per-hook ``any-active`` flag attribute names. The flag is a single-element
@@ -59,7 +59,7 @@ HOOK_POINT_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
 # Valid hook point string values for validation.
 VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHookPoint)
 
-DEFAULT_HOOK_POINT = SteeringHookPoint.POST_MLP
+DEFAULT_HOOK_POINT = SteeringHookPoint.POST_BLOCK
 
 
 def register_steering_buffers(

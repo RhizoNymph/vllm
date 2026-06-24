@@ -129,7 +129,7 @@ class TestChatCompletionSteering:
         with pytest.raises(ValidationError):
             _make_chat(
                 steering_vectors={
-                    "post_mlp": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
+                    "post_block": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
                 }
             )
 
@@ -160,11 +160,11 @@ class TestChatCompletionSteering:
 
     def test_per_row_scales_applied_at_unpack(self):
         packed = {
-            "post_mlp": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
+            "post_block": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
         }
         req = _make_chat(steering_vectors=packed)
         sp = req.to_sampling_params(max_tokens=100, default_sampling_params={})
-        assert sp.steering_vectors["post_mlp"][10].tolist() == pytest.approx(
+        assert sp.steering_vectors["post_block"][10].tolist() == pytest.approx(
             [2.0] * _HIDDEN
         )
 
@@ -213,7 +213,7 @@ class TestCompletionSteering:
         with pytest.raises(ValidationError):
             _make_completion(
                 steering_vectors={
-                    "post_mlp": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
+                    "post_block": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
                 }
             )
 
@@ -243,11 +243,11 @@ class TestCompletionSteering:
 
     def test_per_row_scales_applied_at_unpack(self):
         packed = {
-            "post_mlp": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
+            "post_block": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
         }
         req = _make_completion(steering_vectors=packed)
         sp = req.to_sampling_params(max_tokens=100)
-        assert sp.steering_vectors["post_mlp"][10].tolist() == pytest.approx(
+        assert sp.steering_vectors["post_block"][10].tolist() == pytest.approx(
             [2.0] * _HIDDEN
         )
 

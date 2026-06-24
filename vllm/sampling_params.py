@@ -417,7 +417,7 @@ class SamplingParams(
 
     steering_vectors: SteeringVectorSpec | None = None
     """Base steering vectors applied to both prefill and decode phases.
-    Keyed by hook point name (pre_attn, post_attn, post_mlp), then
+    Keyed by hook point name (pre_attn, post_attn, post_block), then
     layer index. Values are either bare
     ``list[float]`` (scale=1.0) or ``{"vector": [...], "scale": float}``."""
 

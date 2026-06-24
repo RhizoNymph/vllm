@@ -319,15 +319,15 @@ mod tests {
     fn loads_inline_module_with_string_layer_keys() {
         let file = write_temp(
             r#"{
-                "vectors": {"post_mlp": {"14": [0.1, 0.2, 0.3]}},
+                "vectors": {"post_block": {"14": [0.1, 0.2, 0.3]}},
                 "decode_vectors": {"pre_attn": {"3": {"vector": [1.0, 2.0], "scale": 0.5}}}
             }"#,
         );
         let module = load_steering_module(file.path().to_str().unwrap()).expect("load");
 
         let base = module.vectors.expect("vectors");
-        assert_eq!(base["post_mlp"][&14].vector, vec![0.1, 0.2, 0.3]);
-        assert_eq!(base["post_mlp"][&14].scale, 1.0);
+        assert_eq!(base["post_block"][&14].vector, vec![0.1, 0.2, 0.3]);
+        assert_eq!(base["post_block"][&14].scale, 1.0);
         assert!(module.prefill_vectors.is_none());
         let decode = module.decode_vectors.expect("decode");
         assert_eq!(decode["pre_attn"][&3].vector, vec![1.0, 2.0]);
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn non_integer_layer_key_is_rejected() {
-        let file = write_temp(r#"{"vectors": {"post_mlp": {"oops": [0.1]}}}"#);
+        let file = write_temp(r#"{"vectors": {"post_block": {"oops": [0.1]}}}"#);
         assert!(matches!(
             load_steering_module(file.path().to_str().unwrap()),
             Err(SteeringModuleLoadError::Tier { .. })

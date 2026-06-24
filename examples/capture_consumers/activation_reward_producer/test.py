@@ -63,7 +63,7 @@ def test_payload_shape_and_lifecycle(tmp: Path) -> None:
         _mock_config(),
         {
             "layer": 12,
-            "hook": "post_mlp",
+            "hook": "post_block",
             "vector_path": str(vec_path),
             "position_slice": {"start": 2, "end": None, "stride": 1},
             "scale": 5.0,
@@ -73,11 +73,11 @@ def test_payload_shape_and_lifecycle(tmp: Path) -> None:
 
     # Validator returns the pinned spec.
     spec = producer.validate_client_spec({}, _ctx())
-    assert spec.hooks == {"post_mlp": [12]}
+    assert spec.hooks == {"post_block": [12]}
     assert spec.positions == "all_generated"
 
     # Two chunks across two steps; total 6 rows; slice starts at 2.
-    key = (VllmInternalRequestId("req-1"), 12, "post_mlp")
+    key = (VllmInternalRequestId("req-1"), 12, "post_block")
     chunk_a = CaptureChunk(
         key=key,
         tensor=torch.randn(3, HIDDEN),
@@ -127,12 +127,12 @@ def test_empty_window_payload(tmp: Path) -> None:
         _mock_config(),
         {
             "layer": 0,
-            "hook": "post_mlp",
+            "hook": "post_block",
             "vector_path": str(vec_path),
             "position_slice": {"start": 100, "end": None, "stride": 1},
         },
     )
-    key = (VllmInternalRequestId("short"), 0, "post_mlp")
+    key = (VllmInternalRequestId("short"), 0, "post_block")
     producer.submit_chunk(
         CaptureChunk(
             key=key,
@@ -156,9 +156,9 @@ def test_no_chunks_partial_error(tmp: Path) -> None:
 
     producer = ActivationRewardProducer(
         _mock_config(),
-        {"layer": 0, "hook": "post_mlp", "vector_path": str(vec_path)},
+        {"layer": 0, "hook": "post_block", "vector_path": str(vec_path)},
     )
-    key = (VllmInternalRequestId("ghost"), 0, "post_mlp")
+    key = (VllmInternalRequestId("ghost"), 0, "post_block")
     producer.submit_finalize(CaptureFinalize(key=key))
     result = producer.get_result(key)
     assert result.status == "partial_error"
@@ -172,7 +172,7 @@ def test_non_empty_client_spec_rejected(tmp: Path) -> None:
 
     producer = ActivationRewardProducer(
         _mock_config(),
-        {"layer": 0, "hook": "post_mlp", "vector_path": str(vec_path)},
+        {"layer": 0, "hook": "post_block", "vector_path": str(vec_path)},
     )
     try:
         producer.validate_client_spec({"layer": 99}, _ctx())
@@ -189,7 +189,7 @@ def test_tp_pp_rejected(tmp: Path) -> None:
 
     producer = ActivationRewardProducer(
         _mock_config(),
-        {"layer": 0, "hook": "post_mlp", "vector_path": str(vec_path)},
+        {"layer": 0, "hook": "post_block", "vector_path": str(vec_path)},
     )
     try:
         producer.validate_client_spec({}, _ctx(tp=2))
@@ -207,7 +207,7 @@ def test_bad_layer_rejected(tmp: Path) -> None:
     try:
         ActivationRewardProducer(
             _mock_config(),
-            {"layer": NUM_LAYERS + 5, "hook": "post_mlp", "vector_path": str(vec_path)},
+            {"layer": NUM_LAYERS + 5, "hook": "post_block", "vector_path": str(vec_path)},
         )
     except ValueError as e:
         assert "out of range" in str(e)
@@ -223,7 +223,7 @@ def test_vector_hidden_size_mismatch(tmp: Path) -> None:
     try:
         ActivationRewardProducer(
             _mock_config(),
-            {"layer": 0, "hook": "post_mlp", "vector_path": str(vec_path)},
+            {"layer": 0, "hook": "post_block", "vector_path": str(vec_path)},
         )
     except ValueError as e:
         assert "hidden_size" in str(e)

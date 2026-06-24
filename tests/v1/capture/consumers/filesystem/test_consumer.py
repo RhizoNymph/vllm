@@ -408,12 +408,12 @@ class TestValidateClientSpec:
             raw = FilesystemCaptureRequest(
                 request_id="par-req",
                 tag="par-tag",
-                hooks={"post_mlp": [0, 1, 2]},
+                hooks={"post_block": [0, 1, 2]},
                 positions="last_prompt",
             )
             spec = consumer.validate_client_spec(raw, ctx)
             assert isinstance(spec, CaptureSpec)
-            assert spec.hooks["post_mlp"] == [0, 1, 2]
+            assert spec.hooks["post_block"] == [0, 1, 2]
         finally:
             consumer.shutdown(timeout=5.0)
 
@@ -432,7 +432,7 @@ class TestValidateClientSpec:
             raw = FilesystemCaptureRequest(
                 request_id="pp-accepts",
                 tag="pp-accepts",
-                hooks={"post_mlp": [0, 1]},
+                hooks={"post_block": [0, 1]},
                 positions="last_prompt",
                 layout=layout,
             )
@@ -525,7 +525,7 @@ class TestGetResultLifecycle:
         consumer = _make_consumer(tmp_path)
         try:
             request_id = VllmInternalRequestId("result-test")
-            key: CaptureKey = (request_id, 1, "post_mlp")
+            key: CaptureKey = (request_id, 1, "post_block")
 
             tensor = torch.randn(1, 4, dtype=torch.float32)
             consumer.submit_chunk(
@@ -568,7 +568,7 @@ class TestWaitForResult:
         consumer = _make_consumer(tmp_path)
         try:
             request_id = VllmInternalRequestId("wait-ok")
-            key: CaptureKey = (request_id, 2, "post_mlp")
+            key: CaptureKey = (request_id, 2, "post_block")
 
             tensor = torch.randn(1, 4, dtype=torch.float32)
             consumer.submit_chunk(

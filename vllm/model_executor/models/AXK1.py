@@ -710,7 +710,7 @@ class AXK1DecoderLayer(nn.Module):
             # The scaling of AXK1MOE output would be done in the forward
             # of AXK1MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
 
         return hidden_states, residual
 

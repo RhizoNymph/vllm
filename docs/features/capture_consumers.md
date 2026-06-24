@@ -290,7 +290,7 @@ llm = LLM(
     model="meta-llama/Llama-3-8B",
     capture_consumers=[
         {"name": "filesystem", "params": {"root": "/tmp/captures"}},
-        {"name": "logging", "params": {"hooks": {"post_mlp": [0]}}},
+        {"name": "logging", "params": {"hooks": {"post_block": [0]}}},
     ],
 )
 ```
@@ -323,7 +323,7 @@ sampling_params = SamplingParams(
         "filesystem": FilesystemCaptureRequest(
             request_id="probe_0001",
             tag="mnist-probe-v1",
-            hooks={"post_mlp": [12]},
+            hooks={"post_block": [12]},
             positions="last_prompt",
         ),
     },
@@ -355,7 +355,7 @@ response = httpx.post(
                 "filesystem": {
                     "request_id": "probe_train_0001",
                     "tag": "capital-probe",
-                    "hooks": {"post_mlp": [12, 16, 20, 24]},
+                    "hooks": {"post_block": [12, 16, 20, 24]},
                     "positions": "last_prompt",
                     "layout": "packed",
                 },
@@ -392,7 +392,7 @@ sampling_params = SamplingParams(
         "filesystem": FilesystemCaptureRequest(
             request_id="req1",
             tag="demo",
-            hooks={"post_mlp": [0]},
+            hooks={"post_block": [0]},
             positions="last_prompt",
         ),
     },
@@ -428,7 +428,7 @@ response body as `capture_results`, mirroring the structure above.
 ## Parallelism
 
 Capturing the residual-stream hooks (`pre_attn`, `post_attn`,
-`post_mlp`) is supported under **tensor, pipeline, expert, and data
+`post_block`) is supported under **tensor, pipeline, expert, and data
 parallelism** for worker-location consumers — including the built-in
 `filesystem` consumer. How it works:
 

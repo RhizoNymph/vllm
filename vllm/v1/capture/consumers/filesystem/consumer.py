@@ -304,8 +304,8 @@ class FilesystemConsumer:
 
         Accepts a list of ``layer:hook`` shorthands or a single
         ``';'``-separated string (``,`` already separates CLI params), e.g.
-        ``filesystem:root=/x,graphsafe_keys=12:post_mlp;20:post_mlp`` or
-        ``{"graphsafe_keys": ["all:post_mlp"]}``. These per-request taps then
+        ``filesystem:root=/x,graphsafe_keys=12:post_block;20:post_block`` or
+        ``{"graphsafe_keys": ["all:post_block"]}``. These per-request taps then
         run graph-safe without a separate ``--capture-graphsafe-key`` flag.
         """
         raw = params.get("graphsafe_keys")

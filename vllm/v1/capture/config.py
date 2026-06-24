@@ -171,7 +171,7 @@ def parse_consumer_spec(shorthand: str) -> CaptureConsumerSpec:
 
 
 _VALID_HOOK_NAMES = frozenset(
-    {"pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"}
+    {"pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out"}
 )
 
 
@@ -185,7 +185,7 @@ def parse_graphsafe_key(shorthand: str) -> tuple[int, str]:
     if ":" not in text:
         raise ValueError(
             f"graph-safe capture key {shorthand!r} must be 'layer:hook' "
-            f"(e.g. '12:post_mlp')"
+            f"(e.g. '12:post_block')"
         )
     layer_str, hook = text.split(":", 1)
     hook = hook.strip()
@@ -211,7 +211,7 @@ def parse_graphsafe_key(shorthand: str) -> tuple[int, str]:
 # taps that are actually wired; ``mlp_in``/``mlp_out`` are valid to name
 # explicitly but excluded here so ``:all`` never reserves buffers for taps
 # that never fire.
-_GRAPHSAFE_ALL_HOOKS: tuple[str, ...] = ("pre_attn", "post_attn", "post_mlp")
+_GRAPHSAFE_ALL_HOOKS: tuple[str, ...] = ("pre_attn", "post_attn", "post_block")
 
 
 def expand_graphsafe_keys(
@@ -223,12 +223,12 @@ def expand_graphsafe_keys(
 
     - ``"L:hook"``   — a single ``(L, hook)`` key.
     - ``"L:all"``    — every standard hook (``pre_attn``/``post_attn``/
-      ``post_mlp``) at layer ``L``.
+      ``post_block``) at layer ``L``.
     - ``"all:hook"`` — ``hook`` on every layer in ``[0, num_layers)``.
     - ``"all:all"``  — every standard hook on every layer.
 
     The result is sorted and de-duplicated, so overlapping shorthands (e.g.
-    ``"5:post_mlp"`` and ``"5:all"``) collapse cleanly.
+    ``"5:post_block"`` and ``"5:all"``) collapse cleanly.
 
     Args:
         shorthands: Raw ``layer:hook`` strings (``layer``/``hook`` may be
@@ -245,7 +245,7 @@ def expand_graphsafe_keys(
         if ":" not in text:
             raise ValueError(
                 f"graph-safe capture key {shorthand!r} must be 'layer:hook' "
-                f"(e.g. '12:post_mlp', '12:all', 'all:post_mlp', 'all:all')"
+                f"(e.g. '12:post_block', '12:all', 'all:post_block', 'all:all')"
             )
         layer_str, hook_str = (part.strip() for part in text.split(":", 1))
 

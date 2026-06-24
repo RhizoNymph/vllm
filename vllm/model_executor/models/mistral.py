@@ -206,7 +206,7 @@ class MistralDecoderLayer(LlamaDecoderLayer):
             hidden_states = hidden_states * (1 + self.ada_rms_norm_t_cond(t_cond))
 
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
         return hidden_states, residual
 
 

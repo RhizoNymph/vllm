@@ -267,7 +267,7 @@ class InternLMDecoderLayer(nn.Module):
         hidden_states, residual = self.ffn_norm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.feed_forward(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
         return hidden_states, residual
 
 

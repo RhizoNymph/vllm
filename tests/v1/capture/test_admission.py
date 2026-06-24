@@ -35,7 +35,7 @@ class _PromptConsumer(CaptureConsumer):
         pass
 
     def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
-        return CaptureSpec(hooks={"post_mlp": [0, 1]}, positions="last_prompt")
+        return CaptureSpec(hooks={"post_block": [0, 1]}, positions="last_prompt")
 
     def on_capture(self, key, tensor, sidecar):  # pragma: no cover - unused
         pass
@@ -50,7 +50,7 @@ class _GeneratedConsumer(CaptureConsumer):
         pass
 
     def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
-        return CaptureSpec(hooks={"post_mlp": [0]}, positions="all_generated")
+        return CaptureSpec(hooks={"post_block": [0]}, positions="all_generated")
 
     def on_capture(self, key, tensor, sidecar):  # pragma: no cover - unused
         pass
@@ -106,7 +106,7 @@ class TestResolveCapturePrefixFlags:
         assert sp.capture_touches_prompt is True
         assert sp.capture_min_prompt_position == 7
         # Store serve-set: union of (hook, layer) and prompt positions.
-        assert sp.capture_store_hook_layers == [("post_mlp", 0), ("post_mlp", 1)]
+        assert sp.capture_store_hook_layers == [("post_block", 0), ("post_block", 1)]
         assert sp.capture_store_positions == [7]
 
     def test_floor_is_min_across_consumers(self) -> None:
@@ -119,7 +119,7 @@ class TestResolveCapturePrefixFlags:
                 pass
 
             def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
-                return CaptureSpec(hooks={"post_mlp": [0]}, positions="all_prompt")
+                return CaptureSpec(hooks={"post_block": [0]}, positions="all_prompt")
 
             def on_capture(self, key, tensor, sidecar):  # pragma: no cover
                 pass
