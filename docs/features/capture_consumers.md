@@ -196,12 +196,16 @@ On a **network filesystem the flush tail can dominate** this delay, but the
 governing cost is **metadata-RPC count, not `fsync`**: each `per_file` capture
 incurs create/open/close (and, with `atomic_publish`, rename) round-trips to
 the file server, and that per-small-file rate — not crash-durability syncing —
-is the ceiling. Measurements on one NFS deployment landed around ~90 small
-files/s (~30 MB/s at ~350 KB/file); large contiguous writes, by contrast,
-reach ~93% of the raw disk bound. This is why the `fsync`/`atomic_publish`
-toggles are near-no-ops there while the **`packed`/`sharded`** layouts (which
-collapse the metadata-RPC count per request) are the real lever — and why a
-post-batch reader should size its wait to the file count, not the byte volume.
+is the ceiling. In our benchmarks (driving the writer directly against an NFS
+export over a 20 GbE bond), ~120 KB files moved at ~29 MB/s and ran at the
+**same rate over 1 GbE and the bond** — proof the fabric is irrelevant once
+you're metadata-bound — whereas 64 MB contiguous writes reached ~371 MB/s,
+~93% of the ~398 MB/s raw disk bound. This is why the `fsync`/`atomic_publish`
+toggles are near-no-ops there while the **`packed`/`sharded`** layouts are the
+real lever: for the same small-capture workload, `per_file` ~26 MB/s →
+`packed` (one file per request) ~118 MB/s → `sharded` (many requests per file)
+~93% of the disk bound. A post-batch reader should size its wait to the file
+count, not the byte volume.
 
 #### Backpressure & overload
 
