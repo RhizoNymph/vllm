@@ -684,19 +684,19 @@ class TestGlobalCaptureSpec:
     def test_returns_configured_spec(self, tmp_path: pathlib.Path) -> None:
         consumer = _make_consumer(
             tmp_path,
-            global_hooks={"post_mlp": [0, 2]},
+            global_hooks={"post_block": [0, 2]},
             global_positions="all_generated",
         )
         try:
             spec = consumer.global_capture_spec()
             assert spec is not None
-            assert spec.hooks == {"post_mlp": [0, 2]}
+            assert spec.hooks == {"post_block": [0, 2]}
             assert spec.positions == "all_generated"
         finally:
             consumer.shutdown(timeout=5.0)
 
     def test_default_positions_all_prompt(self, tmp_path: pathlib.Path) -> None:
-        consumer = _make_consumer(tmp_path, global_hooks={"post_mlp": [1]})
+        consumer = _make_consumer(tmp_path, global_hooks={"post_block": [1]})
         try:
             spec = consumer.global_capture_spec()
             assert spec is not None
@@ -738,26 +738,33 @@ class TestGlobalCaptureSpec:
         with pytest.raises(ValueError, match="not a valid hook point"):
             _make_consumer(tmp_path, global_hooks={"bogus": [0]})
 
+    def test_renamed_hook_old_name_rejected(self, tmp_path: pathlib.Path) -> None:
+        # ``post_mlp`` was renamed to ``post_block``; the global validator
+        # must reject the old name (it previously accepted it, silently
+        # capturing nothing since no model fires ``post_mlp``).
+        with pytest.raises(ValueError, match="not a valid hook point"):
+            _make_consumer(tmp_path, global_hooks={"post_mlp": [0]})
+
     def test_non_dict_global_hooks_rejected(self, tmp_path: pathlib.Path) -> None:
         with pytest.raises(ValueError, match="must be a dict"):
             _make_consumer(tmp_path, global_hooks=[0, 1])
 
     def test_empty_layer_list_rejected(self, tmp_path: pathlib.Path) -> None:
         with pytest.raises(ValueError, match="resolved to no layers"):
-            _make_consumer(tmp_path, global_hooks={"post_mlp": []})
+            _make_consumer(tmp_path, global_hooks={"post_block": []})
 
     def test_negative_layer_rejected(self, tmp_path: pathlib.Path) -> None:
         with pytest.raises(ValueError, match="non-negative"):
-            _make_consumer(tmp_path, global_hooks={"post_mlp": [-1]})
+            _make_consumer(tmp_path, global_hooks={"post_block": [-1]})
 
     def test_non_int_layer_rejected(self, tmp_path: pathlib.Path) -> None:
         with pytest.raises(ValueError, match="must be ints"):
-            _make_consumer(tmp_path, global_hooks={"post_mlp": ["x"]})
+            _make_consumer(tmp_path, global_hooks={"post_block": ["x"]})
 
     def test_default_tag_configurable(self, tmp_path: pathlib.Path) -> None:
         consumer = _make_consumer(
             tmp_path,
-            global_hooks={"post_mlp": [0]},
+            global_hooks={"post_block": [0]},
             default_tag="run42",
         )
         try:
@@ -776,59 +783,59 @@ class TestGlobalCaptureSpec:
 
     def test_string_dsl_multiple_hooks(self, tmp_path: pathlib.Path) -> None:
         consumer = _make_consumer(
-            tmp_path, global_hooks="pre_attn:0-2;post_mlp:20"
+            tmp_path, global_hooks="pre_attn:0-2;post_block:20"
         )
         try:
             spec = consumer.global_capture_spec()
             assert spec is not None
-            assert spec.hooks == {"pre_attn": [0, 1, 2], "post_mlp": [20]}
+            assert spec.hooks == {"pre_attn": [0, 1, 2], "post_block": [20]}
         finally:
             consumer.shutdown(timeout=5.0)
 
     def test_string_dsl_all(self, tmp_path: pathlib.Path) -> None:
         # num_hidden_layers defaults to 32 in the fixture.
-        consumer = _make_consumer(tmp_path, global_hooks="post_mlp:all")
+        consumer = _make_consumer(tmp_path, global_hooks="post_block:all")
         try:
             spec = consumer.global_capture_spec()
             assert spec is not None
-            assert spec.hooks == {"post_mlp": list(range(32))}
+            assert spec.hooks == {"post_block": list(range(32))}
         finally:
             consumer.shutdown(timeout=5.0)
 
     def test_dict_value_range_string(self, tmp_path: pathlib.Path) -> None:
-        consumer = _make_consumer(tmp_path, global_hooks={"post_mlp": "0-3"})
+        consumer = _make_consumer(tmp_path, global_hooks={"post_block": "0-3"})
         try:
             spec = consumer.global_capture_spec()
             assert spec is not None
-            assert spec.hooks == {"post_mlp": [0, 1, 2, 3]}
+            assert spec.hooks == {"post_block": [0, 1, 2, 3]}
         finally:
             consumer.shutdown(timeout=5.0)
 
     def test_dict_value_dot_list_and_all(self, tmp_path: pathlib.Path) -> None:
         consumer = _make_consumer(
-            tmp_path, global_hooks={"post_mlp": "1.5.9", "pre_attn": "all"}
+            tmp_path, global_hooks={"post_block": "1.5.9", "pre_attn": "all"}
         )
         try:
             spec = consumer.global_capture_spec()
             assert spec is not None
-            assert spec.hooks["post_mlp"] == [1, 5, 9]
+            assert spec.hooks["post_block"] == [1, 5, 9]
             assert spec.hooks["pre_attn"] == list(range(32))
         finally:
             consumer.shutdown(timeout=5.0)
 
     def test_layer_out_of_range_rejected(self, tmp_path: pathlib.Path) -> None:
         with pytest.raises(ValueError, match="out of range"):
-            _make_consumer(tmp_path, global_hooks={"post_mlp": [99]})
+            _make_consumer(tmp_path, global_hooks={"post_block": [99]})
 
     def test_string_dsl_missing_colon_rejected(
         self, tmp_path: pathlib.Path
     ) -> None:
         with pytest.raises(ValueError, match="must be '<hook>:<layers>'"):
-            _make_consumer(tmp_path, global_hooks="post_mlp")
+            _make_consumer(tmp_path, global_hooks="post_block")
 
     def test_bad_layer_spec_string_rejected(self, tmp_path: pathlib.Path) -> None:
         with pytest.raises(ValueError, match="layer spec"):
-            _make_consumer(tmp_path, global_hooks={"post_mlp": "1,2,3"})
+            _make_consumer(tmp_path, global_hooks={"post_block": "1,2,3"})
 
 
 class TestClassVars:
