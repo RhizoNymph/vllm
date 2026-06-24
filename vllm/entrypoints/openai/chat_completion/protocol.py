@@ -486,6 +486,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "spec fails the consumer's admission validator."
         ),
     )
+    capture_wait: bool = Field(
+        default=False,
+        description=(
+            "When true (and `capture` is set), hold the response until this "
+            "request's capture results have finalized (files durable), then "
+            "report them in `capture_results`. Capture writes are otherwise "
+            "asynchronous and may land after the response."
+        ),
+    )
 
     # Per-request inline steering vectors in binary wire format.  Each entry
     # is ``{dtype, shape, layer_indices, data: base64, scales?}`` — see

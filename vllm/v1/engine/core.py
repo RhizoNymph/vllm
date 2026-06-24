@@ -1280,7 +1280,18 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                if block and self.vllm_config.capture_consumers_config is not None:
+                    # Capture finalize is asynchronous (writer threads); when
+                    # the engine is idle there is no ModelRunnerOutput to
+                    # carry late results to ``capture_wait`` clients. Wait
+                    # with a bounded timeout and drain/emit on each tick.
+                    try:
+                        req = self.input_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        self._emit_late_capture_results()
+                        continue
+                else:
+                    req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -1294,6 +1305,21 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+
+    def _emit_late_capture_results(self) -> None:
+        """Deliver capture results that finalized while the engine is idle."""
+        from vllm.v1.engine import EngineCoreOutputs
+
+        merged: dict = {}
+        for rank_results in self.model_executor.collective_rpc(
+            "drain_pending_capture_results"
+        ):
+            if rank_results:
+                merged.update(rank_results)
+        if merged:
+            self.output_queue.put_nowait(
+                (0, EngineCoreOutputs(late_capture_results=merged))
+            )
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
