@@ -60,7 +60,7 @@ Python API):
 | `timeout_seconds` | `float` | `180.0` | Per-write timeout; failures become `partial_error`. |
 | `on_collision` | `"overwrite" \| "error" \| "suffix"` | `"overwrite"` | What to do when the target `.bin` already exists. |
 | `fd_cache_size` | `int` | `256` | Per-thread LRU file-descriptor cache. |
-| `fsync` | `bool` | `True` | `fsync` each file before publish. `False` trades crash-durability for throughput. A no-op on Linux NFS exports (sync **and** async) — the per-small-file ceiling is metadata-RPC count (create/open/close/rename), **not** `fsync`; only a `COMMIT`-honoring NAS makes it bite. See [Durability vs. response timing](#durability-vs-response-timing). |
+| `fsync` | `bool` | `True` | `fsync` each file before publish. `False` trades crash-durability for throughput; the impact is storage-dependent — redundant on a Linux `sync` export, free on Linux `async` (both no-ops in our A/B), but a real per-file `COMMIT` cost on a NAS that buffers writes and honors `COMMIT` (the writer holds files open, so the publish-time `fsync` is the operative commit). File count is the universal lever; see [Durability vs. response timing](#durability-vs-response-timing). |
 | `atomic_publish` | `bool` | `True` | Publish via `.tmp` + atomic rename. `False` writes straight to the final path (drops two rename RPCs/file, loses atomic visibility; requires `on_collision="overwrite"`). |
 | `default_layout` | `"per_file" \| "packed" \| "sharded"` | `"per_file"` | Layout for requests that don't set their own `layout`. |
 | `coalesce_max_bytes` | `int` | `1<<20` | Merge consecutive same-key queued writes into one `writev` up to this size (`0` disables). Most effective for `packed`/`sharded`. |
@@ -169,9 +169,10 @@ ceiling. The right lever depends on whether you're disk-bound or code-bound:
   request, far fewer metadata round-trips than `per_file`); or **`sharded`**
   for the many-small-requests case (collapses commit count to ~`num_shards`).
   `coalesce_max_bytes` (default 1 MiB) merges per-step appends; larger rarely
-  helps. The `fsync` toggle is a no-op on Linux NFS exports (sync or async) —
-  file count is the lever, not crash-durability syncing (see [Durability vs.
-  response timing](#durability-vs-response-timing)).
+  helps. The `fsync` toggle only helps on storage that buffers writes and honors
+  `COMMIT` (e.g. a NAS); it's a no-op on Linux sync/async exports. File count is
+  the lever under every regime (see [Durability vs. response
+  timing](#durability-vs-response-timing)).
 - **Code-bound** (fast local NVMe / tmpfs, where the disk isn't the wall):
   the single dispatch/submit thread is the limit. Use `packed` (one
   `WriteTask` + one lock per request per step via the batched submit path)
@@ -194,32 +195,37 @@ request (`layers × hooks` files in `per_file` layout, one `packed.*` pair in
 and is indistinguishable from data loss. (Servers can instead have the request
 block until capture finalizes; see the `capture_wait` request flag.)
 
-On a **network filesystem the flush tail can dominate** this delay, but on
-every NFS export we measured the governing cost is **file count, not `fsync`**.
-Each `per_file` capture incurs create/open/close (and, with `atomic_publish`,
-rename) round-trips to the file server; that per-small-file metadata rate is the
-ceiling, and toggling the client's `fsync` does not move it. We A/B'd `fsync` on
-the same export over a 20 GbE bond in both server modes: on a **`sync`** export
-~28 MB/s with fsync vs ~26 without — fsync is redundant, the server commits each
-write before replying; on an **`async`** export ~204 vs ~198 MB/s — fsync is
-free, a Linux `async` export does not flush on `COMMIT`. The ~7× gap between the
-two modes is the **export's server-side commit mode**, not anything the client
-does. Tiny files also run at the same rate over 1 GbE and the bond (the ceiling
-is metadata-RPC *latency*, not bandwidth), while 64 MB contiguous writes reach
-~93% of the raw disk bound (~371 of ~398 MB/s) once the per-file overhead
-amortizes.
+On a **network filesystem the flush tail can dominate** this delay, and the
+underlying cost is **synchronous `COMMIT` round-trips to the file server**.
+Whether the `fsync` toggle is what *triggers* those commits depends on the
+server's write/`COMMIT` semantics interacting with the writer's FD cache: the
+writer keeps each request's `.bin.tmp` **open across decode steps** (a per-thread
+LRU FD cache), so the per-file `close` is deferred to finalize, where an `fsync`
+(if enabled) precedes the rename. Three regimes:
 
-The lever is therefore **file count**: for the same small-capture workload,
-`per_file` ~26 MB/s → `packed` (one file per request) ~120 MB/s → `sharded`
-(many requests per file) near the disk bound. A post-batch reader should size
-its wait to the file count, not the byte volume.
+- **Linux `sync` export** — the server commits each write before replying, so by
+  finalize the data is already durable and the `fsync` is **redundant**. A/B
+  (120 KB files, 8 threads, 20 GbE bond): ~28 MB/s with fsync vs ~26 without.
+- **Linux `async` export** — the server acks `COMMIT` without flushing, so
+  `fsync` is **free** (durability deferred to lazy server writeback). Same A/B:
+  ~204 vs ~198 MB/s. The ~7× jump over the `sync` export is the **server-side
+  commit mode**, not anything the client does.
+- **A NAS that buffers writes but honors `COMMIT`** — the held-open fd means the
+  publish-time `fsync` is the *operative* commit: a real synchronous per-file
+  round-trip (measured ~90 `per_file` captures/s on one deployment — a 100-request
+  × 36-layer run ~40 s to flush). Here `fsync=False` is a genuine throughput
+  lever, traded against crash-durability.
 
-> **Not measured here:** a NAS appliance that honors `COMMIT` synchronously —
-> unlike a Linux `async` export — can make `fsync` a real per-file cost
-> (buffered writes, flushed only on `COMMIT`). Even then the fix is the same:
-> fewer, larger files (`packed`/`sharded`) cut the `COMMIT` count along with the
-> metadata RPCs. Only the absolute `fsync` impact varies with how the server
-> treats `COMMIT`; the guidance — minimize file count — does not.
+So the **`fsync` impact is storage-dependent**, but the **file-count ceiling is
+universal**: each `per_file` capture costs create/open/close/rename RPCs whatever
+the commit policy, and that per-small-file rate dominates. Tiny files run at the
+same rate over 1 GbE and the bond (metadata-RPC *latency*-bound, not bandwidth),
+while 64 MB contiguous writes reach ~93% of the raw disk bound once the per-file
+overhead amortizes. The lever you control is **file count**: `per_file` ~26 MB/s
+→ `packed` (one file per request) ~120 MB/s → `sharded` (many requests per file)
+near the disk bound — and fewer files cut the `COMMIT` count under *every* regime
+above. A post-batch reader should size its wait to the file count, not the byte
+volume.
 
 #### Backpressure & overload
 
