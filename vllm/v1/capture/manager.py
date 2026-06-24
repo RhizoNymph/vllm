@@ -303,6 +303,7 @@ class CaptureManager:
         spill_dir: str | None = None,
         spill_max_bytes: int = 4 << 30,
         local_layer_range: tuple[int, int] | None = None,
+        graphsafe_keys: Sequence[tuple[int, str]] | None = None,
     ) -> None:
         if len(consumers) != len(consumer_specs):
             msg = (
@@ -371,6 +372,12 @@ class CaptureManager:
         # global specs fall through the dynamic ``index_select`` path like
         # client specs.  That keeps the eager-only behavior unchanged while
         # the runner gets the recorded full-residual copy.
+        # Per-request (client) specs that tap only graph-safe-allowlisted keys
+        # take the same persistent-buffer path as global specs (no force-eager).
+        # The allowlist is fixed at startup so its buffers and full-residual
+        # copies are baked into the CUDA graph at warmup — independent of which
+        # request, if any, currently taps them. Filtered to this stage's owned
+        # layers like the global candidate keys.
         start, end = self._local_layer_range
         candidate_keys: set[tuple[int, str]] = set()
         for spec in self._consumer_specs:
@@ -380,6 +387,12 @@ class CaptureManager:
                 for layer_idx in layers:
                     if start <= layer_idx < end:
                         candidate_keys.add((layer_idx, hook_name))
+
+        graphsafe_in_range: set[tuple[int, str]] = set()
+        for layer_idx, hook_name in graphsafe_keys or ():
+            if start <= layer_idx < end:
+                graphsafe_in_range.add((layer_idx, hook_name))
+        candidate_keys |= graphsafe_in_range
 
         self._global_buffers: dict[tuple[int, str], torch.Tensor] = {}
         if candidate_keys and max_num_tokens > 0:
@@ -414,7 +427,16 @@ class CaptureManager:
             )
         # Keys actually served by the buffer path. Empty unless buffers were
         # allocated, so :meth:`build_step_plan` routing and ``on_hook`` agree.
+        # Includes both global-spec keys and graph-safe-allowlisted keys: both
+        # are served by the persistent buffer post-forward.
         self._global_keys: frozenset[tuple[int, str]] = frozenset(self._global_buffers)
+        # Subset of buffered keys that came from the graph-safe per-request
+        # allowlist (may overlap with global-spec keys). Exposed so the
+        # rank-replicated step gate can decide which client specs avoid eager.
+        # Only populated when buffers were actually allocated.
+        self._graphsafe_keys: frozenset[tuple[int, str]] = frozenset(
+            graphsafe_in_range & set(self._global_buffers)
+        )
         # Active plan buffered between ``build_step_plan`` (called by the
         # runner pre-forward) and ``on_hook`` fires from inside the
         # compiled forward graph.  Cleared by ``consume_step_plan`` once
@@ -504,6 +526,18 @@ class CaptureManager:
     @property
     def num_consumers(self) -> int:
         return len(self._consumers)
+
+    @property
+    def graphsafe_keys(self) -> frozenset[tuple[int, str]]:
+        """``(layer, hook)`` keys served by the graph-safe per-request path.
+
+        These are the startup-allowlisted keys for which a persistent buffer
+        was allocated, so a per-request client spec tapping only these keys
+        avoids the force-eager gate. Empty when the allowlist is unset or
+        ``max_num_tokens`` was 0 (CPU tests). Layer indices are global
+        (model-wide), matching client-spec layer references.
+        """
+        return self._graphsafe_keys
 
     # ---------------------------------------------------------- registration
 
