@@ -330,10 +330,12 @@ class Gemma3DecoderLayer(nn.Module):
             hidden_states, residual
         )
         hidden_states = self.mlp(hidden_states)
+        # post_block must observe the true block output: residual + the *normed*
+        # MLP branch (= hidden_states[L+1]). Apply the post-FFN norm before the
+        # hook. Steering still rides ``residual`` so generation is unchanged.
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
 
         hidden_states, residual = apply_block_steering(self, hidden_states, residual)
-
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
 
         return hidden_states, residual
 
