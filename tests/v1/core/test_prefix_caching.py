@@ -431,7 +431,7 @@ def test_capture_serves_from_store_instead_of_reforwarding():
         sp.capture = {"c": {}}
         sp.capture_touches_prompt = True
         sp.capture_min_prompt_position = 0  # all_prompt -> C floor is 0
-        sp.capture_store_hook_layers = [("post_mlp", 1)]
+        sp.capture_store_hook_layers = [("post_block", 1)]
         sp.capture_store_positions = list(range(len(tokens)))
         req.skip_reading_prefix_cache = req.get_skip_reading_prefix_cache()
         return req
@@ -441,7 +441,7 @@ def test_capture_serves_from_store_instead_of_reforwarding():
     try:
         req1 = _capture_req("1")
         keys = [
-            activation_key(req1.block_hashes, block_size, p, 1, "post_mlp")
+            activation_key(req1.block_hashes, block_size, p, 1, "post_block")
             for p in range(len(tokens))
         ]
         for k in keys:
@@ -482,7 +482,7 @@ def test_reset_prefix_cache_invalidates_activation_store():
         hash_block_size=16,
     )
     store = ActivationStore(max_bytes=10_000)
-    store.put((b"b", 0, 1, "post_mlp"), torch.zeros(2, dtype=torch.float32))
+    store.put((b"b", 0, 1, "post_block"), torch.zeros(2, dtype=torch.float32))
     set_active_activation_store(store)
     try:
         assert len(store) == 1

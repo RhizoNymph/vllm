@@ -576,7 +576,7 @@ class GPUModelRunner(
             self._capture_step_gate = CaptureStepGate(graphsafe_keys=_gs_keys)
 
             # Capturer-rank gate. The replicated residual hooks
-            # (pre_attn/post_attn/post_mlp) read the residual stream after
+            # (pre_attn/post_attn/post_block) read the residual stream after
             # the tensor-parallel all-reduce / MoE combine, so it is
             # byte-identical across the tensor-parallel group within each
             # (data-parallel, pipeline) cell. Exactly one rank — TP rank 0

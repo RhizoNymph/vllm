@@ -217,7 +217,7 @@ class OPTDecoderLayer(nn.Module):
         hidden_states, _ = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:

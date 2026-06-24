@@ -52,7 +52,7 @@ def _drive(
     for r in range(num_requests):
         req = f"req_{r:04d}"
         steps = rng.randint(1, max_steps)
-        layer, hook = rng.randint(0, 5), "post_mlp"
+        layer, hook = rng.randint(0, 5), "post_block"
         d = root / req
         d.mkdir(parents=True, exist_ok=True)
         bp = d / f"{layer}_{hook}.bin"

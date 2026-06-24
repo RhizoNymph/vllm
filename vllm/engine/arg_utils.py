@@ -616,8 +616,8 @@ class EngineArgs:
     # (breaking only at the tapped op) instead of forcing the whole step eager.
     capture_piecewise_fallback: bool = False
     # Graph-safe per-request capture allowlist: repeatable ``layer:hook`` keys
-    # (e.g. --capture-graphsafe-key 12:post_mlp). ``layer`` and/or ``hook`` may
-    # be ``all`` (``12:all`` = every standard hook at layer 12; ``all:post_mlp``
+    # (e.g. --capture-graphsafe-key 12:post_block). ``layer`` and/or ``hook`` may
+    # be ``all`` (``12:all`` = every standard hook at layer 12; ``all:post_block``
     # = that hook on every layer; ``all:all`` = everything). A per-request
     # capture spec tapping only allowlisted keys runs at full cudagraph speed
     # via persistent buffers; tapping any other key falls back to forcing the
@@ -1431,9 +1431,9 @@ class EngineArgs:
             default=None,
             metavar="LAYER:HOOK",
             help="Allowlist a (layer, hook) for graph-safe per-request "
-            "capture (e.g. --capture-graphsafe-key 12:post_mlp). LAYER and/or "
+            "capture (e.g. --capture-graphsafe-key 12:post_block). LAYER and/or "
             "HOOK may be 'all': '12:all' = every standard hook at layer 12, "
-            "'all:post_mlp' = that hook on every layer, 'all:all' = everything. "
+            "'all:post_block' = that hook on every layer, 'all:all' = everything. "
             "A per-request capture spec tapping only allowlisted keys runs at "
             "full cudagraph speed via a persistent buffer instead of forcing "
             "the step eager; tapping any non-allowlisted key still forces "

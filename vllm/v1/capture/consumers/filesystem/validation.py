@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 # so admission rejects them until they are wired; re-add here once
 # implemented.
 _VALID_HOOK_NAMES: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_mlp")
+    ("pre_attn", "post_attn", "post_block")
 )
 
 _VALID_POSITION_KINDS: frozenset[str] = frozenset(
@@ -375,7 +375,7 @@ def validate_filesystem_request(
     _structural_validate(raw)
 
     # 2. Parallelism. The residual hooks captured today (pre_attn /
-    # post_attn / post_mlp) read the residual stream after the
+    # post_attn / post_block) read the residual stream after the
     # tensor-parallel all-reduce / MoE combine, so it is replicated and
     # full-width across the TP and EP planes; data parallelism partitions
     # requests across independent engine cores. All four axes are

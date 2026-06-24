@@ -839,7 +839,7 @@ class OlmoHybridDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states
             hidden_states = apply_layer_steering(
-                self, hidden_states, SteeringHookPoint.POST_MLP
+                self, hidden_states, SteeringHookPoint.POST_BLOCK
             )
         else:
             residual = hidden_states
@@ -856,7 +856,7 @@ class OlmoHybridDecoderLayer(nn.Module):
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = residual + hidden_states
             hidden_states = apply_layer_steering(
-                self, hidden_states, SteeringHookPoint.POST_MLP
+                self, hidden_states, SteeringHookPoint.POST_BLOCK
             )
         return hidden_states
 

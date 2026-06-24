@@ -998,7 +998,7 @@ class OpenPanguDecoderLayer(nn.Module):
 
         if self.sandwich_norm:
             hidden_states = self.post_mlp_layernorm(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
 
         return hidden_states, residual
 

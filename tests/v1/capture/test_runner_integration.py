@@ -113,7 +113,7 @@ def test_filesystem_consumer_end_to_end_via_manager(tmp_path: pathlib.Path) -> N
     # ``_register_capture_request`` resolves via
     # ``validate_client_spec``.
     client_spec = CaptureSpec(
-        hooks={"post_mlp": [1]},
+        hooks={"post_block": [1]},
         positions="last_prompt",
     )
 
@@ -139,10 +139,10 @@ def test_filesystem_consumer_end_to_end_via_manager(tmp_path: pathlib.Path) -> N
     )
     plan = mgr.build_step_plan(batch_view)
 
-    # Simulate ``on_hook`` firing: for the single (layer=1, hook=post_mlp)
+    # Simulate ``on_hook`` firing: for the single (layer=1, hook=post_block)
     # key, populate the scratch with a known tensor.
     hidden = torch.arange(24, dtype=torch.float32).reshape(3, 8)
-    mgr.on_hook(1, "post_mlp", hidden)
+    mgr.on_hook(1, "post_block", hidden)
 
     # Drain.
     mgr.dispatch_step_captures(plan)
@@ -151,11 +151,11 @@ def test_filesystem_consumer_end_to_end_via_manager(tmp_path: pathlib.Path) -> N
     assert list(results.keys()) == [0]
 
     # Wait for the writer pool to flush.
-    _wait_for_status(consumer, (req_id, 1, "post_mlp"))
+    _wait_for_status(consumer, (req_id, 1, "post_block"))
     consumer.shutdown()
 
     # Verify the expected file exists under the consumer's layout.
-    bin_path = tmp_path / "default" / req_id / "1_post_mlp.bin"
+    bin_path = tmp_path / "default" / req_id / "1_post_block.bin"
     sidecar_path = bin_path.with_suffix(".json")
     assert bin_path.exists(), f"missing bin file {bin_path}"
     assert sidecar_path.exists(), f"missing sidecar {sidecar_path}"
@@ -164,7 +164,7 @@ def test_filesystem_consumer_end_to_end_via_manager(tmp_path: pathlib.Path) -> N
     sidecar = json.loads(sidecar_path.read_text())
     assert sidecar["request_id"] == req_id
     assert sidecar["layer"] == 1
-    assert sidecar["hook"] == "post_mlp"
+    assert sidecar["hook"] == "post_block"
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +332,7 @@ def test_manager_admission_error_yields_error_result() -> None:
 
     mgr = CaptureManager(
         consumers=(sink,),
-        consumer_specs=(CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt"),),
+        consumer_specs=(CaptureSpec(hooks={"post_block": [0]}, positions="last_prompt"),),
         num_hidden_layers=2,
         hidden_size=4,
         model_dtype=torch.float32,
@@ -386,7 +386,7 @@ def test_filesystem_consumer_byte_for_byte_matches_writer(
     )
 
     tensor = torch.arange(16, dtype=torch.float32).reshape(2, 8)
-    key = (VllmInternalRequestId("req-gold"), 3, "post_mlp")
+    key = (VllmInternalRequestId("req-gold"), 3, "post_block")
 
     consumer.submit_chunk(
         CaptureChunk(
@@ -409,10 +409,10 @@ def test_filesystem_consumer_byte_for_byte_matches_writer(
             },
         )
     )
-    _wait_for_status(consumer, ("req-gold", 3, "post_mlp"))
+    _wait_for_status(consumer, ("req-gold", 3, "post_block"))
     consumer.shutdown()
 
-    consumer_bin = consumer_root / "gold" / "req-gold" / "3_post_mlp.bin"
+    consumer_bin = consumer_root / "gold" / "req-gold" / "3_post_block.bin"
     assert consumer_bin.exists()
     consumer_bytes = consumer_bin.read_bytes()
 
@@ -421,14 +421,14 @@ def test_filesystem_consumer_byte_for_byte_matches_writer(
     writer_root.mkdir()
     writer = ActivationWriter(writer_root, num_threads=1)
     try:
-        writer_bin = writer_root / "gold" / "req-gold" / "3_post_mlp.bin"
+        writer_bin = writer_root / "gold" / "req-gold" / "3_post_block.bin"
         writer_bin.parent.mkdir(parents=True, exist_ok=True)
         writer.submit(
             WriteTask(
                 path=writer_bin,
                 payload=bytes(tensor.numpy().tobytes()),
                 append=True,
-                key=("req-gold", 3, "post_mlp"),
+                key=("req-gold", 3, "post_block"),
             )
         )
         writer.submit(
@@ -441,14 +441,14 @@ def test_filesystem_consumer_byte_for_byte_matches_writer(
                     "shape": [2, 8],
                     "dtype": "float32",
                 },
-                key=("req-gold", 3, "post_mlp"),
+                key=("req-gold", 3, "post_block"),
             )
         )
 
         # Spin until writer finalizes.
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            result = writer.get_result(("req-gold", 3, "post_mlp"))
+            result = writer.get_result(("req-gold", 3, "post_block"))
             if result is not None and result.status in ("ok", "error"):
                 break
             time.sleep(0.005)
@@ -552,14 +552,14 @@ def test_pipeline_parallel_two_stage_shared_fs(tmp_path: pathlib.Path) -> None:
     its ``CaptureManager`` is built with the *global* layer count and the
     stage's *local* ``[start, end)`` slice, and both write to the same
     root (the shared mount). A client spec spanning both stages
-    (``post_mlp`` at layers 1 and 3 of a 4-layer model) must land exactly
+    (``post_block`` at layers 1 and 3 of a 4-layer model) must land exactly
     one file per layer under its global-layer path, with each stage
     writing only the layers it owns — the Option-A merge the engine then
     unions at the result level.
     """
     GLOBAL = 4
     req_id = "req-pp"
-    client_spec = CaptureSpec(hooks={"post_mlp": [1, 3]}, positions="last_prompt")
+    client_spec = CaptureSpec(hooks={"post_block": [1, 3]}, positions="last_prompt")
 
     def _drive_stage(local_range: tuple[int, int], owned_layer: int) -> None:
         consumer = FilesystemConsumer(
@@ -594,15 +594,15 @@ def test_pipeline_parallel_two_stage_shared_fs(tmp_path: pathlib.Path) -> None:
         )
         plan = mgr.build_step_plan(batch_view)
         # Only this stage's owned layer is planned.
-        assert set(plan.gather_indices) == {(owned_layer, "post_mlp")}
+        assert set(plan.gather_indices) == {(owned_layer, "post_block")}
 
         hidden = torch.arange(24, dtype=torch.float32).reshape(3, 8)
         # Firing the other stage's layer is a no-op on this manager.
-        mgr.on_hook(owned_layer, "post_mlp", hidden)
+        mgr.on_hook(owned_layer, "post_block", hidden)
         mgr.dispatch_step_captures(plan)
         results = mgr.finalize_request(req_id)
         assert list(results.keys()) == [0]
-        _wait_for_status(consumer, (req_id, owned_layer, "post_mlp"))
+        _wait_for_status(consumer, (req_id, owned_layer, "post_block"))
         consumer.shutdown()
 
     # Stage 0 owns global layers [0, 2) → captures layer 1.
@@ -613,4 +613,4 @@ def test_pipeline_parallel_two_stage_shared_fs(tmp_path: pathlib.Path) -> None:
     req_dir = tmp_path / "default" / req_id
     written = sorted(p.name for p in req_dir.glob("*.bin"))
     # Exactly one file per requested layer, keyed by the GLOBAL layer index.
-    assert written == ["1_post_mlp.bin", "3_post_mlp.bin"]
+    assert written == ["1_post_block.bin", "3_post_block.bin"]

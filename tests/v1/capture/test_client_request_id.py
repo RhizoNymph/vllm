@@ -199,7 +199,7 @@ def test_filesystem_json_includes_client_request_id(tmp_path: pathlib.Path) -> N
 
     mgr.register_request(
         internal_id,
-        client_specs={0: CaptureSpec(hooks={"post_mlp": [1]}, positions="last_prompt")},
+        client_specs={0: CaptureSpec(hooks={"post_block": [1]}, positions="last_prompt")},
         num_prompt_tokens=3,
         sidecar_fields=sidecar_fields,
     )
@@ -212,15 +212,15 @@ def test_filesystem_json_includes_client_request_id(tmp_path: pathlib.Path) -> N
         token_offsets=[0],
     )
     plan = mgr.build_step_plan(batch_view)
-    mgr.on_hook(1, "post_mlp", torch.arange(24, dtype=torch.float32).reshape(3, 8))
+    mgr.on_hook(1, "post_block", torch.arange(24, dtype=torch.float32).reshape(3, 8))
     mgr.dispatch_step_captures(plan)
     mgr.finalize_request(internal_id)
 
-    _wait_for_status(consumer, (internal_id, 1, "post_mlp"))
+    _wait_for_status(consumer, (internal_id, 1, "post_block"))
     consumer.shutdown()
 
     # Directory naming is unchanged (keyed by request_id_slug == internal id).
-    sidecar_path = tmp_path / "default" / internal_id / "1_post_mlp.json"
+    sidecar_path = tmp_path / "default" / internal_id / "1_post_block.json"
     assert sidecar_path.exists(), f"missing sidecar {sidecar_path}"
     sidecar = json.loads(sidecar_path.read_text())
     assert sidecar["client_request_id"] == client_id

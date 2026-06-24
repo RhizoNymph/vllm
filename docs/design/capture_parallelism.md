@@ -18,7 +18,7 @@ guide see [Capture Consumers](../features/capture_consumers.md).
 ## TL;DR
 
 - **The capturable hooks are replicated.** The three hooks that fire
-  today — `pre_attn`, `post_attn`, `post_mlp` — read the residual
+  today — `pre_attn`, `post_attn`, `post_block` — read the residual
   stream *after* the TP all-reduce and the MoE combine, so the tensor
   is full `hidden_size`, **byte-identical on every TP and every EP
   rank**. For these hooks, TP/EP support is a *rank gate*, not a
@@ -52,10 +52,10 @@ downstream of the reducing collectives:
   (`vllm/model_executor/layers/linear.py:1558-1559`), so attention- and
   MLP-output projections produce full `hidden_size` on every TP rank.
 - MoE paths all-gather/all-reduce before the residual add
-  (`vllm/model_executor/models/deepseek_v2.py:384`), so `post_mlp` on an
+  (`vllm/model_executor/models/deepseek_v2.py:384`), so `post_block` on an
   EP rank also sees the full residual.
 
-Hence `pre_attn` / `post_attn` / `post_mlp` are `[num_rows,
+Hence `pre_attn` / `post_attn` / `post_block` are `[num_rows,
 hidden_size]` and identical across the TP×EP plane of a PP stage.
 
 What is **genuinely sharded** (and not captured today):
@@ -166,7 +166,7 @@ declared `location` can select between them.
   filesystem consumer writes to a path keyed by **global** layer index
   + request_id on a **shared** mount.
 - The on-disk layout merges naturally: stage 0 writes
-  `…/req/12_post_mlp.bin`, stage 1 writes `…/req/40_post_mlp.bin`, no
+  `…/req/12_post_block.bin`, stage 1 writes `…/req/40_post_block.bin`, no
   collision. The `packed`/`sharded` layouts (one file per request / per
   tag) cannot merge by global layer index alone, so under PP each stage
   writes its **own** file keyed by stage rank

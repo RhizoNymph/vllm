@@ -298,7 +298,7 @@ class CohereDecoderLayer(nn.Module):
         )
         hidden_states = hidden_states + hidden_states_mlp
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
 
         return hidden_states, residual

@@ -117,7 +117,7 @@ VllmInternalRequestId = NewType("VllmInternalRequestId", str)
 CaptureKey = tuple[VllmInternalRequestId, int, str]
 # (request id, layer index, hook name)
 
-HookName = Literal["pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"]
+HookName = Literal["pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out"]
 PositionSelector = (
     Literal["last_prompt", "all_prompt", "all_generated", "all"]
     | list[int]
@@ -693,7 +693,7 @@ Writer details (`writer.py`):
 - TP / PP / EP / DP are all accepted for the replicated residual hooks
   (no parallel-size rejection). See
   [Capture Consumers under Parallelism](capture_parallelism.md).
-- Every hook name is in `{pre_attn, post_attn, post_mlp, mlp_in,
+- Every hook name is in `{pre_attn, post_attn, post_block, mlp_in,
   mlp_out}`.
 - Every resolved layer is in `[0, num_hidden_layers)`, the **global**
   layer count (admission validates the full layer space; the runner then

@@ -85,16 +85,16 @@ def _view(rows):
 
 class TestConfig:
     def test_parse_graphsafe_key(self):
-        assert parse_graphsafe_key("12:post_mlp") == (12, "post_mlp")
+        assert parse_graphsafe_key("12:post_block") == (12, "post_block")
         assert parse_graphsafe_key("  0:pre_attn ") == (0, "pre_attn")
 
     def test_parse_graphsafe_key_rejects_bad_forms(self):
         with pytest.raises(ValueError):
             parse_graphsafe_key("12")  # no hook
         with pytest.raises(ValueError):
-            parse_graphsafe_key("x:post_mlp")  # non-integer layer
+            parse_graphsafe_key("x:post_block")  # non-integer layer
         with pytest.raises(ValueError):
-            parse_graphsafe_key("-1:post_mlp")  # negative
+            parse_graphsafe_key("-1:post_block")  # negative
         with pytest.raises(ValueError):
             parse_graphsafe_key("3:not_a_hook")  # unknown hook
 
@@ -102,41 +102,41 @@ class TestConfig:
         base = CaptureConsumersConfig(consumers=[CaptureConsumerSpec(name="fs")])
         with_keys = CaptureConsumersConfig(
             consumers=[CaptureConsumerSpec(name="fs")],
-            graphsafe_keys=[(1, "post_mlp")],
+            graphsafe_keys=[(1, "post_block")],
         )
         assert base.compute_hash() != with_keys.compute_hash()
 
 
 class TestExpandShorthands:
     def test_concrete_key(self):
-        assert expand_graphsafe_keys(["12:post_mlp"], num_layers=32) == [
-            (12, "post_mlp")
+        assert expand_graphsafe_keys(["12:post_block"], num_layers=32) == [
+            (12, "post_block")
         ]
 
     def test_layer_all_fans_out_standard_hooks(self):
         assert expand_graphsafe_keys(["5:all"], num_layers=32) == [
             (5, "post_attn"),
-            (5, "post_mlp"),
+            (5, "post_block"),
             (5, "pre_attn"),
         ]
 
     def test_all_layers_one_hook(self):
-        assert expand_graphsafe_keys(["all:post_mlp"], num_layers=4) == [
-            (0, "post_mlp"),
-            (1, "post_mlp"),
-            (2, "post_mlp"),
-            (3, "post_mlp"),
+        assert expand_graphsafe_keys(["all:post_block"], num_layers=4) == [
+            (0, "post_block"),
+            (1, "post_block"),
+            (2, "post_block"),
+            (3, "post_block"),
         ]
 
     def test_all_all(self):
         keys = expand_graphsafe_keys(["all:all"], num_layers=2)
         assert len(keys) == 2 * 3
-        assert (0, "pre_attn") in keys and (1, "post_mlp") in keys
+        assert (0, "pre_attn") in keys and (1, "post_block") in keys
 
     def test_dedup_overlapping_shorthands(self):
-        # "5:all" already covers "5:post_mlp" -> no duplicate.
-        keys = expand_graphsafe_keys(["5:post_mlp", "5:all"], num_layers=32)
-        assert keys == [(5, "post_attn"), (5, "post_mlp"), (5, "pre_attn")]
+        # "5:all" already covers "5:post_block" -> no duplicate.
+        keys = expand_graphsafe_keys(["5:post_block", "5:all"], num_layers=32)
+        assert keys == [(5, "post_attn"), (5, "post_block"), (5, "pre_attn")]
 
     def test_all_forms_does_not_include_unwired_hooks(self):
         # mlp_in/mlp_out are valid to name explicitly but excluded from :all.
@@ -147,7 +147,7 @@ class TestExpandShorthands:
 
     def test_layer_out_of_range_rejected(self):
         with pytest.raises(ValueError, match="outside the model's"):
-            expand_graphsafe_keys(["40:post_mlp"], num_layers=32)
+            expand_graphsafe_keys(["40:post_block"], num_layers=32)
 
     def test_unknown_hook_rejected(self):
         with pytest.raises(ValueError, match="unknown hook"):
@@ -168,14 +168,14 @@ class TestConsumerDeclaredKeys:
 
     def test_filesystem_declares_from_list_param(self):
         assert FilesystemConsumer.declared_graphsafe_keys(
-            {"root": "/x", "graphsafe_keys": ["12:post_mlp", "all:post_attn"]}
-        ) == ["12:post_mlp", "all:post_attn"]
+            {"root": "/x", "graphsafe_keys": ["12:post_block", "all:post_attn"]}
+        ) == ["12:post_block", "all:post_attn"]
 
     def test_filesystem_declares_from_cli_style_string(self):
         # ',' separates CLI params, so the list uses ';'.
         assert FilesystemConsumer.declared_graphsafe_keys(
-            {"root": "/x", "graphsafe_keys": "12:post_mlp;20:post_mlp"}
-        ) == ["12:post_mlp", "20:post_mlp"]
+            {"root": "/x", "graphsafe_keys": "12:post_block;20:post_block"}
+        ) == ["12:post_block", "20:post_block"]
 
     def test_filesystem_declares_nothing_without_param(self):
         assert FilesystemConsumer.declared_graphsafe_keys({"root": "/x"}) == []
@@ -186,26 +186,26 @@ class TestResolveShorthands:
         specs = [
             CaptureConsumerSpec(
                 name="filesystem",
-                params={"root": "/x", "graphsafe_keys": ["12:post_mlp"]},
+                params={"root": "/x", "graphsafe_keys": ["12:post_block"]},
             )
         ]
-        keys, source = resolve_graphsafe_shorthands(specs, cli_keys=["5:post_mlp"])
-        assert keys == ["5:post_mlp"]
+        keys, source = resolve_graphsafe_shorthands(specs, cli_keys=["5:post_block"])
+        assert keys == ["5:post_block"]
         assert source == "--capture-graphsafe-key"
 
     def test_default_is_union_of_consumer_declarations(self):
         specs = [
             CaptureConsumerSpec(
                 name="filesystem",
-                params={"root": "/a", "graphsafe_keys": ["12:post_mlp"]},
+                params={"root": "/a", "graphsafe_keys": ["12:post_block"]},
             ),
             CaptureConsumerSpec(
                 name="filesystem",
-                params={"root": "/b", "graphsafe_keys": ["20:post_mlp"]},
+                params={"root": "/b", "graphsafe_keys": ["20:post_block"]},
             ),
         ]
         keys, source = resolve_graphsafe_shorthands(specs, cli_keys=None)
-        assert keys == ["12:post_mlp", "20:post_mlp"]
+        assert keys == ["12:post_block", "20:post_block"]
         assert source == "registered consumer(s)"
 
     def test_empty_when_nothing_declared(self):
@@ -218,7 +218,7 @@ class TestResolveShorthands:
         specs = [
             CaptureConsumerSpec(
                 name="filesystem",
-                params={"root": "/a", "graphsafe_keys": ["5:post_mlp"]},
+                params={"root": "/a", "graphsafe_keys": ["5:post_block"]},
             ),
             CaptureConsumerSpec(
                 name="filesystem",
@@ -228,7 +228,7 @@ class TestResolveShorthands:
         raw, _ = resolve_graphsafe_shorthands(specs, cli_keys=None)
         assert expand_graphsafe_keys(raw, num_layers=32) == [
             (5, "post_attn"),
-            (5, "post_mlp"),
+            (5, "post_block"),
             (5, "pre_attn"),
         ]
 
@@ -240,10 +240,10 @@ class TestResolveShorthands:
 
 class TestGateCoverage:
     def test_covered_client_key_does_not_force_eager(self):
-        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_mlp")}))
+        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_block")}))
         gate.register(
             "a",
-            {"fs": {"hooks": {"post_mlp": [1]}, "positions": "all_generated"}},
+            {"fs": {"hooks": {"post_block": [1]}, "positions": "all_generated"}},
         )
         assert gate.tracked_requests() == 1
         # A decode step that captures (all_generated hits the gen token) must
@@ -252,16 +252,16 @@ class TestGateCoverage:
 
     def test_uncovered_layer_forces_eager(self):
         # Allowlist covers layer 1; the spec taps layer 2 → still eager.
-        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_mlp")}))
+        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_block")}))
         gate.register(
             "a",
-            {"fs": {"hooks": {"post_mlp": [2]}, "positions": "all_generated"}},
+            {"fs": {"hooks": {"post_block": [2]}, "positions": "all_generated"}},
         )
         assert gate.step_captures(_view([("a", 10, 10, 1)])) is True
 
     def test_uncovered_hook_forces_eager(self):
         # Same layer, different hook → not covered.
-        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_mlp")}))
+        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_block")}))
         gate.register(
             "a",
             {"fs": {"hooks": {"pre_attn": [1]}, "positions": "all_generated"}},
@@ -270,19 +270,19 @@ class TestGateCoverage:
 
     def test_partial_coverage_forces_eager(self):
         # One key covered, one not → the uncovered one forces eager.
-        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_mlp")}))
+        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_block")}))
         gate.register(
             "a",
-            {"fs": {"hooks": {"post_mlp": [1, 2]}, "positions": "all_generated"}},
+            {"fs": {"hooks": {"post_block": [1, 2]}, "positions": "all_generated"}},
         )
         assert gate.step_captures(_view([("a", 10, 10, 1)])) is True
 
     def test_covered_but_out_of_window_does_not_force_eager(self):
         # Covered key, but last_prompt position is not in this decode window.
-        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_mlp")}))
+        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_block")}))
         gate.register(
             "a",
-            {"fs": {"hooks": {"post_mlp": [1]}, "positions": "last_prompt"}},
+            {"fs": {"hooks": {"post_block": [1]}, "positions": "last_prompt"}},
         )
         assert gate.step_captures(_view([("a", 10, 10, 1)])) is False
         # Prefill chunk covering the last prompt token is still graph-safe.
@@ -293,26 +293,26 @@ class TestGateCoverage:
         gate = CaptureStepGate()
         gate.register(
             "a",
-            {"fs": {"hooks": {"post_mlp": [1]}, "positions": "all_generated"}},
+            {"fs": {"hooks": {"post_block": [1]}, "positions": "all_generated"}},
         )
         assert gate.step_captures(_view([("a", 10, 10, 1)])) is True
 
     def test_unparseable_hooks_forces_eager(self):
         # A spec whose hooks aren't the expected mapping is treated as
         # uncovered (conservative) even if an allowlist is configured.
-        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_mlp")}))
+        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_block")}))
         gate.register("a", {"fs": {"positions": "all_generated"}})  # no hooks
         assert gate.step_captures(_view([("a", 10, 10, 1)])) is True
 
     def test_mixed_batch_one_covered_one_uncovered(self):
-        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_mlp")}))
+        gate = CaptureStepGate(graphsafe_keys=frozenset({(1, "post_block")}))
         gate.register(
             "safe",
-            {"fs": {"hooks": {"post_mlp": [1]}, "positions": "all_generated"}},
+            {"fs": {"hooks": {"post_block": [1]}, "positions": "all_generated"}},
         )
         gate.register(
             "unsafe",
-            {"fs": {"hooks": {"post_mlp": [3]}, "positions": "all_generated"}},
+            {"fs": {"hooks": {"post_block": [3]}, "positions": "all_generated"}},
         )
         # The uncovered request forces eager for the whole batch.
         assert (
@@ -347,31 +347,31 @@ def _make_graphsafe_manager(
 
 class TestManagerBufferPath:
     def test_allowlist_allocates_buffers_without_global_spec(self):
-        mgr, _ = _make_graphsafe_manager(graphsafe_keys=[(1, "post_mlp")])
+        mgr, _ = _make_graphsafe_manager(graphsafe_keys=[(1, "post_block")])
         # The allowlisted key gets a persistent buffer even with no global
         # spec (consumer_specs is (None,)).
-        assert (1, "post_mlp") in mgr._global_buffers
-        assert mgr.graphsafe_keys == frozenset({(1, "post_mlp")})
-        buf = mgr._global_buffers[(1, "post_mlp")]
+        assert (1, "post_block") in mgr._global_buffers
+        assert mgr.graphsafe_keys == frozenset({(1, "post_block")})
+        buf = mgr._global_buffers[(1, "post_block")]
         assert buf.shape == (16, HIDDEN_SIZE)
 
     def test_no_buffers_without_max_num_tokens(self):
         mgr, _ = _make_graphsafe_manager(
-            graphsafe_keys=[(1, "post_mlp")], max_num_tokens=0
+            graphsafe_keys=[(1, "post_block")], max_num_tokens=0
         )
         assert mgr._global_buffers == {}
         assert mgr.graphsafe_keys == frozenset()
 
     def test_out_of_range_allowlist_key_dropped(self):
         # Layer 99 is out of the model's layer range → no buffer.
-        mgr, _ = _make_graphsafe_manager(graphsafe_keys=[(99, "post_mlp")])
+        mgr, _ = _make_graphsafe_manager(graphsafe_keys=[(99, "post_block")])
         assert mgr._global_buffers == {}
         assert mgr.graphsafe_keys == frozenset()
 
     def test_client_spec_on_covered_key_routes_to_buffer(self):
-        mgr, _ = _make_graphsafe_manager(graphsafe_keys=[(1, "post_mlp")])
+        mgr, _ = _make_graphsafe_manager(graphsafe_keys=[(1, "post_block")])
         client_spec = CaptureSpec(
-            hooks={"post_mlp": [1]}, positions="last_prompt"
+            hooks={"post_block": [1]}, positions="last_prompt"
         )
         mgr.register_request(
             "r1", client_specs={0: client_spec}, num_prompt_tokens=10
@@ -381,18 +381,18 @@ class TestManagerBufferPath:
         )
         # Covered client key takes the persistent-buffer path, not the
         # dynamic in-hook gather (which would force eager).
-        assert (1, "post_mlp") in plan.global_gather_indices
-        assert (1, "post_mlp") not in plan.gather_indices
+        assert (1, "post_block") in plan.global_gather_indices
+        assert (1, "post_block") not in plan.gather_indices
         assert plan.gather_indices == {}
         # last_prompt of a 10-token prompt is absolute row 9.
-        assert plan.global_gather_indices[(1, "post_mlp")].tolist() == [9]
+        assert plan.global_gather_indices[(1, "post_block")].tolist() == [9]
 
     def test_buffer_slice_matches_eager_gather(self):
         """The post-forward buffer slice yields the same rows as the eager
         dynamic gather would have."""
-        mgr, sink = _make_graphsafe_manager(graphsafe_keys=[(1, "post_mlp")])
+        mgr, sink = _make_graphsafe_manager(graphsafe_keys=[(1, "post_block")])
         client_spec = CaptureSpec(
-            hooks={"post_mlp": [1]}, positions="last_prompt"
+            hooks={"post_block": [1]}, positions="last_prompt"
         )
         mgr.register_request(
             "r1", client_specs={0: client_spec}, num_prompt_tokens=10
@@ -404,10 +404,10 @@ class TestManagerBufferPath:
         )
         # on_hook performs the fixed full-residual copy into the buffer
         # (the recorded copy at graph replay).
-        mgr.on_hook(1, "post_mlp", hidden)
+        mgr.on_hook(1, "post_block", hidden)
         # The buffer holds the full residual; on_hook must NOT populate
         # scratch for a buffered key (host slices it post-forward).
-        assert (1, "post_mlp") not in plan.scratch_gpu
+        assert (1, "post_block") not in plan.scratch_gpu
 
         mgr.dispatch_step_captures(plan)
         mgr._drain_dispatch_queue()
@@ -424,13 +424,13 @@ class TestManagerBufferPath:
     def test_uncovered_client_key_stays_on_dynamic_path(self):
         # An allowlist that covers layer 1 only; the client taps layer 2,
         # which must keep the dynamic in-hook gather (forces eager at runtime).
-        mgr, _ = _make_graphsafe_manager(graphsafe_keys=[(1, "post_mlp")])
+        mgr, _ = _make_graphsafe_manager(graphsafe_keys=[(1, "post_block")])
         client_spec = CaptureSpec(
-            hooks={"post_mlp": [2]}, positions="last_prompt"
+            hooks={"post_block": [2]}, positions="last_prompt"
         )
         mgr.register_request(
             "r1", client_specs={0: client_spec}, num_prompt_tokens=10
         )
         plan = mgr.build_step_plan(_view([("r1", 10, 0, 10)]))
-        assert (2, "post_mlp") in plan.gather_indices
-        assert (2, "post_mlp") not in plan.global_gather_indices
+        assert (2, "post_block") in plan.gather_indices
+        assert (2, "post_block") not in plan.global_gather_indices

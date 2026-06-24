@@ -268,7 +268,7 @@ class Gemma2DecoderLayer(nn.Module):
             hidden_states, residual
         )
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_BLOCK)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         return hidden_states, residual
 
