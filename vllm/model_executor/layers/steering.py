@@ -36,8 +36,9 @@ class SteeringHookPoint(str, Enum):
     POST_ATTN = "post_attn"
     """Steer the residual skip tensor in the post-attention region."""
 
-    POST_BLOCK = "post_block"
-    """Steer the residual skip tensor in the post-MLP region."""
+    POST_BLOCK = "post_block"  # block output: residual + mlp branch (true hs[L+1])
+    """Steer the block-output residual stream (``residual + mlp_branch``), the
+    true ``hidden_states[L + 1]`` -- see :func:`apply_block_steering`."""
 
 
 # Buffer attribute names on decoder layer modules, keyed by hook point.
@@ -173,6 +174,52 @@ def apply_layer_steering(
         module.steering_index,
         getattr(module, HOOK_POINT_ANY_ACTIVE_ATTR[hook_point]),
     )
+
+
+def apply_block_steering(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block-output hook (``post_block``), replacing the old ``post_mlp``.
+
+    vLLM defers each branch-add into the *next* fused add+norm, so at the end
+    of a decoder layer ``residual`` does NOT yet include this layer's MLP
+    output -- the true block output (what HF exposes as
+    ``hidden_states[L + 1]``) is ``residual + hidden_states``. The old
+    ``post_mlp`` hook captured bare ``residual`` (post-attention, pre-MLP-add),
+    which is also byte-identical to what ``post_attn`` captures -- a footgun
+    for anyone reading the residual stream.
+
+    Capture consumers therefore see ``residual + hidden_states`` here. The
+    sum is computed only when a capture manager is installed on this rank
+    (a static property for the process lifetime, so ``torch.compile`` traces
+    it as a constant branch; non-capture servers pay nothing).
+
+    Steering is still applied to ``residual`` -- identical propagation to the
+    old ``post_mlp`` behavior, because the steering delta rides the residual
+    stream into the next layer's fused add either way.
+    """
+    from vllm.model_executor.layers.activation_capture import (
+        get_active_capture_manager,
+    )
+
+    if get_active_capture_manager() is not None:
+        maybe_capture_residual(
+            residual + hidden_states,
+            module.layer_idx,
+            SteeringHookPoint.POST_BLOCK.value,
+        )
+    table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_BLOCK]
+    if not hasattr(module, table_attr):
+        return hidden_states, residual
+    residual = torch.ops.vllm.apply_steering(
+        residual,
+        getattr(module, table_attr),
+        module.steering_index,
+        getattr(module, HOOK_POINT_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]),
+    )
+    return hidden_states, residual
 
 
 def apply_steering(
