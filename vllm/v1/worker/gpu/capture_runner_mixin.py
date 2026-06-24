@@ -312,6 +312,14 @@ class CaptureRunnerMixin:
 
         sidecar_fields: dict[str, Any] = {
             "vllm_internal_request_id": new_req_data.req_id,
+            # Client-supplied request id for universal attribution. Falls
+            # back to the internal id if randomization was disabled / the
+            # client id is unavailable (None-safe).
+            "client_request_id": (
+                new_req_data.client_request_id
+                if new_req_data.client_request_id is not None
+                else new_req_data.req_id
+            ),
             "prompt_token_ids": (
                 list(new_req_data.prompt_token_ids)
                 if new_req_data.prompt_token_ids is not None
