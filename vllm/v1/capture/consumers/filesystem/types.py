@@ -78,6 +78,39 @@ class FilesystemConsumerParams:
     # an open shard is sealed (published) and a new one started.
     num_shards: int = 8
     shard_max_bytes: int = 256 << 20  # 256 MiB
+    # ---- Global (consumer-level) capture spec ----
+    #
+    # When ``global_hooks`` is set, the consumer advertises a *global*
+    # ``CaptureSpec`` (via ``global_capture_spec()``) so every request is
+    # captured uniformly without a per-request ``SamplingParams.capture``.
+    # A global spec rides the CUDA-graph-safe persistent-buffer path in the
+    # manager, so filesystem capture no longer forces eager every step —
+    # the ~4x cost the dynamic per-request gather incurs under cudagraph.
+    #
+    # ``global_hooks`` maps a hook-point name (``pre_attn`` / ``post_attn``
+    # / ``post_mlp``) to its layers, given either as a dict or a CLI-safe
+    # string DSL ``"<hook>:<layers>[;<hook>:<layers>]"``. Each hook's layers
+    # may be a list of ints, or a layer-spec string ``"all"`` /
+    # ``"<a>-<b>"`` (inclusive range) / ``"<i>.<j>.<k>"`` (dot list). So
+    # ``{"post_mlp": "all"}``, ``{"pre_attn": [0, 17]}`` and
+    # ``"pre_attn:0-17;post_mlp:20"`` are all valid. Resolved against the
+    # model's layer count in ``FilesystemConsumer.__init__``. ``global_positions``
+    # is the uniform position selector (``last_prompt`` / ``all_prompt`` /
+    # ``all_generated`` / ``all`` / explicit ``list[int]``). ``None``
+    # global_hooks keeps the legacy per-request-only behavior.
+    #
+    # Global-driven requests have no per-request ``tag``/``request_id``
+    # (those come from a ``FilesystemCaptureRequest``), so their files are
+    # named ``{root}/{default_tag}/{engine_request_id}/...`` — the engine
+    # request id is threaded through the manager's dispatch path and used
+    # as the per-request directory.
+    global_hooks: dict[str, Any] | str | None = None
+    global_positions: str | list[int] = "all_prompt"
+    # Tag (directory) for global-driven captures and the fallback for any
+    # request that reaches the consumer without an admission record. Defaults
+    # to ``"default"`` to preserve the legacy fallback directory name; set it
+    # when configuring global capture to give the run a meaningful tag.
+    default_tag: str = "default"
 
 
 # Valid values for FilesystemCaptureRequest.layout / default_layout.

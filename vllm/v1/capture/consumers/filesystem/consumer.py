@@ -18,7 +18,7 @@ import logging
 import pathlib
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from vllm.v1.capture.consumers.filesystem.types import (
     VALID_LAYOUTS,
@@ -45,7 +45,7 @@ from vllm.v1.capture.types import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.capture.types import CaptureContext
+    from vllm.v1.capture.types import CaptureContext, HookName, PositionSelector
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,134 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
         coalesce_max_bytes=int(params.get("coalesce_max_bytes", 1 << 20)),
         num_shards=int(params.get("num_shards", 8)),
         shard_max_bytes=int(params.get("shard_max_bytes", 256 << 20)),
+        # Kept raw (dict or string DSL); resolved against the model's layer
+        # count in ``FilesystemConsumer.__init__`` (where ``all`` needs it).
+        global_hooks=params.get("global_hooks"),
+        global_positions=params.get("global_positions", "all_prompt"),
+        default_tag=str(params.get("default_tag", "default")),
     )
+
+
+# Hook points that have a real model forward tap; mirrors
+# ``filesystem.validation._VALID_HOOK_NAMES``. Redeclared here (not
+# imported) to keep ``_parse_params`` torch/pydantic-free.
+_VALID_GLOBAL_HOOK_NAMES: frozenset[str] = frozenset(
+    ("pre_attn", "post_attn", "post_mlp")
+)
+
+
+def _resolve_layer_spec(spec: Any, num_layers: int, hook_name: str) -> list[int]:
+    """Resolve one hook's layer spec into a sorted, de-duped index list.
+
+    ``spec`` is either an explicit list/tuple of ints, or a string:
+    ``"all"`` | ``"<a>-<b>"`` (inclusive range) | ``"<i>.<j>.<k>"``
+    (dot-separated list) | ``"<i>"`` (single). The dot/range/``all`` forms
+    keep the value comma-free so it survives the ``--capture-consumers
+    name:k=v,k=v`` CLI shorthand.
+    """
+    if isinstance(spec, str):
+        s = spec.strip()
+        if not s:
+            raise ValueError(f"global_hooks[{hook_name!r}] has an empty layer spec")
+        if s == "all":
+            layers = list(range(num_layers))
+        elif "-" in s:
+            lo_s, _, hi_s = s.partition("-")
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] range {s!r} must be '<int>-<int>'"
+                ) from None
+            layers = list(range(lo, hi + 1))
+        else:
+            try:
+                layers = [int(x) for x in s.split(".")]
+            except ValueError:
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] layer spec {s!r} must be 'all', "
+                    f"'<a>-<b>', or dot-separated ints (e.g. '1.5.9')"
+                ) from None
+    elif isinstance(spec, (list, tuple)):
+        layers = []
+        for x in spec:
+            if isinstance(x, bool) or not isinstance(x, int):
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] entries must be ints, "
+                    f"got {type(x).__name__}"
+                )
+            layers.append(x)
+    else:
+        raise ValueError(
+            f"global_hooks[{hook_name!r}] must be a list of ints or a layer-spec "
+            f"string, got {type(spec).__name__}"
+        )
+    if not layers:
+        raise ValueError(f"global_hooks[{hook_name!r}] resolved to no layers")
+    for layer in layers:
+        if layer < 0:
+            raise ValueError(
+                f"global_hooks[{hook_name!r}] layer {layer} must be non-negative"
+            )
+        if layer >= num_layers:
+            raise ValueError(
+                f"global_hooks[{hook_name!r}] layer {layer} is out of range for a "
+                f"model with {num_layers} layers"
+            )
+    return sorted(set(layers))
+
+
+def _resolve_global_hooks(
+    raw: Any, num_layers: int
+) -> dict[str, list[int]] | None:
+    """Resolve the ``global_hooks`` param into ``{hook: [layers]}`` or None.
+
+    Accepts either form:
+
+    - a **dict** ``{hook: layers}`` where ``layers`` is a list of ints or a
+      layer-spec string (``"all"`` / ``"0-17"`` / ``"1.5.9"``); or
+    - a **string** in the CLI-safe DSL ``"<hook>:<layers>[;<hook>:<layers>]"``
+      (e.g. ``"post_mlp:all"`` or ``"pre_attn:0-17;post_mlp:20"``).
+
+    ``None``/empty disables the global spec (legacy per-request-only
+    behavior). ``num_layers`` is the model's total decoder-layer count, used
+    to expand ``all``.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        items: list[tuple[str, Any]] = []
+        for part in text.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            hook, sep, layerspec = part.partition(":")
+            if not sep or not layerspec.strip():
+                raise ValueError(
+                    f"global_hooks entry {part!r} must be '<hook>:<layers>'"
+                )
+            items.append((hook.strip(), layerspec.strip()))
+    elif isinstance(raw, dict):
+        if not raw:
+            return None
+        items = list(raw.items())
+    else:
+        raise ValueError(
+            f"global_hooks must be a dict or a '<hook>:<layers>' string, "
+            f"got {type(raw).__name__}"
+        )
+    parsed: dict[str, list[int]] = {}
+    for hook_name, layerspec in items:
+        if hook_name not in _VALID_GLOBAL_HOOK_NAMES:
+            raise ValueError(
+                f"global_hooks key {hook_name!r} is not a valid hook point; "
+                f"valid names: {sorted(_VALID_GLOBAL_HOOK_NAMES)}"
+            )
+        parsed[hook_name] = _resolve_layer_spec(layerspec, num_layers, hook_name)
+    return parsed or None
 
 
 def _pp_geometry(
@@ -220,6 +347,25 @@ class FilesystemConsumer:
     ) -> None:
         self._vllm_config = vllm_config
         self._params = _parse_params(params)
+        # Consumer-level global capture spec (CUDA-graph-safe path). Built
+        # once at construction from ``global_hooks``/``global_positions``;
+        # ``None`` keeps the legacy per-request-only behavior. When set, the
+        # manager captures every request uniformly via the persistent-buffer
+        # path and files are named by the engine request id under
+        # ``default_tag`` (see :meth:`_resolve_chunk_slugs`).
+        self._global_spec: CaptureSpec | None = None
+        if self._params.global_hooks:
+            num_layers = (
+                self._vllm_config.model_config.get_total_num_hidden_layers()
+            )
+            resolved = _resolve_global_hooks(self._params.global_hooks, num_layers)
+            if resolved is not None:
+                self._global_spec = CaptureSpec(
+                    hooks=cast("dict[HookName, list[int]]", resolved),
+                    positions=cast(
+                        "PositionSelector", self._params.global_positions
+                    ),
+                )
         # ``expanduser`` so ``root=~/path`` works: a shell does not expand the
         # ``~`` in ``--capture-consumers filesystem:root=~/path`` (it is not at
         # a word boundary), so the literal ``~`` would otherwise become a
@@ -294,9 +440,16 @@ class FilesystemConsumer:
     # CaptureSink protocol
     # ------------------------------------------------------------------
 
-    def global_capture_spec(self) -> None:
-        """Filesystem consumer has no global spec — capture is per-request."""
-        return None
+    def global_capture_spec(self) -> CaptureSpec | None:
+        """Return the consumer-level global capture spec, if configured.
+
+        When ``global_hooks`` is set the consumer advertises a uniform
+        ``CaptureSpec`` so every request is captured via the manager's
+        CUDA-graph-safe persistent-buffer path (no force-eager). Returns
+        ``None`` otherwise, preserving the legacy per-request behavior where
+        capture is driven only by ``SamplingParams.capture``.
+        """
+        return self._global_spec
 
     @classmethod
     def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
@@ -436,10 +589,15 @@ class FilesystemConsumer:
         self, req_str: str, chunk: CaptureChunk
     ) -> tuple[str, str]:
         """Slug priority: chunk.metadata override → admission record →
-        ``("default", req)`` fallback."""
+        ``(default_tag, req)`` fallback.
+
+        The fallback path is what global-driven (non-validated) requests
+        take: no ``FilesystemCaptureRequest`` was admitted, so the consumer
+        names files by the engine request id under the consumer's
+        ``default_tag``."""
         with self._lock:
             recorded = self._request_slugs.get(req_str)
-        fallback_tag, fallback_req = recorded or ("default", req_str)
+        fallback_tag, fallback_req = recorded or (self._params.default_tag, req_str)
         return (
             chunk.metadata.get("tag_slug", fallback_tag),
             chunk.metadata.get("request_id_slug", fallback_req),
@@ -626,7 +784,10 @@ class FilesystemConsumer:
                 # lock we already hold); they're fixed for the request, so
                 # this avoids a per-batch _resolve_chunk_slugs lock round-trip.
                 recorded = self._request_slugs.get(req_str)
-                fallback_tag, fallback_req = recorded or ("default", req_str)
+                fallback_tag, fallback_req = recorded or (
+                    self._params.default_tag,
+                    req_str,
+                )
                 meta = chunks[0].metadata
                 state = _PackedState(
                     tag_slug=meta.get("tag_slug", fallback_tag),
@@ -806,7 +967,7 @@ class FilesystemConsumer:
         elif recorded is not None:
             tag_slug, request_id_slug = recorded
         else:
-            tag_slug, request_id_slug = "default", req_str
+            tag_slug, request_id_slug = self._params.default_tag, req_str
 
         tag_slug = finalize.sidecar.get("tag_slug", tag_slug)
         request_id_slug = finalize.sidecar.get("request_id_slug", request_id_slug)

@@ -55,15 +55,20 @@ def _make_vllm_config(
     *,
     root_path: str | None = "/tmp/activations",
     max_bytes: int = 0,
+    num_hidden_layers: int = 32,
 ) -> MagicMock:
     """Build a minimal mock ``VllmConfig`` for the filesystem consumer.
 
     ``root_path`` / ``max_bytes`` are accepted for backwards compatibility
     with older call sites but are no longer consulted by the validator;
     the consumer receives its ``root`` via its constructor ``params``.
+    ``num_hidden_layers`` backs ``model_config.get_total_num_hidden_layers()``,
+    which the consumer reads to resolve ``global_hooks`` (e.g. ``"all"``).
     """
     del root_path, max_bytes
-    return MagicMock()
+    cfg = MagicMock()
+    cfg.model_config.get_total_num_hidden_layers.return_value = num_hidden_layers
+    return cfg
 
 
 def _make_context(
@@ -664,6 +669,166 @@ class TestShutdown:
             assert consumer.global_capture_spec() is None
         finally:
             consumer.shutdown(timeout=5.0)
+
+
+class TestGlobalCaptureSpec:
+    """Consumer-level global capture spec (CUDA-graph-safe path)."""
+
+    def test_none_without_global_hooks(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path)
+        try:
+            assert consumer.global_capture_spec() is None
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_returns_configured_spec(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path,
+            global_hooks={"post_mlp": [0, 2]},
+            global_positions="all_generated",
+        )
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"post_mlp": [0, 2]}
+            assert spec.positions == "all_generated"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_default_positions_all_prompt(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path, global_hooks={"post_mlp": [1]})
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.positions == "all_prompt"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_explicit_positions_list(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path,
+            global_hooks={"pre_attn": [0]},
+            global_positions=[0, 1, 2],
+        )
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.positions == [0, 1, 2]
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_layers_sorted_deduped(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path, global_hooks={"post_attn": [3, 1, 1, 0]})
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"post_attn": [0, 1, 3]}
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_empty_global_hooks_disables(self, tmp_path: pathlib.Path) -> None:
+        # An empty dict is treated as "not configured" → no global spec.
+        consumer = _make_consumer(tmp_path, global_hooks={})
+        try:
+            assert consumer.global_capture_spec() is None
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_invalid_hook_name_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="not a valid hook point"):
+            _make_consumer(tmp_path, global_hooks={"bogus": [0]})
+
+    def test_non_dict_global_hooks_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="must be a dict"):
+            _make_consumer(tmp_path, global_hooks=[0, 1])
+
+    def test_empty_layer_list_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="resolved to no layers"):
+            _make_consumer(tmp_path, global_hooks={"post_mlp": []})
+
+    def test_negative_layer_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            _make_consumer(tmp_path, global_hooks={"post_mlp": [-1]})
+
+    def test_non_int_layer_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="must be ints"):
+            _make_consumer(tmp_path, global_hooks={"post_mlp": ["x"]})
+
+    def test_default_tag_configurable(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path,
+            global_hooks={"post_mlp": [0]},
+            default_tag="run42",
+        )
+        try:
+            assert consumer._params.default_tag == "run42"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_default_tag_defaults_to_default(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path)
+        try:
+            assert consumer._params.default_tag == "default"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    # ---- string DSL + range / all / dot-list (CLI-safe forms) ----
+
+    def test_string_dsl_multiple_hooks(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path, global_hooks="pre_attn:0-2;post_mlp:20"
+        )
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"pre_attn": [0, 1, 2], "post_mlp": [20]}
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_string_dsl_all(self, tmp_path: pathlib.Path) -> None:
+        # num_hidden_layers defaults to 32 in the fixture.
+        consumer = _make_consumer(tmp_path, global_hooks="post_mlp:all")
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"post_mlp": list(range(32))}
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_dict_value_range_string(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path, global_hooks={"post_mlp": "0-3"})
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"post_mlp": [0, 1, 2, 3]}
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_dict_value_dot_list_and_all(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path, global_hooks={"post_mlp": "1.5.9", "pre_attn": "all"}
+        )
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks["post_mlp"] == [1, 5, 9]
+            assert spec.hooks["pre_attn"] == list(range(32))
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_layer_out_of_range_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="out of range"):
+            _make_consumer(tmp_path, global_hooks={"post_mlp": [99]})
+
+    def test_string_dsl_missing_colon_rejected(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        with pytest.raises(ValueError, match="must be '<hook>:<layers>'"):
+            _make_consumer(tmp_path, global_hooks="post_mlp")
+
+    def test_bad_layer_spec_string_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="layer spec"):
+            _make_consumer(tmp_path, global_hooks={"post_mlp": "1,2,3"})
 
 
 class TestClassVars:
