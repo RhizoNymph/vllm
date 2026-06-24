@@ -63,12 +63,24 @@ def _wait_for_status(
     pytest.fail(f"timeout waiting for {key} to finalize")
 
 
+class _FakeModelConfig:
+    """Stand-in exposing the layer count the consumer reads to resolve
+    ``global_hooks`` (e.g. ``"all"``)."""
+
+    def __init__(self, num_hidden_layers: int = 32) -> None:
+        self._num_hidden_layers = num_hidden_layers
+
+    def get_total_num_hidden_layers(self) -> int:
+        return self._num_hidden_layers
+
+
 class _FakeVllmConfig:
     """Minimal stand-in for ``VllmConfig`` — enough for the filesystem
     consumer's constructor to run without pulling in pydantic."""
 
-    def __init__(self) -> None:
+    def __init__(self, num_hidden_layers: int = 32) -> None:
         self.capture_consumers_config = None
+        self.model_config = _FakeModelConfig(num_hidden_layers)
 
 
 # ---------------------------------------------------------------------------

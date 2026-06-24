@@ -67,7 +67,6 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
             f"default_layout must be one of {sorted(VALID_LAYOUTS)}, "
             f"got {default_layout!r}"
         )
-    global_hooks = _parse_global_hooks(params.get("global_hooks"))
     return FilesystemConsumerParams(
         root=str(params["root"]),
         writer_threads=int(params.get("writer_threads", 4)),
@@ -81,8 +80,10 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
         coalesce_max_bytes=int(params.get("coalesce_max_bytes", 1 << 20)),
         num_shards=int(params.get("num_shards", 8)),
         shard_max_bytes=int(params.get("shard_max_bytes", 256 << 20)),
-        global_hooks=global_hooks,
-        global_positions=params.get("global_positions", "last_prompt"),
+        # Kept raw (dict or string DSL); resolved against the model's layer
+        # count in ``FilesystemConsumer.__init__`` (where ``all`` needs it).
+        global_hooks=params.get("global_hooks"),
+        global_positions=params.get("global_positions", "all_prompt"),
         default_tag=str(params.get("default_tag", "default")),
     )
 
@@ -95,51 +96,118 @@ _VALID_GLOBAL_HOOK_NAMES: frozenset[str] = frozenset(
 )
 
 
-def _parse_global_hooks(raw: Any) -> dict[str, list[int]] | None:
-    """Validate the ``global_hooks`` param into ``{hook: [layers]}`` or None.
+def _resolve_layer_spec(spec: Any, num_layers: int, hook_name: str) -> list[int]:
+    """Resolve one hook's layer spec into a sorted, de-duped index list.
+
+    ``spec`` is either an explicit list/tuple of ints, or a string:
+    ``"all"`` | ``"<a>-<b>"`` (inclusive range) | ``"<i>.<j>.<k>"``
+    (dot-separated list) | ``"<i>"`` (single). The dot/range/``all`` forms
+    keep the value comma-free so it survives the ``--capture-consumers
+    name:k=v,k=v`` CLI shorthand.
+    """
+    if isinstance(spec, str):
+        s = spec.strip()
+        if not s:
+            raise ValueError(f"global_hooks[{hook_name!r}] has an empty layer spec")
+        if s == "all":
+            layers = list(range(num_layers))
+        elif "-" in s:
+            lo_s, _, hi_s = s.partition("-")
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] range {s!r} must be '<int>-<int>'"
+                ) from None
+            layers = list(range(lo, hi + 1))
+        else:
+            try:
+                layers = [int(x) for x in s.split(".")]
+            except ValueError:
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] layer spec {s!r} must be 'all', "
+                    f"'<a>-<b>', or dot-separated ints (e.g. '1.5.9')"
+                ) from None
+    elif isinstance(spec, (list, tuple)):
+        layers = []
+        for x in spec:
+            if isinstance(x, bool) or not isinstance(x, int):
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] entries must be ints, "
+                    f"got {type(x).__name__}"
+                )
+            layers.append(x)
+    else:
+        raise ValueError(
+            f"global_hooks[{hook_name!r}] must be a list of ints or a layer-spec "
+            f"string, got {type(spec).__name__}"
+        )
+    if not layers:
+        raise ValueError(f"global_hooks[{hook_name!r}] resolved to no layers")
+    for layer in layers:
+        if layer < 0:
+            raise ValueError(
+                f"global_hooks[{hook_name!r}] layer {layer} must be non-negative"
+            )
+        if layer >= num_layers:
+            raise ValueError(
+                f"global_hooks[{hook_name!r}] layer {layer} is out of range for a "
+                f"model with {num_layers} layers"
+            )
+    return sorted(set(layers))
+
+
+def _resolve_global_hooks(
+    raw: Any, num_layers: int
+) -> dict[str, list[int]] | None:
+    """Resolve the ``global_hooks`` param into ``{hook: [layers]}`` or None.
+
+    Accepts either form:
+
+    - a **dict** ``{hook: layers}`` where ``layers`` is a list of ints or a
+      layer-spec string (``"all"`` / ``"0-17"`` / ``"1.5.9"``); or
+    - a **string** in the CLI-safe DSL ``"<hook>:<layers>[;<hook>:<layers>]"``
+      (e.g. ``"post_mlp:all"`` or ``"pre_attn:0-17;post_mlp:20"``).
 
     ``None``/empty disables the global spec (legacy per-request-only
-    behavior). Each value must be a non-empty list of non-negative int
-    layer indices; layer bounds are re-checked against the model in
-    :meth:`CaptureManager.register_request`, so only structural validation
-    happens here.
+    behavior). ``num_layers`` is the model's total decoder-layer count, used
+    to expand ``all``.
     """
     if raw is None:
         return None
-    if not isinstance(raw, dict):
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        items: list[tuple[str, Any]] = []
+        for part in text.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            hook, sep, layerspec = part.partition(":")
+            if not sep or not layerspec.strip():
+                raise ValueError(
+                    f"global_hooks entry {part!r} must be '<hook>:<layers>'"
+                )
+            items.append((hook.strip(), layerspec.strip()))
+    elif isinstance(raw, dict):
+        if not raw:
+            return None
+        items = list(raw.items())
+    else:
         raise ValueError(
-            f"global_hooks must be a dict mapping hook name to layer list, "
+            f"global_hooks must be a dict or a '<hook>:<layers>' string, "
             f"got {type(raw).__name__}"
         )
-    if not raw:
-        return None
     parsed: dict[str, list[int]] = {}
-    for hook_name, layers in raw.items():
+    for hook_name, layerspec in items:
         if hook_name not in _VALID_GLOBAL_HOOK_NAMES:
             raise ValueError(
                 f"global_hooks key {hook_name!r} is not a valid hook point; "
                 f"valid names: {sorted(_VALID_GLOBAL_HOOK_NAMES)}"
             )
-        if not isinstance(layers, (list, tuple)) or not layers:
-            raise ValueError(
-                f"global_hooks[{hook_name!r}] must be a non-empty list of "
-                f"layer indices, got {layers!r}"
-            )
-        resolved: list[int] = []
-        for layer in layers:
-            if isinstance(layer, bool) or not isinstance(layer, int):
-                raise ValueError(
-                    f"global_hooks[{hook_name!r}] entries must be ints, "
-                    f"got {type(layer).__name__}"
-                )
-            if layer < 0:
-                raise ValueError(
-                    f"global_hooks[{hook_name!r}] layer {layer} must be "
-                    f"non-negative"
-                )
-            resolved.append(layer)
-        parsed[hook_name] = sorted(set(resolved))
-    return parsed
+        parsed[hook_name] = _resolve_layer_spec(layerspec, num_layers, hook_name)
+    return parsed or None
 
 
 def _pp_geometry(
@@ -286,11 +354,18 @@ class FilesystemConsumer:
         # path and files are named by the engine request id under
         # ``default_tag`` (see :meth:`_resolve_chunk_slugs`).
         self._global_spec: CaptureSpec | None = None
-        if self._params.global_hooks is not None:
-            self._global_spec = CaptureSpec(
-                hooks=cast("dict[HookName, list[int]]", self._params.global_hooks),
-                positions=cast("PositionSelector", self._params.global_positions),
+        if self._params.global_hooks:
+            num_layers = (
+                self._vllm_config.model_config.get_total_num_hidden_layers()
             )
+            resolved = _resolve_global_hooks(self._params.global_hooks, num_layers)
+            if resolved is not None:
+                self._global_spec = CaptureSpec(
+                    hooks=cast("dict[HookName, list[int]]", resolved),
+                    positions=cast(
+                        "PositionSelector", self._params.global_positions
+                    ),
+                )
         # ``expanduser`` so ``root=~/path`` works: a shell does not expand the
         # ``~`` in ``--capture-consumers filesystem:root=~/path`` (it is not at
         # a word boundary), so the literal ``~`` would otherwise become a

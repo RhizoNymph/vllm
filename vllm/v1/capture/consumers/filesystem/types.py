@@ -88,8 +88,14 @@ class FilesystemConsumerParams:
     # the ~4x cost the dynamic per-request gather incurs under cudagraph.
     #
     # ``global_hooks`` maps a hook-point name (``pre_attn`` / ``post_attn``
-    # / ``post_mlp``) to its layer indices. ``global_positions`` is the
-    # uniform position selector (``last_prompt`` / ``all_prompt`` /
+    # / ``post_mlp``) to its layers, given either as a dict or a CLI-safe
+    # string DSL ``"<hook>:<layers>[;<hook>:<layers>]"``. Each hook's layers
+    # may be a list of ints, or a layer-spec string ``"all"`` /
+    # ``"<a>-<b>"`` (inclusive range) / ``"<i>.<j>.<k>"`` (dot list). So
+    # ``{"post_mlp": "all"}``, ``{"pre_attn": [0, 17]}`` and
+    # ``"pre_attn:0-17;post_mlp:20"`` are all valid. Resolved against the
+    # model's layer count in ``FilesystemConsumer.__init__``. ``global_positions``
+    # is the uniform position selector (``last_prompt`` / ``all_prompt`` /
     # ``all_generated`` / ``all`` / explicit ``list[int]``). ``None``
     # global_hooks keeps the legacy per-request-only behavior.
     #
@@ -98,8 +104,8 @@ class FilesystemConsumerParams:
     # named ``{root}/{default_tag}/{engine_request_id}/...`` — the engine
     # request id is threaded through the manager's dispatch path and used
     # as the per-request directory.
-    global_hooks: dict[str, list[int]] | None = None
-    global_positions: str | list[int] = "last_prompt"
+    global_hooks: dict[str, Any] | str | None = None
+    global_positions: str | list[int] = "all_prompt"
     # Tag (directory) for global-driven captures and the fallback for any
     # request that reaches the consumer without an admission record. Defaults
     # to ``"default"`` to preserve the legacy fallback directory name; set it
