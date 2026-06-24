@@ -1316,9 +1316,19 @@ class EngineCoreProc(EngineCore):
         ):
             if rank_results:
                 merged.update(rank_results)
-        if merged:
+        if not merged:
+            return
+        # Route each request's late results to the front-end that issued it
+        # (default 0), so multi-client / data-parallel deployments don't lose
+        # them to client 0.
+        from collections import defaultdict
+
+        by_client: dict[int, dict] = defaultdict(dict)
+        for rid, res in merged.items():
+            by_client[self.scheduler.take_capture_client_index(rid)][rid] = res
+        for client_index, results in by_client.items():
             self.output_queue.put_nowait(
-                (0, EngineCoreOutputs(late_capture_results=merged))
+                (client_index, EngineCoreOutputs(late_capture_results=results))
             )
 
     def _process_engine_step(self) -> bool:

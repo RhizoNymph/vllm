@@ -104,6 +104,15 @@ class Scheduler(SchedulerInterface):
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
 
+        # ``capture_wait`` late-result routing: capture results can finalize
+        # after the owning request finished (and is no longer tracked), so we
+        # remember its ``client_index`` to route the late ``EngineCoreOutputs``
+        # to the right front-end. Only non-zero clients are recorded — client 0
+        # is the default fallback, so single-front-end deployments stay empty
+        # (no overhead, no leak). Bounded as a backstop for entries whose
+        # results were instead delivered in-band and never late-popped.
+        self._capture_client_index: dict[str, int] = {}
+
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = (
@@ -1901,16 +1910,18 @@ class Scheduler(SchedulerInterface):
 
         # Anything still in ``capture_results`` finalized AFTER its request
         # finished (no EngineCoreOutput exists to carry it). Surface it
-        # batch-level for ``capture_wait`` clients. NOTE: delivered on
-        # client 0's outputs -- the owning client is no longer tracked once
-        # the request finishes; multi-client routing is a follow-up.
-        late_capture_results = {
-            rid: res for rid, res in capture_results.items() if res
-        }
-        if late_capture_results:
-            if 0 not in engine_core_outputs:
-                engine_core_outputs[0] = EngineCoreOutputs()
-            engine_core_outputs[0].late_capture_results = late_capture_results
+        # batch-level for ``capture_wait`` clients, routed to the owning
+        # front-end via the remembered client_index (default 0).
+        late_by_client: dict[int, dict] = defaultdict(dict)
+        for rid, res in capture_results.items():
+            if res:
+                late_by_client[self._capture_client_index.pop(rid, 0)][rid] = res
+        for client_index, results in late_by_client.items():
+            eco = engine_core_outputs.get(client_index)
+            if eco is None:
+                eco = EngineCoreOutputs()
+                engine_core_outputs[client_index] = eco
+            eco.late_capture_results = results
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:
@@ -2114,10 +2125,34 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if (
+                request.client_index != 0
+                and request.sampling_params is not None
+                and request.sampling_params.capture
+            ):
+                self._capture_client_index[request.request_id] = (
+                    request.client_index
+                )
+                # Backstop bound (FIFO): drop the oldest entry if results were
+                # delivered in-band and never late-popped. Late results arrive
+                # within seconds, so live entries are never evicted in practice.
+                while len(self._capture_client_index) > 16384:
+                    self._capture_client_index.pop(
+                        next(iter(self._capture_client_index))
+                    )
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+
+    def take_capture_client_index(self, req_id: str) -> int:
+        """Pop the owning front-end client index for a capture request.
+
+        Used by the engine core's idle-loop late-capture drain to route
+        ``capture_wait`` results to the client that issued the request.
+        Returns 0 (the default front-end) for unrecorded requests.
+        """
+        return self._capture_client_index.pop(req_id, 0)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
