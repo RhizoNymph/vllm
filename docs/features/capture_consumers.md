@@ -60,7 +60,7 @@ Python API):
 | `timeout_seconds` | `float` | `180.0` | Per-write timeout; failures become `partial_error`. |
 | `on_collision` | `"overwrite" \| "error" \| "suffix"` | `"overwrite"` | What to do when the target `.bin` already exists. |
 | `fd_cache_size` | `int` | `256` | Per-thread LRU file-descriptor cache. |
-| `fsync` | `bool` | `True` | `fsync` each file before publish. `False` trades crash-durability for throughput (near-no-op on NFS, where `close` already COMMITs). |
+| `fsync` | `bool` | `True` | `fsync` each file before publish. `False` trades crash-durability for throughput. Near-no-op on a sync NFS export — the per-small-file ceiling there is metadata-RPC count (create/open/close/rename), **not** `fsync`; see [Durability vs. response timing](#durability-vs-response-timing). |
 | `atomic_publish` | `bool` | `True` | Publish via `.tmp` + atomic rename. `False` writes straight to the final path (drops two rename RPCs/file, loses atomic visibility; requires `on_collision="overwrite"`). |
 | `default_layout` | `"per_file" \| "packed" \| "sharded"` | `"per_file"` | Layout for requests that don't set their own `layout`. |
 | `coalesce_max_bytes` | `int` | `1<<20` | Merge consecutive same-key queued writes into one `writev` up to this size (`0` disables). Most effective for `packed`/`sharded`. |
@@ -179,6 +179,33 @@ ceiling. The right lever depends on whether you're disk-bound or code-bound:
 
 For online capture during serving, none of this is on the critical path —
 residual-stream volume at token-generation rate is far below these ceilings.
+
+#### Durability vs. response timing
+
+A request's HTTP response is generated when **text generation** finishes; its
+capture files are written **asynchronously** by the consumer's writer threads
+and may land seconds later. When the files haven't been published by the time
+the response is built, its `capture_results` field reports `status: "pending"`.
+Clients that must read the files should wait for the **expected file set** per
+request (`layers × hooks` files in `per_file` layout, one `packed.*` pair in
+`packed`) rather than sleeping a fixed interval — a fixed sleep races the flush
+and is indistinguishable from data loss. (Servers can instead have the request
+block until capture finalizes; see the `capture_wait` request flag.)
+
+On a **network filesystem the flush tail can dominate** this delay, but the
+governing cost is **metadata-RPC count, not `fsync`**: each `per_file` capture
+incurs create/open/close (and, with `atomic_publish`, rename) round-trips to
+the file server, and that per-small-file rate — not crash-durability syncing —
+is the ceiling. In our benchmarks (driving the writer directly against an NFS
+export over a 20 GbE bond), ~120 KB files moved at ~29 MB/s and ran at the
+**same rate over 1 GbE and the bond** — proof the fabric is irrelevant once
+you're metadata-bound — whereas 64 MB contiguous writes reached ~371 MB/s,
+~93% of the ~398 MB/s raw disk bound. This is why the `fsync`/`atomic_publish`
+toggles are near-no-ops there while the **`packed`/`sharded`** layouts are the
+real lever: for the same small-capture workload, `per_file` ~26 MB/s →
+`packed` (one file per request) ~118 MB/s → `sharded` (many requests per file)
+~93% of the disk bound. A post-batch reader should size its wait to the file
+count, not the byte volume.
 
 #### Backpressure & overload
 
