@@ -11,8 +11,14 @@ from vllm.utils.hashing import safe_hash
 class SteeringConfig:
     """Configuration for per-request activation steering."""
 
-    max_steering_configs: int = Field(default=4, ge=1)
-    """Max number of distinct per-request steering configs in a single batch."""
+    max_steering_configs: int = Field(default=32, ge=1)
+    """Max number of distinct per-request steering configs in a single batch.
+
+    This bounds the worker's steering table rows; the scheduler reserves a row
+    per distinct ``(config_hash, phase)`` and applies backpressure (holds
+    requests in the waiting queue) once the pool is full, so a request that
+    asked for steering is never silently run unsteered. Configs are cheap
+    (one table row each), so this defaults generously."""
 
     def compute_hash(self) -> str:
         """
