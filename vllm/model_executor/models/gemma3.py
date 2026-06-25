@@ -353,8 +353,16 @@ class Gemma3Model(nn.Module):
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
         steering_config = getattr(vllm_config, "steering_config", None)
+        # Buffer rows must cover the static config pool AND the dynamic-override
+        # pool (rows allocated at runtime by RequestSteeringOverride); mirror
+        # get_steering_buffer_config / the runner's warmup table_rows. Omitting
+        # max_dynamic_steering_configs undersizes the table and the override
+        # path writes past it (device-side assert in populate_steering_tables).
         max_steering_configs = (
-            steering_config.max_steering_configs if steering_config else 0
+            steering_config.max_steering_configs
+            + getattr(steering_config, "max_dynamic_steering_configs", 0)
+            if steering_config
+            else 0
         )
         steering_dtype = get_steering_buffer_dtype(vllm_config)
 
