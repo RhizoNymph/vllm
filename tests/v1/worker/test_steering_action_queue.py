@@ -32,7 +32,7 @@ HIDDEN = 16
 class _FakeLayer:
     """Stands in for a decoder layer with steering buffers attached."""
 
-    def __init__(self, hooks: tuple[str, ...] = ("post_mlp",)) -> None:
+    def __init__(self, hooks: tuple[str, ...] = ("post_block",)) -> None:
         for hook in hooks:
             setattr(
                 self,
@@ -66,7 +66,7 @@ class _FakeManager:
 
 def _update(
     layer: int = 0,
-    hook: str = "post_mlp",
+    hook: str = "post_block",
     phase: str = "decode",
     vec: np.ndarray | None = None,
 ) -> SteeringVectorUpdate:
@@ -169,7 +169,7 @@ def test_apply_valid_decode_update_routes_to_tier():
     assert mgr.calls == []
     assert len(mgr.tier_calls) == 1
     hook, layer, tensor = mgr.tier_calls[0]
-    assert (hook, layer) == ("post_mlp", 0)
+    assert (hook, layer) == ("post_block", 0)
     assert torch.equal(tensor, torch.from_numpy(vec))
     assert mgr._tables_dirty
 
@@ -179,11 +179,11 @@ def test_apply_multi_layer_update():
     layers = {0: _FakeLayer(), 1: _FakeLayer()}
     vec = np.ones(HIDDEN, dtype=np.float32)
     update = SteeringVectorUpdate(
-        vectors={"post_mlp": {0: vec, 1: vec * 2}}, phase="decode"
+        vectors={"post_block": {0: vec, 1: vec * 2}}, phase="decode"
     )
     applied, rejected = apply_steering_updates([update], mgr, layers)
     assert (applied, rejected) == (1, 0)
-    assert {(c[0], c[1]) for c in mgr.tier_calls} == {("post_mlp", 0), ("post_mlp", 1)}
+    assert {(c[0], c[1]) for c in mgr.tier_calls} == {("post_block", 0), ("post_block", 1)}
 
 
 @pytest.mark.parametrize("phase", ["base", "prefill"])
@@ -306,10 +306,10 @@ class _RealSteerableLayer(torch.nn.Module):
     def __init__(self, num_rows: int, hidden_size: int):
         super().__init__()
         self.register_buffer(
-            "steering_table_post_mlp", torch.zeros(num_rows, hidden_size)
+            "steering_table_post_block", torch.zeros(num_rows, hidden_size)
         )
         self.register_buffer(
-            "steering_table_post_mlp_dynvec", torch.zeros(hidden_size)
+            "steering_table_post_block_dynvec", torch.zeros(hidden_size)
         )
 
 
@@ -337,10 +337,10 @@ def test_real_manager_decode_update_lands_in_dynamic_tier():
     mgr.populate_steering_tables(layers)
     layer = layers[0]
     torch.testing.assert_close(
-        layer.steering_table_post_mlp_dynvec, torch.from_numpy(vec)
+        layer.steering_table_post_block_dynvec, torch.from_numpy(vec)
     )
     # No table row carries the tier anymore.
-    assert torch.all(layer.steering_table_post_mlp == 0)
+    assert torch.all(layer.steering_table_post_block == 0)
 
 
 def test_real_manager_zero_vector_disengages():
@@ -351,13 +351,13 @@ def test_real_manager_zero_vector_disengages():
         [_update(vec=np.ones(HIDDEN, dtype=np.float32))], mgr, layers
     )
     mgr.populate_steering_tables(layers)
-    assert torch.all(layers[0].steering_table_post_mlp_dynvec == 1.0)
+    assert torch.all(layers[0].steering_table_post_block_dynvec == 1.0)
 
     apply_steering_updates(
         [_update(vec=np.zeros(HIDDEN, dtype=np.float32))], mgr, layers
     )
     mgr.populate_steering_tables(layers)
-    assert torch.all(layers[0].steering_table_post_mlp_dynvec == 0.0)
+    assert torch.all(layers[0].steering_table_post_block_dynvec == 0.0)
 
 
 def test_real_manager_decode_update_composes_with_per_request_config():
@@ -367,7 +367,7 @@ def test_real_manager_decode_update_composes_with_per_request_config():
     mgr, layers = _real_setup()
     req_vec = [2.0] * HIDDEN
     row = mgr.register_config(
-        config_hash=7, vectors={"post_mlp": {0: req_vec}}, phase="decode"
+        config_hash=7, vectors={"post_block": {0: req_vec}}, phase="decode"
     )
     apply_steering_updates(
         [_update(vec=np.ones(HIDDEN, dtype=np.float32))], mgr, layers
@@ -375,8 +375,8 @@ def test_real_manager_decode_update_composes_with_per_request_config():
     mgr.populate_steering_tables(layers)
     layer = layers[0]
     # Row = per-request only (2.0); tier (1.0) is the separate kernel term.
-    assert torch.all(layer.steering_table_post_mlp[row] == 2.0)
-    assert torch.all(layer.steering_table_post_mlp_dynvec == 1.0)
+    assert torch.all(layer.steering_table_post_block[row] == 2.0)
+    assert torch.all(layer.steering_table_post_block_dynvec == 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -408,14 +408,14 @@ def test_validate_scale_rejects_negative_and_nonfinite():
 
 
 def _layers() -> dict:
-    return {0: _FakeLayer(("post_mlp",))}
+    return {0: _FakeLayer(("post_block",))}
 
 
 def test_validate_monitor_accepts_set_and_clear():
     layers = _layers()
     validate_steering_monitor(
         SteeringMonitorUpdate(
-            hook="post_mlp",
+            hook="post_block",
             layer=0,
             probe=np.ones(HIDDEN, np.float32),
             threshold=0.5,
@@ -425,7 +425,7 @@ def test_validate_monitor_accepts_set_and_clear():
     )
     # Clear (probe=None) only needs a valid target.
     validate_steering_monitor(
-        SteeringMonitorUpdate(hook="post_mlp", layer=0, probe=None), layers
+        SteeringMonitorUpdate(hook="post_block", layer=0, probe=None), layers
     )
 
 
@@ -437,7 +437,7 @@ def test_validate_monitor_rejects_bad_hook_and_layer():
         )
     with pytest.raises(SteeringVectorError):
         validate_steering_monitor(
-            SteeringMonitorUpdate(hook="post_mlp", layer=9, probe=None), layers
+            SteeringMonitorUpdate(hook="post_block", layer=9, probe=None), layers
         )
 
 
@@ -446,7 +446,7 @@ def test_validate_monitor_rejects_bad_probe_and_params():
     with pytest.raises(SteeringVectorError):  # wrong size
         validate_steering_monitor(
             SteeringMonitorUpdate(
-                hook="post_mlp", layer=0, probe=np.ones(HIDDEN + 1, np.float32)
+                hook="post_block", layer=0, probe=np.ones(HIDDEN + 1, np.float32)
             ),
             layers,
         )
@@ -454,12 +454,12 @@ def test_validate_monitor_rejects_bad_probe_and_params():
         bad = np.ones(HIDDEN, np.float32)
         bad[0] = np.inf
         validate_steering_monitor(
-            SteeringMonitorUpdate(hook="post_mlp", layer=0, probe=bad), layers
+            SteeringMonitorUpdate(hook="post_block", layer=0, probe=bad), layers
         )
     with pytest.raises(SteeringVectorError):  # negative sharpness
         validate_steering_monitor(
             SteeringMonitorUpdate(
-                hook="post_mlp",
+                hook="post_block",
                 layer=0,
                 probe=np.ones(HIDDEN, np.float32),
                 sharpness=-1.0,
@@ -469,7 +469,7 @@ def test_validate_monitor_rejects_bad_probe_and_params():
     with pytest.raises(SteeringVectorError):  # non-finite threshold
         validate_steering_monitor(
             SteeringMonitorUpdate(
-                hook="post_mlp",
+                hook="post_block",
                 layer=0,
                 probe=np.ones(HIDDEN, np.float32),
                 threshold=float("nan"),

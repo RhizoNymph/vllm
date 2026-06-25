@@ -52,7 +52,7 @@ class _FakeSchedulerOutput:
         self.total_num_scheduled_tokens = sum(scheduled.values())
 
 
-def _slim_manager(keys=((1, "post_mlp"),)) -> CaptureManager:
+def _slim_manager(keys=((1, "post_block"),)) -> CaptureManager:
     hooks: dict[str, list[int]] = {}
     for layer, hook in keys:
         hooks.setdefault(hook, []).append(layer)
@@ -72,7 +72,7 @@ def _slim_manager(keys=((1, "post_mlp"),)) -> CaptureManager:
 class _RunnerStub:
     """Duck-typed receiver for the unbound runner methods under test."""
 
-    def __init__(self, reqs, monitor_keys=((1, "post_mlp"),)):
+    def __init__(self, reqs, monitor_keys=((1, "post_block"),)):
         self.input_batch = _FakeInputBatch(reqs)
         self._sync_capture_buffers = _slim_manager(monitor_keys)
         self._sync_monitor_keys = sorted(monitor_keys)
@@ -109,8 +109,8 @@ def test_step_view_spans_phases_and_token_ids():
     out = stub._build_step_capture_view(_FakeSchedulerOutput({"a": 3, "b": 1}))
 
     assert out.step == 0
-    assert set(out.tensors.keys()) == {(1, "post_mlp")}
-    assert out.tensors[(1, "post_mlp")].shape == (4, HIDDEN)
+    assert set(out.tensors.keys()) == {(1, "post_block")}
+    assert out.tensors[(1, "post_block")].shape == (4, HIDDEN)
 
     a, b = out.requests
     assert (a.req_id, a.start, a.end, a.phase) == ("a", 0, 3, "prefill")
@@ -136,13 +136,13 @@ def test_step_view_tensor_is_zero_copy_of_buffer():
     stub = _RunnerStub(reqs=[{"req_id": "a", "num_computed": 8, "num_prompt": 8}])
     mgr = stub._sync_capture_buffers
     hidden = torch.randn(1, HIDDEN)
-    mgr.on_hook(1, "post_mlp", hidden)
+    mgr.on_hook(1, "post_block", hidden)
 
     out = stub._build_step_capture_view(_FakeSchedulerOutput({"a": 1}))
-    view_tensor = out.tensors[(1, "post_mlp")]
+    view_tensor = out.tensors[(1, "post_block")]
     torch.testing.assert_close(view_tensor, hidden)
     # Zero-copy: writing through the buffer is visible in the view.
-    mgr.global_buffer((1, "post_mlp"))[0].fill_(7.0)
+    mgr.global_buffer((1, "post_block"))[0].fill_(7.0)
     assert bool((view_tensor[0] == 7.0).all())
 
 
@@ -169,7 +169,7 @@ class _BoomConsumer:
 def test_run_sync_consumers_routes_actions_and_isolates_failures():
     stub = _RunnerStub(reqs=[{"req_id": "a", "num_computed": 8, "num_prompt": 8}])
     update = SteeringVectorUpdate(
-        vectors={"post_mlp": {1: np.ones(HIDDEN, dtype=np.float32)}}
+        vectors={"post_block": {1: np.ones(HIDDEN, dtype=np.float32)}}
     )
     good = _ActionsConsumer([update])
     stub._sync_consumers = [("boom", _BoomConsumer()), ("good", good)]
@@ -277,15 +277,15 @@ class _MixinStub(SteeringModelRunnerMixin):
 class _Layer(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.register_buffer("steering_table_post_mlp", torch.zeros(7, HIDDEN))
-        self.register_buffer("steering_table_post_mlp_dynvec", torch.zeros(HIDDEN))
+        self.register_buffer("steering_table_post_block", torch.zeros(7, HIDDEN))
+        self.register_buffer("steering_table_post_block_dynvec", torch.zeros(HIDDEN))
 
 
 def test_apply_actions_routes_vector_updates_to_manager():
     mgr = SteeringManager(max_steering_configs=4, device=None)
     host = _MixinStub(mgr, {1: _Layer()})
     update = SteeringVectorUpdate(
-        vectors={"post_mlp": {1: np.full(HIDDEN, 2.0, dtype=np.float32)}}
+        vectors={"post_block": {1: np.full(HIDDEN, 2.0, dtype=np.float32)}}
     )
     applied, rejected = host._apply_steering_actions([update], source="sync:test")
     assert (applied, rejected) == (1, 0)
@@ -298,8 +298,8 @@ def test_apply_actions_routes_vector_updates_to_manager():
     # Decode updates now land on the dedicated dynamic tier (§5.4), not
     # the global-decode row — applied by the kernel via token_scales.
     layer = host._steerable_layers_cache[1]
-    assert torch.all(layer.steering_table_post_mlp[2] == 0.0)
-    assert torch.all(layer.steering_table_post_mlp_dynvec == 2.0)
+    assert torch.all(layer.steering_table_post_block[2] == 0.0)
+    assert torch.all(layer.steering_table_post_block_dynvec == 2.0)
 
 
 def test_apply_actions_rejects_unknown_action_type():
@@ -313,7 +313,7 @@ def test_apply_actions_rejects_unknown_action_type():
 def test_apply_actions_rejects_when_steering_uninitialized():
     host = _MixinStub(None, {})
     update = SteeringVectorUpdate(
-        vectors={"post_mlp": {1: np.ones(HIDDEN, dtype=np.float32)}}
+        vectors={"post_block": {1: np.ones(HIDDEN, dtype=np.float32)}}
     )
     applied, rejected = host._apply_steering_actions([update], source="s")
     assert (applied, rejected) == (0, 1)
@@ -323,10 +323,10 @@ def test_apply_actions_mixes_good_and_bad():
     mgr = SteeringManager(max_steering_configs=4, device=None)
     host = _MixinStub(mgr, {1: _Layer()})
     good = SteeringVectorUpdate(
-        vectors={"post_mlp": {1: np.ones(HIDDEN, dtype=np.float32)}}
+        vectors={"post_block": {1: np.ones(HIDDEN, dtype=np.float32)}}
     )
     bad_layer = SteeringVectorUpdate(
-        vectors={"post_mlp": {3: np.ones(HIDDEN, dtype=np.float32)}}
+        vectors={"post_block": {3: np.ones(HIDDEN, dtype=np.float32)}}
     )
     applied, rejected = host._apply_steering_actions(
         [good, object(), bad_layer], source="s"

@@ -119,7 +119,7 @@ def test_dynamic_override_one_step_latency_and_targeting():
             "name": "dynamic_steering_e2e",
             "params": {
                 "steer_layer": LAYER,
-                "steer_hook": "post_mlp",
+                "steer_hook": "post_block",
                 "steer_norm": 24.0,
                 "emit_after_steps": 1,
             },

@@ -27,17 +27,17 @@ HIDDEN = 8
 MAX_STATIC = 4
 MAX_DYNAMIC = 2
 NUM_ROWS = MAX_STATIC + MAX_DYNAMIC + 3
-_HP = "post_mlp"
+_HP = "post_block"
 
 
 class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.register_buffer("steering_table_post_mlp", torch.zeros(NUM_ROWS, HIDDEN))
+        self.register_buffer("steering_table_post_block", torch.zeros(NUM_ROWS, HIDDEN))
         self.register_buffer(
-            "steering_table_post_mlp_any_active", torch.zeros(1, dtype=torch.bool)
+            "steering_table_post_block_any_active", torch.zeros(1, dtype=torch.bool)
         )
-        self.register_buffer("steering_table_post_mlp_dynvec", torch.zeros(HIDDEN))
+        self.register_buffer("steering_table_post_block_dynvec", torch.zeros(HIDDEN))
 
 
 def _mgr() -> SteeringManager:
@@ -53,11 +53,11 @@ def _full(value: float) -> torch.Tensor:
 
 
 def _dynvec(layers, idx=0):
-    return layers[idx].steering_table_post_mlp_dynvec
+    return layers[idx].steering_table_post_block_dynvec
 
 
 def _table(layers, idx=0):
-    return layers[idx].steering_table_post_mlp
+    return layers[idx].steering_table_post_block
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ def test_tier_lands_in_dynvec_buffer_not_rows():
     assert torch.all(_dynvec(layers) == 5.0)  # dedicated buffer holds the tier
     assert torch.all(_table(layers) == 0.0)  # NO table row carries it
     # Tier-only still marks the layer active so the kernel runs.
-    assert bool(layers[0].steering_table_post_mlp_any_active.item())
+    assert bool(layers[0].steering_table_post_block_any_active.item())
 
 
 def test_tier_does_not_touch_operator_decode_row():

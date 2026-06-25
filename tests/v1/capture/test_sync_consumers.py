@@ -36,7 +36,7 @@ class _SyncProbe:
         self.seen_views: list[StepCaptureView] = []
 
     def global_capture_spec(self):
-        return CaptureSpec(hooks={"post_mlp": [1]}, positions="all_generated")
+        return CaptureSpec(hooks={"post_block": [1]}, positions="all_generated")
 
     def on_step(self, view):
         self.seen_views.append(view)
@@ -111,7 +111,7 @@ def test_build_sync_consumers_skips_async():
 
     with _patch_registry({"probe": _SyncProbe, "logging": LoggingConsumer}):
         config = [
-            {"name": "logging", "params": {"hooks": {"post_mlp": [0]}}},
+            {"name": "logging", "params": {"hooks": {"post_block": [0]}}},
             {"name": "probe", "params": {}},
         ]
         sync_consumers = _registry.build_sync_consumers(_vllm_config(config))
@@ -178,7 +178,7 @@ def _slim_manager(**overrides) -> CaptureManager:
         consumers=(),
         consumer_specs=(),
         extra_global_specs=(
-            CaptureSpec(hooks={"post_mlp": [1]}, positions="all_generated"),
+            CaptureSpec(hooks={"post_block": [1]}, positions="all_generated"),
         ),
         num_hidden_layers=NUM_LAYERS,
         hidden_size=HIDDEN,
@@ -201,17 +201,17 @@ def test_slim_manager_spawns_no_threads():
 
 def test_slim_manager_allocates_extra_global_buffers():
     mgr = _slim_manager()
-    buf = mgr.global_buffer((1, "post_mlp"))
+    buf = mgr.global_buffer((1, "post_block"))
     assert buf is not None
     assert buf.shape == (MAX_TOKENS, HIDDEN)
-    assert mgr.global_buffer((0, "post_mlp")) is None
+    assert mgr.global_buffer((0, "post_block")) is None
 
 
 def test_slim_manager_on_hook_fills_buffer():
     mgr = _slim_manager()
     hidden = torch.arange(3 * HIDDEN, dtype=torch.float32).reshape(3, HIDDEN)
-    mgr.on_hook(1, "post_mlp", hidden)
-    buf = mgr.global_buffer((1, "post_mlp"))
+    mgr.on_hook(1, "post_block", hidden)
+    buf = mgr.global_buffer((1, "post_block"))
     torch.testing.assert_close(buf[:3], hidden)
     # Non-monitored key: no-op, no crash.
     mgr.on_hook(0, "pre_attn", hidden)
@@ -253,8 +253,8 @@ def test_full_manager_accepts_extra_global_specs():
 
 def test_extra_global_specs_respect_local_layer_range():
     mgr = _slim_manager(
-        extra_global_specs=(CaptureSpec(hooks={"post_mlp": [0, 3]}, positions="all"),),
+        extra_global_specs=(CaptureSpec(hooks={"post_block": [0, 3]}, positions="all"),),
         local_layer_range=(0, 2),
     )
-    assert mgr.global_buffer((0, "post_mlp")) is not None
-    assert mgr.global_buffer((3, "post_mlp")) is None
+    assert mgr.global_buffer((0, "post_block")) is not None
+    assert mgr.global_buffer((3, "post_block")) is None

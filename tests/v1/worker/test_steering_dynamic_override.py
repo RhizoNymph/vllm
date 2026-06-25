@@ -32,32 +32,32 @@ HIDDEN = 8
 MAX_STATIC = 4
 MAX_DYNAMIC = 2
 NUM_ROWS = MAX_STATIC + MAX_DYNAMIC + 3
-_HP = "post_mlp"
+_HP = "post_block"
 
 
 class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.register_buffer("steering_table_post_mlp", torch.zeros(NUM_ROWS, HIDDEN))
+        self.register_buffer("steering_table_post_block", torch.zeros(NUM_ROWS, HIDDEN))
         self.register_buffer(
-            "steering_table_post_mlp_any_active", torch.zeros(1, dtype=torch.bool)
+            "steering_table_post_block_any_active", torch.zeros(1, dtype=torch.bool)
         )
         self.register_buffer(
-            "steering_table_post_mlp_dynvec", torch.zeros(HIDDEN)
+            "steering_table_post_block_dynvec", torch.zeros(HIDDEN)
         )
         self.register_buffer("steering_index", torch.zeros(16, dtype=torch.long))
         self.register_buffer("steering_token_scales", torch.zeros(16))
         self.register_buffer("steering_row_gate", torch.ones(16))
         self.register_buffer("steering_decode_mask", torch.zeros(16))
         self.register_buffer(
-            "steering_table_post_mlp_monitor_probe", torch.zeros(HIDDEN)
+            "steering_table_post_block_monitor_probe", torch.zeros(HIDDEN)
         )
         self.register_buffer(
-            "steering_table_post_mlp_monitor_params",
+            "steering_table_post_block_monitor_params",
             torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32),
         )
         self.register_buffer(
-            "steering_table_post_mlp_monitor_active", torch.zeros(1, dtype=torch.bool)
+            "steering_table_post_block_monitor_active", torch.zeros(1, dtype=torch.bool)
         )
 
 
@@ -150,10 +150,10 @@ def test_populate_composes_dynamic_row_with_global_decode():
     dyn_id, row = mgr.register_dynamic_config(_vec(5.0))
     mgr.populate_steering_tables(layers)
 
-    table = layers[0].steering_table_post_mlp
+    table = layers[0].steering_table_post_block
     assert torch.all(table[row] == 7.0)  # global decode (2) + override (5)
     assert torch.all(table[2] == 2.0)  # global decode row unaffected
-    assert bool(layers[0].steering_table_post_mlp_any_active.item())
+    assert bool(layers[0].steering_table_post_block_any_active.item())
 
 
 def test_populate_dynamic_row_without_globals():
@@ -161,7 +161,7 @@ def test_populate_dynamic_row_without_globals():
     layers = {0: _Layer()}
     _dyn_id, row = mgr.register_dynamic_config(_vec(3.0))
     mgr.populate_steering_tables(layers)
-    assert torch.all(layers[0].steering_table_post_mlp[row] == 3.0)
+    assert torch.all(layers[0].steering_table_post_block[row] == 3.0)
 
 
 def test_update_dynamic_config_rewrites_same_row():
@@ -169,12 +169,12 @@ def test_update_dynamic_config_rewrites_same_row():
     layers = {0: _Layer()}
     dyn_id, row = mgr.register_dynamic_config(_vec(1.0))
     mgr.populate_steering_tables(layers)
-    assert torch.all(layers[0].steering_table_post_mlp[row] == 1.0)
+    assert torch.all(layers[0].steering_table_post_block[row] == 1.0)
 
     mgr.update_dynamic_config(dyn_id, _vec(9.0))
     assert mgr._tables_dirty
     mgr.populate_steering_tables(layers)
-    assert torch.all(layers[0].steering_table_post_mlp[row] == 9.0)
+    assert torch.all(layers[0].steering_table_post_block[row] == 9.0)
     assert mgr.get_dynamic_row(dyn_id) == row
 
 
@@ -195,7 +195,7 @@ def test_register_populate_release_register_cycle():
     id2, row2 = mgr.register_dynamic_config(_vec(4.0))
     assert row2 == row1
     mgr.populate_steering_tables(layers)
-    assert torch.all(layers[0].steering_table_post_mlp[row2] == 4.0)
+    assert torch.all(layers[0].steering_table_post_block[row2] == 4.0)
 
 
 def test_dynamic_and_static_rows_coexist_in_populate():
@@ -204,7 +204,7 @@ def test_dynamic_and_static_rows_coexist_in_populate():
     static_row = mgr.register_config(config_hash=7, vectors=_vec(2.0), phase="decode")
     _dyn_id, dyn_row = mgr.register_dynamic_config(_vec(5.0))
     mgr.populate_steering_tables(layers)
-    table = layers[0].steering_table_post_mlp
+    table = layers[0].steering_table_post_block
     assert torch.all(table[static_row] == 2.0)
     assert torch.all(table[dyn_row] == 5.0)
     assert static_row != dyn_row
@@ -480,7 +480,7 @@ def test_override_only_state_defeats_nothing_active_short_circuit():
     host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
     steering_index = host._steerable_layers_cache[0].steering_index
     assert int(steering_index[0]) == dyn_row
-    table = host._steerable_layers_cache[0].steering_table_post_mlp
+    table = host._steerable_layers_cache[0].steering_table_post_block
     assert torch.all(table[dyn_row] == 5.0)
 
 
@@ -489,13 +489,13 @@ def test_monitor_only_state_defeats_nothing_active_short_circuit():
     still populate so the monitor's active flag is written (Phase 2)."""
     host = _MixinHost([_decode_req()])
     host._steering_manager.set_monitor(
-        "post_mlp", 0, torch.ones(HIDDEN), threshold=0.0, sharpness=4.0
+        "post_block", 0, torch.ones(HIDDEN), threshold=0.0, sharpness=4.0
     )
     host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
     layer = host._steerable_layers_cache[0]
-    assert bool(layer.steering_table_post_mlp_monitor_active.item())
+    assert bool(layer.steering_table_post_block_monitor_active.item())
     torch.testing.assert_close(
-        layer.steering_table_post_mlp_monitor_params,
+        layer.steering_table_post_block_monitor_params,
         torch.tensor([0.0, 4.0, 0.0], dtype=torch.float32),
     )
 
@@ -508,7 +508,7 @@ def test_monitor_update_dispatches_through_apply_path():
     applied, rejected = host._apply_steering_actions(
         [
             SteeringMonitorUpdate(
-                hook="post_mlp",
+                hook="post_block",
                 layer=0,
                 probe=probe,
                 threshold=1.0,
@@ -519,11 +519,11 @@ def test_monitor_update_dispatches_through_apply_path():
         source="s",
     )
     assert (applied, rejected) == (1, 0)
-    cfg = host._steering_manager.monitor_configs["post_mlp"][0]
+    cfg = host._steering_manager.monitor_configs["post_block"][0]
     assert cfg["threshold"] == 1.0 and cfg["sharpness"] == 3.0
     # Clear.
     host._apply_steering_actions(
-        [SteeringMonitorUpdate(hook="post_mlp", layer=0, probe=None, source="s")],
+        [SteeringMonitorUpdate(hook="post_block", layer=0, probe=None, source="s")],
         source="s",
     )
     assert not host._steering_manager.has_monitor
@@ -534,7 +534,7 @@ def test_monitor_update_bad_probe_rejected():
     applied, rejected = host._apply_steering_actions(
         [
             SteeringMonitorUpdate(
-                hook="post_mlp",
+                hook="post_block",
                 layer=0,
                 probe=np.ones(HIDDEN + 5, np.float32),
                 source="s",
@@ -551,15 +551,15 @@ def test_clearing_monitor_deactivates_flag_on_transition():
     nothing-active transition must zero its active flag."""
     host = _MixinHost([_decode_req()])
     host._steering_manager.set_monitor(
-        "post_mlp", 0, torch.ones(HIDDEN), 0.0, 4.0
+        "post_block", 0, torch.ones(HIDDEN), 0.0, 4.0
     )
     host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
     layer = host._steerable_layers_cache[0]
-    assert bool(layer.steering_table_post_mlp_monitor_active.item())
+    assert bool(layer.steering_table_post_block_monitor_active.item())
     # Clear and step again → short-circuit transition deactivates.
     host._steering_manager.clear_monitor()
     host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
-    assert not bool(layer.steering_table_post_mlp_monitor_active.item())
+    assert not bool(layer.steering_table_post_block_monitor_active.item())
 
 
 # ---------------------------------------------------------------------------
@@ -707,7 +707,7 @@ def test_token_scales_gate_decode_gets_gain_prefill_zero():
     assert torch.all(tscales[1:4] == 0.0)  # p1 prefill tokens → 0
     # dvec buffer carries the tier vector.
     assert torch.all(
-        host._steerable_layers_cache[0].steering_table_post_mlp_dynvec == 1.0
+        host._steerable_layers_cache[0].steering_table_post_block_dynvec == 1.0
     )
 
 
@@ -723,7 +723,7 @@ def test_tier_only_state_defeats_nothing_active_short_circuit():
     tscales = host._steerable_layers_cache[0].steering_token_scales
     assert float(tscales[0]) == 1.0  # gate written → not short-circuited
     assert torch.all(
-        host._steerable_layers_cache[0].steering_table_post_mlp_dynvec == 4.0
+        host._steerable_layers_cache[0].steering_table_post_block_dynvec == 4.0
     )
 
 

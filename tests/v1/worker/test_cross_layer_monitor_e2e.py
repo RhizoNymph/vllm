@@ -6,7 +6,7 @@ L, gate at layers ≥ L"). The unit tests prove the branch wiring; this proves
 the cross-layer reach AND the graph ordering end to end on a real ``LLM``.
 
 Setup: ``enable_cross_layer_monitor=True`` + a strong dynamic **tier** vector at
-``TIER_LAYER`` (post_mlp). A saturating gate-OFF monitor (probe=0,
+``TIER_LAYER`` (post_block). A saturating gate-OFF monitor (probe=0,
 threshold=+1e6 ⇒ gate≈0) multiplies the shared ``token_scales`` the tier reads.
 
 - monitor BEFORE the tier ⇒ the gate (written at L < tier) reaches the tier ⇒
@@ -40,7 +40,7 @@ import torch
 MODEL = os.environ.get("DYNSTEER_E2E_MODEL", "google/gemma-4-E2B-it")
 TIER_LAYER = int(os.environ.get("DYNSTEER_E2E_LAYER", "40"))
 IS_LOCAL = MODEL.endswith(".gguf") or os.path.exists(MODEL)
-HOOK = "post_mlp"
+HOOK = "post_block"
 PROMPT = "The capital of France is"
 MAX_TOKENS = 32
 

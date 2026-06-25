@@ -33,7 +33,7 @@ from vllm.model_executor.layers.steering import (
 HIDDEN = 8
 MAX_TOKENS = 4
 MAX_CONFIGS = 2
-HOOK = SteeringHookPoint.POST_MLP
+HOOK = SteeringHookPoint.POST_BLOCK
 
 
 def _make_module() -> nn.Module:

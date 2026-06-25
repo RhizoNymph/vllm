@@ -22,15 +22,15 @@ HIDDEN = 8
 MAX_STATIC = 4
 MAX_DYNAMIC = 2
 NUM_ROWS = MAX_STATIC + MAX_DYNAMIC + 3
-_HP = "post_mlp"
+_HP = "post_block"
 
 
 class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.register_buffer("steering_table_post_mlp", torch.zeros(NUM_ROWS, HIDDEN))
+        self.register_buffer("steering_table_post_block", torch.zeros(NUM_ROWS, HIDDEN))
         self.register_buffer(
-            "steering_table_post_mlp_any_active", torch.zeros(1, dtype=torch.bool)
+            "steering_table_post_block_any_active", torch.zeros(1, dtype=torch.bool)
         )
         self.register_buffer("steering_scales", torch.ones(NUM_ROWS))
 
@@ -110,7 +110,7 @@ def test_scales_only_cheap_path_does_not_touch_table():
     layers = {0: _Layer()}
     mgr.update_global_vectors(_HP, 0, torch.full((HIDDEN,), 4.0), phase="decode")
     mgr.populate_steering_tables(layers)
-    table_before = layers[0].steering_table_post_mlp.clone()
+    table_before = layers[0].steering_table_post_block.clone()
 
     # A scale-only change sets _scales_dirty (not _tables_dirty).
     mgr.set_global_scale("decode", 0.25)
@@ -119,7 +119,7 @@ def test_scales_only_cheap_path_does_not_touch_table():
 
     assert _scales(layers)[2].item() == 0.25
     # The table content is untouched (vector not re-uploaded).
-    assert torch.equal(layers[0].steering_table_post_mlp, table_before)
+    assert torch.equal(layers[0].steering_table_post_block, table_before)
     assert not mgr._scales_dirty
 
 

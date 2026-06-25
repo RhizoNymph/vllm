@@ -17,7 +17,7 @@ import torch
 from vllm.v1.worker.steering_manager import SteeringManager
 
 HIDDEN = 8
-_HP = "post_mlp"
+_HP = "post_block"
 
 
 def _mgr() -> SteeringManager:

@@ -20,26 +20,26 @@ HIDDEN = 8
 MAX_STATIC = 4
 MAX_DYNAMIC = 2
 NUM_ROWS = MAX_STATIC + MAX_DYNAMIC + 3
-_HP = "post_mlp"
+_HP = "post_block"
 
 
 class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.register_buffer("steering_table_post_mlp", torch.zeros(NUM_ROWS, HIDDEN))
+        self.register_buffer("steering_table_post_block", torch.zeros(NUM_ROWS, HIDDEN))
         self.register_buffer(
-            "steering_table_post_mlp_any_active", torch.zeros(1, dtype=torch.bool)
+            "steering_table_post_block_any_active", torch.zeros(1, dtype=torch.bool)
         )
-        self.register_buffer("steering_table_post_mlp_dynvec", torch.zeros(HIDDEN))
+        self.register_buffer("steering_table_post_block_dynvec", torch.zeros(HIDDEN))
         self.register_buffer(
-            "steering_table_post_mlp_monitor_probe", torch.zeros(HIDDEN)
+            "steering_table_post_block_monitor_probe", torch.zeros(HIDDEN)
         )
         self.register_buffer(
-            "steering_table_post_mlp_monitor_params",
+            "steering_table_post_block_monitor_params",
             torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32),
         )
         self.register_buffer(
-            "steering_table_post_mlp_monitor_active", torch.zeros(1, dtype=torch.bool)
+            "steering_table_post_block_monitor_active", torch.zeros(1, dtype=torch.bool)
         )
 
 
@@ -52,15 +52,15 @@ def _mgr() -> SteeringManager:
 
 
 def _probe(layers, idx=0):
-    return layers[idx].steering_table_post_mlp_monitor_probe
+    return layers[idx].steering_table_post_block_monitor_probe
 
 
 def _params(layers, idx=0):
-    return layers[idx].steering_table_post_mlp_monitor_params
+    return layers[idx].steering_table_post_block_monitor_params
 
 
 def _active(layers, idx=0):
-    return bool(layers[idx].steering_table_post_mlp_monitor_active.item())
+    return bool(layers[idx].steering_table_post_block_monitor_active.item())
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +151,7 @@ def test_monitor_independent_of_table_rows():
     mgr.populate_steering_tables(layers)
     # Monitor active; table rows untouched (all zero — no operator steering).
     assert _active(layers)
-    assert torch.all(layers[0].steering_table_post_mlp == 0.0)
+    assert torch.all(layers[0].steering_table_post_block == 0.0)
 
 
 if __name__ == "__main__":

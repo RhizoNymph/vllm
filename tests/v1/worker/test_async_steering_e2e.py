@@ -76,7 +76,7 @@ def _build_llm():
                 "name": "steering_ex_async_tier",
                 "params": {
                     "steer_layer": LAYER,
-                    "steer_hook": "post_mlp",
+                    "steer_hook": "post_block",
                     "steer_norm": 24.0,
                 },
             }

@@ -91,7 +91,7 @@ def _two_outputs(params: dict) -> tuple[list[int], list[int]]:
         del llm
 
 
-_BASE = {"steer_layer": LAYER, "steer_hook": "post_mlp", "steer_norm": 24.0,
+_BASE = {"steer_layer": LAYER, "steer_hook": "post_block", "steer_norm": 24.0,
          "emit_after_steps": 1}
 
 

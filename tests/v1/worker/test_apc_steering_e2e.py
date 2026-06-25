@@ -51,7 +51,7 @@ def test_steered_continuation_does_not_reuse_steered_decode_kv():
             "name": "dynamic_steering_e2e",
             "params": {
                 "steer_layer": LAYER,
-                "steer_hook": "post_mlp",
+                "steer_hook": "post_block",
                 "steer_norm": 24.0,
                 "emit_after_steps": 1,
             },
