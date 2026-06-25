@@ -24,6 +24,7 @@ from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
     apply_block_steering,
     apply_layer_steering,
+    register_steering_buffers,
 )
 
 
@@ -111,6 +112,60 @@ def test_block_output_differs_from_post_attn(monkeypatch):
     torch.testing.assert_close(post_block_capture - post_attn_capture, hidden)
 
 
+def _emit_recorder(monkeypatch):
+    """Replace the shared op-emitting helper with a recorder.
+
+    Returns the list of ``(x, hook_point)`` it was called with. Lets the
+    CPU tests assert *which* tensor/hook each entry point steers without
+    needing the CUDA-only ``apply_steering`` op.
+    """
+    seen: list[tuple[torch.Tensor, SteeringHookPoint]] = []
+
+    def _record(module, x, hook_point):
+        seen.append((x, hook_point))
+        return x
+
+    monkeypatch.setattr(steering_mod, "_emit_steering_op", _record)
+    return seen
+
+
+def test_block_steering_routes_through_shared_emit(monkeypatch):
+    """Regression: ``apply_block_steering`` must steer ``residual`` via the
+    shared ``_emit_steering_op`` helper (POST_BLOCK), not a stale hand-rolled
+    op call. Before the fix it emitted a 4-arg ``apply_steering`` against the
+    12-arg op, crashing torch.compile tracing of the default hook."""
+    _intercept_capture(monkeypatch, manager=None)
+    seen = _emit_recorder(monkeypatch)
+    layer = _Layer()
+    # Only the table needs to exist for the hasattr gate to pass.
+    layer.register_buffer(
+        HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_BLOCK], torch.zeros(5, 8)
+    )
+    hidden = torch.randn(3, 8)
+    residual = torch.randn(3, 8)
+
+    out_hidden, out_residual = apply_block_steering(layer, hidden, residual)
+
+    assert len(seen) == 1
+    steered_x, hook = seen[0]
+    assert hook == SteeringHookPoint.POST_BLOCK
+    torch.testing.assert_close(steered_x, residual)  # steers residual, not hidden
+    torch.testing.assert_close(out_hidden, hidden)
+
+
+def test_apply_steering_op_schema_has_full_arity():
+    """The registered op carries the full 12-arg dynamic signature; both
+    entry points build a call of this arity via ``_emit_steering_op``. Guards
+    the op side of the same regression."""
+    import vllm.model_executor.layers.steering  # noqa: F401  registers the op
+
+    schema = torch.ops.vllm.apply_steering.default._schema
+    assert len(schema.arguments) == 12, (
+        f"apply_steering op has {len(schema.arguments)} args; "
+        "callers in _emit_steering_op must match exactly"
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_steering_rides_residual_not_hidden(monkeypatch):
     """When a table is active, steering is added to ``residual``; ``hidden``
@@ -118,14 +173,24 @@ def test_steering_rides_residual_not_hidden(monkeypatch):
     _intercept_capture(monkeypatch, manager=None)  # capture irrelevant here
     device = torch.device("cuda")
     layer = _Layer().to(device)
+    # Register the full per-hook + shared buffer set (scales default to 1.0,
+    # monitor/tier inactive) so the real 12-arg op runs.
+    register_steering_buffers(
+        layer,
+        16,
+        max_steering_tokens=8,
+        max_steering_configs=2,
+        dtype=torch.float16,
+    )
+    layer.to(device)
     hidden = torch.randn(3, 16, dtype=torch.float16, device=device)
     residual = torch.randn(3, 16, dtype=torch.float16, device=device)
 
     table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_BLOCK]
     flag_attr = HOOK_POINT_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
     table = torch.randn(5, 16, dtype=torch.float16, device=device)
-    layer.register_buffer(table_attr, table)
-    layer.register_buffer(flag_attr, torch.ones(1, dtype=torch.bool, device=device))
+    setattr(layer, table_attr, table)
+    setattr(layer, flag_attr, torch.ones(1, dtype=torch.bool, device=device))
     layer.steering_index = torch.tensor([0, 1, 2], dtype=torch.long, device=device)
 
     out_hidden, out_residual = apply_block_steering(layer, hidden, residual)
