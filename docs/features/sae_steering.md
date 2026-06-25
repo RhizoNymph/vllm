@@ -1,41 +1,41 @@
-# SAE-Based Steering (Delta / Feature-Surgery)
+# SAE-Based Steering (Delta + Full Reconstruction)
 
-> **Status:** design doc, not yet implemented. Companion to
-> [`steering.md`](steering.md) and
+> **Status:** delta path fully implemented (Triton kernel + buffers +
+> custom op + worker admission).  Full-reconstruction path implemented
+> (compaction-based CUDA path + buffers + custom op + worker admission).
+> Companion to [`steering.md`](steering.md) and
 > [`../design/steering_runtime.md`](../design/steering_runtime.md).
-> This document defines the contract for the next-generation steering
-> path that lifts the per-token operation from "additive vector" to
-> "feature-level surgery on a sparse autoencoder."
 
 ## In Scope
 
-- Per-(layer, hook_point) **SAE feature surgery**: encode the live
-  residual into SAE feature space, replace a small set of named feature
-  activations with caller-supplied clamp values (or relative offsets),
-  and add the resulting decoder-direction delta back into the residual.
+- Per-(layer, hook_point) **SAE feature surgery (delta)**: encode the
+  live residual into SAE feature space, replace a small set of named
+  feature activations with caller-supplied clamp values (or relative
+  offsets), and add the resulting decoder-direction delta back into the
+  residual.
+- **SAE full reconstruction**: replace the residual entirely with the
+  SAE's `decode(activate(encode(h))) + b_dec`, optionally with
+  per-(layer, hook) clamps applied to the activation before decode.
+  Sibling kind (`SteeringModuleKind.SAE_FULL_RECONSTRUCTION`, wire
+  value `sae_full_reconstruction`) registered alongside delta modules.
 - Loading SAE weights as a new kind of named steering module
-  (`SteeringModuleKind.SAE`), distinct from the existing additive
-  `vectors`-based modules.
+  (`SteeringModuleKind.SAE_DELTA` for the delta path,
+  `SteeringModuleKind.SAE_FULL_RECONSTRUCTION` for the replacement
+  variant), distinct from the existing additive `vectors`-based
+  modules.
 - Per-request clamp specs: a request says "for SAE module `golden_gate`,
   clamp feature 34 to value 5.0 in the post-MLP hook on layer 20."
 - Composition with the existing additive tier (additive vector + SAE
-  delta on the same hook).
+  delta + SAE full reconstruction on the same hook, in that order).
 - TP / PP correctness, prefix-cache correctness, CUDA-graph compatibility.
 
 ## Out of Scope
-
-- **Full SAE forward pass with reconstruction-replacement** (Anthropic
-  Scaling Monosemanticity / Golden Gate Claude semantics: replace `x`
-  with `decode(modify(encode(x)))` and discard `x`'s reconstruction
-  error). That is a different op with materially different cost,
-  numerical, and prefix-cache properties. It can be added later as a
-  parallel `SteeringModuleKind.SAE_FULL_RECONSTRUCTION` without
-  reshaping the surface defined here.
 - **Training SAEs.** Weights are loaded from disk (Gemma Scope, Llama
   Scope, user-provided checkpoints, etc.).
-- **Cross-layer crosscoders / transcoders.** Each SAE module here is
-  scoped to a single (layer, hook_point) pair; composition across layers
-  happens by registering multiple modules.
+- **Cross-layer crosscoders / transcoders.** Each SAE site is bound to
+  one `(layer, hook_point)` pair, but one registered SAE module may
+  cover multiple independent sites when its manifest lists multiple
+  pairs. The runtime does not model cross-layer feature interactions.
 - **Probe-based / classifier-based steering.** This document is
   specifically about decoder-direction interventions on SAE feature
   activations.
@@ -65,8 +65,8 @@ admission-and-row-allocation contract in
 fixed-cost-per-feature-clamp op composes naturally with that contract,
 preserves the existing additive kernel as a hot path, and avoids
 inflicting SAE reconstruction error on tokens that are not being
-steered. The full-reconstruction variant is left as a future module
-kind; it is not on the critical path.
+steered. The full-reconstruction runtime is left as follow-up work; the
+current branch only ships its eager math primitive.
 
 ## Type System
 
@@ -79,66 +79,49 @@ class SteeringModuleKind(str, Enum):
     SAE_DELTA = "sae_delta" # this document: encode -> clamp -> decoder-direction delta
 
 @dataclass
-class SAELayerWeights:
-    """Single (layer, hook_point) SAE bound to one position in the model."""
-    layer_idx: int
-    hook_point: SteeringHookPoint
-    # Encoder rows used at inference time. Shape (d_sae, d_model).
-    # We only need rows for features that may be clamped; in the common
-    # case d_sae is large (32k-128k) but |clampable_features| is small.
-    # See "Encoder Footprint" below.
-    encoder_weight: torch.Tensor      # (d_sae, d_model) or (k_clamp, d_model)
-    encoder_bias: torch.Tensor        # (d_sae,) or (k_clamp,)
-    decoder_weight: torch.Tensor      # (d_sae, d_model) — full, for decoder rows
-    activation: SAEActivation         # ReLU / TopK / JumpReLU
-    # JumpReLU threshold or TopK k, optional depending on activation.
-    activation_params: dict[str, float] | None = None
-    feature_index_map: dict[int, int] | None = None  # public_id -> internal_row
-
-@dataclass
-class SAESteeringModule:
-    name: str
-    kind: Literal[SteeringModuleKind.SAE_DELTA]
+class SAEModuleManifest:
     d_model: int
     d_sae: int
-    layers: dict[tuple[int, str], SAELayerWeights]  # (layer_idx, hook_point_str)
+    activation: SAEActivation
+    layers: tuple[tuple[int, str], ...]       # (layer_idx, hook_point_str)
+    clampable_features: tuple[int, ...]       # row order for loaded weights
+    activation_params: dict[str, float] = field(default_factory=dict)
+    weights_uri: str | None = None
 
 @dataclass(frozen=True)
 class SAEClampEntry:
     feature_idx: int
-    # Exactly one of these is set:
-    target_value: float | None = None     # absolute clamp: f_i := target_value
-    additive: float | None = None         # relative: f_i := f_i + additive
+    kind: Literal["absolute", "additive"]
+    value: float
     # If True, only apply when f_i > 0 in the live encoder pass; otherwise
     # always apply. Lets users say "amplify when present" vs "force-set".
     only_if_active: bool = False
-    # Derived in __post_init__: whether this entry needs the encoder
-    # GEMM at runtime. True iff target_value is set OR only_if_active
-    # is True. False for plain `additive` entries that don't gate on
-    # the live activation. The kernel skips the encoder pass entirely
-    # when no active clamp entry needs it.
+    # Derived in __post_init__: whether this entry semantically needs
+    # the live encoder activation. True for absolute clamps or
+    # `only_if_active` additive clamps; False for plain additive
+    # entries whose delta is independent of the live activation.
     requires_encoder_pass: bool = field(init=False)
 
 @dataclass(frozen=True)
 class SAEClampSpec:
     """Per-request clamp spec for one SAE module."""
     module_name: str
-    # (layer_idx, hook_point) -> list of clamp entries
-    clamps: dict[tuple[int, SteeringHookPoint], tuple[SAEClampEntry, ...]]
+    # hook_point -> layer_idx -> clamp entries
+    clamps: dict[str, dict[int, tuple[SAEClampEntry, ...]]]
+    phase: Literal["both", "prefill", "decode"] = "both"
 ```
 
-`target_value` and `additive` are mutually exclusive at the type level
-via a discriminated-union helper (validated at construction). The
-`only_if_active` flag distinguishes the "Golden-Gate-style amplify"
-semantics from the "force a feature on" semantics; both are common in
-the literature.
+`kind="absolute"` means `f_i := value`; `kind="additive"` means
+`f_i := f_i + value`. The `only_if_active` flag distinguishes the
+"Golden-Gate-style amplify" semantics from the "force a feature on"
+semantics; both are common in the literature.
 
 ## Data Flow
 
 ### Startup
 
 1. Operator registers an SAE module via either:
-   - CLI: `--steering-modules sae:golden_gate=/path/to/sae_dir/` where
+   - CLI: `--steering-modules golden_gate=/path/to/sae_dir/` where
      `sae_dir/` contains a `manifest.json` plus per-layer weight
      tensors in safetensors.
    - Runtime API: `POST /v1/steering/modules/register` with
@@ -154,13 +137,14 @@ the literature.
    - Filters `module.layers` by `_locally_owned_layers` (PP sharding).
    - For each owned `(layer_idx, hook_point)`, materializes the weight
      tensors on the worker's device, in the model's compute dtype.
-   - Stashes the module under `worker.sae_modules[name]`.
+   - Stashes the manifest under the worker-side SAE module registry.
 
 Cross-rank invariant: the *set of clampable feature indices* and the
 *module name → (layer, hook) → row layout* must be byte-identical
 across ranks, because per-request clamp configs are hashed and turned
-into shared row indices via the existing `SteeringManager` machinery.
-Weight tensors themselves are local; only the schema is replicated.
+into shared row indices via deterministic replay in the SAE clamp
+manager. Weight tensors themselves are local; only the schema is
+replicated.
 
 ### Per-Request Admission
 
@@ -171,27 +155,26 @@ since multiple SAE modules can compose). The admission pipeline:
    computed on the engine side, identical on every worker. Prefix-cache
    keys reuse this hash for prefill-affecting tiers, exactly like the
    additive path.
-2. The scheduler reserves capacity in
-   `SteeringManager.max_steering_configs` *before* dispatch, identical
-   to the existing flow.
+2. The scheduler reserves capacity in the additive and SAE row pools
+   independently before dispatch. A request using both paths may need
+   one row in each pool.
 3. On admission, the worker resolves each `SAEClampSpec` against the
-   broadcast SAE registry, allocates a per-`(name, phase)` row in a new
-   parallel structure (`SAEClampManager`, see below), and writes the
-   row's contents into per-layer SAE clamp tables.
+   broadcast SAE registry, allocates a `(config_hash, phase)` entry in
+   `SAEClampManager`, and writes the row's contents into per-layer SAE
+   clamp tables.
 
 ### Per-Step Forward
 
-For each steerable decoder layer with at least one clamp active, the
-new op `apply_layer_sae_delta(hidden_states, sae_clamp_table_*)` runs
-*after* the existing `apply_layer_steering` additive call. The
-existing additive path is unchanged.
+For each decoder layer with SAE buffers attached, the SAE delta runs
+after the existing additive steering stage inside `apply_layer_steering`.
+The existing additive path remains the first stage.
 
 ```python
 # Existing, unchanged:
 hidden = apply_layer_steering(hidden, hook_point=POST_MLP)
 
-# New, only enters the graph if at least one SAE module is registered
-# AND at least one row in this batch needs SAE delta on this hook:
+# SAE stage is present only when SAE buffers are attached; it becomes
+# a runtime no-op when no row in this batch needs SAE delta on this hook.
 hidden = apply_layer_sae_delta(hidden, hook_point=POST_MLP)
 ```
 
@@ -204,9 +187,9 @@ so torch.compile treats it as an opaque splitting point, mirroring
 # (1) Project residual onto the encoder rows for the clamp targets.
 #     pre_acts = h @ W_enc_clamped.T + b_enc_clamped
 # (2) Apply activation (ReLU / JumpReLU / TopK-mask) -> live f.
-# (3) Compute delta = clamp(f, target) - f, where the clamp comes from
-#     the row of sae_clamp_table for r (target_value, additive,
-#     only_if_active flags packed into a small struct per feature).
+# (3) Compute delta = clamp(f, kind/value) - f, where the clamp comes
+#     from the row of sae_clamp_table for r (kind, value,
+#     only_if_active flags packed per feature).
 # (4) Add delta @ W_dec_clamped to h.
 ```
 
@@ -224,8 +207,10 @@ also phase-aware:
 ```text
 effective_prefill = additive_prefill_effective (existing)
                   + sae_delta(prefill_clamps)
+                  + sae_full_reconstruction(prefill_specs)
 effective_decode  = additive_decode_effective (existing)
                   + sae_delta(decode_clamps)
+                  + sae_full_reconstruction(decode_specs)
 ```
 
 The two paths share the same `(config_hash, phase)` keying so prefill
@@ -241,24 +226,33 @@ New files:
   `apply_layer_sae_delta`, custom-op registration, per-layer buffer
   allocation analogous to `register_steering_buffers`.
 - `vllm/model_executor/layers/sae_steering_kernel.py` — Triton kernel.
+- `vllm/model_executor/layers/sae_full_reconstruction.py` — public op
+  `apply_layer_sae_full_reconstruction` + custom-op registration +
+  per-(layer, hook) buffer allocation for the replacement variant.
+- `vllm/model_executor/layers/sae_full_reconstruction_kernel.py` —
+  compaction-based CUDA path that runs the encoder / clamp / decoder
+  math only on active tokens (`recon_mask=True`); cuBLAS-backed
+  matmul on the dense subset.
+- `vllm/v1/worker/sae_full_reconstruction_manager.py` — per-request
+  row allocator for the full-reconstruction path, parallel to
+  `SAEClampManager`.
 - `vllm/v1/worker/sae_clamp_manager.py` — clamp-table allocator,
   parallel to `SteeringManager`. Shares the determinism-by-replay
   contract; no cross-rank collectives in the hot path.
-- `vllm/v1/worker/sae_module_registry.py` — worker-side SAE weight
-  registry, keyed by name; populated by `collective_rpc` broadcast.
 - `vllm/entrypoints/openai/steering/sae_loader.py` — manifest +
   safetensors reader. Validates dtype, shape, hook-point names,
   `d_model` against the loaded model's hidden size.
-- `tests/models/language/generation/test_sae_steering.py` — small
-  end-to-end fixture test plus a numeric equivalence test against an
-  eager Python reference.
+- `tests/models/language/generation/test_sae_steering_real_weights.py`
+  — CUDA-gated real-weights generation tests against a Gemma Scope SAE.
+- `tests/model_executor/layers/test_sae_full_reconstruction_op.py`
+  — CPU reference tests for the eager full-reconstruction primitive.
 
 Touched files:
 
 - `vllm/sampling_params.py` — add `sae_clamp_specs` field; validation
   delegates to `SAEClampSpec.__post_init__`.
 - `vllm/config/steering_types.py` — extend `hash_steering_config` to
-  fold SAE clamp specs into the hash; add `merge_sae_clamp_specs`.
+  fold SAE clamp specs into the hash.
 - `vllm/v1/worker/steering_model_runner_mixin.py` — wire SAE clamp
   manager alongside the additive `_steering_manager`. Phase transition
   and resumption paths register/release SAE rows the same way the
@@ -268,18 +262,15 @@ Touched files:
   their current behavior under `kind="additive"`.
 - `vllm/entrypoints/serve/steering/modules_router.py` — accept
   `kind: "sae_delta"` and an SAE manifest payload.
-- Decoder `*.py` files: **no changes**. The new op is wired only at the
-  layer-hook call sites that already exist for `apply_layer_steering`,
-  via a sibling call. (Phased plan below makes this concrete.)
-- `docs/features/steering.md` — cross-link to this doc.
-- `docs/design/steering_runtime.md` — add an "SAE delta" subsection
-  describing the parallel admission flow.
+- Decoder `*.py` files: **no changes**. The SAE delta dispatch is
+  centralized inside `apply_layer_steering`, so existing layer-hook call
+  sites pick it up without per-model edits.
 
 ## Invariants and Constraints
 
 - **Determinism contract is preserved.** Every worker sees identical
   registry-broadcast and identical scheduler output, so every worker
-  derives identical `sae_config_to_row` mappings, even if it owns
+  derives identical SAE `config_to_row` mappings, even if it owns
   zero layers of a given module under PP. Row-allocation is rank-local
   but symmetric, exactly as for the additive manager.
 - **Capacity is strict.** `--max-steering-configs` continues to gate
@@ -334,11 +325,9 @@ The encoder is the memory-cost question. Two options:
 
 We adopt option 2 for the initial implementation. Operators who want
 "any feature may be clamped at runtime" can declare the full feature
-set explicitly and pay option 1's cost. The decoder is always loaded
-in full because feature-deltas can index any decoder row at runtime;
-in practice operators who load only a partial encoder will also load
-only the matching decoder rows, and the registry enforces that the
-encoder/decoder row sets are equal.
+set explicitly and pay option 1's cost. Encoder and decoder buffers
+are both loaded only for the declared `clampable_features` rows, and
+the registry/loader enforce that the row sets and ordering match.
 
 ## Phased Rollout
 
@@ -347,8 +336,9 @@ encoder/decoder row sets are equal.
      the broadcast machinery for SAE modules. Existing additive flow
      unchanged.
    - Wire `SAEClampSpec` through `SamplingParams` and the OpenAI
-     server. Validation is real; the worker accepts the spec but
-     reports "SAE_DELTA not yet implemented" if asked to apply it.
+     server. This phase originally stopped at validation and worker
+     admission guards; later phases replaced that guard with the
+     implemented SAE manager / buffer / kernel path described below.
    - Tests: registration, broadcast determinism across mock TP ranks,
      hash-folding for prefix-cache keys, SamplingParams round-trip.
 
@@ -402,8 +392,8 @@ encoder/decoder row sets are equal.
      filtering on `_locally_owned_layers`) and detach on
      unregister or kind-swap.  New worker-side method
      `attach_sae_weights(name, weights)` injects encoder/decoder
-     tensors into the per-(layer, hook) buffers — the test-fixture
-     and future-loader entry point.
+     tensors into the per-(layer, hook) buffers for tests, runtime
+     registration, and startup/full-registry broadcasts.
    - **Stage 3 (shipped).** Decoder-model wiring: rather than touch
      all 70+ model files that call `apply_layer_steering`, the
      SAE delta is dispatched from inside that function — additive
@@ -489,7 +479,7 @@ encoder/decoder row sets are equal.
      qualitative-shift assertion is robust to it.  Per-feature
      thresholds remain a kernel-level follow-up.
 
-6. **Phase 4 — Full-reconstruction variant (in progress).**
+6. **Phase 4 — Full-reconstruction variant (shipped).**
    - **Stage 1 (shipped).** Eager math primitive in
      `vllm/model_executor/layers/sae_full_reconstruction.py`:
      `apply_sae_full_reconstruction` projects each masked token
@@ -513,35 +503,126 @@ encoder/decoder row sets are equal.
      paths.  This stage matches the Phase-1A scope shape: math
      primitive only, no buffers / custom-op / kernel / worker
      plumbing.
-   - **Stage 2 (planned).** Per-(layer, hook) buffers for the
-     full encoder / decoder, layer-hook dispatch shim mirroring
-     `apply_layer_sae_delta`, and `direct_register_custom_op`
-     registration as `torch.ops.vllm.apply_sae_full_reconstruction`
-     so `torch.compile` treats the op as an opaque splitting
-     point.  At-most-one-SAE-module-per-(layer, hook) extends to
-     cover full-reconstruction-kind sites — the kind discriminator
-     comes from the manifest the worker stashes.
-   - **Stage 3 (planned).** Worker mixin integration — a parallel
-     `SAEFullReconstructionManager` + admission /
-     transition / release paths, the strict-capacity contract
-     mirrored from the delta path, and `_attach_sae_full_recon_buffers`
-     / `attach_sae_full_recon_weights` for register / inject.  A
-     new per-request `SAEFullReconstructionSpec` (allowing empty
-     clamp lists, since pure reconstruction is a meaningful op)
-     lands in this stage with hash plumbing folded into
-     `hash_steering_config`.  Prefix-cache invariants are revisited
-     here — full-reconstruction is a residual *replacement* not a
-     perturbation, so even baseline-clamp-set requests differ
-     from no-SAE baselines and the cache key must reflect that.
-   - **Stage 4 (planned).** Fused Triton kernel and CUDA-graph
-     warmup, mirroring `sae_steering_kernel.py`'s shape but
-     branching on the per-token `recon_mask` so unmasked tokens
-     short-circuit the encoder / decoder GEMMs.
-   - **Stage 5 (planned).** Real-weights e2e against Gemma Scope,
-     parallel to `test_sae_steering_real_weights.py`; verifies
-     residual *replacement* (rather than delta) on a known
-     feature actually drives outputs in the qualitative
-     direction.
+   - **Stage 2 (shipped).** Per-(layer, hook) buffers for the
+     full encoder / decoder + per-row clamp tables (sized
+     `(max_recon_configs + 1, n_clamp)` with row 0 reserved as the
+     no-reconstruction sentinel), shared `sae_recon_index`
+     per-token routing buffer, and a layer-hook dispatch shim
+     `apply_layer_sae_full_reconstruction` that gathers per-token
+     clamp tensors and derives `recon_mask = (recon_index != 0)`.
+     The compute path is registered as
+     `torch.ops.vllm.apply_sae_full_reconstruction` (tensor-only
+     schema with int activation code + float scalar param) so
+     `torch.compile` treats the call as an opaque splitting point,
+     mirroring the additive `apply_steering` and the delta
+     `apply_sae_delta`.  The public Python API
+     `apply_sae_full_reconstruction(activation, activation_params,
+     ...)` keeps its enum signature and bypasses `torch.ops` so
+     CPU-only test environments aren't subject to dispatch-key
+     mismatches.  At-most-one-SAE-module-per-(layer, hook) extends
+     to cover full-reconstruction-kind sites; double-registration
+     raises `ValueError`.  Stage-2 tests cover buffer shapes /
+     dtypes / unregistration, recon-index sharing across layers,
+     and the dispatch shim's row-0-passthrough / row-N-routing /
+     custom-op-fence behaviour.  Until Stage 4 lands, the registered
+     op routes both CPU and CUDA through the eager body so the
+     surface is stable for callers (no kernel-vs-op-func skew).
+   - **Stage 3 (shipped — type system + manager + populator).**
+     `SteeringModuleKind.SAE_FULL_RECONSTRUCTION` enum value,
+     `SAEFullReconstructionSpec` per-request type (allows empty
+     `clamps`, since pure reconstruction is a meaningful op),
+     `coerce_sae_full_reconstruction_specs` / `hash_sae_full_reconstruction_specs`
+     helpers.  `SamplingParams.sae_full_reconstruction_specs`
+     field with phase-filtered hash plumbing folded into both
+     `prefill_steering_config_hash` and `decode_steering_config_hash`
+     via `hash_steering_config` — using a distinct domain
+     separator from the delta block so a delta and a
+     full-reconstruction request with identical clamp content
+     never collide on prefix-cache keys.  New
+     `SAEFullReconstructionManager` (parallel to `SAEClampManager`):
+     strict capacity, refcount, deterministic-replay across ranks,
+     no global tier, row 0 = no-reconstruction sentinel.  New
+     `populate_sae_full_recon_clamp_table` projector parallel to
+     the delta populator with the same module-match / phase-match
+     / layer-match gating; specs with empty `clamps` correctly
+     allocate a row (so the dispatch shim's `recon_index != 0`
+     gate fires) but leave the clamp tables zeroed.  Registry
+     accepts `kind=SAE_FULL_RECONSTRUCTION` modules with the same
+     manifest validation as `SAE_DELTA`.  Worker mixin integration
+     (admission / transition / release / per-step buffer update,
+     `_attach_sae_full_recon_buffers` / `attach_sae_full_recon_weights`)
+     lands in Stage 3b.
+   - **Stage 3b (shipped — worker mixin lifecycle).**  The worker
+     mixin now branches on `kind="sae_full_reconstruction"` to
+     attach the full-reconstruction buffers + per-row clamp tables
+     + the shared `sae_recon_index` to every owned (layer, hook)
+     site, and detaches symmetrically on unregister or kind-swap.
+     A new `_sae_fr_clamp_manager` runs in parallel to the delta
+     manager with the same admission / release contract; the
+     existing lifecycle hooks
+     (`_register_initial_steering_config`,
+     `_release_finished_steering_configs`,
+     `_assert_sae_clamps_can_be_applied`'s sibling
+     `_assert_sae_full_recon_specs_can_be_applied`) thread the new
+     spec through.  `attach_sae_full_recon_weights` copies encoder
+     / decoder weights and biases into the per-(layer, hook)
+     buffers — the test-injection / future-loader entry point.
+     A new `_update_sae_full_recon_buffers` per-step pass populates
+     the clamp tables and builds `sae_recon_index` via the same
+     `np.repeat` + non-blocking H2D pipeline the delta path uses.
+     The new state is `getattr`-guarded throughout so existing
+     test harnesses that don't initialise the full-reconstruction
+     surface continue to work unchanged.
+   - **Stage 4 (shipped — compaction-based per-token short-circuit).**
+     The full-reconstruction CUDA path now lives in
+     `vllm/model_executor/layers/sae_full_reconstruction_kernel.py`
+     as `apply_sae_full_recon_triton`.  It compacts active tokens
+     (where `recon_mask=True`) into a dense subset, runs the
+     encoder / clamp / decoder math on that subset only, and
+     scatters the reconstructed rows back into the output —
+     unmasked positions retain the original residual via an
+     `out.copy_(hidden_states)` initialisation.  The two large
+     GEMMs (encoder `(n_active, d_sae)` and decoder
+     `(n_active, d_model)`) dispatch to PyTorch matmul, which
+     calls into cuBLAS — already near-optimal at the typical
+     Gemma-Scope shape (`d_sae=16384`, `d_model=2304`).  A custom
+     Triton kernel was deliberately not written: at these sizes
+     it doesn't beat cuBLAS, and the per-token short-circuit is
+     what the design doc identifies as the actual win.  The
+     surface (`apply_sae_full_recon_triton`) is the swap point if
+     a future Triton-kernel optimisation lands.  The
+     `apply_sae_full_reconstruction_op` body now dispatches to
+     this CUDA path on `is_cuda` tensors; the eager body remains
+     the CPU fallback and the test ground truth.
+     `warmup_apply_sae_full_recon_kernel` mirrors
+     `warmup_apply_steering_kernel` for cuBLAS handle / autotune
+     warmup; it's wired into `_attach_sae_full_recon_buffers` so
+     module registration pays the warmup cost outside any captured
+     forward.  CPU + CUDA-gated parity tests in
+     `test_sae_full_reconstruction_kernel.py` confirm the
+     compaction path matches the eager body bit-for-bit on shared
+     inputs.
+   - **Stage 5 (shipped — Gemma Scope real-weights e2e).**
+     `tests/models/language/generation/test_sae_full_reconstruction_real_weights.py`
+     is the parallel of the delta path's
+     `test_sae_steering_real_weights.py`, against the same
+     Gemma 2-2B + `gemma-scope-2b-pt-res/layer_12/width_16k/average_l0_82`
+     SAE.  A new loader helper
+     `load_gemma_scope_sae_full_recon` in
+     `vllm/entrypoints/openai/steering/sae_loader.py` returns the
+     full-`d_sae` × `d_model` encoder / decoder weights plus the
+     `decoder_bias` (the delta loader subsets to the clampable
+     features and drops the decoder bias because the delta math
+     doesn't need it; replacement does).  Three tests guard the
+     replacement variant against silent regressions: pure
+     reconstruction (no clamps) shifts output via reconstruction
+     error vs no-spec baseline, a clamp shifts output beyond the
+     pure-recon baseline, and clamp magnitude is monotone in the
+     output divergence.  All three are gated on real Gemma weights
+     (HF-token + CUDA), so they skip cleanly in CI and on dev
+     boxes without GPUs while still running in environments that
+     have the artefacts.  Phase 4 is feature-complete with this
+     stage.
 
 ## Resolved Design Decisions
 
@@ -559,32 +640,30 @@ conversation.
 - **Encoder pass is spec-driven, per clamp entry.** Each
   `SAEClampEntry` carries a `requires_encoder_pass: bool` flag,
   derived automatically by `__post_init__`:
-    - `target_value` set, `only_if_active=False` → encoder pass
+    - `kind="absolute"`, `only_if_active=False` → encoder pass
       **required** (need live `f_i` to compute the subtraction
-      `target_value − f_i`).
-    - `target_value` set, `only_if_active=True` → encoder pass
+      `value - f_i`).
+    - `kind="absolute"`, `only_if_active=True` → encoder pass
       **required** (need to gate on `f_i > 0`).
-    - `additive` set → encoder pass **optional**; defaults to off
-      since the delta `additive · W_dec[i]` is independent of `f_i`.
+    - `kind="additive"` → encoder pass is semantically optional when
+      `only_if_active=False`, since the delta `value * W_dec[i]` is
+      independent of `f_i`.
       Users who want clamp-with-floor-on-existing-activation
       semantics can request it explicitly.
-  At dispatch, the kernel checks the union of `requires_encoder_pass`
-  flags across the active clamp set. If none require it, the encoder
-  GEMM is skipped entirely and the path collapses to a sparse
-  decoder-direction add — basically the existing additive op's hot
-  path with a different row layout.
+  The current delta kernel still runs the encoder path for active SAE
+  rows; using this flag to skip the encoder for plain additive clamps
+  remains an optimization opportunity.
 
-- **Manifest format: both.** Phase-0 plumbing accepts a vLLM-native
-  JSON manifest. Phase-1 ships an SAE Lens / Gemma Scope adapter that
-  reads the upstream on-disk layout and synthesizes the native
-  manifest internally. The runtime only ever sees the native form.
-  This isolates upstream layout churn from the worker's loader.
+- **Manifest format: both.** Runtime registration accepts a
+  vLLM-native JSON manifest. The loader also supports Gemma Scope
+  `params.npz` files and synthesizes the native manifest internally.
+  The worker only ever sees the native form, which isolates upstream
+  layout churn from worker buffer attachment and request admission.
 
 - **Activations supported at launch: ReLU, JumpReLU, TopK.** No
   batch-TopK, no Gated SAE, no others in the initial scope. The
-  activation is a discriminated-union field on
-  `SAELayerWeights.activation` so adding more later is a switch-table
-  extension, not a rewrite.
+  activation is carried by the `SAEModuleManifest`, so adding more
+  later is a switch-table extension, not a rewrite.
 
 - **Numeric dtype: hybrid.** Encoder/decoder GEMMs + W_dec gather in
   the model's compute dtype (bf16/fp16 in most deployments), matching

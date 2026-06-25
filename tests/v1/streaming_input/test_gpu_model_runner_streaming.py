@@ -232,7 +232,6 @@ def _make_steering_runner():
         vocab_size=32000,
         block_sizes=[16],
         kernel_block_sizes=[16],
-        is_spec_decode=False,
         logitsprocs=None,
         is_pooling_model=False,
     )
@@ -243,6 +242,15 @@ def _make_steering_runner():
     runner._steering_manager.register_config = Mock()
     runner._steering_manager.release_config = Mock()
     runner._req_steering_phase = {}
+    runner._sae_clamp_manager = None
+    runner._req_sae_phase = {}
+    runner._locally_owned_layers = {0}
+    runner._refresh_streaming_steering = (
+        GPUModelRunner._refresh_streaming_steering.__get__(runner, GPUModelRunner)
+    )
+    runner._resolve_request_steering = GPUModelRunner._resolve_request_steering.__get__(
+        runner, GPUModelRunner
+    )
     return runner
 
 
@@ -289,6 +297,10 @@ def _make_new_req_data(
     sp = Mock()
     sp.effective_prefill_steering = effective_prefill
     sp.effective_decode_steering = effective_decode
+    sp.prefill_additive_steering_config_hash = prefill_hash
+    sp.decode_additive_steering_config_hash = decode_hash
+    sp.steering_module_ref = None
+    sp.sae_clamp_specs = None
     new_req_data.sampling_params = sp
     return new_req_data
 
@@ -328,7 +340,11 @@ def test_streaming_update_refreshes_steering_hashes():
 
     # New prefill config registered.
     runner._steering_manager.register_config.assert_called_once_with(
-        333, prefill_vectors, phase="prefill"
+        333,
+        prefill_vectors,
+        phase="prefill",
+        content_hash=333,
+        locally_owned_layers={0},
     )
 
     # Phase tracking reset to prefill.
@@ -363,7 +379,11 @@ def test_streaming_update_no_steering_to_steering():
 
     # New prefill config registered.
     runner._steering_manager.register_config.assert_called_once_with(
-        111, prefill_vectors, phase="prefill"
+        111,
+        prefill_vectors,
+        phase="prefill",
+        content_hash=111,
+        locally_owned_layers={0},
     )
 
     assert runner._req_steering_phase[req_id] == "prefill"
@@ -426,7 +446,11 @@ def test_streaming_update_steering_hashes_unchanged():
 
     # New prefill config registered (re-entering prefill).
     runner._steering_manager.register_config.assert_called_once_with(
-        111, prefill_vectors, phase="prefill"
+        111,
+        prefill_vectors,
+        phase="prefill",
+        content_hash=111,
+        locally_owned_layers={0},
     )
 
 
@@ -441,7 +465,7 @@ def test_streaming_update_no_steering_manager():
     runner.input_batch.add_request(req_state)
 
     # Remove the steering manager to simulate no-steering setup.
-    del runner._steering_manager
+    runner._steering_manager = None
 
     new_req_data = _make_new_req_data(
         req_id,
@@ -485,6 +509,48 @@ def test_streaming_update_capacity_error_propagates():
     runner._steering_manager.register_config.assert_called_once()
 
 
+def test_streaming_update_failure_restores_old_vectors_not_new_params():
+    """Rollback must snapshot old sampling params before request mutation."""
+    runner = _make_steering_runner()
+    req_id = "steer_req_restore"
+
+    old_decode_vectors = {"layer.0": {0: [0.1, 0.2]}}
+    old_sp = SamplingParams(temperature=0.5)
+    old_sp.__dict__["effective_prefill_steering"] = None
+    old_sp.__dict__["effective_decode_steering"] = old_decode_vectors
+    old_sp.__dict__["prefill_additive_steering_config_hash"] = 111
+    old_sp.__dict__["decode_additive_steering_config_hash"] = 222
+
+    req_state = _make_req_state(req_id, prefill_hash=111, decode_hash=222)
+    req_state.sampling_params = old_sp
+    runner.requests[req_id] = req_state
+    runner.input_batch.add_request(req_state)
+    runner._req_steering_phase[req_id] = "decode"
+
+    new_prefill_vectors = {"layer.0": {0: [9.0, 9.0]}}
+    new_decode_vectors = {"layer.0": {0: [8.0, 8.0]}}
+    new_req_data = _make_new_req_data(
+        req_id,
+        prefill_hash=333,
+        decode_hash=444,
+        effective_prefill=new_prefill_vectors,
+        effective_decode=new_decode_vectors,
+    )
+    runner._steering_manager.register_config.side_effect = [
+        RuntimeError("capacity full"),
+        None,
+    ]
+
+    with pytest.raises(RuntimeError, match="capacity full"):
+        GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
+
+    restore_call = runner._steering_manager.register_config.call_args_list[1]
+    assert restore_call.args[:2] == (222, old_decode_vectors)
+    assert restore_call.kwargs["phase"] == "decode"
+    assert restore_call.kwargs["content_hash"] == 222
+    assert restore_call.args[1] is not new_decode_vectors
+
+
 def test_streaming_update_decode_phase_no_hash_vector_mismatch():
     """Verify no hash/vector mismatch when a decode-phase request gets a
     streaming update with new steering vectors.
@@ -521,7 +587,6 @@ def test_streaming_update_decode_phase_no_hash_vector_mismatch():
         vocab_size=32000,
         block_sizes=[16],
         kernel_block_sizes=[16],
-        is_spec_decode=False,
         logitsprocs=None,
         is_pooling_model=False,
     )
@@ -531,6 +596,15 @@ def test_streaming_update_decode_phase_no_hash_vector_mismatch():
     mgr = SteeringManager(max_steering_configs=4)
     runner._steering_manager = mgr
     runner._req_steering_phase = {}
+    runner._sae_clamp_manager = None
+    runner._req_sae_phase = {}
+    runner._locally_owned_layers = {0}
+    runner._refresh_streaming_steering = (
+        GPUModelRunner._refresh_streaming_steering.__get__(runner, GPUModelRunner)
+    )
+    runner._resolve_request_steering = GPUModelRunner._resolve_request_steering.__get__(
+        runner, GPUModelRunner
+    )
 
     req_id = "hash_mismatch_req"
 
@@ -588,6 +662,10 @@ def test_streaming_update_decode_phase_no_hash_vector_mismatch():
     sp = Mock()
     sp.effective_prefill_steering = new_prefill_vectors
     sp.effective_decode_steering = {"layer.0": {0: [5.0, 6.0, 7.0, 8.0]}}
+    sp.prefill_additive_steering_config_hash = new_prefill_hash
+    sp.decode_additive_steering_config_hash = new_decode_hash
+    sp.steering_module_ref = None
+    sp.sae_clamp_specs = None
     new_req_data.sampling_params = sp
 
     # --- Execute the streaming update ---

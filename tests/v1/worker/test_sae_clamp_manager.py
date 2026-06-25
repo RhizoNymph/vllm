@@ -68,9 +68,9 @@ class TestRowAllocation:
 
     def test_register_consecutive_rows(self):
         m = SAEClampManager(max_sae_configs=4)
-        r1 = m.register_clamp_spec(1, (_make_spec(),), "prefill")
-        r2 = m.register_clamp_spec(2, (_make_spec(),), "prefill")
-        r3 = m.register_clamp_spec(3, (_make_spec(),), "prefill")
+        r1 = m.register_clamp_spec(1, (_make_spec(value=1.0),), "prefill")
+        r2 = m.register_clamp_spec(2, (_make_spec(value=2.0),), "prefill")
+        r3 = m.register_clamp_spec(3, (_make_spec(value=3.0),), "prefill")
         assert (r1, r2, r3) == (1, 2, 3)
 
     def test_same_hash_same_phase_returns_existing_row_and_increments_refcount(self):
@@ -79,6 +79,31 @@ class TestRowAllocation:
         r2 = m.register_clamp_spec(1, (_make_spec(),), "prefill")
         assert r1 == r2 == 1
         assert m.config_refcounts[(1, "prefill")] == 2
+
+    def test_same_sae_content_different_request_hash_aliases_row(self):
+        m = SAEClampManager(max_sae_configs=4)
+        spec = _make_spec()
+
+        r1 = m.register_clamp_spec(1, (spec,), "prefill")
+        r2 = m.register_clamp_spec(2, (spec,), "prefill")
+
+        assert r1 == r2 == 1
+        assert m.config_to_row[(1, "prefill")] == 1
+        assert m.config_to_row[(2, "prefill")] == 1
+        assert m.config_refcounts[(1, "prefill")] == 1
+        assert m.config_refcounts[(2, "prefill")] == 1
+        assert len(list(m.active_rows())) == 1
+
+    def test_both_and_prefill_specs_alias_prefill_row(self):
+        m = SAEClampManager(max_sae_configs=4)
+        both = _make_spec(phase="both")
+        prefill = _make_spec(phase="prefill")
+
+        r1 = m.register_clamp_spec(1, (both,), "prefill")
+        r2 = m.register_clamp_spec(2, (prefill,), "prefill")
+
+        assert r1 == r2 == 1
+        assert len(list(m.active_rows())) == 1
 
     def test_same_hash_different_phase_gets_new_row(self):
         m = SAEClampManager(max_sae_configs=4)
@@ -93,10 +118,10 @@ class TestCapacityContract:
 
     def test_register_at_capacity_raises(self):
         m = SAEClampManager(max_sae_configs=2)
-        m.register_clamp_spec(1, (_make_spec(),), "prefill")
-        m.register_clamp_spec(2, (_make_spec(),), "prefill")
+        m.register_clamp_spec(1, (_make_spec(value=1.0),), "prefill")
+        m.register_clamp_spec(2, (_make_spec(value=2.0),), "prefill")
         with pytest.raises(RuntimeError, match="No free SAE clamp"):
-            m.register_clamp_spec(3, (_make_spec(),), "prefill")
+            m.register_clamp_spec(3, (_make_spec(value=3.0),), "prefill")
 
     def test_release_then_register_reuses_freed_row(self):
         m = SAEClampManager(max_sae_configs=2)
@@ -177,11 +202,8 @@ class TestActiveRowsEnumeration:
         rows = list(m.active_rows())
         # (row, hash, phase, specs) tuples; sorted by row index.
         assert [r[0] for r in rows] == [1, 2, 3]
-        assert [(r[1], r[2]) for r in rows] == [
-            (10, "prefill"),
-            (20, "decode"),
-            (30, "prefill"),
-        ]
+        assert [r[2] for r in rows] == ["prefill", "decode", "prefill"]
+        assert [r[3][0].module_name for r in rows] == ["a", "b", "c"]
 
     def test_yields_specs_tuple_for_repopulation(self):
         m = SAEClampManager(max_sae_configs=4)
@@ -207,13 +229,34 @@ class TestActiveRowsEnumeration:
         with pytest.raises(ValueError, match="empty specs"):
             m.register_clamp_spec(7, (), "prefill")
 
+    def test_overlapping_specs_rejected(self):
+        m = SAEClampManager(max_sae_configs=4)
+        spec_a = _make_spec(phase="both", value=1.0)
+        spec_b = _make_spec(phase="prefill", value=2.0)
+        with pytest.raises(ValueError, match="overlapping clamps"):
+            m.register_clamp_spec(7, (spec_a, spec_b), "prefill")
+
+    def test_same_feature_disjoint_phases_allowed(self):
+        m = SAEClampManager(max_sae_configs=4)
+        spec_a = _make_spec(phase="prefill", value=1.0)
+        spec_b = _make_spec(phase="decode", value=2.0)
+        row = m.register_clamp_spec(7, (spec_a, spec_b), "prefill")
+        assert row == 1
+
+    def test_specs_with_no_entries_for_phase_rejected(self):
+        m = SAEClampManager(max_sae_configs=4)
+        with pytest.raises(ValueError, match="do not apply"):
+            m.register_clamp_spec(7, (_make_spec(phase="decode"),), "prefill")
+
     def test_freed_row_is_not_yielded(self):
         m = SAEClampManager(max_sae_configs=4)
         m.register_clamp_spec(10, (_make_spec(),), "prefill")
         m.register_clamp_spec(20, (_make_spec(),), "decode")
         m.release_clamp_spec(10, "prefill")
         rows = list(m.active_rows())
-        assert [r[1] for r in rows] == [20]
+        assert [(r[2], r[3][0].module_name) for r in rows] == [
+            ("decode", "golden_gate")
+        ]
 
 
 class TestDirtyFlag:

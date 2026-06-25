@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,7 @@ import torch
 from vllm.config.sae_steering_types import SAEActivation
 from vllm.entrypoints.openai.steering.registry import (
     SAEModuleManifest,
+    SteeringModuleRegistry,
     sae_manifest_from_dict,
 )
 from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
@@ -93,6 +95,13 @@ def _site_filename(layer_idx: int, hook_str: str) -> str:
     return f"layer_{layer_idx}_{hook_str}.safetensors"
 
 
+def _coerce_loader_int(value: object, *, field_name: str) -> int:
+    """Accept real integer scalars while rejecting bool and strings."""
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{field_name} must be an integer, got {value!r}.")
+    return int(value)
+
+
 def load_sae_module_from_dir(path: str | Path) -> LoadedSAEModule:
     """Load an SAE module from a ``manifest.json`` + safetensors layout.
 
@@ -127,7 +136,20 @@ def load_sae_module_from_dir(path: str | Path) -> LoadedSAEModule:
         manifest_payload = json.load(fh)
     if not isinstance(manifest_payload, dict):
         raise ValueError(f"SAE manifest at {manifest_path!r} must be a JSON object.")
-    manifest = sae_manifest_from_dict(manifest_payload)
+    try:
+        manifest = sae_manifest_from_dict(manifest_payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"SAE manifest at {manifest_path!r} is invalid: {exc}"
+        ) from exc
+    try:
+        SteeringModuleRegistry()._validate_sae_manifest(
+            name=str(manifest_path), manifest=manifest
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"SAE manifest at {manifest_path!r} is invalid: {exc}"
+        ) from exc
     weights = _load_weights_for_manifest(manifest, base)
     return LoadedSAEModule(manifest=manifest, weights=weights)
 
@@ -192,6 +214,16 @@ def _validate_site_tensors(
             raise ValueError(
                 f"SAE site {site!r}: tensor {key!r} has shape "
                 f"{tuple(tensor.shape)}; expected {expected}."
+            )
+        if not torch.is_floating_point(tensor):
+            raise ValueError(
+                f"SAE site {site!r}: tensor {key!r} must have a floating "
+                f"dtype, got {tensor.dtype}."
+            )
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise ValueError(
+                f"SAE site {site!r}: tensor {key!r} must contain only "
+                "finite values."
             )
         out[key] = tensor
     return out
@@ -276,7 +308,15 @@ def load_gemma_scope_sae(
             f"hook_str {hook_str!r} is not a valid hook point.  "
             f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}."
         )
-    feature_list = list(clampable_features)
+    layer_idx = _coerce_loader_int(layer_idx, field_name="layer_idx")
+    if layer_idx < 0:
+        raise ValueError(f"layer_idx must be non-negative, got {layer_idx}.")
+    if not torch.empty((), dtype=weights_dtype).is_floating_point():
+        raise ValueError(f"weights_dtype must be floating point, got {weights_dtype}.")
+    feature_list = [
+        _coerce_loader_int(f, field_name=f"clampable_features[{i}]")
+        for i, f in enumerate(clampable_features)
+    ]
     if not feature_list:
         raise ValueError(
             "clampable_features must be a non-empty sequence of feature indices."
@@ -286,17 +326,34 @@ def load_gemma_scope_sae(
             f"clampable_features must be unique; got duplicates in {feature_list}."
         )
 
-    npz = np.load(str(npz_path))
-    missing = [k for k in _GEMMA_SCOPE_KEYS if k not in npz.files]
-    if missing:
-        raise ValueError(
-            f"Gemma Scope NPZ at {npz_path!r} is missing required keys: "
-            f"{missing}.  Found: {sorted(npz.files)}."
-        )
-    W_enc = npz["W_enc"]  # (d_model, d_sae)
-    W_dec = npz["W_dec"]  # (d_sae, d_model)
-    b_enc = npz["b_enc"]  # (d_sae,)
-    thresholds = npz["threshold"]  # (d_sae,)
+    with np.load(str(npz_path)) as npz:
+        missing = [k for k in _GEMMA_SCOPE_KEYS if k not in npz.files]
+        if missing:
+            raise ValueError(
+                f"Gemma Scope NPZ at {npz_path!r} is missing required keys: "
+                f"{missing}.  Found: {sorted(npz.files)}."
+            )
+        W_enc = npz["W_enc"]  # (d_model, d_sae)
+        W_dec = npz["W_dec"]  # (d_sae, d_model)
+        b_enc = npz["b_enc"]  # (d_sae,)
+        thresholds = npz["threshold"]  # (d_sae,)
+
+    for key, arr in (
+        ("W_enc", W_enc),
+        ("W_dec", W_dec),
+        ("b_enc", b_enc),
+        ("threshold", thresholds),
+    ):
+        if not np.issubdtype(arr.dtype, np.floating):
+            raise ValueError(
+                f"Gemma Scope NPZ at {npz_path!r}: {key} must have a "
+                f"floating dtype, got {arr.dtype}."
+            )
+        if not np.isfinite(arr).all():
+            raise ValueError(
+                f"Gemma Scope NPZ at {npz_path!r}: {key} must contain only "
+                "finite values."
+            )
 
     if W_enc.ndim != 2 or W_dec.ndim != 2:
         raise ValueError(
@@ -355,14 +412,18 @@ def load_gemma_scope_sae(
         d_model=int(d_model),
         d_sae=int(d_sae),
         activation=activation,
-        layers=((int(layer_idx), str(hook_str)),),
-        clampable_features=tuple(int(f) for f in feature_list),
+        layers=((layer_idx, str(hook_str)),),
+        clampable_features=tuple(feature_list),
         activation_params=resolved_params,
+    )
+    SteeringModuleRegistry()._validate_sae_manifest(
+        name=str(npz_path),
+        manifest=manifest,
     )
     return LoadedSAEModule(
         manifest=manifest,
         weights={
-            (int(layer_idx), str(hook_str)): {
+            (layer_idx, str(hook_str)): {
                 "encoder_weight": enc_w_t,
                 "encoder_bias": enc_b_t,
                 "decoder_weight": dec_w_t,
@@ -449,7 +510,12 @@ def merge_loaded_sae_modules(
             idx,
         )
         for layer_idx, hook_str in m.layers:
-            key = (int(layer_idx), str(hook_str))
+            key = (
+                _coerce_loader_int(
+                    layer_idx, field_name=f"parts[{idx}].manifest.layers[][0]"
+                ),
+                str(hook_str),
+            )
             if key in layers_seen:
                 tag = f" [{name!r}]" if name else ""
                 raise ValueError(
@@ -474,3 +540,160 @@ def merge_loaded_sae_modules(
         activation_params=dict(head.manifest.activation_params),
     )
     return LoadedSAEModule(manifest=merged_manifest, weights=merged_weights)
+
+
+# ---------------------------------------------------------------------------
+# Gemma Scope NPZ → full-reconstruction weights
+# ---------------------------------------------------------------------------
+
+
+def load_gemma_scope_sae_full_recon(
+    npz_path: str | Path,
+    *,
+    layer_idx: int,
+    hook_str: str,
+    clampable_features: Sequence[int],
+    activation: SAEActivation = SAEActivation.JUMPRELU,
+    activation_params: Mapping[str, float] | None = None,
+    weights_dtype: torch.dtype = torch.float32,
+) -> LoadedSAEModule:
+    """Load one ``(layer, hook)`` Gemma Scope SAE for the *full-reconstruction* path.
+
+    Sibling to :func:`load_gemma_scope_sae` for the delta path.  The
+    delta loader subsets the encoder / decoder rows to
+    ``clampable_features``; the full-reconstruction path needs the
+    *complete* SAE forward (every feature participates in the
+    reconstruction), so this loader returns the **full** ``d_sae`` ×
+    ``d_model`` encoder and decoder, plus the decoder bias.
+
+    Output shapes match what :meth:`attach_sae_full_recon_weights` on
+    the worker mixin expects:
+
+    * ``encoder_weight`` : ``(d_sae, d_model)``       — ``W_enc.T``
+    * ``encoder_bias``   : ``(d_sae,)``               — ``b_enc``
+    * ``decoder_weight`` : ``(d_sae, d_model)``       — ``W_dec``
+    * ``decoder_bias``   : ``(d_model,)``             — ``b_dec``
+
+    The returned :class:`SAEModuleManifest` carries the full ``d_sae``
+    in ``d_sae`` and the caller-supplied ``clampable_features`` —
+    those are the indices where the request-side spec may apply
+    clamps.  The encoder / decoder buffers themselves cover every
+    feature; the kernel reads the clampable subset by gathering at
+    those indices.
+
+    JumpReLU thresholds: same simplification as the delta-path
+    loader.  Gemma Scope ships per-feature thresholds; the kernel
+    takes a scalar.  The median over the *clampable subset* is used
+    by default; pass ``activation_params={"threshold": value}`` to
+    override.  This matters more for the full-reconstruction path
+    than for the delta path — the encoder runs over every feature,
+    so a uniform threshold over the full SAE is a noticeable
+    simplification.  Tracked as a follow-up; for the qualitative
+    output-shift assertion in the e2e test the simplification is
+    acceptable, but quantitative reconstruction-fidelity work
+    needs per-feature thresholds first.
+    """
+    if hook_str not in VALID_HOOK_POINT_NAMES:
+        raise ValueError(
+            f"hook_str {hook_str!r} is not a valid hook point.  "
+            f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}."
+        )
+    feature_list = list(clampable_features)
+    if not feature_list:
+        raise ValueError(
+            "clampable_features must be a non-empty sequence of feature indices."
+        )
+    if len(set(feature_list)) != len(feature_list):
+        raise ValueError(
+            f"clampable_features must be unique; got duplicates in {feature_list}."
+        )
+
+    npz = np.load(str(npz_path))
+    missing = [k for k in (*_GEMMA_SCOPE_KEYS, "b_dec") if k not in npz.files]
+    if missing:
+        raise ValueError(
+            f"Gemma Scope NPZ at {npz_path!r} is missing required keys for "
+            f"full-reconstruction: {missing}.  Found: {sorted(npz.files)}."
+        )
+    W_enc = npz["W_enc"]  # (d_model, d_sae)
+    W_dec = npz["W_dec"]  # (d_sae, d_model)
+    b_enc = npz["b_enc"]  # (d_sae,)
+    b_dec = npz["b_dec"]  # (d_model,)
+    thresholds = npz["threshold"]  # (d_sae,)
+
+    if W_enc.ndim != 2 or W_dec.ndim != 2:
+        raise ValueError(
+            f"Gemma Scope NPZ at {npz_path!r}: W_enc/W_dec must be 2D; "
+            f"got W_enc.shape={W_enc.shape}, W_dec.shape={W_dec.shape}."
+        )
+    d_model_enc, d_sae_enc = W_enc.shape
+    d_sae_dec, d_model_dec = W_dec.shape
+    if d_model_enc != d_model_dec:
+        raise ValueError(
+            f"Gemma Scope NPZ at {npz_path!r}: W_enc and W_dec disagree on "
+            f"d_model ({d_model_enc} vs {d_model_dec})."
+        )
+    if d_sae_enc != d_sae_dec:
+        raise ValueError(
+            f"Gemma Scope NPZ at {npz_path!r}: W_enc and W_dec disagree on "
+            f"d_sae ({d_sae_enc} vs {d_sae_dec})."
+        )
+    if b_enc.shape != (d_sae_enc,):
+        raise ValueError(
+            f"Gemma Scope NPZ at {npz_path!r}: b_enc.shape={b_enc.shape}, "
+            f"expected ({d_sae_enc},)."
+        )
+    if b_dec.shape != (d_model_enc,):
+        raise ValueError(
+            f"Gemma Scope NPZ at {npz_path!r}: b_dec.shape={b_dec.shape}, "
+            f"expected ({d_model_enc},)."
+        )
+    if thresholds.shape != (d_sae_enc,):
+        raise ValueError(
+            f"Gemma Scope NPZ at {npz_path!r}: threshold.shape={thresholds.shape}, "
+            f"expected ({d_sae_enc},)."
+        )
+
+    d_model = d_model_enc
+    d_sae = d_sae_enc
+    out_of_range = [f for f in feature_list if f < 0 or f >= d_sae]
+    if out_of_range:
+        raise ValueError(
+            f"clampable_features contains indices outside [0, {d_sae}): {out_of_range}."
+        )
+
+    # Full encoder / decoder + biases — no subsetting on the rows
+    # themselves; we pass the entire SAE through.  ``W_enc.T`` is
+    # what the buffer expects: row ``i`` is the encoder direction
+    # for feature ``i``.
+    enc_w_t = torch.from_numpy(np.ascontiguousarray(W_enc.T)).to(weights_dtype)
+    enc_b_t = torch.from_numpy(np.ascontiguousarray(b_enc)).to(weights_dtype)
+    dec_w_t = torch.from_numpy(np.ascontiguousarray(W_dec)).to(weights_dtype)
+    dec_b_t = torch.from_numpy(np.ascontiguousarray(b_dec)).to(weights_dtype)
+
+    feat_idx = np.asarray(feature_list, dtype=np.int64)
+    threshold_subset = thresholds[feat_idx]
+    resolved_params = _resolve_jumprelu_params(
+        activation=activation,
+        activation_params=activation_params,
+        threshold_subset=threshold_subset,
+    )
+    manifest = SAEModuleManifest(
+        d_model=int(d_model),
+        d_sae=int(d_sae),
+        activation=activation,
+        layers=((int(layer_idx), str(hook_str)),),
+        clampable_features=tuple(int(f) for f in feature_list),
+        activation_params=resolved_params,
+    )
+    return LoadedSAEModule(
+        manifest=manifest,
+        weights={
+            (int(layer_idx), str(hook_str)): {
+                "encoder_weight": enc_w_t,
+                "encoder_bias": enc_b_t,
+                "decoder_weight": dec_w_t,
+                "decoder_bias": dec_b_t,
+            },
+        },
+    )

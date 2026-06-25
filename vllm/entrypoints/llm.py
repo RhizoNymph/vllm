@@ -447,6 +447,14 @@ class LLM:
         self.request_counter = Counter()
         self.default_sampling_params: dict[str, Any] | None = None
 
+        # Per-engine LRU mapping (prefill_hash, decode_hash) -> auto-named
+        # steering module name. This lets repeated inline steering specs use
+        # the named-module fast path instead of repeatedly shipping vector
+        # blobs across the engine boundary.
+        from vllm.config.steering_types import SteeringAutoPromoteLRU
+
+        self._steering_auto_promote_lru = SteeringAutoPromoteLRU(capacity=512)
+
         supported_tasks = self.llm_engine.get_supported_tasks()
         self.supported_tasks = supported_tasks
         self.pooling_task = self.model_config.get_pooling_task(supported_tasks)
@@ -1875,6 +1883,32 @@ class LLM:
 
         return added_request_ids
 
+    def _maybe_auto_promote_steering(self, sp: SamplingParams) -> None:
+        """Auto-promote repeated inline steering to a named module."""
+        vllm_config = getattr(self.llm_engine, "vllm_config", None)
+        if getattr(vllm_config, "steering_config", None) is None:
+            return
+        from vllm.config.steering_types import maybe_auto_promote_steering_modules
+
+        maybe_auto_promote_steering_modules(
+            sp,
+            rpc_fn=self.llm_engine.collective_rpc,
+            registry_lru=self._steering_auto_promote_lru,
+        )
+
+    def _maybe_pack_inline_steering(self, sp: SamplingParams) -> None:
+        """Pack inline steering vectors in the model dtype before submission."""
+        vllm_config = getattr(self.llm_engine, "vllm_config", None)
+        if getattr(vllm_config, "steering_config", None) is None:
+            return
+        from vllm.config.steering_types import maybe_pack_inline_steering_for_request
+
+        try:
+            torch_dtype = self.llm_engine.model_config.dtype
+        except AttributeError:
+            return
+        maybe_pack_inline_steering_for_request(sp, torch_dtype)
+
     def _add_request(
         self,
         prompt: EngineInput,
@@ -1885,6 +1919,8 @@ class LLM:
         if isinstance(params, SamplingParams):
             # We only care about the final output
             params.output_kind = RequestOutputKind.FINAL_ONLY
+            self._maybe_auto_promote_steering(params)
+            self._maybe_pack_inline_steering(params)
 
         request_id = str(next(self.request_counter))
 

@@ -195,6 +195,13 @@ class WorkerBase:
     def unregister_steering_modules(self, names: list[str]) -> None:
         raise NotImplementedError
 
+    def attach_sae_weights(
+        self,
+        module_name: str,
+        weights: dict[tuple[int, str], dict[str, torch.Tensor]],
+    ) -> None:
+        raise NotImplementedError
+
     @property
     def vocab_size(self) -> int:
         """Get vocabulary size from model configuration."""

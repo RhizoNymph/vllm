@@ -63,6 +63,8 @@ from vllm.utils.torch_utils import direct_register_custom_op
 CLAMP_KIND_NONE = 0
 CLAMP_KIND_ABSOLUTE = 1
 CLAMP_KIND_ADDITIVE = 2
+_VALID_CLAMP_KIND_MIN = CLAMP_KIND_NONE
+_VALID_CLAMP_KIND_MAX = CLAMP_KIND_ADDITIVE
 
 # Integer encoding of :class:`SAEActivation`.  The Triton kernel (and
 # the registered torch op) take an ``int`` activation code so the
@@ -81,6 +83,28 @@ _ACTIVATION_TO_CODE: dict[SAEActivation, int] = {
 _CODE_TO_ACTIVATION: dict[int, SAEActivation] = {
     code: act for act, code in _ACTIVATION_TO_CODE.items()
 }
+
+
+def _validate_clamp_kind_values(clamp_kind: torch.Tensor) -> None:
+    """Reject unknown clamp-kind enum values for CPU validation paths.
+
+    CUDA layer dispatch uses worker-populated tables whose values are
+    produced from validated ``SAEClampEntry.kind`` strings. Avoid a
+    per-call device reduction / host sync there, while still making the
+    public eager APIs fail closed for malformed CPU tensors.
+    """
+    if clamp_kind.is_cuda or clamp_kind.numel() == 0:
+        return
+    invalid = (clamp_kind < _VALID_CLAMP_KIND_MIN) | (
+        clamp_kind > _VALID_CLAMP_KIND_MAX
+    )
+    if bool(torch.any(invalid).item()):
+        bad = int(clamp_kind[invalid][0].item())
+        raise ValueError(
+            "clamp_kind entries must be one of "
+            f"{CLAMP_KIND_NONE}, {CLAMP_KIND_ABSOLUTE}, "
+            f"{CLAMP_KIND_ADDITIVE}; got {bad}."
+        )
 
 
 def _activation_to_scalar(
@@ -131,6 +155,11 @@ HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.POST_ATTN: "sae_clamp_only_if_active_post_attn",
     SteeringHookPoint.POST_MLP: "sae_clamp_only_if_active_post_mlp",
 }
+HOOK_POINT_SAE_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_any_active_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_any_active_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_any_active_post_mlp",
+}
 HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_encoder_weight_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_encoder_weight_post_attn",
@@ -169,6 +198,7 @@ _SAE_BUFFER_ATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
     HOOK_POINT_SAE_CLAMP_KIND_ATTR,
     HOOK_POINT_SAE_CLAMP_VALUE_ATTR,
     HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR,
+    HOOK_POINT_SAE_ANY_ACTIVE_ATTR,
     HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
     HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
     HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
@@ -191,6 +221,7 @@ def register_sae_buffers(
     hidden_size: int,
     max_sae_configs: int,
     dtype: torch.dtype,
+    device: torch.device | None = None,
 ) -> None:
     """Attach SAE buffers for one ``(layer, hook)`` site to ``module``.
 
@@ -213,6 +244,10 @@ def register_sae_buffers(
             (SAE disabled engine-wide), mirroring
             ``register_steering_buffers``.
         dtype: compute dtype for the encoder/decoder weight tensors.
+        device: device for the runtime buffers.  Runtime registrations
+            happen after the model layer has already moved to its worker
+            device, so callers should pass the device of an existing layer
+            buffer to avoid attaching CPU SAE buffers to CUDA layers.
     """
     if max_sae_configs == 0:
         return
@@ -228,49 +263,58 @@ def register_sae_buffers(
             "(layer, hook) site; unregister the existing module first."
         )
     n_rows = max_sae_configs + 1
-    # Clamp tables: per-(row, feature) clamp state.
-    module.register_buffer(
-        kind_attr,
-        torch.zeros(n_rows, n_clamp, dtype=torch.int8),
-        persistent=False,
-    )
-    module.register_buffer(
-        HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point],
-        torch.zeros(n_rows, n_clamp, dtype=torch.float32),
-        persistent=False,
-    )
-    module.register_buffer(
-        HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point],
-        torch.zeros(n_rows, n_clamp, dtype=torch.bool),
-        persistent=False,
-    )
-    # Encoder / decoder weights for the clampable subset.  Worker code
-    # writes the actual values via ``copy_`` after manifest-driven
-    # weight loading; defaulting to zeros means an unloaded site
-    # produces zero delta (safe default, fail-quiet).
-    module.register_buffer(
-        HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[hook_point],
-        torch.zeros(n_clamp, hidden_size, dtype=dtype),
-        persistent=False,
-    )
-    module.register_buffer(
-        HOOK_POINT_SAE_ENCODER_BIAS_ATTR[hook_point],
-        torch.zeros(n_clamp, dtype=dtype),
-        persistent=False,
-    )
-    module.register_buffer(
-        HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[hook_point],
-        torch.zeros(n_clamp, hidden_size, dtype=dtype),
-        persistent=False,
-    )
-    # Python attributes — read as per-site constants by the kernel.
-    setattr(module, HOOK_POINT_SAE_MODULE_NAME_ATTR[hook_point], module_name)
-    setattr(module, HOOK_POINT_SAE_ACTIVATION_ATTR[hook_point], activation)
-    setattr(
-        module,
-        HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR[hook_point],
-        dict(activation_params),
-    )
+    try:
+        # Clamp tables: per-(row, feature) clamp state.
+        module.register_buffer(
+            kind_attr,
+            torch.zeros(n_rows, n_clamp, dtype=torch.int8, device=device),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point],
+            torch.zeros(n_rows, n_clamp, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point],
+            torch.zeros(n_rows, n_clamp, dtype=torch.bool, device=device),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_SAE_ANY_ACTIVE_ATTR[hook_point],
+            torch.zeros(1, dtype=torch.bool, device=device),
+            persistent=False,
+        )
+        # Encoder / decoder weights for the clampable subset.  Worker code
+        # writes the actual values via ``copy_`` after manifest-driven
+        # weight loading; defaulting to zeros means an unloaded site
+        # produces zero delta (safe default, fail-quiet).
+        module.register_buffer(
+            HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[hook_point],
+            torch.zeros(n_clamp, hidden_size, dtype=dtype, device=device),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_SAE_ENCODER_BIAS_ATTR[hook_point],
+            torch.zeros(n_clamp, dtype=dtype, device=device),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[hook_point],
+            torch.zeros(n_clamp, hidden_size, dtype=dtype, device=device),
+            persistent=False,
+        )
+        # Python attributes — read as per-site constants by the kernel.
+        setattr(module, HOOK_POINT_SAE_MODULE_NAME_ATTR[hook_point], module_name)
+        setattr(module, HOOK_POINT_SAE_ACTIVATION_ATTR[hook_point], activation)
+        setattr(
+            module,
+            HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR[hook_point],
+            dict(activation_params),
+        )
+    except Exception:
+        unregister_sae_buffers(module, hook_point=hook_point)
+        raise
 
 
 def unregister_sae_buffers(
@@ -306,7 +350,9 @@ def sae_buffers_attached(module: nn.Module, hook_point: SteeringHookPoint) -> bo
     return hasattr(module, HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point])
 
 
-def register_sae_index_buffer(module: nn.Module, max_tokens: int) -> None:
+def register_sae_index_buffer(
+    module: nn.Module, max_tokens: int, device: torch.device | None = None
+) -> None:
     """Attach the shared per-token ``sae_index`` buffer to ``module``.
 
     Mirrors the additive ``steering_index`` buffer: a single
@@ -314,12 +360,21 @@ def register_sae_index_buffer(module: nn.Module, max_tokens: int) -> None:
     :func:`share_sae_index_across_layers` so all SAE-covered layers
     point at the same physical tensor.  When ``max_tokens == 0`` (no
     SAE-bearing batches expected), registration is a no-op.
+
+    Idempotent per layer: a manifest covering multiple hooks on the
+    same decoder layer — or a second SAE module attaching to another
+    hook on an already-covered layer — calls this helper again for
+    the same module.  ``register_buffer`` raises when the attribute
+    already exists, so we short-circuit when ``sae_index`` is present
+    to keep multi-hook registrations working.
     """
     if max_tokens == 0:
         return
+    if hasattr(module, "sae_index"):
+        return
     module.register_buffer(
         "sae_index",
-        torch.zeros(max_tokens, dtype=torch.long),
+        torch.zeros(max_tokens, dtype=torch.long, device=device),
         persistent=False,
     )
 
@@ -334,6 +389,27 @@ def share_sae_index_across_layers(layers: list[nn.Module]) -> None:
             shared = layer.sae_index
             continue
         layer.sae_index = shared
+
+
+def _topk_mask_lowest_indices(pre_act: torch.Tensor, k: int) -> torch.Tensor:
+    """Return a TopK mask with ties broken by lower feature index.
+
+    ``torch.topk`` finds the kth-value cutoff efficiently, but does not
+    define which equal-valued features it returns.  We use it only for
+    the cutoff, then select all greater values plus the first
+    ``k - count(greater)`` tied columns in natural feature-index order.
+    This keeps exact-k deterministic semantics without a full argsort.
+    """
+    if k >= pre_act.shape[1]:
+        return torch.ones_like(pre_act, dtype=torch.bool)
+    cutoff = torch.topk(pre_act, k, dim=1, largest=True, sorted=False).values.min(
+        dim=1, keepdim=True
+    ).values
+    greater = pre_act > cutoff
+    remaining = k - greater.sum(dim=1, keepdim=True)
+    ties = pre_act == cutoff
+    tie_rank = torch.cumsum(ties.to(torch.int64), dim=1)
+    return greater | (ties & (tie_rank <= remaining))
 
 
 def sae_encode(
@@ -373,10 +449,7 @@ def sae_encode(
         n_clamp = pre_act.shape[1]
         if k >= n_clamp:
             return pre_act
-        # Per-row TopK mask.
-        _, top_idx = torch.topk(pre_act, k=k, dim=1, largest=True)
-        mask = torch.zeros_like(pre_act, dtype=torch.bool)
-        mask.scatter_(1, top_idx, True)
+        mask = _topk_mask_lowest_indices(pre_act, k)
         return torch.where(mask, pre_act, torch.zeros_like(pre_act))
     raise ValueError(f"Unsupported SAE activation: {activation!r}")
 
@@ -389,6 +462,7 @@ def _apply_sae_delta_eager(
     clamp_kind: torch.Tensor,
     clamp_value: torch.Tensor,
     clamp_only_if_active: torch.Tensor,
+    any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
 ) -> torch.Tensor:
@@ -403,6 +477,12 @@ def _apply_sae_delta_eager(
     activation_params = _scalar_to_activation_params(activation, activation_param)
 
     # (n_tokens, n_clamp) fp32 — encoder pass.
+    if not any_active.is_cuda and (
+        not bool(any_active.item())
+        or not bool(torch.any(clamp_kind != CLAMP_KIND_NONE))
+    ):
+        return hidden_states.clone()
+
     f = sae_encode(
         hidden_states, encoder_weight, encoder_bias, activation, activation_params
     )
@@ -410,7 +490,7 @@ def _apply_sae_delta_eager(
     kind = clamp_kind.to(torch.int8)
     value = clamp_value.to(torch.float32)
     gated = clamp_only_if_active.to(torch.bool)
-    active = f > 0.0
+    active = f != 0.0 if activation is SAEActivation.TOPK else f > 0.0
 
     new_f_absolute = value
     new_f_additive = f + value
@@ -420,6 +500,10 @@ def _apply_sae_delta_eager(
         torch.where(kind == CLAMP_KIND_ADDITIVE, new_f_additive, f),
     )
     apply_clamp = (kind != CLAMP_KIND_NONE) & (~gated | active)
+    if any_active.is_cuda:
+        # Preserve the Triton kernels' device-side any_active gate in
+        # CUDA fallback paths without synchronizing to inspect the bool.
+        apply_clamp = apply_clamp & any_active.to(torch.bool).view(1, 1)
     delta = torch.where(apply_clamp, new_f - f, torch.zeros_like(f))
 
     delta_compute = delta.to(hidden_states.dtype)
@@ -436,6 +520,7 @@ def apply_sae_delta_op(
     clamp_kind: torch.Tensor,
     clamp_value: torch.Tensor,
     clamp_only_if_active: torch.Tensor,
+    any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
 ) -> torch.Tensor:
@@ -467,6 +552,7 @@ def apply_sae_delta_op(
             clamp_kind,
             clamp_value,
             clamp_only_if_active,
+            any_active,
             int(activation_code),
             float(activation_param),
         )
@@ -478,6 +564,7 @@ def apply_sae_delta_op(
         clamp_kind,
         clamp_value,
         clamp_only_if_active,
+        any_active,
         int(activation_code),
         float(activation_param),
     )
@@ -491,6 +578,7 @@ def apply_sae_delta_op_fake(
     clamp_kind: torch.Tensor,
     clamp_value: torch.Tensor,
     clamp_only_if_active: torch.Tensor,
+    any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
 ) -> torch.Tensor:
@@ -506,6 +594,86 @@ direct_register_custom_op(
 )
 
 
+def apply_sae_delta_indexed_op(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    clamp_kind_table: torch.Tensor,
+    clamp_value_table: torch.Tensor,
+    clamp_only_if_active_table: torch.Tensor,
+    sae_index: torch.Tensor,
+    any_active: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> torch.Tensor:
+    """Layer-hook op that indexes clamp tables inside the backend.
+
+    Keeping the row-index gather inside the custom op lets the CUDA kernel
+    check ``any_active`` before loading clamp tables, so registered-but-idle
+    SAE modules avoid per-token gather work.
+    """
+    if hidden_states.is_cuda:
+        from vllm.model_executor.layers.sae_steering_kernel import (
+            apply_sae_delta_indexed_triton,
+        )
+
+        return apply_sae_delta_indexed_triton(
+            hidden_states,
+            encoder_weight,
+            encoder_bias,
+            decoder_weight,
+            clamp_kind_table,
+            clamp_value_table,
+            clamp_only_if_active_table,
+            sae_index,
+            any_active,
+            int(activation_code),
+            float(activation_param),
+        )
+    if not any_active.is_cuda and not bool(any_active.item()):
+        return hidden_states.clone()
+    n_tokens = hidden_states.shape[0]
+    idx = sae_index[:n_tokens]
+    return _apply_sae_delta_eager(
+        hidden_states,
+        encoder_weight,
+        encoder_bias,
+        decoder_weight,
+        clamp_kind_table[idx],
+        clamp_value_table[idx],
+        clamp_only_if_active_table[idx],
+        any_active,
+        int(activation_code),
+        float(activation_param),
+    )
+
+
+def apply_sae_delta_indexed_op_fake(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    clamp_kind_table: torch.Tensor,
+    clamp_value_table: torch.Tensor,
+    clamp_only_if_active_table: torch.Tensor,
+    sae_index: torch.Tensor,
+    any_active: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> torch.Tensor:
+    """FX-tracing fake — correct shape, no computation."""
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="apply_sae_delta_indexed",
+    op_func=apply_sae_delta_indexed_op,
+    fake_impl=apply_sae_delta_indexed_op_fake,
+    mutates_args=[],
+)
+
+
 def apply_sae_delta(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
@@ -516,6 +684,7 @@ def apply_sae_delta(
     clamp_kind: torch.Tensor,
     clamp_value: torch.Tensor,
     clamp_only_if_active: torch.Tensor,
+    any_active: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Public Python API for the SAE feature-surgery delta op.
 
@@ -541,6 +710,11 @@ def apply_sae_delta(
         clamp_only_if_active: ``(n_tokens, n_clamp)`` bool.  When True,
             the clamp is suppressed at positions where ``f <= 0`` in
             the live encoder pass — "amplify when present" semantics.
+        any_active: Optional single-element bool tensor.  When False,
+            the op skips the table gather / encoder / decoder work and
+            returns a fresh no-op copy.  Layer-hook dispatch passes a
+            device tensor here so compiled CUDA graphs keep a stable
+            topology while inactive SAE sites avoid the expensive path.
 
     Returns:
         ``hidden_states + Σ_i delta_i · W_dec[i]`` in the same dtype
@@ -583,10 +757,24 @@ def apply_sae_delta(
             raise ValueError(
                 f"{name} must be {expected_clamp_shape}; got {tuple(t.shape)}."
             )
+    if clamp_kind.dtype != torch.int8:
+        raise ValueError(f"clamp_kind must be torch.int8; got {clamp_kind.dtype}.")
+    _validate_clamp_kind_values(clamp_kind)
+    if not clamp_value.dtype.is_floating_point:
+        raise ValueError(
+            f"clamp_value must be a floating dtype; got {clamp_value.dtype}."
+        )
+    if clamp_only_if_active.dtype != torch.bool:
+        raise ValueError(
+            "clamp_only_if_active must be torch.bool; "
+            f"got {clamp_only_if_active.dtype}."
+        )
 
     # n_clamp == 0 short-circuit: no features to clamp, no work to do.
     if n_clamp == 0:
         return hidden_states.clone()
+    if any_active is None:
+        any_active = torch.ones(1, dtype=torch.bool, device=hidden_states.device)
 
     code = _ACTIVATION_TO_CODE[activation]
     param = _activation_to_scalar(activation, activation_params)
@@ -598,6 +786,7 @@ def apply_sae_delta(
         clamp_kind,
         clamp_value,
         clamp_only_if_active,
+        any_active,
         code,
         param,
     )
@@ -619,14 +808,16 @@ def apply_layer_sae_delta(
     branch and the disabled path emits no SAE kernel at all —
     mirroring :func:`apply_layer_steering`.
 
-    The shim performs a per-token gather from the row table to build
-    the ``(n_tokens, n_clamp)`` clamp tensors, then dispatches to
-    ``torch.ops.vllm.apply_sae_delta``.  The torch-op indirection is
-    what makes :mod:`torch.compile` treat the SAE call as an opaque
-    splitting point (mirroring :func:`apply_layer_steering` →
-    ``torch.ops.vllm.apply_steering``); under CUDA the op routes to a
-    fused Triton kernel.  ``n_clamp == 0`` short-circuits before the
-    op call so we never launch a degenerate kernel.
+    The shim passes the row table plus ``sae_index`` to
+    ``torch.ops.vllm.apply_sae_delta_indexed``.  The backend performs
+    the per-token gather after checking ``any_active``, so an attached
+    but idle SAE module avoids table-gather work.  The torch-op
+    indirection is what makes :mod:`torch.compile` treat the SAE call
+    as an opaque splitting point (mirroring
+    :func:`apply_layer_steering` → ``torch.ops.vllm.apply_steering``);
+    under CUDA the op routes to a fused Triton kernel.  ``n_clamp == 0``
+    short-circuits before the op call so we never launch a degenerate
+    kernel.
     """
     if not sae_buffers_attached(module, hook_point):
         return hidden_states
@@ -647,22 +838,22 @@ def apply_layer_sae_delta(
 
     if enc_w.shape[0] == 0:
         return hidden_states
-
-    # Per-token gather: (max_rows, n_clamp) → (n_tokens, n_clamp).
-    clamp_kind = kind_table[sae_index]
-    clamp_value = value_table[sae_index]
-    clamp_only_if_active = only_table[sae_index]
+    any_active = getattr(module, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[hook_point], None)
+    if any_active is None:
+        any_active = torch.ones(1, dtype=torch.bool, device=hidden_states.device)
 
     code = _ACTIVATION_TO_CODE[activation]
     param = _activation_to_scalar(activation, activation_params)
-    return torch.ops.vllm.apply_sae_delta(
+    return torch.ops.vllm.apply_sae_delta_indexed(
         hidden_states,
         enc_w,
         enc_b,
         dec_w,
-        clamp_kind,
-        clamp_value,
-        clamp_only_if_active,
+        kind_table,
+        value_table,
+        only_table,
+        sae_index,
+        any_active,
         code,
         param,
     )
@@ -710,9 +901,9 @@ def populate_sae_clamp_table(
     other rows' existing buffer content untouched.  Production
     callers omit it so every row is populated under its own phase.
 
-    Phase 1B uses this populator as a Python-eager reference; Phase 2
-    will replace it with a batched index_copy_ that mirrors the
-    additive populator.
+    The populator runs only when manager state is dirty, not on every
+    token. The per-token work happens in the custom op after the row
+    table and ``sae_index`` have been materialized.
 
     Args:
         manager: the :class:`SAEClampManager` holding active rows.
@@ -739,6 +930,7 @@ def populate_sae_clamp_table(
     kind_table = getattr(module, HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point])
     value_table = getattr(module, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point])
     only_table = getattr(module, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
+    any_active = getattr(module, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[hook_point], None)
     n_clamp = kind_table.shape[1]
     if len(clampable_features) != n_clamp:
         raise ValueError(
@@ -753,6 +945,8 @@ def populate_sae_clamp_table(
     kind_table[0].zero_()
     value_table[0].zero_()
     only_table[0].zero_()
+    if any_active is not None and worker_phase is None:
+        any_active.zero_()
     hook_name = hook_point.value
     for row, _config_hash, row_phase, specs in manager.active_rows():
         if worker_phase is not None and row_phase != worker_phase:
@@ -793,6 +987,8 @@ def populate_sae_clamp_table(
                 )
                 value_table[row, pos] = float(entry.value)
                 only_table[row, pos] = bool(entry.only_if_active)
+                if any_active is not None:
+                    any_active.fill_(True)
 
 
 # Note: an earlier draft had a ``_phase_applies(spec_phase, worker_phase,

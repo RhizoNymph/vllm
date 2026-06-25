@@ -226,6 +226,59 @@ class TestRegisterSaeBuffers:
             m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
         )
 
+    def test_partial_registration_failure_rolls_back_buffers(self, monkeypatch):
+        m = _bare_module()
+        original_register_buffer = m.register_buffer
+        calls = 0
+
+        def fail_after_first_buffer(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("buffer allocation failed")
+            return original_register_buffer(*args, **kwargs)
+
+        monkeypatch.setattr(m, "register_buffer", fail_after_first_buffer)
+
+        with pytest.raises(RuntimeError, match="buffer allocation failed"):
+            register_sae_buffers(
+                m,
+                hook_point=SteeringHookPoint.POST_MLP,
+                module_name="g",
+                activation=SAEActivation.RELU,
+                activation_params={},
+                n_clamp=2,
+                hidden_size=4,
+                max_sae_configs=1,
+                dtype=torch.float32,
+            )
+
+        assert not sae_buffers_attached(m, SteeringHookPoint.POST_MLP)
+        for attr_table in (
+            HOOK_POINT_SAE_CLAMP_KIND_ATTR,
+            HOOK_POINT_SAE_CLAMP_VALUE_ATTR,
+            HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR,
+            HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
+            HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
+            HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
+            HOOK_POINT_SAE_MODULE_NAME_ATTR,
+        ):
+            assert not hasattr(m, attr_table[SteeringHookPoint.POST_MLP])
+
+        monkeypatch.setattr(m, "register_buffer", original_register_buffer)
+        register_sae_buffers(
+            m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            activation=SAEActivation.RELU,
+            activation_params={},
+            n_clamp=2,
+            hidden_size=4,
+            max_sae_configs=1,
+            dtype=torch.float32,
+        )
+        assert sae_buffers_attached(m, SteeringHookPoint.POST_MLP)
+
 
 class TestSaeBuffersAttached:
     """``sae_buffers_attached`` is the constant-time dispatch check."""

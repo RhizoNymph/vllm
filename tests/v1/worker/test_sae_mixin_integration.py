@@ -29,11 +29,13 @@ Coverage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 
+import vllm.v1.worker.steering_model_runner_mixin as steering_mixin_mod
 from vllm import SamplingParams
 from vllm.config.sae_steering_types import (
     SAEClampEntry,
@@ -49,9 +51,10 @@ from vllm.model_executor.layers.sae_steering import (
     sae_buffers_attached,
 )
 from vllm.model_executor.layers.steering import (
-    HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
+    register_steering_buffers,
 )
+from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.sae_clamp_manager import SAEClampManager
 from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 
@@ -83,16 +86,12 @@ def _make_decoder_layer(layer_idx: int, hidden_size: int = 4) -> nn.Module:
     """Bare decoder-layer stand-in with the additive table buffers attached."""
     m = nn.Module()
     m.layer_idx = layer_idx  # type: ignore[attr-defined]
-    # Additive steering buffers — needed because _attach_sae_buffers
-    # discovers compute dtype from them.
-    for hp in SteeringHookPoint:
-        m.register_buffer(
-            HOOK_POINT_TABLE_ATTR[hp],
-            torch.zeros(7, hidden_size, dtype=torch.float32),
-            persistent=False,
-        )
-    m.register_buffer(
-        "steering_index", torch.zeros(16, dtype=torch.long), persistent=False
+    register_steering_buffers(
+        m,
+        hidden_size,
+        max_steering_tokens=16,
+        max_steering_configs=4,
+        dtype=torch.float32,
     )
     return m
 
@@ -120,6 +119,7 @@ class _RichHarness(SteeringModelRunnerMixin):
         self._sae_steerable_sites: dict = {}
         self._req_sae_phase: dict = {}
         self._req_steering_phase: dict = {}
+        self._req_transition_scan_candidates: set[str] = set()
         self._steering_index_dirty = False
         self._sae_clamp_manager = SAEClampManager(max_sae_configs)
         self._steering_manager = None  # not exercised in these tests
@@ -128,6 +128,7 @@ class _RichHarness(SteeringModelRunnerMixin):
         self._steering_index_pinned = None
         self._sae_rows_scratch = None
         self._sae_index_pinned = None
+        self.requests: dict = {}
 
 
 def _sae_payload(
@@ -238,6 +239,23 @@ class TestRegisterAttachesSaeBuffers:
         )
         assert enc_w.shape == (3, 8)
 
+    def test_runtime_buffers_follow_existing_layer_device(self):
+        h = _RichHarness(layer_indices=(20,))
+        layer = h._steerable_layers_cache[20].to("meta")
+        h._steerable_layers_cache[20] = layer
+
+        h.register_steering_modules({"g": _sae_payload()})
+
+        assert layer.sae_index.device.type == "meta"  # type: ignore[attr-defined]
+        enc_w = getattr(
+            layer, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+        )
+        kind = getattr(
+            layer, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+        )
+        assert enc_w.device.type == "meta"
+        assert kind.device.type == "meta"
+
     def test_index_buffer_attached_and_shared(self):
         h = _RichHarness(layer_indices=(20, 21))
         h.register_steering_modules(
@@ -250,6 +268,102 @@ class TestRegisterAttachesSaeBuffers:
         site20 = h._steerable_layers_cache[20]
         site21 = h._steerable_layers_cache[21]
         assert site20.sae_index is site21.sae_index  # type: ignore[attr-defined]
+
+    def test_index_shared_across_distinct_modules(self):
+        """Two SAE modules on disjoint layers must share one ``sae_index``.
+
+        The per-step populator writes through a single tensor picked
+        from ``_sae_steerable_sites``; if the second module's layer
+        kept its own ``sae_index``, clamp requests against it would
+        gather row 0 and silently no-op.
+        """
+        h = _RichHarness(layer_indices=(20, 21))
+        h.register_steering_modules(
+            {"a": _sae_payload(layers=((20, "post_mlp"),))},
+        )
+        h.register_steering_modules(
+            {"b": _sae_payload(layers=((21, "post_mlp"),))},
+        )
+        site20 = h._steerable_layers_cache[20]
+        site21 = h._steerable_layers_cache[21]
+        assert site20.sae_index is site21.sae_index  # type: ignore[attr-defined]
+
+    def test_register_warms_attached_sae_module(self, monkeypatch):
+        h = _RichHarness(layer_indices=(20, 21))
+        calls: list[tuple[object, tuple[int, ...], torch.dtype]] = []
+
+        def record_warmup(self, *, manifest, attached_layers, ref_dtype):
+            calls.append(
+                (
+                    manifest,
+                    tuple(layer.layer_idx for layer in attached_layers),
+                    ref_dtype,
+                )
+            )
+
+        monkeypatch.setattr(
+            SteeringModelRunnerMixin,
+            "_warmup_sae_kernel_for_module",
+            record_warmup,
+        )
+
+        h.register_steering_modules(
+            {
+                "g": _sae_payload(
+                    layers=((20, "post_mlp"), (21, "post_mlp")),
+                    clampable=(0, 1),
+                    d_model=4,
+                ),
+            }
+        )
+
+        assert len(calls) == 1
+        manifest, layer_indices, ref_dtype = calls[0]
+        assert manifest.d_model == 4
+        assert manifest.clampable_features == (0, 1)
+        assert layer_indices == (20, 21)
+        assert ref_dtype is torch.float32
+
+    def test_negative_layer_indices_are_rejected(self):
+        h = _RichHarness()
+        with pytest.raises(SteeringVectorError, match="non-negative"):
+            h.register_steering_modules(
+                {"g": _sae_payload(layers=((-1, "post_mlp"),))},
+            )
+        assert h._sae_module_registry == {}
+        assert h._sae_steerable_sites == {}
+
+    def test_index_registration_failure_rolls_back_half_attached_buffers(
+        self,
+        monkeypatch,
+    ):
+        h = _RichHarness(layer_indices=(20,))
+        original_register_index = steering_mixin_mod.register_sae_index_buffer
+
+        def fail_register_index(*args, **kwargs):
+            raise RuntimeError("index allocation failed")
+
+        monkeypatch.setattr(
+            steering_mixin_mod,
+            "register_sae_index_buffer",
+            fail_register_index,
+        )
+
+        with pytest.raises(RuntimeError, match="index allocation failed"):
+            h.register_steering_modules({"g": _sae_payload()})
+
+        site = h._steerable_layers_cache[20]
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert h._sae_module_registry == {}
+        assert h._sae_steerable_sites == {}
+
+        monkeypatch.setattr(
+            steering_mixin_mod,
+            "register_sae_index_buffer",
+            original_register_index,
+        )
+        h.register_steering_modules({"g": _sae_payload()})
+        assert sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
 
 
 class TestUnregisterDetachesSaeBuffers:
@@ -359,12 +473,95 @@ class TestAttachSaeWeights:
                 },
             )
 
+    def test_shape_mismatch_does_not_partially_copy(self):
+        h = _RichHarness(layer_indices=(20, 21))
+        h.register_steering_modules(
+            {
+                "g": _sae_payload(
+                    layers=((20, "post_mlp"), (21, "post_mlp")),
+                    clampable=(0, 1),
+                )
+            }
+        )
+        site20 = h._steerable_layers_cache[20]
+        enc_w20 = getattr(
+            site20, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+        )
+        assert torch.count_nonzero(enc_w20) == 0
+
+        with pytest.raises(SteeringVectorError, match="shape"):
+            h.attach_sae_weights(
+                "g",
+                {
+                    (20, "post_mlp"): {
+                        "encoder_weight": torch.ones(2, 4),
+                        "encoder_bias": torch.ones(2),
+                        "decoder_weight": torch.ones(2, 4),
+                    },
+                    (21, "post_mlp"): {
+                        "encoder_weight": torch.zeros(99, 4),
+                        "encoder_bias": torch.zeros(2),
+                        "decoder_weight": torch.zeros(2, 4),
+                    },
+                },
+            )
+        assert torch.count_nonzero(enc_w20) == 0
+
+    def test_non_floating_tensor_raises(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload(clampable=(0, 1))})
+        with pytest.raises(SteeringVectorError, match="floating dtype"):
+            h.attach_sae_weights(
+                "g",
+                {
+                    (20, "post_mlp"): {
+                        "encoder_weight": torch.zeros(2, 4, dtype=torch.int64),
+                        "encoder_bias": torch.zeros(2),
+                        "decoder_weight": torch.zeros(2, 4),
+                    }
+                },
+            )
+
+    def test_non_tensor_weight_raises_steering_error(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload(clampable=(0, 1))})
+        with pytest.raises(SteeringVectorError, match="torch.Tensor"):
+            h.attach_sae_weights(
+                "g",
+                {
+                    (20, "post_mlp"): {
+                        "encoder_weight": [[0.0, 0.0, 0.0, 0.0]],
+                        "encoder_bias": torch.zeros(2),
+                        "decoder_weight": torch.zeros(2, 4),
+                    }
+                },
+            )
+
+    def test_non_finite_tensor_raises(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload(clampable=(0, 1))})
+        bad = torch.zeros(2, 4)
+        bad[0, 0] = float("nan")
+        with pytest.raises(SteeringVectorError, match="finite values"):
+            h.attach_sae_weights(
+                "g",
+                {
+                    (20, "post_mlp"): {
+                        "encoder_weight": bad,
+                        "encoder_bias": torch.zeros(2),
+                        "decoder_weight": torch.zeros(2, 4),
+                    }
+                },
+            )
+
     def test_layer_not_owned_by_rank_silently_skipped(self):
         # PP scenario: rank doesn't own layer 99, so the weights for it
         # are dropped without error.  The on-disk loader can't know
         # which rank owns which layer; pruning is the rank's job.
         h = _RichHarness(layer_indices=(20,))
-        h.register_steering_modules({"g": _sae_payload(clampable=(0, 1))})
+        h.register_steering_modules(
+            {"g": _sae_payload(layers=((99, "post_mlp"),), clampable=(0, 1))}
+        )
         h.attach_sae_weights(
             "g",
             {
@@ -374,6 +571,223 @@ class TestAttachSaeWeights:
                     "decoder_weight": torch.zeros(2, 4),
                 }
             },
+        )
+
+    def test_missing_owned_site_raises(self):
+        h = _RichHarness(layer_indices=(20, 21))
+        h.register_steering_modules(
+            {
+                "g": _sae_payload(
+                    layers=((20, "post_mlp"), (21, "post_mlp")),
+                    clampable=(0, 1),
+                )
+            }
+        )
+        with pytest.raises(SteeringVectorError, match="missing weights"):
+            h.attach_sae_weights(
+                "g",
+                {
+                    (20, "post_mlp"): {
+                        "encoder_weight": torch.zeros(2, 4),
+                        "encoder_bias": torch.zeros(2),
+                        "decoder_weight": torch.zeros(2, 4),
+                    }
+                },
+            )
+
+
+class TestRegisterWithInlineWeights:
+    """``register_steering_modules`` accepts inline weights for SAE
+    payloads.  The worker registers the manifest and attaches the
+    tensors atomically — there is no observable window where the
+    module is registered but the buffers are still zero-filled."""
+
+    def _payload_with_weights(self, *, d_model: int = 4, clampable=(0, 1)) -> dict:
+        n = len(clampable)
+        body = _sae_payload(d_model=d_model, clampable=clampable)
+        body["sae_weights"] = {
+            (20, "post_mlp"): {
+                "encoder_weight": torch.ones(n, d_model),
+                "encoder_bias": torch.full((n,), 0.5),
+                "decoder_weight": torch.full((n, d_model), 2.0),
+            }
+        }
+        return body
+
+    def test_inline_weights_populate_buffers_in_one_call(self):
+        h = _RichHarness(hidden_size=4)
+        h.register_steering_modules({"g": self._payload_with_weights()})
+        site = h._steerable_layers_cache[20]
+        enc_w = getattr(
+            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+        )
+        assert torch.equal(enc_w, torch.ones(2, 4))
+
+    def test_attach_failure_rolls_back_registry_entry(self):
+        """A bad weight shape inside the inline payload must leave the
+        worker with neither a registered module nor any half-attached
+        buffers — otherwise a future request could resolve the name
+        and gather rows from zero-filled tables."""
+        h = _RichHarness(hidden_size=4)
+        bad = _sae_payload(d_model=4, clampable=(0, 1))
+        bad["sae_weights"] = {
+            (20, "post_mlp"): {
+                "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
+                "encoder_bias": torch.zeros(2),
+                "decoder_weight": torch.zeros(2, 4),
+            }
+        }
+        with pytest.raises(SteeringVectorError):
+            h.register_steering_modules({"g": bad})
+        assert "g" not in h._sae_module_registry
+        site = h._steerable_layers_cache[20]
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+
+    def test_additive_to_sae_replacement_failure_restores_additive(self):
+        """A failed additive-to-SAE replacement must leave the additive
+        module intact on the worker.  Otherwise the server-side rollback
+        would restore the additive entry on the registry while the
+        worker has lost it, diverging the two."""
+        h = _RichHarness(hidden_size=4)
+        # Seed an additive module at name 'g'.
+        additive_payload = {
+            "kind": "additive",
+            "vectors": {"post_mlp": {20: [0.1, 0.2, 0.3, 0.4]}},
+            "prefill_vectors": None,
+            "decode_vectors": None,
+        }
+        h.register_steering_modules({"g": additive_payload})
+        assert "g" in h._steering_module_registry
+        prior_additive = h._steering_module_registry["g"]
+
+        # Re-register the same name as SAE with a bad-shape weight
+        # payload; attach must fail.
+        bad = _sae_payload(d_model=4, clampable=(0, 1))
+        bad["sae_weights"] = {
+            (20, "post_mlp"): {
+                "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
+                "encoder_bias": torch.zeros(2),
+                "decoder_weight": torch.zeros(2, 4),
+            }
+        }
+        with pytest.raises(SteeringVectorError):
+            h.register_steering_modules({"g": bad})
+
+        # SAE entry never sticks; additive entry restored bit-for-bit.
+        assert "g" not in h._sae_module_registry
+        assert "g" in h._steering_module_registry
+        assert h._steering_module_registry["g"] is prior_additive
+        site = h._steerable_layers_cache[20]
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+
+    def test_replacement_failure_restores_previous_module(self):
+        """A failed replacement must put the previously-loaded SAE
+        weights back, not destroy them along with the bad request."""
+        h = _RichHarness(hidden_size=4)
+        # Seed a working SAE with recognisable weight values.
+        good = _sae_payload(d_model=4, clampable=(0, 1))
+        good["sae_weights"] = {
+            (20, "post_mlp"): {
+                "encoder_weight": torch.full((2, 4), 7.0),
+                "encoder_bias": torch.full((2,), 0.25),
+                "decoder_weight": torch.full((2, 4), 3.0),
+            }
+        }
+        h.register_steering_modules({"g": good})
+        site = h._steerable_layers_cache[20]
+        assert torch.equal(
+            getattr(
+                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            ),
+            torch.full((2, 4), 7.0),
+        )
+
+        # Re-register the same name with a bad-shape weight payload.
+        bad = _sae_payload(d_model=4, clampable=(0, 1))
+        bad["sae_weights"] = {
+            (20, "post_mlp"): {
+                "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
+                "encoder_bias": torch.zeros(2),
+                "decoder_weight": torch.zeros(2, 4),
+            }
+        }
+        with pytest.raises(SteeringVectorError):
+            h.register_steering_modules({"g": bad})
+
+        # Registry entry preserved, buffers re-attached with the
+        # original tensors.
+        assert "g" in h._sae_module_registry
+        assert sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert torch.equal(
+            getattr(
+                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            ),
+            torch.full((2, 4), 7.0),
+        )
+        assert torch.equal(
+            getattr(site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]),
+            torch.full((2,), 0.25),
+        )
+
+    def test_replace_true_failure_restores_additive_registry(self):
+        h = _RichHarness(hidden_size=4)
+        h.register_steering_modules(
+            {
+                "m": {
+                    "kind": "additive",
+                    "vectors": {"post_mlp": {20: [0.1, 0.2, 0.3, 0.4]}},
+                }
+            }
+        )
+        prior = h._steering_module_registry["m"]
+        prior_cache = h._steering_module_resolved_cache["m"]
+
+        with pytest.raises(SteeringVectorError):
+            h.register_steering_modules(
+                {"bad": {"kind": "sae_delta", "sae_manifest": {"d_model": 4}}},
+                replace=True,
+            )
+
+        assert h._steering_module_registry["m"] is prior
+        assert h._steering_module_resolved_cache["m"] is prior_cache
+        assert h._sae_module_registry == {}
+
+    def test_replace_true_failure_restores_sae_buffers_and_weights(self):
+        h = _RichHarness(hidden_size=4)
+        good = _sae_payload(d_model=4, clampable=(0, 1))
+        good["sae_weights"] = {
+            (20, "post_mlp"): {
+                "encoder_weight": torch.full((2, 4), 5.0),
+                "encoder_bias": torch.full((2,), 0.75),
+                "decoder_weight": torch.full((2, 4), 6.0),
+            }
+        }
+        h.register_steering_modules({"g": good})
+        site = h._steerable_layers_cache[20]
+
+        bad = _sae_payload(d_model=4, clampable=(0, 1))
+        bad["sae_weights"] = {
+            (20, "post_mlp"): {
+                "encoder_weight": torch.zeros(99, 4),
+                "encoder_bias": torch.zeros(2),
+                "decoder_weight": torch.zeros(2, 4),
+            }
+        }
+        with pytest.raises(SteeringVectorError):
+            h.register_steering_modules({"bad": bad}, replace=True)
+
+        assert "g" in h._sae_module_registry
+        assert "bad" not in h._sae_module_registry
+        assert sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert torch.equal(
+            getattr(
+                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            ),
+            torch.full((2, 4), 5.0),
+        )
+        assert torch.equal(
+            getattr(site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]),
+            torch.full((2,), 0.75),
         )
 
 
@@ -390,7 +804,8 @@ class TestRegisterInitialSaeClamps:
             is_prefilling=True,
         )
         assert h._req_sae_phase["req-1"] == "prefill"
-        assert h._sae_clamp_manager.config_to_row[(111, "prefill")] == 1
+        sae_hash = sp.prefill_sae_clamp_config_hash
+        assert h._sae_clamp_manager.config_to_row[(sae_hash, "prefill")] == 1
 
     def test_admit_under_decode_when_full_prefix_cache_hit(self):
         h = _RichHarness()
@@ -404,7 +819,32 @@ class TestRegisterInitialSaeClamps:
             is_prefilling=False,
         )
         assert h._req_sae_phase["req-1"] == "decode"
-        assert h._sae_clamp_manager.config_to_row[(222, "decode")] == 1
+        sae_hash = sp.decode_sae_clamp_config_hash
+        assert h._sae_clamp_manager.config_to_row[(sae_hash, "decode")] == 1
+
+    def test_same_sae_spec_deduplicates_across_different_combined_hashes(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+        sp = SamplingParams(sae_clamp_specs=(_make_clamp_spec(),))
+
+        h._register_initial_sae_clamps(
+            "req-1",
+            sp,
+            prefill_hash=111,
+            decode_hash=333,
+            is_prefilling=True,
+        )
+        h._register_initial_sae_clamps(
+            "req-2",
+            sp,
+            prefill_hash=222,
+            decode_hash=444,
+            is_prefilling=True,
+        )
+
+        sae_hash = sp.prefill_sae_clamp_config_hash
+        assert h._sae_clamp_manager.config_to_row == {(sae_hash, "prefill"): 1}
+        assert h._sae_clamp_manager.config_refcounts[(sae_hash, "prefill")] == 2
 
     def test_no_clamps_no_op(self):
         h = _RichHarness()
@@ -433,6 +873,42 @@ class TestRegisterInitialSaeClamps:
         )
         assert "req-1" not in h._req_sae_phase
 
+    def test_decode_only_spec_does_not_consume_prefill_row_from_additive_hash(self):
+        # The prefill hash can be nonzero because of additive steering
+        # while the SAE spec itself is decode-only.  SAE admission must
+        # look at the phase-filtered SAE specs, not just the combined
+        # additive+SAE hash, or it burns a no-op SAE row in prefill.
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+        sp = SamplingParams(sae_clamp_specs=(_make_clamp_spec(phase="decode"),))
+
+        h._register_initial_sae_clamps(
+            "req-1",
+            sp,
+            prefill_hash=111,
+            decode_hash=222,
+            is_prefilling=True,
+        )
+
+        assert "req-1" not in h._req_sae_phase
+        assert h._sae_clamp_manager.config_to_row == {}
+
+    def test_prefill_only_spec_does_not_consume_decode_row_from_additive_hash(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+        sp = SamplingParams(sae_clamp_specs=(_make_clamp_spec(phase="prefill"),))
+
+        h._register_initial_sae_clamps(
+            "req-1",
+            sp,
+            prefill_hash=111,
+            decode_hash=222,
+            is_prefilling=False,
+        )
+
+        assert "req-1" not in h._req_sae_phase
+        assert h._sae_clamp_manager.config_to_row == {}
+
 
 class TestReleaseSaeForRequest:
     def test_releases_under_recorded_phase(self):
@@ -459,6 +935,23 @@ class TestReleaseSaeForRequest:
             "req-1", sp, prefill_hash=111, decode_hash=222, is_prefilling=False
         )
         h._release_sae_for_request("req-1", prefill_hash=111, decode_hash=222)
+        assert h._sae_clamp_manager.config_to_row == {}
+
+    def test_finished_release_does_not_require_additive_manager(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+        sp = SamplingParams(sae_clamp_specs=(_make_clamp_spec(),))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=111, decode_hash=222, is_prefilling=True
+        )
+        h.requests["req-1"] = SimpleNamespace(
+            prefill_steering_config_hash=111,
+            decode_steering_config_hash=222,
+        )
+
+        h._release_finished_steering_configs({"req-1"})
+
+        assert "req-1" not in h._req_sae_phase
         assert h._sae_clamp_manager.config_to_row == {}
 
 
@@ -521,4 +1014,30 @@ class TestKindSwapClearsTracking:
         # the buffer-attach lifecycle and the request-row lifecycle
         # are independent.  (Production-side, the request will fail
         # validation on its next admission step anyway.)
-        assert h._sae_clamp_manager.config_to_row[(111, "prefill")] == 1
+        sae_hash = sp.prefill_sae_clamp_config_hash
+        assert h._sae_clamp_manager.config_to_row[(sae_hash, "prefill")] == 1
+
+
+class TestWorkerRpcSurface:
+    def test_gpu_worker_exposes_attach_sae_weights_rpc(self):
+        class _Runner:
+            def __init__(self):
+                self.calls = []
+
+            def attach_sae_weights(self, module_name, weights):
+                self.calls.append((module_name, weights))
+
+        worker = Worker.__new__(Worker)
+        runner = _Runner()
+        worker.model_runner = runner
+        weights = {
+            (20, "post_mlp"): {
+                "encoder_weight": torch.zeros(1, 2),
+                "encoder_bias": torch.zeros(1),
+                "decoder_weight": torch.zeros(1, 2),
+            }
+        }
+
+        worker.attach_sae_weights("g", weights)
+
+        assert runner.calls == [("g", weights)]

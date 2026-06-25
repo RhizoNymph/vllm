@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Literal
+import math
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from vllm.config.steering_types import SteeringVectorSpec
 
@@ -13,21 +14,21 @@ class SAEModuleManifestRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    d_model: int = Field(
+    d_model: StrictInt = Field(
         description="Residual-stream dimension the SAE was trained against.",
         gt=0,
     )
-    d_sae: int = Field(
+    d_sae: StrictInt = Field(
         description="Number of SAE features (encoder/decoder rows).", gt=0
     )
     activation: Literal["relu", "jumprelu", "topk"] = Field(
         description="Encoder activation function the SAE was trained with."
     )
-    layers: list[tuple[int, str]] = Field(
+    layers: list[tuple[StrictInt, str]] = Field(
         description="(layer_idx, hook_point) pairs the SAE applies to.",
         min_length=1,
     )
-    clampable_features: list[int] = Field(
+    clampable_features: list[StrictInt] = Field(
         description=(
             "Feature indices that may be clamped at runtime.  "
             "Encoder/decoder rows are loaded only for this subset."
@@ -43,10 +44,32 @@ class SAEModuleManifestRequest(BaseModel):
     weights_uri: str | None = Field(
         default=None,
         description=(
-            "Local path or URI for SAE weight artifacts.  Phase-0 "
-            "stores this without dereferencing it."
+            "Local path or URI for SAE weight artifacts.  The register "
+            "endpoint loads these weights and broadcasts them with the "
+            "manifest."
         ),
     )
+
+    @field_validator("activation_params", mode="before")
+    @classmethod
+    def validate_activation_params(cls, value: Any) -> Any:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("activation_params must be a dict.")
+        for key, param in value.items():
+            if not isinstance(key, str):
+                raise ValueError("activation_params keys must be strings.")
+            if (
+                isinstance(param, bool)
+                or not isinstance(param, (int, float))
+                or not math.isfinite(float(param))
+            ):
+                raise ValueError(
+                    "activation_params values must be finite numbers, "
+                    f"got {param!r} for key {key!r}."
+                )
+        return value
 
 
 class RegisterSteeringModuleRequest(BaseModel):

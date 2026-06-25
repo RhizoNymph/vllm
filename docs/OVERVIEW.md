@@ -12,7 +12,7 @@ Goal: serve large language models with the standard vLLM stack
 (continuous batching, prefix caching, `torch.compile`, CUDA graphs,
 TP/PP) **and** allow injection of activation steering — both
 precomputed additive vectors (today) and SAE-based feature surgery
-(planned, see [`features/sae_steering.md`](features/sae_steering.md))
+(see [`features/sae_steering.md`](features/sae_steering.md))
 — into the residual stream of decoder layers, with phase-aware
 per-request and global tiers.
 
@@ -61,7 +61,8 @@ Across one inference step:
 Engine receives request
    ├── SamplingParams.steering_* validated and hashed
    │     -> prefill_steering_config_hash, decode_steering_config_hash
-   └── Scheduler reserves SteeringManager row(s) before dispatch
+   └── Scheduler reserves additive and/or SAE steering row capacity
+       before dispatch
 
 Worker receives SchedulerOutput
    ├── Mixin: register/release rows for new+finished requests
@@ -77,8 +78,11 @@ Model forward (under torch.compile / CUDA graph):
        residual = apply_layer_steering(residual, POST_ATTN)
        ... mlp ...
        residual = apply_layer_steering(residual, POST_MLP)
-   # apply_layer_steering = gather row from steering_table by
-   # steering_index, add into residual; row 0 is the no-op sentinel.
+   # apply_layer_steering composition order (each stage is independently
+   # gated by a static hasattr check on its per-layer buffer):
+   #   1. additive gather/add by steering_index
+   #   2. SAE delta when SAE delta buffers are attached
+   #   3. SAE full reconstruction when full-recon buffers are attached
 
 Engine collects outputs
    └── On request finish: SteeringManager.release_config drops refcounts
@@ -107,25 +111,33 @@ folded into the standard cache hash.
 - doc: [`features/steering.md`](features/steering.md)
 - design: [`design/steering_runtime.md`](design/steering_runtime.md)
 
-### SAE-Based Steering (delta / feature surgery) — planned
+### SAE-Based Steering (delta + full reconstruction)
 
-- description: Per-(layer, hook) SAE feature surgery — encode the
-  live residual, replace a small set of feature activations with
-  caller-supplied clamp values, add the resulting decoder-direction
-  delta back into the residual. Composes additively with the
-  existing additive tier; uses the same admission, TP/PP, and
-  prefix-cache machinery. Adopts the "delta intervention" variant
-  (most follow-up SAE-steering work) rather than the
-  reconstruction-replacement variant from Anthropic's Scaling
-  Monosemanticity, which is parked as a future module kind.
-- entry_points (planned):
+- description: Per-(layer, hook) SAE feature surgery in two variants.
+  **Delta**: encode the live residual, replace a small set of
+  feature activations with caller-supplied clamp values, add the
+  resulting decoder-direction delta back into the residual.  **Full
+  reconstruction**: replace the residual entirely with the SAE's
+  `decode(activate(encode(h))) + b_dec`, optionally with the same
+  per-(layer, hook) clamps applied to the activation before decode
+  (Anthropic Scaling Monosemanticity / Golden Gate Claude
+  semantics).  Both variants compose additively with the existing
+  additive tier and use the same admission, TP/PP, and prefix-cache
+  machinery.
+- entry_points:
     - `vllm.model_executor.layers.sae_steering.apply_layer_sae_delta`
+    - `vllm.model_executor.layers.sae_full_reconstruction.apply_layer_sae_full_reconstruction`
     - `vllm.v1.worker.sae_clamp_manager.SAEClampManager`
+    - `vllm.v1.worker.sae_full_reconstruction_manager.SAEFullReconstructionManager`
     - `POST /v1/steering/modules/register` with
-      `kind: "sae_delta"`
-    - `SamplingParams.sae_clamp_specs`
-- depends_on: Activation Steering (shares the manager, runner mixin,
-  named-module registry, custom-op shim, prefix-cache key folding).
+      `kind: "sae_delta"` or `kind: "sae_full_reconstruction"`
+    - `SamplingParams.sae_clamp_specs` (delta) and
+      `SamplingParams.sae_full_reconstruction_specs` (replacement)
+- depends_on: Activation Steering runtime patterns (runner mixin,
+  named-module registry, custom-op shim, scheduler admission, and
+  prefix-cache key folding). SAE rows are owned by parallel
+  `SAEClampManager` and `SAEFullReconstructionManager`s, each with
+  its own row table per (layer, hook) site.
 - doc: [`features/sae_steering.md`](features/sae_steering.md)
 
 ## Where to Read Next

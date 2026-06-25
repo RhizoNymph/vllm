@@ -12,6 +12,8 @@ Covers:
 - hash_steering_config combined with SAE specs
 """
 
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from vllm.config.sae_steering_types import (
@@ -21,6 +23,7 @@ from vllm.config.sae_steering_types import (
     SteeringModuleKind,
     coerce_sae_clamp_specs,
     hash_sae_clamp_specs,
+    hash_sae_clamp_specs_for_phase,
 )
 from vllm.config.steering_types import hash_steering_config
 
@@ -79,6 +82,14 @@ class TestSAEClampEntry:
         with pytest.raises(ValueError, match="finite"):
             SAEClampEntry(feature_idx=0, kind="absolute", value=float("nan"))
 
+    def test_bool_value_rejected(self):
+        with pytest.raises(ValueError, match="finite float"):
+            SAEClampEntry(
+                feature_idx=0,
+                kind="absolute",
+                value=True,  # type: ignore[arg-type]
+            )
+
     def test_non_int_feature_idx_rejected(self):
         # Pydantic coerces ``"0"`` to int 0, so we use a non-coercible
         # string to exercise the type validation path.
@@ -89,9 +100,25 @@ class TestSAEClampEntry:
                 value=1.0,
             )
 
+    def test_bool_feature_idx_rejected(self):
+        with pytest.raises(ValueError, match="non-negative int"):
+            SAEClampEntry(
+                feature_idx=True,  # type: ignore[arg-type]
+                kind="absolute",
+                value=1.0,
+            )
+
+    def test_feature_idx_too_large_rejected(self):
+        with pytest.raises(ValueError, match="2147483647"):
+            SAEClampEntry(
+                feature_idx=2**31,
+                kind="absolute",
+                value=1.0,
+            )
+
     def test_frozen(self):
         e = SAEClampEntry(feature_idx=0, kind="absolute", value=1.0)
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             e.feature_idx = 1  # type: ignore[misc]
 
 
@@ -157,6 +184,28 @@ class TestSAEClampSpec:
             SAEClampSpec(
                 module_name="m",
                 clamps={"post_mlp": {-1: (SAEClampEntry(0, "absolute", 1.0),)}},
+            )
+
+    def test_bool_layer_idx_rejected(self):
+        with pytest.raises(ValueError, match="non-negative integer"):
+            SAEClampSpec(
+                module_name="m",
+                clamps={
+                    "post_mlp": {
+                        True: (SAEClampEntry(0, "absolute", 1.0),),  # type: ignore[dict-item]
+                    }
+                },
+            )
+
+    def test_layer_idx_too_large_rejected(self):
+        with pytest.raises(ValueError, match="2147483647"):
+            SAEClampSpec(
+                module_name="m",
+                clamps={
+                    "post_mlp": {
+                        2**31: (SAEClampEntry(0, "absolute", 1.0),),
+                    }
+                },
             )
 
     def test_duplicate_feature_idx_rejected(self):
@@ -233,6 +282,34 @@ class TestCoerceSAEClampSpecs:
         assert len(entries) == 1 and isinstance(entries[0], SAEClampEntry)
         assert entries[0].feature_idx == 34
 
+    def test_duplicate_normalized_layer_keys_rejected(self):
+        with pytest.raises(ValueError, match="duplicate layer key"):
+            coerce_sae_clamp_specs(
+                [
+                    {
+                        "module_name": "g",
+                        "clamps": {
+                            "post_mlp": {
+                                "1": [
+                                    {
+                                        "feature_idx": 1,
+                                        "kind": "absolute",
+                                        "value": 1.0,
+                                    }
+                                ],
+                                "01": [
+                                    {
+                                        "feature_idx": 2,
+                                        "kind": "absolute",
+                                        "value": 2.0,
+                                    }
+                                ],
+                            }
+                        },
+                    }
+                ]
+            )
+
     def test_passthrough_for_already_typed(self):
         s = _spec()
         out = coerce_sae_clamp_specs((s,))
@@ -247,6 +324,157 @@ class TestCoerceSAEClampSpecs:
     def test_non_list_input_rejected(self):
         with pytest.raises(ValueError, match="must be a list"):
             coerce_sae_clamp_specs({"module_name": "g"})
+
+    def test_string_value_rejected(self):
+        with pytest.raises(ValueError, match="value must be a finite float"):
+            coerce_sae_clamp_specs(
+                [
+                    {
+                        "module_name": "g",
+                        "clamps": {
+                            "post_mlp": {
+                                "20": [
+                                    {
+                                        "feature_idx": 34,
+                                        "kind": "absolute",
+                                        "value": "5.0",
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                ]
+            )
+
+    def test_string_only_if_active_rejected(self):
+        with pytest.raises(ValueError, match="only_if_active must be a bool"):
+            coerce_sae_clamp_specs(
+                [
+                    {
+                        "module_name": "g",
+                        "clamps": {
+                            "post_mlp": {
+                                "20": [
+                                    {
+                                        "feature_idx": 34,
+                                        "kind": "additive",
+                                        "value": 5.0,
+                                        "only_if_active": "false",
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                ]
+            )
+
+    @pytest.mark.parametrize("missing_key", ["feature_idx", "kind", "value"])
+    def test_missing_entry_required_field_raises_value_error(self, missing_key):
+        entry = {
+            "feature_idx": 34,
+            "kind": "absolute",
+            "value": 5.0,
+        }
+        entry.pop(missing_key)
+        with pytest.raises(ValueError, match="missing required field"):
+            coerce_sae_clamp_specs(
+                [
+                    {
+                        "module_name": "g",
+                        "clamps": {"post_mlp": {"20": [entry]}},
+                    }
+                ]
+            )
+
+    def test_bool_layer_key_rejected(self):
+        with pytest.raises(ValueError, match="invalid layer key"):
+            coerce_sae_clamp_specs(
+                [
+                    {
+                        "module_name": "g",
+                        "clamps": {
+                            "post_mlp": {
+                                True: [
+                                    {
+                                        "feature_idx": 34,
+                                        "kind": "absolute",
+                                        "value": 5.0,
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                ]
+            )
+
+    def test_float_layer_key_rejected(self):
+        with pytest.raises(ValueError, match="invalid layer key"):
+            coerce_sae_clamp_specs(
+                [
+                    {
+                        "module_name": "g",
+                        "clamps": {
+                            "post_mlp": {
+                                20.5: [
+                                    {
+                                        "feature_idx": 34,
+                                        "kind": "absolute",
+                                        "value": 5.0,
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                ]
+            )
+
+    def test_overlapping_same_feature_same_phase_rejected(self):
+        raw = [
+            {
+                "module_name": "g",
+                "phase": "prefill",
+                "clamps": {
+                    "post_mlp": {
+                        "20": [
+                            {
+                                "feature_idx": 34,
+                                "kind": "absolute",
+                                "value": 1.0,
+                            }
+                        ]
+                    }
+                },
+            },
+            {
+                "module_name": "g",
+                "phase": "prefill",
+                "clamps": {
+                    "post_mlp": {
+                        "20": [
+                            {
+                                "feature_idx": 34,
+                                "kind": "additive",
+                                "value": 2.0,
+                            }
+                        ]
+                    }
+                },
+            },
+        ]
+        with pytest.raises(ValueError, match="overlapping clamps"):
+            coerce_sae_clamp_specs(raw)
+
+    def test_overlapping_both_phase_rejected(self):
+        a = _spec(module_name="g", phase="both")
+        b = _spec(module_name="g", phase="decode")
+        with pytest.raises(ValueError, match="overlapping clamps"):
+            coerce_sae_clamp_specs((a, b))
+
+    def test_same_feature_disjoint_phases_allowed(self):
+        a = _spec(module_name="g", phase="prefill")
+        b = _spec(module_name="g", phase="decode")
+        out = coerce_sae_clamp_specs((a, b))
+        assert out == (a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +535,23 @@ class TestHashSAEClampSpecs:
         b = (_spec(module_name="beta"), _spec(module_name="alpha"))
         assert hash_sae_clamp_specs(a) == hash_sae_clamp_specs(b)
 
+    def test_same_module_same_phase_disjoint_specs_order_independent(self):
+        """Equal module/phase sort keys must still canonicalize content."""
+        spec_a = SAEClampSpec(
+            module_name="m",
+            phase="both",
+            clamps={"post_mlp": {0: (SAEClampEntry(1, "absolute", 1.0),)}},
+        )
+        spec_b = SAEClampSpec(
+            module_name="m",
+            phase="both",
+            clamps={"post_mlp": {1: (SAEClampEntry(2, "additive", 2.0),)}},
+        )
+
+        assert hash_sae_clamp_specs((spec_a, spec_b)) == hash_sae_clamp_specs(
+            (spec_b, spec_a)
+        )
+
     def test_entry_order_independent(self):
         """Entries within the same (hook, layer) hash the same regardless
         of the order the user passed them in."""
@@ -320,6 +565,39 @@ class TestHashSAEClampSpecs:
         h = hash_sae_clamp_specs((_spec(),))
         assert h >= 0
         assert h <= 0x7FFFFFFFFFFFFFFF
+
+    def test_max_int32_indices_hash(self):
+        spec = SAEClampSpec(
+            module_name="m",
+            clamps={
+                "post_mlp": {
+                    2**31 - 1: (
+                        SAEClampEntry(2**31 - 1, "absolute", 1.0),
+                    )
+                }
+            },
+        )
+        h = hash_sae_clamp_specs((spec,))
+        assert h > 0
+
+
+class TestHashSAEClampSpecsForPhase:
+    def test_both_and_prefill_specs_share_prefill_row_hash(self):
+        both = _spec(module_name="m", phase="both")
+        prefill = _spec(module_name="m", phase="prefill")
+
+        assert hash_sae_clamp_specs_for_phase(
+            (both,), "prefill"
+        ) == hash_sae_clamp_specs_for_phase((prefill,), "prefill")
+
+    def test_decode_only_spec_omitted_from_prefill_row_hash(self):
+        decode = _spec(module_name="m", phase="decode")
+        assert hash_sae_clamp_specs_for_phase((decode,), "prefill") == 0
+
+    def test_request_hash_still_distinguishes_phase_semantics(self):
+        both = _spec(module_name="m", phase="both")
+        prefill = _spec(module_name="m", phase="prefill")
+        assert hash_sae_clamp_specs((both,)) != hash_sae_clamp_specs((prefill,))
 
 
 # ---------------------------------------------------------------------------

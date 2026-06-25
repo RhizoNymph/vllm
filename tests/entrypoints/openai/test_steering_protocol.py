@@ -10,6 +10,7 @@ passes them through correctly.
 """
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    BatchChatCompletionRequest,
     ChatCompletionRequest,
 )
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
@@ -45,6 +46,24 @@ _COMPLETION_BASE = {
     "prompt": "Hello",
     "model": "test-model",
 }
+
+_SAE_CLAMP_SPECS = [
+    {
+        "module_name": "golden-gate",
+        "phase": "prefill",
+        "clamps": {
+            "post_mlp": {
+                "20": [
+                    {
+                        "feature_idx": 34,
+                        "kind": "absolute",
+                        "value": 5.0,
+                    }
+                ]
+            }
+        },
+    }
+]
 
 
 def _make_chat(**extra):
@@ -130,6 +149,20 @@ class TestChatCompletionSteering:
         assert entry["vector"] == [0.4, 0.5, 0.6]
         assert entry["scale"] == 2.0
 
+    def test_sae_clamp_specs_to_sampling_params(self):
+        req = _make_chat(sae_clamp_specs=_SAE_CLAMP_SPECS)
+        sp = req.to_sampling_params(
+            max_tokens=100,
+            default_sampling_params={},
+        )
+
+        assert sp.sae_clamp_specs is not None
+        spec = sp.sae_clamp_specs[0]
+        assert spec.module_name == "golden-gate"
+        assert spec.phase == "prefill"
+        assert 20 in spec.clamps["post_mlp"]
+        assert spec.clamps["post_mlp"][20][0].feature_idx == 34
+
 
 # ---------------------------------------------------------------------------
 # CompletionRequest tests
@@ -197,6 +230,17 @@ class TestCompletionSteering:
         assert entry["vector"] == [0.4, 0.5, 0.6]
         assert entry["scale"] == 2.0
 
+    def test_sae_clamp_specs_to_sampling_params(self):
+        req = _make_completion(sae_clamp_specs=_SAE_CLAMP_SPECS)
+        sp = req.to_sampling_params(max_tokens=100)
+
+        assert sp.sae_clamp_specs is not None
+        spec = sp.sae_clamp_specs[0]
+        assert spec.module_name == "golden-gate"
+        assert spec.phase == "prefill"
+        assert 20 in spec.clamps["post_mlp"]
+        assert spec.clamps["post_mlp"][20][0].feature_idx == 34
+
 
 # ---------------------------------------------------------------------------
 # steering_name field tests
@@ -230,3 +274,25 @@ class TestSteeringNameField:
         )
         assert chat.steering_name == "base_personality"
         assert chat.steering_vectors is not None
+
+
+class TestBatchChatCompletionSteering:
+    def test_batch_chat_declares_and_forwards_steering_fields(self):
+        batch = BatchChatCompletionRequest.model_validate(
+            {
+                "model": "test-model",
+                "messages": [[{"role": "user", "content": "Hello"}]],
+                "steering_name": "base_personality",
+                "steering_vectors": _BARE_VECTORS,
+                "sae_clamp_specs": _SAE_CLAMP_SPECS,
+            }
+        )
+
+        single = batch.to_chat_completion_request(batch.messages[0])
+
+        assert batch.steering_name == "base_personality"
+        assert batch.steering_vectors == _BARE_VECTORS
+        assert batch.sae_clamp_specs == _SAE_CLAMP_SPECS
+        assert single.steering_name == "base_personality"
+        assert single.steering_vectors == _BARE_VECTORS
+        assert single.sae_clamp_specs == _SAE_CLAMP_SPECS

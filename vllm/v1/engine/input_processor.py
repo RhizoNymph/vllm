@@ -162,12 +162,17 @@ class InputProcessor:
             params.steering_vectors is not None
             or params.prefill_steering_vectors is not None
             or params.decode_steering_vectors is not None
+            or params.steering_module_ref is not None
+            or params.sae_clamp_specs is not None
+            or params._effective_prefill_steering_packed is not None
+            or params._effective_decode_steering_packed is not None
         )
         if has_steering and not self.steering_config:
             raise ValueError(
-                "Per-request steering vectors were provided but steering "
-                "is not enabled. Start the server with --enable-steering "
-                "to use per-request steering vectors."
+                "Per-request steering vectors, named-module references, "
+                "or SAE clamp specs were provided but steering is not "
+                "enabled. Start the server with --enable-steering to use "
+                "per-request steering."
             )
 
     def _get_mm_identifier(

@@ -16,6 +16,7 @@ import torch.nn as nn
 from vllm.model_executor.layers.steering import (
     DEFAULT_HOOK_POINT,
     HOOK_POINT_TABLE_ATTR,
+    register_steering_buffers,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
 
@@ -36,11 +37,12 @@ class FakeSteerableLayer(nn.Module):
 
     def __init__(self, num_rows: int, hidden_size: int):
         super().__init__()
-        for attr in HOOK_POINT_TABLE_ATTR.values():
-            self.register_buffer(
-                attr,
-                torch.zeros(num_rows, hidden_size),
-            )
+        register_steering_buffers(
+            self,
+            hidden_size,
+            max_steering_tokens=1,
+            max_steering_configs=num_rows - 3,
+        )
 
 
 def _make_manager(

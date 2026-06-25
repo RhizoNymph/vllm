@@ -2,21 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from vllm.config.multimodal import MultiModalConfig
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.batch_serving import (
+    OpenAIServingChatBatch,
+)
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    BatchChatCompletionRequest,
+    ChatCompletionRequest,
+)
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.steering.registry import SteeringModuleRegistry
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
-from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.engine.async_llm import AsyncLLM
 
 MODEL_NAME = "openai-community/gpt2"
@@ -72,14 +79,35 @@ class MockVllmConfig:
     parallel_config: MockParallelConfig
 
 
+@dataclass
+class DummyTokenizer:
+    max_chars_per_token: int = 1
+
+    def decode(self, tokens: list[int]) -> str:
+        return str(tokens)
+
+    def encode(self, text: str, **kwargs) -> list[int]:
+        return list(range(len(text)))
+
+    def __call__(self, text: str, **kwargs):
+        return type("Tokenized", (), {"input_ids": self.encode(text, **kwargs)})()
+
+
 def _build_renderer(model_config: MockModelConfig):
     return HfRenderer(
         MockVllmConfig(model_config, parallel_config=MockParallelConfig()),
-        cached_tokenizer_from_config(model_config),
+        DummyTokenizer(),
     )
 
 
-def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
+def _build_serving_chat(
+    engine: AsyncLLM,
+    serving_cls=OpenAIServingChat,
+) -> OpenAIServingChat:
+    engine.vllm_config = MockVllmConfig(  # type: ignore[attr-defined]
+        engine.model_config,
+        parallel_config=MockParallelConfig(),
+    )
     models = OpenAIServingModels(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
@@ -92,7 +120,7 @@ def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
         chat_template=None,
         chat_template_content_format="auto",
     )
-    serving_chat = OpenAIServingChat(
+    serving_chat = serving_cls(
         engine,
         models,
         response_role="assistant",
@@ -319,6 +347,118 @@ async def test_chat_named_steering_without_raw_request_returns_error():
 
     assert isinstance(response, ErrorResponse)
     assert "Named steering modules are not available" in response.error.message
+
+
+@pytest.mark.asyncio
+async def test_chat_beam_search_with_steering_returns_error():
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Test prompt"}],
+        max_tokens=10,
+        use_beam_search=True,
+        steering_vectors={"post_mlp": {0: [0.1]}},
+    )
+
+    serving_chat = OpenAIServingChat.__new__(OpenAIServingChat)
+    response = await serving_chat.create_chat_completion(request)
+
+    assert isinstance(response, ErrorResponse)
+    assert "Beam search does not support steering" in response.error.message
+
+
+@pytest.mark.asyncio
+async def test_batch_chat_sae_without_raw_request_returns_error():
+    request = BatchChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[[{"role": "user", "content": "Test prompt"}]],
+        max_tokens=10,
+        sae_clamp_specs=[
+            {
+                "module_name": "g",
+                "clamps": {
+                    "post_mlp": {
+                        "20": [
+                            {
+                                "feature_idx": 0,
+                                "kind": "absolute",
+                                "value": 1.0,
+                            }
+                        ]
+                    }
+                },
+            }
+        ],
+    )
+
+    serving_chat = OpenAIServingChatBatch.__new__(OpenAIServingChatBatch)
+    response = await serving_chat.create_batch_chat_completion(request)
+
+    assert isinstance(response, ErrorResponse)
+    assert "sae_clamp_specs requires steering to be enabled" in response.error.message
+
+
+@pytest.mark.asyncio
+async def test_batch_chat_named_steering_applies_sampling_param_hashes():
+    registry = SteeringModuleRegistry()
+    await registry.register("named-module", vectors={"post_mlp": {0: [1.0, 2.0]}})
+
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine, OpenAIServingChatBatch)
+    serving_chat.chat_completion_full_generator_batch = AsyncMock(
+        return_value="batch-ok"
+    )
+
+    async def mock_generate(*args, **kwargs):
+        yield RequestOutput(
+            request_id=args[2],
+            prompt="Test prompt",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="ok",
+                    token_ids=[4],
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+            metrics=None,
+            lora_request=None,
+            encoder_prompt=None,
+            encoder_prompt_token_ids=None,
+        )
+
+    mock_engine.generate = MagicMock(side_effect=mock_generate)
+    raw_request = SimpleNamespace(
+        headers={},
+        state=SimpleNamespace(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(steering_module_registry=registry)
+        ),
+    )
+    request = BatchChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[[{"role": "user", "content": "Test prompt"}]],
+        max_tokens=10,
+        steering_name="named-module",
+    )
+
+    response = await serving_chat.create_batch_chat_completion(request, raw_request)
+
+    assert response == "batch-ok"
+    sampling_params = mock_engine.generate.call_args.args[1]
+    assert sampling_params.steering_module_ref == ("named-module", 1.0)
+    assert sampling_params.prefill_steering_config_hash != 0
+    assert sampling_params.decode_steering_config_hash != 0
 
 
 @pytest.mark.parametrize(

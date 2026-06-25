@@ -39,6 +39,7 @@ from vllm.model_executor.layers.sae_steering import (
     _activation_to_scalar,
     _scalar_to_activation_params,
     apply_sae_delta,
+    apply_sae_delta_indexed_op,
     apply_sae_delta_op,
 )
 from vllm.model_executor.layers.sae_steering_kernel import (
@@ -179,6 +180,10 @@ class TestCustomOpRegistration:
             "torch.ops.vllm.apply_sae_delta should be registered "
             "by importing vllm.model_executor.layers.sae_steering."
         )
+        assert hasattr(torch.ops.vllm, "apply_sae_delta_indexed"), (
+            "torch.ops.vllm.apply_sae_delta_indexed should be registered "
+            "by importing vllm.model_executor.layers.sae_steering."
+        )
 
     def test_op_func_equivalent_to_public_api_on_cpu(self):
         torch.manual_seed(0)
@@ -205,11 +210,70 @@ class TestCustomOpRegistration:
             clamps["clamp_kind"],
             clamps["clamp_value"],
             clamps["clamp_only_if_active"],
+            torch.ones(1, dtype=torch.bool),
             ACTIVATION_CODE_RELU,
             0.0,
         )
 
         assert torch.allclose(public, op)
+
+    def test_indexed_op_func_equivalent_to_public_api_on_cpu(self):
+        torch.manual_seed(0)
+        n_tokens, d_model, n_clamp = 4, 6, 3
+        inputs = _make_random_inputs(
+            n_tokens=n_tokens, d_model=d_model, n_clamp=n_clamp, seed=42
+        )
+        clamps = _random_clamps(n_tokens=n_tokens, n_clamp=n_clamp, seed=7)
+
+        public = apply_sae_delta(
+            **inputs,
+            activation=SAEActivation.RELU,
+            activation_params={},
+            **clamps,
+        )
+        indexed = apply_sae_delta_indexed_op(
+            inputs["hidden_states"],
+            inputs["encoder_weight"],
+            inputs["encoder_bias"],
+            inputs["decoder_weight"],
+            clamps["clamp_kind"],
+            clamps["clamp_value"],
+            clamps["clamp_only_if_active"],
+            torch.arange(n_tokens, dtype=torch.long),
+            torch.ones(1, dtype=torch.bool),
+            ACTIVATION_CODE_RELU,
+            0.0,
+        )
+
+        assert torch.allclose(public, indexed)
+
+    def test_indexed_op_inactive_skips_table_gather_on_cpu(self):
+        hidden = torch.randn(3, 4)
+        encoder_weight = torch.randn(2, 4)
+        encoder_bias = torch.randn(2)
+        decoder_weight = torch.randn(2, 4)
+        kind_table = torch.full((2, 2), 1, dtype=torch.int8)
+        value_table = torch.full((2, 2), float("nan"), dtype=torch.float32)
+        only_table = torch.zeros(2, 2, dtype=torch.bool)
+        # Out-of-range rows prove the inactive path returns before indexing.
+        index = torch.full((3,), 99, dtype=torch.long)
+
+        out = apply_sae_delta_indexed_op(
+            hidden,
+            encoder_weight,
+            encoder_bias,
+            decoder_weight,
+            kind_table,
+            value_table,
+            only_table,
+            index,
+            torch.zeros(1, dtype=torch.bool),
+            ACTIVATION_CODE_RELU,
+            0.0,
+        )
+
+        torch.testing.assert_close(out, hidden)
+        assert out.data_ptr() != hidden.data_ptr()
 
     def test_op_func_jumprelu_threshold_param(self):
         # Distinct threshold values must produce distinct outputs to
@@ -236,9 +300,9 @@ class TestCustomOpRegistration:
 
 
 class TestLayerDispatchUsesCustomOp:
-    """``apply_layer_sae_delta`` must call through the registered op.
+    """``apply_layer_sae_delta`` must call through the indexed registered op.
 
-    Verified by a monkeypatch hook on ``torch.ops.vllm.apply_sae_delta``
+    Verified by a monkeypatch hook on ``torch.ops.vllm.apply_sae_delta_indexed``
     that records call counts; this guards against a regression where
     the layer shim calls the eager Python function directly and skips
     the torch.compile fence.
@@ -269,7 +333,7 @@ class TestLayerDispatchUsesCustomOp:
         )
         register_sae_index_buffer(layer, max_tokens=8)
 
-        original = torch.ops.vllm.apply_sae_delta
+        original = torch.ops.vllm.apply_sae_delta_indexed
         calls = {"n": 0}
 
         def counting_op(*args, **kwargs):
@@ -279,7 +343,7 @@ class TestLayerDispatchUsesCustomOp:
         # Patch the OpOverloadPacket attribute the layer shim resolves
         # at call time.  We can't reassign the C++ op directly, so we
         # patch the Python-visible accessor on the ops module.
-        monkeypatch.setattr(torch.ops.vllm, "apply_sae_delta", counting_op)
+        monkeypatch.setattr(torch.ops.vllm, "apply_sae_delta_indexed", counting_op)
 
         h = torch.randn(3, 4)
         out = apply_layer_sae_delta(layer, h, SteeringHookPoint.POST_MLP)
@@ -474,6 +538,105 @@ class TestKernelEdgeCases:
 
 
 @cuda_required
+class TestIndexedKernelParity:
+    """The production indexed-table kernel must match gathered eager inputs."""
+
+    def test_indexed_random_rows_match_eager(self):
+        n_tokens, d_model, n_clamp, n_rows = 5, 17, 3, 4
+        cpu_inputs = _make_random_inputs(
+            n_tokens=n_tokens, d_model=d_model, n_clamp=n_clamp, seed=123
+        )
+        row_clamps = _random_clamps(n_tokens=n_rows, n_clamp=n_clamp, seed=321)
+        index = torch.tensor([0, 1, 2, 3, 1], dtype=torch.long)
+
+        ref = apply_sae_delta(
+            **cpu_inputs,
+            activation=SAEActivation.JUMPRELU,
+            activation_params={"threshold": 0.25},
+            clamp_kind=row_clamps["clamp_kind"][index],
+            clamp_value=row_clamps["clamp_value"][index],
+            clamp_only_if_active=row_clamps["clamp_only_if_active"][index],
+        )
+
+        gpu_inputs = {k: v.cuda() for k, v in cpu_inputs.items()}
+        got = apply_sae_delta_indexed_op(
+            gpu_inputs["hidden_states"],
+            gpu_inputs["encoder_weight"],
+            gpu_inputs["encoder_bias"],
+            gpu_inputs["decoder_weight"],
+            row_clamps["clamp_kind"].cuda(),
+            row_clamps["clamp_value"].cuda(),
+            row_clamps["clamp_only_if_active"].cuda(),
+            index.cuda(),
+            torch.ones(1, dtype=torch.bool, device="cuda"),
+            ACTIVATION_CODE_JUMPRELU,
+            0.25,
+        )
+
+        assert got.is_cuda
+        torch.testing.assert_close(got.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+    def test_indexed_inactive_skips_out_of_range_rows(self):
+        hidden = torch.randn(3, 8, device="cuda")
+        encoder_weight = torch.randn(2, 8, device="cuda")
+        encoder_bias = torch.randn(2, device="cuda")
+        decoder_weight = torch.randn(2, 8, device="cuda")
+        kind_table = torch.ones(2, 2, dtype=torch.int8, device="cuda")
+        value_table = torch.full((2, 2), float("nan"), device="cuda")
+        only_table = torch.zeros(2, 2, dtype=torch.bool, device="cuda")
+        index = torch.full((3,), 99, dtype=torch.long, device="cuda")
+
+        out = apply_sae_delta_indexed_op(
+            hidden,
+            encoder_weight,
+            encoder_bias,
+            decoder_weight,
+            kind_table,
+            value_table,
+            only_table,
+            index,
+            torch.zeros(1, dtype=torch.bool, device="cuda"),
+            ACTIVATION_CODE_RELU,
+            0.0,
+        )
+
+        torch.testing.assert_close(out, hidden)
+
+    def test_indexed_unsupported_inactive_skips_out_of_range_rows(self):
+        """The large-n_clamp fallback must preserve kernel inactive behavior."""
+        n_tokens, d_model, n_clamp, n_rows = 3, 8, 257, 2
+        hidden = torch.randn(n_tokens, d_model, device="cuda")
+        encoder_weight = torch.randn(n_clamp, d_model, device="cuda")
+        encoder_bias = torch.randn(n_clamp, device="cuda")
+        decoder_weight = torch.randn(n_clamp, d_model, device="cuda")
+        kind_table = torch.ones(n_rows, n_clamp, dtype=torch.int8, device="cuda")
+        value_table = torch.ones(n_rows, n_clamp, device="cuda")
+        only_table = torch.zeros(n_rows, n_clamp, dtype=torch.bool, device="cuda")
+        index = torch.full((n_tokens,), 99, dtype=torch.long, device="cuda")
+
+        from vllm.model_executor.layers.sae_steering_kernel import (
+            apply_sae_delta_indexed_triton,
+        )
+
+        assert not _kernel_supports(n_clamp)
+        out = apply_sae_delta_indexed_triton(
+            hidden,
+            encoder_weight,
+            encoder_bias,
+            decoder_weight,
+            kind_table,
+            value_table,
+            only_table,
+            index,
+            torch.zeros(1, dtype=torch.bool, device="cuda"),
+            ACTIVATION_CODE_RELU,
+            0.0,
+        )
+
+        torch.testing.assert_close(out, hidden)
+
+
+@cuda_required
 class TestKernelCudaGraph:
     """The kernel must capture and replay correctly under a CUDA graph."""
 
@@ -507,6 +670,7 @@ class TestKernelCudaGraph:
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         out_buf = torch.empty_like(gpu_inputs["hidden_states"])
+        any_active = torch.ones(1, dtype=torch.bool, device="cuda")
         with torch.cuda.graph(graph):
             captured = apply_sae_delta_triton(
                 gpu_inputs["hidden_states"],
@@ -516,6 +680,7 @@ class TestKernelCudaGraph:
                 gpu_clamps["clamp_kind"],
                 gpu_clamps["clamp_value"],
                 gpu_clamps["clamp_only_if_active"],
+                any_active,
                 ACTIVATION_CODE_RELU,
                 0.0,
             )
@@ -531,6 +696,68 @@ class TestKernelCudaGraph:
             **cpu_clamps,
         )
         assert torch.allclose(out_buf.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+    def test_indexed_capture_and_replay_matches_eager(self):
+        torch.manual_seed(0)
+        n_tokens, d_model, n_clamp, n_rows = 4, 32, 3, 3
+        cpu_inputs = _make_random_inputs(
+            n_tokens=n_tokens, d_model=d_model, n_clamp=n_clamp, seed=2026
+        )
+        row_clamps = _random_clamps(n_tokens=n_rows, n_clamp=n_clamp, seed=2027)
+        index = torch.tensor([0, 1, 2, 1], dtype=torch.long)
+        gpu_inputs = {k: v.cuda() for k, v in cpu_inputs.items()}
+
+        from vllm.model_executor.layers.sae_steering_kernel import (
+            apply_sae_delta_indexed_triton,
+            warmup_apply_sae_delta_kernel,
+        )
+
+        warmup_apply_sae_delta_kernel(
+            hidden_size=d_model,
+            n_clamp=n_clamp,
+            table_dtype=torch.float32,
+            compute_dtype=torch.float32,
+            device=torch.device("cuda"),
+            activation_code=ACTIVATION_CODE_RELU,
+            activation_param=0.0,
+        )
+
+        kind_table = row_clamps["clamp_kind"].cuda()
+        value_table = row_clamps["clamp_value"].cuda()
+        only_table = row_clamps["clamp_only_if_active"].cuda()
+        gpu_index = index.cuda()
+        any_active = torch.ones(1, dtype=torch.bool, device="cuda")
+
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        out_buf = torch.empty_like(gpu_inputs["hidden_states"])
+        with torch.cuda.graph(graph):
+            captured = apply_sae_delta_indexed_triton(
+                gpu_inputs["hidden_states"],
+                gpu_inputs["encoder_weight"],
+                gpu_inputs["encoder_bias"],
+                gpu_inputs["decoder_weight"],
+                kind_table,
+                value_table,
+                only_table,
+                gpu_index,
+                any_active,
+                ACTIVATION_CODE_RELU,
+                0.0,
+            )
+            out_buf.copy_(captured)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        ref = apply_sae_delta(
+            **cpu_inputs,
+            activation=SAEActivation.RELU,
+            activation_params={},
+            clamp_kind=row_clamps["clamp_kind"][index],
+            clamp_value=row_clamps["clamp_value"][index],
+            clamp_only_if_active=row_clamps["clamp_only_if_active"][index],
+        )
+        torch.testing.assert_close(out_buf.cpu(), ref, atol=1e-4, rtol=1e-4)
 
 
 @cuda_required

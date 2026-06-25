@@ -967,6 +967,13 @@ class Worker(WorkerBase):
     def unregister_steering_modules(self, names: list[str]) -> None:
         return self.model_runner.unregister_steering_modules(names)
 
+    def attach_sae_weights(
+        self,
+        module_name: str,
+        weights: dict[tuple[int, str], dict[str, torch.Tensor]],
+    ) -> None:
+        return self.model_runner.attach_sae_weights(module_name, weights)
+
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return
