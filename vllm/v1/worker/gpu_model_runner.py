@@ -583,10 +583,22 @@ class GPUModelRunner(
             # therefore forces eager only when a per-request *client* spec
             # captures this step; global-only and plain steps keep full
             # cudagraph speed.
-            self._capture_step_gate = CaptureStepGate()
+            # The graph-safe per-request allowlist (a rank-identical config
+            # value) lets a client spec tapping only allowlisted keys ride the
+            # persistent-buffer path and skip eager too. Built with the global,
+            # unfiltered key set so every rank reaches the same decision.
+            _gs_keys = frozenset(
+                getattr(
+                    self.vllm_config.capture_consumers_config,
+                    "graphsafe_keys",
+                    None,
+                )
+                or ()
+            )
+            self._capture_step_gate = CaptureStepGate(graphsafe_keys=_gs_keys)
 
             # Capturer-rank gate. The replicated residual hooks
-            # (pre_attn/post_attn/post_mlp) read the residual stream after
+            # (pre_attn/post_attn/post_block) read the residual stream after
             # the tensor-parallel all-reduce / MoE combine, so it is
             # byte-identical across the tensor-parallel group within each
             # (data-parallel, pipeline) cell. Exactly one rank — TP rank 0
@@ -705,6 +717,7 @@ class GPUModelRunner(
                     overload_policy=getattr(cc_config, "overload_policy", "spill"),
                     spill_dir=getattr(cc_config, "spill_dir", None),
                     spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
+                    graphsafe_keys=getattr(cc_config, "graphsafe_keys", None),
                 )
                 self._capture_validators = validators
                 self._capture_name_to_index = dict(name_to_index)
@@ -2238,6 +2251,18 @@ class GPUModelRunner(
                     "sync capture consumer %s warmup failed; continuing", name
                 )
 
+    def drain_pending_capture_results(self) -> dict:
+        """Swap out capture results that finalized since the last drain.
+
+        Called via collective_rpc from the engine core's idle loop so
+        ``capture_wait`` clients receive results even when no further
+        engine steps run (results normally ride ``ModelRunnerOutput``).
+        """
+        with self._pending_capture_results_lock:
+            pending = self._pending_capture_results
+            self._pending_capture_results = {}
+        return pending
+
     def _finalize_capture_for_request_async(self, req_id: str) -> None:
         """Drive the capture manager to finalize *req_id* off the step thread.
 
@@ -2254,8 +2279,6 @@ class GPUModelRunner(
             return
 
         index_to_name = self._capture_index_to_name
-        pending = self._pending_capture_results
-        lock = self._pending_capture_results_lock
 
         def _on_complete(indexed: dict[int, "CaptureResult"]) -> None:
             if not indexed:
@@ -2264,8 +2287,17 @@ class GPUModelRunner(
                 index_to_name.get(idx, f"consumer_{idx}"): result
                 for idx, result in indexed.items()
             }
-            with lock:
-                pending.setdefault(req_id, {}).update(named)
+            # Resolve the stash dict at CALL time, not closure-creation time:
+            # the per-step drain (and ``drain_pending_capture_results``) swap
+            # ``self._pending_capture_results`` for a fresh dict, so a
+            # reference captured here is orphaned by the time the finalize
+            # thread fires (~seconds later, after writer fsync) and the
+            # results silently vanish -- requests then never report capture
+            # results at all.
+            with self._pending_capture_results_lock:
+                self._pending_capture_results.setdefault(req_id, {}).update(
+                    named
+                )
 
         mgr.finalize_request_async(req_id, _on_complete)
 

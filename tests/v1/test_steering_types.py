@@ -370,10 +370,10 @@ class TestDimensionCrossValidation:
         ):
             SamplingParams(
                 steering_vectors={
-                    "post_mlp": {15: [1.0, 2.0]},
+                    "post_block": {15: [1.0, 2.0]},
                 },
                 prefill_steering_vectors={
-                    "post_mlp": {15: [1.0]},
+                    "post_block": {15: [1.0]},
                 },
             )
 
@@ -386,10 +386,10 @@ class TestDimensionCrossValidation:
         ):
             SamplingParams(
                 steering_vectors={
-                    "post_mlp": {0: [1.0, 2.0, 3.0]},
+                    "post_block": {0: [1.0, 2.0, 3.0]},
                 },
                 decode_steering_vectors={
-                    "post_mlp": {0: [1.0, 2.0]},
+                    "post_block": {0: [1.0, 2.0]},
                 },
             )
 
@@ -399,10 +399,10 @@ class TestDimensionCrossValidation:
 
         params = SamplingParams(
             steering_vectors={
-                "post_mlp": {0: [1.0, 2.0]},
+                "post_block": {0: [1.0, 2.0]},
             },
             prefill_steering_vectors={
-                "post_mlp": {0: [3.0, 4.0]},
+                "post_block": {0: [3.0, 4.0]},
             },
         )
         assert params.steering_vectors is not None
@@ -415,10 +415,10 @@ class TestDimensionCrossValidation:
 
         params = SamplingParams(
             steering_vectors={
-                "post_mlp": {0: [1.0, 2.0]},
+                "post_block": {0: [1.0, 2.0]},
             },
             prefill_steering_vectors={
-                "post_mlp": {1: [1.0]},
+                "post_block": {1: [1.0]},
             },
         )
         assert params.steering_vectors is not None
@@ -434,10 +434,10 @@ class TestDimensionCrossValidation:
         ):
             SamplingParams(
                 prefill_steering_vectors={
-                    "post_mlp": {0: [1.0, 2.0]},
+                    "post_block": {0: [1.0, 2.0]},
                 },
                 decode_steering_vectors={
-                    "post_mlp": {0: [1.0]},
+                    "post_block": {0: [1.0]},
                 },
             )
 
@@ -448,10 +448,10 @@ class TestDimensionCrossValidation:
 
         params = SamplingParams(
             prefill_steering_vectors={
-                "post_mlp": {0: [1.0, 2.0]},
+                "post_block": {0: [1.0, 2.0]},
             },
             decode_steering_vectors={
-                "post_mlp": {1: [1.0]},
+                "post_block": {1: [1.0]},
             },
         )
         assert params.prefill_steering_vectors is not None
@@ -464,10 +464,10 @@ class TestDimensionCrossValidation:
 
         params = SamplingParams(
             prefill_steering_vectors={
-                "post_mlp": {0: [1.0, 2.0]},
+                "post_block": {0: [1.0, 2.0]},
             },
             decode_steering_vectors={
-                "post_mlp": {0: [3.0, 4.0]},
+                "post_block": {0: [3.0, 4.0]},
             },
         )
         assert params.prefill_steering_vectors is not None
@@ -483,12 +483,12 @@ class TestDimensionCrossValidation:
         ):
             SamplingParams(
                 prefill_steering_vectors={
-                    "post_mlp": {
+                    "post_block": {
                         0: {"vector": [1.0, 2.0], "scale": 0.5},
                     },
                 },
                 decode_steering_vectors={
-                    "post_mlp": {0: [1.0]},
+                    "post_block": {0: [1.0]},
                 },
             )
 
@@ -509,7 +509,7 @@ class TestSamplingParamsExtraKeyRejection:
         with pytest.raises(ValueError, match="unexpected keys"):
             SamplingParams(
                 steering_vectors={
-                    "post_mlp": {
+                    "post_block": {
                         0: {"vector": [1.0, 2.0], "scale": 1.0, "typo": "bad"},
                     },
                 },
@@ -522,7 +522,7 @@ class TestSamplingParamsExtraKeyRejection:
         with pytest.raises(ValueError, match="unexpected keys"):
             SamplingParams(
                 prefill_steering_vectors={
-                    "post_mlp": {
+                    "post_block": {
                         0: {"vector": [1.0], "scale": 1.0, "extra": 42},
                     },
                 },
@@ -535,7 +535,7 @@ class TestSamplingParamsExtraKeyRejection:
         with pytest.raises(ValueError, match="unexpected keys"):
             SamplingParams(
                 decode_steering_vectors={
-                    "post_mlp": {
+                    "post_block": {
                         0: {"vector": [1.0], "scale": 1.0, "foo": 1, "bar": 2},
                     },
                 },

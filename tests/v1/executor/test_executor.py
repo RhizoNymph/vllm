@@ -219,7 +219,7 @@ class TestCaptureAwareAggregator:
         from vllm.v1.capture.types import CaptureResult, VllmInternalRequestId
 
         return CaptureResult(
-            key=(VllmInternalRequestId(req), layer, "post_mlp"),
+            key=(VllmInternalRequestId(req), layer, "post_block"),
             status="ok",
         )
 

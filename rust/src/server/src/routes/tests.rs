@@ -4695,7 +4695,7 @@ async fn steering_modules_register_broadcasts_and_lists() {
                 .uri("/v1/steering/modules")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"modules":{"creativity":{"vectors":{"post_mlp":{"14":[0.1,0.2]}}}}}"#,
+                    r#"{"modules":{"creativity":{"vectors":{"post_block":{"14":[0.1,0.2]}}}}}"#,
                 ))
                 .expect("build request"),
         )

@@ -117,7 +117,7 @@ VllmInternalRequestId = NewType("VllmInternalRequestId", str)
 CaptureKey = tuple[VllmInternalRequestId, int, str]
 # (request id, layer index, hook name)
 
-HookName = Literal["pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"]
+HookName = Literal["pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out"]
 PositionSelector = (
     Literal["last_prompt", "all_prompt", "all_generated", "all"]
     | list[int]
@@ -595,12 +595,26 @@ without buffering the whole tensor. Owns a private `ActivationWriter`
 thread pool (`writer.py`).
 
 - `location = "worker"`, `reads_client_spec = True`.
-- `global_capture_spec()` returns `None` — captures are always
-  per-request via `SamplingParams.capture["filesystem"]`.
+- `global_capture_spec()` returns `None` by default (captures are
+  per-request via `SamplingParams.capture["filesystem"]`), **or** a
+  `CaptureSpec` built from the consumer-level `global_hooks` /
+  `global_positions` params when those are configured. A global spec
+  captures every request uniformly and rides the manager's
+  CUDA-graph-safe persistent-buffer path, so filesystem capture no
+  longer forces eager every step (the dominant cost at
+  `positions="all_generated"` under cudagraph). Global-driven requests
+  have no per-request `tag`/`request_id`, so files are named
+  `{root}/{default_tag}/{engine_request_id}/{layer}_{hook}.bin` — the
+  engine request id is already threaded through the manager dispatch
+  path (`CapturePositionEntry.request_id` → `CaptureChunk.key[0]` →
+  the finalize key), so no extra plumbing is needed. `default_tag`
+  defaults to `"default"` (the legacy fallback directory name).
 - `validate_client_spec` accepts `FilesystemCaptureRequest` or a
   matching dict, then lazily delegates to
   `validation.validate_filesystem_request` (lazy to avoid pulling
-  pydantic in at module import).
+  pydantic in at module import). Per-request client specs and the
+  global spec coexist: a client spec for a request overrides the
+  global spec for that request (manager merge rule).
 
 Per-chunk flow:
 
@@ -679,7 +693,7 @@ Writer details (`writer.py`):
 - TP / PP / EP / DP are all accepted for the replicated residual hooks
   (no parallel-size rejection). See
   [Capture Consumers under Parallelism](capture_parallelism.md).
-- Every hook name is in `{pre_attn, post_attn, post_mlp, mlp_in,
+- Every hook name is in `{pre_attn, post_attn, post_block, mlp_in,
   mlp_out}`.
 - Every resolved layer is in `[0, num_hidden_layers)`, the **global**
   layer count (admission validates the full layer space; the runner then

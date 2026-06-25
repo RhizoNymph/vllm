@@ -1177,6 +1177,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        # Capture-aware piecewise fallback: when a per-request capture forces
+        # eager, prefer replaying the piecewise cudagraph (breaking only at the
+        # vllm::capture_residual split op) over running the whole step eager.
+        # Gated on ``piecewise_capture_fallback`` because it is only sound when
+        # the capture op was registered as a graph split point at config time
+        # (otherwise the dynamic gather would be recorded into a cudagraph
+        # segment). Also requires piecewise cudagraphs to actually be built;
+        # otherwise dispatch returns no piecewise descriptor and we fall back
+        # to eager.
+        capture_piecewise = (
+            capture_pending
+            and not is_profile
+            and not skip_compiled
+            and self._capture_piecewise_fallback_enabled
+            and self.cudagraph_manager is not None
+            and self.cudagraph_manager.cudagraph_mode.has_piecewise_cudagraphs()
+        )
+
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1185,6 +1203,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
             self.dp_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled or capture_pending,
+            capture_piecewise=capture_piecewise,
             num_active_loras=num_active_loras,
         )
 

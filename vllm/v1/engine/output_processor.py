@@ -440,6 +440,12 @@ class OutputProcessor:
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
         self.request_states: dict[str, RequestState] = {}
+        # ``capture_wait``: capture results that finalized after their
+        # request finished, awaiting collection via
+        # ``AsyncLLM.wait_for_capture_results``. Insertion-ordered and
+        # bounded so uncollected entries cannot leak.
+        self._late_capture_results: dict[str, dict] = {}
+        self._late_capture_events: dict[str, asyncio.Event] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
@@ -584,11 +590,21 @@ class OutputProcessor:
             # Queue the streaming update otherwise.
             req_state.input_chunk_queue.append(update)
 
+    def pop_late_capture_results(self, request_id: str) -> dict | None:
+        """Collect (and clear) late capture results for ``request_id``."""
+        self._late_capture_events.pop(request_id, None)
+        return self._late_capture_results.pop(request_id, None)
+
+    def register_late_capture_event(self, request_id: str) -> asyncio.Event:
+        """Event set when late capture results for ``request_id`` arrive."""
+        return self._late_capture_events.setdefault(request_id, asyncio.Event())
+
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
+        late_capture_results: dict[str, dict] | None = None,
     ) -> OutputProcessorOutput:
         """
         Process the EngineCoreOutputs:
@@ -614,6 +630,22 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        if late_capture_results:
+            for rid, late in late_capture_results.items():
+                # ``rid`` is the engine-internal request id, which may carry
+                # a random suffix on top of the client-facing id that
+                # ``wait_for_capture_results`` callers hold (e.g.
+                # ``cmpl-x-0-<suffix>`` vs ``cmpl-x-0``). Index under both.
+                for key in {rid, rid.rsplit("-", 1)[0]}:
+                    self._late_capture_results[key] = late
+                    if (ev := self._late_capture_events.get(key)) is not None:
+                        ev.set()
+            # Bound the stash: clients that never collect must not leak.
+            while len(self._late_capture_results) > 4096:
+                self._late_capture_results.pop(
+                    next(iter(self._late_capture_results))
+                )
+
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)

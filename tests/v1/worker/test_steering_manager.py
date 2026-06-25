@@ -23,8 +23,8 @@ from vllm.v1.worker.steering_manager import SteeringManager
 
 HIDDEN_SIZE = 8
 MAX_CONFIGS = 4
-_HP = DEFAULT_HOOK_POINT.value  # "post_mlp"
-_TABLE_ATTR = "steering_table_post_mlp"
+_HP = DEFAULT_HOOK_POINT.value  # "post_block"
+_TABLE_ATTR = "steering_table_post_block"
 
 
 # ---------------------------------------------------------------------------

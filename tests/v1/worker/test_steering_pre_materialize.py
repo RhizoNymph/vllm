@@ -55,8 +55,8 @@ class _PrematerializeStub(SteeringModelRunnerMixin):
 
 
 def _spec(layer_to_vec: dict[int, list[float]]) -> dict:
-    """Build a single-hook SteeringVectorSpec on hook ``post_mlp``."""
-    return {"post_mlp": dict(layer_to_vec)}
+    """Build a single-hook SteeringVectorSpec on hook ``post_block``."""
+    return {"post_block": dict(layer_to_vec)}
 
 
 def _module_payload(
@@ -390,7 +390,7 @@ class TestReRegisterRefreshesPin:
         # Verify contents match the *new* spec by checking the manager
         # stored the new vector in its config_vectors map.
         stored = stub._steering_manager.config_vectors[(named_only_h, "prefill")]
-        layer0_t = stored["post_mlp"][0].squeeze(0)
+        layer0_t = stored["post_block"][0].squeeze(0)
         assert layer0_t.tolist() == [9.0, 9.0, 9.0, 9.0]
 
     def test_replace_true_drops_all_prior_pins(self):

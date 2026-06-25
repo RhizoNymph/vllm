@@ -767,9 +767,9 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = hidden_states + residual
-        maybe_capture_residual(hidden_states, self.layer_idx, "post_mlp")
+        maybe_capture_residual(hidden_states, self.layer_idx, "post_block")
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
 
         # Apply PLE (Per-Layer Embedding) if configured

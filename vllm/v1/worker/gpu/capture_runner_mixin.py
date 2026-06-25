@@ -44,6 +44,7 @@ class CaptureRunnerMixin:
 
     # ---- state (set by _init_capture_state) -------------------------------
     _capture_feature_enabled: bool = False
+    _capture_piecewise_fallback_enabled: bool = False
     _capture_manager: Any = None
     _capture_step_gate: Any = None
     _capture_validators: list[Any]
@@ -73,6 +74,15 @@ class CaptureRunnerMixin:
 
         cc_config = self.vllm_config.capture_consumers_config
         self._capture_feature_enabled = cc_config is not None
+        # Capture-aware piecewise cudagraph fallback (opt-in). When enabled,
+        # the capture op is a graph split point (registered at config time) so
+        # a per-request capture step replays the piecewise cudagraph instead of
+        # forcing the whole step eager. The runtime fallback in the model
+        # runner is gated on this flag for soundness — without the split op the
+        # dynamic gather would land inside a cudagraphed segment.
+        self._capture_piecewise_fallback_enabled = (
+            cc_config is not None and cc_config.piecewise_capture_fallback
+        )
         if cc_config is None:
             return
 
@@ -83,7 +93,11 @@ class CaptureRunnerMixin:
 
         # Global capture specs ride a CUDA-graph-safe persistent-buffer path, so
         # the gate forces eager only when a per-request *client* spec captures.
-        self._capture_step_gate = CaptureStepGate()
+        # The graph-safe allowlist (a rank-identical config value) further lets
+        # a client spec tapping only allowlisted keys skip eager too; the gate
+        # is built with the global, unfiltered key set so every rank agrees.
+        graphsafe_keys = frozenset(getattr(cc_config, "graphsafe_keys", None) or ())
+        self._capture_step_gate = CaptureStepGate(graphsafe_keys=graphsafe_keys)
 
         if get_tp_group().rank_in_group != 0:
             # Non-capturer rank: no manager, cold-path custom op.
@@ -122,6 +136,7 @@ class CaptureRunnerMixin:
                 overload_policy=getattr(cc_config, "overload_policy", "spill"),
                 spill_dir=getattr(cc_config, "spill_dir", None),
                 spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
+                graphsafe_keys=getattr(cc_config, "graphsafe_keys", None),
             )
             self._capture_validators = validators
             self._capture_name_to_index = dict(name_to_index)
@@ -312,6 +327,14 @@ class CaptureRunnerMixin:
 
         sidecar_fields: dict[str, Any] = {
             "vllm_internal_request_id": new_req_data.req_id,
+            # Client-supplied request id for universal attribution. Falls
+            # back to the internal id if randomization was disabled / the
+            # client id is unavailable (None-safe).
+            "client_request_id": (
+                new_req_data.client_request_id
+                if new_req_data.client_request_id is not None
+                else new_req_data.req_id
+            ),
             "prompt_token_ids": (
                 list(new_req_data.prompt_token_ids)
                 if new_req_data.prompt_token_ids is not None
@@ -439,8 +462,6 @@ class CaptureRunnerMixin:
             return
 
         index_to_name = self._capture_index_to_name
-        pending = self._pending_capture_results
-        lock = self._pending_capture_results_lock
 
         def _on_complete(indexed: dict[int, CaptureResult]) -> None:
             if not indexed:
@@ -449,8 +470,17 @@ class CaptureRunnerMixin:
                 index_to_name.get(idx, f"consumer_{idx}"): result
                 for idx, result in indexed.items()
             }
-            with lock:
-                pending.setdefault(req_id, {}).update(named)
+            # Resolve the stash dict at CALL time, not closure-creation time:
+            # ``_drain_capture_results`` / ``drain_pending_capture_results``
+            # swap ``self._pending_capture_results`` for a fresh dict, so a
+            # reference captured here would be orphaned by the time the
+            # finalize thread fires (~seconds later, after writer fsync) and
+            # the results would silently vanish -- the request would never
+            # report capture results (and ``capture_wait`` would hang).
+            with self._pending_capture_results_lock:
+                self._pending_capture_results.setdefault(req_id, {}).update(
+                    named
+                )
 
         mgr.finalize_request_async(req_id, _on_complete)
 
@@ -462,3 +492,17 @@ class CaptureRunnerMixin:
             results = self._pending_capture_results
             self._pending_capture_results = {}
         return results
+
+    def drain_pending_capture_results(
+        self,
+    ) -> dict[str, dict[str, CaptureResult]]:
+        """collective_rpc target for the ``capture_wait`` idle-loop drain.
+
+        The engine core's idle loop calls this (via the worker's
+        ``drain_pending_capture_results``) so capture results that finalize
+        after a request's final step still reach ``capture_wait`` clients,
+        even when no further ``ModelRunnerOutput`` is produced. Mirrors the
+        v1 ``GPUModelRunner`` method; shares the per-step swap buffer with
+        :meth:`_drain_capture_results`.
+        """
+        return self._drain_capture_results()

@@ -51,7 +51,10 @@ class CaptureConsumer(ABC):
       with shared-memory tensor handoff.
     - ``required_sidecar_fields``: optional sidecar field names the
       framework must populate for this consumer.
-      ``vllm_internal_request_id`` is always present.
+      ``vllm_internal_request_id`` and ``client_request_id`` are always
+      present (the latter is the original client-supplied request id, for
+      universal attribution; it falls back to the internal id when request
+      id randomization is disabled).
     - ``reads_client_spec``: whether the consumer accepts per-request
       opt-in via ``SamplingParams.capture[consumer_name]``. Default
       ``False`` — most consumers have a global spec set at
@@ -99,6 +102,20 @@ class CaptureConsumer(ABC):
     def global_capture_spec(self) -> CaptureSpec | None:
         return None
 
+    @classmethod
+    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
+        """Graph-safe ``layer:hook`` keys this consumer wants pre-buffered for
+        per-request capture, derived from its ``params``.
+
+        Shorthands are allowed (``"N:hook"``, ``"N:all"``, ``"all:hook"``,
+        ``"all:all"``). The union across all registered consumers forms the
+        DEFAULT graph-safe allowlist; an explicit ``--capture-graphsafe-key`` /
+        ``capture_graphsafe_keys`` overrides it. Resolved at config-build time
+        from the class + params (no instance is constructed), so this must not
+        depend on runtime state. Default: none.
+        """
+        return []
+
     def validate_client_spec(
         self,
         raw_spec: Any,
@@ -119,8 +136,9 @@ class CaptureConsumer(ABC):
         """Called once per finalized capture key.
 
         ``tensor`` has shape ``(num_rows, hidden_size)`` in the dtype
-        captured. ``sidecar`` is filtered to the consumer's
-        ``required_sidecar_fields`` plus ``vllm_internal_request_id``.
+        captured. ``sidecar`` carries the consumer's
+        ``required_sidecar_fields`` plus the always-present
+        ``vllm_internal_request_id`` and ``client_request_id``.
         """
 
     def on_error(  # noqa: B027 — intentional no-op default.

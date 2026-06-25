@@ -486,6 +486,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "spec fails the consumer's admission validator."
         ),
     )
+    capture_wait: bool = Field(
+        default=False,
+        description=(
+            "When true (and `capture` is set), hold the response until this "
+            "request's capture results have finalized (files durable), then "
+            "report them in `capture_results`. Capture writes are otherwise "
+            "asynchronous and may land after the response."
+        ),
+    )
 
     # Per-request inline steering vectors in binary wire format.  Each entry
     # is ``{dtype, shape, layer_indices, data: base64, scales?}`` — see
@@ -495,7 +504,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     steering_vectors: SteeringVectorSpecPacked | None = Field(
         default=None,
         description="Per-request activation steering vectors keyed by hook "
-        "point name (pre_attn, post_attn, post_mlp). Each hook carries one "
+        "point name (pre_attn, post_attn, post_block). Each hook carries one "
         "base64-encoded (num_layers, hidden_size) blob plus a sibling "
         "layer_indices list (and optional per-row scales).",
     )

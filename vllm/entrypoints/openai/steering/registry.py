@@ -153,7 +153,7 @@ class SteeringModuleRegistry:
 
         Each tier in the JSON file may be either the legacy shape::
 
-            {"vectors": {"post_mlp": {"14": [0.1, ...]}}}
+            {"vectors": {"post_block": {"14": [0.1, ...]}}}
 
         (string layer keys are converted to int) or the binary-wire
         ``SteeringVectorSpecPacked`` shape (base64-encoded ``data`` field

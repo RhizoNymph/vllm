@@ -38,7 +38,7 @@ def _row(val: float, hidden: int = 4) -> torch.Tensor:
 
 
 def _key(i: int):
-    return (bytes([i]), 0, 0, "post_mlp")
+    return (bytes([i]), 0, 0, "post_block")
 
 
 class TestBasics:
@@ -194,7 +194,7 @@ class TestExtractAll:
 
 class TestPendingServe:
     def test_stash_and_pop(self) -> None:
-        payload = {(1, "post_mlp", 0): _row(0.0)}
+        payload = {(1, "post_block", 0): _row(0.0)}
         stash_pending_serve("rq", payload)
         assert pop_pending_serve("rq") is payload
         assert pop_pending_serve("rq") is None  # cleared
@@ -214,7 +214,7 @@ class TestReserveStoreServe:
     def test_reserves_when_all_resident(self) -> None:
         store = ActivationStore(max_bytes=10_000)
         set_active_activation_store(store)
-        hook_layers = [("post_mlp", 1)]
+        hook_layers = [("post_block", 1)]
         positions = [0, 1]
         self._populate(store, [b"b0"], 2, hook_layers, positions)
         try:
@@ -224,12 +224,12 @@ class TestReserveStoreServe:
         finally:
             set_active_activation_store(None)
         assert payload is not None
-        assert set(payload.keys()) == {(1, "post_mlp", 0), (1, "post_mlp", 1)}
+        assert set(payload.keys()) == {(1, "post_block", 0), (1, "post_block", 1)}
 
     def test_no_reserve_on_any_miss(self) -> None:
         store = ActivationStore(max_bytes=10_000)
         set_active_activation_store(store)
-        hook_layers = [("post_mlp", 1)]
+        hook_layers = [("post_block", 1)]
         # Only position 0 is present; position 1 is missing.
         self._populate(store, [b"b0"], 2, hook_layers, [0])
         try:
@@ -242,7 +242,7 @@ class TestReserveStoreServe:
     def test_no_reserve_without_store(self) -> None:
         set_active_activation_store(None)
         assert (
-            try_reserve_store_serve("rq", [b"b0"], 2, [("post_mlp", 1)], [0]) is False
+            try_reserve_store_serve("rq", [b"b0"], 2, [("post_block", 1)], [0]) is False
         )
 
     def test_no_reserve_on_unkeyable_position(self) -> None:
@@ -250,7 +250,7 @@ class TestReserveStoreServe:
         set_active_activation_store(store)
         try:
             # position 4 -> block 2, but only one block is hashed -> unkeyable.
-            ok = try_reserve_store_serve("rq", [b"b0"], 2, [("post_mlp", 1)], [4])
+            ok = try_reserve_store_serve("rq", [b"b0"], 2, [("post_block", 1)], [4])
         finally:
             set_active_activation_store(None)
         assert ok is False
@@ -276,7 +276,7 @@ class _RecordingSink:
 class TestServeFromStore:
     def test_injects_chunks_per_consumer(self) -> None:
         sink = _RecordingSink()
-        spec = CaptureSpec(hooks={"post_mlp": [1]}, positions="all_prompt")
+        spec = CaptureSpec(hooks={"post_block": [1]}, positions="all_prompt")
         mgr = CaptureManager(
             consumers=(sink,),
             consumer_specs=(spec,),
@@ -286,8 +286,8 @@ class TestServeFromStore:
         )
         mgr.register_request("r", client_specs=None, num_prompt_tokens=2)
         payload = {
-            (1, "post_mlp", 0): _row(10.0),
-            (1, "post_mlp", 1): _row(11.0),
+            (1, "post_block", 0): _row(10.0),
+            (1, "post_block", 1): _row(11.0),
         }
         try:
             mgr.serve_from_store("r", payload)
@@ -295,7 +295,7 @@ class TestServeFromStore:
             mgr.shutdown(timeout=2.0)
         assert len(sink.chunks) == 1
         chunk = sink.chunks[0]
-        assert chunk.key == ("r", 1, "post_mlp")
+        assert chunk.key == ("r", 1, "post_block")
         assert chunk.metadata["positions"] == [0, 1]
         assert chunk.metadata["served_from_store"] is True
         assert torch.equal(chunk.tensor, torch.stack([_row(10.0), _row(11.0)]))
@@ -304,11 +304,11 @@ class TestServeFromStore:
 class TestActivationKey:
     def test_basic_key(self) -> None:
         # hash_block_size=2: position 3 -> block 1, offset 1.
-        assert activation_key([b"blk0", b"blk1"], 2, 3, 5, "post_mlp") == (
+        assert activation_key([b"blk0", b"blk1"], 2, 3, 5, "post_block") == (
             b"blk1",
             1,
             5,
-            "post_mlp",
+            "post_block",
         )
 
     def test_position_zero(self) -> None:
@@ -316,7 +316,7 @@ class TestActivationKey:
 
     def test_partial_block_unhashed_is_none(self) -> None:
         # position 4 -> block 2, but only 2 blocks are hashed.
-        assert activation_key([b"a", b"b"], 2, 4, 0, "post_mlp") is None
+        assert activation_key([b"a", b"b"], 2, 4, 0, "post_block") is None
 
     def test_negative_position_is_none(self) -> None:
         assert activation_key([b"a"], 2, -1, 0, "h") is None
@@ -347,7 +347,7 @@ def _state(num_prompt_tokens: int, block_hashes, hash_block_size: int):
     )
 
 
-def _entries(positions, layer=1, hook="post_mlp"):
+def _entries(positions, layer=1, hook="post_block"):
     return [
         CapturePositionEntry(
             request_id="r",
@@ -362,7 +362,7 @@ def _entries(positions, layer=1, hook="post_mlp"):
     ]
 
 
-def _packet(entries, view, layer=1, hook="post_mlp"):
+def _packet(entries, view, layer=1, hook="post_block"):
     return _DispatchPacket(
         entries=entries,
         scratch_pinned={(layer, hook): (None, view)},
@@ -384,9 +384,9 @@ class TestWriteThrough:
             set_active_activation_store(None)
             mgr.shutdown(timeout=2.0)
         # positions 0,1 -> blk0 off 0,1 ; positions 2,3 -> blk1 off 0,1.
-        assert (b"blk0", 0, 1, "post_mlp") in store
-        assert (b"blk1", 1, 1, "post_mlp") in store
-        got = store.get((b"blk1", 1, 1, "post_mlp"))
+        assert (b"blk0", 0, 1, "post_block") in store
+        assert (b"blk1", 1, 1, "post_block") in store
+        got = store.get((b"blk1", 1, 1, "post_block"))
         assert got is not None and torch.equal(got, view[3])
 
     def test_skips_generated_positions(self) -> None:
@@ -401,9 +401,9 @@ class TestWriteThrough:
         finally:
             set_active_activation_store(None)
             mgr.shutdown(timeout=2.0)
-        assert (b"blk0", 0, 1, "post_mlp") in store
+        assert (b"blk0", 0, 1, "post_block") in store
         # Position 2 (generated) must not be stored.
-        assert (b"blk1", 0, 1, "post_mlp") not in store
+        assert (b"blk1", 0, 1, "post_block") not in store
         assert len(store) == 2
 
     def test_rows_are_cloned_off_buffer(self) -> None:
@@ -418,9 +418,9 @@ class TestWriteThrough:
             set_active_activation_store(None)
             mgr.shutdown(timeout=2.0)
         # Mutating the (recycled) pinned buffer must not corrupt the store.
-        before = store.get((b"blk0", 0, 1, "post_mlp")).clone()
+        before = store.get((b"blk0", 0, 1, "post_block")).clone()
         view.zero_()
-        after = store.get((b"blk0", 0, 1, "post_mlp"))
+        after = store.get((b"blk0", 0, 1, "post_block"))
         assert torch.equal(after, before)
 
     def test_noop_without_store(self) -> None:

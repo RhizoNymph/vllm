@@ -50,7 +50,7 @@ Also supported:
 - Global steering through HTTP endpoints
 - Per-request steering through `SamplingParams`
 - Three additive tiers (base / prefill-specific / decode-specific)
-- Three hook points: `pre_attn`, `post_attn`, `post_mlp`
+- Three hook points: `pre_attn`, `post_attn`, `post_block`
 - Phase-aware scheduler admission for per-request steering
 - Prefix-cache separation for different prefill steering configs
 - Continuous batching
@@ -109,7 +109,7 @@ activation that is discarded immediately afterward.
 | --- | --- |
 | `pre_attn` | Residual stream before attention |
 | `post_attn` | Residual stream after attention |
-| `post_mlp` | Residual stream after MLP |
+| `post_block` | Residual stream after MLP |
 
 For supported models, these hooks are wired directly into each decoder
 layer's forward path. Unused hook points are zero-valued no-ops.
@@ -157,7 +157,7 @@ curl -X POST http://localhost:8000/v1/steering/set \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
-      "post_mlp": {
+      "post_block": {
         "15": {"vector": [0.1, 0.2], "scale": 2.0}
       }
     },
@@ -209,7 +209,7 @@ packed_hook = {
 
 requests.post(
     "http://localhost:8000/v1/steering/set",
-    json={"vectors": {"post_mlp": packed_hook}},
+    json={"vectors": {"post_block": packed_hook}},
 )
 ```
 
@@ -248,7 +248,7 @@ params = SamplingParams(
     max_tokens=64,
     temperature=0.0,
     steering_vectors={
-        "post_mlp": {
+        "post_block": {
             15: {"vector": [0.1, 0.2], "scale": 2.0},
         },
     },
@@ -288,7 +288,7 @@ vec = np.random.standard_normal(2560).astype(np.float16)
 stacked = np.stack([vec], axis=0)  # (num_layers, hidden_size)
 
 base = {
-    "post_mlp": {
+    "post_block": {
         "dtype": str(stacked.dtype),  # "float16" | "float32" | "float64"
         "shape": list(stacked.shape),
         "layer_indices": [15],
@@ -335,7 +335,7 @@ The JSON file uses the same three-tier format as the global steering API:
 ```json
 {
   "vectors": {
-    "post_mlp": {
+    "post_block": {
       "15": [0.1, 0.2, 0.3],
       "20": {"vector": [0.4, 0.5, 0.6], "scale": 2.0}
     }
@@ -357,7 +357,7 @@ startup cost:
 ```json
 {
   "vectors": {
-    "post_mlp": {
+    "post_block": {
       "dtype": "float32",
       "shape": [2, 2560],
       "layer_indices": [15, 20],
@@ -379,7 +379,7 @@ curl -X POST http://localhost:8000/v1/steering/modules/register \
   -d '{
     "name": "creativity",
     "vectors": {
-      "post_mlp": {"15": [0.1, 0.2, 0.3]}
+      "post_block": {"15": [0.1, 0.2, 0.3]}
     }
   }'
 
@@ -412,7 +412,7 @@ requests.post(
     json={
         "name": "creativity",
         "vectors": {
-            "post_mlp": {
+            "post_block": {
                 "dtype": str(stacked.dtype),
                 "shape": list(stacked.shape),
                 "layer_indices": [15],
@@ -454,7 +454,7 @@ response = client.chat.completions.create(
     extra_body={
         "steering_name": "creativity",
         "steering_vectors": {
-            "post_mlp": {15: [0.05, 0.1, 0.15]},
+            "post_block": {15: [0.05, 0.1, 0.15]},
         },
     },
 )
@@ -546,7 +546,7 @@ Returns per-layer hook-point availability aggregated across TP × PP ranks:
 
 ```bash
 curl http://localhost:8000/v1/steering/layers
-# {"layers": {"0": {"hook_points": ["post_mlp"]}, "1": {"hook_points": ["post_mlp", "pre_attn"]}, ...}}
+# {"layers": {"0": {"hook_points": ["post_block"]}, "1": {"hook_points": ["post_block", "pre_attn"]}, ...}}
 ```
 
 Useful to confirm which layers of the loaded model are steerable before

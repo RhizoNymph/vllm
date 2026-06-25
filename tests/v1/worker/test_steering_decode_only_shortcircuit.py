@@ -27,15 +27,15 @@ from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 HIDDEN = 8
 MAX_CONFIGS = 4
 NUM_ROWS = MAX_CONFIGS + 3
-_HP = "post_mlp"
+_HP = "post_block"
 
 
 class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.register_buffer("steering_table_post_mlp", torch.zeros(NUM_ROWS, HIDDEN))
+        self.register_buffer("steering_table_post_block", torch.zeros(NUM_ROWS, HIDDEN))
         self.register_buffer(
-            "steering_table_post_mlp_any_active", torch.zeros(1, dtype=torch.bool)
+            "steering_table_post_block_any_active", torch.zeros(1, dtype=torch.bool)
         )
         self.register_buffer("steering_index", torch.zeros(16, dtype=torch.long))
         self.register_buffer(

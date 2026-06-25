@@ -43,6 +43,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_dtype,
     register_steering_buffers,
@@ -329,10 +330,12 @@ class Gemma3DecoderLayer(nn.Module):
             hidden_states, residual
         )
         hidden_states = self.mlp(hidden_states)
-
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
-
+        # post_block must observe the true block output: residual + the *normed*
+        # MLP branch (= hidden_states[L+1]). Apply the post-FFN norm before the
+        # hook. Steering still rides ``residual`` so generation is unchanged.
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 
         return hidden_states, residual
 

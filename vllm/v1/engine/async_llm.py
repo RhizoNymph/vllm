@@ -679,6 +679,21 @@ class AsyncLLM(EngineClient):
                         IterationStats() if (log_stats and num_outputs) else None
                     )
 
+                    # Late capture results may arrive on a bare
+                    # EngineCoreOutputs with NO per-request outputs (emitted
+                    # by the engine core's idle loop after the owning request
+                    # finished), so deliver them outside the slicing loop --
+                    # zero outputs means zero slices.
+                    if late_capture := getattr(
+                        outputs, "late_capture_results", None
+                    ):
+                        output_processor.process_outputs(
+                            [],
+                            outputs.timestamp,
+                            None,
+                            late_capture_results=late_capture,
+                        )
+
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
                     # event loop for too long.
@@ -720,6 +735,29 @@ class AsyncLLM(EngineClient):
                 output_processor.propagate_error(e)
 
         self.output_handler = asyncio.create_task(output_handler())
+
+    async def wait_for_capture_results(
+        self, request_id: str, timeout: float = 300.0
+    ) -> dict | None:
+        """Await capture results that finalize after ``request_id`` finished.
+
+        Used by ``capture_wait`` API requests: capture files are written
+        asynchronously, so a request's results may arrive (via the
+        scheduler's ``late_capture_results``) seconds after its final
+        token. Returns ``None`` on timeout.
+        """
+        op = self.output_processor
+        results = op.pop_late_capture_results(request_id)
+        if results is not None:
+            return results
+        event = op.register_late_capture_event(request_id)
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            op._late_capture_events.pop(request_id, None)
+        return op.pop_late_capture_results(request_id)
 
     async def abort(
         self, request_id: str | Iterable[str], internal: bool = False
