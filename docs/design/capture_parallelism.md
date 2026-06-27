@@ -61,9 +61,12 @@ hidden_size]` and identical across the TP×EP plane of a PP stage.
 What is **genuinely sharded** (and not captured today):
 
 - The MLP **intermediate** (`gate_up_proj` output) is sharded along
-  `intermediate_size / tp` (`ColumnParallelLinear`). Note `mlp_in` (the
-  input to `gate_up_proj`) is the *replicated* residual; only the
-  intermediate between `gate_up` and `down` is sharded.
+  `intermediate_size / tp` (`ColumnParallelLinear`). Note the `mlp_in`
+  hook (the normed input to `gate_up_proj`) and the `mlp_out` hook (the
+  block's MLP branch, read after the `down_proj` all-reduce) are both
+  *replicated* and are captured today on gemma3/gemma4/qwen3 like the
+  other residual-stream hooks; only the intermediate between `gate_up`
+  and `down` is sharded.
 - Per-expert MoE outputs are sharded across EP ranks before the
   combine.
 

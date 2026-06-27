@@ -752,6 +752,10 @@ class Gemma4DecoderLayer(nn.Module):
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        # mlp_in is the normed dense-MLP input (transcoder training tap). On MoE
+        # layers the parallel MoE branch is normed separately, so mlp_in covers
+        # only the dense path; mlp_out still captures the combined branch.
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_in")
         hidden_states = self.mlp(hidden_states)
 
         if self.enable_moe_block:
@@ -766,6 +770,9 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states = hidden_states_1 + hidden_states_2
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        # mlp_out is the normed MLP branch added to the residual stream, so
+        # post_block == post_attn + mlp_out.
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_out")
         hidden_states = hidden_states + residual
         maybe_capture_residual(hidden_states, self.layer_idx, "post_block")
         hidden_states = apply_layer_steering(

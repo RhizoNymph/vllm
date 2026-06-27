@@ -31,6 +31,30 @@ The two modes compose: a single request can trigger a global consumer
 *and* a per-request consumer, and `RequestOutput.capture_results`
 returns a per-consumer result dict.
 
+### Hook points
+
+A `(layer, hook)` names where in the decoder layer an activation is read.
+The available hooks are:
+
+| Hook | Tensor captured |
+| --- | --- |
+| `pre_attn` | Residual stream entering the layer (before the attention sublayer). |
+| `post_attn` | Residual stream after the attention sublayer's contribution. |
+| `post_block` | Residual stream leaving the layer (`= post_attn + mlp_out`), i.e. HF's `hidden_states[L+1]`. |
+| `mlp_in` | Normalized activation fed **into** the MLP/MoE sublayer (output of the pre-MLP norm). |
+| `mlp_out` | The MLP/MoE branch the sublayer writes back to the residual stream (after any post-MLP norm / layer-scale). |
+
+`pre_attn`/`post_attn`/`post_block` are wired on every model. `mlp_in`
+and `mlp_out` are the paired taps needed to **train transcoders** (a
+transcoder learns `mlp_in → mlp_out` for one layer; cross-layer
+transcoders consume them across layers, aligned per token). They are
+wired on **gemma3, gemma4, and the qwen3 family** (`qwen3`, `qwen3_moe`,
+`qwen3_next`/Qwen3.5); request them explicitly by name (e.g.
+`{"mlp_in": [12], "mlp_out": [12]}`). They are deliberately excluded from
+the `:all` fan-out so `:all` stays model-agnostic. On gemma MoE layers
+`mlp_in` covers only the dense path (the parallel MoE branch is normed
+separately); `mlp_out` always captures the combined branch.
+
 ## Built-in Consumers
 
 vLLM ships two consumers, registered in its own `pyproject.toml` via
@@ -475,14 +499,17 @@ response body as `capture_results`, mirroring the structure above.
 ## Parallelism
 
 Capturing the residual-stream hooks (`pre_attn`, `post_attn`,
-`post_block`) is supported under **tensor, pipeline, expert, and data
-parallelism** for worker-location consumers — including the built-in
-`filesystem` consumer. How it works:
+`post_block`) and the MLP-sublayer hooks (`mlp_in`, `mlp_out`) is
+supported under **tensor, pipeline, expert, and data parallelism** for
+worker-location consumers — including the built-in `filesystem`
+consumer. How it works:
 
-- The residual stream these hooks read is **replicated** across the
-  tensor- and expert-parallel ranks within each pipeline stage (it is
-  read after the TP all-reduce / MoE combine), so exactly one rank — TP
-  rank 0 of each stage — captures it; the other ranks add no overhead.
+- The tensors these hooks read are **replicated** across the tensor- and
+  expert-parallel ranks within each pipeline stage. `mlp_in` is the
+  replicated normed input; `mlp_out` is read after the MLP/MoE down-proj
+  all-reduce / combine — so, like the residual-stream hooks, exactly one
+  rank — TP rank 0 of each stage — captures them and the other ranks add
+  no overhead.
 - Under **pipeline parallelism**, each stage's TP rank 0 captures the
   (global-indexed) layers that stage owns and writes them to the capture
   target; the engine merges the per-stage results into one
