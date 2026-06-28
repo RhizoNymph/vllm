@@ -70,6 +70,12 @@ class _SyncBase:
     execution: ClassVar[Literal["sync"]] = "sync"
     reads_client_spec: ClassVar[bool] = False
 
+    @classmethod
+    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
+        # Sync consumers read the StepCaptureView directly; no per-request
+        # graph-safe pre-buffering. Required by the registry's config build.
+        return []
+
     def __init__(self, vllm_config: VllmConfig, params: dict[str, Any]) -> None:
         model_config = getattr(vllm_config, "model_config", None)
         self._hidden = model_config.get_hidden_size() if model_config else None
@@ -328,6 +334,12 @@ class ConversationLatchExample:
     location: ClassVar[Literal["worker"]] = "worker"
     execution: ClassVar[Literal["sync"]] = "sync"
     reads_client_spec: ClassVar[bool] = False
+
+    @classmethod
+    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
+        # Sync consumers read the StepCaptureView directly; no per-request
+        # graph-safe pre-buffering. Required by the registry's config build.
+        return []
 
     def __init__(self, vllm_config: VllmConfig, params: dict[str, Any]) -> None:
         model_config = getattr(vllm_config, "model_config", None)
