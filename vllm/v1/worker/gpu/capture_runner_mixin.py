@@ -577,7 +577,11 @@ class CaptureRunnerMixin:
         """
         from vllm.v1.capture.step_view import StepCaptureView, StepRequestView
 
-        num_tokens = int(input_batch.num_tokens)
+        # Real scheduled token count, NOT input_batch.num_tokens (the
+        # cudagraph-padded forward size): the global buffer's leading rows hold
+        # the real tokens, so slicing to the padded size would expose padding
+        # rows. Matches v1 (scheduler_output.total_num_scheduled_tokens).
+        num_tokens = int(scheduler_output.total_num_scheduled_tokens)
         tensors: dict[tuple[int, str], torch.Tensor] = {}
         for key in self._sync_monitor_keys:
             buf = self._sync_capture_buffers.global_buffer(key)

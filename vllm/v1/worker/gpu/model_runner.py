@@ -1376,8 +1376,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
         # applied before the next step's ``_update_steering_buffers_v2``. The
         # global capture buffers are still valid here (the next forward
         # overwrites them); ``num_computed_tokens`` has not yet advanced, so the
-        # view reads start-of-step state matching the forward layout.
-        if self._sync_consumers:
+        # view reads start-of-step state matching the forward layout. Skipped on
+        # dummy/cudagraph-capture runs (``dummy_run``) so consumer policy never
+        # sees dummy activations — matches v1, whose capture path never reaches
+        # this call.
+        if self._sync_consumers and not dummy_run:
             self._run_sync_consumers(scheduler_output, input_batch)
 
         if self.is_last_pp_rank:
