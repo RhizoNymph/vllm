@@ -738,6 +738,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+
+        # Warm sync-consumer device compute now (full CUDA context) so the first
+        # served step doesn't pay the one-time GEMV init cost on the hot path.
+        if self._sync_consumers:
+            self._warmup_sync_consumers()
+
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
@@ -1364,6 +1370,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
         # before non-last stages return their intermediate tensors below.
         if self._capture_manager is not None:
             self._finalize_capture_step()
+
+        # Sync-execution consumers: run on EVERY rank (outside the rank-0-only
+        # manager guard above), post-forward, so returned steering actions are
+        # applied before the next step's ``_update_steering_buffers_v2``. The
+        # global capture buffers are still valid here (the next forward
+        # overwrites them); ``num_computed_tokens`` has not yet advanced, so the
+        # view reads start-of-step state matching the forward layout.
+        if self._sync_consumers:
+            self._run_sync_consumers(scheduler_output, input_batch)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
