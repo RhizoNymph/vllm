@@ -197,13 +197,17 @@ class PatchStudy:
                 "positions": positions,
             }
         }
+        # capture_wait holds the response until the capture has finalized, so
+        # the source store is durably populated before any patch request
+        # references this run (capture write-through is otherwise async — a
+        # patch issued too early would resolve to a missing source).
         resp = self._sync.completions.create(
             model=self.model,
             prompt=prompt,
             max_tokens=1,
             temperature=0.0,
             logprobs=self.logprobs,
-            extra_body={"capture": capture},
+            extra_body={"capture": capture, "capture_wait": True},
         )
         choice = resp.choices[0]
         clean_lp = (
