@@ -20,3 +20,4 @@ steering_ex_per_request_scale = "dynamic_steering_controller.minimal_examples:Pe
 steering_ex_monitor_tier = "dynamic_steering_controller.minimal_examples:MonitorTierExample"
 steering_ex_monitor_rowgate = "dynamic_steering_controller.minimal_examples:MonitorRowGateExample"
 steering_ex_async_tier = "dynamic_steering_controller.minimal_examples:AsyncTierExample"
+steering_ex_conversation_latch = "dynamic_steering_controller.minimal_examples:ConversationLatchExample"

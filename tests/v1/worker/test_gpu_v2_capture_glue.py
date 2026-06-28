@@ -200,6 +200,7 @@ class _AddGlue(CaptureRunnerMixin):
         self._capture_feature_enabled = True
         self._capture_step_gate = gate
         self._capture_manager = mgr
+        self._sync_conversation_ids = {}
         self.registered_calls = []
 
     # Stub the full registration machinery; only the branching is under test.
@@ -209,10 +210,12 @@ class _AddGlue(CaptureRunnerMixin):
             self._capture_manager._reqs.add(new_req_data.req_id)
 
 
-def _new_req(req_id, capture):
+def _new_req(req_id, capture, conversation_id=None):
     return SimpleNamespace(
         req_id=req_id,
-        sampling_params=SimpleNamespace(capture=capture),
+        sampling_params=SimpleNamespace(
+            capture=capture, conversation_id=conversation_id
+        ),
     )
 
 
@@ -327,6 +330,7 @@ class _SyncGlue(CaptureRunnerMixin):
         self._sync_consumer_stats = {}
         self._sync_step_counter = 0
         self._sync_timing_events = None  # CPU: wall-time accounting path
+        self._sync_conversation_ids = {}
         self.applied = []
 
     # The steering mixin provides this on the real runner (resolved via MRO).
@@ -410,3 +414,56 @@ def test_run_sync_consumers_isolates_exceptions():
 
     assert glue.applied == []
     assert glue._sync_consumer_stats["probe"]["steps"] == 1
+
+
+# ---- conversation id plumbing ---------------------------------------------
+
+
+def test_capture_add_stashes_conversation_id():
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _AddGlue(gate, mgr)
+
+    glue._capture_add_request(
+        _new_req("a", {"c": {}}, conversation_id="conv-9"), was_present=False
+    )
+
+    assert glue._sync_conversation_ids == {"a": "conv-9"}
+
+
+def test_capture_add_missing_conversation_id_is_none():
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _AddGlue(gate, mgr)
+
+    glue._capture_add_request(_new_req("a", {"c": {}}), was_present=False)
+
+    assert glue._sync_conversation_ids == {"a": None}
+
+
+def test_capture_finish_drops_conversation_id():
+    glue = _AddGlue(_FakeGate(), None)
+    glue._sync_conversation_ids["a"] = "conv-1"
+
+    glue._capture_finish_request("a")
+
+    assert "a" not in glue._sync_conversation_ids
+
+
+def test_step_capture_view_carries_conversation_id():
+    rs = _req_states(
+        prompt_len=[5, 10],
+        num_computed=[5, 0],
+        req_id_to_index={"d": 0, "p": 1},
+    )
+    key = (3, "post_block")
+    buf = np.arange(8 * 2, dtype=np.float32).reshape(8, 2)
+    glue = _SyncGlue(rs, [], {key: buf}, [key])
+    # Only "d" is tagged; "p" has no conversation id (defaults to None).
+    glue._sync_conversation_ids = {"d": "conv-1"}
+    sched = SimpleNamespace(
+        num_scheduled_tokens={"d": 1, "p": 3}, total_num_scheduled_tokens=4
+    )
+
+    view = glue._build_step_capture_view(sched, _sync_input_batch())
+
+    convs = {r.req_id: r.conversation_id for r in view.requests}
+    assert convs == {"d": "conv-1", "p": None}

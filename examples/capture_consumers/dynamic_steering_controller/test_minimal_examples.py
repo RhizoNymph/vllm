@@ -21,6 +21,7 @@ from dynamic_steering_controller.e2e_stub import (  # noqa: E402
 )
 from dynamic_steering_controller.minimal_examples import (  # noqa: E402
     AsyncTierExample,
+    ConversationLatchExample,
     GlobalTierExample,
     MonitorRowGateExample,
     MonitorTierExample,
@@ -173,6 +174,113 @@ def test_cfg_stub_reqscale_emits_override_then_req_id_scale():
     assert acts[1].req_id == "r1" and acts[1].scale == 0.0
     # Override is first so the req_id scale can resolve the fresh dyn_id.
     assert acts[0].req_id == "r1"
+
+
+# ---------------------------------------------------------------------------
+# ConversationLatchExample — trigger / bridge / prune
+# ---------------------------------------------------------------------------
+
+_PROBE_KEY = (LAYER, "post_block")
+
+
+def _latch_params(**kw):
+    p = {"steer_layer": LAYER, "steer_norm": 4.0, "threshold": 0.5}
+    p.update(kw)
+    return p
+
+
+def _latch_view(ex, reqs):
+    """Build a decode-step view for ConversationLatchExample.
+
+    ``reqs``: list of ``(req_id, conversation_id, phase, value)``. Each request
+    gets one residual row set to ``value * probe``; since the probe is a unit
+    vector the mean projection equals ``value`` (so ``value > threshold`` is
+    the trigger condition).
+    """
+    import torch
+
+    rows, views = [], []
+    for i, (rid, cid, phase, value) in enumerate(reqs):
+        rows.append(value * ex._probe)
+        views.append(
+            StepRequestView(
+                req_id=rid, start=i, end=i + 1, phase=phase,
+                token_ids=np.empty(0, dtype=np.int64), conversation_id=cid,
+            )
+        )
+    tensor = torch.tensor(np.stack(rows), dtype=torch.float32)
+    return StepCaptureView(step=0, tensors={_PROBE_KEY: tensor}, requests=views)
+
+
+def test_latch_trigger_overrides_and_latches_conversation():
+    ex = ConversationLatchExample(_cfg(), _latch_params())
+    # value 1.0 > threshold 0.5 -> trigger.
+    acts = ex.on_step(_latch_view(ex, [("r1", "c1", "decode", 1.0)]))
+    assert len(acts) == 1 and isinstance(acts[0], RequestSteeringOverride)
+    assert acts[0].req_id == "r1"
+    assert "c1" in ex._latched and "r1" in ex._armed
+    assert ex.status()["triggers"] == 1
+
+
+def test_latch_does_not_trigger_below_threshold():
+    ex = ConversationLatchExample(_cfg(), _latch_params())
+    # value 0.0 < threshold -> no trigger, conversation not latched.
+    assert ex.on_step(_latch_view(ex, [("r1", "c1", "decode", 0.0)])) is None
+    assert ex._latched == {} and ex._armed == set()
+
+
+def test_latch_bridges_later_request_of_same_conversation():
+    ex = ConversationLatchExample(_cfg(), _latch_params())
+    # Turn 1: r1 triggers and latches c1.
+    ex.on_step(_latch_view(ex, [("r1", "c1", "decode", 1.0)]))
+    # Turn 2: a NEW request r2 of c1, residual BELOW threshold -> bridged
+    # (steered without re-triggering) because the conversation is latched.
+    acts = ex.on_step(_latch_view(ex, [("r2", "c1", "decode", 0.0)]))
+    assert len(acts) == 1 and isinstance(acts[0], RequestSteeringOverride)
+    assert acts[0].req_id == "r2"
+    assert ex.status()["bridges"] == 1
+    # r1 finished -> pruned from armed; r2 is now armed.
+    assert ex._armed == {"r2"}
+
+
+def test_latch_leaves_other_conversations_untouched():
+    ex = ConversationLatchExample(_cfg(), _latch_params())
+    ex.on_step(_latch_view(ex, [("r1", "c1", "decode", 1.0)]))  # latch c1
+    # A different conversation c2, below threshold -> untouched.
+    assert ex.on_step(_latch_view(ex, [("r2", "c2", "decode", 0.0)])) is None
+    assert "c2" not in ex._latched
+
+
+def test_latch_emit_once_per_request_and_prunes_finished():
+    ex = ConversationLatchExample(_cfg(), _latch_params())
+    ex.on_step(_latch_view(ex, [("r1", "c1", "decode", 1.0)]))
+    # Same live request, next step: already armed -> no duplicate override.
+    assert ex.on_step(_latch_view(ex, [("r1", "c1", "decode", 1.0)])) is None
+    # r1 gone -> pruned from armed.
+    ex.on_step(_latch_view(ex, [("r9", "c9", "decode", 0.0)]))
+    assert "r1" not in ex._armed
+
+
+def test_latch_ignores_untagged_and_prefill_rows():
+    ex = ConversationLatchExample(_cfg(), _latch_params())
+    acts = ex.on_step(
+        _latch_view(
+            ex,
+            [
+                ("r1", None, "decode", 1.0),   # untagged conversation
+                ("r2", "c1", "prefill", 1.0),  # prefill phase
+            ],
+        )
+    )
+    assert acts is None and ex._latched == {}
+
+
+def test_latch_map_is_bounded():
+    ex = ConversationLatchExample(_cfg(), _latch_params(max_conversations=2))
+    for i in range(3):
+        ex.on_step(_latch_view(ex, [(f"r{i}", f"c{i}", "decode", 1.0)]))
+    # Oldest conversation evicted; map capped at 2.
+    assert len(ex._latched) == 2 and "c0" not in ex._latched
 
 
 if __name__ == "__main__":

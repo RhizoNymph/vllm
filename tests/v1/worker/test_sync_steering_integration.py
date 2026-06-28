@@ -79,6 +79,8 @@ class _RunnerStub:
         self._sync_consumers = []
         self._sync_consumer_stats = {}
         self._sync_step_counter = 0
+        # req_id -> client conversation id (populated by tests that exercise it)
+        self._sync_conversation_ids: dict[str, str | None] = {}
         self.applied_calls = []
 
     def _build_step_capture_view(self, scheduler_output):
@@ -117,6 +119,21 @@ def test_step_view_spans_phases_and_token_ids():
     np.testing.assert_array_equal(a.token_ids, [4, 5, 6])
     assert (b.req_id, b.start, b.end, b.phase) == ("b", 3, 4, "decode")
     np.testing.assert_array_equal(b.token_ids, [1012])
+
+
+def test_step_view_carries_conversation_id():
+    stub = _RunnerStub(
+        reqs=[
+            {"req_id": "a", "num_computed": 4, "num_prompt": 10},
+            {"req_id": "b", "num_computed": 12, "num_prompt": 8},
+        ]
+    )
+    # Only "a" is tagged; "b" defaults to None (absent from the map).
+    stub._sync_conversation_ids = {"a": "conv-1"}
+    out = stub._build_step_capture_view(_FakeSchedulerOutput({"a": 3, "b": 1}))
+
+    convs = {r.req_id: r.conversation_id for r in out.requests}
+    assert convs == {"a": "conv-1", "b": None}
 
 
 def test_step_view_skips_zero_token_and_unknown_requests():

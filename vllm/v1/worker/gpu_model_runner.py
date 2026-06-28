@@ -559,6 +559,10 @@ class GPUModelRunner(
         self._sync_capture_buffers: Any = None
         self._sync_monitor_keys: list[tuple[int, str]] = []
         self._sync_consumer_stats: dict[str, dict[str, Any]] = {}
+        # req_id -> client conversation id (``SamplingParams.conversation_id``),
+        # surfaced on the per-step ``StepRequestView`` so a sync consumer can
+        # latch a steering decision across the turns of one conversation.
+        self._sync_conversation_ids: dict[str, str | None] = {}
         self._sync_step_counter = 0
         # Per-consumer CUDA event pairs measuring the *added* GPU time of
         # ``on_step`` — the GEMV + tiny D2H the consumer enqueues — rather
@@ -1410,6 +1414,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._sync_conversation_ids.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1528,6 +1533,11 @@ class GPUModelRunner(
                 decode_steering_config_hash=(new_req_data.decode_steering_config_hash),
             )
             self.requests[req_id] = req_state
+            self._sync_conversation_ids[req_id] = (
+                sampling_params.conversation_id
+                if sampling_params is not None
+                else None
+            )
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             # Admit the request for activation capture, if the feature
@@ -2093,6 +2103,7 @@ class GPUModelRunner(
                     end=token_offset + n_tokens,
                     phase="prefill" if num_computed < num_prompt else "decode",
                     token_ids=token_ids,
+                    conversation_id=self._sync_conversation_ids.get(req_id),
                 )
             )
             token_offset += n_tokens
