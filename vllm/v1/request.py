@@ -326,12 +326,22 @@ class Request:
             return 0
         return self.sampling_params.decode_steering_config_hash
 
+    @cached_property
+    def patch_site_demand(self) -> dict[tuple[int, str], int]:
+        """Per-``(layer, hook)`` patch-slot demand. Delegates to
+        ``SamplingParams.patch_site_demand`` (itself cached). Empty when no
+        patching. Used by the scheduler for per-site capacity backpressure."""
+        if self.sampling_params is None:
+            return {}
+        return self.sampling_params.patch_site_demand
+
     def invalidate_steering_hashes(self) -> None:
         """Clear cached steering hashes so they recompute from current
         sampling_params.  Must be called whenever sampling_params is
         replaced (e.g. streaming session updates)."""
         self.__dict__.pop("prefill_steering_config_hash", None)
         self.__dict__.pop("decode_steering_config_hash", None)
+        self.__dict__.pop("patch_site_demand", None)
 
     def get_skip_reading_prefix_cache(self) -> bool:
         # A capture-bearing request whose classification is unknown skips

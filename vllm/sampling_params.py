@@ -1098,6 +1098,24 @@ class SamplingParams(
             module_ref=self.steering_module_ref,
         )
 
+    @cached_property
+    def patch_site_demand(self) -> dict[tuple[int, str], int]:
+        """Per-``(layer, hook)`` patch-slot demand for this request.
+
+        Counts the distinct patched ``dest_position``s at each site. A single
+        forward step can compute all of a request's positions at a site at once
+        (a prefill chunk), so this count is the request's worst-case slot draw
+        at that site — what the scheduler reserves to keep the per-site pool
+        from overflowing (see ``Scheduler``). Empty when no patching."""
+        if not self.patch:
+            return {}
+        demand: dict[tuple[int, str], int] = {}
+        for entry in self.patch:
+            key = (int(entry["layer"]), str(entry["hook"]))
+            seen = demand.setdefault(key, 0)
+            demand[key] = seen + 1
+        return demand
+
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
             raise ValueError(f"n must be 1 when using greedy sampling, got {self.n}.")

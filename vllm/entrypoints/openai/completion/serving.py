@@ -361,6 +361,21 @@ class OpenAIServingCompletion(OpenAIServing):
                 )
                 if error_response is not None:
                     return error_response
+                # Reject (HTTP 400) if a referenced patch source run/site does
+                # not exist, instead of silently completing unpatched.
+                from vllm.v1.capture.patch_admission import (
+                    PatchValidationError,
+                    validate_patch_sources,
+                )
+
+                try:
+                    await validate_patch_sources(self.engine_client, sampling_params)
+                except PatchValidationError as exc:
+                    return self.create_error_response(
+                        str(exc),
+                        status_code=HTTPStatus.BAD_REQUEST,
+                        param="patch",
+                    )
 
             self._log_inputs(
                 request_id_item,

@@ -16,13 +16,18 @@ logged, skipped entry.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import HOOK_POINT_TABLE_ATTR
 
 if TYPE_CHECKING:
+    from vllm.engine.protocol import EngineClient
     from vllm.sampling_params import SamplingParams
     from vllm.v1.capture.types import CaptureContext
+
+logger = init_logger(__name__)
 
 _INJECTABLE_HOOKS = frozenset(h.value for h in HOOK_POINT_TABLE_ATTR)
 
@@ -87,3 +92,99 @@ def resolve_patch_prefix_flags(
     else:
         sampling_params.patch_touches_prompt = False
         sampling_params.patch_min_prompt_position = None
+
+
+class _PatchSourceCache:
+    """Entrypoint-side cache of available patch source runs, refreshed from the
+    worker(s) via ``collective_rpc("get_patch_source_manifests")``.
+
+    Refresh-on-miss: a referenced run/site that is not cached triggers one
+    refresh before rejecting, so a just-captured clean run is never
+    false-rejected. A present run is fetched once and then served from cache,
+    so a sweep that reuses one run issues ~one RPC total. Positive entries can
+    go stale on whole-run eviction; that rare case falls through to the
+    worker's log-and-skip at resolution.
+    """
+
+    def __init__(self) -> None:
+        # run_id -> {"sites": set[(hook, layer)], "positions": set[int]}
+        self._runs: dict[str, dict[str, set]] = {}
+        self._lock = asyncio.Lock()
+
+    async def _refresh(self, engine_client: EngineClient) -> None:
+        results = await engine_client.collective_rpc("get_patch_source_manifests")
+        agg: dict[str, dict[str, set]] = {}
+        for rank_manifests in results or []:
+            for m in rank_manifests or []:
+                entry = agg.setdefault(
+                    m["run_id"], {"sites": set(), "positions": set()}
+                )
+                entry["sites"].update(
+                    (hook, int(layer)) for hook, layer in m["hook_layers"]
+                )
+                entry["positions"].update(int(p) for p in m["positions"])
+        self._runs = agg
+
+    def _missing(
+        self, refs: list[tuple[str, str, int, int]]
+    ) -> tuple[str, str, int, int] | None:
+        for run, hook, layer, pos in refs:
+            entry = self._runs.get(run)
+            if (
+                entry is None
+                or (hook, layer) not in entry["sites"]
+                or pos not in entry["positions"]
+            ):
+                return (run, hook, layer, pos)
+        return None
+
+    async def validate(
+        self, sampling_params: SamplingParams, engine_client: EngineClient
+    ) -> None:
+        """Raise :class:`PatchValidationError` if any referenced source site is
+        absent. Best-effort: if the RPC fails, admission proceeds (the worker
+        log-and-skips a missing source)."""
+        spec = sampling_params.patch
+        if not spec:
+            return
+        refs = [
+            (
+                str(e["source_run"]),
+                str(e["hook"]),
+                int(e["layer"]),
+                int(e["source_position"]),
+            )
+            for e in spec
+        ]
+        if self._missing(refs) is None:
+            return  # all cached-present
+        async with self._lock:
+            try:
+                await self._refresh(engine_client)
+            except Exception as exc:  # noqa: BLE001 — best-effort admission check
+                logger.warning(
+                    "patch source manifest RPC failed (%s); skipping admission "
+                    "existence check (worker will log+skip a missing source)",
+                    exc,
+                )
+                return
+        miss = self._missing(refs)
+        if miss is not None:
+            run, hook, layer, pos = miss
+            raise PatchValidationError(
+                f"patch source not found: run={run!r} site=(layer={layer}, "
+                f"hook={hook}, position={pos}). Capture the clean run "
+                f"(capture={{'patch_source': ...}}, capture_wait=True) first."
+            )
+
+
+# Process-global cache shared across the chat + completion serving instances
+# (one engine per API-server process).
+_PATCH_SOURCE_CACHE = _PatchSourceCache()
+
+
+async def validate_patch_sources(
+    engine_client: EngineClient, sampling_params: SamplingParams
+) -> None:
+    """Validate that a request's patch sources exist (raises on missing)."""
+    await _PATCH_SOURCE_CACHE.validate(sampling_params, engine_client)

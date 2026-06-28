@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for patch admission: prefix-floor classification + validation."""
 
+import asyncio
+
 import pytest
 
 from vllm import SamplingParams
@@ -97,3 +99,103 @@ class TestValidation:
         )
         resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=3)
         assert sp.patch_touches_prompt is True
+
+
+class TestPatchSiteDemand:
+    def test_counts_positions_per_site(self):
+        sp = SamplingParams(
+            patch=[
+                _entry(layer=2, hook="post_block", dest=0),
+                _entry(layer=2, hook="post_block", dest=1),
+                _entry(layer=3, hook="pre_attn", dest=0),
+            ]
+        )
+        assert sp.patch_site_demand == {(2, "post_block"): 2, (3, "pre_attn"): 1}
+
+    def test_empty_when_no_patch(self):
+        assert SamplingParams().patch_site_demand == {}
+
+
+class _FakeEngine:
+    """Minimal engine_client stub: collective_rpc returns per-rank manifests."""
+
+    def __init__(self, ranks_manifests, *, fail=False):
+        self._ranks = ranks_manifests
+        self.fail = fail
+        self.calls = 0
+
+    async def collective_rpc(self, method, *a, **k):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("rpc down")
+        return self._ranks
+
+
+def _manifest(run, hook_layers, positions):
+    return {
+        "run_id": run,
+        "num_prompt_tokens": max(positions) + 1,
+        "hidden_size": 8,
+        "hook_layers": [[hook, layer] for (hook, layer) in hook_layers],
+        "positions": list(positions),
+    }
+
+
+def _patch_sp(run="R1", hook="post_block", layer=2, src=1):
+    return SamplingParams(
+        patch=[_entry(layer=layer, hook=hook, dest=0, run=run, src=src)]
+    )
+
+
+class TestPatchSourceCache:
+    def _cache(self):
+        from vllm.v1.capture.patch_admission import _PatchSourceCache
+
+        return _PatchSourceCache()
+
+    def test_present_source_passes(self):
+        cache = self._cache()
+        eng = _FakeEngine([[_manifest("R1", [("post_block", 2)], [0, 1, 2])]])
+        asyncio.run(cache.validate(_patch_sp(src=1), eng))  # no raise
+        assert eng.calls == 1  # refreshed once (cold cache)
+
+    def test_missing_run_rejects(self):
+        from vllm.v1.capture.patch_admission import PatchValidationError
+
+        cache = self._cache()
+        eng = _FakeEngine([[_manifest("R1", [("post_block", 2)], [0, 1])]])
+        with pytest.raises(PatchValidationError):
+            asyncio.run(cache.validate(_patch_sp(run="GHOST"), eng))
+
+    def test_missing_position_rejects(self):
+        from vllm.v1.capture.patch_admission import PatchValidationError
+
+        cache = self._cache()
+        eng = _FakeEngine([[_manifest("R1", [("post_block", 2)], [0, 1])]])
+        with pytest.raises(PatchValidationError):
+            asyncio.run(cache.validate(_patch_sp(src=9), eng))
+
+    def test_positive_cache_avoids_second_rpc(self):
+        cache = self._cache()
+        eng = _FakeEngine([[_manifest("R1", [("post_block", 2)], [0, 1, 2])]])
+        asyncio.run(cache.validate(_patch_sp(src=1), eng))
+        asyncio.run(cache.validate(_patch_sp(src=2), eng))
+        assert eng.calls == 1  # second call served from cache, no RPC
+
+    def test_rpc_failure_is_best_effort(self):
+        cache = self._cache()
+        eng = _FakeEngine([], fail=True)
+        # Must not raise even though the run is "missing" — admission proceeds.
+        asyncio.run(cache.validate(_patch_sp(run="R1"), eng))
+
+    def test_pp_union_across_ranks(self):
+        # Rank 0 has layer 2, rank 1 has layer 5 of the same run.
+        cache = self._cache()
+        eng = _FakeEngine(
+            [
+                [_manifest("R1", [("post_block", 2)], [0, 1])],
+                [_manifest("R1", [("post_block", 5)], [0, 1])],
+            ]
+        )
+        # site on rank 1's layer resolves via the union.
+        asyncio.run(cache.validate(_patch_sp(layer=5, src=1), eng))
