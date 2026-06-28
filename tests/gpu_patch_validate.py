@@ -73,6 +73,8 @@ def main() -> None:
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--enforce-eager", action="store_true")
     ap.add_argument("--max-patch-slots", type=int, default=64)
+    ap.add_argument("--tensor-parallel-size", type=int, default=1)
+    ap.add_argument("--pipeline-parallel-size", type=int, default=1)
     args = ap.parse_args()
 
     llm = LLM(
@@ -82,6 +84,13 @@ def main() -> None:
         patch_source_cache_bytes=4_000_000_000,
         capture_consumers=[{"name": "patch_source"}],
         enforce_eager=args.enforce_eager,
+        tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
+        distributed_executor_backend=(
+            "ray"
+            if args.tensor_parallel_size * args.pipeline_parallel_size > 1
+            else None
+        ),
         gpu_memory_utilization=0.85,
         max_model_len=2048,
     )
