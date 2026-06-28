@@ -410,3 +410,59 @@ def test_run_sync_consumers_isolates_exceptions():
 
     assert glue.applied == []
     assert glue._sync_consumer_stats["probe"]["steps"] == 1
+
+
+def test_in_kernel_warmup_flag_defaults_false():
+    # The runner gate (``not self._in_kernel_warmup``) relies on this default so
+    # real serving steps always run sync consumers.
+    assert CaptureRunnerMixin._in_kernel_warmup is False
+
+
+def test_warmup_kernels_flags_execute_model_as_warmup(monkeypatch):
+    # ``warmup_kernels`` drives synthetic forwards through the *real*
+    # execute_model (v2-only), so it must mark them as warmup the whole time and
+    # clear the flag afterward — that is exactly what the runner's sync-consumer
+    # gate keys off. Stub the request builders/synchronize so this stays CPU-only.
+    import torch
+
+    from vllm.v1.worker.gpu import warmup as warmup_mod
+
+    monkeypatch.setattr(warmup_mod, "Request", lambda *a, **k: object())
+    monkeypatch.setattr(
+        warmup_mod.NewRequestData,
+        "from_request",
+        staticmethod(lambda *a, **k: object()),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *a, **k: None)
+
+    model_runner = SimpleNamespace(
+        num_speculative_steps=0,
+        decode_query_len=1,
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
+            ],
+            num_blocks=100,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=1, max_num_batched_tokens=8
+        ),
+        is_pooling_model=True,  # skips sampler/decode/grammar branches
+        is_last_pp_rank=True,
+        kv_connector=SimpleNamespace(set_disabled=lambda _disabled: None),
+        _in_kernel_warmup=False,
+    )
+
+    # Record the flag value seen during each real forward.
+    seen_flags: list[bool] = []
+    warmup_mod.warmup_kernels(
+        model_runner,
+        worker_execute_model=lambda _out: seen_flags.append(
+            model_runner._in_kernel_warmup
+        ),
+        worker_sample_tokens=lambda _g: None,
+    )
+
+    # Flag was set for every warmup forward (prefill + cleanup) and cleared after.
+    assert seen_flags and all(seen_flags)
+    assert model_runner._in_kernel_warmup is False

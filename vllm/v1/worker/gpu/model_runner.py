@@ -1377,10 +1377,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
         # global capture buffers are still valid here (the next forward
         # overwrites them); ``num_computed_tokens`` has not yet advanced, so the
         # view reads start-of-step state matching the forward layout. Skipped on
-        # dummy/cudagraph-capture runs (``dummy_run``) so consumer policy never
-        # sees dummy activations — matches v1, whose capture path never reaches
-        # this call.
-        if self._sync_consumers and not dummy_run:
+        # dummy/cudagraph-capture runs (``dummy_run``) and the v2-only
+        # ``warmup_kernels`` JIT pass (``_in_kernel_warmup``) so consumer policy
+        # never sees dummy/warmup activations — matches v1, whose warmup uses
+        # ``_dummy_run`` and so never reaches this call.
+        if self._sync_consumers and not dummy_run and not self._in_kernel_warmup:
             self._run_sync_consumers(scheduler_output, input_batch)
 
         if self.is_last_pp_rank:
