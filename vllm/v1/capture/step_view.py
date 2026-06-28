@@ -52,6 +52,14 @@ class StepRequestView:
     # The window's input token ids (length ``end - start``), copied out
     # of the batch's CPU token table — safe to retain across steps.
     token_ids: np.ndarray
+    # Optional client-supplied conversation grouping id
+    # (``SamplingParams.conversation_id``). Pure host-side string metadata
+    # (no GPU work / D2H), so it is populated identically on the v1 and v2
+    # runners — unlike ``token_ids``, which is empty on v2. Lets a sync
+    # consumer correlate successive requests of the same conversation (e.g.
+    # latch a steering decision after a trigger and re-apply it to later
+    # turns). ``None`` when the request did not set it.
+    conversation_id: str | None = None
 
 
 @dataclass(frozen=True)

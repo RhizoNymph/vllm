@@ -521,6 +521,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
+    conversation_id: str | None = Field(
+        default=None,
+        description="Opaque client conversation/session id. Surfaced to "
+        "worker-side capture consumers via StepRequestView.conversation_id so a "
+        "dynamic-steering consumer can apply per-conversation (e.g. latched) "
+        "steering across the requests of one conversation.",
+    )
+
     steering_name: str | None = Field(
         default=None,
         description="Name of a pre-registered steering module. "
@@ -760,6 +768,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
+            conversation_id=self.conversation_id,
         )
         # Attach the capture dict (keyed by consumer name). The
         # entrypoint's ``_admit_capture`` mutates each value in place

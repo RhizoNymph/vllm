@@ -284,3 +284,24 @@ class TestSteeringNameField:
         )
         assert chat.steering_name == "base_personality"
         assert chat.steering_vectors is not None
+
+    def test_conversation_id_defaults_none(self):
+        assert _make_chat().conversation_id is None
+        assert _make_completion().conversation_id is None
+
+    def test_conversation_id_threads_to_sampling_params(self):
+        """conversation_id on the request reaches SamplingParams (and thus the
+        worker / StepRequestView), for both chat and completion."""
+        chat = _make_chat(conversation_id="conv-7")
+        assert chat.conversation_id == "conv-7"
+        sp = chat.to_sampling_params(max_tokens=8, default_sampling_params={})
+        assert sp.conversation_id == "conv-7"
+
+        comp = _make_completion(conversation_id="conv-9")
+        assert comp.conversation_id == "conv-9"
+        sp_c = comp.to_sampling_params(max_tokens=8, default_sampling_params={})
+        assert sp_c.conversation_id == "conv-9"
+
+    def test_conversation_id_none_when_absent(self):
+        sp = _make_chat().to_sampling_params(max_tokens=8, default_sampling_params={})
+        assert sp.conversation_id is None

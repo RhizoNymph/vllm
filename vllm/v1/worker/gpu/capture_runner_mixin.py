@@ -103,6 +103,10 @@ class CaptureRunnerMixin:
         self._sync_consumer_stats = {}
         self._sync_step_counter = 0
         self._sync_timing_events = None
+        # req_id -> client conversation id (``SamplingParams.conversation_id``).
+        # RequestState drops sampling_params, so the conversation id is stashed
+        # here at admission and read back when building the per-step view.
+        self._sync_conversation_ids: dict[str, str | None] = {}
 
         cc_config = self.vllm_config.capture_consumers_config
         self._capture_feature_enabled = cc_config is not None
@@ -291,6 +295,12 @@ class CaptureRunnerMixin:
         if not self._capture_feature_enabled:
             return
         req_id = new_req_data.req_id
+        # Stash the conversation id for the per-step view (host-side metadata,
+        # survives the streaming re-add / preemption-resume branches below).
+        sp_new = new_req_data.sampling_params
+        self._sync_conversation_ids[req_id] = getattr(
+            sp_new, "conversation_id", None
+        )
         mgr = self._capture_manager
         if was_present:
             # Streaming re-add: prior chunk's capture state is stale.
@@ -310,6 +320,7 @@ class CaptureRunnerMixin:
         """Drop a finished request from the gate and finalize its capture."""
         if not self._capture_feature_enabled:
             return
+        self._sync_conversation_ids.pop(req_id, None)
         if self._capture_step_gate is not None:
             self._capture_step_gate.drop(req_id)
         if self._capture_manager is not None:
@@ -611,13 +622,15 @@ class CaptureRunnerMixin:
             req_idx = int(idx_np[i])
             num_computed = int(num_computed_np[req_idx])
             num_prompt = int(prompt_len_np[req_idx])
+            req_id = req_ids[i]
             requests.append(
                 StepRequestView(
-                    req_id=req_ids[i],
+                    req_id=req_id,
                     start=start,
                     end=end,
                     phase="prefill" if num_computed < num_prompt else "decode",
                     token_ids=empty_ids,
+                    conversation_id=self._sync_conversation_ids.get(req_id),
                 )
             )
 
