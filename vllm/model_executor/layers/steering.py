@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
-from vllm.model_executor.layers.activation_capture import maybe_capture_residual
+from vllm.model_executor.layers.activation_capture import (
+    maybe_capture_residual,
+    maybe_capture_residual_add,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
@@ -222,8 +225,14 @@ def apply_block_steering(
     from vllm.model_executor.layers.patch import maybe_apply_patch_block
 
     if get_active_capture_manager() is not None:
-        maybe_capture_residual(
-            residual + hidden_states,
+        # Pass the summands separately: the block output (residual + branch)
+        # is never bound to a value the model uses (vLLM defers the add), so a
+        # pre-summed tensor is dead in the compiled graph and the capture op
+        # gets DCE'd under CUDA graphs. ``maybe_capture_residual_add`` keeps
+        # both summands as live anchors and forms the sum inside the op.
+        maybe_capture_residual_add(
+            residual,
+            hidden_states,
             module.layer_idx,
             SteeringHookPoint.POST_BLOCK.value,
         )

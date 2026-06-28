@@ -109,6 +109,34 @@ def maybe_capture_residual(
     torch.ops.vllm.capture_residual(hidden_states, layer_idx, hook_id)
 
 
+def maybe_capture_residual_add(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    layer_idx: int,
+    hook_name: str,
+) -> None:
+    """Capture the sum ``a + b`` while keeping both summands as live anchors.
+
+    The block-output hook (``post_block``) wants ``residual + mlp_branch``,
+    but vLLM defers that add into the next layer's fused add+norm, so the sum
+    is never bound to a value the model consumes. Forming it eagerly and
+    passing it to :func:`maybe_capture_residual` yields a tensor that is
+    *dead* everywhere except the capture op; ``torch.compile`` then DCEs the
+    op (its ``mutates_args`` anchor is a throwaway) and the persistent global
+    buffer is never written under CUDA graphs — all-zeros at replay.
+
+    Passing ``a`` and ``b`` separately keeps both anchors **live** (they flow
+    on into the next layer), so the op survives DCE exactly like the live
+    ``apply_layer_steering`` capture. The sum is formed inside the op, a real
+    kernel recorded into each graph at warmup.
+    """
+    mgr = _ACTIVE_CAPTURE_MANAGER
+    if mgr is None:
+        return
+    hook_id = _HOOK_NAME_TO_ID[hook_name]
+    torch.ops.vllm.capture_residual_add(a, b, layer_idx, hook_id)
+
+
 def _capture_residual_impl(
     hidden_states: torch.Tensor,
     layer_idx: int,
@@ -159,4 +187,49 @@ direct_register_custom_op(
     op_func=_capture_residual_impl,
     fake_impl=_capture_residual_fake,
     mutates_args=["hidden_states"],
+)
+
+
+def _capture_residual_add_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    layer_idx: int,
+    hook_id: int,
+) -> torch.Tensor:
+    """Real impl of ``torch.ops.vllm.capture_residual_add``.
+
+    Captures ``a + b`` (the block output) via :meth:`CaptureManager.on_hook`.
+    The add is formed here, inside the op, so ``torch.compile`` never sees a
+    dead summed tensor to DCE — see :func:`maybe_capture_residual_add`.
+    Returns ``a`` unchanged; the ``mutates_args`` white lie below anchors the
+    op on its live inputs.
+    """
+    mgr = _ACTIVE_CAPTURE_MANAGER
+    if mgr is None:
+        return a
+    hook_name = _HOOK_ID_TO_NAME[hook_id]
+    mgr.on_hook(layer_idx, hook_name, a + b)
+    return a
+
+
+def _capture_residual_add_fake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    layer_idx: int,
+    hook_id: int,
+) -> torch.Tensor:
+    """FX-tracing fake impl for the summed-capture custom op."""
+    return torch.empty_like(a)
+
+
+# ``mutates_args=["a", "b"]`` anchors the op on both summands. Both flow on
+# into the next layer (the deferred residual add), so they are live in the
+# compiled graph and the op survives DCE even though its return is discarded
+# and the captured sum is never otherwise materialized. The impl mutates
+# neither — the annotation only marks the side effect.
+direct_register_custom_op(
+    op_name="capture_residual_add",
+    op_func=_capture_residual_add_impl,
+    fake_impl=_capture_residual_add_fake,
+    mutates_args=["a", "b"],
 )

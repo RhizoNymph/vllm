@@ -47,8 +47,79 @@ def _intercept_capture(monkeypatch, manager):
     def _record(tensor, layer_idx, hook_name):
         captured.append((tensor.clone(), layer_idx, hook_name))
 
+    def _record_add(a, b, layer_idx, hook_name):
+        # apply_block_steering captures the live summands; record their sum so
+        # assertions still see the block output (residual + branch).
+        captured.append(((a + b).clone(), layer_idx, hook_name))
+
     monkeypatch.setattr(steering_mod, "maybe_capture_residual", _record)
+    monkeypatch.setattr(steering_mod, "maybe_capture_residual_add", _record_add)
     return captured
+
+
+def test_block_capture_anchors_on_live_summands(monkeypatch):
+    """Regression (cudagraph all-zeros): ``apply_block_steering`` must hand the
+    capture op the two *live* summands separately, not a pre-summed throwaway.
+
+    The deferred-add representation means ``residual + branch`` is dead in the
+    compiled graph; a pre-summed tensor lets ``torch.compile`` DCE the capture
+    op, so the persistent global buffer is never written under CUDA graphs
+    (all-zeros at replay). Passing both summands keeps the op anchored on live
+    tensors. This asserts the call shape, not just the resulting value.
+    """
+    seen: list[tuple[torch.Tensor, torch.Tensor, int, str]] = []
+
+    monkeypatch.setattr(
+        cap_mod, "get_active_capture_manager", lambda: object()
+    )
+    monkeypatch.setattr(
+        steering_mod,
+        "maybe_capture_residual_add",
+        lambda a, b, layer_idx, hook_name: seen.append((a, b, layer_idx, hook_name)),
+    )
+
+    layer = _Layer(layer_idx=2)
+    hidden = torch.randn(4, 8)
+    residual = torch.randn(4, 8)
+    apply_block_steering(layer, hidden, residual)
+
+    assert len(seen) == 1
+    a, b, layer_idx, hook_name = seen[0]
+    assert layer_idx == 2
+    assert hook_name == SteeringHookPoint.POST_BLOCK.value
+    # The two live summands are passed straight through (identity, not a sum).
+    assert a is residual and b is hidden
+
+
+def test_capture_residual_add_op_forwards_sum_to_on_hook():
+    """``_capture_residual_add_impl`` forwards ``a + b`` to ``on_hook`` and
+    returns ``a`` unchanged (the live anchor). Exercised via the python impl
+    since the op itself is CUDA-dispatch-only."""
+    from vllm.model_executor.layers.activation_capture import (
+        _capture_residual_add_impl,
+        set_active_capture_manager,
+    )
+
+    calls: list[tuple[int, str, torch.Tensor]] = []
+
+    class _FakeMgr:
+        def on_hook(self, layer_idx, hook_name, hidden_states):
+            calls.append((layer_idx, hook_name, hidden_states.clone()))
+
+    a = torch.randn(3, 5)
+    b = torch.randn(3, 5)
+    set_active_capture_manager(_FakeMgr())
+    try:
+        out = _capture_residual_add_impl(a, b, 7, 2)  # hook_id 2 == post_block
+    finally:
+        set_active_capture_manager(None)
+
+    assert out is a  # live anchor returned unchanged
+    assert len(calls) == 1
+    layer_idx, hook_name, captured = calls[0]
+    assert layer_idx == 7
+    assert hook_name == "post_block"
+    torch.testing.assert_close(captured, a + b)
 
 
 def test_capture_sees_block_output(monkeypatch):
