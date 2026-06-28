@@ -27,6 +27,15 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    get_steering_buffer_dtype,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -40,6 +49,7 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsPP
 from .utils import (
     AutoWeightsLoader,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -307,23 +317,44 @@ class DbrxBlock(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        vllm_config: VllmConfig | None = None,
     ):
         super().__init__()
+        self.layer_idx = extract_layer_index(prefix)
         self.norm_attn_norm = DbrxFusedNormAttention(
             config, cache_config, quant_config, prefix=f"{prefix}.norm_attn_norm"
         )
         self.ffn = DbrxMoE(config, quant_config, prefix=f"{prefix}.ffn")
+
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.d_model,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+            dtype=get_steering_buffer_dtype(vllm_config),
+        )
 
     def forward(
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # DBRX adds each branch explicitly (no deferred add), so the input
+        # hidden_states is the pre-attn residual and norm_attn_norm returns the
+        # post-attn residual. Hooks mirror the shared steering/capture seam.
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.PRE_ATTN
+        )
         hidden_states, residual = self.norm_attn_norm(
             position_ids=position_ids,
             hidden_states=hidden_states,
         )
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.ffn(hidden_states)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         hidden_states = hidden_states + residual
         return hidden_states
 
@@ -343,9 +374,16 @@ class DbrxModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.blocks = make_layers(
             config.n_layers,
-            lambda prefix: DbrxBlock(config, cache_config, quant_config, prefix=prefix),
+            lambda prefix: DbrxBlock(
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                vllm_config=vllm_config,
+            ),
             prefix=f"{prefix}.blocks",
         )
+        share_steering_index_across_layers(self.blocks)
         self.norm_f = nn.LayerNorm(config.d_model, eps=1e-5)
         for module in self.modules():
             if hasattr(module, "bias") and isinstance(module.bias, nn.Parameter):
