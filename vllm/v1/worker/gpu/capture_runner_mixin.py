@@ -50,6 +50,12 @@ class CaptureRunnerMixin:
     # ---- state (set by _init_capture_state) -------------------------------
     _capture_feature_enabled: bool = False
     _capture_piecewise_fallback_enabled: bool = False
+    # Set True only while ``warmup_kernels`` drives synthetic forwards through
+    # the real ``execute_model`` (a v2-only JIT-compile pass; v1 instead warms
+    # up via ``_dummy_run``, which never reaches this runner's ``execute_model``).
+    # Gates sync consumers off those startup warmup steps so consumer policy
+    # never runs on dummy activations.
+    _in_kernel_warmup: bool = False
     _capture_manager: Any = None
     _capture_step_gate: Any = None
     _capture_validators: list[Any]
