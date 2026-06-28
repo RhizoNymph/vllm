@@ -39,7 +39,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -396,7 +398,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         )
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNetAttention(
+            self.linear_attn = QwenGatedDeltaNetAttention(
                 config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
