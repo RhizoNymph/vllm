@@ -245,16 +245,36 @@ class PatchStudy:
         foil_token: str | None = None,
         metric: str = "logprob",
         clean: CleanRun | None = None,
+        server_side: bool = False,
     ) -> SweepResult:
         """Fan out one patched request per (layer, position) cell.
 
         ``metric``: ``"logprob"`` (P(answer)), ``"logit_diff"`` (answer - foil),
         or ``"recovered"`` ((patched - corrupt) / (clean - corrupt)).
+
+        With ``server_side=True`` the whole grid is sent as a single
+        ``/v1/patch_sweep`` request — the server expands and batches the cells
+        internally (no per-cell HTTP round trips). Returns the same
+        :class:`SweepResult`.
         """
         hook = hook or self.hook
         layers = list(layers)
         positions = list(positions)
         notes: list[str] = []
+
+        if server_side:
+            return await self._sweep_server_side(
+                corrupt_prompt,
+                run=run,
+                layers=layers,
+                positions=positions,
+                hook=hook,
+                alpha=alpha,
+                answer_token=answer_token,
+                foil_token=foil_token,
+                metric=metric,
+                clean=clean,
+            )
 
         async with AsyncOpenAI(
             base_url=self.base_url, api_key=self.api_key
@@ -328,6 +348,64 @@ class PatchStudy:
             clean=clean_val,
             corrupt=corrupt_val,
             notes=notes,
+        )
+
+    async def _sweep_server_side(
+        self,
+        corrupt_prompt: str,
+        *,
+        run: str,
+        layers: list[int],
+        positions: list[int],
+        hook: str,
+        alpha: float,
+        answer_token: str,
+        foil_token: str | None,
+        metric: str,
+        clean: CleanRun | None,
+    ) -> SweepResult:
+        """One POST to /v1/patch_sweep; the server expands + batches the grid."""
+        import httpx
+
+        clean_baseline = None
+        if clean is not None:
+            clean_baseline = (
+                clean.clean_logit_diff
+                if metric == "logit_diff"
+                else clean.clean_logprob
+            )
+        payload = {
+            "model": self.model,
+            "prompt": corrupt_prompt,
+            "source_run": run,
+            "hook": hook,
+            "layers": layers,
+            "positions": positions,
+            "alpha": alpha,
+            "answer_token": answer_token,
+            "foil_token": foil_token,
+            "metric": metric,
+            "logprobs": self.logprobs,
+            "clean_baseline": clean_baseline,
+        }
+        url = f"{self.base_url}/patch_sweep"
+        async with httpx.AsyncClient(timeout=None) as client:
+            resp = await client.post(
+                url, json=payload, headers={"Authorization": f"Bearer {self.api_key}"}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return SweepResult(
+            layers=data["layers"],
+            positions=data["positions"],
+            hook=data["hook"],
+            metric_name=data["metric"],
+            grid=data["grid"],
+            clean=data.get("clean"),
+            corrupt=data.get("corrupt"),
+            notes=[f"skipped={len(data.get('skipped', []))}"]
+            if data.get("skipped")
+            else [],
         )
 
     @staticmethod
