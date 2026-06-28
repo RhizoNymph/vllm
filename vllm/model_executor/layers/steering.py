@@ -86,7 +86,20 @@ def register_steering_buffers(
     :func:`apply_layer_steering` to short-circuit so the steering
     kernel never launches.  This keeps disabled-mode forwards free of
     steering overhead.
+
+    Activation-patching buffers piggyback here (independent of whether
+    steering itself is enabled) so they attach to exactly the decoder
+    layers — PP-local — that register steering buffers, with no model
+    file changes.  This must run before the steering early-return so
+    patch buffers are attached even when ``max_steering_configs == 0``.
     """
+    # Lazy import: ``patch`` imports hook-point constants from this module,
+    # so a module-level import here would be circular.
+    from vllm.model_executor.layers.patch import maybe_register_patch_buffers
+
+    maybe_register_patch_buffers(
+        module, hidden_size, max_patch_tokens=max_steering_tokens, dtype=dtype
+    )
     if max_steering_configs == 0:
         return
     table_dtype = dtype if dtype is not None else torch.float32
@@ -164,7 +177,10 @@ def apply_layer_steering(
     of the layer's lifetime, so ``torch.compile`` traces it as a static
     branch and the disabled path emits no steering kernel at all.
     """
+    from vllm.model_executor.layers.patch import maybe_apply_patch
+
     maybe_capture_residual(hidden_states, module.layer_idx, hook_point.value)
+    hidden_states = maybe_apply_patch(module, hidden_states, hook_point)
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
     if not hasattr(module, table_attr):
         return hidden_states
@@ -203,6 +219,7 @@ def apply_block_steering(
     from vllm.model_executor.layers.activation_capture import (
         get_active_capture_manager,
     )
+    from vllm.model_executor.layers.patch import maybe_apply_patch_block
 
     if get_active_capture_manager() is not None:
         maybe_capture_residual(
@@ -210,6 +227,7 @@ def apply_block_steering(
             module.layer_idx,
             SteeringHookPoint.POST_BLOCK.value,
         )
+    residual = maybe_apply_patch_block(module, hidden_states, residual)
     table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_BLOCK]
     if not hasattr(module, table_attr):
         return hidden_states, residual

@@ -564,6 +564,14 @@ class KVCacheManager:
                     stats.puts,
                     stats.evictions,
                 )
+        # The patch source store holds clean-run activations under the current
+        # weights; the same pure-function premise breaks on a weight update, so
+        # drop it on a prefix-cache reset too (same process under TP1/PP1).
+        from vllm.v1.capture.source_store import get_active_patch_source_store
+
+        source_store = get_active_patch_source_store()
+        if source_store is not None:
+            source_store.invalidate_all()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True
