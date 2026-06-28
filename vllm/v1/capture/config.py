@@ -207,10 +207,11 @@ def parse_graphsafe_key(shorthand: str) -> tuple[int, str]:
     return (layer, hook)
 
 
-# Hooks that ``:all`` fans out to. Restricted to the standard residual-stream
-# taps that are actually wired; ``mlp_in``/``mlp_out`` are valid to name
-# explicitly but excluded here so ``:all`` never reserves buffers for taps
-# that never fire.
+# Hooks that ``:all`` fans out to. Restricted to the residual-stream taps wired
+# on every model. ``mlp_in``/``mlp_out`` are valid to name explicitly (and fire
+# on the models that wire them -- gemma3, gemma4, and the qwen3 family) but are
+# excluded here so ``:all`` stays model-agnostic and never reserves buffers for
+# taps a given model never fires.
 _GRAPHSAFE_ALL_HOOKS: tuple[str, ...] = ("pre_attn", "post_attn", "post_block")
 
 
