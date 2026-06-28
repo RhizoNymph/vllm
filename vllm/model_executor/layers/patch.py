@@ -243,10 +243,11 @@ def apply_patch(
         return hidden_states.clone()
     n = hidden_states.shape[0]
     slots = patch_index[:n].long()
-    # alpha[0] == 0 makes slot-0 rows passthrough without a branch.
+    # alpha[0] == 0 makes slot-0 rows passthrough without a branch. Precise lerp
+    # form ``(1-a)*h + a*t`` is exact at the endpoints (a==1 -> table).
     alpha = patch_alpha[slots].unsqueeze(1).to(hidden_states.dtype)
     gathered = patch_table[slots].to(hidden_states.dtype)
-    return hidden_states + alpha * (gathered - hidden_states)
+    return (1 - alpha) * hidden_states + alpha * gathered
 
 
 def apply_patch_fake(
@@ -296,8 +297,9 @@ def apply_patch_block(
     slots = patch_index[:n].long()
     alpha = patch_alpha[slots].unsqueeze(1).to(residual.dtype)
     gathered = patch_table[slots].to(residual.dtype)
-    block_out = residual + hidden_states
-    return residual + alpha * (gathered - block_out)
+    # out_res + hidden == lerp(residual + hidden, table, alpha); written so
+    # alpha==0 yields residual exactly (passthrough).
+    return (1 - alpha) * residual + alpha * (gathered - hidden_states)
 
 
 def apply_patch_block_fake(

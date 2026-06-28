@@ -44,6 +44,7 @@ from .model import ModelConfig
 from .observability import ObservabilityConfig
 from .offload import OffloadConfig
 from .parallel import ParallelConfig
+from .patch import PatchConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
@@ -365,6 +366,8 @@ class VllmConfig:
     or programmatically via ``LLM(capture_consumers=...)``."""
     steering_config: SteeringConfig | None = None
     """Per-request activation steering configuration."""
+    patch_config: PatchConfig | None = None
+    """Activation-patching configuration. ``None`` disables patching."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
     diffusion_config: DiffusionConfig | None = None
@@ -497,6 +500,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.steering_config:
             vllm_factors.append(self.steering_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.patch_config:
+            vllm_factors.append(self.patch_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.speculative_config:

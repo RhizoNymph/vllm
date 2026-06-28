@@ -103,7 +103,9 @@ def _apply_patch_kernel(
         h_vals = tl.load(hidden_row_ptr + h_idx * h_stride_h, mask=mask)
         t_vals = tl.load(table_row_ptr + h_idx * t_stride_h, mask=mask)
         a = alpha.to(h_vals.dtype)
-        result = h_vals + a * (t_vals.to(h_vals.dtype) - h_vals)
+        # Precise lerp form: exact at the endpoints (a==1 -> table, a==0 -> hs),
+        # unlike ``h + a*(t-h)`` which loses the endpoints to rounding.
+        result = (1.0 - a) * h_vals + a * t_vals.to(h_vals.dtype)
         tl.store(out_row_ptr + h_idx * o_stride_h, result, mask=mask)
 
 
@@ -165,8 +167,9 @@ def _apply_patch_block_kernel(
         h_vals = tl.load(hidden_row_ptr + h_idx * h_stride_h, mask=mask)
         t_vals = tl.load(table_row_ptr + h_idx * t_stride_h, mask=mask)
         a = alpha.to(r_vals.dtype)
-        block_out = r_vals + h_vals
-        result = r_vals + a * (t_vals.to(r_vals.dtype) - block_out)
+        # out_res such that out_res + h == lerp(r + h, table, a). Written as
+        # (1-a)*r + a*(t-h) so a==0 yields r exactly (passthrough).
+        result = (1.0 - a) * r_vals + a * (t_vals.to(r_vals.dtype) - h_vals)
         tl.store(out_row_ptr + h_idx * o_stride_h, result, mask=mask)
 
 

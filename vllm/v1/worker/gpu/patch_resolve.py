@@ -4,10 +4,23 @@
 
 A patch spec entry references a clean run's stored activation by
 ``(source_run, layer, hook, source_position)``; resolution looks each up in the
-per-worker patch source store and pairs it with the destination
-``(layer, hook, dest_position, alpha)``. The store and the spec field are wired
-in later phases; until then this returns an empty list so the runner lifecycle
-is import-safe and a no-op.
+per-worker :class:`PatchSourceStore` and pairs it with the destination
+``(layer, hook, dest_position, alpha)``.
+
+Cross-rank behavior:
+
+- **TP1 / PP**: the store lives on this rank (PP: with its local layers), so
+  resolution is purely local. Only locally-owned layers are resolved.
+- **TP>1**: the capture manager (hence the store) lives only on TP rank 0, but
+  injection must be byte-identical on every TP rank (the residual is replicated
+  across the group). Rank 0 resolves and **broadcasts** the resolved entries to
+  its TP peers, who apply the identical patch. Resolution runs in lockstep on
+  all ranks (``add_requests`` is driven by the broadcast scheduler output), so
+  the collective is safe.
+
+Strictness: source existence is validated at admission (the entrypoint checks
+the source manifest), so a miss here means an eviction race or bug — it is
+logged and the entry skipped rather than crashing the engine.
 """
 
 from __future__ import annotations
@@ -15,12 +28,65 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.worker.patch_runner_mixin import PatchEntry
+from vllm.v1.capture.source_store import get_active_patch_source_store
+from vllm.v1.worker.patch_runner_mixin import PatchEntry, get_patchable_hook
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import NewRequestData
 
 logger = init_logger(__name__)
+
+
+def _tp_group():
+    """Return the TP GroupCoordinator, or ``None`` if unavailable (CPU/tests)."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        return get_tp_group()
+    except Exception:
+        return None
+
+
+def _resolve_local(candidates: list[dict]) -> list[PatchEntry]:
+    """Resolve candidate spec entries against the local source store.
+
+    Missing sources are logged and skipped (admission is the strict gate).
+    """
+    store = get_active_patch_source_store()
+    if store is None:
+        logger.warning(
+            "patch resolution: no active source store on this rank; "
+            "dropping %d patch entries",
+            len(candidates),
+        )
+        return []
+    entries: list[PatchEntry] = []
+    for e in candidates:
+        layer = int(e["layer"])
+        hook = str(e["hook"])
+        source_run = str(e["source_run"])
+        source_pos = int(e["source_position"])
+        row = store.get_row(source_run, layer, hook, source_pos)
+        if row is None:
+            logger.error(
+                "patch source missing at resolution: run=%s layer=%d hook=%s "
+                "pos=%d (evicted or never captured); skipping entry",
+                source_run,
+                layer,
+                hook,
+                source_pos,
+            )
+            continue
+        entries.append(
+            PatchEntry(
+                layer=layer,
+                hook=get_patchable_hook(hook),
+                dest_pos=int(e["dest_position"]),
+                source=row,
+                alpha=float(e.get("alpha", 1.0)),
+            )
+        )
+    return entries
 
 
 def resolve_patch_entries(
@@ -30,7 +96,8 @@ def resolve_patch_entries(
 ) -> list[PatchEntry]:
     """Resolve ``new_req_data``'s patch spec into entries for local layers.
 
-    Returns ``[]`` until the source store + spec field are wired (later phase).
+    Runs in lockstep on every TP rank; rank 0 owns the store and broadcasts the
+    resolved entries to peers (no-op at TP1).
     """
     sampling_params = getattr(new_req_data, "sampling_params", None)
     if sampling_params is None:
@@ -38,5 +105,23 @@ def resolve_patch_entries(
     spec = getattr(sampling_params, "patch", None)
     if not spec:
         return []
-    # Source-store resolution is implemented in the source-store phase.
-    return []
+
+    # Candidate entries for locally-owned layers, in deterministic spec order —
+    # identical on every rank (all ranks see the same broadcast spec).
+    candidates = [e for e in spec if int(e["layer"]) in local_layers]
+    if not candidates:
+        return []
+
+    tp = _tp_group()
+    world_size = getattr(tp, "world_size", 1) if tp is not None else 1
+
+    if world_size <= 1:
+        return _resolve_local(candidates)
+
+    # TP>1: rank 0 resolves from its store and broadcasts to peers so all ranks
+    # apply the identical patch (residual is replicated across the TP group).
+    if tp.rank_in_group == 0:
+        resolved = _resolve_local(candidates)
+        tp.broadcast_object(resolved, src=0)
+        return resolved
+    return tp.broadcast_object(None, src=0) or []

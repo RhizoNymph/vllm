@@ -473,6 +473,15 @@ class OpenAIServingChat(OpenAIServing):
                 if error_response is not None:
                     return error_response
 
+            if isinstance(sampling_params, SamplingParams) and sampling_params.patch:
+                error_response = self._admit_patch(
+                    sampling_params=sampling_params,
+                    engine_input=engine_input,
+                    request_id=sub_request_id,
+                )
+                if error_response is not None:
+                    return error_response
+
             self._log_inputs(
                 sub_request_id,
                 engine_input,
@@ -607,6 +616,46 @@ class OpenAIServingChat(OpenAIServing):
                 str(exc),
                 status_code=HTTPStatus.BAD_REQUEST,
                 param=getattr(exc, "capture_param", "capture"),
+            )
+        return None
+
+    def _admit_patch(
+        self,
+        *,
+        sampling_params: SamplingParams,
+        engine_input: EngineInput,
+        request_id: str,
+    ) -> ErrorResponse | None:
+        """Validate the patch spec and stamp prefix-cache flags."""
+        from vllm.v1.capture.patch_admission import (
+            PatchValidationError,
+            resolve_patch_prefix_flags,
+        )
+
+        if not sampling_params.patch:
+            return None
+        try:
+            num_prompt_tokens = self._extract_prompt_len(engine_input)
+            ctx = build_capture_context(
+                self.engine_client.vllm_config, num_prompt_tokens, request_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            return self.create_error_response(
+                f"patch: failed to read request shape: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="patch",
+            )
+        patch_config = getattr(self.engine_client.vllm_config, "patch_config", None)
+        max_patch_slots = (
+            getattr(patch_config, "max_patch_slots", 0) if patch_config else 0
+        )
+        try:
+            resolve_patch_prefix_flags(
+                sampling_params, ctx, max_patch_slots=max_patch_slots
+            )
+        except PatchValidationError as exc:
+            return self.create_error_response(
+                str(exc), status_code=HTTPStatus.BAD_REQUEST, param="patch"
             )
         return None
 
