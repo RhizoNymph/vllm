@@ -354,7 +354,9 @@ def test_step_capture_view_slices_buffers_and_spans():
     key = (3, "post_block")
     buf = np.arange(8 * 2, dtype=np.float32).reshape(8, 2)
     glue = _SyncGlue(rs, [], {key: buf}, [key])
-    sched = SimpleNamespace(num_scheduled_tokens={"d": 1, "p": 3})
+    sched = SimpleNamespace(
+        num_scheduled_tokens={"d": 1, "p": 3}, total_num_scheduled_tokens=4
+    )
 
     view = glue._build_step_capture_view(sched, _sync_input_batch())
 
@@ -374,7 +376,9 @@ def test_run_sync_consumers_applies_actions_and_counts_steps():
     actions = [object()]
     consumer = _RecordingConsumer(actions=actions)
     glue = _SyncGlue(rs, [("probe", consumer)], {}, [])
-    sched = SimpleNamespace(num_scheduled_tokens={"d": 1})
+    sched = SimpleNamespace(
+        num_scheduled_tokens={"d": 1}, total_num_scheduled_tokens=1
+    )
     ib = SimpleNamespace(
         num_tokens=1,
         num_reqs=1,
@@ -396,7 +400,9 @@ def test_run_sync_consumers_isolates_exceptions():
     rs = _req_states([5], [5], {"d": 0})
     consumer = _RecordingConsumer(raises=True)
     glue = _SyncGlue(rs, [("probe", consumer)], {}, [])
-    sched = SimpleNamespace(num_scheduled_tokens={"d": 1})
+    sched = SimpleNamespace(
+        num_scheduled_tokens={"d": 1}, total_num_scheduled_tokens=1
+    )
     ib = SimpleNamespace(
         num_tokens=1,
         num_reqs=1,
