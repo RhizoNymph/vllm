@@ -256,7 +256,9 @@ request id + the window's token ids — everything trivially
 rank-identical. Token ids enable policies that react to emitted tokens
 (trigger phrases) alongside activation probes. Sampling params and
 richer metadata are deliberately excluded until a concrete policy needs
-them.
+them; the one host-side field a policy has since needed — the client
+`conversation_id` — rides the dedicated request-metadata channel (§5.6),
+not `SamplingParams`.
 
 Returned actions are validated and applied **inline** through the same
 `apply_steering_updates` path Phase 0 built (we are already on the
@@ -494,6 +496,29 @@ populate time instead). Two implementations, by phase:
   decided: metric + rate-limited warning only in v1, no automatic
   disable; a hard kill is itself a rank-divergence hazard unless its
   trigger is rank-replicated).
+
+### 5.6 Request-level metadata channel (`RequestMetadata`)
+
+Some policies need per-request host-side context that is *not* a sampling
+parameter — e.g. the conversation-latch consumer correlates successive
+requests of one conversation by an opaque client `conversation_id`. Such
+fields live on `vllm.v1.request_metadata.RequestMetadata`, a small typed
+`msgspec.Struct` carried on `EngineCoreRequest.request_metadata` alongside
+`external_req_id` (the client request id), *not* on `SamplingParams`. It is
+the extensible home for this class of field: `conversation_id` today,
+declarative steering specs as siblings later. New fields keep a default so
+older callers and serialized payloads stay valid.
+
+Flow (mirrors the `client_request_id` precedent): the OpenAI entrypoint
+builds it from the request (`ChatCompletionRequest.to_request_metadata()` /
+`CompletionRequest.to_request_metadata()`) and passes it to
+`generate(...)`; it threads through `AsyncLLM.add_request` →
+`InputProcessor.process_inputs` → `EngineCoreRequest` →
+`Request.request_metadata` → `NewRequestData.request_metadata`. Both runners
+read `conversation_id` off it at admission and stash it for the per-step
+view. Because it is pure host-side string metadata (no GPU work / D2H), it
+is surfaced identically on the v1 and v2 runners via
+`StepRequestView.conversation_id`.
 
 ## 6. Distributed execution (the determinism problem)
 

@@ -289,19 +289,29 @@ class TestSteeringNameField:
         assert _make_chat().conversation_id is None
         assert _make_completion().conversation_id is None
 
-    def test_conversation_id_threads_to_sampling_params(self):
-        """conversation_id on the request reaches SamplingParams (and thus the
+    def test_conversation_id_not_on_sampling_params(self):
+        """conversation_id is request metadata, not a sampling parameter:
+        ``to_sampling_params`` must not carry it onto ``SamplingParams``."""
+        chat = _make_chat(conversation_id="conv-7")
+        sp = chat.to_sampling_params(max_tokens=8, default_sampling_params={})
+        assert not hasattr(sp, "conversation_id")
+
+        comp = _make_completion(conversation_id="conv-9")
+        sp_c = comp.to_sampling_params(max_tokens=8, default_sampling_params={})
+        assert not hasattr(sp_c, "conversation_id")
+
+    def test_conversation_id_threads_to_request_metadata(self):
+        """conversation_id on the request reaches RequestMetadata (and thus the
         worker / StepRequestView), for both chat and completion."""
         chat = _make_chat(conversation_id="conv-7")
         assert chat.conversation_id == "conv-7"
-        sp = chat.to_sampling_params(max_tokens=8, default_sampling_params={})
-        assert sp.conversation_id == "conv-7"
+        assert chat.to_request_metadata().conversation_id == "conv-7"
 
         comp = _make_completion(conversation_id="conv-9")
         assert comp.conversation_id == "conv-9"
-        sp_c = comp.to_sampling_params(max_tokens=8, default_sampling_params={})
-        assert sp_c.conversation_id == "conv-9"
+        assert comp.to_request_metadata().conversation_id == "conv-9"
 
     def test_conversation_id_none_when_absent(self):
-        sp = _make_chat().to_sampling_params(max_tokens=8, default_sampling_params={})
-        assert sp.conversation_id is None
+        meta = _make_chat().to_request_metadata()
+        assert meta.conversation_id is None
+        assert meta.is_empty()

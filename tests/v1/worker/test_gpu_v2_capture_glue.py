@@ -16,6 +16,10 @@ import numpy as np
 
 from vllm.v1.worker.gpu.capture_runner_mixin import CaptureRunnerMixin
 
+# Sentinel distinguishing "request_metadata not supplied" (build a default
+# namespace) from an explicit ``request_metadata=None`` (offline path).
+_UNSET = object()
+
 
 class _Glue(CaptureRunnerMixin):
     """Minimal host exposing only what the view builders / drain read."""
@@ -210,12 +214,15 @@ class _AddGlue(CaptureRunnerMixin):
             self._capture_manager._reqs.add(new_req_data.req_id)
 
 
-def _new_req(req_id, capture, conversation_id=None):
+def _new_req(req_id, capture, conversation_id=None, request_metadata=_UNSET):
+    # conversation_id now travels on request_metadata, not sampling_params.
+    # Pass ``request_metadata=None`` to exercise the no-metadata (offline) path.
+    if request_metadata is _UNSET:
+        request_metadata = SimpleNamespace(conversation_id=conversation_id)
     return SimpleNamespace(
         req_id=req_id,
-        sampling_params=SimpleNamespace(
-            capture=capture, conversation_id=conversation_id
-        ),
+        sampling_params=SimpleNamespace(capture=capture),
+        request_metadata=request_metadata,
     )
 
 
@@ -380,9 +387,7 @@ def test_run_sync_consumers_applies_actions_and_counts_steps():
     actions = [object()]
     consumer = _RecordingConsumer(actions=actions)
     glue = _SyncGlue(rs, [("probe", consumer)], {}, [])
-    sched = SimpleNamespace(
-        num_scheduled_tokens={"d": 1}, total_num_scheduled_tokens=1
-    )
+    sched = SimpleNamespace(num_scheduled_tokens={"d": 1}, total_num_scheduled_tokens=1)
     ib = SimpleNamespace(
         num_tokens=1,
         num_reqs=1,
@@ -404,9 +409,7 @@ def test_run_sync_consumers_isolates_exceptions():
     rs = _req_states([5], [5], {"d": 0})
     consumer = _RecordingConsumer(raises=True)
     glue = _SyncGlue(rs, [("probe", consumer)], {}, [])
-    sched = SimpleNamespace(
-        num_scheduled_tokens={"d": 1}, total_num_scheduled_tokens=1
-    )
+    sched = SimpleNamespace(num_scheduled_tokens={"d": 1}, total_num_scheduled_tokens=1)
     ib = SimpleNamespace(
         num_tokens=1,
         num_reqs=1,
@@ -454,9 +457,7 @@ def test_warmup_kernels_flags_execute_model_as_warmup(monkeypatch):
             ],
             num_blocks=100,
         ),
-        scheduler_config=SimpleNamespace(
-            max_num_seqs=1, max_num_batched_tokens=8
-        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=8),
         is_pooling_model=True,  # skips sampler/decode/grammar branches
         is_last_pp_rank=True,
         kv_connector=SimpleNamespace(set_disabled=lambda _disabled: None),
@@ -497,6 +498,18 @@ def test_capture_add_missing_conversation_id_is_none():
     glue = _AddGlue(gate, mgr)
 
     glue._capture_add_request(_new_req("a", {"c": {}}), was_present=False)
+
+    assert glue._sync_conversation_ids == {"a": None}
+
+
+def test_capture_add_no_request_metadata_is_none():
+    # Offline / non-OpenAI path: request_metadata is None entirely.
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _AddGlue(gate, mgr)
+
+    glue._capture_add_request(
+        _new_req("a", {"c": {}}, request_metadata=None), was_present=False
+    )
 
     assert glue._sync_conversation_ids == {"a": None}
 

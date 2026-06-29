@@ -72,6 +72,7 @@ def _engine_core_request(request_id: str, external_req_id: str | None):
         reasoning_ended=None,
         reasoning_parser_kwargs=None,
         abort_immediately=False,
+        request_metadata=None,
     )
 
 

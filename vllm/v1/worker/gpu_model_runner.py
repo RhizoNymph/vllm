@@ -559,7 +559,7 @@ class GPUModelRunner(
         self._sync_capture_buffers: Any = None
         self._sync_monitor_keys: list[tuple[int, str]] = []
         self._sync_consumer_stats: dict[str, dict[str, Any]] = {}
-        # req_id -> client conversation id (``SamplingParams.conversation_id``),
+        # req_id -> client conversation id (``RequestMetadata.conversation_id``),
         # surfaced on the per-step ``StepRequestView`` so a sync consumer can
         # latch a steering decision across the turns of one conversation.
         self._sync_conversation_ids: dict[str, str | None] = {}
@@ -1533,10 +1533,9 @@ class GPUModelRunner(
                 decode_steering_config_hash=(new_req_data.decode_steering_config_hash),
             )
             self.requests[req_id] = req_state
+            rmeta = new_req_data.request_metadata
             self._sync_conversation_ids[req_id] = (
-                sampling_params.conversation_id
-                if sampling_params is not None
-                else None
+                rmeta.conversation_id if rmeta is not None else None
             )
             self.late_interaction_runner.register_request(req_id, pooling_params)
 

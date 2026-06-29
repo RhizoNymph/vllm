@@ -53,7 +53,7 @@ class StepRequestView:
     # of the batch's CPU token table — safe to retain across steps.
     token_ids: np.ndarray
     # Optional client-supplied conversation grouping id
-    # (``SamplingParams.conversation_id``). Pure host-side string metadata
+    # (``RequestMetadata.conversation_id``). Pure host-side string metadata
     # (no GPU work / D2H), so it is populated identically on the v1 and v2
     # runners — unlike ``token_ids``, which is empty on v2. Lets a sync
     # consumer correlate successive requests of the same conversation (e.g.

@@ -18,6 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.capture.types import CaptureResult
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.request_metadata import RequestMetadata
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -125,6 +126,12 @@ class EngineCoreRequest(
     # to the request_id field, see InputProcessor.assign_request_id().
     # Used in outputs and to support abort(req_id, internal=False).
     external_req_id: str | None = None
+
+    # Request-level host-side metadata (conversation id, and future
+    # declarative steering specs). Distinct from sampling parameters: it does
+    # not influence sampling, so it rides here alongside ``external_req_id``
+    # rather than on ``SamplingParams``. ``None`` when the request set none.
+    request_metadata: RequestMetadata | None = None
 
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None

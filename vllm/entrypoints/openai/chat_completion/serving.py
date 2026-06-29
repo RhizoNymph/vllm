@@ -521,6 +521,7 @@ class OpenAIServingChat(OpenAIServing):
                     }
                     if parser is not None and parser.reasoning_parser is not None
                     else None,
+                    request_metadata=request.to_request_metadata(),
                 )
 
             generators.append(generator)

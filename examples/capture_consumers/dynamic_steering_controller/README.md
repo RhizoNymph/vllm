@@ -145,7 +145,7 @@ each emit exactly one kind of action (or use one transport):
 | `steering_ex_monitor_tier` | sync | `SteeringMonitorUpdate` (in-graph per-token gate on the tier) |
 | `steering_ex_monitor_rowgate` | sync | `SteeringMonitorUpdate(gate_rows=True)` (in-graph per-token gate on per-request rows) |
 | `steering_ex_async_tier` | async | `SteeringVectorUpdate` via the action queue (`on_capture` fires at request finalize, so it steers a *subsequent* request) |
-| `steering_ex_conversation_latch` | sync | `RequestSteeringOverride` latched per `conversation_id` — once a probe trigger fires, later turns of the same conversation are steered via the bridge (requires `SamplingParams.conversation_id`) |
+| `steering_ex_conversation_latch` | sync | `RequestSteeringOverride` latched per `conversation_id` — once a probe trigger fires, later turns of the same conversation are steered via the bridge (requires the request's `conversation_id` field) |
 
 Other reachable targets via the same actions: `SteeringScaleUpdate()` with
 no field set scales the global decode row; `config_hash=` scales a static

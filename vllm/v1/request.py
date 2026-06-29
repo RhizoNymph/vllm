@@ -22,6 +22,7 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.metrics.stats import PrefillStats
+from vllm.v1.request_metadata import RequestMetadata
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
@@ -79,6 +80,7 @@ class Request:
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
         external_req_id: str | None = None,
+        request_metadata: RequestMetadata | None = None,
     ) -> None:
         self.request_id = request_id
         # The original client-supplied request id (the id the API returned).
@@ -88,6 +90,10 @@ class Request:
         # Optional/None-safe: equals the internal id when randomization is
         # off, and is unset for synthetically constructed requests.
         self.external_req_id = external_req_id
+        # Request-level host-side metadata (conversation id, future steering
+        # specs). Carries the full struct so new sibling fields flow to the
+        # worker without further plumbing. ``None`` when the request set none.
+        self.request_metadata = request_metadata
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -214,6 +220,7 @@ class Request:
         return cls(
             request_id=request.request_id,
             external_req_id=request.external_req_id,
+            request_metadata=request.request_metadata,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,

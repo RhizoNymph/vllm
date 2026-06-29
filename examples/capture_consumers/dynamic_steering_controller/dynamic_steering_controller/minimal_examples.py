@@ -296,8 +296,9 @@ class ConversationLatchExample:
     conversation, every later decode step — **including subsequent requests of
     the same conversation** — is steered the same ``particular way``.
 
-    Requires the client to tag requests with ``SamplingParams.conversation_id``
-    (surfaced on :attr:`StepRequestView.conversation_id`). It is a pure
+    Requires the client to tag requests with the ``conversation_id`` request
+    field (carried as request metadata, surfaced on
+    :attr:`StepRequestView.conversation_id`). It is a pure
     host-side sync consumer (no kernels): it reads the residual to detect the
     trigger and emits a sticky :class:`RequestSteeringOverride` that routes the
     request's decode tokens to a dynamic-pool row holding

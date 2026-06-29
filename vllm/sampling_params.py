@@ -415,18 +415,6 @@ class SamplingParams(
     serve. Set by ``_admit_capture`` alongside ``capture_store_hook_layers``.
     Not client-settable."""
 
-    conversation_id: str | None = None
-    """Optional client-supplied conversation grouping id.
-
-    Pure host-side string metadata: it is threaded to the worker's
-    per-request bookkeeping and surfaced on
-    :class:`vllm.v1.capture.step_view.StepRequestView.conversation_id` so a
-    sync capture/steering consumer can correlate successive requests of the
-    same conversation (e.g. latch a steering decision after a trigger fires
-    and re-apply it to later turns). Unlike token ids it costs no GPU work or
-    D2H, so it is populated identically on the v1 and v2 runners. ``None`` for
-    requests that do not opt in (existing consumers/tests are unaffected)."""
-
     steering_vectors: SteeringVectorSpec | None = None
     """Base steering vectors applied to both prefill and decode phases.
     Keyed by hook point name (pre_attn, post_attn, post_block), then
@@ -522,7 +510,6 @@ class SamplingParams(
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
         capture: dict[str, Any] | None = None,
-        conversation_id: str | None = None,
         steering_vectors: SteeringVectorSpec | None = None,
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
@@ -569,7 +556,6 @@ class SamplingParams(
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
             capture=capture,
-            conversation_id=conversation_id,
             steering_vectors=steering_vectors,
             prefill_steering_vectors=prefill_steering_vectors,
             decode_steering_vectors=decode_steering_vectors,

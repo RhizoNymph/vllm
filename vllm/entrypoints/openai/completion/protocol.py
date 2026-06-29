@@ -41,6 +41,7 @@ from vllm.sampling_params import (
     ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
+from vllm.v1.request_metadata import RequestMetadata
 
 logger = init_logger(__name__)
 
@@ -249,7 +250,8 @@ class CompletionRequest(OpenAIBaseModel):
 
     conversation_id: str | None = Field(
         default=None,
-        description="Opaque client conversation/session id. Surfaced to "
+        description="Opaque client conversation/session id. Carried as "
+        "request metadata (not a sampling parameter) and surfaced to "
         "worker-side capture consumers via StepRequestView.conversation_id so a "
         "dynamic-steering consumer can apply per-conversation (e.g. latched) "
         "steering across the requests of one conversation.",
@@ -416,11 +418,19 @@ class CompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
-            conversation_id=self.conversation_id,
         )
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)
         return sampling_params
+
+    def to_request_metadata(self) -> RequestMetadata:
+        """Build the request-level metadata channel for this request.
+
+        Holds host-side per-request fields that are not sampling parameters
+        (currently the conversation id); threaded to the worker alongside the
+        client request id rather than on ``SamplingParams``.
+        """
+        return RequestMetadata(conversation_id=self.conversation_id)
 
     @model_validator(mode="before")
     @classmethod

@@ -103,9 +103,9 @@ class CaptureRunnerMixin:
         self._sync_consumer_stats = {}
         self._sync_step_counter = 0
         self._sync_timing_events = None
-        # req_id -> client conversation id (``SamplingParams.conversation_id``).
-        # RequestState drops sampling_params, so the conversation id is stashed
-        # here at admission and read back when building the per-step view.
+        # req_id -> client conversation id
+        # (``RequestMetadata.conversation_id``). Stashed here at admission from
+        # the request metadata and read back when building the per-step view.
         self._sync_conversation_ids: dict[str, str | None] = {}
 
         cc_config = self.vllm_config.capture_consumers_config
@@ -297,9 +297,9 @@ class CaptureRunnerMixin:
         req_id = new_req_data.req_id
         # Stash the conversation id for the per-step view (host-side metadata,
         # survives the streaming re-add / preemption-resume branches below).
-        sp_new = new_req_data.sampling_params
-        self._sync_conversation_ids[req_id] = getattr(
-            sp_new, "conversation_id", None
+        rmeta = new_req_data.request_metadata
+        self._sync_conversation_ids[req_id] = (
+            rmeta.conversation_id if rmeta is not None else None
         )
         mgr = self._capture_manager
         if was_present:
