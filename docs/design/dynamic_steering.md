@@ -495,6 +495,50 @@ populate time instead). Two implementations, by phase:
   disable; a hard kill is itself a rank-divergence hazard unless its
   trigger is rank-replicated).
 
+### 5.6 Consumer-contract ABC and the controller base
+
+The sync-consumer contract — `on_step`, `global_capture_spec`, the fixed
+`location="worker"` / `execution="sync"` / `reads_client_spec=False`
+metadata, and the `declared_graphsafe_keys(cls, params) -> list` classmethod
+the capture registry calls at config-build time — is encoded as an `abc.ABC`,
+`SyncCaptureConsumer` (`vllm/v1/capture/consumer.py`). It is a sibling of
+`CaptureConsumer`, not a subclass: a sync consumer never implements
+`on_capture`. `declared_graphsafe_keys` ships a `[]` default so a sync
+consumer is never forced to override it (a missing one used to crash deep in
+`resolve_graphsafe_shorthands` with a cryptic `AttributeError`, never in a
+unit test); `on_step` and `global_capture_spec` are `@abstractmethod`, so an
+incomplete consumer fails with a clear `TypeError` at construction instead.
+
+`SteeringController` (`vllm/v1/capture/controller.py`) is a higher-level ABC
+**on top of** `SyncCaptureConsumer` that owns the bookkeeping every dynamic
+consumer otherwise re-writes by hand, leaving the subclass a single policy
+method:
+
+```python
+def decide(self, request_view, residual) -> SteeringAction | None: ...
+```
+
+The base implements `on_step` in terms of `decide` and owns:
+
+- **per-request lifecycle** — tracks the live request ids each step and
+  prunes per-request `armed` state to the live set (state for finished /
+  preempted requests is dropped automatically);
+- **conversation scoping** — keys decisions on
+  `StepRequestView.conversation_id`, skipping untagged and prefill rows, with
+  a bounded (FIFO-evicted) `conversation_id -> sticky-override` map;
+- **the latch pattern** — a `RequestSteeringOverride` returned by `decide`
+  (the *trigger*) is latched onto the conversation and applied to the firing
+  request; every later request of that conversation is *bridged* (overridden
+  with the same vectors, no re-trigger).
+
+The base resolves the single monitored `(layer, hook)` from the subclass's
+`global_capture_spec()` and hands `decide` the firing request's residual
+window. `decide` reuses the existing action vocabulary
+(`RequestSteeringOverride`, `SteeringVectorUpdate`, …) — no new actions.
+`ConversationLatchExample` (the example plugin) is the proof: it subclasses
+`SteeringController` and collapses to just the probe projection + threshold
+decision in `decide`, with all latch/bridge/prune/scope plumbing inherited.
+
 ## 6. Distributed execution (the determinism problem)
 
 This is the design's sharpest constraint, and where the earlier sketch
