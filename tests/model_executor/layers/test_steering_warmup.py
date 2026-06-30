@@ -151,9 +151,29 @@ class TestWarmupCUDA:
             mparams = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=device)
             mactive = torch.zeros(1, dtype=torch.bool, device=device)
             dmask = torch.zeros(n, dtype=torch.float32, device=device)
+            rprobe = torch.zeros(8, 128, dtype=torch.float32, device=device)
+            rparams = (
+                torch.tensor([-1.0e30, 1.0], dtype=torch.float32, device=device)
+                .expand(8, 2)
+                .clone()
+            )
+            ractive = torch.zeros(1, dtype=torch.bool, device=device)
             torch.ops.vllm.apply_steering(
-                hidden, table, index, active, scales, dvec, tscale, rgate,
-                probe, mparams, mactive, dmask,
+                hidden,
+                table,
+                index,
+                active,
+                scales,
+                dvec,
+                tscale,
+                rgate,
+                probe,
+                mparams,
+                mactive,
+                dmask,
+                rprobe,
+                rparams,
+                ractive,
             )
 
         torch.accelerator.synchronize()

@@ -89,6 +89,33 @@ HOOK_POINT_MONITOR_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
     for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
 }
 
+# Per-hook PER-ROW monitor buffers (per-request in-graph monitor). Unlike the
+# single global probe above, these hold one probe + ``[threshold, sharpness]``
+# PER TABLE ROW, so each request's row is gated by its OWN probe condition
+# (``gate = sigmoid(sharpness*(residual@probe[row] - threshold[row]))``). The
+# kernel gathers ``probe_table[row]`` like it gathers ``table[row]`` and folds
+# the gate into the row term only (decode-only). Opt-in: the buffers are
+# registered at a ``(1, 1)`` dummy size and resized to ``(rows, hidden)`` by
+# :func:`resize_steering_row_monitor_buffers` only when the engine enables the
+# row monitor — so the op signature stays stable without per-model edits.
+HOOK_POINT_ROW_PROBE_ATTR: dict[SteeringHookPoint, str] = {
+    hp: f"{table_attr}_monitor_probe_table"
+    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
+}
+HOOK_POINT_ROW_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
+    hp: f"{table_attr}_monitor_row_params"
+    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
+}
+HOOK_POINT_ROW_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
+    hp: f"{table_attr}_monitor_row_active"
+    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
+}
+
+# Default per-row monitor params: threshold -1e30, sharpness 1.0. With a
+# default-zero probe this gives ``sigmoid(1*(0 - (-1e30))) == 1.0`` exactly, so
+# an unconfigured row passes through ungated with no extra branch.
+_ROW_MONITOR_DEFAULT_PARAMS: tuple[float, float] = (-1.0e30, 1.0)
+
 # Valid hook point string values for validation.
 VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHookPoint)
 
@@ -172,6 +199,29 @@ def register_steering_buffers(
         )
         module.register_buffer(
             HOOK_POINT_MONITOR_ACTIVE_ATTR[hp],
+            torch.zeros(1, dtype=torch.bool),
+            persistent=False,
+        )
+        # Per-row monitor buffers (per-request in-graph monitor). Registered
+        # at a ``(1, 1)`` / ``(1, 2)`` dummy size so the ``apply_steering`` op
+        # signature is always present without touching the ~70 model files.
+        # When the engine enables the row monitor, the runner resizes these to
+        # ``(max_steering_configs + 3, hidden)`` / ``(rows, 2)`` once across all
+        # layers via :func:`resize_steering_row_monitor_buffers`. The active
+        # flag is never set while the buffers are dummies, so the kernel/eager
+        # per-row block (guarded by this flag) never indexes them.
+        module.register_buffer(
+            HOOK_POINT_ROW_PROBE_ATTR[hp],
+            torch.zeros(1, 1, dtype=torch.float32),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_ROW_PARAMS_ATTR[hp],
+            torch.tensor([list(_ROW_MONITOR_DEFAULT_PARAMS)], dtype=torch.float32),
+            persistent=False,
+        )
+        module.register_buffer(
+            HOOK_POINT_ROW_ACTIVE_ATTR[hp],
             torch.zeros(1, dtype=torch.bool),
             persistent=False,
         )
@@ -338,6 +388,47 @@ def share_steering_decode_mask_across_layers(layers) -> None:
         layer.steering_decode_mask = shared
 
 
+def resize_steering_row_monitor_buffers(layers, *, enable: bool) -> None:
+    """Size up the per-row monitor probe/params buffers when enabled.
+
+    :func:`register_steering_buffers` always registers ``(1, 1)`` / ``(1, 2)``
+    dummies so the ``apply_steering`` op signature is stable without touching
+    every model file. When the engine sets ``enable_row_monitor``, this
+    replaces them with full ``(rows, hidden)`` probe tables and ``(rows, 2)``
+    param tables (default ``[-1e30, 1.0]`` ⇒ ungated pass-through) on every
+    steerable layer/hook — called once from the runner's steering init, the
+    single site with all layers in hand (mirrors the ``share_*`` helpers).
+    Per-(layer, hook) so a row configured at one site never imposes its
+    threshold on the same row index at another site where the probe is zero.
+    """
+    if not enable:
+        return
+    for layer in layers:
+        for hp in SteeringHookPoint:
+            table = getattr(layer, HOOK_POINT_TABLE_ATTR[hp], None)
+            if table is None:
+                continue
+            rows, hidden = int(table.shape[0]), int(table.shape[1])
+            probe_attr = HOOK_POINT_ROW_PROBE_ATTR[hp]
+            existing = getattr(layer, probe_attr, None)
+            if existing is None or tuple(existing.shape) == (rows, hidden):
+                continue
+            dev = existing.device
+            setattr(
+                layer,
+                probe_attr,
+                torch.zeros(rows, hidden, dtype=torch.float32, device=dev),
+            )
+            thr, sharp = _ROW_MONITOR_DEFAULT_PARAMS
+            setattr(
+                layer,
+                HOOK_POINT_ROW_PARAMS_ATTR[hp],
+                torch.tensor([thr, sharp], dtype=torch.float32, device=dev)
+                .expand(rows, 2)
+                .clone(),
+            )
+
+
 def _emit_steering_op(
     module: nn.Module,
     x: torch.Tensor,
@@ -398,6 +489,9 @@ def _emit_steering_op(
         getattr(module, HOOK_POINT_MONITOR_PARAMS_ATTR[hook_point]),
         fused_active,
         module.steering_decode_mask,
+        getattr(module, HOOK_POINT_ROW_PROBE_ATTR[hook_point]),
+        getattr(module, HOOK_POINT_ROW_PARAMS_ATTR[hook_point]),
+        getattr(module, HOOK_POINT_ROW_ACTIVE_ATTR[hook_point]),
     )
 
 
@@ -486,9 +580,22 @@ def apply_steering(
     steering_monitor_params: torch.Tensor,
     steering_monitor_active: torch.Tensor,
     steering_decode_mask: torch.Tensor,
+    steering_monitor_probe_table: torch.Tensor,
+    steering_monitor_row_params: torch.Tensor,
+    steering_monitor_row_active: torch.Tensor,
 ) -> torch.Tensor:
     """Apply per-request activation steering via indexed gather, with the
     in-graph monitor gate fused in (non-mutating, same-hook).
+
+    ``steering_monitor_probe_table`` / ``steering_monitor_row_params`` /
+    ``steering_monitor_row_active`` are the **per-request** (per-row) monitor:
+    when ``row_active`` is set, the gate that scales the row term is computed
+    from each token's own row's probe (``probe_table[row]``) and params
+    (``row_params[row] = [threshold, sharpness]``), so concurrent requests at a
+    site can carry DIFFERENT probes — unlike the single global
+    ``steering_monitor_probe`` above. Decode-only via ``steering_decode_mask``
+    (prefill rows stay ungated); orthogonal to and composes with the global
+    monitor. Opt-in: ``(1, 1)`` dummy buffers + a never-set flag when disabled.
 
     Two additive terms: the per-row gather
     ``table[index[i]] * scales[index[i]] * row_gate[i]`` plus the
@@ -569,6 +676,9 @@ def apply_steering(
             steering_monitor_params,
             steering_monitor_active,
             steering_decode_mask,
+            steering_monitor_probe_table,
+            steering_monitor_row_params,
+            steering_monitor_row_active,
         )
     # CPU eager: short-circuit on the host so we don't even materialize
     # the gather. ``.item()`` synchronizes against the device producer
@@ -597,6 +707,18 @@ def apply_steering(
         if bool(gate_rows.item() != 0.0):
             dm = steering_decode_mask[:n]
             rgate_t = rgate_t * (dm * gate + (1.0 - dm))
+    # Per-row (per-request) monitor: gate each token's row term by ITS OWN
+    # row's probe + params, decode-only. Orthogonal to the global monitor
+    # above (both multiply into rgate_t). Guarded by the row-active flag so an
+    # unconfigured site (incl. the (1,1) dummy buffers) never indexes them.
+    if bool(steering_monitor_row_active.item()):
+        pr = steering_monitor_probe_table[rows].to(torch.float32)
+        rscore = (hidden_states.to(torch.float32) * pr).sum(dim=1)
+        rthr = steering_monitor_row_params[rows, 0]
+        rsharp = steering_monitor_row_params[rows, 1]
+        rgate = torch.sigmoid(rsharp * (rscore - rthr))
+        dm = steering_decode_mask[:n]
+        rgate_t = rgate_t * (dm * rgate + (1.0 - dm))
     # Per-row scale (fp32, default 1.0) × per-token row gate (default 1.0);
     # both broadcast over hidden dim. The row gate keeps prefill rows at
     # full strength (1.0) and lets the monitor gate decode rows per token.
@@ -621,6 +743,9 @@ def apply_steering_fake(
     steering_monitor_params: torch.Tensor,
     steering_monitor_active: torch.Tensor,
     steering_decode_mask: torch.Tensor,
+    steering_monitor_probe_table: torch.Tensor,
+    steering_monitor_row_params: torch.Tensor,
+    steering_monitor_row_active: torch.Tensor,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)

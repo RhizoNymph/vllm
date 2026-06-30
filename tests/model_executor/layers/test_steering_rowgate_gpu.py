@@ -50,9 +50,29 @@ def test_kernel_row_gate_matches_eager(dtype, n):
     mparams = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=dev)
     mactive = torch.zeros(1, dtype=torch.bool, device=dev)  # monitor off
     dmask = torch.zeros(n, dtype=torch.float32, device=dev)
+    rprobe = torch.zeros(9, H, dtype=torch.float32, device=dev)
+    rparams = (
+        torch.tensor([-1.0e30, 1.0], dtype=torch.float32, device=dev)
+        .expand(9, 2)
+        .clone()
+    )
+    ractive = torch.zeros(1, dtype=torch.bool, device=dev)  # row monitor off
     out = torch.ops.vllm.apply_steering(
-        hidden, table, index, any_active, scales, dvec, tscale, rgate,
-        probe, mparams, mactive, dmask,
+        hidden,
+        table,
+        index,
+        any_active,
+        scales,
+        dvec,
+        tscale,
+        rgate,
+        probe,
+        mparams,
+        mactive,
+        dmask,
+        rprobe,
+        rparams,
+        ractive,
     )
     exp = _eager(hidden, table, index, scales, dvec, tscale, rgate)
     rel = (out.to(torch.float32) - exp).abs().max() / (exp.abs().max() + 1e-6)
@@ -63,25 +83,25 @@ def test_monitor_gate_rows_decode_only():
     dev = torch.device("cuda")
     n = 4
     probe = torch.ones(H, dtype=torch.float32, device=dev)
-    hidden = torch.stack([
-        torch.full((H,), 1.0),    # decode, engaged
-        torch.full((H,), 1.0),    # prefill (mask 0) — must stay 1.0
-        torch.full((H,), -1.0),   # decode, disengaged
-        torch.full((H,), -1.0),   # prefill (mask 0) — must stay 1.0
-    ]).to(dtype=torch.bfloat16, device=dev)
+    hidden = torch.stack(
+        [
+            torch.full((H,), 1.0),  # decode, engaged
+            torch.full((H,), 1.0),  # prefill (mask 0) — must stay 1.0
+            torch.full((H,), -1.0),  # decode, disengaged
+            torch.full((H,), -1.0),  # prefill (mask 0) — must stay 1.0
+        ]
+    ).to(dtype=torch.bfloat16, device=dev)
     params = torch.tensor([0.0, 50.0, 1.0], dtype=torch.float32, device=dev)
     active = torch.ones(1, dtype=torch.bool, device=dev)
     tscale = torch.zeros(n, dtype=torch.float32, device=dev)
     dmask = torch.tensor([1.0, 0.0, 1.0, 0.0], dtype=torch.float32, device=dev)
     rgate = torch.ones(n, dtype=torch.float32, device=dev)
-    torch.ops.vllm.steering_monitor(
-        hidden, probe, params, active, tscale, dmask, rgate
-    )
+    torch.ops.vllm.steering_monitor(hidden, probe, params, active, tscale, dmask, rgate)
     rg = rgate.cpu()
-    assert rg[0] > 0.99            # decode engaged
-    assert rg[1].item() == 1.0     # prefill never gated
-    assert rg[2] < 0.01            # decode disengaged
-    assert rg[3].item() == 1.0     # prefill never gated
+    assert rg[0] > 0.99  # decode engaged
+    assert rg[1].item() == 1.0  # prefill never gated
+    assert rg[2] < 0.01  # decode disengaged
+    assert rg[3].item() == 1.0  # prefill never gated
 
 
 if __name__ == "__main__":

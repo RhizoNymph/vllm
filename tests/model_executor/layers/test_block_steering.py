@@ -70,9 +70,7 @@ def test_block_capture_anchors_on_live_summands(monkeypatch):
     """
     seen: list[tuple[torch.Tensor, torch.Tensor, int, str]] = []
 
-    monkeypatch.setattr(
-        cap_mod, "get_active_capture_manager", lambda: object()
-    )
+    monkeypatch.setattr(cap_mod, "get_active_capture_manager", lambda: object())
     monkeypatch.setattr(
         steering_mod,
         "maybe_capture_residual_add",
@@ -225,13 +223,13 @@ def test_block_steering_routes_through_shared_emit(monkeypatch):
 
 
 def test_apply_steering_op_schema_has_full_arity():
-    """The registered op carries the full 12-arg dynamic signature; both
-    entry points build a call of this arity via ``_emit_steering_op``. Guards
-    the op side of the same regression."""
+    """The registered op carries the full 15-arg dynamic signature (12 base +
+    3 per-row monitor args); both entry points build a call of this arity via
+    ``_emit_steering_op``. Guards the op side of the same regression."""
     import vllm.model_executor.layers.steering  # noqa: F401  registers the op
 
     schema = torch.ops.vllm.apply_steering.default._schema
-    assert len(schema.arguments) == 12, (
+    assert len(schema.arguments) == 15, (
         f"apply_steering op has {len(schema.arguments)} args; "
         "callers in _emit_steering_op must match exactly"
     )
