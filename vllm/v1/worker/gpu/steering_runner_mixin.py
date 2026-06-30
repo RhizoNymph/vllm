@@ -37,6 +37,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
     HOOK_POINT_MONITOR_ACTIVE_ATTR,
+    HOOK_POINT_ROW_ACTIVE_ATTR,
     SteeringHookPoint,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
@@ -268,6 +269,7 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
             and not mgr.has_dynamic
             and not mgr.has_dynamic_tier
             and not mgr.has_monitor
+            and not mgr.has_row_monitor
             and not mgr.global_base_vectors
             and not mgr.global_prefill_vectors
             and not mgr.global_decode_vectors
@@ -297,6 +299,9 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
                         mon_buf = getattr(mod, HOOK_POINT_MONITOR_ACTIVE_ATTR[hp], None)
                         if mon_buf is not None:
                             mon_buf.zero_()
+                        row_buf = getattr(mod, HOOK_POINT_ROW_ACTIVE_ATTR[hp], None)
+                        if row_buf is not None:
+                            row_buf.zero_()
                 self._steering_index_dirty = False
             # Nothing dynamic is active; revert any request still reported as
             # dynamically steered back to its admitted decode key.
@@ -424,12 +429,8 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
                 token_scales_pinned.shape[0],
                 token_scales.shape[0],
             )
-            token_scales_pinned[:n_gate].copy_(
-                torch.from_numpy(gate_expanded[:n_gate])
-            )
-            token_scales[:n_gate].copy_(
-                token_scales_pinned[:n_gate], non_blocking=True
-            )
+            token_scales_pinned[:n_gate].copy_(torch.from_numpy(gate_expanded[:n_gate]))
+            token_scales[:n_gate].copy_(token_scales_pinned[:n_gate], non_blocking=True)
         else:
             n_gate = 0
         if n_gate < token_scales.shape[0]:
@@ -453,12 +454,8 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
                 decode_mask_pinned.shape[0],
                 decode_mask.shape[0],
             )
-            decode_mask_pinned[:n_mask].copy_(
-                torch.from_numpy(mask_expanded[:n_mask])
-            )
-            decode_mask[:n_mask].copy_(
-                decode_mask_pinned[:n_mask], non_blocking=True
-            )
+            decode_mask_pinned[:n_mask].copy_(torch.from_numpy(mask_expanded[:n_mask]))
+            decode_mask[:n_mask].copy_(decode_mask_pinned[:n_mask], non_blocking=True)
         else:
             n_mask = 0
         if n_mask < decode_mask.shape[0]:
@@ -522,9 +519,7 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
 
         # Drop reported state for requests no longer in the decode batch.
         if self._req_decode_sig_reported:
-            for rid in [
-                r for r in self._req_decode_sig_reported if r not in seen
-            ]:
+            for rid in [r for r in self._req_decode_sig_reported if r not in seen]:
                 self._req_decode_sig_reported.pop(rid, None)
         return deltas
 
@@ -558,8 +553,7 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
             return _reject("steering is not initialized on this worker")
         if mgr.max_dynamic_steering_configs <= 0:
             return _reject(
-                "dynamic override pool is disabled "
-                "(max_dynamic_steering_configs=0)"
+                "dynamic override pool is disabled (max_dynamic_steering_configs=0)"
             )
 
         existing_dyn_id = self._req_dynamic_decode.get(req_id)

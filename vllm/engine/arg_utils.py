@@ -598,6 +598,7 @@ class EngineArgs:
     max_steering_configs: int = SteeringConfig.max_steering_configs
     max_dynamic_steering_configs: int = SteeringConfig.max_dynamic_steering_configs
     enable_cross_layer_monitor: bool = SteeringConfig.enable_cross_layer_monitor
+    enable_row_monitor: bool = SteeringConfig.enable_row_monitor
 
     # --capture-consumers is repeatable (action="append"); when unset the
     # whole capture-consumer pipeline stays disabled.
@@ -1468,6 +1469,10 @@ class EngineArgs:
             "--enable-cross-layer-monitor",
             **steering_kwargs["enable_cross_layer_monitor"],
         )
+        steering_group.add_argument(
+            "--enable-row-monitor",
+            **steering_kwargs["enable_row_monitor"],
+        )
 
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
@@ -2199,6 +2204,7 @@ class EngineArgs:
                 max_steering_configs=self.max_steering_configs,
                 max_dynamic_steering_configs=self.max_dynamic_steering_configs,
                 enable_cross_layer_monitor=self.enable_cross_layer_monitor,
+                enable_row_monitor=self.enable_row_monitor,
             )
             if self.enable_steering
             else None

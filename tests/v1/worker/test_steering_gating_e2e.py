@@ -61,7 +61,7 @@ def _common_prefix_len(a: list[int], b: list[int]) -> int:
     return n
 
 
-def _build_llm(params: dict):
+def _build_llm(params: dict, *, enable_row_monitor: bool = False):
     from vllm import LLM
 
     kwargs: dict = dict(
@@ -74,15 +74,19 @@ def _build_llm(params: dict):
         seed=0,
         capture_consumers=[{"name": "dynamic_steering_e2e_cfg", "params": params}],
     )
+    if enable_row_monitor:
+        kwargs["enable_row_monitor"] = True
     if not IS_LOCAL:
         kwargs["load_format"] = "dummy"
     return LLM(**kwargs)
 
 
-def _two_outputs(params: dict) -> tuple[list[int], list[int]]:
+def _two_outputs(
+    params: dict, *, enable_row_monitor: bool = False
+) -> tuple[list[int], list[int]]:
     from vllm import SamplingParams
 
-    llm = _build_llm(params)
+    llm = _build_llm(params, enable_row_monitor=enable_row_monitor)
     try:
         sp = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0, seed=0)
         outs = llm.generate([PROMPT, PROMPT], sp)
@@ -91,8 +95,12 @@ def _two_outputs(params: dict) -> tuple[list[int], list[int]]:
         del llm
 
 
-_BASE = {"steer_layer": LAYER, "steer_hook": "post_block", "steer_norm": 24.0,
-         "emit_after_steps": 1}
+_BASE = {
+    "steer_layer": LAYER,
+    "steer_hook": "post_block",
+    "steer_norm": 24.0,
+    "emit_after_steps": 1,
+}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -142,6 +150,40 @@ def test_req_id_scale_modulates_override_row():
     print(f"[no scale] first_diff={o_diff} a={o_a}\n           b={o_b}")
     assert o_a != o_b and 1 <= o_diff <= NOISE_FLOOR, (
         f"unscaled override did not steer early: first_diff={o_diff}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.skipif(
+    IS_LOCAL and not os.path.exists(MODEL),
+    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
+)
+def test_per_row_monitor_gates_per_request_row():
+    """The PER-ROW monitor (``SteeringMonitorUpdate(req_id=...)``,
+    ``enable_row_monitor``) gates ONLY the target's override row by its own
+    probe. Gate ON ⇒ the target's add is applied (early divergence from the
+    in-batch control); gate OFF ⇒ the add is suppressed (target tracks the
+    control to the noise floor). The control request, having no per-row
+    monitor, is unaffected either way — isolating the per-request probe."""
+    on_a, on_b = _two_outputs(
+        {**_BASE, "mode": "perrow", "gate_on": True}, enable_row_monitor=True
+    )
+    on_diff = _common_prefix_len(on_a, on_b)
+    print(f"[perrow ON]  first_diff={on_diff} a={on_a}\n             b={on_b}")
+    assert on_a != on_b, "per-row gate ON steered neither/both — row never applied"
+    assert 1 <= on_diff <= NOISE_FLOOR, (
+        f"per-row gate ON: expected early steered divergence in "
+        f"[1,{NOISE_FLOOR}], got {on_diff}"
+    )
+
+    off_a, off_b = _two_outputs(
+        {**_BASE, "mode": "perrow", "gate_on": False}, enable_row_monitor=True
+    )
+    off_diff = _common_prefix_len(off_a, off_b)
+    print(f"[perrow OFF] first_diff={off_diff} a={off_a}\n             b={off_b}")
+    assert off_diff > NOISE_FLOOR, (
+        f"per-row gate OFF: row not suppressed — target diverged at "
+        f"{off_diff} (expected > {NOISE_FLOOR}, i.e. unsteered-like)"
     )
 
 

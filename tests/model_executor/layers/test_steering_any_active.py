@@ -36,22 +36,32 @@ from vllm.model_executor.layers.steering import apply_steering as _real_apply_st
 
 
 def apply_steering(*args):
-    """Back-compat shim: the op gained 4 fused-monitor args
-    (probe, params, active, decode_mask). These any_active tests predate
-    the monitor and call with the original 8 args; default the monitor to
-    inactive so their assertions (no monitor gating) still hold."""
-    if len(args) == 12:
+    """Back-compat shim: the op gained 4 fused-monitor args (probe, params,
+    active, decode_mask) and later 3 per-row-monitor args (probe_table,
+    row_params, row_active). These any_active tests predate both and call with
+    the original 8 args; default every monitor to inactive so their assertions
+    (no monitor gating) still hold."""
+    if len(args) == 15:
         return _real_apply_steering(*args)
     hidden, table = args[0], args[1]
     n, h = hidden.shape[0], table.shape[1]
     dev = table.device
+    if len(args) == 8:
+        args = (
+            *args,
+            torch.zeros(h, device=dev),  # monitor probe
+            torch.tensor([0.0, 1.0, 0.0], device=dev),  # [thr, sharp, gate_rows]
+            torch.zeros(1, dtype=torch.bool, device=dev),  # monitor active (off)
+            torch.zeros(n, device=dev),  # decode mask
+        )
+    # args is now 12 (8 + fused monitor); pad the 3 per-row-monitor args (off).
     return _real_apply_steering(
         *args,
-        torch.zeros(h, device=dev),  # monitor probe
-        torch.tensor([0.0, 1.0, 0.0], device=dev),  # [threshold, sharp, gate_rows]
-        torch.zeros(1, dtype=torch.bool, device=dev),  # monitor active (off)
-        torch.zeros(n, device=dev),  # decode mask
+        torch.zeros(1, 1, device=dev),  # row probe table (dummy)
+        torch.tensor([[-1.0e30, 1.0]], device=dev),  # row params (dummy)
+        torch.zeros(1, dtype=torch.bool, device=dev),  # row active (off)
     )
+
 
 # ---------------------------------------------------------------------------
 # CPU eager path
@@ -292,8 +302,19 @@ class TestFusedMonitorCPU:
     mutating). These exercise the CPU eager path of that fused gate."""
 
     @staticmethod
-    def _ref(hidden, table, index, scales, dvec, tscale, rgate,
-             probe, params, dmask, monitor_on):
+    def _ref(
+        hidden,
+        table,
+        index,
+        scales,
+        dvec,
+        tscale,
+        rgate,
+        probe,
+        params,
+        dmask,
+        monitor_on,
+    ):
         ts, rg = tscale.clone(), rgate.clone()
         if monitor_on:
             g = torch.sigmoid(params[1] * (hidden @ probe - params[0]))
@@ -318,30 +339,61 @@ class TestFusedMonitorCPU:
         rgate = torch.ones(n)
         probe = torch.randn(h)
         out = _real_apply_steering(
-            hidden, table, index, any_active, scales, dvec, tscale, rgate,
-            probe, params, monitor_active, dmask,
+            hidden,
+            table,
+            index,
+            any_active,
+            scales,
+            dvec,
+            tscale,
+            rgate,
+            probe,
+            params,
+            monitor_active,
+            dmask,
+            torch.zeros(1, 1),  # row probe table (off)
+            torch.tensor([[-1.0e30, 1.0]]),  # row params (off)
+            torch.zeros(1, dtype=torch.bool),  # row active (off)
         )
-        exp = self._ref(hidden, table, index, scales, dvec, tscale, rgate,
-                        probe, params, dmask, bool(monitor_active.item()))
+        exp = self._ref(
+            hidden,
+            table,
+            index,
+            scales,
+            dvec,
+            tscale,
+            rgate,
+            probe,
+            params,
+            dmask,
+            bool(monitor_active.item()),
+        )
         torch.testing.assert_close(out, exp)
 
     def test_monitor_inactive_is_plain_steering(self):
         params = torch.tensor([0.0, 4.0, 1.0])
-        self._run(params, torch.zeros(1, dtype=torch.bool),
-                  torch.ones(4), gate_rows_expect=False)
+        self._run(
+            params,
+            torch.zeros(1, dtype=torch.bool),
+            torch.ones(4),
+            gate_rows_expect=False,
+        )
 
     def test_monitor_active_gates_tier_only(self):
         # gate_rows = 0 ⇒ only the tier (token_scales) is gated, not rows.
         params = torch.tensor([0.0, 4.0, 0.0])
-        self._run(params, torch.ones(1, dtype=torch.bool),
-                  torch.ones(4), gate_rows_expect=False)
+        self._run(
+            params,
+            torch.ones(1, dtype=torch.bool),
+            torch.ones(4),
+            gate_rows_expect=False,
+        )
 
     def test_monitor_active_gates_rows_decode_only(self):
         # gate_rows = 1 ⇒ rows gated for decode tokens (mask 1), prefill stays.
         params = torch.tensor([0.0, 4.0, 1.0])
         dmask = torch.tensor([1.0, 1.0, 0.0, 0.0])  # 2 decode, 2 prefill
-        self._run(params, torch.ones(1, dtype=torch.bool),
-                  dmask, gate_rows_expect=True)
+        self._run(params, torch.ones(1, dtype=torch.bool), dmask, gate_rows_expect=True)
 
 
 if __name__ == "__main__":

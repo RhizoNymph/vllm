@@ -49,6 +49,9 @@ def _apply_steering_kernel(
     mparams_ptr,
     mactive_ptr,
     dmask_ptr,
+    rprobe_ptr,
+    rparams_ptr,
+    ractive_ptr,
     out_ptr,
     N,
     H,
@@ -62,6 +65,9 @@ def _apply_steering_kernel(
     rg_stride_n,
     p_stride_h,
     dm_stride_n,
+    rp_stride_r,
+    rp_stride_h,
+    rpp_stride_r,
     o_stride_n,
     o_stride_h,
     BLOCK_H: tl.constexpr,
@@ -143,6 +149,28 @@ def _apply_steering_kernel(
             dm = tl.load(dmask_ptr + pid_n * dm_stride_n)
             rgate = rgate * (dm * gate + (1.0 - dm))
 
+    # Per-row (per-request) monitor: gate THIS token's row term by its own
+    # row's probe + params (probe_table[row], row_params[row]). Orthogonal to
+    # the global monitor above; decode-only. Skipped when inactive (incl. the
+    # (1,1) dummy buffers when the row monitor is disabled).
+    ractive = tl.load(ractive_ptr)
+    if ractive != 0:
+        racc = tl.zeros((), dtype=tl.float32)
+        rprobe_row_ptr = rprobe_ptr + row * rp_stride_r
+        for h_off in range(0, H, BLOCK_H):
+            h_idx = h_off + tl.arange(0, BLOCK_H)
+            mask = h_idx < H
+            h_vals = tl.load(hidden_row_ptr + h_idx * h_stride_h, mask=mask, other=0.0)
+            rp_vals = tl.load(
+                rprobe_row_ptr + h_idx * rp_stride_h, mask=mask, other=0.0
+            )
+            racc += tl.sum(h_vals.to(tl.float32) * rp_vals.to(tl.float32))
+        rthr = tl.load(rparams_ptr + row * rpp_stride_r + 0)
+        rsharp = tl.load(rparams_ptr + row * rpp_stride_r + 1)
+        rgval = tl.sigmoid(rsharp * (racc - rthr))
+        dm = tl.load(dmask_ptr + pid_n * dm_stride_n)
+        rgate = rgate * (dm * rgval + (1.0 - dm))
+
     for h_off in range(0, H, BLOCK_H):
         h_idx = h_off + tl.arange(0, BLOCK_H)
         mask = h_idx < H
@@ -153,9 +181,7 @@ def _apply_steering_kernel(
         # (fp32 table + bf16 hidden, common before PR 1 lands) work.
         result = (
             h_vals
-            + t_vals.to(h_vals.dtype)
-            * scale.to(h_vals.dtype)
-            * rgate.to(h_vals.dtype)
+            + t_vals.to(h_vals.dtype) * scale.to(h_vals.dtype) * rgate.to(h_vals.dtype)
             + d_vals.to(h_vals.dtype) * tscale.to(h_vals.dtype)
         )
         tl.store(out_row_ptr + h_idx * o_stride_h, result, mask=mask)
@@ -193,6 +219,9 @@ def apply_steering_triton(
     steering_monitor_params: torch.Tensor,
     steering_monitor_active: torch.Tensor,
     steering_decode_mask: torch.Tensor,
+    steering_monitor_probe_table: torch.Tensor,
+    steering_monitor_row_params: torch.Tensor,
+    steering_monitor_row_active: torch.Tensor,
 ) -> torch.Tensor:
     """Compute the steered output with the fused in-graph monitor gate.
 
@@ -231,6 +260,9 @@ def apply_steering_triton(
         steering_monitor_params,
         steering_monitor_active,
         steering_decode_mask,
+        steering_monitor_probe_table,
+        steering_monitor_row_params,
+        steering_monitor_row_active,
         out,
         N,
         H,
@@ -244,6 +276,9 @@ def apply_steering_triton(
         steering_row_gate.stride(0),
         steering_monitor_probe.stride(0),
         steering_decode_mask.stride(0),
+        steering_monitor_probe_table.stride(0),
+        steering_monitor_probe_table.stride(1),
+        steering_monitor_row_params.stride(0),
         out.stride(0),
         out.stride(1),
         BLOCK_H=block_h,
@@ -380,6 +415,16 @@ def warmup_apply_steering_kernel(
     mparams_buf = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=device)
     mactive_flag = torch.zeros(1, dtype=torch.bool, device=device)
     dmask_buf = torch.zeros(max_n, dtype=torch.float32, device=device)
+    # Per-row monitor buffers (inactive during warmup; same compiled artifact).
+    rprobe_buf = torch.zeros(
+        max(table_rows, 1), hidden_size, dtype=torch.float32, device=device
+    )
+    rparams_buf = (
+        torch.tensor([-1.0e30, 1.0], dtype=torch.float32, device=device)
+        .expand(max(table_rows, 1), 2)
+        .clone()
+    )
+    ractive_flag = torch.zeros(1, dtype=torch.bool, device=device)
 
     t0 = time.perf_counter()
     for n in sizes:
@@ -391,16 +436,40 @@ def warmup_apply_steering_kernel(
         # Inactive path first — exercises the short-circuit branch.
         active_flag.fill_(False)
         torch.ops.vllm.apply_steering(
-            hidden_view, table_buf, index_view, active_flag, scales_buf,
-            dvec_buf, tscale_view, rgate_view,
-            probe_buf, mparams_buf, mactive_flag, dmask_view,
+            hidden_view,
+            table_buf,
+            index_view,
+            active_flag,
+            scales_buf,
+            dvec_buf,
+            tscale_view,
+            rgate_view,
+            probe_buf,
+            mparams_buf,
+            mactive_flag,
+            dmask_view,
+            rprobe_buf,
+            rparams_buf,
+            ractive_flag,
         )
         # Active path — exercises the gather + add.
         active_flag.fill_(True)
         torch.ops.vllm.apply_steering(
-            hidden_view, table_buf, index_view, active_flag, scales_buf,
-            dvec_buf, tscale_view, rgate_view,
-            probe_buf, mparams_buf, mactive_flag, dmask_view,
+            hidden_view,
+            table_buf,
+            index_view,
+            active_flag,
+            scales_buf,
+            dvec_buf,
+            tscale_view,
+            rgate_view,
+            probe_buf,
+            mparams_buf,
+            mactive_flag,
+            dmask_view,
+            rprobe_buf,
+            rparams_buf,
+            ractive_flag,
         )
     # Block until every JIT compile (and cuLibraryLoadData) has retired so
     # the wall-clock measurement and cache-size readback reflect reality.

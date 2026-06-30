@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
 
+from vllm.v1.capture.consumer import SyncCaptureConsumer
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
     SteeringMonitorUpdate,
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.steering_action_queue import SteeringAction
 
 
-class DeterministicOverrideStub:
+class DeterministicOverrideStub(SyncCaptureConsumer):
     """Steers one deterministically-chosen request, exactly once."""
 
     location: ClassVar[Literal["worker"]] = "worker"
@@ -71,9 +72,7 @@ class DeterministicOverrideStub:
     def global_capture_spec(self) -> CaptureSpec:
         from vllm.v1.capture.types import CaptureSpec
 
-        return CaptureSpec(
-            hooks={self._hook: [self._layer]}, positions="all_generated"
-        )
+        return CaptureSpec(hooks={self._hook: [self._layer]}, positions="all_generated")
 
     def status(self) -> dict[str, Any]:
         return {
@@ -115,7 +114,7 @@ class DeterministicOverrideStub:
         return None
 
 
-class ConfigurableOverrideStub:
+class ConfigurableOverrideStub(SyncCaptureConsumer):
     """Override stub with a configurable companion action — for engine-level
     e2e validation of per-request row gating and req_id-keyed scaling.
 
@@ -168,7 +167,7 @@ class ConfigurableOverrideStub:
         self._hook = str(params.get("steer_hook", "post_mlp"))
         self._emit_after = max(1, int(params.get("emit_after_steps", 1)))
         self._mode = str(params.get("mode", "override"))
-        if self._mode not in ("override", "rowgate", "reqscale"):
+        if self._mode not in ("override", "rowgate", "reqscale", "perrow"):
             raise ValueError(f"unknown mode: {self._mode!r}")
         self._gate_on = bool(params.get("gate_on", True))
         self._scale = float(params.get("scale", 0.0))
@@ -191,9 +190,7 @@ class ConfigurableOverrideStub:
     def global_capture_spec(self) -> CaptureSpec:
         from vllm.v1.capture.types import CaptureSpec
 
-        return CaptureSpec(
-            hooks={self._hook: [self._layer]}, positions="all_generated"
-        )
+        return CaptureSpec(hooks={self._hook: [self._layer]}, positions="all_generated")
 
     def status(self) -> dict[str, Any]:
         return {
@@ -216,6 +213,24 @@ class ConfigurableOverrideStub:
                     threshold=threshold,
                     sharpness=self._sharpness,
                     gate_rows=True,
+                    source="dynamic_steering_e2e_cfg",
+                )
+            ]
+        if self._mode == "perrow":
+            # PER-ROW monitor: a SteeringMonitorUpdate keyed by req_id gates
+            # ONLY the target's override row by its own probe (requires
+            # ``enable_row_monitor``). Threshold saturated to force the gate
+            # fully ON/OFF — gate ON applies the target's add, gate OFF
+            # suppresses it, while the control request is untouched.
+            threshold = -self._SATURATE if self._gate_on else self._SATURATE
+            return [
+                SteeringMonitorUpdate(
+                    hook=self._hook,
+                    layer=self._layer,
+                    probe=self._probe,
+                    threshold=threshold,
+                    sharpness=self._sharpness,
+                    req_id=target,
                     source="dynamic_steering_e2e_cfg",
                 )
             ]

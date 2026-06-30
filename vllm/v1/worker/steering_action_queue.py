@@ -151,6 +151,21 @@ class SteeringMonitorUpdate:
     (prefill gate entries are zeroed by the runner, so ``0*gate==0``); it
     never touches prefill rows or prefix-cache keys. The probe and params
     are runtime state, never part of any config hash.
+
+    Targeting (at most one of ``req_id``/``config_hash``/``dyn_id``):
+
+    - none set ⇒ the GLOBAL monitor (the single probe per site above), which
+      gates the dynamic tier and, when ``gate_rows``, all per-request rows;
+    - ``config_hash`` set ⇒ a PER-ROW monitor on that static decode config
+      row only (each row gated by its own probe — true per-request gating);
+    - ``dyn_id`` set ⇒ a per-row monitor on that dynamic-override row;
+    - ``req_id`` set ⇒ the dynamic-override row of that request (resolved
+      ``req_id → dyn_id`` by the runner). ``probe=None`` clears the target.
+
+    The per-row monitor requires the engine to enable it
+    (``enable_row_monitor``); ``gate_rows`` is ignored for per-row targets
+    (a per-row monitor always gates its own row). See
+    docs/design/dynamic_steering.md.
     """
 
     hook: str
@@ -161,6 +176,11 @@ class SteeringMonitorUpdate:
     # When True the monitor also gates the per-request row term (not just
     # the §5.4 tier), decode-only. See dynamic_steering_row_gating.md.
     gate_rows: bool = False
+    # Per-row (per-request) targeting; at most one may be set. All None ⇒
+    # the global monitor (unchanged behavior).
+    req_id: str | None = None
+    config_hash: int | None = None
+    dyn_id: int | None = None
     source: str = ""
 
 
@@ -364,8 +384,19 @@ def validate_steering_monitor(
 
     A clear (``probe=None``) only needs a valid ``(hook, layer)`` target;
     a set additionally validates the probe shape/finiteness and the
-    policy params.
+    policy params. At most one per-row target may be set.
     """
+    targets = sum(
+        (
+            action.req_id is not None,
+            action.config_hash is not None,
+            action.dyn_id is not None,
+        )
+    )
+    if targets > 1:
+        raise SteeringVectorError(
+            "monitor update must target at most one of req_id / config_hash / dyn_id"
+        )
     if action.hook not in VALID_HOOK_POINT_NAMES:
         raise SteeringVectorError(f"invalid hook point: {action.hook!r}")
     table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(action.hook)]

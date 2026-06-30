@@ -23,8 +23,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
     HOOK_POINT_MONITOR_ACTIVE_ATTR,
+    HOOK_POINT_ROW_ACTIVE_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
+    resize_steering_row_monitor_buffers,
     share_steering_decode_mask_across_layers,
     share_steering_row_gate_across_layers,
     share_steering_token_scales_across_layers,
@@ -251,6 +253,19 @@ class SteeringModelRunnerMixin:
         for mod in steerable.values():
             mod._cross_layer_monitor = cross_layer
 
+        # Per-row (per-request) monitor: opt-in. When enabled, resize the
+        # dummy ``(1, 1)`` probe/params buffers to full per-row tables across
+        # every steerable layer (the single site with all layers in hand,
+        # like the share_* helpers). The flag also gates the per-row branch of
+        # ``_apply_monitor_update`` so a targeted monitor on a disabled engine
+        # is rejected rather than silently dropped.
+        self._row_monitor_enabled = bool(
+            getattr(steering_config, "enable_row_monitor", False)
+        )
+        resize_steering_row_monitor_buffers(
+            steerable.values(), enable=self._row_monitor_enabled
+        )
+
         # Resolve device from the first steerable layer's table buffer
         # so per-request vectors are allocated on the same device,
         # avoiding CPU->GPU copies each step.
@@ -287,9 +302,7 @@ class SteeringModelRunnerMixin:
         pp_size = getattr(parallel_config, "pipeline_parallel_size", 1)
         if tp_size == 1 and pp_size == 1:
             install_steering_action_queue(SteeringActionQueue())
-            logger.info(
-                "dynamic steering action queue installed (tp=1, pp=1)"
-            )
+            logger.info("dynamic steering action queue installed (tp=1, pp=1)")
         else:
             install_steering_action_queue(None)
             logger.info(
@@ -688,9 +701,7 @@ class SteeringModelRunnerMixin:
         # Apply-path counters by source (both transports).
         status["apply_stats"] = {
             source: dict(counts)
-            for source, counts in getattr(
-                self, "_dynamic_steering_stats", {}
-            ).items()
+            for source, counts in getattr(self, "_dynamic_steering_stats", {}).items()
         }
 
         # Dynamic-override pool occupancy.
@@ -739,13 +750,36 @@ class SteeringModelRunnerMixin:
         else:
             status["monitor"] = None
 
+        # Per-row (per-request) monitor: configured per-owner sites + params
+        # (probe vectors omitted). ``enabled`` reflects the engine opt-in.
+        if mgr is not None:
+            status["row_monitor"] = {
+                "enabled": bool(getattr(self, "_row_monitor_enabled", False)),
+                "active": mgr.has_row_monitor,
+                "sites": {
+                    hook: {
+                        layer: {
+                            str(owner): {
+                                "threshold": cfg["threshold"],
+                                "sharpness": cfg["sharpness"],
+                            }
+                            for owner, cfg in owners.items()
+                        }
+                        for layer, owners in layers.items()
+                        if owners
+                    }
+                    for hook, layers in mgr._row_monitor.items()
+                    if layers
+                },
+            }
+        else:
+            status["row_monitor"] = None
+
         # Per-row strength scales (§5.3): non-default scales by owner.
         if mgr is not None:
             status["dynamic_scales"] = {
                 "global": dict(mgr._global_scales),
-                "config": {
-                    f"{h}:{p}": s for (h, p), s in mgr._config_scales.items()
-                },
+                "config": {f"{h}:{p}": s for (h, p), s in mgr._config_scales.items()},
                 "dynamic": {str(d): s for d, s in mgr._dynamic_scales.items()},
             }
         else:
@@ -770,9 +804,7 @@ class SteeringModelRunnerMixin:
                 "gpu_total_ms": round(stats.get("gpu_total_ms", 0.0), 3),
                 "gpu_max_ms": round(stats.get("gpu_max_ms", 0.0), 3),
                 "gpu_avg_ms": (
-                    round(stats["gpu_total_ms"] / gpu_steps, 3)
-                    if gpu_steps
-                    else None
+                    round(stats["gpu_total_ms"] / gpu_steps, 3) if gpu_steps else None
                 ),
                 "gpu_last_ms": stats.get("gpu_last_ms"),
                 "over_budget_steps": stats.get("over_budget_steps", 0),
@@ -1223,8 +1255,7 @@ class SteeringModelRunnerMixin:
             return _reject("steering is not initialized on this worker")
         if mgr.max_dynamic_steering_configs <= 0:
             return _reject(
-                "dynamic override pool is disabled "
-                "(max_dynamic_steering_configs=0)"
+                "dynamic override pool is disabled (max_dynamic_steering_configs=0)"
             )
 
         existing_dyn_id = self._req_dynamic_decode.get(req_id)
@@ -1328,10 +1359,13 @@ class SteeringModelRunnerMixin:
     ) -> bool:
         """Configure/clear the in-graph monitor at a probe site (§8).
 
-        Decode-tier only and cache-safe by construction: the monitor only
-        scales the dynamic tier's per-token gate, which the runner zeroes
-        for prefill tokens (``0*gate==0``). A rejected action keeps the
-        previous monitor state. ``probe=None`` clears the site.
+        Two modes by targeting. Untargeted ⇒ the GLOBAL monitor (one probe
+        per site, gates the dynamic tier and, when ``gate_rows``, all rows).
+        Targeted (``req_id``/``config_hash``/``dyn_id``) ⇒ a PER-ROW monitor
+        on that owner's decode row only — true per-request gating, requires
+        ``enable_row_monitor``. Decode-tier/decode-row only and cache-safe by
+        construction. A rejected action keeps the previous monitor state;
+        ``probe=None`` clears the target.
         """
         mgr = self._steering_manager
 
@@ -1348,19 +1382,61 @@ class SteeringModelRunnerMixin:
         except SteeringVectorError as exc:
             return _reject(str(exc))
 
-        if action.probe is None:
-            mgr.clear_monitor(action.hook, action.layer)
-            return True
-        probe = torch.from_numpy(
-            np.ascontiguousarray(action.probe, dtype=np.float32)
+        targeted = (
+            action.req_id is not None
+            or action.config_hash is not None
+            or action.dyn_id is not None
         )
-        mgr.set_monitor(
+        if not targeted:
+            # GLOBAL monitor (unchanged behavior).
+            if action.probe is None:
+                mgr.clear_monitor(action.hook, action.layer)
+                return True
+            probe = torch.from_numpy(
+                np.ascontiguousarray(action.probe, dtype=np.float32)
+            )
+            mgr.set_monitor(
+                action.hook,
+                action.layer,
+                probe,
+                action.threshold,
+                action.sharpness,
+                gate_rows=action.gate_rows,
+                locally_owned_layers=self._locally_owned_layers,
+            )
+            return True
+
+        # PER-ROW (per-request) monitor.
+        if not getattr(self, "_row_monitor_enabled", False):
+            return _reject(
+                "per-row monitor requires the engine flag enable_row_monitor"
+            )
+        if action.req_id is not None:
+            dyn_id = self._req_dynamic_decode.get(action.req_id)
+            if dyn_id is None:
+                return _reject(
+                    f"request {action.req_id} has no live dynamic override to "
+                    "attach a per-row monitor to"
+                )
+            owner_key: tuple = ("dyn", dyn_id)
+        elif action.dyn_id is not None:
+            if action.dyn_id not in mgr._dynamic_to_row:
+                return _reject(f"unknown dynamic row dyn_id={action.dyn_id}")
+            owner_key = ("dyn", action.dyn_id)
+        else:
+            owner_key = ("config", int(action.config_hash), "decode")
+
+        if action.probe is None:
+            mgr.clear_row_monitor(action.hook, action.layer, owner_key)
+            return True
+        probe = torch.from_numpy(np.ascontiguousarray(action.probe, dtype=np.float32))
+        mgr.set_row_monitor(
             action.hook,
             action.layer,
+            owner_key,
             probe,
             action.threshold,
             action.sharpness,
-            gate_rows=action.gate_rows,
             locally_owned_layers=self._locally_owned_layers,
         )
         return True
@@ -1421,9 +1497,7 @@ class SteeringModelRunnerMixin:
         # (bounded memory; a re-appearing request simply re-reports — the
         # scheduler applies it idempotently).
         if self._req_decode_sig_reported:
-            for rid in [
-                r for r in self._req_decode_sig_reported if r not in seen
-            ]:
+            for rid in [r for r in self._req_decode_sig_reported if r not in seen]:
                 self._req_decode_sig_reported.pop(rid, None)
         return deltas
 
@@ -1506,6 +1580,7 @@ class SteeringModelRunnerMixin:
             and not self._steering_manager.has_dynamic
             and not self._steering_manager.has_dynamic_tier
             and not self._steering_manager.has_monitor
+            and not self._steering_manager.has_row_monitor
             and not self._steering_manager.global_base_vectors
             and not self._steering_manager.global_prefill_vectors
             and not self._steering_manager.global_decode_vectors
@@ -1545,6 +1620,10 @@ class SteeringModelRunnerMixin:
                         mon_buf = getattr(mod, HOOK_POINT_MONITOR_ACTIVE_ATTR[hp], None)
                         if mon_buf is not None:
                             mon_buf.zero_()
+                        # Same for the per-row monitor active flag.
+                        row_buf = getattr(mod, HOOK_POINT_ROW_ACTIVE_ATTR[hp], None)
+                        if row_buf is not None:
+                            row_buf.zero_()
                 self._steering_index_dirty = False
             # Nothing dynamic is active; revert any request still reported as
             # dynamically steered back to its admitted decode key.
@@ -1735,12 +1814,8 @@ class SteeringModelRunnerMixin:
                 token_scales_pinned.shape[0],
                 token_scales.shape[0],
             )
-            token_scales_pinned[:n_gate].copy_(
-                torch.from_numpy(gate_expanded[:n_gate])
-            )
-            token_scales[:n_gate].copy_(
-                token_scales_pinned[:n_gate], non_blocking=True
-            )
+            token_scales_pinned[:n_gate].copy_(torch.from_numpy(gate_expanded[:n_gate]))
+            token_scales[:n_gate].copy_(token_scales_pinned[:n_gate], non_blocking=True)
         else:
             n_gate = 0
         if n_gate < token_scales.shape[0]:
@@ -1765,12 +1840,8 @@ class SteeringModelRunnerMixin:
                 decode_mask_pinned.shape[0],
                 decode_mask.shape[0],
             )
-            decode_mask_pinned[:n_mask].copy_(
-                torch.from_numpy(mask_expanded[:n_mask])
-            )
-            decode_mask[:n_mask].copy_(
-                decode_mask_pinned[:n_mask], non_blocking=True
-            )
+            decode_mask_pinned[:n_mask].copy_(torch.from_numpy(mask_expanded[:n_mask]))
+            decode_mask[:n_mask].copy_(decode_mask_pinned[:n_mask], non_blocking=True)
         else:
             n_mask = 0
         if n_mask < decode_mask.shape[0]:
