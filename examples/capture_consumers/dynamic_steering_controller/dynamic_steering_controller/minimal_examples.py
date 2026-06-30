@@ -33,7 +33,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 import numpy as np
 import torch
 
-from vllm.v1.capture.consumer import CaptureConsumer
+from vllm.v1.capture.consumer import CaptureConsumer, SyncCaptureConsumer
+from vllm.v1.capture.controller import SteeringController
 from vllm.v1.capture.types import CaptureSpec
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
@@ -46,7 +47,7 @@ from vllm.v1.worker.steering_action_queue import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.capture.step_view import StepCaptureView
+    from vllm.v1.capture.step_view import StepCaptureView, StepRequestView
 
 _HOOK = "post_mlp"
 
@@ -58,25 +59,18 @@ def _seeded_vector(hidden: int, norm: float) -> np.ndarray:
     return np.ascontiguousarray(v / float(np.linalg.norm(v)) * norm, dtype=np.float32)
 
 
-class _SyncBase:
+class _SyncBase(SyncCaptureConsumer):
     """Shared scaffolding for the sync examples.
 
-    Declares the sync-consumer contract (worker-side, exactly-1-step
-    latency, global spec on one site), loads engine params, and tracks the
-    first request seen in decode as the deterministic ``target``.
+    Inherits the sync-consumer contract (worker-side, exactly-1-step latency,
+    ``declared_graphsafe_keys`` default) from
+    :class:`~vllm.v1.capture.consumer.SyncCaptureConsumer`, loads engine
+    params, and tracks the first request seen in decode as the deterministic
+    ``target``.
     """
 
-    location: ClassVar[Literal["worker"]] = "worker"
-    execution: ClassVar[Literal["sync"]] = "sync"
-    reads_client_spec: ClassVar[bool] = False
-
-    @classmethod
-    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
-        # Sync consumers read the StepCaptureView directly; no per-request
-        # graph-safe pre-buffering. Required by the registry's config build.
-        return []
-
     def __init__(self, vllm_config: VllmConfig, params: dict[str, Any]) -> None:
+        super().__init__(vllm_config, params)
         model_config = getattr(vllm_config, "model_config", None)
         self._hidden = model_config.get_hidden_size() if model_config else None
         self._layer = int(params["steer_layer"])
@@ -95,9 +89,6 @@ class _SyncBase:
 
     def status(self) -> dict[str, Any]:
         return {"target": self._target, "emitted": self._emitted}
-
-    def shutdown(self, timeout: float = 30.0) -> None:  # noqa: B027
-        pass
 
     def _ready_target(self, view: StepCaptureView) -> str | None:
         """Return the target req_id on the step it reaches ``emit_after``
@@ -291,7 +282,7 @@ class AsyncTierExample(CaptureConsumer):
         return {"submitted": self._submitted}
 
 
-class ConversationLatchExample:
+class ConversationLatchExample(SteeringController):
     """Per-conversation *latched* steering: once a probe trigger fires in a
     conversation, every later decode step — **including subsequent requests of
     the same conversation** — is steered the same ``particular way``.
@@ -304,20 +295,23 @@ class ConversationLatchExample:
     request's decode tokens to a dynamic-pool row holding
     ``global_decode + steer_vec``.
 
-    Two ways a request gets steered:
+    All of the latch/bridge/prune/scope bookkeeping lives in
+    :class:`~vllm.v1.capture.controller.SteeringController`; this class supplies
+    only the policy (:meth:`decide`) and the monitored site
+    (:meth:`global_capture_spec`):
 
-    - **TRIGGER** — a live request not yet overridden whose probe projection
-      ``mean(h · probe)`` over the step's residual window exceeds
-      ``threshold``. Latches the conversation and overrides this request.
-    - **BRIDGE** — a *new* request of an already-latched conversation: it is
-      overridden immediately (no re-trigger needed), so the steering carries
-      across turns.
+    - **TRIGGER** — :meth:`decide` returns an override when a request's probe
+      projection ``mean(h · probe)`` over its residual window exceeds
+      ``threshold``; the base latches the conversation and overrides it.
+    - **BRIDGE** — handled entirely by the base: a *new* request of an
+      already-latched conversation is overridden immediately (no re-trigger),
+      so the steering carries across turns.
 
-    Reads activations (``view.tensors``), never ``req.token_ids`` (empty on the
-    v2 runner). ``RequestSteeringOverride`` auto-expires on finish / preempt /
-    streaming re-add, so per-request ``armed`` state is pruned to the live set
-    each step; the per-conversation ``latched`` map persists (bounded by
-    ``max_conversations``, FIFO eviction).
+    Reads activations (``residual``), never ``req.token_ids`` (empty on the v2
+    runner). ``RequestSteeringOverride`` auto-expires on finish / preempt /
+    streaming re-add, so the base prunes per-request ``armed`` state to the
+    live set each step; the per-conversation ``latched`` map persists (bounded
+    by ``max_conversations``, FIFO eviction).
 
     Params:
       ``steer_layer`` (int, required), ``steer_hook`` (default ``post_block``),
@@ -332,17 +326,8 @@ class ConversationLatchExample:
       ``max_conversations`` (default 1024) — bound on the latch map.
     """
 
-    location: ClassVar[Literal["worker"]] = "worker"
-    execution: ClassVar[Literal["sync"]] = "sync"
-    reads_client_spec: ClassVar[bool] = False
-
-    @classmethod
-    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
-        # Sync consumers read the StepCaptureView directly; no per-request
-        # graph-safe pre-buffering. Required by the registry's config build.
-        return []
-
     def __init__(self, vllm_config: VllmConfig, params: dict[str, Any]) -> None:
+        super().__init__(vllm_config, params)
         model_config = getattr(vllm_config, "model_config", None)
         self._hidden = model_config.get_hidden_size() if model_config else None
         self._steer_layer = int(params["steer_layer"])
@@ -351,19 +336,11 @@ class ConversationLatchExample:
         self._probe_layer = int(params.get("probe_layer", self._steer_layer))
         self._probe_hook = str(params.get("probe_hook", self._steer_hook))
         self._threshold = float(params.get("threshold", 0.0))
-        self._max_conversations = max(1, int(params.get("max_conversations", 1024)))
 
         probe, steer = self._load_vectors(params)
         self._probe = probe  # unit probe (np.float32 [hidden]) or None
         self._steer = steer  # steer vector (np.float32 [hidden]) or None
         self._probe_t: torch.Tensor | None = None  # cached device tensor
-
-        # conv_id -> steer vector to (re)apply; persists across requests.
-        self._latched: dict[str, np.ndarray] = {}
-        # live req_ids already overridden this run (emit-once per request).
-        self._armed: set[str] = set()
-        self._triggers = 0
-        self._bridges = 0
 
     def _load_vectors(
         self, params: dict[str, Any]
@@ -395,74 +372,25 @@ class ConversationLatchExample:
             positions="all_generated",
         )
 
-    def status(self) -> dict[str, Any]:
-        return {
-            "latched_conversations": len(self._latched),
-            "armed_requests": len(self._armed),
-            "triggers": self._triggers,
-            "bridges": self._bridges,
-        }
-
-    def shutdown(self, timeout: float = 30.0) -> None:  # noqa: B027
-        pass
-
     def _steer_vectors(self, vec: np.ndarray) -> dict[str, dict[int, np.ndarray]]:
         return {self._steer_hook: {self._steer_layer: vec}}
 
-    def _latch(self, cid: str, vec: np.ndarray) -> None:
-        """Record the conversation's steer vector, FIFO-evicting if full."""
-        if cid not in self._latched and len(self._latched) >= self._max_conversations:
-            # Drop the oldest conversation (dict preserves insertion order).
-            self._latched.pop(next(iter(self._latched)))
-        self._latched[cid] = vec
-
-    def _projection(self, view: StepCaptureView, start: int, end: int) -> float:
-        """Mean probe projection over a request's residual window."""
-        x = view.tensors[(self._probe_layer, self._probe_hook)][start:end]
-        if self._probe_t is None or self._probe_t.device != x.device:
-            self._probe_t = torch.as_tensor(
-                self._probe, dtype=torch.float32, device=x.device
-            )
-        return float((x.float() @ self._probe_t).mean())
-
-    def on_step(self, view: StepCaptureView) -> list[SteeringAction] | None:
+    def decide(
+        self, request_view: StepRequestView, residual: torch.Tensor
+    ) -> SteeringAction | None:
+        """Trigger when the mean probe projection over ``residual`` exceeds
+        ``threshold``; the base latches the conversation and bridges later
+        requests. Returns ``None`` (no-op) if the vectors failed to load."""
         if self._steer is None or self._probe is None:
             return None
-        actions: list[SteeringAction] = []
-        live: set[str] = set()
-        for req in view.requests:
-            live.add(req.req_id)
-            cid = req.conversation_id
-            # Latching keys on the conversation id and only decode tokens are
-            # routed by the override, so untagged / prefill rows are skipped.
-            if cid is None or req.phase != "decode":
-                continue
-            if req.req_id in self._armed:
-                continue
-            if cid in self._latched:
-                # BRIDGE: a new request of an already-latched conversation.
-                actions.append(
-                    RequestSteeringOverride(
-                        req_id=req.req_id,
-                        vectors=self._steer_vectors(self._latched[cid]),
-                        source="conversation_latch_example",
-                    )
-                )
-                self._armed.add(req.req_id)
-                self._bridges += 1
-                continue
-            # TRIGGER: probe this request's residual.
-            if self._projection(view, req.start, req.end) > self._threshold:
-                self._latch(cid, self._steer)
-                actions.append(
-                    RequestSteeringOverride(
-                        req_id=req.req_id,
-                        vectors=self._steer_vectors(self._steer),
-                        source="conversation_latch_example",
-                    )
-                )
-                self._armed.add(req.req_id)
-                self._triggers += 1
-        # Prune finished requests; the per-conversation latch persists.
-        self._armed &= live
-        return actions or None
+        if self._probe_t is None or self._probe_t.device != residual.device:
+            self._probe_t = torch.as_tensor(
+                self._probe, dtype=torch.float32, device=residual.device
+            )
+        if float((residual.float() @ self._probe_t).mean()) <= self._threshold:
+            return None
+        return RequestSteeringOverride(
+            req_id=request_view.req_id,
+            vectors=self._steer_vectors(self._steer),
+            source="conversation_latch_example",
+        )
