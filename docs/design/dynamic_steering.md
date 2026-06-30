@@ -731,6 +731,64 @@ model) later showed the mutating monitor adds **zero** launches/syncs — 1 op o
 path is cudagraph-safe; it ships opt-in to keep the default path byte-identical.
 See `steering-bench/docs/dynamic_steering_cudagraph_finding.md`.
 
+### 8.1 Per-row (per-request) monitor — IMPLEMENTED
+
+The global monitor above carries **one** probe per `(layer, hook)`: every
+request at a site shares its probe/threshold, and `gate_rows` gates all
+per-request rows uniformly. That blocks *per-request* same-step gating —
+concurrent requests cannot be conditioned on different probes, and a request's
+add vector cannot be gated independently of its neighbours'.
+
+The **per-row monitor** (opt-in via `SteeringConfig.enable_row_monitor`) lifts
+this: each steering table row carries its OWN probe + `[threshold, sharpness]`,
+so the gate scaling a token's row term is computed from that token's row's
+probe (`gate = sigmoid(sharpness*(residual@probe[row] - threshold[row]))`).
+The steering ROW is already per-request (the override pool / static config
+rows), so a per-request same-step `add` becomes in-graph: install the add
+vector in the request's row, attach a per-row monitor to that row's owner, and
+the kernel gates it per decode token — the added vector is per-request, only
+the kernel machinery is shared. Decode-only (folded into `row_gate` via the
+decode mask exactly like the global `gate_rows` path), so prefill rows stay
+ungated and prefix-cache keys are untouched.
+
+Design mirrors the §5.3 per-row scale and the §5.2 override pool:
+
+- **Buffers** (per `(layer, hook)`, like the table): `*_monitor_probe_table`
+  `(rows, hidden)` and `*_monitor_row_params` `(rows, 2)` = `[threshold,
+  sharpness]`, plus a `*_monitor_row_active` flag. Default params
+  `[-1e30, 1.0]` + zero probe ⇒ `sigmoid → 1.0` ⇒ unconfigured rows pass
+  through with no branch. Per-`(layer, hook)` (not shared across layers) so a
+  row configured at one site never imposes its threshold at another where the
+  probe is zero. **Opt-in:** registered at a `(1, 1)` dummy size and resized
+  to full only when `enable_row_monitor` (so the op signature is stable
+  without touching model files; `resize_steering_row_monitor_buffers` runs once
+  from `_init_steering_state`). The flag is in `compute_hash` (buffer shape is
+  baked into captured graphs).
+- **Manager** keys configs by logical owner (`("global","decode")` /
+  `("config", hash, "decode")` / `("dyn", dyn_id)`) so they survive row
+  reassignment, and scatters them in row-position order with the same
+  `indices` as the table write (`set_row_monitor`/`clear_row_monitor`/
+  `has_row_monitor`/`_build_row_probe_and_params`).
+- **Action**: `SteeringMonitorUpdate` gains optional `req_id`/`config_hash`/
+  `dyn_id` (at most one). None ⇒ the global monitor (unchanged); one set ⇒ a
+  per-row monitor on that owner (`req_id` resolved to its live `dyn_id`).
+- **APC**: a request's effective decode signature folds in its row's probe +
+  params, so a temporal probe change re-keys the steered decode KV.
+- **Kernel**: a second per-token reduction gathers `probe_table[row]` and
+  multiplies its gate into `row_gate` (decode-only), guarded by a tensor
+  `row_active` flag (graph topology stable). Orthogonal to the global monitor;
+  both compose. Remaining shared resource: nothing — each row is independent;
+  only the kernel reduction is per-site.
+
+**Per-row wiring (additions):** `steering_kernel.py` (per-row reduction +
+strides + warmup), `steering.py` (3 attr maps + dummy buffers +
+`resize_steering_row_monitor_buffers` + 15-arg op + eager per-row block),
+`steering_manager.py` (`_row_monitor` state + set/clear/has + populate +
+signature fold), `steering_action_queue.py` (targeting + validation),
+`steering_model_runner_mixin.py` + `gpu/steering_runner_mixin.py` (per-row
+apply branch + short-circuit + transition deactivation + status),
+`config/steering.py` (`enable_row_monitor`).
+
 **Wiring:** `vllm/model_executor/layers/steering_monitor_kernel.py`
 (Triton), `steering.py` (op + per-hook buffers + `apply_layer_steering`
 call + warmup), `steering_manager.py` (`set_monitor`/`clear_monitor`/
