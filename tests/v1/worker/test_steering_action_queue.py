@@ -183,7 +183,10 @@ def test_apply_multi_layer_update():
     )
     applied, rejected = apply_steering_updates([update], mgr, layers)
     assert (applied, rejected) == (1, 0)
-    assert {(c[0], c[1]) for c in mgr.tier_calls} == {("post_block", 0), ("post_block", 1)}
+    assert {(c[0], c[1]) for c in mgr.tier_calls} == {
+        ("post_block", 0),
+        ("post_block", 1),
+    }
 
 
 @pytest.mark.parametrize("phase", ["base", "prefill"])
@@ -476,3 +479,32 @@ def test_validate_monitor_rejects_bad_probe_and_params():
             ),
             layers,
         )
+
+
+def test_validate_monitor_rejects_multiple_row_targets():
+    layers = _layers()
+    with pytest.raises(SteeringVectorError):
+        validate_steering_monitor(
+            SteeringMonitorUpdate(
+                hook="post_block",
+                layer=0,
+                probe=np.ones(HIDDEN, np.float32),
+                config_hash=1,
+                dyn_id=2,
+            ),
+            layers,
+        )
+
+
+def test_validate_monitor_accepts_single_row_target():
+    layers = _layers()
+    # A single per-row target is valid (global vs per-row is a runtime branch).
+    validate_steering_monitor(
+        SteeringMonitorUpdate(
+            hook="post_block",
+            layer=0,
+            probe=np.ones(HIDDEN, np.float32),
+            config_hash=12345,
+        ),
+        layers,
+    )
