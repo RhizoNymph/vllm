@@ -40,6 +40,16 @@ class SteeringConfig:
     topology, so it is part of ``compute_hash``. See
     docs/design/dynamic_steering.md §8."""
 
+    enable_row_monitor: bool = Field(default=False)
+    """Opt in to the PER-ROW (per-request) in-graph monitor: each steering
+    table row carries its own probe + ``[threshold, sharpness]``, so concurrent
+    requests at a site can be gated by different probe conditions (true
+    per-request same-step steering). When ``True``, the per-(layer, hook) probe
+    table is sized to ``(max rows, hidden)`` (instead of a ``(1, 1)`` dummy),
+    which is baked into the captured graph buffers, so it is part of
+    ``compute_hash``. When ``False`` (default) only the global monitor exists.
+    See docs/design/dynamic_steering.md."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -60,6 +70,9 @@ class SteeringConfig:
         # Cross-layer monitor changes the compiled graph topology (emits the
         # mutating steering_monitor op at every steered hook).
         factors.append(self.enable_cross_layer_monitor)
+        # Per-row monitor changes the per-row probe-table buffer shape, which
+        # is baked into captured graphs.
+        factors.append(self.enable_row_monitor)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str

@@ -49,11 +49,15 @@ import torch
 from vllm.config.steering_types import hash_steering_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
+    _ROW_MONITOR_DEFAULT_PARAMS,
     HOOK_POINT_ANY_ACTIVE_ATTR,
     HOOK_POINT_DYNVEC_ATTR,
     HOOK_POINT_MONITOR_ACTIVE_ATTR,
     HOOK_POINT_MONITOR_PARAMS_ATTR,
     HOOK_POINT_MONITOR_PROBE_ATTR,
+    HOOK_POINT_ROW_ACTIVE_ATTR,
+    HOOK_POINT_ROW_PARAMS_ATTR,
+    HOOK_POINT_ROW_PROBE_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
@@ -161,6 +165,23 @@ class SteeringManager:
         # populate time (gated by ``_tables_dirty``); policy params then
         # live in the persistent buffers, host-tunable without recapture.
         self.monitor_configs: dict[str, dict[int, dict]] = {}
+
+        # PER-ROW (per-request) in-graph monitor configs. Keyed
+        # hook -> layer -> owner_key -> {"probe", "threshold", "sharpness"},
+        # where owner_key is the LOGICAL row owner so configs survive row
+        # reassignment (like ``_config_scales``/``_dynamic_scales``):
+        #   ("global", "decode")              -> row 2 (global decode)
+        #   ("config", config_hash, "decode") -> a static decode config row
+        #   ("dyn", dyn_id)                   -> a dynamic-override row
+        # Unlike ``monitor_configs`` (one global probe per site), each row is
+        # gated by ITS OWN probe, so concurrent requests at a site can carry
+        # different probes. Written into the per-row probe-table buffers at
+        # populate; gates the row term only, decode-only. Opt-in via
+        # ``enable_row_monitor`` (else the buffers stay dummy and this is
+        # never activated). See docs/design/dynamic_steering.md.
+        self._row_monitor: dict[str, dict[int, dict[tuple, dict]]] = {}
+        # Lazy per-owner signature cache for APC (None ⇒ stale, rebuild).
+        self._row_monitor_sig_cache: dict[tuple, int] | None = None
 
         # APC steering-signature caches (see
         # docs/design/dynamic_steering_apc_notification.md). The worker
@@ -657,6 +678,191 @@ class SteeringManager:
         return any(layers for layers in self.monitor_configs.values())
 
     # ------------------------------------------------------------------
+    # Per-row (per-request) in-graph monitor
+    # ------------------------------------------------------------------
+
+    def set_row_monitor(
+        self,
+        hook_point: str,
+        layer_idx: int,
+        owner_key: tuple,
+        probe: torch.Tensor,
+        threshold: float,
+        sharpness: float,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Configure the per-row monitor for one logical row owner at a site.
+
+        ``owner_key`` is ``("global", "decode")``,
+        ``("config", config_hash, "decode")`` or ``("dyn", dyn_id)`` — the
+        gate ``sigmoid(sharpness*(residual@probe - threshold))`` is applied to
+        that owner's row term only, decode-only. Stored keyed by owner so it
+        survives row reassignment; written into the per-row probe table at the
+        next populate.
+
+        ``locally_owned_layers`` (TP/PP): a no-op when ``layer_idx`` is not
+        owned by this worker (rank-replicated callers stay in lock-step).
+        """
+        if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
+            return
+        self._row_monitor.setdefault(hook_point, {}).setdefault(layer_idx, {})[
+            owner_key
+        ] = {
+            "probe": probe.detach().to(torch.float32).clone().reshape(-1),
+            "threshold": float(threshold),
+            "sharpness": float(sharpness),
+        }
+        self._row_monitor_sig_cache = None
+        self._tables_dirty = True
+
+    def clear_row_monitor(
+        self,
+        hook_point: str | None = None,
+        layer_idx: int | None = None,
+        owner_key: tuple | None = None,
+    ) -> None:
+        """Remove per-row monitor configs.
+
+        No args clears everything; progressively narrower args clear a hook,
+        a ``(hook, layer)`` site, or a single ``(hook, layer, owner)`` entry.
+        """
+        if not self._row_monitor:
+            return
+        if hook_point is None:
+            self._row_monitor.clear()
+            self._row_monitor_sig_cache = None
+            self._tables_dirty = True
+            return
+        layers = self._row_monitor.get(hook_point)
+        if layers is None:
+            return
+        if layer_idx is None:
+            del self._row_monitor[hook_point]
+        elif owner_key is None:
+            layers.pop(layer_idx, None)
+            if not layers:
+                del self._row_monitor[hook_point]
+        else:
+            owners = layers.get(layer_idx)
+            if owners is None:
+                return
+            owners.pop(owner_key, None)
+            if not owners:
+                layers.pop(layer_idx, None)
+            if not layers:
+                del self._row_monitor[hook_point]
+        self._row_monitor_sig_cache = None
+        self._tables_dirty = True
+
+    @property
+    def has_row_monitor(self) -> bool:
+        """True if any per-row monitor entry is configured."""
+        return any(
+            owners
+            for layers in self._row_monitor.values()
+            for owners in layers.values()
+        )
+
+    def _build_row_probe_and_params(
+        self,
+        hp_str: str,
+        layer_idx: int,
+        device: torch.device,
+        hidden_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Build the per-row probe table + ``[threshold, sharpness]`` params in
+        populate (row-position) order ``[0, 1, 2, *config_rows,
+        *dynamic_rows]`` — matching ``_cached_indices`` — for one ``(hook,
+        layer)`` site.
+
+        Unconfigured rows (and rows 0/1, and all prefill rows) get a zero
+        probe + the default ``[-1e30, 1.0]`` params ⇒ ``sigmoid → 1.0`` ⇒
+        ungated pass-through. Returns ``(probe_mat, params_mat,
+        any_configured)``.
+        """
+        site = self._row_monitor.get(hp_str, {}).get(layer_idx, {})
+        ordered_configs = self._cached_ordered_configs or list(
+            self.config_to_row.items()
+        )
+        ordered_dynamic = self._cached_ordered_dynamic or list(
+            self._dynamic_to_row.items()
+        )
+        num_rows = 3 + len(ordered_configs) + len(ordered_dynamic)
+        thr0, sharp0 = _ROW_MONITOR_DEFAULT_PARAMS
+        probe_mat = torch.zeros(
+            num_rows, hidden_size, dtype=torch.float32, device=device
+        )
+        params_mat = (
+            torch.tensor([thr0, sharp0], dtype=torch.float32, device=device)
+            .expand(num_rows, 2)
+            .clone()
+        )
+        any_configured = False
+
+        def _apply(pos: int, owner_key: tuple) -> None:
+            nonlocal any_configured
+            cfg = site.get(owner_key)
+            if cfg is None:
+                return
+            probe = cfg["probe"]
+            if probe.numel() != hidden_size:
+                return
+            probe_mat[pos].copy_(probe.to(device))
+            params_mat[pos, 0] = cfg["threshold"]
+            params_mat[pos, 1] = cfg["sharpness"]
+            any_configured = True
+
+        # Row 2 = global decode; rows 0/1 (sentinel/prefill) stay default.
+        _apply(2, ("global", "decode"))
+        pos = 3
+        for (config_hash, phase), _row in ordered_configs:
+            if phase == "decode":
+                _apply(pos, ("config", config_hash, "decode"))
+            pos += 1
+        for dyn_id, _row in ordered_dynamic:
+            _apply(pos, ("dyn", dyn_id))
+            pos += 1
+        return probe_mat, params_mat, any_configured
+
+    def _row_monitor_signature_for(self, owner_keys: tuple[tuple, ...]) -> int | None:
+        """Cached hash of every per-row monitor entry matching any of
+        ``owner_keys`` (probe + threshold + sharpness + site), or ``None`` when
+        none match. Used to fold a request's effective row monitor into its APC
+        decode signature."""
+        if self._row_monitor_sig_cache is None:
+            cache: dict[tuple, int] = {}
+            for hook in sorted(self._row_monitor.keys()):
+                layers = self._row_monitor[hook]
+                for layer_idx in sorted(layers.keys()):
+                    for owner_key, cfg in layers[layer_idx].items():
+                        h = cache.get(owner_key)
+                        acc = hashlib.sha256(b"dynsteer-rowmon")
+                        if h is not None:
+                            acc.update(int(h).to_bytes(8, "little"))
+                        acc.update(hook.encode())
+                        acc.update(int(layer_idx).to_bytes(4, "little", signed=True))
+                        acc.update(
+                            cfg["probe"]
+                            .detach()
+                            .cpu()
+                            .to(torch.float32)
+                            .numpy()
+                            .tobytes()
+                        )
+                        acc.update(np.float64(cfg["threshold"]).tobytes())
+                        acc.update(np.float64(cfg["sharpness"]).tobytes())
+                        cache[owner_key] = (
+                            int(acc.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+                        )
+            self._row_monitor_sig_cache = cache
+        out: int | None = None
+        for key in owner_keys:
+            sig = self._row_monitor_sig_cache.get(key)
+            if sig is not None:
+                out = sig if out is None else (out ^ sig)
+        return out
+
+    # ------------------------------------------------------------------
     # APC effective-decode-steering signature (see
     # docs/design/dynamic_steering_apc_notification.md)
     # ------------------------------------------------------------------
@@ -666,9 +872,7 @@ class SteeringManager:
         the gain is folded per-call since it is a cheap scalar that the
         caller reads fresh)."""
         if self._tier_sig_cache is None:
-            self._tier_sig_cache = self._hash_tensor_vectors(
-                self.dynamic_tier_vectors
-            )
+            self._tier_sig_cache = self._hash_tensor_vectors(self.dynamic_tier_vectors)
         return self._tier_sig_cache
 
     def _monitor_signature(self) -> int:
@@ -687,9 +891,7 @@ class SteeringManager:
                     h.update(np.float64(cfg["threshold"]).tobytes())
                     h.update(np.float64(cfg["sharpness"]).tobytes())
                     h.update(b"\x01" if cfg.get("gate_rows") else b"\x00")
-            self._monitor_sig_cache = (
-                int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
-            )
+            self._monitor_sig_cache = int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
         return self._monitor_sig_cache
 
     @staticmethod
@@ -727,7 +929,21 @@ class SteeringManager:
         has_override = dyn_id is not None and dyn_id in self._dynamic_sig
         has_tier = self.has_dynamic_tier
         has_monitor = self.has_monitor
-        if not (has_override or has_tier or has_monitor):
+        # Per-row monitor on THIS request's decode row: keyed by its dyn
+        # override (if any) else its static decode config, plus the global
+        # decode row (row 2) a no-config decode request routes through. The
+        # probe/params are runtime state not in ``base_decode_hash``, so fold
+        # them in — else a temporal probe change reuses stale steered KV.
+        if dyn_id is not None:
+            row_owner_keys: tuple[tuple, ...] = (("dyn", dyn_id),)
+        else:
+            row_owner_keys = (
+                ("config", base_decode_hash, "decode"),
+                ("global", "decode"),
+            )
+        row_mon_sig = self._row_monitor_signature_for(row_owner_keys)
+        has_row_mon = row_mon_sig is not None
+        if not (has_override or has_tier or has_monitor or has_row_mon):
             return None
         h = hashlib.sha256(b"dynsteer-decode-sig")
         h.update(int(base_decode_hash).to_bytes(8, "little", signed=False))
@@ -742,6 +958,9 @@ class SteeringManager:
         if has_monitor:
             h.update(b"\x03mon")
             h.update(int(self._monitor_signature()).to_bytes(8, "little"))
+        if has_row_mon:
+            h.update(b"\x04rowmon")
+            h.update(int(row_mon_sig).to_bytes(8, "little"))
         return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
     # ------------------------------------------------------------------
@@ -1317,6 +1536,40 @@ class SteeringManager:
                 )
             )
             active_buf.fill_(True)
+
+        # Write each (hook, layer)'s PER-ROW monitor probe table + params
+        # (per-request in-graph monitor). Built in row-position order and
+        # scattered with the same ``indices`` as the table write; the
+        # ``row_active`` flag is set iff some row at this site carries a probe.
+        # Layers whose row-monitor buffers are still the ``(1, 1)`` dummies
+        # (engine did not enable the row monitor, or a test fake) are skipped.
+        for active_pos, (_table, hp_str, layer_idx, mod) in enumerate(active_tables):
+            try:
+                hp_enum = SteeringHookPoint(hp_str)
+            except ValueError:
+                continue
+            row_active_buf = getattr(mod, HOOK_POINT_ROW_ACTIVE_ATTR[hp_enum], None)
+            if row_active_buf is None:
+                continue
+            probe_tbl = getattr(mod, HOOK_POINT_ROW_PROBE_ATTR[hp_enum], None)
+            row_params_buf = getattr(mod, HOOK_POINT_ROW_PARAMS_ATTR[hp_enum], None)
+            if (
+                probe_tbl is None
+                or row_params_buf is None
+                or probe_tbl.shape[0] != _table.shape[0]
+            ):
+                # Disabled (dummy buffers) — never activate the per-row path.
+                row_active_buf.fill_(False)
+                continue
+            probe_mat, params_mat, any_cfg = self._build_row_probe_and_params(
+                hp_str, layer_idx, probe_tbl.device, int(_table.shape[1])
+            )
+            if not any_cfg:
+                row_active_buf.fill_(False)
+                continue
+            probe_tbl.index_copy_(0, indices, probe_mat.to(probe_tbl.dtype))
+            row_params_buf.index_copy_(0, indices, params_mat.to(row_params_buf.dtype))
+            row_active_buf.fill_(True)
 
         # Write the per-row strength scales (§5.3) alongside the tables.
         # The scale vector is hook/layer-independent, so build it once and
