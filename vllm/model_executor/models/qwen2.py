@@ -347,6 +347,17 @@ class Qwen2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+# Level-2 (2a) trunk re-entry prototype (in-process only): (entry_layer, hidden).
+# When set, Qwen2Model.forward enters the stack at ``entry_layer`` using ``hidden``
+# as the merged residual stream, skipping the layers below it.
+_PATCH_2A_ENTRY: "tuple[int, torch.Tensor] | None" = None
+
+
+def set_patch_2a_entry(spec: "tuple[int, torch.Tensor] | None") -> None:
+    global _PATCH_2A_ENTRY
+    _PATCH_2A_ENTRY = spec
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": {0: "b"},
@@ -439,7 +450,17 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if get_pp_group().is_first_rank:
+        # Level-2 (2a) trunk re-entry prototype: enter the stack at layer L with
+        # the cached merged residual stream, skipping layers < L. Feeding
+        # (hidden_states=merged, residual=None) is bit-identical to the normal
+        # path, because input_layernorm(h, r) only ever depends on h + r.
+        _start_layer = self.start_layer
+        entry_2a = _PATCH_2A_ENTRY
+        if entry_2a is not None and get_pp_group().is_first_rank:
+            _start_layer = entry_2a[0]
+            hidden_states = entry_2a[1]
+            residual = None
+        elif get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -452,7 +473,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
+            islice(self.layers, _start_layer, self.end_layer)
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
