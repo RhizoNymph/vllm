@@ -33,6 +33,7 @@ from vllm.model_executor.layers.steering import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.steering_action_queue import (
+    DECLARATIVE_SOURCE,
     RequestSteeringOverride,
     SteeringActionQueue,
     SteeringMonitorUpdate,
@@ -226,6 +227,11 @@ class SteeringModelRunnerMixin:
         # scheduler accounting are never touched. Cleaned up on request
         # finish, preemption resumption, and streaming re-add.
         self._req_dynamic_decode: dict[str, int] = {}
+        # req_id -> source tag that owns the request's dynamic override.
+        # Enforces precedence: an operator/server consumer (any non-declarative
+        # source) WINS over a client declarative gate. Cleaned up alongside
+        # ``_req_dynamic_decode``.
+        self._req_override_source: dict[str, str] = {}
         # APC steering-signature reporting (see
         # docs/design/dynamic_steering_apc_notification.md). Last effective
         # decode signature reported to the scheduler per request, so each
@@ -1258,6 +1264,14 @@ class SteeringModelRunnerMixin:
                 "dynamic override pool is disabled (max_dynamic_steering_configs=0)"
             )
 
+        # Precedence: a client declarative gate must yield to an
+        # operator/server consumer that already owns this request's override.
+        owner = self._req_override_source.get(req_id)
+        if source == DECLARATIVE_SOURCE and owner is not None and owner != source:
+            return _reject(
+                f"declarative gate yields: request already steered by '{owner}'"
+            )
+
         existing_dyn_id = self._req_dynamic_decode.get(req_id)
 
         # Clear: revert to admitted routing. Clearing a request with no
@@ -1265,6 +1279,7 @@ class SteeringModelRunnerMixin:
         if action.vectors is None:
             if existing_dyn_id is not None:
                 self._req_dynamic_decode.pop(req_id, None)
+                self._req_override_source.pop(req_id, None)
                 mgr.release_dynamic_config(existing_dyn_id)
             return True
 
@@ -1278,27 +1293,43 @@ class SteeringModelRunnerMixin:
                 "request is still prefilling (overrides are decode-only; "
                 "prefill steering feeds prefix-cache keys)"
             )
+
+        # Compose-on-top: fold the request's admitted decode steering delta
+        # into the override so ``action.vectors`` adds to (rather than
+        # replaces) the client's static decode steering.
+        vectors = action.vectors
+        if action.compose_admitted:
+            req_state = self.requests.get(req_id)
+            sp = req_state.sampling_params if req_state is not None else None
+            admitted = (
+                self._resolve_request_steering(sp, "decode") if sp is not None else None
+            )
+            if admitted:
+                vectors = merge_steering_specs(admitted, action.vectors)
+
         try:
-            validate_steering_vectors(action.vectors, self._steerable_layers_cache)
+            validate_steering_vectors(vectors, self._steerable_layers_cache)
         except SteeringVectorError as exc:
             return _reject(str(exc))
 
         if existing_dyn_id is not None:
             mgr.update_dynamic_config(
                 existing_dyn_id,
-                action.vectors,
+                vectors,
                 locally_owned_layers=self._locally_owned_layers,
             )
+            self._req_override_source[req_id] = source
             return True
         try:
             dyn_id, _row = mgr.register_dynamic_config(
-                action.vectors,
+                vectors,
                 locally_owned_layers=self._locally_owned_layers,
             )
         except RuntimeError as exc:
             # Pool exhausted: previous state (admitted routing) kept.
             return _reject(str(exc))
         self._req_dynamic_decode[req_id] = dyn_id
+        self._req_override_source[req_id] = source
         return True
 
     def _apply_scale_update(
@@ -1339,6 +1370,12 @@ class SteeringModelRunnerMixin:
             # Resolve req_id -> the request's live dynamic-override row.
             # Lets a sync consumer modulate a per-request override's
             # strength cheaply without ever seeing the internal dyn_id.
+            owner = self._req_override_source.get(action.req_id)
+            if source == DECLARATIVE_SOURCE and owner is not None and owner != source:
+                return _reject(
+                    f"declarative gate yields: request {action.req_id} already "
+                    f"steered by '{owner}'"
+                )
             dyn_id = self._req_dynamic_decode.get(action.req_id)
             if dyn_id is None:
                 return _reject(
@@ -1412,6 +1449,12 @@ class SteeringModelRunnerMixin:
                 "per-row monitor requires the engine flag enable_row_monitor"
             )
         if action.req_id is not None:
+            owner = self._req_override_source.get(action.req_id)
+            if source == DECLARATIVE_SOURCE and owner is not None and owner != source:
+                return _reject(
+                    f"declarative gate yields: request {action.req_id} already "
+                    f"steered by '{owner}'"
+                )
             dyn_id = self._req_dynamic_decode.get(action.req_id)
             if dyn_id is None:
                 return _reject(
@@ -1442,7 +1485,12 @@ class SteeringModelRunnerMixin:
         return True
 
     def _drop_request_dynamic_override(self, req_id: str) -> None:
-        """Release ``req_id``'s dynamic override, if any. Idempotent."""
+        """Release ``req_id``'s dynamic override, if any. Idempotent.
+
+        ``release_dynamic_config`` also purges the row's per-row monitor and
+        strength scale, so a per-request declarative gate leaves no residue.
+        """
+        self._req_override_source.pop(req_id, None)
         dyn_id = self._req_dynamic_decode.pop(req_id, None)
         if dyn_id is not None and self._steering_manager is not None:
             self._steering_manager.release_dynamic_config(dyn_id)

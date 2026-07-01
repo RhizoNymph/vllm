@@ -102,6 +102,13 @@ class RequestSteeringOverride:
 
     req_id: str
     vectors: dict[str, dict[int, np.ndarray]] | None
+    # When True, the runner folds the request's admitted decode steering
+    # delta into the override row so it becomes
+    # ``global_decode_effective + admitted_decode_delta + vectors`` (i.e.
+    # ``vectors`` is ADDED ON TOP of the request's static decode steering
+    # rather than replacing it). Used by the declarative consumer's ``add``
+    # gates so a client's static ``decode_steering_vectors`` are preserved.
+    compose_admitted: bool = False
     # Identifies the submitting observer in logs and stats.
     source: str = ""
 
@@ -182,6 +189,14 @@ class SteeringMonitorUpdate:
     config_hash: int | None = None
     dyn_id: int | None = None
     source: str = ""
+
+
+# Source tag stamped on every action emitted by the built-in declarative
+# per-request steering consumer. The runner uses it to enforce precedence:
+# an operator/server-registered consumer (any other source) WINS over a
+# client's declarative gate — a declarative action targeting a request already
+# owned by another source is rejected and logged.
+DECLARATIVE_SOURCE = "declarative"
 
 
 # Everything the apply path accepts, from either transport (queue or
