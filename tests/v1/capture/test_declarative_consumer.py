@@ -156,6 +156,22 @@ def test_multi_add_merge_single_override():
     )
 
 
+def test_conversation_bridges_a_later_gateless_turn():
+    # A later turn of a latched conversation carries NO gates of its own but
+    # must still be bridged (regression: the no-gate short-circuit used to run
+    # before the bridge check, so gateless turns were skipped).
+    c = _consumer(probe_sites=["5:post_block"])
+    tensors = {SITE: torch.ones(1, HIDDEN) * 10.0}
+    c.on_step(_view([_req("t1", [_add("rest_of_conversation", "probe")], cid="k")],
+                    tensors))
+    assert len(c._latched) == 1
+    # turn 2: same conversation, steering=None -> bridged, not skipped
+    acts = c.on_step(_view([_req("t2", None, cid="k")]))
+    assert _types(acts) == ["RequestSteeringOverride"]
+    assert acts[0].req_id == "t2"
+    assert c._bridges == 1
+
+
 def test_finished_request_state_pruned():
     c = _consumer()
     c.on_step(_view([_req("r", [_add("rest_of_request")])]))

@@ -185,11 +185,12 @@ class DeclarativeSteeringConsumer(SteeringController):
                         req_id=rid, vectors=None, source=DECLARATIVE_SOURCE
                     )
                 )
-            gates = req.steering
-            if not gates or req.phase != "decode":
+            if req.phase != "decode":
                 continue
             cid = req.conversation_id
-            # Bridge a new request of an already-latched conversation.
+            # Bridge a new request of an already-latched conversation FIRST —
+            # a later turn is bridged even when it declares no gates of its own
+            # (that is the point of rest_of_conversation).
             if (
                 rid not in self._armed
                 and cid is not None
@@ -200,6 +201,8 @@ class DeclarativeSteeringConsumer(SteeringController):
                 self._bridges += 1
                 continue
             if rid in self._armed:
+                continue
+            if not req.steering:
                 continue
             try:
                 self._process_request(req, view, actions)
