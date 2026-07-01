@@ -24,34 +24,19 @@ from vllm.v1.worker.patch_runner_mixin import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
 
 
 class PatchRunnerMixin(PatchModelRunnerMixin):
-    """v2 activation-patching control plane."""
+    """v2 activation-patching control plane.
 
-    def _patch_add_request(self, new_req_data: NewRequestData) -> None:
-        """Resolve a newly admitted request's patch spec into source entries.
-
-        Resolution (sampling_params.patch + the per-worker source store) is
-        wired in the source-store / admission phase. Streaming re-adds drop any
-        prior spec first, matching the steering/capture re-add discipline.
-        """
-        if not self._patchable_layers:
-            return
-        self._patch_specs.pop(new_req_data.req_id, None)
-
-        from vllm.v1.worker.gpu.patch_resolve import resolve_patch_entries
-
-        entries = resolve_patch_entries(
-            new_req_data,
-            local_layers=self._locally_owned_patch_layers,
-        )
-        if entries:
-            self._patch_specs[new_req_data.req_id] = entries
+    ``_patch_add_request`` (spec resolution) and the request lifecycle are
+    runner-agnostic and live in :class:`PatchModelRunnerMixin`; this subclass
+    adds only the v2-coupled per-step batch-view projection.
+    """
 
     def _update_patch_buffers_v2(
         self, scheduler_output: SchedulerOutput, input_batch: InputBatch

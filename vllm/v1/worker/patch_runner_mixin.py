@@ -251,6 +251,27 @@ class PatchModelRunnerMixin:
 
     # ---- request lifecycle -------------------------------------------------
 
+    def _patch_add_request(self, new_req_data) -> None:
+        """Resolve a newly admitted request's patch spec into source entries.
+
+        Runner-agnostic: resolution reads ``sampling_params.patch`` + the
+        per-worker source store, keeping only locally-owned layers (PP) and
+        broadcasting across the TP group. Streaming re-adds drop any prior spec
+        first, matching the steering/capture re-add discipline.
+        """
+        if not self._patchable_layers:
+            return
+        self._patch_specs.pop(new_req_data.req_id, None)
+
+        from vllm.v1.worker.gpu.patch_resolve import resolve_patch_entries
+
+        entries = resolve_patch_entries(
+            new_req_data,
+            local_layers=self._locally_owned_patch_layers,
+        )
+        if entries:
+            self._patch_specs[new_req_data.req_id] = entries
+
     def _patch_finish_requests(self, req_ids: set[str] | list[str]) -> None:
         """Drop specs for finished/preempted requests.
 
