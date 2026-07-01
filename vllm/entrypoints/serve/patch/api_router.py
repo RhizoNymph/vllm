@@ -96,6 +96,28 @@ def cell_metric(
     return ans
 
 
+def dispatch_mode(
+    mode: str,
+    n_prompt: int,
+    n_positions: int,
+    apc_on: bool,
+    min_prompt_tokens: int,
+    min_positions: int,
+) -> str:
+    """Resolve ``mode`` to the strategy actually used ("level1" or "2a").
+
+    ``auto`` picks 2a only in its favorable regime — long prompt AND large
+    per-layer groups, with prefix caching off (2a recomputes all positions).
+    Otherwise 2a's trunk + fragmentation overhead makes it slower, so use
+    level1. Explicit "level1"/"2a" pass through unchanged.
+    """
+    if mode != "auto":
+        return mode
+    if not apc_on and n_prompt >= min_prompt_tokens and n_positions >= min_positions:
+        return "2a"
+    return "level1"
+
+
 def argmax_cell(
     grid: list[list[float | None]], layers: list[int], positions: list[int]
 ) -> dict | None:
@@ -182,14 +204,14 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     if body.hook not in _INJECTABLE_HOOKS:
         return _err(f"hook {body.hook!r} not injectable; valid: "
                     f"{sorted(_INJECTABLE_HOOKS)}")
-    if body.mode == "2a":
-        # 2a re-enters at layer L and must recompute every position (layers >= L
-        # build their KV from the injected trunk); prefix reuse would serve stale
-        # KV. Fail loud until the per-request floor-0 wiring lands.
-        cache_config = getattr(vllm_config, "cache_config", None)
-        if getattr(cache_config, "enable_prefix_caching", False):
-            return _err("mode=2a requires the server to run with "
-                        "--no-enable-prefix-caching")
+    # 2a re-enters at layer L and must recompute every position (layers >= L
+    # build their KV from the injected trunk); prefix reuse would serve stale KV.
+    cache_config = getattr(vllm_config, "cache_config", None)
+    apc_on = bool(getattr(cache_config, "enable_prefix_caching", False))
+    if body.mode == "2a" and apc_on:
+        # Explicit 2a under prefix caching fails loud (auto silently uses level1).
+        return _err("mode=2a requires the server to run with "
+                    "--no-enable-prefix-caching")
 
     num_layers = vllm_config.model_config.get_total_num_hidden_layers()
     layers = resolve_layers(body.layers)
@@ -210,6 +232,19 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     if not layers or not positions:
         return _err("empty sweep grid (no layers or positions)")
     corrupt_val = cell_metric(corrupt_lp, body) if corrupt_lp else None
+
+    # Adaptive dispatch: "auto" uses 2a only in its favorable regime (long
+    # prompt + large per-layer groups, prefix caching off), else level1 —
+    # otherwise 2a's trunk + fragmentation overhead makes it slower.
+    effective_mode = dispatch_mode(
+        body.mode, n_prompt, len(positions), apc_on,
+        body.auto_min_prompt_tokens, body.auto_min_positions,
+    )
+    if body.mode == "auto":
+        logger.info(
+            "patch_sweep auto → %s (n_prompt=%d positions=%d apc=%s)",
+            effective_mode, n_prompt, len(positions), apc_on,
+        )
 
     # Validate every referenced source site exists (one combined spec).
     from vllm.v1.capture.patch_admission import (
@@ -242,8 +277,8 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     ]
 
     # For 2a, capture the corrupt trunk once so cells can re-enter mid-stack.
-    trunk_run: str | None = body.trunk_run if body.mode == "2a" else None
-    if body.mode == "2a" and trunk_run is None:
+    trunk_run: str | None = body.trunk_run if effective_mode == "2a" else None
+    if effective_mode == "2a" and trunk_run is None:
         # No pre-captured trunk: capture it in-line (only the needed layers,
         # post_block[L-1]). Reusing a pre-captured trunk across sweeps avoids
         # paying this each time.
@@ -319,6 +354,7 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         clean=clean_val,
         corrupt=corrupt_val,
         argmax=argmax_cell(grid, layers, positions),
+        mode_used=effective_mode,
     )
 
 

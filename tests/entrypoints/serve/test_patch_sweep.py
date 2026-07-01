@@ -8,6 +8,7 @@ from vllm.entrypoints.serve.patch.api_router import (
     answer_logprob,
     argmax_cell,
     cell_metric,
+    dispatch_mode,
     resolve_layers,
     resolve_positions,
 )
@@ -94,3 +95,25 @@ class TestArgmax:
 
     def test_argmax_all_none(self):
         assert argmax_cell([[None]], [0], [0]) is None
+
+
+class TestDispatchMode:
+    def test_explicit_passthrough(self):
+        assert dispatch_mode("level1", 9999, 999, False, 512, 16) == "level1"
+        assert dispatch_mode("2a", 1, 1, True, 512, 16) == "2a"
+
+    def test_auto_picks_2a_when_large(self):
+        assert dispatch_mode("auto", 2000, 40, False, 512, 16) == "2a"
+
+    def test_auto_level1_short_prompt(self):
+        assert dispatch_mode("auto", 100, 40, False, 512, 16) == "level1"
+
+    def test_auto_level1_few_positions(self):
+        assert dispatch_mode("auto", 2000, 5, False, 512, 16) == "level1"
+
+    def test_auto_level1_when_apc_on(self):
+        assert dispatch_mode("auto", 2000, 40, True, 512, 16) == "level1"
+
+    def test_auto_respects_custom_thresholds(self):
+        # A big model can lower the prompt threshold to use 2a on short prompts.
+        assert dispatch_mode("auto", 128, 32, False, 64, 16) == "2a"

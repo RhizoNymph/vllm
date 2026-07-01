@@ -50,8 +50,16 @@ class PatchSweepRequest(BaseModel):
     # Execution strategy. "level1" (default) recomputes the whole stack per
     # cell. "2a" re-enters the forward at each cell's layer from the cached
     # corrupt trunk, skipping layers below it (serialized per-layer group so
-    # each batch is homogeneous in entry_layer).
-    mode: Literal["level1", "2a"] = "level1"
+    # each batch is homogeneous in entry_layer). "auto" dispatches per sweep:
+    # 2a only when the sweep is in 2a's favorable regime (long prompt + large
+    # per-layer groups), else level1 — 2a's trunk + fragmentation overhead makes
+    # it slower for small sweeps.
+    mode: Literal["level1", "2a", "auto"] = "level1"
+    # "auto" thresholds: use 2a only when prompt length and positions-per-layer
+    # both clear these. Defaults are conservative for a small model; larger
+    # models are compute-bound sooner, so they can lower auto_min_prompt_tokens.
+    auto_min_prompt_tokens: int = 512
+    auto_min_positions: int = 16
     # 2a only: handle of a pre-captured corrupt trunk (post_block at the swept
     # layers' L-1). If omitted, the endpoint captures it in-line — but capturing
     # once and reusing across sweeps amortizes that cost, which otherwise
@@ -70,3 +78,6 @@ class PatchSweepResponse(BaseModel):
     corrupt: float | None = None
     argmax: dict | None = None
     skipped: list[dict] = Field(default_factory=list)
+    # Execution strategy actually used ("level1" or "2a"); differs from the
+    # request when mode="auto" dispatches.
+    mode_used: str = "level1"
