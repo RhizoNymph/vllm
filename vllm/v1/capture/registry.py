@@ -109,8 +109,21 @@ def _load_entry_points() -> dict[str, type[CaptureConsumer]]:
                 )
             resolved[ep.name] = cls
 
+        # Merge vLLM's built-in consumers last so a reserved built-in name
+        # resolves even on an editable install whose dist-info entry points
+        # predate the built-in (and cannot be shadowed by a third-party EP).
+        resolved.update(_builtin_consumers())
+
         _class_cache = resolved
         return _class_cache
+
+
+def _builtin_consumers() -> dict[str, type[CaptureConsumer]]:
+    """vLLM's in-tree consumers, registered under reserved (leading-underscore)
+    names independent of the entry-point/dist-info state."""
+    from vllm.v1.capture.declarative import DeclarativeSteeringConsumer
+
+    return {"_declarative_steering": DeclarativeSteeringConsumer}
 
 
 def load_consumer_class(name: str) -> type[CaptureConsumer]:
