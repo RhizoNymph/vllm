@@ -857,6 +857,8 @@ class GPUModelRunner(
             # Resolve the request's patch spec into per-layer source vectors
             # (rank-local; only locally-owned layers are kept).
             self._patch_add_request(new_req_data)
+            # Record any Level-2 (2a) trunk re-entry spec for this request.
+            self._patch_2a_add_request(new_req_data)
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
@@ -1317,6 +1319,26 @@ class GPUModelRunner(
             if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
                 input_ids = None
 
+        # Level-2 (2a) trunk re-entry: when every scheduled request carries a
+        # homogeneous ``patch_2a`` spec, replace the embeddings with the cached
+        # trunk residual and enter the stack at ``entry_layer`` (skipping lower
+        # layers). Any violation degrades to the normal full forward (Level-1).
+        patch_2a_active = False
+        if (
+            getattr(self, "_patchable_layers", None)
+            and self.is_first_pp_rank
+            and batch_desc.cg_mode == CUDAGraphMode.NONE
+            and not (dummy_run and skip_attn_for_dummy_run)
+        ):
+            _entry = self._build_2a_entry(input_batch)
+            if _entry is not None:
+                from vllm.model_executor.models.qwen2 import set_patch_2a_entry
+
+                entry_layer, inputs_embeds = _entry
+                input_ids = None
+                set_patch_2a_entry((entry_layer, None))
+                patch_2a_active = True
+
         model_inputs = {
             "input_ids": input_ids,
             "positions": input_batch.positions,
@@ -1382,6 +1404,12 @@ class GPUModelRunner(
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if patch_2a_active:
+            # Clear the per-step 2a entry so the next step re-enters at layer 0.
+            from vllm.model_executor.models.qwen2 import set_patch_2a_entry
+
+            set_patch_2a_entry(None)
 
         # Dispatch the rows the in-forward capture op gathered this step. Runs
         # on every PP stage (each capturer rank owns its stage's layers) and

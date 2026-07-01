@@ -347,13 +347,16 @@ class Qwen2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-# Level-2 (2a) trunk re-entry prototype (in-process only): (entry_layer, hidden).
-# When set, Qwen2Model.forward enters the stack at ``entry_layer`` using ``hidden``
-# as the merged residual stream, skipping the layers below it.
-_PATCH_2A_ENTRY: "tuple[int, torch.Tensor] | None" = None
+# Level-2 (2a) trunk re-entry: (start_layer, hidden_or_None). When set,
+# Qwen2Model.forward enters the stack at ``start_layer`` using the merged
+# residual stream as input, skipping the layers below it. ``hidden`` is the
+# entry residual; if None, it is taken from ``inputs_embeds`` (the model runner
+# path). Set per-step by the runner (single-threaded execute_model) or directly
+# in-process by the proof harness.
+_PATCH_2A_ENTRY: "tuple[int, torch.Tensor | None] | None" = None
 
 
-def set_patch_2a_entry(spec: "tuple[int, torch.Tensor] | None") -> None:
+def set_patch_2a_entry(spec: "tuple[int, torch.Tensor | None] | None") -> None:
     global _PATCH_2A_ENTRY
     _PATCH_2A_ENTRY = spec
 
@@ -457,8 +460,10 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         _start_layer = self.start_layer
         entry_2a = _PATCH_2A_ENTRY
         if entry_2a is not None and get_pp_group().is_first_rank:
+            # entry_2a = (start_layer, hidden_or_None). When hidden is None the
+            # runner supplies the entry residual via ``inputs_embeds``.
             _start_layer = entry_2a[0]
-            hidden_states = entry_2a[1]
+            hidden_states = entry_2a[1] if entry_2a[1] is not None else inputs_embeds
             residual = None
         elif get_pp_group().is_first_rank:
             if inputs_embeds is not None:

@@ -187,6 +187,12 @@ class PatchModelRunnerMixin:
         self._patch_specs = {}
         self._patch_touched_sites = set()
         self._patch_index_dirty = False
+        # Level-2 (2a) trunk re-entry: per-request (entry_layer, trunk_run) and
+        # the entry-tensor build params (filled below when patching is enabled).
+        self._patch_2a_specs: dict[str, tuple[int, str]] = {}
+        self._patch_2a_hidden = 0
+        self._patch_2a_device = None
+        self._patch_2a_dtype = None
         patchable: dict[int, nn.Module] = {}
         if hasattr(self, "get_model"):
             for mod in self.get_model().modules():
@@ -225,6 +231,12 @@ class PatchModelRunnerMixin:
         table_device = a_table.device
         table_dtype = a_table.dtype
         hidden_size = int(a_table.shape[1])
+        # 2a entry tensor is built in the residual-stream (compute) dtype.
+        self._patch_2a_hidden = hidden_size
+        self._patch_2a_device = table_device
+        self._patch_2a_dtype = getattr(
+            self.vllm_config.model_config, "dtype", table_dtype
+        )
 
         if table_device.type == "cuda":
             from vllm.model_executor.layers.patch_kernel import (
@@ -257,10 +269,11 @@ class PatchModelRunnerMixin:
         Preempted requests re-enter via the add path on resume, which
         re-resolves their spec; recomputation re-fires the patch automatically.
         """
-        if not self._patch_specs:
+        if not self._patch_specs and not self._patch_2a_specs:
             return
         for req_id in req_ids:
             self._patch_specs.pop(req_id, None)
+            self._patch_2a_specs.pop(req_id, None)
 
     # ---- per-step buffer maintenance ---------------------------------------
 

@@ -123,10 +123,12 @@ async def _first_token_logprobs(
     patch: list[dict] | None,
     logprobs: int,
     tag: str,
+    patch_2a: dict | None = None,
 ) -> tuple[dict[int, Any] | None, int]:
     """Run one short greedy generation; return (first-token logprobs, n_prompt)."""
     sp = SamplingParams(
-        temperature=0.0, max_tokens=1, logprobs=logprobs, patch=patch
+        temperature=0.0, max_tokens=1, logprobs=logprobs, patch=patch,
+        patch_2a=patch_2a,
     )
     request_id = f"patchsweep-{tag}-{uuid4().hex[:8]}"
     final = None
@@ -135,6 +137,33 @@ async def _first_token_logprobs(
     if final is None or not final.outputs or not final.outputs[0].logprobs:
         return None, len(final.prompt_token_ids) if final else 0
     return final.outputs[0].logprobs[0], len(final.prompt_token_ids)
+
+
+async def _capture_trunk(
+    eng: EngineClient, prompt: str, trunk_layers: list[int]
+) -> str:
+    """Capture the corrupt baseline's ``post_block`` trunk (the 2a entry rows).
+
+    Only the layers actually needed as entry residuals are captured (``L - 1``
+    for each swept entry-layer ``L``); capturing all layers is dominated by the
+    per-row store writes and needlessly slow. Returns the trunk run handle, held
+    until the capture writes are durable.
+    """
+    trunk_run = f"trunk-{uuid4().hex[:8]}"
+    capture = {
+        "patch_source": {
+            "run": trunk_run,
+            "hooks": {"post_block": trunk_layers},
+            "positions": "all_prompt",
+        }
+    }
+    sp = SamplingParams(temperature=0.0, max_tokens=1, capture=capture)
+    request_id = f"patchsweep-trunk-{uuid4().hex[:8]}"
+    async for _ in eng.generate({"prompt": prompt}, sp, request_id):
+        pass
+    if hasattr(eng, "wait_for_capture_results"):
+        await eng.wait_for_capture_results(request_id)
+    return trunk_run
 
 
 @router.post("/v1/patch_sweep")
@@ -153,6 +182,14 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     if body.hook not in _INJECTABLE_HOOKS:
         return _err(f"hook {body.hook!r} not injectable; valid: "
                     f"{sorted(_INJECTABLE_HOOKS)}")
+    if body.mode == "2a":
+        # 2a re-enters at layer L and must recompute every position (layers >= L
+        # build their KV from the injected trunk); prefix reuse would serve stale
+        # KV. Fail loud until the per-request floor-0 wiring lands.
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if getattr(cache_config, "enable_prefix_caching", False):
+            return _err("mode=2a requires the server to run with "
+                        "--no-enable-prefix-caching")
 
     num_layers = vllm_config.model_config.get_total_num_hidden_layers()
     layers = resolve_layers(body.layers)
@@ -204,6 +241,20 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         [None] * len(positions) for _ in layers
     ]
 
+    # For 2a, capture the corrupt trunk once so cells can re-enter mid-stack.
+    trunk_run: str | None = body.trunk_run if body.mode == "2a" else None
+    if body.mode == "2a" and trunk_run is None:
+        # No pre-captured trunk: capture it in-line (only the needed layers,
+        # post_block[L-1]). Reusing a pre-captured trunk across sweeps avoids
+        # paying this each time.
+        trunk_layers = sorted({layer - 1 for layer in layers if layer >= 1})
+        try:
+            trunk_run = await _capture_trunk(eng, body.prompt, trunk_layers)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("patch_sweep 2a trunk capture failed")
+            return _err(f"2a trunk capture failed: {exc}",
+                        HTTPStatus.INTERNAL_SERVER_ERROR.value)
+
     async def run_cell(i: int, layer: int, j: int, pos: int) -> None:
         patch = [
             {
@@ -215,18 +266,33 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
                 "alpha": body.alpha,
             }
         ]
+        # Re-enter at ``layer`` from the cached trunk (entry_layer >= 1 only;
+        # layer 0 has nothing below to skip, so it runs as Level-1).
+        patch_2a = (
+            {"entry_layer": layer, "trunk_run": trunk_run}
+            if trunk_run is not None and layer >= 1
+            else None
+        )
         lp, _ = await _first_token_logprobs(
-            eng, body.prompt, patch, body.logprobs, f"{layer}-{pos}"
+            eng, body.prompt, patch, body.logprobs, f"{layer}-{pos}", patch_2a
         )
         grid[i][j] = cell_metric(lp, body) if lp else None
 
-    await asyncio.gather(
-        *(
-            run_cell(i, layer, j, pos)
-            for i, layer in enumerate(layers)
-            for j, pos in enumerate(positions)
+    if trunk_run is not None:
+        # Serialize per entry-layer so each in-flight batch is homogeneous in
+        # entry_layer (the runner requires a single start_layer per forward).
+        for i, layer in enumerate(layers):
+            await asyncio.gather(
+                *(run_cell(i, layer, j, pos) for j, pos in enumerate(positions))
+            )
+    else:
+        await asyncio.gather(
+            *(
+                run_cell(i, layer, j, pos)
+                for i, layer in enumerate(layers)
+                for j, pos in enumerate(positions)
+            )
         )
-    )
 
     clean_val = body.clean_baseline
     if body.metric == "recovered":

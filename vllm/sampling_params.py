@@ -440,6 +440,16 @@ class SamplingParams(
     reuse is clamped to this position so it (and later positions) are
     re-forwarded and the patch hook fires. Not client-settable."""
 
+    patch_2a: dict[str, Any] | None = None
+    """Level-2 (2a) trunk re-entry spec: ``{"entry_layer": int, "trunk_run":
+    str}``. When set, the worker enters the forward at ``entry_layer`` using the
+    captured ``trunk_run`` residual (``post_block[entry_layer - 1]``) as the
+    merged residual stream, skipping layers below it — instead of re-running the
+    whole stack. Used with a ``patch`` spec whose site sits at ``entry_layer``
+    (the clean source, applied on top of the trunk entry). Requires the batch to
+    be homogeneous in ``entry_layer``; the sweep endpoint serializes layer
+    groups. Structural validation only at construction."""
+
     steering_vectors: SteeringVectorSpec | None = None
     """Base steering vectors applied to both prefill and decode phases.
     Keyed by hook point name (pre_attn, post_attn, post_block), then
@@ -536,6 +546,7 @@ class SamplingParams(
         repetition_detection: RepetitionDetectionParams | None = None,
         capture: dict[str, Any] | None = None,
         patch: list[dict[str, Any]] | None = None,
+        patch_2a: dict[str, Any] | None = None,
         steering_vectors: SteeringVectorSpec | None = None,
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
@@ -583,6 +594,7 @@ class SamplingParams(
             repetition_detection=repetition_detection,
             capture=capture,
             patch=patch,
+            patch_2a=patch_2a,
             steering_vectors=steering_vectors,
             prefill_steering_vectors=prefill_steering_vectors,
             decode_steering_vectors=decode_steering_vectors,
@@ -632,6 +644,7 @@ class SamplingParams(
         self._verify_args()
         self._validate_capture()
         self._validate_patch()
+        self._validate_patch_2a()
 
         if self.temperature < _SAMPLING_EPS:
             # Zero temperature means greedy sampling.
@@ -721,6 +734,24 @@ class SamplingParams(
             alpha = entry.get("alpha", 1.0)
             if not isinstance(alpha, (int, float)):
                 raise ValueError(f"patch[{i}]['alpha'] must be a number")
+
+    def _validate_patch_2a(self) -> None:
+        """Structural check on ``patch_2a`` (Level-2 trunk re-entry)."""
+        spec = self.patch_2a
+        if spec is None:
+            return
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"patch_2a must be a dict, got {type(spec).__name__}"
+            )
+        if "entry_layer" not in spec or "trunk_run" not in spec:
+            raise ValueError(
+                "patch_2a requires 'entry_layer' and 'trunk_run' keys"
+            )
+        if not isinstance(spec["entry_layer"], int) or spec["entry_layer"] < 1:
+            raise ValueError("patch_2a['entry_layer'] must be an int >= 1")
+        if not isinstance(spec["trunk_run"], str):
+            raise ValueError("patch_2a['trunk_run'] must be a str")
 
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):

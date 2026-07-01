@@ -47,6 +47,16 @@ class PatchSweepRequest(BaseModel):
     # Clean baseline answer metric (from capture_clean) for the recovered
     # metric; the corrupt baseline is computed in-endpoint.
     clean_baseline: float | None = None
+    # Execution strategy. "level1" (default) recomputes the whole stack per
+    # cell. "2a" re-enters the forward at each cell's layer from the cached
+    # corrupt trunk, skipping layers below it (serialized per-layer group so
+    # each batch is homogeneous in entry_layer).
+    mode: Literal["level1", "2a"] = "level1"
+    # 2a only: handle of a pre-captured corrupt trunk (post_block at the swept
+    # layers' L-1). If omitted, the endpoint captures it in-line — but capturing
+    # once and reusing across sweeps amortizes that cost, which otherwise
+    # dominates a single small sweep.
+    trunk_run: str | None = None
 
 
 class PatchSweepResponse(BaseModel):
