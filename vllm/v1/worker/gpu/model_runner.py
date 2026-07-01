@@ -1178,6 +1178,15 @@ class GPUModelRunner(
             # before prepare_inputs runs.
             capture_pending = self._capture_gate_decision(scheduler_output)
 
+        # A step containing Level-2 (2a) requests must run eager + uncompiled:
+        # 2a sets a per-step ``start_layer`` (skipping layers) that a captured
+        # cudagraph or a torch.compiled trace would bake in / ignore. Forces only
+        # these steps eager — all other traffic keeps cudagraphs.
+        patch_2a_pending = bool(getattr(self, "_patch_2a_specs", None)) and any(
+            r in self._patch_2a_specs
+            for r in scheduler_output.num_scheduled_tokens
+        )
+
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
@@ -1196,6 +1205,9 @@ class GPUModelRunner(
             # Encoder-decoder models such as Whisper should run eager/non-compiled
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
+            skip_compiled = True
+        if patch_2a_pending:
+            # 2a's runtime start_layer must not be baked by torch.compile.
             skip_compiled = True
 
         # Capture-aware piecewise fallback: when a per-request capture forces
