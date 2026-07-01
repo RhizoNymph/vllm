@@ -100,20 +100,20 @@ def dispatch_mode(
     mode: str,
     n_prompt: int,
     n_positions: int,
-    apc_on: bool,
     min_prompt_tokens: int,
     min_positions: int,
 ) -> str:
     """Resolve ``mode`` to the strategy actually used ("level1" or "2a").
 
     ``auto`` picks 2a only in its favorable regime — long prompt AND large
-    per-layer groups, with prefix caching off (2a recomputes all positions).
-    Otherwise 2a's trunk + fragmentation overhead makes it slower, so use
-    level1. Explicit "level1"/"2a" pass through unchanged.
+    per-layer groups. Otherwise 2a's trunk + fragmentation overhead makes it
+    slower, so use level1. Explicit "level1"/"2a" pass through unchanged. 2a is
+    prefix-cache-safe (per-cell salt forces floor-0 + write isolation), so
+    prefix caching no longer gates the choice.
     """
     if mode != "auto":
         return mode
-    if not apc_on and n_prompt >= min_prompt_tokens and n_positions >= min_positions:
+    if n_prompt >= min_prompt_tokens and n_positions >= min_positions:
         return "2a"
     return "level1"
 
@@ -146,15 +146,26 @@ async def _first_token_logprobs(
     logprobs: int,
     tag: str,
     patch_2a: dict | None = None,
+    cache_salt: str | None = None,
 ) -> tuple[dict[int, Any] | None, int]:
-    """Run one short greedy generation; return (first-token logprobs, n_prompt)."""
+    """Run one short greedy generation; return (first-token logprobs, n_prompt).
+
+    ``cache_salt`` (set per 2a cell) makes the request's block hashes unique, so
+    it (a) finds no prefix hit and recomputes every position — the floor-0 that
+    2a needs since it rebuilds layers >= L from the injected trunk — and (b) does
+    not read or poison other requests' cached KV. This lets 2a run with prefix
+    caching enabled (no --no-enable-prefix-caching).
+    """
     sp = SamplingParams(
         temperature=0.0, max_tokens=1, logprobs=logprobs, patch=patch,
         patch_2a=patch_2a,
     )
+    prompt_in: dict[str, Any] = {"prompt": prompt}
+    if cache_salt is not None:
+        prompt_in["cache_salt"] = cache_salt
     request_id = f"patchsweep-{tag}-{uuid4().hex[:8]}"
     final = None
-    async for out in eng.generate({"prompt": prompt}, sp, request_id):
+    async for out in eng.generate(prompt_in, sp, request_id):
         final = out
     if final is None or not final.outputs or not final.outputs[0].logprobs:
         return None, len(final.prompt_token_ids) if final else 0
@@ -204,14 +215,6 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     if body.hook not in _INJECTABLE_HOOKS:
         return _err(f"hook {body.hook!r} not injectable; valid: "
                     f"{sorted(_INJECTABLE_HOOKS)}")
-    # 2a re-enters at layer L and must recompute every position (layers >= L
-    # build their KV from the injected trunk); prefix reuse would serve stale KV.
-    cache_config = getattr(vllm_config, "cache_config", None)
-    apc_on = bool(getattr(cache_config, "enable_prefix_caching", False))
-    if body.mode == "2a" and apc_on:
-        # Explicit 2a under prefix caching fails loud (auto silently uses level1).
-        return _err("mode=2a requires the server to run with "
-                    "--no-enable-prefix-caching")
 
     num_layers = vllm_config.model_config.get_total_num_hidden_layers()
     layers = resolve_layers(body.layers)
@@ -237,13 +240,13 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     # prompt + large per-layer groups, prefix caching off), else level1 —
     # otherwise 2a's trunk + fragmentation overhead makes it slower.
     effective_mode = dispatch_mode(
-        body.mode, n_prompt, len(positions), apc_on,
+        body.mode, n_prompt, len(positions),
         body.auto_min_prompt_tokens, body.auto_min_positions,
     )
     if body.mode == "auto":
         logger.info(
-            "patch_sweep auto → %s (n_prompt=%d positions=%d apc=%s)",
-            effective_mode, n_prompt, len(positions), apc_on,
+            "patch_sweep auto → %s (n_prompt=%d positions=%d)",
+            effective_mode, n_prompt, len(positions),
         )
 
     # Validate every referenced source site exists (one combined spec).
@@ -308,8 +311,15 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
             if trunk_run is not None and layer >= 1
             else None
         )
+        # Unique per-cell salt → this 2a cell finds no prefix hit (recomputes
+        # every position, the floor-0 2a needs) and its patched KV can't be read
+        # by or poison other requests. Enables running with prefix caching on.
+        cache_salt = (
+            f"2a-{trunk_run}-{layer}-{pos}" if patch_2a is not None else None
+        )
         lp, _ = await _first_token_logprobs(
-            eng, body.prompt, patch, body.logprobs, f"{layer}-{pos}", patch_2a
+            eng, body.prompt, patch, body.logprobs, f"{layer}-{pos}", patch_2a,
+            cache_salt,
         )
         grid[i][j] = cell_metric(lp, body) if lp else None
 

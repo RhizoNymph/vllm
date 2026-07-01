@@ -99,21 +99,18 @@ class TestArgmax:
 
 class TestDispatchMode:
     def test_explicit_passthrough(self):
-        assert dispatch_mode("level1", 9999, 999, False, 512, 16) == "level1"
-        assert dispatch_mode("2a", 1, 1, True, 512, 16) == "2a"
+        assert dispatch_mode("level1", 9999, 999, 512, 16) == "level1"
+        assert dispatch_mode("2a", 1, 1, 512, 16) == "2a"
 
     def test_auto_picks_2a_when_large(self):
-        assert dispatch_mode("auto", 2000, 40, False, 512, 16) == "2a"
+        assert dispatch_mode("auto", 2000, 40, 512, 16) == "2a"
 
     def test_auto_level1_short_prompt(self):
-        assert dispatch_mode("auto", 100, 40, False, 512, 16) == "level1"
+        assert dispatch_mode("auto", 100, 40, 512, 16) == "level1"
 
     def test_auto_level1_few_positions(self):
-        assert dispatch_mode("auto", 2000, 5, False, 512, 16) == "level1"
-
-    def test_auto_level1_when_apc_on(self):
-        assert dispatch_mode("auto", 2000, 40, True, 512, 16) == "level1"
+        assert dispatch_mode("auto", 2000, 5, 512, 16) == "level1"
 
     def test_auto_respects_custom_thresholds(self):
         # A big model can lower the prompt threshold to use 2a on short prompts.
-        assert dispatch_mode("auto", 128, 32, False, 64, 16) == "2a"
+        assert dispatch_mode("auto", 128, 32, 64, 16) == "2a"
