@@ -599,6 +599,10 @@ class EngineArgs:
     max_dynamic_steering_configs: int = SteeringConfig.max_dynamic_steering_configs
     enable_cross_layer_monitor: bool = SteeringConfig.enable_cross_layer_monitor
     enable_row_monitor: bool = SteeringConfig.enable_row_monitor
+    enable_declarative_gates: bool = SteeringConfig.enable_declarative_gates
+    declarative_probe_sites: list[str] = get_field(
+        SteeringConfig, "declarative_probe_sites"
+    )
 
     # --capture-consumers is repeatable (action="append"); when unset the
     # whole capture-consumer pipeline stays disabled.
@@ -1473,6 +1477,14 @@ class EngineArgs:
             "--enable-row-monitor",
             **steering_kwargs["enable_row_monitor"],
         )
+        steering_group.add_argument(
+            "--enable-declarative-gates",
+            **steering_kwargs["enable_declarative_gates"],
+        )
+        steering_group.add_argument(
+            "--declarative-probe-sites",
+            **steering_kwargs["declarative_probe_sites"],
+        )
 
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
@@ -2205,6 +2217,8 @@ class EngineArgs:
                 max_dynamic_steering_configs=self.max_dynamic_steering_configs,
                 enable_cross_layer_monitor=self.enable_cross_layer_monitor,
                 enable_row_monitor=self.enable_row_monitor,
+                enable_declarative_gates=self.enable_declarative_gates,
+                declarative_probe_sites=self.declarative_probe_sites,
             )
             if self.enable_steering
             else None
