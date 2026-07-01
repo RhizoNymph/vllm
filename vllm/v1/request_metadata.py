@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import msgspec
 
+from vllm.v1.steering_schema import SteeringGate
+
 
 class RequestMetadata(
     msgspec.Struct,
@@ -38,10 +40,21 @@ class RequestMetadata(
             host-side string metadata: it costs no GPU work or D2H, so it is
             populated identically on the v1 and v2 runners. ``None`` when the
             request does not opt in.
+        steering: Optional list of declarative per-request steering gates
+            (``when × scope × apply``; see
+            :mod:`vllm.v1.steering_schema`). Lets a client attach its own
+            conditional steering to the request without a server-registered
+            consumer; the built-in declarative consumer reads these off
+            :class:`vllm.v1.capture.step_view.StepRequestView.steering` and
+            drives the steering substrate. Named vector sources are resolved
+            to inline packed bytes at the frontend, so this always carries
+            self-contained data by the time it reaches the worker. ``None``
+            when the request declares no gates.
     """
 
     conversation_id: str | None = None
+    steering: list[SteeringGate] | None = None
 
     def is_empty(self) -> bool:
         """Return ``True`` when no metadata field is set."""
-        return self.conversation_id is None
+        return self.conversation_id is None and self.steering is None

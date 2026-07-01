@@ -264,6 +264,14 @@ class CompletionRequest(OpenAIBaseModel):
         "composed with any inline steering vector fields.",
     )
 
+    steering: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Declarative per-request steering gates: a list of "
+        "{when, scope, apply}. See the chat completion `steering` field for "
+        "the gate schema. Applied by the built-in declarative consumer; "
+        "requires --enable-steering.",
+    )
+
     # --8<-- [end:completion-extra-params]
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
@@ -423,14 +431,22 @@ class CompletionRequest(OpenAIBaseModel):
             sampling_params.capture = dict(self.capture)
         return sampling_params
 
-    def to_request_metadata(self) -> RequestMetadata:
+    def to_request_metadata(self, vector_registry=None) -> RequestMetadata:
         """Build the request-level metadata channel for this request.
 
         Holds host-side per-request fields that are not sampling parameters
-        (currently the conversation id); threaded to the worker alongside the
-        client request id rather than on ``SamplingParams``.
+        (the conversation id and declarative steering gates); threaded to the
+        worker alongside the client request id rather than on
+        ``SamplingParams``. Named vector sources in ``steering`` are resolved
+        via *vector_registry*; raises ``ValueError`` on a malformed spec or
+        unknown name (surfaced by the caller as HTTP 400).
         """
-        return RequestMetadata(conversation_id=self.conversation_id)
+        from vllm.v1.steering_schema import build_steering_gates
+
+        return RequestMetadata(
+            conversation_id=self.conversation_id,
+            steering=build_steering_gates(self.steering, vector_registry),
+        )
 
     @model_validator(mode="before")
     @classmethod
