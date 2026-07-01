@@ -70,4 +70,22 @@ consumer_controller_base:
     - examples/.../minimal_examples.py (_SyncBase, ConversationLatchExample)
   depends_on: [capture_consumers, dynamic_steering]
   doc: docs/design/dynamic_steering.md  # §5.6
+
+declarative_per_request_steering:
+  description: >
+    A client attaches its own conditional steering to a request (a nested list
+    of when x scope x apply gates in RequestMetadata.steering) with NO
+    server-registered consumer. A built-in auto-registered consumer maps gates
+    to the steering substrate: probe x this_token gates run in-graph via the
+    per-row monitor; other scopes are host-latched (reusing SteeringController).
+    Vector sources are name-first (a frontend probe/steer registry + admin
+    endpoint) with an inline base64 packed escape hatch; operator consumers win
+    over client gates.
+  entry_points:
+    - vllm/v1/steering_schema.py (gate schema + resolve/build)
+    - vllm/v1/capture/declarative.py (DeclarativeSteeringConsumer)
+    - vllm/entrypoints/openai/steering/vector_registry.py (named vectors)
+    - vllm/entrypoints/serve/steering/vectors_router.py (admin endpoints)
+  depends_on: [dynamic_steering, consumer_controller_base]
+  doc: docs/design/dynamic_steering.md  # §8.2
 ```

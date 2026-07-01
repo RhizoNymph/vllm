@@ -799,6 +799,67 @@ call + warmup), `steering_manager.py` (`set_monitor`/`clear_monitor`/
 `validate_steering_monitor`). The gemma4 taps are unchanged — the monitor
 rides the existing `apply_layer_steering` call at every hook.
 
+### 8.2 Declarative per-request gates — IMPLEMENTED
+
+Everything above requires an operator to author and deploy a capture consumer.
+Declarative gates let a **client** attach its own conditional steering to a
+request — no server-registered consumer. A request carries a nested list of
+gates in `RequestMetadata.steering` (§5.6), each a **`when × scope × apply`**:
+
+- **when**: `always` | `probe` (`sigmoid(sharpness·(residual@probe −
+  threshold))`).
+- **scope**: `this_token` | `next_step` | `rest_of_request` |
+  `rest_of_conversation`.
+- **apply**: `add` (vector × strength, composed **on top of** the request's
+  static decode steering) | `attenuate` (damp existing steering by a factor).
+
+**Schema** (`vllm/v1/steering_schema.py`): msgspec tagged unions (`kind`
+discriminator) so gates ride the `EngineCoreRequest` msgpack channel like
+`conversation_id`. A vector source is `{"kind":"name","name":...}` (a
+server-registered probe/steer vector) or `{"kind":"inline","packed":{hook:
+SteeringHookPacked}}` (the base64 escape hatch, §5.6). Names are resolved to
+inline packed at the **frontend** (`build_steering_gates` in
+`to_request_metadata`), so the worker only ever sees packed bytes — no
+worker-side registry. `resolve_gates` unpacks to numpy once at admission and
+surfaces `ResolvedGate`s on `StepRequestView.steering` (both runners).
+
+**Built-in consumer** (`vllm/v1/capture/declarative.py`,
+`DeclarativeSteeringConsumer`): subclasses `SteeringController` to reuse the
+bounded conversation latch/bridge and `_armed` lifecycle but overrides
+`on_step` (multi-gate, multi-scope). Auto-registered under the reserved name
+`_declarative_steering` when steering is on, `enable_declarative_gates` is set
+(default), and `pp==1` (sync-consumer constraint); enabling it also turns on
+`enable_row_monitor` (§8.1). Gate → substrate:
+
+- `add`: one `RequestSteeringOverride(compose_admitted=True)` per request (all
+  `add` gates merge into one override row). `this_token+probe` also emits a
+  per-request `SteeringMonitorUpdate(req_id=...)` so the gate re-evaluates
+  **in-graph every decode token** (§8.1, free). Host-evaluated scopes
+  (`next_step`/`rest_of_request`/`rest_of_conversation` + `probe`) evaluate the
+  probe once on the CPU against the captured residual; `rest_of_conversation`
+  latches and bridges later turns.
+- `attenuate`: a per-request `SteeringScaleUpdate` (installing an admitted-only
+  override first so the damp is per-request, not shared across a config row).
+
+**`global_capture_spec()`** is a configured allow-list (`declarative_probe_sites`,
+default one site) — only host-evaluated probes need a captured residual;
+`this_token` probes are computed in-kernel and need none.
+
+**Precedence** (operator wins, `steering_model_runner_mixin.py`): every
+declarative action is stamped `source="declarative"`; the runner records the
+owning source per request (`_req_override_source`) and rejects a declarative
+action for a request already owned by another (operator) source. Compose-on-top
+is a runner-side fold (`RequestSteeringOverride.compose_admitted` →
+`_resolve_request_steering(..., "decode")` + the gate delta). On request finish
+`release_dynamic_config` purges the row's per-row monitor + scale so nothing
+leaks.
+
+**Named vector registry** (frontend, `vllm/entrypoints/openai/steering/
+vector_registry.py` + admin routes `vllm/entrypoints/serve/steering/
+vectors_router.py`): `POST /v1/steering/vectors/register|unregister`, `GET
+/v1/steering/vectors`, gated by the steering API key + dev mode. Distinct from
+the module registry (§5.7) — single named probe/steer vectors, frontend-only.
+
 ## 9. Test plan
 
 - **Phase 0 (on this branch)**: unit tests for queue mechanics, drain
