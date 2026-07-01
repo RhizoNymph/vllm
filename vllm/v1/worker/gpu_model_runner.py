@@ -563,6 +563,10 @@ class GPUModelRunner(
         # surfaced on the per-step ``StepRequestView`` so a sync consumer can
         # latch a steering decision across the turns of one conversation.
         self._sync_conversation_ids: dict[str, str | None] = {}
+        # Declarative per-request steering gates, unpacked to numpy once at
+        # admission and surfaced on ``StepRequestView.steering`` for the
+        # built-in declarative steering consumer.
+        self._sync_steering_gates: dict[str, list | None] = {}
         self._sync_step_counter = 0
         # Per-consumer CUDA event pairs measuring the *added* GPU time of
         # ``on_step`` — the GEMV + tiny D2H the consumer enqueues — rather
@@ -1415,6 +1419,7 @@ class GPUModelRunner(
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
             self._sync_conversation_ids.pop(req_id, None)
+            self._sync_steering_gates.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1537,6 +1542,10 @@ class GPUModelRunner(
             self._sync_conversation_ids[req_id] = (
                 rmeta.conversation_id if rmeta is not None else None
             )
+            if rmeta is not None and rmeta.steering is not None:
+                from vllm.v1.steering_schema import resolve_gates
+
+                self._sync_steering_gates[req_id] = resolve_gates(rmeta.steering)
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             # Admit the request for activation capture, if the feature
@@ -2103,6 +2112,7 @@ class GPUModelRunner(
                     phase="prefill" if num_computed < num_prompt else "decode",
                     token_ids=token_ids,
                     conversation_id=self._sync_conversation_ids.get(req_id),
+                    steering=self._sync_steering_gates.get(req_id),
                 )
             )
             token_offset += n_tokens

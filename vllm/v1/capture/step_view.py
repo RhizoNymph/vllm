@@ -24,10 +24,13 @@ must finish reading (e.g. its probe GEMM and any D2H) inside
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from vllm.v1.steering_schema import ResolvedGate
 
 __all__ = ["StepCaptureView", "StepRequestView"]
 
@@ -60,6 +63,14 @@ class StepRequestView:
     # latch a steering decision after a trigger and re-apply it to later
     # turns). ``None`` when the request did not set it.
     conversation_id: str | None = None
+    # Optional declarative per-request steering gates
+    # (``RequestMetadata.steering``), already unpacked to numpy once at
+    # admission (:func:`vllm.v1.steering_schema.resolve_gates`). Like
+    # ``conversation_id`` this is pure host-side metadata (no GPU work / D2H),
+    # populated identically on the v1 and v2 runners. Read by the built-in
+    # declarative steering consumer. ``None`` when the request declared no
+    # gates.
+    steering: list[ResolvedGate] | None = None
 
 
 @dataclass(frozen=True)
