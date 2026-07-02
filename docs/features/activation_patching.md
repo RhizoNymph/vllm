@@ -36,7 +36,7 @@ capture run.
 End-to-end GPU-validated with real weights (eager + cudagraph):
 
 - **Qwen3-0.6B** (v2 runner, default): TP1/PP1, TP2/PP1, TP1/PP2.
-- **gemma3-4b** (v1 runner): TP1/PP1.
+- **gemma3-4b** (v1 runner): TP1/PP1, TP2/PP1, TP1/PP2.
 
 Both prove no-op / self-identity are bit-exact, cross-run replace reproduces the
 clean run within bf16 accumulation, and single-site denoising surfaces the clean
@@ -174,9 +174,11 @@ python -m vllm.entrypoints.openai.api_server \
   no-op, keeping the kernel branch-free.
 - **Strict capacity.** Overflow is prevented at admission + scheduler
   backpressure; the kernel never sees an out-of-range slot.
-- **Buffer registration.** Patch buffers attach at model build via the
-  process-global slot count (set by `set_patch_buffer_slots` before the model is
-  built, on both runners). With slots 0 the apply path constant-folds out.
+- **Buffer registration.** Patch buffers self-register during the model build by
+  reading the slot count from the ambient `VllmConfig` context
+  (`get_current_vllm_config_or_none`), so any runner that builds a model gets
+  them for free; the `set_patch_buffer_slots` global is a test-only fallback.
+  With slots 0 the apply path constant-folds out.
 
 ## Related files
 
