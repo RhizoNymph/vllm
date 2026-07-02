@@ -31,6 +31,13 @@ class PatchSweepRequest(BaseModel):
     """The corrupted/destination prompt swept over."""
     source_run: str
     """Clean-run handle whose stored activations are patched in."""
+    clean_prompt: str | None = None
+    """The clean prompt ``source_run`` was captured from. Required when it
+    tokenizes to a different length than ``prompt``: positions are then
+    aligned (common token prefix by identity, common suffix by the length
+    delta) and the unalignable middle is skipped loudly — assuming
+    ``source == dest`` across a length divergence silently patches the wrong
+    positions."""
     hook: str = "post_block"
     layers: list[int] | LayerRange
     positions: list[int] | Literal["all_prompt"] = "all_prompt"
@@ -60,3 +67,12 @@ class PatchSweepResponse(BaseModel):
     corrupt: float | None = None
     argmax: dict | None = None
     skipped: list[dict] = Field(default_factory=list)
+    alignment: dict | None = None
+    """Position-alignment summary when ``clean_prompt`` was provided
+    (prefix/suffix lengths and any unaligned positions that were skipped)."""
+    noise_floor: float | None = None
+    """|metric(baseline re-run inside the cell batch) - metric(solo baseline)|.
+    vLLM is not batch-invariant by default, so identical requests in different
+    batch compositions return slightly different logprobs; grid differences at
+    or below this floor are not meaningful. For exact reproducibility start the
+    server with batch-invariant mode (see docs/features/batch_invariance.md)."""

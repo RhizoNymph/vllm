@@ -64,6 +64,39 @@ class CleanRun:
     answer_token: str | None = None
     clean_logprob: float | None = None
     clean_logit_diff: float | None = None
+    prompt: str | None = None
+    """The clean prompt text — lets sweeps align positions automatically when
+    the corrupt prompt tokenizes to a different length."""
+
+
+def _align_token_positions(
+    clean_ids: list[int], corrupt_ids: list[int]
+) -> tuple[dict[int, int], list[int]]:
+    """(mapping dest->source, unaligned dest positions).
+
+    Equal lengths map identity everywhere (corresponding positions, the
+    standard causal-tracing setup). Unequal lengths map the common token
+    prefix by identity and the common suffix by the length delta; the
+    differing middle has no positional correspondence and is unaligned.
+    Mirrors ``vllm/entrypoints/serve/patch/alignment.py``.
+    """
+    n_clean, n_corrupt = len(clean_ids), len(corrupt_ids)
+    if n_clean == n_corrupt:
+        return {i: i for i in range(n_corrupt)}, []
+    limit = min(n_clean, n_corrupt)
+    prefix = 0
+    while prefix < limit and clean_ids[prefix] == corrupt_ids[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < limit - prefix
+        and clean_ids[n_clean - 1 - suffix] == corrupt_ids[n_corrupt - 1 - suffix]
+    ):
+        suffix += 1
+    shift = n_clean - n_corrupt
+    mapping = {i: i for i in range(prefix)}
+    mapping.update({i: i + shift for i in range(n_corrupt - suffix, n_corrupt)})
+    return mapping, list(range(prefix, n_corrupt - suffix))
 
 
 @dataclass
@@ -215,6 +248,25 @@ class PatchStudy:
                            self._grade_token_id(foil_token)) if i is not None]
         return ids or None
 
+    def _tokenize(self, text: str) -> list[int] | None:
+        """Tokenize ``text`` via the server's ``/tokenize`` (None on failure)."""
+        import httpx
+
+        try:
+            root = self.base_url.rstrip("/")
+            root = root[: -len("/v1")] if root.endswith("/v1") else root
+            r = httpx.post(
+                f"{root}/tokenize",
+                json={"model": self.model, "prompt": text,
+                      "add_special_tokens": True},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            return [int(t) for t in r.json().get("tokens", [])]
+        except Exception as exc:  # noqa: BLE001
+            print(f"warning: /tokenize failed ({exc})")
+            return None
+
     # ---- step 1: capture the clean run once --------------------------------
 
     def capture_clean(
@@ -279,6 +331,7 @@ class PatchStudy:
             answer_token=answer_token,
             clean_logprob=clean_lp,
             clean_logit_diff=clean_diff,
+            prompt=prompt,
         )
 
     # ---- step 2: sweep the corrupted prompt --------------------------------
@@ -329,6 +382,31 @@ class PatchStudy:
 
         grade_ids = self._grade_ids(answer_token, foil_token)
 
+        # Position alignment: when the clean prompt is known, map each dest
+        # position to its clean source position. Equal lengths map identity;
+        # unequal lengths align prefix/suffix and skip the differing middle
+        # (source == dest across a length divergence patches the WRONG
+        # positions — a shifted-but-plausible heatmap).
+        source_map: dict[int, int] | None = None
+        if clean is not None and clean.prompt is not None:
+            ids_clean = self._tokenize(clean.prompt)
+            ids_corrupt = self._tokenize(corrupt_prompt)
+            if ids_clean is not None and ids_corrupt is not None:
+                mapping, unaligned = _align_token_positions(ids_clean, ids_corrupt)
+                source_map = mapping
+                dropped = [p for p in positions if p in set(unaligned)]
+                if dropped:
+                    positions = [p for p in positions if p not in set(dropped)]
+                    notes.append(
+                        f"skipped unaligned positions {dropped} (clean/corrupt "
+                        f"token spans differ there; no positional "
+                        f"correspondence)"
+                    )
+            elif len(corrupt_prompt) != len(clean.prompt):
+                notes.append(
+                    "warning: /tokenize unavailable; positions assumed aligned"
+                )
+
         async with AsyncOpenAI(
             base_url=self.base_url, api_key=self.api_key
         ) as aclient:
@@ -362,7 +440,9 @@ class PatchStudy:
                         "hook": hook,
                         "dest_position": pos,
                         "source_run": run,
-                        "source_position": pos,
+                        "source_position": (
+                            source_map[pos] if source_map is not None else pos
+                        ),
                         "alpha": alpha,
                     }
                 ]
@@ -437,6 +517,9 @@ class PatchStudy:
             "model": self.model,
             "prompt": corrupt_prompt,
             "source_run": run,
+            # The server aligns positions when the prompts tokenize to
+            # different lengths (and 400s a mismatch without clean_prompt).
+            "clean_prompt": clean.prompt if clean is not None else None,
             "hook": hook,
             "layers": layers,
             "positions": positions,
@@ -454,6 +537,11 @@ class PatchStudy:
             )
             resp.raise_for_status()
             data = resp.json()
+        notes = []
+        if data.get("skipped"):
+            notes.append(f"skipped={data['skipped']}")
+        if data.get("alignment"):
+            notes.append(f"alignment={data['alignment']}")
         return SweepResult(
             layers=data["layers"],
             positions=data["positions"],
@@ -462,9 +550,7 @@ class PatchStudy:
             grid=data["grid"],
             clean=data.get("clean"),
             corrupt=data.get("corrupt"),
-            notes=[f"skipped={len(data.get('skipped', []))}"]
-            if data.get("skipped")
-            else [],
+            notes=notes,
         )
 
     @staticmethod

@@ -115,6 +115,7 @@ class _PatchSourceCache:
     def __init__(self) -> None:
         # run_id -> {"sites": set[(hook, layer)], "positions": set[int]}
         self._runs: dict[str, dict[str, set]] = {}
+        self._run_prompt_tokens: dict[str, int] = {}
         self._lock = asyncio.Lock()
         # run_id -> monotonic time we last leased it on the workers.
         self._leased_at: dict[str, float] = {}
@@ -122,6 +123,7 @@ class _PatchSourceCache:
     async def _refresh(self, engine_client: EngineClient) -> None:
         results = await engine_client.collective_rpc("get_patch_source_manifests")
         agg: dict[str, dict[str, set]] = {}
+        num_prompt_tokens: dict[str, int] = {}
         for rank_manifests in results or []:
             for m in rank_manifests or []:
                 entry = agg.setdefault(
@@ -131,7 +133,28 @@ class _PatchSourceCache:
                     (hook, int(layer)) for hook, layer in m["hook_layers"]
                 )
                 entry["positions"].update(int(p) for p in m["positions"])
+                num_prompt_tokens[m["run_id"]] = max(
+                    num_prompt_tokens.get(m["run_id"], 0),
+                    int(m.get("num_prompt_tokens", 0)),
+                )
         self._runs = agg
+        self._run_prompt_tokens = num_prompt_tokens
+
+    async def run_prompt_tokens(
+        self, run_id: str, engine_client: EngineClient
+    ) -> int | None:
+        """Prompt-token count of ``run_id``'s captured clean prompt, or None.
+
+        Used to detect clean/corrupt tokenization-length mismatch before a
+        sweep assumes ``source == dest`` positions. Refresh-on-miss like
+        ``validate``; best-effort (None) on RPC failure."""
+        if run_id not in getattr(self, "_run_prompt_tokens", {}):
+            async with self._lock:
+                try:
+                    await self._refresh(engine_client)
+                except Exception:  # noqa: BLE001 — best-effort
+                    return None
+        return getattr(self, "_run_prompt_tokens", {}).get(run_id)
 
     def _missing(
         self, refs: list[tuple[str, str, int, int]]
@@ -223,3 +246,10 @@ async def validate_patch_sources(
 ) -> None:
     """Validate that a request's patch sources exist (raises on missing)."""
     await _PATCH_SOURCE_CACHE.validate(sampling_params, engine_client)
+
+
+async def get_run_prompt_tokens(
+    engine_client: EngineClient, run_id: str
+) -> int | None:
+    """Prompt-token count of a captured source run (None if unknown)."""
+    return await _PATCH_SOURCE_CACHE.run_prompt_tokens(run_id, engine_client)

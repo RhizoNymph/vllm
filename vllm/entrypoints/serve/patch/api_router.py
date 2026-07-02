@@ -22,6 +22,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.serve.patch.alignment import align_token_positions
 from vllm.entrypoints.serve.patch.protocol import (
     LayerRange,
     PatchSweepRequest,
@@ -224,12 +225,60 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         return _err("empty sweep grid (no layers or positions)")
     corrupt_val = cell_metric(corrupt_lp, body) if corrupt_lp else None
 
-    # Validate every referenced source site exists (one combined spec).
+    # Position alignment: map each dest position to its clean source position.
+    # With clean_prompt given, the alignment handles length mismatches (common
+    # prefix identity, common suffix shifted, differing middle skipped loudly).
+    # Without it, refuse a length mismatch outright — assuming source == dest
+    # across a divergence would sweep silently shifted positions.
     from vllm.v1.capture.patch_admission import (
         PatchValidationError,
+        get_run_prompt_tokens,
         validate_patch_sources,
     )
 
+    skipped: list[dict] = []
+    alignment_summary: dict | None = None
+    if body.clean_prompt is not None:
+        import inspect
+
+        tokenizer = eng.get_tokenizer()
+        if inspect.isawaitable(tokenizer):
+            tokenizer = await tokenizer
+        align = align_token_positions(
+            tokenizer.encode(body.clean_prompt),
+            tokenizer.encode(body.prompt),
+        )
+        alignment_summary = align.summary()
+        aligned, dropped = [], []
+        for pos in positions:
+            (aligned if align.source_for(pos) is not None else dropped).append(pos)
+        for pos in dropped:
+            skipped.append(
+                {
+                    "position": pos,
+                    "reason": "unaligned: clean/corrupt token spans differ "
+                    "here (no positional correspondence)",
+                }
+            )
+        positions = aligned
+        if not positions:
+            return _err(
+                "no alignable positions: the prompts share no common token "
+                "prefix/suffix at the requested positions"
+            )
+        source_for = align.source_for
+    else:
+        run_len = await get_run_prompt_tokens(eng, body.source_run)
+        if run_len is not None and run_len != n_prompt:
+            return _err(
+                f"source run {body.source_run!r} was captured from a "
+                f"{run_len}-token prompt but this prompt has {n_prompt} "
+                f"tokens; positions would misalign. Pass clean_prompt for "
+                f"automatic alignment (or explicit aligned positions)."
+            )
+        source_for = lambda pos: pos  # noqa: E731 — identity alignment
+
+    # Validate every referenced source site exists (one combined spec).
     probe = SamplingParams(
         patch=[
             {
@@ -237,7 +286,7 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
                 "hook": body.hook,
                 "dest_position": pos,
                 "source_run": body.source_run,
-                "source_position": pos,
+                "source_position": source_for(pos),
                 "alpha": body.alpha,
             }
             for layer in layers
@@ -262,7 +311,7 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
                 "hook": body.hook,
                 "dest_position": pos,
                 "source_run": body.source_run,
-                "source_position": pos,
+                "source_position": source_for(pos),
                 "alpha": body.alpha,
             }
         ]
@@ -274,19 +323,36 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         )
         grid[i][j] = cell_metric(lp, body) if lp else None
 
-    await asyncio.gather(
-        *(
-            run_cell(i, layer, j, pos)
-            for i, layer in enumerate(layers)
-            for j, pos in enumerate(positions)
+    async def rerun_baseline() -> float | None:
+        # Same unpatched request as the solo baseline, but batched with the
+        # cells: the metric delta between the two IS the batch-nondeterminism
+        # noise floor for this sweep (vLLM is not batch-invariant by default).
+        lp, _ = await _first_token_logprobs(
+            eng, body.prompt, None, body.logprobs, "noisefloor", grade_ids
         )
+        return cell_metric(lp, body) if lp else None
+
+    _, corrupt_val_batched = await asyncio.gather(
+        asyncio.gather(
+            *(
+                run_cell(i, layer, j, pos)
+                for i, layer in enumerate(layers)
+                for j, pos in enumerate(positions)
+            )
+        ),
+        rerun_baseline(),
+    )
+    noise_floor = (
+        abs(corrupt_val_batched - corrupt_val)
+        if corrupt_val_batched is not None and corrupt_val is not None
+        else None
     )
 
     # Void any cell whose patch failed to resolve on the workers (source
     # evicted between admission and resolution — near-impossible with leasing,
     # but a silently-unpatched cell reported as a patched result is wrong
     # science, so drain the failure registry and null those cells loudly.
-    skipped: list[dict] = []
+    # (Appends to `skipped`, which may already carry unaligned positions.)
     try:
         failure_maps = await eng.collective_rpc("pop_patch_resolution_failures")
     except Exception as exc:  # noqa: BLE001 — backstop is best-effort
@@ -333,6 +399,8 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         corrupt=corrupt_val,
         argmax=argmax_cell(grid, layers, positions),
         skipped=skipped,
+        alignment=alignment_summary,
+        noise_floor=noise_floor,
     )
 
 
