@@ -1116,6 +1116,36 @@ class SamplingParams(
             demand[key] = seen + 1
         return demand
 
+    @cached_property
+    def patch_kv_taint(self) -> tuple[int, int] | None:
+        """``(min_dest_position, spec_hash)`` for patch-aware prefix caching.
+
+        A patched activation at position ``p`` changes the KV written at ``p``
+        and (via attention in later layers) at every subsequent position, so
+        blocks containing any position ``>= min_dest_position`` must not share
+        cache entries with unpatched runs. ``spec_hash`` is a deterministic
+        digest of the full spec (stable across processes, unlike ``hash()``),
+        folded into those blocks' hashes: distinct specs get distinct KV
+        chains, while blocks strictly below the patch floor stay shareable.
+        ``None`` when the request patches nothing."""
+        if not self.patch:
+            return None
+        import hashlib
+
+        entries = sorted(
+            (
+                int(e["layer"]),
+                str(e["hook"]),
+                int(e["dest_position"]),
+                str(e["source_run"]),
+                int(e["source_position"]),
+                float(e.get("alpha", 1.0)),
+            )
+            for e in self.patch
+        )
+        digest = hashlib.sha256(repr(entries).encode()).digest()
+        return min(e[2] for e in entries), int.from_bytes(digest[:8], "big")
+
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
             raise ValueError(f"n must be 1 when using greedy sampling, got {self.n}.")
