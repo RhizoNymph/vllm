@@ -50,6 +50,22 @@ class SteeringConfig:
     ``compute_hash``. When ``False`` (default) only the global monitor exists.
     See docs/design/dynamic_steering.md."""
 
+    enable_declarative_gates: bool = Field(default=True)
+    """Enable the built-in declarative per-request steering consumer: a client
+    can attach its own conditional steering to a request (a nested list of
+    ``when × scope × apply`` gates in ``RequestMetadata.steering``) without a
+    server-registered consumer. When enabled (and steering is on, pipeline
+    parallelism is 1) the consumer is auto-registered and ``enable_row_monitor``
+    is turned on so ``this_token`` probe gates run in-graph. Does not itself
+    change the compiled graph (the implied row-monitor flag does), so it is not a
+    ``compute_hash`` factor. See docs/design/dynamic_steering.md."""
+
+    declarative_probe_sites: list[str] = Field(default_factory=list)
+    """``layer:hook`` sites whose residual the declarative consumer captures so
+    host-evaluated probes (non-``this_token`` scopes with ``when=probe``) can
+    read them. ``this_token`` probes are computed in-graph and need no capture.
+    Empty ⇒ a single default site is captured (see the consumer)."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

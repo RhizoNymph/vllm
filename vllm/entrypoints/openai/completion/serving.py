@@ -266,6 +266,24 @@ class OpenAIServingCompletion(OpenAIServing):
                 )
             steering_module_ref = (request.steering_name, 1.0)
 
+        # Build the request-metadata channel once (declarative steering gate
+        # names are resolved against the vector registry here; a malformed
+        # gate spec or unknown name raises ValueError → HTTP 400).
+        steering_vector_registry = (
+            None
+            if raw_request is None
+            else getattr(raw_request.app.state, "steering_vector_registry", None)
+        )
+        try:
+            req_metadata_channel = request.to_request_metadata(
+                vector_registry=steering_vector_registry
+            )
+        except ValueError as exc:
+            return self.create_error_response(
+                f"Invalid steering gate spec: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
@@ -343,7 +361,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     trace_headers=trace_headers,
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
-                    request_metadata=request.to_request_metadata(),
+                    request_metadata=req_metadata_channel,
                 )
 
             generators.append(generator)

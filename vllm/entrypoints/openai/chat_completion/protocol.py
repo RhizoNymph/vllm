@@ -531,6 +531,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "steering across the requests of one conversation.",
     )
 
+    steering: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Declarative per-request steering gates: a list of "
+        "{when, scope, apply}. `when` is {kind:'always'} or "
+        "{kind:'probe', probe:<vec>, threshold, sharpness?}; `scope` is "
+        "this_token|next_step|rest_of_request|rest_of_conversation; `apply` is "
+        "{kind:'add', steer:<vec>, strength?} or {kind:'attenuate', strength}. "
+        "A <vec> is {kind:'name', name:<registered>} or "
+        "{kind:'inline', packed:{hook: SteeringHookPacked}} (base64). Applied by "
+        "the built-in declarative consumer with no server-registered consumer; "
+        "requires the server to be started with --enable-steering.",
+    )
+
     steering_name: str | None = Field(
         default=None,
         description="Name of a pre-registered steering module. "
@@ -780,14 +793,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
             sampling_params.capture = dict(self.capture)
         return sampling_params
 
-    def to_request_metadata(self) -> RequestMetadata:
+    def to_request_metadata(self, vector_registry=None) -> RequestMetadata:
         """Build the request-level metadata channel for this request.
 
         Holds host-side per-request fields that are not sampling parameters
-        (currently the conversation id); threaded to the worker alongside the
-        client request id rather than on ``SamplingParams``.
+        (the conversation id and declarative steering gates); threaded to the
+        worker alongside the client request id rather than on
+        ``SamplingParams``. Named vector sources in ``steering`` are resolved
+        to inline packed bytes here via *vector_registry*; raises
+        ``ValueError`` on a malformed gate spec or unknown name (surfaced by
+        the caller as HTTP 400).
         """
-        return RequestMetadata(conversation_id=self.conversation_id)
+        from vllm.v1.steering_schema import build_steering_gates
+
+        return RequestMetadata(
+            conversation_id=self.conversation_id,
+            steering=build_steering_gates(self.steering, vector_registry),
+        )
 
     @model_validator(mode="before")
     @classmethod

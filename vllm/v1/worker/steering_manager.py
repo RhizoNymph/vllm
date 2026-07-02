@@ -435,13 +435,29 @@ class SteeringManager:
         self._tables_dirty = True
 
     def release_dynamic_config(self, dyn_id: int) -> None:
-        """Free a dynamic-override row. No-op for unknown ids."""
+        """Free a dynamic-override row. No-op for unknown ids.
+
+        Also drops any per-row monitor and strength scale attached to this
+        row's owner (``("dyn", dyn_id)``). Without this, per-request monitors
+        installed via ``SteeringMonitorUpdate(req_id=...)`` (and scales) would
+        accumulate in ``_row_monitor`` / ``_dynamic_scales`` for the lifetime
+        of the process, since dyn_ids are monotonic and never reused.
+        """
         row = self._dynamic_to_row.pop(dyn_id, None)
         if row is None:
             return
         self._dynamic_vectors.pop(dyn_id, None)
         self._dynamic_sig.pop(dyn_id, None)
         self._dynamic_free_rows.append(row)
+        # Purge the row's strength scale and any per-row monitor entries.
+        if self._dynamic_scales.pop(dyn_id, None) is not None:
+            self._scales_dirty = True
+        owner_key = ("dyn", dyn_id)
+        if self._row_monitor:
+            for layers in self._row_monitor.values():
+                for owners in layers.values():
+                    owners.pop(owner_key, None)
+            self._row_monitor_sig_cache = None
         self._tables_dirty = True
         self._indices_dirty = True
 

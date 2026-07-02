@@ -107,6 +107,10 @@ class CaptureRunnerMixin:
         # (``RequestMetadata.conversation_id``). Stashed here at admission from
         # the request metadata and read back when building the per-step view.
         self._sync_conversation_ids: dict[str, str | None] = {}
+        # req_id -> declarative per-request steering gates
+        # (``RequestMetadata.steering``), unpacked to numpy once at admission
+        # and surfaced on ``StepRequestView.steering``.
+        self._sync_steering_gates: dict[str, list | None] = {}
 
         cc_config = self.vllm_config.capture_consumers_config
         self._capture_feature_enabled = cc_config is not None
@@ -239,10 +243,24 @@ class CaptureRunnerMixin:
                 for hook_name, layers in sync_spec.hooks.items():
                     monitor_keys.update((int(layer), hook_name) for layer in layers)
             self._sync_monitor_keys = sorted(monitor_keys)
+            from vllm.v1.capture.config import graphsafe_buffer_bytes
+
+            footprint = graphsafe_buffer_bytes(
+                num_keys=len(self._sync_monitor_keys),
+                max_num_tokens=self.max_num_tokens,
+                hidden_size=self.model_config.get_hidden_size(),
+                dtype_bytes=self.model_config.dtype.itemsize,
+            )
             logger.info(
-                "sync capture consumers active: %s (monitor keys: %s)",
+                "sync capture consumers active: %s (monitor keys: %s; "
+                "persistent capture buffers: %d sites x %d tokens x %d hidden "
+                "= %.1f MiB VRAM)",
                 [name for name, _ in self._sync_consumers],
                 self._sync_monitor_keys,
+                len(self._sync_monitor_keys),
+                self.max_num_tokens,
+                self.model_config.get_hidden_size(),
+                footprint / (1024 * 1024),
             )
             if getattr(self.device, "type", None) == "cuda":
                 self._sync_timing_events = {
@@ -301,6 +319,10 @@ class CaptureRunnerMixin:
         self._sync_conversation_ids[req_id] = (
             rmeta.conversation_id if rmeta is not None else None
         )
+        if rmeta is not None and rmeta.steering is not None:
+            from vllm.v1.steering_schema import resolve_gates
+
+            self._sync_steering_gates[req_id] = resolve_gates(rmeta.steering)
         mgr = self._capture_manager
         if was_present:
             # Streaming re-add: prior chunk's capture state is stale.
@@ -321,6 +343,7 @@ class CaptureRunnerMixin:
         if not self._capture_feature_enabled:
             return
         self._sync_conversation_ids.pop(req_id, None)
+        self._sync_steering_gates.pop(req_id, None)
         if self._capture_step_gate is not None:
             self._capture_step_gate.drop(req_id)
         if self._capture_manager is not None:
@@ -631,6 +654,7 @@ class CaptureRunnerMixin:
                     phase="prefill" if num_computed < num_prompt else "decode",
                     token_ids=empty_ids,
                     conversation_id=self._sync_conversation_ids.get(req_id),
+                    steering=self._sync_steering_gates.get(req_id),
                 )
             )
 

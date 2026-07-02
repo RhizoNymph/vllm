@@ -909,6 +909,44 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _maybe_enable_declarative_steering(self) -> None:
+        """Auto-register the built-in declarative per-request steering consumer.
+
+        When steering is enabled and ``enable_declarative_gates`` is set (the
+        default), inject the reserved ``_declarative_steering`` sync consumer so
+        clients can attach ``when × scope × apply`` gates to a request without a
+        server-registered consumer, and turn on ``enable_row_monitor`` so
+        ``this_token`` probe gates run in-graph. Sync consumers require
+        ``pipeline_parallel_size == 1``; skipped otherwise.
+        """
+        sc = self.steering_config
+        if sc is None or not getattr(sc, "enable_declarative_gates", False):
+            return
+        if self.parallel_config.pipeline_parallel_size > 1:
+            logger.warning_once(
+                "Declarative per-request steering requires pipeline parallelism "
+                "== 1; the built-in consumer will not be registered. Set "
+                "enable_declarative_gates=False to silence this warning."
+            )
+            return
+
+        # In-graph ``this_token`` probe gates need the per-row monitor.
+        sc.enable_row_monitor = True
+
+        from vllm.v1.capture.config import CaptureConsumerSpec
+
+        if self.capture_consumers_config is None:
+            self.capture_consumers_config = CaptureConsumersConfig(consumers=[])
+        consumers = self.capture_consumers_config.consumers
+        if any(c.name == "_declarative_steering" for c in consumers):
+            return
+        params: dict = {}
+        if sc.declarative_probe_sites:
+            params["probe_sites"] = list(sc.declarative_probe_sites)
+        consumers.append(
+            CaptureConsumerSpec(name="_declarative_steering", params=params)
+        )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -919,6 +957,8 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
+
+        self._maybe_enable_declarative_steering()
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
