@@ -878,8 +878,11 @@ leaks.
 **Named vector registry** (frontend, `vllm/entrypoints/openai/steering/
 vector_registry.py` + admin routes `vllm/entrypoints/serve/steering/
 vectors_router.py`): `POST /v1/steering/vectors/register|unregister`, `GET
-/v1/steering/vectors`, gated by the steering API key + dev mode. Distinct from
-the module registry (§5.7) — single named probe/steer vectors, frontend-only.
+/v1/steering/vectors`, gated by dev mode (`VLLM_SERVER_DEV_MODE`). Unlike the
+module registry / `/v1/steering/set`, these are NOT behind the steering API key:
+a named vector grants no capability over the already-unauthenticated inline
+packed path (it's naming sugar, inert until referenced). Distinct from the
+module registry (§5.7) — single named probe/steer vectors, frontend-only.
 
 ## 9. Test plan
 

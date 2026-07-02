@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Admin endpoints for the named probe/steer vector registry.
 
-Mutating endpoints are gated behind the steering API key
-(:func:`_authorize_steering_mutation`) and the whole router behind
-``VLLM_SERVER_DEV_MODE`` (matching the steering module router). The registry is
-frontend-only — no worker broadcast — so these handlers only touch
+The whole router is gated behind ``VLLM_SERVER_DEV_MODE`` (like the steering
+module router). Unlike the module registry / ``/v1/steering/set``, the mutating
+endpoints here are NOT additionally gated behind the steering API key:
+registering a named vector grants no capability a client doesn't already have
+(the identical probe/steer vectors can be passed inline, unauthenticated, in a
+per-request declarative gate) — a name is pure server-side sugar over that open
+path and is inert until a request references it. The registry is frontend-only
+— no worker broadcast — so these handlers only touch
 ``app.state.steering_vector_registry``.
 """
 
@@ -15,7 +19,6 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import vllm.envs as envs
-from vllm.entrypoints.serve.steering.api_router import _authorize_steering_mutation
 from vllm.entrypoints.serve.steering.vectors_protocol import (
     RegisterVectorRequest,
     UnregisterVectorRequest,
@@ -45,8 +48,6 @@ def _registry_unavailable() -> JSONResponse:
 async def register_vector(
     request: RegisterVectorRequest, raw_request: Request
 ) -> JSONResponse:
-    if (denied := _authorize_steering_mutation(raw_request)) is not None:
-        return denied
     registry = _get_registry(raw_request)
     if registry is None:
         return _registry_unavailable()
@@ -76,8 +77,6 @@ async def register_vector(
 async def unregister_vector(
     request: UnregisterVectorRequest, raw_request: Request
 ) -> JSONResponse:
-    if (denied := _authorize_steering_mutation(raw_request)) is not None:
-        return denied
     registry = _get_registry(raw_request)
     if registry is None:
         return _registry_unavailable()
