@@ -128,6 +128,7 @@ class DeclarativeSteeringConsumer(SteeringController):
         # Cache numpy probe → torch tensor (host-probe GEMM); keyed by id().
         self._probe_tensor_cache: dict[int, torch.Tensor] = {}
         self._missing_site_warned = False
+        self._unsupported_combo_warned = False
         self._gate_errors = 0
 
     # -- SyncCaptureConsumer interface -------------------------------------
@@ -285,6 +286,23 @@ class DeclarativeSteeringConsumer(SteeringController):
                 ):
                     row_monitor = self._row_monitor_action(gate, rid)
             else:  # attenuate: last one wins (they all damp the same row)
+                if gate.when_kind == "probe" and gate.scope == "this_token":
+                    # Unsupported combo: the substrate cannot damp a row only
+                    # when the probe fires this token (the per-row monitor
+                    # gates a row toward zero when the probe is LOW — the wrong
+                    # shape). The frontend rejects this
+                    # (steering_schema._validate_gate_semantics), but
+                    # non-frontend producers (offline, the Rust frontend) can
+                    # still emit it: skip-and-warn rather than silently
+                    # attenuating unconditionally.
+                    if not self._unsupported_combo_warned:
+                        self._unsupported_combo_warned = True
+                        logger.warning(
+                            "declarative steering: attenuate with when=probe "
+                            "and scope=this_token is unsupported; gate skipped. "
+                            "Use scope=next_step or rest_of_request."
+                        )
+                    continue
                 attenuate_strength = float(gate.strength)
 
         armed = False
