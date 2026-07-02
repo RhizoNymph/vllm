@@ -99,6 +99,14 @@ class CompletionRequest(OpenAIBaseModel):
     )
     allowed_token_ids: list[int] | None = None
     prompt_logprobs: int | None = None
+    logprob_token_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "Specific token IDs to return logprobs for on each generated "
+            "token, regardless of whether they fall in the top-`logprobs`. "
+            "Exact scoring for label/answer tokens (e.g. logit-diff metrics)."
+        ),
+    )
     # --8<-- [end:completion-sampling-params]
 
     # --8<-- [start:completion-extra-params]
@@ -395,6 +403,7 @@ class CompletionRequest(OpenAIBaseModel):
             stop=self.stop,
             stop_token_ids=self.stop_token_ids,
             logprobs=self.logprobs,
+            logprob_token_ids=self.logprob_token_ids,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,

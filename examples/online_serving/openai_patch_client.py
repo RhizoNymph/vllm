@@ -169,6 +169,51 @@ class PatchStudy:
         self.hook = hook
         self.logprobs = logprobs
         self._sync = OpenAI(base_url=base_url, api_key=api_key)
+        self._token_id_cache: dict[str, int | None] = {}
+
+    def _grade_token_id(self, token: str | None) -> int | None:
+        """Resolve a grading token to its single token id via ``/tokenize``.
+
+        The id is passed as ``logprob_token_ids`` so the server scores it
+        exactly on every request — without this, an answer token outside the
+        generated top-k grades as ``None`` (top-k boundary flicker). Returns
+        ``None`` (with a warning) when the string is not a single token or the
+        endpoint is unavailable; grading then falls back to top-k matching.
+        """
+        if token is None:
+            return None
+        if token in self._token_id_cache:
+            return self._token_id_cache[token]
+        import httpx
+
+        token_id: int | None = None
+        try:
+            root = self.base_url.rstrip("/")
+            root = root[: -len("/v1")] if root.endswith("/v1") else root
+            r = httpx.post(
+                f"{root}/tokenize",
+                json={"model": self.model, "prompt": token,
+                      "add_special_tokens": False},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            ids = r.json().get("tokens", [])
+            if len(ids) == 1:
+                token_id = int(ids[0])
+            else:
+                print(f"warning: {token!r} tokenizes to {len(ids)} tokens; "
+                      f"grading falls back to top-k matching")
+        except Exception as exc:  # noqa: BLE001 - fallback is functional
+            print(f"warning: /tokenize failed ({exc}); grading falls back "
+                  f"to top-k matching")
+        self._token_id_cache[token] = token_id
+        return token_id
+
+    def _grade_ids(self, answer_token: str | None,
+                   foil_token: str | None = None) -> list[int] | None:
+        ids = [i for i in (self._grade_token_id(answer_token),
+                           self._grade_token_id(foil_token)) if i is not None]
+        return ids or None
 
     # ---- step 1: capture the clean run once --------------------------------
 
@@ -201,13 +246,19 @@ class PatchStudy:
         # the source store is durably populated before any patch request
         # references this run (capture write-through is otherwise async — a
         # patch issued too early would resolve to a missing source).
+        extra: dict = {"capture": capture, "capture_wait": True}
+        grade_ids = self._grade_ids(answer_token, foil_token)
+        if grade_ids:
+            extra["logprob_token_ids"] = grade_ids
         resp = self._sync.completions.create(
             model=self.model,
             prompt=prompt,
             max_tokens=1,
             temperature=0.0,
-            logprobs=self.logprobs,
-            extra_body={"capture": capture, "capture_wait": True},
+            # the engine requires logprobs == len(logprob_token_ids) when ids
+            # are given (exact scoring replaces top-k)
+            logprobs=len(grade_ids) if grade_ids else self.logprobs,
+            extra_body=extra,
         )
         choice = resp.choices[0]
         clean_lp = (
@@ -276,20 +327,28 @@ class PatchStudy:
                 clean=clean,
             )
 
+        grade_ids = self._grade_ids(answer_token, foil_token)
+
         async with AsyncOpenAI(
             base_url=self.base_url, api_key=self.api_key
         ) as aclient:
             sem = asyncio.Semaphore(self.concurrency)
 
             async def grade(patch: list[dict] | None) -> float | None:
+                extra: dict = {"patch": patch} if patch else {}
+                if grade_ids:
+                    # Exact scoring: the server always reports these ids'
+                    # logprobs, so grading never depends on top-k rank.
+                    extra["logprob_token_ids"] = grade_ids
                 async with sem:
                     resp = await aclient.completions.create(
                         model=self.model,
                         prompt=corrupt_prompt,
                         max_tokens=1,
                         temperature=0.0,
-                        logprobs=self.logprobs,
-                        extra_body=({"patch": patch} if patch else {}),
+                        # engine requires logprobs == len(ids) with exact ids
+                        logprobs=len(grade_ids) if grade_ids else self.logprobs,
+                        extra_body=extra,
                     )
                 return self._metric(resp.choices[0], answer_token, foil_token, metric)
 

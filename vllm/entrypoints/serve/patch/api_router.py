@@ -123,10 +123,22 @@ async def _first_token_logprobs(
     patch: list[dict] | None,
     logprobs: int,
     tag: str,
+    grade_token_ids: list[int] | None = None,
 ) -> tuple[dict[int, Any] | None, int]:
-    """Run one short greedy generation; return (first-token logprobs, n_prompt)."""
+    """Run one short greedy generation; return (first-token logprobs, n_prompt).
+
+    ``grade_token_ids`` (the answer/foil ids) are scored exactly via
+    ``logprob_token_ids`` — their logprobs are always present in the returned
+    dict, independent of top-k rank. Without it, an answer outside the top-k
+    silently graded as ``None`` (top-k boundary flicker). The engine requires
+    ``logprobs == len(logprob_token_ids)`` when ids are given (ids replace
+    top-k)."""
     sp = SamplingParams(
-        temperature=0.0, max_tokens=1, logprobs=logprobs, patch=patch
+        temperature=0.0,
+        max_tokens=1,
+        logprobs=len(grade_token_ids) if grade_token_ids else logprobs,
+        patch=patch,
+        logprob_token_ids=grade_token_ids,
     )
     request_id = f"patchsweep-{tag}-{uuid4().hex[:8]}"
     final = None
@@ -135,6 +147,29 @@ async def _first_token_logprobs(
     if final is None or not final.outputs or not final.outputs[0].logprobs:
         return None, len(final.prompt_token_ids) if final else 0
     return final.outputs[0].logprobs[0], len(final.prompt_token_ids)
+
+
+async def _resolve_grade_token(
+    eng: EngineClient, token: str | None, token_id: int | None, what: str
+) -> int | None:
+    """Resolve an answer/foil to a single token id (id wins; str must be
+    exactly one token). Raises ValueError with a client-facing message."""
+    if token_id is not None:
+        return int(token_id)
+    if token is None:
+        return None
+    import inspect
+
+    tokenizer = eng.get_tokenizer()
+    if inspect.isawaitable(tokenizer):
+        tokenizer = await tokenizer
+    ids = tokenizer.encode(token, add_special_tokens=False)
+    if len(ids) != 1:
+        raise ValueError(
+            f"{what} {token!r} tokenizes to {len(ids)} tokens {ids}; grading "
+            f"needs a single token — pass {what}_id explicitly"
+        )
+    return int(ids[0])
 
 
 @router.post("/v1/patch_sweep")
@@ -159,11 +194,25 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     if any(not (0 <= layer < num_layers) for layer in layers):
         return _err(f"layer out of range [0, {num_layers})")
 
+    # Resolve answer/foil to token ids once; every generation then scores them
+    # exactly via logprob_token_ids (no top-k dependence, no None flicker).
+    try:
+        body.answer_token_id = await _resolve_grade_token(
+            eng, body.answer_token, body.answer_token_id, "answer_token"
+        )
+        body.foil_token_id = await _resolve_grade_token(
+            eng, body.foil_token, body.foil_token_id, "foil_token"
+        )
+    except ValueError as exc:
+        return _err(str(exc))
+    grade_ids = [t for t in (body.answer_token_id, body.foil_token_id)
+                 if t is not None]
+
     # Corrupt baseline (no patch) — also fixes the prompt length for
     # "all_prompt" position resolution.
     try:
         corrupt_lp, n_prompt = await _first_token_logprobs(
-            eng, body.prompt, None, body.logprobs, "baseline"
+            eng, body.prompt, None, body.logprobs, "baseline", grade_ids
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("patch_sweep baseline failed")
@@ -216,7 +265,7 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
             }
         ]
         lp, _ = await _first_token_logprobs(
-            eng, body.prompt, patch, body.logprobs, f"{layer}-{pos}"
+            eng, body.prompt, patch, body.logprobs, f"{layer}-{pos}", grade_ids
         )
         grid[i][j] = cell_metric(lp, body) if lp else None
 
