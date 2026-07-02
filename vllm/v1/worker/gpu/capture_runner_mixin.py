@@ -243,10 +243,24 @@ class CaptureRunnerMixin:
                 for hook_name, layers in sync_spec.hooks.items():
                     monitor_keys.update((int(layer), hook_name) for layer in layers)
             self._sync_monitor_keys = sorted(monitor_keys)
+            from vllm.v1.capture.config import graphsafe_buffer_bytes
+
+            footprint = graphsafe_buffer_bytes(
+                num_keys=len(self._sync_monitor_keys),
+                max_num_tokens=self.max_num_tokens,
+                hidden_size=self.model_config.get_hidden_size(),
+                dtype_bytes=self.model_config.dtype.itemsize,
+            )
             logger.info(
-                "sync capture consumers active: %s (monitor keys: %s)",
+                "sync capture consumers active: %s (monitor keys: %s; "
+                "persistent capture buffers: %d sites x %d tokens x %d hidden "
+                "= %.1f MiB VRAM)",
                 [name for name, _ in self._sync_consumers],
                 self._sync_monitor_keys,
+                len(self._sync_monitor_keys),
+                self.max_num_tokens,
+                self.model_config.get_hidden_size(),
+                footprint / (1024 * 1024),
             )
             if getattr(self.device, "type", None) == "cuda":
                 self._sync_timing_events = {

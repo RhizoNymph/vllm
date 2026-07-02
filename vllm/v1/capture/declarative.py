@@ -76,8 +76,26 @@ _SCOPE_RANK = {
 
 def _parse_site(spec: str) -> tuple[int, str]:
     """Parse a ``"layer:hook"`` probe-site string to ``(layer, hook)``."""
-    layer_str, _, hook = spec.partition(":")
-    return int(layer_str), hook
+    from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
+
+    layer_str, sep, hook = spec.partition(":")
+    if not sep or not hook:
+        raise ValueError(
+            f"declarative probe site {spec!r} must be 'layer:hook' "
+            f"(e.g. '12:post_block')"
+        )
+    try:
+        layer = int(layer_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"declarative probe site {spec!r} has a non-integer layer"
+        ) from exc
+    if hook not in VALID_HOOK_POINT_NAMES:
+        raise ValueError(
+            f"declarative probe site {spec!r} has unknown hook {hook!r}; "
+            f"valid: {sorted(VALID_HOOK_POINT_NAMES)}"
+        )
+    return layer, hook
 
 
 class DeclarativeSteeringConsumer(SteeringController):
@@ -97,7 +115,14 @@ class DeclarativeSteeringConsumer(SteeringController):
     def __init__(self, vllm_config: VllmConfig, params: dict[str, Any]) -> None:
         super().__init__(vllm_config, params)
         sites = params.get("probe_sites") or ["0:post_block"]
-        self._probe_sites: list[tuple[int, str]] = [_parse_site(s) for s in sites]
+        # Accept both space-separated (list) and comma-separated (one string)
+        # forms, since CLI list args commonly arrive as a single "a,b" token.
+        self._probe_sites: list[tuple[int, str]] = [
+            _parse_site(s.strip())
+            for entry in sites
+            for s in str(entry).split(",")
+            if s.strip()
+        ]
         # req_ids with a one-step (``next_step``) override to clear next step.
         self._next_step_pending: set[str] = set()
         # Cache numpy probe → torch tensor (host-probe GEMM); keyed by id().
