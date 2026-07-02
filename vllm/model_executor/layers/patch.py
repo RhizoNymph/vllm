@@ -69,7 +69,12 @@ _PATCH_MAX_SLOTS: int = 0
 
 
 def set_patch_buffer_slots(max_patch_slots: int) -> None:
-    """Set the process-global patch slot count (0 disables patching)."""
+    """TEST-ONLY override of the patch slot count (0 disables patching).
+
+    At runtime the slot count is resolved from the current ``VllmConfig``
+    (see :func:`_resolve_patch_buffer_slots`); this global is consulted only
+    when no config context exists — unit tests constructing layers directly.
+    """
     global _PATCH_MAX_SLOTS
     _PATCH_MAX_SLOTS = int(max_patch_slots)
 
@@ -146,6 +151,25 @@ def register_patch_buffers(
         )
 
 
+def _resolve_patch_buffer_slots() -> int:
+    """Resolve the patch slot count at buffer-registration time.
+
+    Primary source is the *current* ``VllmConfig`` (models are always built
+    under ``set_current_vllm_config``, on every runner), so no runner has to
+    remember to set anything before the model build — the v1 runner once
+    silently shipped patching as a no-op precisely because it didn't set the
+    old process-global. The global (``set_patch_buffer_slots``) is consulted
+    only when no config context exists, i.e. unit tests constructing layers
+    directly.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is not None:
+        return get_patch_buffer_config(vllm_config)
+    return _PATCH_MAX_SLOTS
+
+
 def maybe_register_patch_buffers(
     module: nn.Module,
     hidden_size: int,
@@ -153,20 +177,21 @@ def maybe_register_patch_buffers(
     max_patch_tokens: int,
     dtype: torch.dtype | None = None,
 ) -> None:
-    """Register patch buffers iff patching is enabled process-globally.
+    """Register patch buffers iff patching is enabled in the vllm config.
 
     Called from :func:`register_steering_buffers` so patch buffers attach to
     the same decoder layers as steering buffers, independent of whether
     steering itself is enabled. ``max_patch_tokens`` mirrors the steering index
     length (``max_num_batched_tokens``).
     """
-    if _PATCH_MAX_SLOTS <= 0:
+    max_patch_slots = _resolve_patch_buffer_slots()
+    if max_patch_slots <= 0:
         return
     register_patch_buffers(
         module,
         hidden_size,
         max_patch_tokens=max_patch_tokens,
-        max_patch_slots=_PATCH_MAX_SLOTS,
+        max_patch_slots=max_patch_slots,
         dtype=dtype,
     )
 

@@ -40,10 +40,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
-from vllm.model_executor.layers.patch import (
-    get_patch_buffer_config,
-    set_patch_buffer_slots,
-)
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -284,10 +280,8 @@ class GPUModelRunner(
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
-        # Set the process-global patch slot count before the model is built so
-        # register_steering_buffers attaches patch buffers to each decoder layer
-        # (0 => patching disabled, no buffers, apply path constant-folds out).
-        set_patch_buffer_slots(get_patch_buffer_config(self.vllm_config))
+        # (Patch buffers self-register during the model build from the current
+        # VllmConfig context — no runner-side setup; see patch.py.)
         self.eplb.prepare_load()
         eplb_models_added = False
         with DeviceMemoryProfiler() as m:

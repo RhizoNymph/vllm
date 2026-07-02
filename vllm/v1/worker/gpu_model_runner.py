@@ -5803,17 +5803,8 @@ class GPUModelRunner(
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
 
-        # Set the process-global patch slot count before the model is built so
-        # register_steering_buffers attaches patch buffers to each decoder layer
-        # (0 => patching disabled, no buffers, apply path constant-folds out).
-        # The v2 runner does the same in its load_model; steering reads
-        # vllm_config directly, but patch reads this process-global.
-        from vllm.model_executor.layers.patch import (
-            get_patch_buffer_config,
-            set_patch_buffer_slots,
-        )
-        set_patch_buffer_slots(get_patch_buffer_config(self.vllm_config))
-
+        # (Patch buffers self-register during the model build from the current
+        # VllmConfig context — no runner-side setup; see patch.py.)
         try:
             with DeviceMemoryProfiler() as m:
                 time_before_load = time.perf_counter()
