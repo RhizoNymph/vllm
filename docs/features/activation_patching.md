@@ -20,7 +20,10 @@ capture run.
   vLLM defers each layer's MLP-branch add — see [Invariants](#invariants).
 - **Models:** every architecture wired for steering/capture (the patch buffers
   are folded into `register_steering_buffers`, so patching attaches wherever
-  steering does — zero per-model changes).
+  steering does — zero per-model changes). **Text-only prompts:** multimodal
+  prompts are rejected at admission — prompt positions include image
+  placeholder tokens, so patch positions would target placeholder activations
+  (semantically undefined and unvalidated).
 - **Runners:** both the v1 and v2 GPU model runners.
 - **Parallelism:** TP and PP (source vectors are resolved rank-locally; TP rank
   0 resolves and broadcasts, PP stores are partitioned by owned layers).

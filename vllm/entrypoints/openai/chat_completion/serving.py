@@ -649,6 +649,17 @@ class OpenAIServingChat(OpenAIServing):
 
         if not sampling_params.patch:
             return None
+        # Multimodal prompts are unsupported: prompt positions include image
+        # placeholder tokens, so patch positions would target placeholder
+        # activations — semantically undefined and unvalidated. Fail loud.
+        if _get_mm_token_counts(engine_input):
+            return self.create_error_response(
+                "activation patching is not supported with multimodal "
+                "prompts (positions include image placeholder tokens); "
+                "use a text-only prompt",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="patch",
+            )
         try:
             num_prompt_tokens = self._extract_prompt_len(engine_input)
             ctx = build_capture_context(

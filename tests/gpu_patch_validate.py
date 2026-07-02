@@ -282,6 +282,56 @@ def main() -> None:
         )
     )
 
+    # F. alpha interpolation at E's best site: the answer logprob must move
+    # monotonically corrupt -> clean as alpha goes 0 -> 0.5 -> 1 (exact grading
+    # via logprob_token_ids so mid-alpha values outside top-k still score).
+    if best[0] >= 0:
+        f_layer, f_pos = best[0], best[1]
+
+        def lp_alpha(alpha: float) -> float | None:
+            out = gen(
+                corrupt_prompt,
+                SamplingParams(
+                    temperature=0.0,
+                    max_tokens=1,
+                    logprobs=1,
+                    logprob_token_ids=[clean_tok],
+                    patch=[
+                        {
+                            "layer": f_layer,
+                            "hook": "post_block",
+                            "dest_position": f_pos,
+                            "source_run": "clean",
+                            "source_position": f_pos,
+                            "alpha": alpha,
+                        }
+                    ],
+                ),
+            )
+            return out.get(clean_tok)
+
+        v0, vh, v1 = lp_alpha(0.0), lp_alpha(0.5), lp_alpha(1.0)
+        tol = 0.3  # bf16 + batch-composition noise
+        ok = (
+            v0 is not None
+            and vh is not None
+            and v1 is not None
+            and (v1 - v0) > 1.0  # site is genuinely causal
+            and v0 - tol <= vh <= v1 + tol  # monotone within tolerance
+        )
+        interior = (
+            v0 is not None and vh is not None and v1 is not None
+            and vh > v0 + 0.05 and vh < v1 - 0.05
+        )
+        results.append(
+            (
+                "F alpha=0.5 interpolates between corrupt and clean",
+                bool(ok),
+                f"lp(a=0)={v0} lp(a=0.5)={vh} lp(a=1)={v1}"
+                + ("" if interior else " (saturating, monotone only)"),
+            )
+        )
+
     print("\n==== PATCH VALIDATION RESULTS ({}) ====".format(mode))
     all_ok = True
     for name, ok, detail in results:
