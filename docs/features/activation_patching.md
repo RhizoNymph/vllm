@@ -89,6 +89,31 @@ The `PatchStudy` client
 (`examples/online_serving/openai_patch_client.py`) wraps capture + sweep for the
 coarse→fine "walk" of finding the causal sites.
 
+### Position alignment
+
+Patch entries pair a destination position (corrupt run) with a source position
+(clean run). When the two prompts tokenize to **equal lengths**, corresponding
+positions are the pairing (standard causal tracing) and nothing more is needed.
+When they tokenize to **different lengths**, `source = dest` silently patches
+shifted positions — so the sweep endpoint refuses a length mismatch unless
+`clean_prompt` is provided, in which case positions are aligned automatically:
+the common token prefix maps by identity, the common token suffix maps by the
+length delta, and the differing middle (no positional correspondence) is
+skipped with per-position entries in `skipped` plus an `alignment` summary in
+the response. `PatchStudy` does the same client-side when the `CleanRun` handle
+(which records its prompt) is passed to the sweep.
+
+### Reproducibility
+
+vLLM is not batch-invariant by default: identical requests in different batch
+compositions return slightly different logprobs, so sweep grids reproduce only
+within a small tolerance. Each sweep response reports an empirical
+`noise_floor` — the metric delta between the corrupt baseline run solo and
+re-run inside the cell batch; grid differences at or below it are not
+meaningful. For exact reproducibility, start the server in batch-invariant mode
+(see [Batch Invariance](batch_invariance.md)); causal-tracing signal is
+typically orders of magnitude above the default noise floor.
+
 ## Data / control flow
 
 1. **Clean capture.** The `patch_source` consumer (`location="worker"`) taps the
