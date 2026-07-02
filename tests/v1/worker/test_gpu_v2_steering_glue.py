@@ -34,6 +34,7 @@ class _FakeManager:
         self.has_dynamic = False
         self.has_dynamic_tier = has_dynamic_tier
         self.has_monitor = False
+        self.has_row_monitor = False
         self.dynamic_tier_gain = 2.0
         self.max_dynamic_steering_configs = dyn_pool
         self.registered: list[tuple[int, str]] = []
@@ -134,6 +135,7 @@ def _make_glue(
     glue._steering_index_dirty = False
     glue._locally_owned_layers = frozenset({0})
     glue._req_dynamic_decode = {}
+    glue._req_override_source = {}
     glue._req_decode_sig_reported = {}
     glue._pending_decode_sigs = {}
     glue._dynamic_steering_stats = {}

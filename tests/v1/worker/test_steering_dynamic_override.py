@@ -269,6 +269,7 @@ class _MixinHost(SteeringModelRunnerMixin):
         self._locally_owned_layers = frozenset({0})
         self._dynamic_steering_stats = {}
         self._req_dynamic_decode = {}
+        self._req_override_source = {}
         self._req_steering_phase = {}
         self._steering_index_dirty = False
         self.input_batch = _FakeInputBatch(reqs)
