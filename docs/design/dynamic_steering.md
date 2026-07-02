@@ -841,9 +841,30 @@ bounded conversation latch/bridge and `_armed` lifecycle but overrides
 - `attenuate`: a per-request `SteeringScaleUpdate` (installing an admitted-only
   override first so the damp is per-request, not shared across a config row).
 
-**`global_capture_spec()`** is a configured allow-list (`declarative_probe_sites`,
-default one site) — only host-evaluated probes need a captured residual;
-`this_token` probes are computed in-kernel and need none.
+**Probe sites & capture (`--declarative-probe-sites`).** The consumer's
+`global_capture_spec()` is a configured allow-list of `layer:hook` sites (config
+field `declarative_probe_sites`; CLI accepts both comma- and space-separated,
+default a single site). It matters ONLY for **host-evaluated** probes
+(`next_step`/`rest_of_request`/`rest_of_conversation` with `when=probe`), which
+read the residual from `view.tensors[(layer, hook)]`; `this_token` probes are
+computed in-kernel (per-row monitor, §8.1) and need **no** capture at any layer.
+A host-probe gate naming a site outside the allow-list is **gracefully skipped
+and logged once** — never a crash. Malformed sites (bad layer / unknown hook /
+missing `:`) fail fast at startup with a clear error.
+
+**Capture footprint.** Each captured site is a persistent buffer sized to the
+full forward width, so the VRAM cost is
+`num_sites × max_num_tokens × hidden_size × dtype_bytes`
+(vLLM's `graphsafe_buffer_bytes` helper; the buffer covers the whole step's
+residual, prefill included, not just decode rows). `max_num_tokens`
+(`≈ max_num_batched_tokens`) is the dominant lever — it multiplies every site
+equally, and the set is frozen at graph-capture time (a new site can't be added
+under CUDA graphs without re-capture). Both runners log the total at startup:
+`persistent capture buffers: N sites x T tokens x H hidden = X MiB VRAM`. Rule
+of thumb (bf16): trivial for ≤1B models, single-digit GB for capturing *all*
+layers of a 4–8B at large batch widths, prohibitive for 70B — so capture a
+curated handful of layers (or lean on the zero-capture `this_token` path), not
+everything.
 
 **Precedence** (operator wins, `steering_model_runner_mixin.py`): every
 declarative action is stamped `source="declarative"`; the runner records the
