@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 import torch
 
+from vllm.config.steering_types import merge_steering_specs
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
@@ -42,6 +43,7 @@ from vllm.model_executor.layers.steering import (
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.worker.steering_action_queue import (
+    DECLARATIVE_SOURCE,
     get_steering_action_queue,
     validate_steering_vectors,
 )
@@ -531,11 +533,16 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
     ) -> bool:
         """v2 port of the per-request dynamic decode override apply.
 
-        Identical routing semantics to v1 (allocate/update/release a
-        dynamic-pool row recorded in ``_req_dynamic_decode``; admitted config
-        lifecycle untouched), but the decode-only phase guard reads v2's
-        ``req_states`` (``req_id_to_index`` + ``num_computed_tokens_np`` /
-        ``prompt_len.np``) instead of the v1 input batch.
+        Identical routing semantics to v1
+        (:meth:`SteeringModelRunnerMixin._apply_request_override`): the
+        operator-wins precedence check + ``_req_override_source`` bookkeeping,
+        the ``compose_admitted`` fold of the request's admitted decode
+        steering, and allocate/update/release of a dynamic-pool row recorded in
+        ``_req_dynamic_decode`` (admitted config lifecycle untouched). Only the
+        storage differs: the decode-only phase guard reads v2's ``req_states``
+        (``req_id_to_index`` + ``num_computed_tokens_np`` / ``prompt_len.np``)
+        and the admitted params come from ``_steering_reqs`` (v2 keeps no
+        ``self.requests`` map).
         """
         mgr = self._steering_manager
         req_id = action.req_id
@@ -556,12 +563,21 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
                 "dynamic override pool is disabled (max_dynamic_steering_configs=0)"
             )
 
+        # Precedence: a client declarative gate must yield to an
+        # operator/server consumer that already owns this request's override.
+        owner = self._req_override_source.get(req_id)
+        if source == DECLARATIVE_SOURCE and owner is not None and owner != source:
+            return _reject(
+                f"declarative gate yields: request already steered by '{owner}'"
+            )
+
         existing_dyn_id = self._req_dynamic_decode.get(req_id)
 
         # Clear: revert to admitted routing. Idempotent disengage.
         if action.vectors is None:
             if existing_dyn_id is not None:
                 self._req_dynamic_decode.pop(req_id, None)
+                self._req_override_source.pop(req_id, None)
                 mgr.release_dynamic_config(existing_dyn_id)
             return True
 
@@ -575,24 +591,44 @@ class SteeringRunnerMixin(SteeringModelRunnerMixin):
                 "request is still prefilling (overrides are decode-only; "
                 "prefill steering feeds prefix-cache keys)"
             )
+
+        # Compose-on-top: fold the request's admitted decode steering delta
+        # into the override so ``action.vectors`` adds to (rather than
+        # replaces) the client's static decode steering. Resolving the admitted
+        # spec can raise if the request's steering module is not registered on
+        # this worker; keep prior state rather than escaping the boundary.
+        vectors = action.vectors
+        if action.compose_admitted:
+            rs = self._steering_reqs.get(req_id)
+            sp = rs.sampling_params if rs is not None else None
+            if sp is not None:
+                try:
+                    admitted = self._resolve_request_steering(sp, "decode")
+                except RuntimeError as exc:
+                    return _reject(str(exc))
+                if admitted:
+                    vectors = merge_steering_specs(admitted, action.vectors)
+
         try:
-            validate_steering_vectors(action.vectors, self._steerable_layers_cache)
+            validate_steering_vectors(vectors, self._steerable_layers_cache)
         except SteeringVectorError as exc:
             return _reject(str(exc))
 
         if existing_dyn_id is not None:
             mgr.update_dynamic_config(
                 existing_dyn_id,
-                action.vectors,
+                vectors,
                 locally_owned_layers=self._locally_owned_layers,
             )
+            self._req_override_source[req_id] = source
             return True
         try:
             dyn_id, _row = mgr.register_dynamic_config(
-                action.vectors,
+                vectors,
                 locally_owned_layers=self._locally_owned_layers,
             )
         except RuntimeError as exc:
             return _reject(str(exc))
         self._req_dynamic_decode[req_id] = dyn_id
+        self._req_override_source[req_id] = source
         return True
