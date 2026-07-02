@@ -40,6 +40,8 @@ request already owned by another source (see
 
 from __future__ import annotations
 
+import hashlib
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -63,6 +65,9 @@ if TYPE_CHECKING:
     from vllm.v1.steering_schema import ResolvedGate
 
 logger = init_logger(__name__)
+
+# Max entries kept in the per-consumer host-probe tensor cache.
+_PROBE_CACHE_MAX = 64
 
 # Override-lifetime ranking used to pick the widest scope among a request's
 # firing add gates (they share one override row).
@@ -125,8 +130,16 @@ class DeclarativeSteeringConsumer(SteeringController):
         ]
         # req_ids with a one-step (``next_step``) override to clear next step.
         self._next_step_pending: set[str] = set()
-        # Cache numpy probe → torch tensor (host-probe GEMM); keyed by id().
-        self._probe_tensor_cache: dict[int, torch.Tensor] = {}
+        # Bounded LRU cache: numpy probe → torch tensor (host-probe GEMM).
+        # Keyed by a content digest (not ``id(probe)``): the consumer runs
+        # independently on every TP rank and must decide bit-identically, so
+        # the key must be a pure function of the array's value. ``id()`` keying
+        # both leaked (one tensor per distinct array, never evicted) and, once
+        # a gate's array was GC'd, could alias a new probe's reused address to
+        # a stale tensor — diverging per rank and silently desyncing tables.
+        self._probe_tensor_cache: OrderedDict[
+            tuple[tuple[int, ...], str, bytes], torch.Tensor
+        ] = OrderedDict()
         self._missing_site_warned = False
         self._gate_errors = 0
 
@@ -148,12 +161,27 @@ class DeclarativeSteeringConsumer(SteeringController):
     # -- helpers -----------------------------------------------------------
 
     def _probe_tensor(self, probe: np.ndarray, device: torch.device) -> torch.Tensor:
-        t = self._probe_tensor_cache.get(id(probe))
+        """Return ``probe`` as an fp32 device tensor, content-cached (bounded).
+
+        Args:
+            probe: The per-request probe vector.
+            device: Target device for the GEMV.
+
+        Returns:
+            The uploaded fp32 tensor, reused across value-equal probes.
+        """
+        arr = np.ascontiguousarray(probe, dtype=np.float32)
+        key = (arr.shape, arr.dtype.str, hashlib.sha1(arr.tobytes()).digest())
+        cache = self._probe_tensor_cache
+        t = cache.get(key)
         if t is None or t.device != device:
-            t = torch.from_numpy(
-                np.ascontiguousarray(probe, dtype=np.float32)
-            ).to(device)
-            self._probe_tensor_cache[id(probe)] = t
+            t = torch.from_numpy(arr).to(device)
+            cache[key] = t
+            cache.move_to_end(key)
+            while len(cache) > _PROBE_CACHE_MAX:
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
         return t
 
     def _host_probe_fires(
