@@ -17,6 +17,7 @@ logged, skipped entry.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -101,15 +102,22 @@ class _PatchSourceCache:
     Refresh-on-miss: a referenced run/site that is not cached triggers one
     refresh before rejecting, so a just-captured clean run is never
     false-rejected. A present run is fetched once and then served from cache,
-    so a sweep that reuses one run issues ~one RPC total. Positive entries can
-    go stale on whole-run eviction; that rare case falls through to the
-    worker's log-and-skip at resolution.
+    so a sweep that reuses one run issues ~one RPC total.
+
+    Validated runs are also LEASED against store eviction (the positive cache
+    can go stale on whole-run eviction, and even a fresh check leaves an
+    admission→resolution window). Leases are renewed lazily — one lease RPC per
+    run per ~half-TTL — so the per-cell cost stays zero.
     """
+
+    LEASE_TTL_S = 300.0
 
     def __init__(self) -> None:
         # run_id -> {"sites": set[(hook, layer)], "positions": set[int]}
         self._runs: dict[str, dict[str, set]] = {}
         self._lock = asyncio.Lock()
+        # run_id -> monotonic time we last leased it on the workers.
+        self._leased_at: dict[str, float] = {}
 
     async def _refresh(self, engine_client: EngineClient) -> None:
         results = await engine_client.collective_rpc("get_patch_source_manifests")
@@ -157,6 +165,7 @@ class _PatchSourceCache:
             for e in spec
         ]
         if self._missing(refs) is None:
+            await self._maybe_lease(engine_client, {r[0] for r in refs})
             return  # all cached-present
         async with self._lock:
             try:
@@ -164,7 +173,8 @@ class _PatchSourceCache:
             except Exception as exc:  # noqa: BLE001 — best-effort admission check
                 logger.warning(
                     "patch source manifest RPC failed (%s); skipping admission "
-                    "existence check (worker will log+skip a missing source)",
+                    "existence check (worker records a resolution failure on "
+                    "a missing source)",
                     exc,
                 )
                 return
@@ -176,6 +186,31 @@ class _PatchSourceCache:
                 f"hook={hook}, position={pos}). Capture the clean run "
                 f"(capture={{'patch_source': ...}}, capture_wait=True) first."
             )
+        await self._maybe_lease(engine_client, {r[0] for r in refs})
+
+    async def _maybe_lease(
+        self, engine_client: EngineClient, runs: set[str]
+    ) -> None:
+        """Lease ``runs`` against eviction, renewing at most once per half-TTL.
+
+        Best-effort: a failed lease RPC degrades to the resolution-failure
+        backstop rather than blocking admission.
+        """
+        now = time.monotonic()
+        stale = [
+            run for run in runs
+            if now - self._leased_at.get(run, 0.0) > self.LEASE_TTL_S / 2
+        ]
+        if not stale:
+            return
+        try:
+            await engine_client.collective_rpc(
+                "lease_patch_source_runs", args=(stale, self.LEASE_TTL_S)
+            )
+            for run in stale:
+                self._leased_at[run] = now
+        except Exception as exc:  # noqa: BLE001 — lease is best-effort
+            logger.warning("patch source lease RPC failed (%s)", exc)
 
 
 # Process-global cache shared across the chat + completion serving instances

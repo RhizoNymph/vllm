@@ -124,6 +124,7 @@ async def _first_token_logprobs(
     logprobs: int,
     tag: str,
     grade_token_ids: list[int] | None = None,
+    request_id: str | None = None,
 ) -> tuple[dict[int, Any] | None, int]:
     """Run one short greedy generation; return (first-token logprobs, n_prompt).
 
@@ -140,7 +141,7 @@ async def _first_token_logprobs(
         patch=patch,
         logprob_token_ids=grade_token_ids,
     )
-    request_id = f"patchsweep-{tag}-{uuid4().hex[:8]}"
+    request_id = request_id or f"patchsweep-{tag}-{uuid4().hex[:8]}"
     final = None
     async for out in eng.generate({"prompt": prompt}, sp, request_id):
         final = out
@@ -252,6 +253,7 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     grid: list[list[float | None]] = [
         [None] * len(positions) for _ in layers
     ]
+    cell_req_ids: dict[str, tuple[int, int, int, int]] = {}
 
     async def run_cell(i: int, layer: int, j: int, pos: int) -> None:
         patch = [
@@ -264,8 +266,11 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
                 "alpha": body.alpha,
             }
         ]
+        request_id = f"patchsweep-{layer}-{pos}-{uuid4().hex[:8]}"
+        cell_req_ids[request_id] = (i, layer, j, pos)
         lp, _ = await _first_token_logprobs(
-            eng, body.prompt, patch, body.logprobs, f"{layer}-{pos}", grade_ids
+            eng, body.prompt, patch, body.logprobs, f"{layer}-{pos}",
+            grade_ids, request_id,
         )
         grid[i][j] = cell_metric(lp, body) if lp else None
 
@@ -276,6 +281,31 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
             for j, pos in enumerate(positions)
         )
     )
+
+    # Void any cell whose patch failed to resolve on the workers (source
+    # evicted between admission and resolution — near-impossible with leasing,
+    # but a silently-unpatched cell reported as a patched result is wrong
+    # science, so drain the failure registry and null those cells loudly.
+    skipped: list[dict] = []
+    try:
+        failure_maps = await eng.collective_rpc("pop_patch_resolution_failures")
+    except Exception as exc:  # noqa: BLE001 — backstop is best-effort
+        logger.warning("patch resolution-failure drain RPC failed (%s)", exc)
+        failure_maps = None
+    for rank_failures in failure_maps or []:
+        for req_id, details in (rank_failures or {}).items():
+            cell = cell_req_ids.get(req_id)
+            if cell is None:
+                continue  # not one of this sweep's cells
+            i, layer, j, pos = cell
+            grid[i][j] = None
+            skipped.append(
+                {"layer": layer, "position": pos, "reason": "; ".join(details)}
+            )
+            logger.error(
+                "patch_sweep cell (layer=%d, pos=%d) ran unpatched: %s",
+                layer, pos, details,
+            )
 
     clean_val = body.clean_baseline
     if body.metric == "recovered":
@@ -302,6 +332,7 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         clean=clean_val,
         corrupt=corrupt_val,
         argmax=argmax_cell(grid, layers, positions),
+        skipped=skipped,
     )
 
 

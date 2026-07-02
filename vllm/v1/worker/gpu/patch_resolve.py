@@ -36,6 +36,32 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Process-global registry of per-request resolution failures. A miss here
+# means an admitted patch could not resolve its source (eviction race or bug):
+# the request runs UNPATCHED, so its output must not be trusted as a patched
+# result. Leasing (PatchSourceStore.lease_runs) makes this near-impossible;
+# this registry is the loud backstop — the sweep endpoint drains it after each
+# sweep (collective_rpc) and voids the affected cells.
+_RESOLUTION_FAILURES: dict[str, list[str]] = {}
+_FAILURES_MAX = 1024  # bound the registry; oldest dropped with a log
+
+
+def record_resolution_failure(req_id: str, detail: str) -> None:
+    if req_id not in _RESOLUTION_FAILURES and (
+        len(_RESOLUTION_FAILURES) >= _FAILURES_MAX
+    ):
+        dropped = next(iter(_RESOLUTION_FAILURES))
+        _RESOLUTION_FAILURES.pop(dropped, None)
+        logger.warning("patch resolution-failure registry full; dropped %s", dropped)
+    _RESOLUTION_FAILURES.setdefault(req_id, []).append(detail)
+
+
+def pop_resolution_failures() -> dict[str, list[str]]:
+    """Drain the registry (worker RPC target)."""
+    global _RESOLUTION_FAILURES
+    failures, _RESOLUTION_FAILURES = _RESOLUTION_FAILURES, {}
+    return failures
+
 
 def _tp_group():
     """Return the TP GroupCoordinator, or ``None`` if unavailable (CPU/tests)."""
@@ -47,10 +73,13 @@ def _tp_group():
         return None
 
 
-def _resolve_local(candidates: list[dict]) -> list[PatchEntry]:
+def _resolve_local(candidates: list[dict], req_id: str) -> list[PatchEntry]:
     """Resolve candidate spec entries against the local source store.
 
-    Missing sources are logged and skipped (admission is the strict gate).
+    Missing sources are logged, recorded in the resolution-failure registry
+    (so the request's output can be voided), and skipped — admission is the
+    strict gate; a miss here is an eviction race or a bug, and the engine
+    must not crash for it.
     """
     store = get_active_patch_source_store()
     if store is None:
@@ -59,6 +88,7 @@ def _resolve_local(candidates: list[dict]) -> list[PatchEntry]:
             "dropping %d patch entries",
             len(candidates),
         )
+        record_resolution_failure(req_id, "no active source store on rank")
         return []
     entries: list[PatchEntry] = []
     for e in candidates:
@@ -68,14 +98,13 @@ def _resolve_local(candidates: list[dict]) -> list[PatchEntry]:
         source_pos = int(e["source_position"])
         row = store.get_row(source_run, layer, hook, source_pos)
         if row is None:
-            logger.error(
-                "patch source missing at resolution: run=%s layer=%d hook=%s "
-                "pos=%d (evicted or never captured); skipping entry",
-                source_run,
-                layer,
-                hook,
-                source_pos,
+            detail = (
+                f"source missing: run={source_run} layer={layer} "
+                f"hook={hook} pos={source_pos} (evicted or never captured)"
             )
+            logger.error("patch resolution for %s: %s; skipping entry",
+                         req_id, detail)
+            record_resolution_failure(req_id, detail)
             continue
         entries.append(
             PatchEntry(
@@ -116,12 +145,12 @@ def resolve_patch_entries(
     world_size = getattr(tp, "world_size", 1) if tp is not None else 1
 
     if world_size <= 1:
-        return _resolve_local(candidates)
+        return _resolve_local(candidates, new_req_data.req_id)
 
     # TP>1: rank 0 resolves from its store and broadcasts to peers so all ranks
     # apply the identical patch (residual is replicated across the TP group).
     if tp.rank_in_group == 0:
-        resolved = _resolve_local(candidates)
+        resolved = _resolve_local(candidates, new_req_data.req_id)
         tp.broadcast_object(resolved, src=0)
         return resolved
     return tp.broadcast_object(None, src=0) or []

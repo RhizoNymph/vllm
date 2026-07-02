@@ -153,3 +153,62 @@ class TestActiveAccessor:
             assert get_active_patch_source_store() is None
         finally:
             set_active_patch_source_store(prev)
+
+
+class TestLeases:
+    """Leased runs must survive eviction pressure (admission→resolution race)."""
+
+    def test_leased_run_not_evicted(self):
+        row_bytes = 4 * 4  # 4 fp32 elements
+        store = PatchSourceStore(max_bytes=int(row_bytes * 1.5))
+        store.put_row("A", 0, "post_block", 0, _row(4, 1.0), num_prompt_tokens=1)
+        store.lease_runs(["A"], ttl_seconds=60.0)
+        # B's write would normally evict LRU run A; the lease must protect it
+        # (soft-exceeding the budget instead).
+        store.put_row("B", 0, "post_block", 0, _row(4, 2.0), num_prompt_tokens=1)
+        assert store.get_row("A", 0, "post_block", 0) is not None
+
+    def test_expired_lease_evictable(self):
+        row_bytes = 4 * 4
+        store = PatchSourceStore(max_bytes=int(row_bytes * 1.5))
+        store.put_row("A", 0, "post_block", 0, _row(4, 1.0), num_prompt_tokens=1)
+        store.lease_runs(["A"], ttl_seconds=0.0)  # immediately expired
+        store.put_row("B", 0, "post_block", 0, _row(4, 2.0), num_prompt_tokens=1)
+        assert store.get_row("A", 0, "post_block", 0) is None  # evicted
+        assert store.get_row("B", 0, "post_block", 0) is not None
+
+    def test_unleased_lru_evicted_before_leased(self):
+        row_bytes = 4 * 4
+        store = PatchSourceStore(max_bytes=int(row_bytes * 2.5))
+        store.put_row("A", 0, "post_block", 0, _row(4, 1.0), num_prompt_tokens=1)
+        store.put_row("B", 0, "post_block", 0, _row(4, 2.0), num_prompt_tokens=1)
+        store.lease_runs(["A"], ttl_seconds=60.0)
+        # C pushes over budget: A is older but leased -> B (unleased) evicts.
+        store.put_row("C", 0, "post_block", 0, _row(4, 3.0), num_prompt_tokens=1)
+        assert store.get_row("A", 0, "post_block", 0) is not None
+        assert store.get_row("B", 0, "post_block", 0) is None
+        assert store.get_row("C", 0, "post_block", 0) is not None
+
+    def test_lease_renewal_extends(self):
+        store = PatchSourceStore(max_bytes=0)
+        store.put_row("A", 0, "post_block", 0, _row(4, 1.0), num_prompt_tokens=1)
+        store.lease_runs(["A"], ttl_seconds=0.0)
+        store.lease_runs(["A"], ttl_seconds=60.0)  # renewal wins (max expiry)
+        assert store._leased_locked("A") is True
+
+
+class TestResolutionFailureRegistry:
+    def test_record_and_pop(self):
+        from vllm.v1.worker.gpu.patch_resolve import (
+            pop_resolution_failures,
+            record_resolution_failure,
+        )
+
+        pop_resolution_failures()  # drain any prior state
+        record_resolution_failure("req-1", "source missing: run=X")
+        record_resolution_failure("req-1", "source missing: run=Y")
+        record_resolution_failure("req-2", "no active source store on rank")
+        failures = pop_resolution_failures()
+        assert set(failures) == {"req-1", "req-2"}
+        assert len(failures["req-1"]) == 2
+        assert pop_resolution_failures() == {}  # drained

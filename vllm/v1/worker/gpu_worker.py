@@ -1016,6 +1016,32 @@ class Worker(WorkerBase):
             for m in store.manifests()
         ]
 
+    def lease_patch_source_runs(
+        self, run_ids: list[str], ttl_seconds: float
+    ) -> None:
+        """Protect ``run_ids`` from source-store eviction for ``ttl_seconds``.
+
+        Called via ``collective_rpc`` by the admission path after validating a
+        patch request, closing the admission→resolution eviction race. No-op on
+        ranks without an active store.
+        """
+        from vllm.v1.capture.source_store import get_active_patch_source_store
+
+        store = get_active_patch_source_store()
+        if store is not None:
+            store.lease_runs(list(run_ids), float(ttl_seconds))
+
+    def pop_patch_resolution_failures(self) -> dict[str, list[str]]:
+        """Drain this rank's patch resolution-failure registry.
+
+        Called via ``collective_rpc`` by the sweep endpoint after a sweep; any
+        request listed here ran UNPATCHED (source missing at resolution) and
+        its cell must be voided rather than reported as a patched result.
+        """
+        from vllm.v1.worker.gpu.patch_resolve import pop_resolution_failures
+
+        return pop_resolution_failures()
+
     def list_steerable_layers(self) -> dict[int, list[str]]:
         return self.model_runner.list_steerable_layers()
 

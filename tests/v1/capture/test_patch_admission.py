@@ -157,7 +157,8 @@ class TestPatchSourceCache:
         cache = self._cache()
         eng = _FakeEngine([[_manifest("R1", [("post_block", 2)], [0, 1, 2])]])
         asyncio.run(cache.validate(_patch_sp(src=1), eng))  # no raise
-        assert eng.calls == 1  # refreshed once (cold cache)
+        # cold cache: one manifest refresh + one eviction-lease RPC
+        assert eng.calls == 2
 
     def test_missing_run_rejects(self):
         from vllm.v1.capture.patch_admission import PatchValidationError
@@ -180,7 +181,17 @@ class TestPatchSourceCache:
         eng = _FakeEngine([[_manifest("R1", [("post_block", 2)], [0, 1, 2])]])
         asyncio.run(cache.validate(_patch_sp(src=1), eng))
         asyncio.run(cache.validate(_patch_sp(src=2), eng))
-        assert eng.calls == 1  # second call served from cache, no RPC
+        # 2 = cold manifest refresh + one lease; the second validate is served
+        # from cache AND its lease is still fresh (throttled to half-TTL), so
+        # it issues no RPC at all — a sweep stays ~O(1) RPCs total.
+        assert eng.calls == 2
+
+    def test_lease_rpc_throttled_across_many_validates(self):
+        cache = self._cache()
+        eng = _FakeEngine([[_manifest("R1", [("post_block", 2)], [0, 1, 2])]])
+        for src in (0, 1, 2, 0, 1, 2):
+            asyncio.run(cache.validate(_patch_sp(src=src), eng))
+        assert eng.calls == 2  # manifest + single lease, regardless of cells
 
     def test_rpc_failure_is_best_effort(self):
         cache = self._cache()

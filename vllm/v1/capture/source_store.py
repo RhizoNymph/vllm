@@ -29,6 +29,7 @@ peers at resolution time, since the residual is replicated across the group).
 from __future__ import annotations
 
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -102,6 +103,12 @@ class PatchSourceStore:
         self._rows_put = 0
         self._runs_evicted = 0
         self._invalidations = 0
+        # run_id -> monotonic expiry. Leased runs are referenced by admitted
+        # (or about-to-be-admitted) patch requests and must not be evicted:
+        # an eviction between admission and worker resolution silently
+        # un-patches the request. Leases are best-effort TTLs, renewed by the
+        # admission path; the budget may be soft-exceeded while runs are leased.
+        self._leases: dict[str, float] = {}
 
     @property
     def max_bytes(self) -> int:
@@ -149,27 +156,46 @@ class PatchSourceStore:
             self._rows_put += 1
             self._evict_to_budget_locked(protect=run_id)
 
+    def lease_runs(self, run_ids: list[str], ttl_seconds: float) -> None:
+        """Protect ``run_ids`` from eviction for ``ttl_seconds`` (best-effort).
+
+        Called (via worker RPC) by the admission path after validating a patch
+        request's sources, closing the admission→resolution eviction race. A
+        renewed lease extends the expiry; leases never block writes, only
+        eviction (the budget is soft-exceeded while leases are live).
+        """
+        expiry = time.monotonic() + float(ttl_seconds)
+        with self._lock:
+            for run_id in run_ids:
+                prev = self._leases.get(run_id, 0.0)
+                self._leases[run_id] = max(prev, expiry)
+
+    def _leased_locked(self, run_id: str) -> bool:
+        expiry = self._leases.get(run_id)
+        if expiry is None:
+            return False
+        if expiry <= time.monotonic():
+            del self._leases[run_id]
+            return False
+        return True
+
     def _evict_to_budget_locked(self, *, protect: str | None = None) -> None:
-        over_bytes = self._max_bytes > 0 and self._resident_bytes > self._max_bytes
-        over_runs = self._max_runs is not None and len(self._runs) > self._max_runs
-        while (over_bytes or over_runs) and len(self._runs) > 0:
-            run_id, run = next(iter(self._runs.items()))
-            if run_id == protect:
-                # Never evict the run being written; if it alone exceeds the
-                # budget we keep it (and log) rather than corrupt it.
-                if len(self._runs) == 1:
-                    logger.warning(
-                        "patch source run %s (%.3f GB) exceeds budget %.3f GB; "
-                        "kept (single run)",
-                        run_id,
-                        run.resident_bytes / 1e9,
-                        self._max_bytes / 1e9,
-                    )
-                    return
-                # Rotate the protected run to the back and evict the next LRU.
-                self._runs.move_to_end(run_id)
-                run_id, run = next(iter(self._runs.items()))
-            self._runs.pop(run_id, None)
+        def over() -> bool:
+            return (
+                self._max_bytes > 0 and self._resident_bytes > self._max_bytes
+            ) or (self._max_runs is not None and len(self._runs) > self._max_runs)
+
+        # Walk the LRU order, skipping the run being written and any leased
+        # run. If everything is protected, soft-exceed the budget (evicting a
+        # leased run would silently un-patch in-flight requests — worse than
+        # temporary memory pressure).
+        candidates = list(self._runs.keys())
+        for run_id in candidates:
+            if not over():
+                return
+            if run_id == protect or self._leased_locked(run_id):
+                continue
+            run = self._runs.pop(run_id)
             self._resident_bytes -= run.resident_bytes
             self._runs_evicted += 1
             logger.info(
@@ -177,8 +203,14 @@ class PatchSourceStore:
                 run_id,
                 run.resident_bytes / 1e9,
             )
-            over_bytes = self._max_bytes > 0 and self._resident_bytes > self._max_bytes
-            over_runs = self._max_runs is not None and len(self._runs) > self._max_runs
+        if over():
+            logger.warning(
+                "patch source store over budget (%.3f/%.3f GB) but all %d "
+                "runs are leased or being written; keeping (soft-exceed)",
+                self._resident_bytes / 1e9,
+                self._max_bytes / 1e9,
+                len(self._runs),
+            )
 
     def get_row(
         self, run_id: str, layer: int, hook: str, position: int
