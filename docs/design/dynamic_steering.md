@@ -821,7 +821,12 @@ SteeringHookPacked}}` (the base64 escape hatch, §5.6). Names are resolved to
 inline packed at the **frontend** (`build_steering_gates` in
 `to_request_metadata`), so the worker only ever sees packed bytes — no
 worker-side registry. `resolve_gates` unpacks to numpy once at admission and
-surfaces `ResolvedGate`s on `StepRequestView.steering` (both runners).
+surfaces `ResolvedGate`s on `StepRequestView.steering` (both runners). Admission
+wraps it in `resolve_gates_safe`: a malformed payload from a producer that
+bypassed the frontend dry-run (offline `LLM`, Rust frontend, msgpack skew) is
+**gracefully skipped and logged once** — the request proceeds without
+declarative steering rather than crashing the engine core (all TP ranks see the
+same bytes and fail identically, so the graceful path can't desync them).
 
 **Built-in consumer** (`vllm/v1/capture/declarative.py`,
 `DeclarativeSteeringConsumer`): subclasses `SteeringController` to reuse the

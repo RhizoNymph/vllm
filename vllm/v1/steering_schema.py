@@ -36,6 +36,15 @@ import msgspec
 import numpy as np
 
 from vllm.config.steering_types import SteeringHookPacked, unpack_steering_vectors
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+# Rate-limit the admission-side warning: a broken producer would otherwise
+# emit one line per request. Latched on first graceful skip (see
+# ``resolve_gates_safe``); mirrors ``_missing_site_warned`` in the
+# declarative consumer.
+_resolve_failure_warned = False
 
 if TYPE_CHECKING:
     from typing import Protocol
@@ -253,6 +262,50 @@ def resolve_gates(
     return resolved
 
 
+def resolve_gates_safe(
+    gates: list[SteeringGate] | None,
+    req_id: str | None = None,
+) -> list[ResolvedGate] | None:
+    """Fail-safe :func:`resolve_gates` for the model-runner admission path.
+
+    The frontend dry-runs :func:`build_steering_gates` so a malformed spec is
+    rejected as HTTP 400, but other producers of ``RequestMetadata.steering``
+    (offline ``LLM``, the Rust frontend, msgpack version skew) bypass that
+    check. A raw ``resolve_gates`` there would raise ``ValueError`` /
+    ``TypeError`` / ``KeyError`` straight through ``_update_states`` and abort
+    the engine core — a full-server DoS from one bad request. Here we instead
+    log once and drop the request's declarative gates, letting generation
+    proceed without them.
+
+    Determinism: the gates arrive as identical serialized bytes on every TP
+    rank, so a malformed spec fails identically on all ranks; the graceful
+    path returns ``None`` everywhere and cannot desync them.
+
+    Args:
+        gates: Per-request gates to resolve, or ``None``.
+        req_id: Request id, included in the warning for triage.
+
+    Returns:
+        Resolved gates, or ``None`` if the input was empty or malformed.
+    """
+    if not gates:
+        return None
+    try:
+        return resolve_gates(gates)
+    except Exception:  # noqa: BLE001 - fail-safe: never abort the engine core
+        global _resolve_failure_warned
+        if not _resolve_failure_warned:
+            _resolve_failure_warned = True
+            logger.warning(
+                "declarative steering: failed to resolve gates for request %s; "
+                "gates skipped (request proceeds without declarative steering). "
+                "This suppresses further identical warnings.",
+                req_id,
+                exc_info=True,
+            )
+        return None
+
+
 # --------------------------------------------------------------------------
 # Frontend: validate raw JSON gates + resolve names → inline packed.
 # --------------------------------------------------------------------------
@@ -339,8 +392,14 @@ def build_steering_gates(
     except msgspec.ValidationError as exc:
         raise ValueError(f"invalid steering gate spec: {exc}") from exc
     # Fail fast on structural problems the consumer would otherwise hit
-    # (probe must name exactly one site; add must carry vectors).
-    resolve_gates(gates)
+    # (probe must name exactly one site; add must carry vectors). Normalize
+    # non-ValueError unpack failures (e.g. ``np.dtype("garbage")`` raises
+    # TypeError, missing keys raise KeyError) into ValueError so callers
+    # return HTTP 400 rather than 500.
+    try:
+        resolve_gates(gates)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ValueError(f"invalid steering gate spec: {exc}") from exc
     return gates
 
 
@@ -358,5 +417,6 @@ __all__ = [
     "SteeringGate",
     "ResolvedGate",
     "resolve_gates",
+    "resolve_gates_safe",
     "build_steering_gates",
 ]

@@ -1557,9 +1557,11 @@ class GPUModelRunner(
                 rmeta.conversation_id if rmeta is not None else None
             )
             if rmeta is not None and rmeta.steering is not None:
-                from vllm.v1.steering_schema import resolve_gates
+                from vllm.v1.steering_schema import resolve_gates_safe
 
-                self._sync_steering_gates[req_id] = resolve_gates(rmeta.steering)
+                self._sync_steering_gates[req_id] = resolve_gates_safe(
+                    rmeta.steering, req_id
+                )
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             # Admit the request for activation capture, if the feature
