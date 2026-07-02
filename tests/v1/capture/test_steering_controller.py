@@ -10,6 +10,7 @@ threshold) so the tests exercise the base, not a specific consumer.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -117,6 +118,39 @@ def test_bridge_steers_new_request_of_latched_conversation():
     # Bridged override re-applies the latched vectors.
     np.testing.assert_array_equal(acts[0].vectors[HOOK][LAYER], ctl._vec)
     assert ctl.status()["bridges"] == 1
+
+
+def test_bridge_preserves_all_override_fields():
+    """A bridged turn must steer identically to the trigger turn: every field
+    of the latched override is carried over, only ``req_id`` is rebound. Guards
+    against field-by-field rebuilds silently dropping ``compose_admitted`` (so
+    the trigger composes with admitted steering but later turns replace it).
+    """
+
+    class _ComposeController(_ThresholdController):
+        def decide(self, request_view, residual) -> SteeringAction | None:
+            if float(residual.float().mean()) <= self._threshold:
+                return None
+            return RequestSteeringOverride(
+                req_id=request_view.req_id,
+                vectors={HOOK: {LAYER: self._vec}},
+                compose_admitted=True,
+                source="compose_controller",
+            )
+
+    ctl = _ComposeController(_cfg(), {"threshold": 0.5})
+    ctl.on_step(_view([("r1", "c1", "decode", 1.0)]))  # trigger + latch
+    latched = ctl._latched["c1"]
+    assert latched.compose_admitted is True
+    acts = ctl.on_step(_view([("r2", "c1", "decode", 0.0)]))  # bridge
+    assert len(acts) == 1 and isinstance(acts[0], RequestSteeringOverride)
+    bridged = acts[0]
+    assert bridged.req_id == "r2"
+    # Every field except req_id matches the latched override.
+    assert bridged.compose_admitted is True
+    assert bridged.source == latched.source
+    assert bridged.vectors is latched.vectors
+    assert replace(bridged, req_id="r1") == latched
 
 
 def test_other_conversations_untouched():

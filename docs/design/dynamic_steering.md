@@ -552,8 +552,8 @@ The base implements `on_step` in terms of `decide` and owns:
   a bounded (FIFO-evicted) `conversation_id -> sticky-override` map;
 - **the latch pattern** — a `RequestSteeringOverride` returned by `decide`
   (the *trigger*) is latched onto the conversation and applied to the firing
-  request; every later request of that conversation is *bridged* (overridden
-  with the same vectors, no re-trigger).
+  request; every later request of that conversation is *bridged* (re-issued
+  the same override rebound to the new request, no re-trigger).
 
 The base resolves the single monitored `(layer, hook)` from the subclass's
 `global_capture_spec()` and hands `decide` the firing request's residual
