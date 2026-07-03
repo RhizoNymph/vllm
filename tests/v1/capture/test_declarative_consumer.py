@@ -11,7 +11,10 @@ plus the arming/latch/pulse lifecycle. CPU-only.
 import numpy as np
 import torch
 
-from vllm.v1.capture.declarative import DeclarativeSteeringConsumer
+from vllm.v1.capture.declarative import (
+    _PROBE_CACHE_MAX,
+    DeclarativeSteeringConsumer,
+)
 from vllm.v1.capture.step_view import StepCaptureView, StepRequestView
 from vllm.v1.steering_schema import ResolvedGate
 from vllm.v1.worker.steering_action_queue import (
@@ -207,3 +210,64 @@ def test_finished_request_state_pruned():
     # request no longer live -> pruned
     c.on_step(_view([_req("other", None)]))
     assert "r" not in c._armed
+
+
+# -- host-probe tensor cache -------------------------------------------------
+
+_DEV = torch.device("cpu")
+
+
+def test_probe_cache_equal_content_shares_one_entry():
+    # Two distinct ndarray objects with equal content collapse to one entry
+    # (id()-keyed code would store two).
+    c = _consumer()
+    a = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    b = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    assert a is not b
+    ta = c._probe_tensor(a, _DEV)
+    tb = c._probe_tensor(b, _DEV)
+    assert len(c._probe_tensor_cache) == 1
+    assert ta is tb
+    torch.testing.assert_close(ta, torch.tensor([1.0, 2.0, 3.0]))
+
+
+def test_probe_cache_different_content_distinct_tensors():
+    c = _consumer()
+    a = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    b = np.array([4.0, 5.0, 6.0], dtype=np.float32)
+    ta = c._probe_tensor(a, _DEV)
+    tb = c._probe_tensor(b, _DEV)
+    assert len(c._probe_tensor_cache) == 2
+    assert ta is not tb
+    torch.testing.assert_close(ta, torch.tensor([1.0, 2.0, 3.0]))
+    torch.testing.assert_close(tb, torch.tensor([4.0, 5.0, 6.0]))
+
+
+def test_probe_cache_is_bounded_and_evicts_oldest():
+    c = _consumer()
+    probes = [
+        np.full(2, float(i), dtype=np.float32)
+        for i in range(_PROBE_CACHE_MAX + 5)
+    ]
+    for p in probes:
+        c._probe_tensor(p, _DEV)
+    assert len(c._probe_tensor_cache) == _PROBE_CACHE_MAX
+    # The 5 oldest were evicted; the newest MAX remain and read correctly.
+    survivor = c._probe_tensor(probes[-1], _DEV)
+    torch.testing.assert_close(
+        survivor, torch.full((2,), float(_PROBE_CACHE_MAX + 4))
+    )
+
+
+def test_probe_cache_hit_after_eviction_reuploads():
+    c = _consumer()
+    first = np.full(2, -1.0, dtype=np.float32)
+    c._probe_tensor(first, _DEV)  # LRU-oldest
+    # Evict `first` by inserting MAX newer distinct probes.
+    for i in range(_PROBE_CACHE_MAX):
+        c._probe_tensor(np.full(2, float(i), dtype=np.float32), _DEV)
+    assert len(c._probe_tensor_cache) == _PROBE_CACHE_MAX
+    # A fresh, value-equal array re-uploads with the correct value.
+    again = c._probe_tensor(np.full(2, -1.0, dtype=np.float32), _DEV)
+    torch.testing.assert_close(again, torch.full((2,), -1.0))
+    assert len(c._probe_tensor_cache) == _PROBE_CACHE_MAX

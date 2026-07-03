@@ -34,6 +34,7 @@ class _FakeManager:
         self.has_dynamic = False
         self.has_dynamic_tier = has_dynamic_tier
         self.has_monitor = False
+        self.has_row_monitor = False
         self.dynamic_tier_gain = 2.0
         self.max_dynamic_steering_configs = dyn_pool
         self.registered: list[tuple[int, str]] = []
@@ -134,6 +135,7 @@ def _make_glue(
     glue._steering_index_dirty = False
     glue._locally_owned_layers = frozenset({0})
     glue._req_dynamic_decode = {}
+    glue._req_override_source = {}
     glue._req_decode_sig_reported = {}
     glue._pending_decode_sigs = {}
     glue._dynamic_steering_stats = {}
@@ -489,3 +491,188 @@ def test_scales_dirty_takes_cheap_populate_path():
     # Cheap path taken: scales repopulated, no full table recompose.
     assert mgr.scales_populated == 1
     assert mgr.populated == 0
+
+
+# ---- declarative override parity: compose + operator-wins precedence ----------
+#
+# Mirrors the v1 semantics in
+# ``SteeringModelRunnerMixin._apply_request_override`` on the v2 runner: the
+# ``compose_admitted`` fold, the ``_req_override_source`` bookkeeping, and the
+# operator-wins precedence check the inherited scale/monitor paths rely on.
+
+
+def _pre_attn(value: float) -> dict:
+    return {"pre_attn": {0: np.array([value], dtype=np.float32)}}
+
+
+def _decode_override_glue(req_id: str = "d", hidden: int = 1):
+    """A decode-phase glue whose layer carries a real steering table so the
+    override / scale / monitor validators pass and the apply path runs end to
+    end (the bare ``_layer`` fake has no ``steering_table_*`` buffer)."""
+    glue = _make_glue(num_computed=[10], prompt_len=[8], dyn_pool=4)
+    glue.req_states.req_id_to_index = {req_id: 0}
+    glue._steerable_layers_cache[0].steering_table_pre_attn = torch.zeros(1, hidden)
+    return glue
+
+
+def test_apply_request_override_compose_folds_admitted():
+    from vllm.v1.worker.gpu.steering_runner_mixin import _SteeringReqState
+    from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
+
+    glue = _decode_override_glue()
+    # Admitted decode steering resolves to pre_attn 1.0 (the _make_glue stub).
+    glue._steering_reqs["d"] = _SteeringReqState(
+        sampling_params=object(),
+        prefill_hash=0,
+        decode_hash=5,
+        num_prompt_tokens=8,
+        phase="decode",
+    )
+    captured: dict = {}
+    orig = glue._steering_manager.register_dynamic_config
+
+    def _capture(vectors, locally_owned_layers):
+        captured["vectors"] = vectors
+        return orig(vectors, locally_owned_layers)
+
+    glue._steering_manager.register_dynamic_config = _capture
+
+    action = RequestSteeringOverride(
+        req_id="d", vectors=_pre_attn(2.0), compose_admitted=True, source="declarative"
+    )
+    assert glue._apply_request_override(action, source="declarative") is True
+    # Admitted decode (1.0) folded with the gate delta (2.0) => 3.0, not raw 2.0.
+    folded = np.asarray(captured["vectors"]["pre_attn"][0])
+    assert float(folded[0]) == 3.0
+    assert glue._req_override_source["d"] == "declarative"
+
+
+def test_apply_request_override_no_compose_registers_raw():
+    from vllm.v1.worker.gpu.steering_runner_mixin import _SteeringReqState
+    from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
+
+    glue = _decode_override_glue()
+    glue._steering_reqs["d"] = _SteeringReqState(
+        sampling_params=object(),
+        prefill_hash=0,
+        decode_hash=5,
+        num_prompt_tokens=8,
+        phase="decode",
+    )
+    captured: dict = {}
+    orig = glue._steering_manager.register_dynamic_config
+
+    def _capture(vectors, locally_owned_layers):
+        captured["vectors"] = vectors
+        return orig(vectors, locally_owned_layers)
+
+    glue._steering_manager.register_dynamic_config = _capture
+
+    action = RequestSteeringOverride(
+        req_id="d", vectors=_pre_attn(2.0), compose_admitted=False, source="declarative"
+    )
+    assert glue._apply_request_override(action, source="declarative") is True
+    # No fold: the admitted 1.0 is ignored, the gate delta 2.0 registered raw.
+    assert float(np.asarray(captured["vectors"]["pre_attn"][0])[0]) == 2.0
+
+
+def test_declarative_override_yields_to_operator_owner():
+    from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
+
+    glue = _decode_override_glue()
+    op = RequestSteeringOverride(req_id="d", vectors=_pre_attn(5.0), source="operator")
+    assert glue._apply_request_override(op, source="operator") is True
+    assert glue._req_override_source["d"] == "operator"
+    op_dyn = glue._req_dynamic_decode["d"]
+
+    # A client declarative gate for the same request is rejected; state kept.
+    decl = RequestSteeringOverride(
+        req_id="d", vectors=_pre_attn(9.0), compose_admitted=True, source="declarative"
+    )
+    assert glue._apply_request_override(decl, source="declarative") is False
+    assert glue._req_override_source["d"] == "operator"
+    assert glue._req_dynamic_decode["d"] == op_dyn
+
+
+def test_operator_override_takes_over_declarative_owner():
+    from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
+
+    glue = _decode_override_glue()
+    decl = RequestSteeringOverride(
+        req_id="d", vectors=_pre_attn(3.0), source="declarative"
+    )
+    assert glue._apply_request_override(decl, source="declarative") is True
+    assert glue._req_override_source["d"] == "declarative"
+    decl_dyn = glue._req_dynamic_decode["d"]
+
+    # An operator source is not declarative -> it takes over (update-in-place,
+    # same dyn row) and claims ownership.
+    op = RequestSteeringOverride(req_id="d", vectors=_pre_attn(7.0), source="operator")
+    assert glue._apply_request_override(op, source="operator") is True
+    assert glue._req_override_source["d"] == "operator"
+    assert glue._req_dynamic_decode["d"] == decl_dyn
+
+
+def test_override_clear_purges_source():
+    from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
+
+    glue = _decode_override_glue()
+    op = RequestSteeringOverride(req_id="d", vectors=_pre_attn(5.0), source="operator")
+    assert glue._apply_request_override(op, source="operator") is True
+    assert "d" in glue._req_override_source
+
+    clear = RequestSteeringOverride(req_id="d", vectors=None, source="operator")
+    assert glue._apply_request_override(clear, source="operator") is True
+    assert "d" not in glue._req_override_source
+    assert "d" not in glue._req_dynamic_decode
+
+
+def test_finish_purges_override_source():
+    from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
+
+    glue = _decode_override_glue()
+    glue._steering_add_request(
+        _new_req("d", prefill_hash=0, decode_hash=5, prompt_len=8, num_computed=10)
+    )
+    op = RequestSteeringOverride(req_id="d", vectors=_pre_attn(5.0), source="operator")
+    assert glue._apply_request_override(op, source="operator") is True
+    assert "d" in glue._req_override_source
+
+    glue._steering_finish_requests(["d"])
+    assert "d" not in glue._req_override_source
+    assert "d" not in glue._req_dynamic_decode
+
+
+def test_scale_update_by_req_id_yields_to_operator_owner_v2():
+    from vllm.v1.worker.steering_action_queue import (
+        RequestSteeringOverride,
+        SteeringScaleUpdate,
+    )
+
+    glue = _decode_override_glue()
+    op = RequestSteeringOverride(req_id="d", vectors=_pre_attn(5.0), source="operator")
+    assert glue._apply_request_override(op, source="operator") is True
+
+    # The inherited scale path now sees _req_override_source on v2: a
+    # declarative scale targeting the operator-owned request is rejected.
+    scale = SteeringScaleUpdate(scale=0.5, req_id="d", source="declarative")
+    assert glue._apply_scale_update(scale, source="declarative") is False
+
+
+def test_monitor_update_by_req_id_yields_to_operator_owner_v2():
+    from vllm.v1.worker.steering_action_queue import (
+        RequestSteeringOverride,
+        SteeringMonitorUpdate,
+    )
+
+    glue = _decode_override_glue()
+    glue._row_monitor_enabled = True
+    op = RequestSteeringOverride(req_id="d", vectors=_pre_attn(5.0), source="operator")
+    assert glue._apply_request_override(op, source="operator") is True
+
+    # The inherited per-row monitor path yields too (probe=None clear still
+    # reaches the precedence check).
+    mon = SteeringMonitorUpdate(
+        hook="pre_attn", layer=0, probe=None, req_id="d", source="declarative"
+    )
+    assert glue._apply_monitor_update(mon, source="declarative") is False

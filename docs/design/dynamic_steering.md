@@ -552,8 +552,8 @@ The base implements `on_step` in terms of `decide` and owns:
   a bounded (FIFO-evicted) `conversation_id -> sticky-override` map;
 - **the latch pattern** — a `RequestSteeringOverride` returned by `decide`
   (the *trigger*) is latched onto the conversation and applied to the firing
-  request; every later request of that conversation is *bridged* (overridden
-  with the same vectors, no re-trigger).
+  request; every later request of that conversation is *bridged* (re-issued
+  the same override rebound to the new request, no re-trigger).
 
 The base resolves the single monitored `(layer, hook)` from the subclass's
 `global_capture_spec()` and hands `decide` the firing request's residual
@@ -821,7 +821,12 @@ SteeringHookPacked}}` (the base64 escape hatch, §5.6). Names are resolved to
 inline packed at the **frontend** (`build_steering_gates` in
 `to_request_metadata`), so the worker only ever sees packed bytes — no
 worker-side registry. `resolve_gates` unpacks to numpy once at admission and
-surfaces `ResolvedGate`s on `StepRequestView.steering` (both runners).
+surfaces `ResolvedGate`s on `StepRequestView.steering` (both runners). Admission
+wraps it in `resolve_gates_safe`: a malformed payload from a producer that
+bypassed the frontend dry-run (offline `LLM`, Rust frontend, msgpack skew) is
+**gracefully skipped and logged once** — the request proceeds without
+declarative steering rather than crashing the engine core (all TP ranks see the
+same bytes and fail identically, so the graceful path can't desync them).
 
 **Built-in consumer** (`vllm/v1/capture/declarative.py`,
 `DeclarativeSteeringConsumer`): subclasses `SteeringController` to reuse the
@@ -875,12 +880,16 @@ layers of a 4–8B at large batch widths, prohibitive for 70B — so capture a
 curated handful of layers (or lean on the zero-capture `this_token` path), not
 everything.
 
-**Precedence** (operator wins, `steering_model_runner_mixin.py`): every
-declarative action is stamped `source="declarative"`; the runner records the
-owning source per request (`_req_override_source`) and rejects a declarative
-action for a request already owned by another (operator) source. Compose-on-top
-is a runner-side fold (`RequestSteeringOverride.compose_admitted` →
-`_resolve_request_steering(..., "decode")` + the gate delta). On request finish
+**Precedence** (operator wins, `steering_model_runner_mixin.py` for v1 and
+`gpu/steering_runner_mixin.py` for v2 — both `_apply_request_override`
+implementations are kept in lock-step): every declarative action is stamped
+`source="declarative"`; the runner records the owning source per request
+(`_req_override_source`) and rejects a declarative action for a request already
+owned by another (operator) source, and vice-versa the operator source takes
+over a declarative-owned request. Compose-on-top is a runner-side fold
+(`RequestSteeringOverride.compose_admitted` → `_resolve_request_steering(...,
+"decode")` + the gate delta; guarded so a missing-module `RuntimeError` becomes
+a structured rejection rather than crashing the engine). On request finish
 `release_dynamic_config` purges the row's per-row monitor + scale so nothing
 leaks.
 

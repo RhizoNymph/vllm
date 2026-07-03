@@ -1338,16 +1338,20 @@ class SteeringModelRunnerMixin:
 
         # Compose-on-top: fold the request's admitted decode steering delta
         # into the override so ``action.vectors`` adds to (rather than
-        # replaces) the client's static decode steering.
+        # replaces) the client's static decode steering. Resolving the admitted
+        # spec can raise if the request's steering module is not registered on
+        # this worker; keep prior state rather than escaping the boundary.
         vectors = action.vectors
         if action.compose_admitted:
             req_state = self.requests.get(req_id)
             sp = req_state.sampling_params if req_state is not None else None
-            admitted = (
-                self._resolve_request_steering(sp, "decode") if sp is not None else None
-            )
-            if admitted:
-                vectors = merge_steering_specs(admitted, action.vectors)
+            if sp is not None:
+                try:
+                    admitted = self._resolve_request_steering(sp, "decode")
+                except RuntimeError as exc:
+                    return _reject(str(exc))
+                if admitted:
+                    vectors = merge_steering_specs(admitted, action.vectors)
 
         try:
             validate_steering_vectors(vectors, self._steerable_layers_cache)

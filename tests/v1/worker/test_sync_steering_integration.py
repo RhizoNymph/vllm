@@ -81,6 +81,8 @@ class _RunnerStub:
         self._sync_step_counter = 0
         # req_id -> client conversation id (populated by tests that exercise it)
         self._sync_conversation_ids: dict[str, str | None] = {}
+        # req_id -> resolved declarative gates (populated by tests that use it)
+        self._sync_steering_gates: dict[str, list | None] = {}
         self.applied_calls = []
 
     def _build_step_capture_view(self, scheduler_output):
@@ -226,6 +228,9 @@ class _FakeEvent:
 
     def record(self):
         self.records += 1
+
+    def query(self):
+        return True
 
     def elapsed_time(self, _other):
         return self._elapsed_ms
