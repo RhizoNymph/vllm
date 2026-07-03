@@ -176,6 +176,93 @@ def test_capture_sidecar_client_id_falls_back_to_internal() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# 5. v1 runner `_register_capture_request` builds the client id into the
+#    sidecar (parity with the v2 capture-runner mixin)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingManager:
+    """Captures the ``sidecar_fields`` the runner hands to the manager."""
+
+    def __init__(self) -> None:
+        self.registered: dict[str, dict] = {}
+        self.errors: dict[str, str] = {}
+
+    def register_request(
+        self,
+        req_id,
+        *,
+        client_specs,
+        num_prompt_tokens,
+        sidecar_fields,
+        block_hashes=None,
+        hash_block_size=None,
+    ) -> None:
+        self.registered[req_id] = sidecar_fields
+
+    def record_request_error(self, req_id, msg) -> None:
+        self.errors[req_id] = msg
+
+    def serve_from_store(self, *args, **kwargs) -> None:  # pragma: no cover
+        pass
+
+
+def _fake_v1_runner(mgr: _RecordingManager):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        _capture_manager=mgr,
+        _capture_name_to_index={},
+        _capture_validators=[],
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            get_total_num_hidden_layers=lambda: 4,
+            get_hidden_size=lambda: 8,
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                enable_expert_parallel=False,
+            )
+        ),
+    )
+
+
+def _drive_v1_register(nrd: NewRequestData) -> dict:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    mgr = _RecordingManager()
+    runner = _fake_v1_runner(mgr)
+    GPUModelRunner._register_capture_request(runner, nrd, None)
+    assert not mgr.errors, mgr.errors
+    assert nrd.req_id in mgr.registered
+    return mgr.registered[nrd.req_id]
+
+
+def test_v1_register_capture_request_carries_client_request_id() -> None:
+    req = _make_request("client-9-ffeedd00", external_req_id="client-9")
+    nrd = NewRequestData.from_request(req, block_ids=([],))
+    sidecar = _drive_v1_register(nrd)
+    assert sidecar["client_request_id"] == "client-9"
+    assert sidecar["vllm_internal_request_id"] == "client-9-ffeedd00"
+
+
+def test_v1_register_capture_request_client_id_falls_back_to_internal() -> None:
+    req = _make_request("internal-only", external_req_id=None)
+    nrd = NewRequestData.from_request(req, block_ids=([],))
+    sidecar = _drive_v1_register(nrd)
+    # None-safe: falls back to the internal id so attribution always works.
+    assert sidecar["client_request_id"] == "internal-only"
+
+
+# ---------------------------------------------------------------------------
+# 6. Filesystem consumer JSON metadata includes client_request_id
+# ---------------------------------------------------------------------------
+
+
 def test_filesystem_json_includes_client_request_id(tmp_path: pathlib.Path) -> None:
     consumer = FilesystemConsumer(
         vllm_config=_FakeVllmConfig(),

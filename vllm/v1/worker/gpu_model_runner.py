@@ -1995,6 +1995,14 @@ class GPUModelRunner(
         # Sidecar fields the manager echoes to each consumer on finalize.
         sidecar_fields: dict[str, Any] = {
             "vllm_internal_request_id": new_req_data.req_id,
+            # Client-supplied request id for universal attribution. Falls
+            # back to the internal id if randomization was disabled / the
+            # client id is unavailable (None-safe).
+            "client_request_id": (
+                new_req_data.client_request_id
+                if new_req_data.client_request_id is not None
+                else new_req_data.req_id
+            ),
             "prompt_token_ids": (
                 list(new_req_data.prompt_token_ids)
                 if new_req_data.prompt_token_ids is not None
@@ -2424,6 +2432,22 @@ class GPUModelRunner(
         # Clear `output_token_ids` as previous output tokens are now part of
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
+
+        # Refresh the sync-consumer metadata stashes so a streaming
+        # continuation that changes conversation_id or declarative gates
+        # serves the new values instead of the prior chunk's stale ones
+        # (mirrors the new-request branch and the v2 runner's
+        # `_capture_add_request`).
+        rmeta = new_req_data.request_metadata
+        self._sync_conversation_ids[req_id] = (
+            rmeta.conversation_id if rmeta is not None else None
+        )
+        if rmeta is not None and rmeta.steering is not None:
+            from vllm.v1.steering_schema import resolve_gates_safe
+
+            self._sync_steering_gates[req_id] = resolve_gates_safe(
+                rmeta.steering, req_id
+            )
 
         # Refresh steering config hashes for the re-added request.
         # Streaming re-adds go back through prefill, so we must release
