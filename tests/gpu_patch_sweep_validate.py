@@ -12,20 +12,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib.util
-import sys
-from pathlib import Path
 
-_CLIENT = (
-    Path(__file__).resolve().parent.parent
-    / "examples"
-    / "online_serving"
-    / "openai_patch_client.py"
-)
-spec = importlib.util.spec_from_file_location("openai_patch_client", _CLIENT)
-pc = importlib.util.module_from_spec(spec)
-sys.modules["openai_patch_client"] = pc
-spec.loader.exec_module(pc)
+import vllm.entrypoints.serve.patch.client as pc
 
 
 def _cmp(a, b, tol=0.3) -> tuple[bool, float, int]:
