@@ -42,6 +42,7 @@ effective vectors for each phase.
 
 import hashlib
 from collections import defaultdict
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -61,8 +62,59 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
+from vllm.v1.worker.steering_owner import OwnerStore, RowOwner
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _DirtyState:
+    """Populate-scheduling flags with the implication rules encoded in code.
+
+    Three orthogonal reasons a populate is owed, with the invariants that used
+    to live in scattered comments made explicit:
+
+    * ``content`` (was ``_tables_dirty``): the per-layer table buffers need a
+      full recompose + H2D.
+    * ``membership`` (was ``_indices_dirty``): the row set changed, so the
+      cached ``indices`` / ordered-config scratch must be rebuilt. Membership
+      always implies content (a new/dropped row must be written), so
+      :meth:`mark_membership` sets both.
+    * ``scales`` (was ``_scales_dirty``): only the cheap per-row scale buffers
+      need rewriting.
+
+    A full table populate clears all three (it writes scales alongside the
+    tables); the cheap scales-only path is eligible only when scales are dirty
+    and neither content nor membership is (:attr:`scales_only_eligible`).
+    """
+
+    content: bool = True
+    membership: bool = True
+    scales: bool = True
+
+    def mark_content(self) -> None:
+        """A content mutator ran: a full table populate is owed."""
+        self.content = True
+
+    def mark_membership(self) -> None:
+        """The row set changed: rebuild indices scratch (implies content)."""
+        self.membership = True
+        self.content = True
+
+    def mark_scales(self) -> None:
+        """A scale mutator ran: the cheap scale-buffer write is owed."""
+        self.scales = True
+
+    def clear_after_full_populate(self) -> None:
+        """A full ``populate_steering_tables`` brought every buffer in sync."""
+        self.content = False
+        self.membership = False
+        self.scales = False
+
+    @property
+    def scales_only_eligible(self) -> bool:
+        """True when only scales are dirty (the cheap populate path applies)."""
+        return self.scales and not (self.content or self.membership)
 
 
 class SteeringManager:
@@ -167,21 +219,21 @@ class SteeringManager:
         self.monitor_configs: dict[str, dict[int, dict]] = {}
 
         # PER-ROW (per-request) in-graph monitor configs. Keyed
-        # hook -> layer -> owner_key -> {"probe", "threshold", "sharpness"},
-        # where owner_key is the LOGICAL row owner so configs survive row
-        # reassignment (like ``_config_scales``/``_dynamic_scales``):
-        #   ("global", "decode")              -> row 2 (global decode)
-        #   ("config", config_hash, "decode") -> a static decode config row
-        #   ("dyn", dyn_id)                   -> a dynamic-override row
+        # hook -> layer -> RowOwner -> {"probe", "threshold", "sharpness"},
+        # where the :class:`RowOwner` is the LOGICAL row owner so configs
+        # survive row reassignment (like ``_row_scales``):
+        #   RowOwner.global_("decode")       -> row 2 (global decode)
+        #   RowOwner.config(hash, "decode")  -> a static decode config row
+        #   RowOwner.dyn(dyn_id)             -> a dynamic-override row
         # Unlike ``monitor_configs`` (one global probe per site), each row is
         # gated by ITS OWN probe, so concurrent requests at a site can carry
         # different probes. Written into the per-row probe-table buffers at
         # populate; gates the row term only, decode-only. Opt-in via
         # ``enable_row_monitor`` (else the buffers stay dummy and this is
         # never activated). See docs/design/dynamic_steering.md.
-        self._row_monitor: dict[str, dict[int, dict[tuple, dict]]] = {}
+        self._row_monitor: dict[str, dict[int, dict[RowOwner, dict]]] = {}
         # Lazy per-owner signature cache for APC (None ⇒ stale, rebuild).
-        self._row_monitor_sig_cache: dict[tuple, int] | None = None
+        self._row_monitor_sig_cache: dict[RowOwner, int] | None = None
 
         # APC steering-signature caches (see
         # docs/design/dynamic_steering_apc_notification.md). The worker
@@ -195,29 +247,22 @@ class SteeringManager:
         self._tier_sig_cache: int | None = None
         self._monitor_sig_cache: int | None = None
 
-        # Per-row strength scales (the §5.3 "how much" knob), keyed by
-        # LOGICAL owner so they survive row reassignment: phase->scale for
-        # the global rows 1/2, (config_hash, phase)->scale for static
-        # per-request rows, dyn_id->scale for dynamic-override rows. A
-        # missing key means the default 1.0 (unscaled). Decode-only by
-        # policy (prefill rows are forced to 1.0 at populate time, §7);
-        # the scale never enters config hashes (runtime state, not
-        # identity). See docs/design/dynamic_steering.md §5.3.
-        self._global_scales: dict[str, float] = {}
-        self._config_scales: dict[tuple[int, str], float] = {}
-        self._dynamic_scales: dict[int, float] = {}
-        # Set by any scale mutator; triggers a CHEAP scales-only buffer
-        # write (no table recompose, no vector H2D). Independent of
-        # ``_tables_dirty`` — that is the whole point of the scale knob.
-        self._scales_dirty: bool = True
+        # Per-row strength scales (the §5.3 "how much" knob), keyed by the
+        # LOGICAL :class:`RowOwner` so they survive row reassignment:
+        # ``RowOwner.global_(phase)`` for rows 1/2, ``RowOwner.config(hash,
+        # phase)`` for static per-request rows, ``RowOwner.dyn(dyn_id)`` for
+        # dynamic-override rows. A missing key means the default 1.0
+        # (unscaled). Decode-only by policy (prefill rows are forced to 1.0 at
+        # populate time, §7); the scale never enters config hashes (runtime
+        # state, not identity). See docs/design/dynamic_steering.md §5.3.
+        self._row_scales: dict[RowOwner, float] = {}
 
-        # When True, populate_steering_tables() needs to run to bring the
-        # per-layer table buffers in sync with current state. Set by every
-        # state mutator (register_config new-row path, release_config
-        # refcount->0 path, update_global_vectors, clear_global_vectors);
-        # cleared at the end of populate_steering_tables. Initialized True
-        # so the first populate call always runs.
-        self._tables_dirty: bool = True
+        # Populate-scheduling flags (``content`` / ``membership`` / ``scales``)
+        # with the implication rules encoded in :class:`_DirtyState`. Every
+        # state mutator marks the appropriate flag; a full populate clears all
+        # three, the cheap scales-only path clears just ``scales``. Initialized
+        # all-dirty so the first populate call always runs.
+        self._dirty = _DirtyState()
 
         # Cached scratch tensors for populate_steering_tables. ``indices``
         # is the GPU int64 tensor of target row positions
@@ -229,14 +274,13 @@ class SteeringManager:
         # in register_config / release_config (the two paths that mutate
         # ``config_to_row``).
         #
-        # ``_indices_dirty`` is independent of ``_tables_dirty``: every
-        # global-vector update sets ``_tables_dirty`` (forcing a populate)
-        # but does NOT need to rebuild the scratch tensors.
+        # ``_dirty.membership`` is independent of ``_dirty.content``: every
+        # global-vector update marks content (forcing a populate) but does NOT
+        # need to rebuild the scratch tensors.
         self._cached_indices: torch.Tensor | None = None
         self._cached_zero_row: torch.Tensor | None = None
         self._cached_ordered_configs: list[tuple[tuple[int, str], int]] | None = None
         self._cached_ordered_dynamic: list[tuple[int, int]] | None = None
-        self._indices_dirty: bool = True
 
         # Reusable pinned-CPU staging ring for ``_stack_vectors_to_device``.
         #
@@ -265,6 +309,126 @@ class SteeringManager:
         self._stack_pinned_events: list[torch.cuda.Event | None] = [None] * 4
         self._stack_pinned_numel: list[int] = [0] * 4
         self._stack_pinned_next: int = 0
+
+    # ------------------------------------------------------------------
+    # Dirty-flag adapters (thin views over ``self._dirty``) — kept so the
+    # runner-mixin dispatch ladder and existing tests can read/reset the
+    # three historical flag names unchanged.
+    # ------------------------------------------------------------------
+
+    @property
+    def _tables_dirty(self) -> bool:
+        return self._dirty.content
+
+    @_tables_dirty.setter
+    def _tables_dirty(self, value: bool) -> None:
+        self._dirty.content = bool(value)
+
+    @property
+    def _scales_dirty(self) -> bool:
+        return self._dirty.scales
+
+    @_scales_dirty.setter
+    def _scales_dirty(self, value: bool) -> None:
+        self._dirty.scales = bool(value)
+
+    @property
+    def _indices_dirty(self) -> bool:
+        return self._dirty.membership
+
+    @_indices_dirty.setter
+    def _indices_dirty(self, value: bool) -> None:
+        self._dirty.membership = bool(value)
+
+    # ------------------------------------------------------------------
+    # Per-owner scale adapters — legacy-shaped read views over
+    # ``self._row_scales`` for the ``/v1/steering/dynamic`` status payload.
+    # ------------------------------------------------------------------
+
+    @property
+    def _global_scales(self) -> dict[str, float]:
+        return {
+            o.phase: s for o, s in self._row_scales.items() if o.kind == "global"
+        }
+
+    @property
+    def _config_scales(self) -> dict[tuple[int, str], float]:
+        return {
+            (o.config_hash, o.phase): s
+            for o, s in self._row_scales.items()
+            if o.kind == "config"
+        }
+
+    @property
+    def _dynamic_scales(self) -> dict[int, float]:
+        return {o.dyn_id: s for o, s in self._row_scales.items() if o.kind == "dyn"}
+
+    # ------------------------------------------------------------------
+    # Owner-keyed store registry + single purge path
+    # ------------------------------------------------------------------
+
+    def _owner_stores(self) -> list[OwnerStore]:
+        """Every owner-keyed runtime store, described uniformly.
+
+        Central registry so :meth:`_purge_owner` drops all of an owner's
+        state in one place and a parametrized test asserts each store is
+        purged (a future owner-keyed store added here without a working
+        ``purge`` fails that test). ``install_dummy`` exists only so the
+        test can populate each store generically.
+        """
+        return [
+            OwnerStore(
+                "row_scales",
+                contains=lambda o: o in self._row_scales,
+                purge=lambda o: self._row_scales.pop(o, None) is not None,
+                install_dummy=lambda o: self._row_scales.__setitem__(o, 0.5),
+            ),
+            OwnerStore(
+                "row_monitor",
+                contains=self._row_monitor_has_owner,
+                purge=self._row_monitor_purge_owner,
+                install_dummy=self._row_monitor_install_dummy,
+            ),
+        ]
+
+    def _row_monitor_has_owner(self, owner: RowOwner) -> bool:
+        return any(
+            owner in owners
+            for layers in self._row_monitor.values()
+            for owners in layers.values()
+        )
+
+    def _row_monitor_purge_owner(self, owner: RowOwner) -> bool:
+        removed = False
+        for layers in self._row_monitor.values():
+            for owners in layers.values():
+                if owners.pop(owner, None) is not None:
+                    removed = True
+        return removed
+
+    def _row_monitor_install_dummy(self, owner: RowOwner) -> None:
+        """Attach a throwaway per-row monitor for ``owner`` (test helper)."""
+        self._row_monitor.setdefault("post_block", {}).setdefault(0, {})[owner] = {
+            "probe": torch.zeros(1, dtype=torch.float32),
+            "threshold": 0.0,
+            "sharpness": 1.0,
+        }
+
+    def _purge_owner(self, owner: RowOwner) -> None:
+        """Drop every owner-keyed runtime store entry for ``owner``.
+
+        The single cleanup path shared by both release routes
+        (:meth:`release_dynamic_config` and the refcount-0 branch of
+        :meth:`release_config`). Purges per-row scales and per-row monitors
+        and invalidates the affected signature caches / dirty flags. Freeing
+        the owner's table row (and the resulting membership/content dirty) is
+        the caller's responsibility.
+        """
+        purged = {store.name: store.purge(owner) for store in self._owner_stores()}
+        if purged.get("row_scales"):
+            self._dirty.mark_scales()
+        if purged.get("row_monitor"):
+            self._row_monitor_sig_cache = None
 
     def register_config(
         self,
@@ -320,13 +484,11 @@ class SteeringManager:
         # affects what tensors get constructed, not which row is
         # assigned.
         self.config_vectors[key] = self._store_vectors(vectors, locally_owned_layers)
-        # New row content needs to be written into the per-layer tables on
-        # the next populate call. (Refcount-hit path doesn't set this flag
-        # because the row's contents are already in the table.)
-        self._tables_dirty = True
-        # config_to_row changed; the cached indices/ordered_configs scratch
-        # is now stale and must be rebuilt on the next populate.
-        self._indices_dirty = True
+        # New row content + a changed row set: rebuild indices scratch and
+        # recompose the tables on the next populate (membership implies
+        # content). (Refcount-hit path doesn't mark dirty because the row's
+        # contents are already in the table.)
+        self._dirty.mark_membership()
         return row
 
     def _store_vectors(
@@ -409,8 +571,7 @@ class SteeringManager:
         # Cache the override-vector hash for the APC decode signature. Hash
         # the raw input vectors (np/list) — no device sync, rank-identical.
         self._dynamic_sig[dyn_id] = hash_steering_config(vectors)
-        self._tables_dirty = True
-        self._indices_dirty = True
+        self._dirty.mark_membership()
         return dyn_id, row
 
     def update_dynamic_config(
@@ -432,16 +593,17 @@ class SteeringManager:
             vectors, locally_owned_layers
         )
         self._dynamic_sig[dyn_id] = hash_steering_config(vectors)
-        self._tables_dirty = True
+        self._dirty.mark_content()
 
     def release_dynamic_config(self, dyn_id: int) -> None:
         """Free a dynamic-override row. No-op for unknown ids.
 
-        Also drops any per-row monitor and strength scale attached to this
-        row's owner (``("dyn", dyn_id)``). Without this, per-request monitors
+        Also drops every owner-keyed runtime store for this row's owner
+        (``RowOwner.dyn(dyn_id)``) via :meth:`_purge_owner` — the per-row
+        monitor and strength scale. Without this, per-request monitors
         installed via ``SteeringMonitorUpdate(req_id=...)`` (and scales) would
-        accumulate in ``_row_monitor`` / ``_dynamic_scales`` for the lifetime
-        of the process, since dyn_ids are monotonic and never reused.
+        accumulate for the lifetime of the process, since dyn_ids are
+        monotonic and never reused.
         """
         row = self._dynamic_to_row.pop(dyn_id, None)
         if row is None:
@@ -449,17 +611,9 @@ class SteeringManager:
         self._dynamic_vectors.pop(dyn_id, None)
         self._dynamic_sig.pop(dyn_id, None)
         self._dynamic_free_rows.append(row)
-        # Purge the row's strength scale and any per-row monitor entries.
-        if self._dynamic_scales.pop(dyn_id, None) is not None:
-            self._scales_dirty = True
-        owner_key = ("dyn", dyn_id)
-        if self._row_monitor:
-            for layers in self._row_monitor.values():
-                for owners in layers.values():
-                    owners.pop(owner_key, None)
-            self._row_monitor_sig_cache = None
-        self._tables_dirty = True
-        self._indices_dirty = True
+        # Purge the row's owner-keyed runtime state (scale + per-row monitors).
+        self._purge_owner(RowOwner.dyn(dyn_id))
+        self._dirty.mark_membership()
 
     def get_dynamic_row(self, dyn_id: int) -> int:
         """Return the table row for a live dynamic config."""
@@ -475,7 +629,14 @@ class SteeringManager:
     def release_config(self, config_hash: int, phase: str) -> None:
         """Decrement refcount for ``(config_hash, phase)``.
 
-        Free the row when it reaches 0.
+        Free the row when it reaches 0. On that live->0 transition, also purge
+        every owner-keyed runtime store for this config's owner
+        (``RowOwner.config(config_hash, phase)``) via :meth:`_purge_owner` —
+        its per-config strength scale and any per-row monitors. Without this,
+        a scale or monitor set for content hash H would silently re-apply to a
+        *future* request that re-registers H (content hashes collide by
+        design). A scale pre-armed for a not-yet-registered hash is untouched:
+        purge fires only on this live->0 transition.
         """
         key = (config_hash, phase)
         if key not in self.config_to_row:
@@ -486,12 +647,13 @@ class SteeringManager:
             self.config_vectors.pop(key, None)
             del self.config_refcounts[key]
             self.free_rows.append(row)
-            # The row is now stale (no one references it), but mark dirty so
-            # if another config gets assigned to this row before the next
-            # populate, the populate runs and overwrites the stale content.
-            self._tables_dirty = True
-            # config_to_row shrunk; cached indices scratch is stale.
-            self._indices_dirty = True
+            # Last live registration released: drop its owner-keyed runtime
+            # state so a re-registration of the same hash starts clean.
+            self._purge_owner(RowOwner.config(config_hash, phase))
+            # config_to_row shrunk; rebuild indices scratch and recompose the
+            # tables on the next populate (membership implies content) so a
+            # config later assigned to this row overwrites the stale content.
+            self._dirty.mark_membership()
 
     def get_row_for_config(self, config_hash: int, is_prefill: bool = False) -> int:
         """Return table row for a config.
@@ -554,14 +716,14 @@ class SteeringManager:
             target[hook_point] = {}
         target[hook_point][layer_idx] = vector.clone()
         # Global rows 1, 2 and all per-request rows depend on this state.
-        self._tables_dirty = True
+        self._dirty.mark_content()
 
     def clear_global_vectors(self) -> None:
         """Clear all cached global vectors across all phases and hook points."""
         self.global_base_vectors.clear()
         self.global_prefill_vectors.clear()
         self.global_decode_vectors.clear()
-        self._tables_dirty = True
+        self._dirty.mark_content()
 
     def update_dynamic_tier(
         self,
@@ -595,14 +757,14 @@ class SteeringManager:
             self.dynamic_tier_vectors[hook_point] = {}
         self.dynamic_tier_vectors[hook_point][layer_idx] = vector.clone()
         self._tier_sig_cache = None  # tier changed → APC signature stale
-        self._tables_dirty = True
+        self._dirty.mark_content()
 
     def clear_dynamic_tier(self) -> None:
         """Clear all dynamic additive-tier vectors."""
         if self.dynamic_tier_vectors:
             self.dynamic_tier_vectors.clear()
             self._tier_sig_cache = None
-            self._tables_dirty = True
+            self._dirty.mark_content()
 
     @property
     def has_dynamic_tier(self) -> bool:
@@ -653,7 +815,7 @@ class SteeringManager:
             "gate_rows": bool(gate_rows),
         }
         self._monitor_sig_cache = None  # monitor changed → APC signature stale
-        self._tables_dirty = True
+        self._dirty.mark_content()
 
     def clear_monitor(
         self,
@@ -671,7 +833,7 @@ class SteeringManager:
         if hook_point is None:
             self.monitor_configs.clear()
             self._monitor_sig_cache = None
-            self._tables_dirty = True
+            self._dirty.mark_content()
             return
         layers = self.monitor_configs.get(hook_point)
         if layers is None:
@@ -679,14 +841,14 @@ class SteeringManager:
         if layer_idx is None:
             del self.monitor_configs[hook_point]
             self._monitor_sig_cache = None
-            self._tables_dirty = True
+            self._dirty.mark_content()
             return
         if layer_idx in layers:
             del layers[layer_idx]
             if not layers:
                 del self.monitor_configs[hook_point]
             self._monitor_sig_cache = None
-            self._tables_dirty = True
+            self._dirty.mark_content()
 
     @property
     def has_monitor(self) -> bool:
@@ -701,7 +863,7 @@ class SteeringManager:
         self,
         hook_point: str,
         layer_idx: int,
-        owner_key: tuple,
+        owner: RowOwner,
         probe: torch.Tensor,
         threshold: float,
         sharpness: float,
@@ -709,12 +871,12 @@ class SteeringManager:
     ) -> None:
         """Configure the per-row monitor for one logical row owner at a site.
 
-        ``owner_key`` is ``("global", "decode")``,
-        ``("config", config_hash, "decode")`` or ``("dyn", dyn_id)`` — the
-        gate ``sigmoid(sharpness*(residual@probe - threshold))`` is applied to
-        that owner's row term only, decode-only. Stored keyed by owner so it
-        survives row reassignment; written into the per-row probe table at the
-        next populate.
+        ``owner`` is a :class:`RowOwner` — ``RowOwner.global_("decode")``,
+        ``RowOwner.config(config_hash, "decode")`` or ``RowOwner.dyn(dyn_id)``
+        — the gate ``sigmoid(sharpness*(residual@probe - threshold))`` is
+        applied to that owner's row term only, decode-only. Stored keyed by
+        owner so it survives row reassignment; written into the per-row probe
+        table at the next populate.
 
         ``locally_owned_layers`` (TP/PP): a no-op when ``layer_idx`` is not
         owned by this worker (rank-replicated callers stay in lock-step).
@@ -722,20 +884,20 @@ class SteeringManager:
         if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
             return
         self._row_monitor.setdefault(hook_point, {}).setdefault(layer_idx, {})[
-            owner_key
+            owner
         ] = {
             "probe": probe.detach().to(torch.float32).clone().reshape(-1),
             "threshold": float(threshold),
             "sharpness": float(sharpness),
         }
         self._row_monitor_sig_cache = None
-        self._tables_dirty = True
+        self._dirty.mark_content()
 
     def clear_row_monitor(
         self,
         hook_point: str | None = None,
         layer_idx: int | None = None,
-        owner_key: tuple | None = None,
+        owner: RowOwner | None = None,
     ) -> None:
         """Remove per-row monitor configs.
 
@@ -747,14 +909,14 @@ class SteeringManager:
         if hook_point is None:
             self._row_monitor.clear()
             self._row_monitor_sig_cache = None
-            self._tables_dirty = True
+            self._dirty.mark_content()
             return
         layers = self._row_monitor.get(hook_point)
         if layers is None:
             return
         if layer_idx is None:
             del self._row_monitor[hook_point]
-        elif owner_key is None:
+        elif owner is None:
             layers.pop(layer_idx, None)
             if not layers:
                 del self._row_monitor[hook_point]
@@ -762,13 +924,13 @@ class SteeringManager:
             owners = layers.get(layer_idx)
             if owners is None:
                 return
-            owners.pop(owner_key, None)
+            owners.pop(owner, None)
             if not owners:
                 layers.pop(layer_idx, None)
             if not layers:
                 del self._row_monitor[hook_point]
         self._row_monitor_sig_cache = None
-        self._tables_dirty = True
+        self._dirty.mark_content()
 
     @property
     def has_row_monitor(self) -> bool:
@@ -815,9 +977,9 @@ class SteeringManager:
         )
         any_configured = False
 
-        def _apply(pos: int, owner_key: tuple) -> None:
+        def _apply(pos: int, owner: RowOwner) -> None:
             nonlocal any_configured
-            cfg = site.get(owner_key)
+            cfg = site.get(owner)
             if cfg is None:
                 return
             probe = cfg["probe"]
@@ -829,28 +991,33 @@ class SteeringManager:
             any_configured = True
 
         # Row 2 = global decode; rows 0/1 (sentinel/prefill) stay default.
-        _apply(2, ("global", "decode"))
+        _apply(2, RowOwner.global_("decode"))
         pos = 3
         for (config_hash, phase), _row in ordered_configs:
             if phase == "decode":
-                _apply(pos, ("config", config_hash, "decode"))
+                _apply(pos, RowOwner.config(config_hash, "decode"))
             pos += 1
         for dyn_id, _row in ordered_dynamic:
-            _apply(pos, ("dyn", dyn_id))
+            _apply(pos, RowOwner.dyn(dyn_id))
             pos += 1
         return probe_mat, params_mat, any_configured
 
-    def _row_monitor_signature_for(self, owner_keys: tuple[tuple, ...]) -> int | None:
+    def _row_monitor_signature_for(
+        self, owner_keys: tuple[RowOwner, ...]
+    ) -> int | None:
         """Cached hash of every per-row monitor entry matching any of
         ``owner_keys`` (probe + threshold + sharpness + site), or ``None`` when
         none match. Used to fold a request's effective row monitor into its APC
         decode signature."""
         if self._row_monitor_sig_cache is None:
-            cache: dict[tuple, int] = {}
+            cache: dict[RowOwner, int] = {}
             for hook in sorted(self._row_monitor.keys()):
                 layers = self._row_monitor[hook]
                 for layer_idx in sorted(layers.keys()):
-                    for owner_key, cfg in layers[layer_idx].items():
+                    # Sort by the RowOwner total order so the fold is
+                    # insertion-order independent (free determinism insurance).
+                    for owner_key in sorted(layers[layer_idx].keys()):
+                        cfg = layers[layer_idx][owner_key]
                         h = cache.get(owner_key)
                         acc = hashlib.sha256(b"dynsteer-rowmon")
                         if h is not None:
@@ -951,11 +1118,11 @@ class SteeringManager:
         # probe/params are runtime state not in ``base_decode_hash``, so fold
         # them in — else a temporal probe change reuses stale steered KV.
         if dyn_id is not None:
-            row_owner_keys: tuple[tuple, ...] = (("dyn", dyn_id),)
+            row_owner_keys: tuple[RowOwner, ...] = (RowOwner.dyn(dyn_id),)
         else:
             row_owner_keys = (
-                ("config", base_decode_hash, "decode"),
-                ("global", "decode"),
+                RowOwner.config(base_decode_hash, "decode"),
+                RowOwner.global_("decode"),
             )
         row_mon_sig = self._row_monitor_signature_for(row_owner_keys)
         has_row_mon = row_mon_sig is not None
@@ -995,28 +1162,26 @@ class SteeringManager:
             raise ValueError(
                 f"global scale phase must be prefill/decode, got {phase!r}"
             )
-        self._global_scales[phase] = float(scale)
-        self._scales_dirty = True
+        self._row_scales[RowOwner.global_(phase)] = float(scale)
+        self._dirty.mark_scales()
 
     def set_row_scale(self, config_hash: int, phase: str, scale: float) -> None:
         """Set the strength scale for a static per-request config row."""
         if phase not in ("prefill", "decode"):
             raise ValueError(f"row scale phase must be prefill/decode, got {phase!r}")
-        self._config_scales[(config_hash, phase)] = float(scale)
-        self._scales_dirty = True
+        self._row_scales[RowOwner.config(config_hash, phase)] = float(scale)
+        self._dirty.mark_scales()
 
     def set_dynamic_scale(self, dyn_id: int, scale: float) -> None:
         """Set the strength scale for a dynamic-override row (by dyn_id)."""
-        self._dynamic_scales[dyn_id] = float(scale)
-        self._scales_dirty = True
+        self._row_scales[RowOwner.dyn(dyn_id)] = float(scale)
+        self._dirty.mark_scales()
 
     def clear_scales(self) -> None:
         """Reset every row's scale to the 1.0 default."""
-        if self._global_scales or self._config_scales or self._dynamic_scales:
-            self._global_scales.clear()
-            self._config_scales.clear()
-            self._dynamic_scales.clear()
-            self._scales_dirty = True
+        if self._row_scales:
+            self._row_scales.clear()
+            self._dirty.mark_scales()
 
     def _build_scales_vector(self, device: torch.device) -> torch.Tensor:
         """Assemble the per-row scale vector in populate (row-position)
@@ -1036,18 +1201,18 @@ class SteeringManager:
         scales: list[float] = [
             1.0,  # row 0 sentinel
             1.0,  # row 1 global prefill — never scaled (cache safety)
-            self._global_scales.get("decode", 1.0),  # row 2 global decode
+            self._row_scales.get(RowOwner.global_("decode"), 1.0),  # row 2 decode
         ]
         for (config_hash, phase), _row in ordered_configs:
             # Prefill rows pinned to 1.0; decode rows take their scale.
             scale = (
-                self._config_scales.get((config_hash, phase), 1.0)
+                self._row_scales.get(RowOwner.config(config_hash, phase), 1.0)
                 if phase == "decode"
                 else 1.0
             )
             scales.append(scale)
         for dyn_id, _row in ordered_dynamic:
-            scales.append(self._dynamic_scales.get(dyn_id, 1.0))
+            scales.append(self._row_scales.get(RowOwner.dyn(dyn_id), 1.0))
         return torch.tensor(scales, dtype=torch.float32, device=device)
 
     def populate_steering_scales(
@@ -1062,7 +1227,7 @@ class SteeringManager:
         if self._indices_dirty or self._cached_indices is None:
             # Indices stale (config/dynamic membership changed) — fall back
             # to a full populate which rebuilds indices and writes scales.
-            self._tables_dirty = True
+            self._dirty.mark_content()
             self.populate_steering_tables(steerable_layers)
             return
         indices = self._cached_indices
@@ -1074,7 +1239,7 @@ class SteeringManager:
             scales_vec = self._build_scales_vector(scales_buf.device)
             scales_buf.index_copy_(0, indices, scales_vec)
             written.add(id(scales_buf))
-        self._scales_dirty = False
+        self._dirty.scales = False
 
     def _global_dict_for_phase(self, phase: str) -> dict[str, dict[int, torch.Tensor]]:
         """Return the global vector dict for the given phase."""
@@ -1293,7 +1458,7 @@ class SteeringManager:
                 active_tables.append((table, hp_str, layer_idx, mod))
 
         if not active_tables:
-            self._tables_dirty = False
+            self._dirty.content = False
             return
 
         # Derive device and hidden_size from the first active table.
@@ -1320,7 +1485,7 @@ class SteeringManager:
         # row-assembly loop below, but ``indices`` only needs rebuilding
         # when this ordering changed (register/release).
         if (
-            self._indices_dirty
+            self._dirty.membership
             or self._cached_indices is None
             or self._cached_zero_row is None
             or self._cached_ordered_configs is None
@@ -1345,7 +1510,7 @@ class SteeringManager:
             )
             self._cached_ordered_configs = new_ordered_configs
             self._cached_ordered_dynamic = new_ordered_dynamic
-            self._indices_dirty = False
+            self._dirty.membership = False
         indices: torch.Tensor = self._cached_indices
         zero_row: torch.Tensor = self._cached_zero_row
         ordered_configs: list[tuple[tuple[int, str], int]] = (
@@ -1602,8 +1767,10 @@ class SteeringManager:
 
         # All per-layer table buffers now reflect current state. Subsequent
         # calls can be skipped by the caller until a mutator sets dirty again.
-        self._tables_dirty = False
-        self._scales_dirty = False
+        # A full populate writes scales alongside the tables, so it clears
+        # every dirty flag (membership was cleared in the indices-rebuild block
+        # above; clearing it again is a no-op).
+        self._dirty.clear_after_full_populate()
 
     @property
     def num_active_configs(self) -> int:
