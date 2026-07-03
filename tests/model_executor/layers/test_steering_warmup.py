@@ -118,32 +118,60 @@ class TestWarmupCUDA:
             f"{size_after_first} to {size_after_second}."
         )
 
-    def test_subsequent_invocations_at_warmed_shape_no_new_variants(self):
+    @pytest.mark.parametrize("row_monitor_enabled", [False, True])
+    def test_subsequent_invocations_at_warmed_shape_no_new_variants(
+        self, row_monitor_enabled
+    ):
         """Calling the registered op at a warmed shape must not recompile.
 
         This is the property that actually matters for the served-window
         ``cuLibraryLoadData`` budget: once warmup has touched a shape,
-        the runtime call at that shape must hit the cache.
+        the runtime call at that shape must hit the cache. The runtime-mimic
+        must use the SAME per-row monitor buffer shapes the runner keeps for
+        this config — the ``(1, 1)`` / ``(1, 2)`` registered dummies when the
+        row monitor is disabled (the default), the resized ``(8, 128)`` /
+        ``(8, 2)`` tables when it is enabled — because Triton specializes the
+        probe table's leading stride into a distinct variant. (The previous
+        version always used full-size buffers, matching the buggy warmup rather
+        than the true default runtime, so it never caught the mismatch.)
         """
         device = torch.device("cuda")
         shapes = [4, 16]
+        table_rows = 8
         warmup_apply_steering_kernel(
             hidden_size=128,
-            table_rows=8,
+            table_rows=table_rows,
             table_dtype=torch.float16,
             compute_dtype=torch.float16,
             device=device,
             capture_sizes=shapes,
+            row_monitor_enabled=row_monitor_enabled,
         )
         baseline = _kernel_cache_size()
+
+        # Per-row monitor buffer shapes as the runner keeps them for this
+        # config (matching steering.py's registered dummies /
+        # resize_steering_row_monitor_buffers output).
+        if row_monitor_enabled:
+            rprobe = torch.zeros(table_rows, 128, dtype=torch.float32, device=device)
+            rparams = (
+                torch.tensor([-1.0e30, 1.0], dtype=torch.float32, device=device)
+                .expand(table_rows, 2)
+                .clone()
+            )
+        else:
+            rprobe = torch.zeros(1, 1, dtype=torch.float32, device=device)
+            rparams = torch.tensor(
+                [[-1.0e30, 1.0]], dtype=torch.float32, device=device
+            )
 
         # Mimic a runtime invocation for each warmed shape.
         for n in shapes:
             hidden = torch.zeros(n, 128, dtype=torch.float16, device=device)
-            table = torch.zeros(8, 128, dtype=torch.float16, device=device)
+            table = torch.zeros(table_rows, 128, dtype=torch.float16, device=device)
             index = torch.zeros(n, dtype=torch.long, device=device)
             active = torch.ones(1, dtype=torch.bool, device=device)
-            scales = torch.ones(8, dtype=torch.float32, device=device)
+            scales = torch.ones(table_rows, dtype=torch.float32, device=device)
             dvec = torch.zeros(128, dtype=torch.float32, device=device)
             tscale = torch.zeros(n, dtype=torch.float32, device=device)
             rgate = torch.ones(n, dtype=torch.float32, device=device)
@@ -151,12 +179,6 @@ class TestWarmupCUDA:
             mparams = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=device)
             mactive = torch.zeros(1, dtype=torch.bool, device=device)
             dmask = torch.zeros(n, dtype=torch.float32, device=device)
-            rprobe = torch.zeros(8, 128, dtype=torch.float32, device=device)
-            rparams = (
-                torch.tensor([-1.0e30, 1.0], dtype=torch.float32, device=device)
-                .expand(8, 2)
-                .clone()
-            )
             ractive = torch.zeros(1, dtype=torch.bool, device=device)
             torch.ops.vllm.apply_steering(
                 hidden,
