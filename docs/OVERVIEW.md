@@ -34,7 +34,8 @@ Overview:
     and writes per-(layer, hook) buffers before the forward; the apply path
     overwrites/interpolates the residual, then steering adds on top. The
     /v1/patch_sweep endpoint fans a (layers × positions) grid through continuous
-    batching for one-call causal-tracing sweeps.
+    batching for one-call causal-tracing sweeps; when the referenced source run
+    is missing and clean_prompt is given it auto-captures the clean run first.
 
 Features Index:
   activation_capture:

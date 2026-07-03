@@ -140,6 +140,25 @@ class _PatchSourceCache:
         self._runs = agg
         self._run_prompt_tokens = num_prompt_tokens
 
+    async def run_exists(
+        self, run_id: str, engine_client: EngineClient
+    ) -> bool | None:
+        """Whether ``run_id`` is present in the worker manifests (tri-state).
+
+        Returns ``True`` (present), ``False`` (confirmed absent after a
+        refresh), or ``None`` (a manifest RPC failed, so existence is unknown).
+        Refresh-on-miss so a run captured just before this call is not falsely
+        reported absent; the ``None`` case lets callers fall back to the
+        best-effort resolution-failure path rather than a hard 400."""
+        if run_id in self._runs:
+            return True
+        async with self._lock:
+            try:
+                await self._refresh(engine_client)
+            except Exception:  # noqa: BLE001 — unknown, not confirmed-absent
+                return None
+        return run_id in self._runs
+
     async def run_prompt_tokens(
         self, run_id: str, engine_client: EngineClient
     ) -> int | None:
@@ -253,3 +272,15 @@ async def get_run_prompt_tokens(
 ) -> int | None:
     """Prompt-token count of a captured source run (None if unknown)."""
     return await _PATCH_SOURCE_CACHE.run_prompt_tokens(run_id, engine_client)
+
+
+async def patch_source_run_exists(
+    engine_client: EngineClient, run_id: str
+) -> bool | None:
+    """Whether a patch source run exists (tri-state: True/False/None-unknown).
+
+    Refresh-on-miss; ``None`` when a manifest RPC failed. Used by the sweep
+    endpoint to decide between reusing an existing run, auto-capturing a
+    missing one, or deferring to the best-effort resolution path when the
+    existence check itself could not run."""
+    return await _PATCH_SOURCE_CACHE.run_exists(run_id, engine_client)

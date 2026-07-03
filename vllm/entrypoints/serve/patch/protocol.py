@@ -32,12 +32,18 @@ class PatchSweepRequest(BaseModel):
     source_run: str
     """Clean-run handle whose stored activations are patched in."""
     clean_prompt: str | None = None
-    """The clean prompt ``source_run`` was captured from. Required when it
-    tokenizes to a different length than ``prompt``: positions are then
-    aligned (common token prefix by identity, common suffix by the length
-    delta) and the unalignable middle is skipped loudly — assuming
-    ``source == dest`` across a length divergence silently patches the wrong
-    positions."""
+    """The clean prompt ``source_run`` was captured from.
+
+    Serves two roles. (1) Position alignment: required when it tokenizes to a
+    different length than ``prompt`` — positions are then aligned (common token
+    prefix by identity, common suffix by the length delta) and the unalignable
+    middle is skipped loudly (assuming ``source == dest`` across a length
+    divergence silently patches the wrong positions). (2) One-call auto-capture:
+    when ``source_run`` does not yet exist, the server captures this clean
+    prompt itself (hook + swept layers, ``all_prompt`` positions) with
+    capture-wait durability before running the grid, collapsing the
+    capture-then-sweep dance to a single request. Without it a missing
+    ``source_run`` is a 400 (capture the clean run explicitly first)."""
     hook: str = "post_block"
     layers: list[int] | LayerRange
     positions: list[int] | Literal["all_prompt"] = "all_prompt"
@@ -51,8 +57,10 @@ class PatchSweepRequest(BaseModel):
     foil_token_id: int | None = None
     metric: Literal["logprob", "logit_diff", "recovered"] = "logprob"
     logprobs: int = Field(default=20, ge=1)
-    # Clean baseline answer metric (from capture_clean) for the recovered
-    # metric; the corrupt baseline is computed in-endpoint.
+    # Clean baseline answer metric (from an explicit capture_clean) for the
+    # recovered metric; the corrupt baseline is computed in-endpoint. Ignored
+    # when the server auto-captures (the clean baseline is then graded from the
+    # internal clean generation).
     clean_baseline: float | None = None
 
 
@@ -76,3 +84,10 @@ class PatchSweepResponse(BaseModel):
     batch compositions return slightly different logprobs; grid differences at
     or below this floor are not meaningful. For exact reproducibility start the
     server with batch-invariant mode (see docs/features/batch_invariance.md)."""
+    auto_captured: bool = False
+    """True when ``source_run`` was missing and the server captured
+    ``clean_prompt`` itself (one-call sweep) before running the grid, rather
+    than reusing a pre-existing capture run."""
+    captured_source_run: str | None = None
+    """The run handle the auto-capture wrote under (equals ``source_run``), or
+    ``None`` when no auto-capture happened."""
