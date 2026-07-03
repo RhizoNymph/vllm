@@ -151,6 +151,66 @@ async def _first_token_logprobs(
     return final.outputs[0].logprobs[0], len(final.prompt_token_ids)
 
 
+async def _auto_capture_clean(
+    eng: EngineClient,
+    clean_prompt: str,
+    source_run: str,
+    hook: str,
+    layers: list[int],
+    logprobs: int,
+    grade_token_ids: list[int] | None,
+) -> dict[int, Any] | None:
+    """Capture the clean run server-side, blocking until it is durable.
+
+    Mirrors the client's ``capture_clean``: taps ``hook`` at every swept
+    ``layer`` over ``all_prompt`` positions into ``source_run`` via the
+    ``patch_source`` capture consumer, then waits for the capture to finalize
+    (``capture_wait`` semantics) so the per-worker source store is populated
+    before any cell resolves against it.
+
+    Args:
+        layers: The swept layer set (the capture covers exactly these sites).
+        grade_token_ids: Answer/foil ids scored exactly via ``logprob_token_ids``
+            so the returned first-token logprobs grade the clean baseline the
+            same way the corrupt baseline is graded.
+
+    Returns:
+        The clean run's first-token ``{token_id: Logprob}`` dict, or ``None``
+        if the generation produced no logprobs.
+    """
+    sp = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+        logprobs=len(grade_token_ids) if grade_token_ids else logprobs,
+        logprob_token_ids=grade_token_ids,
+        capture={
+            "patch_source": {
+                "run": source_run,
+                "hooks": {hook: list(layers)},
+                "positions": "all_prompt",
+            }
+        },
+    )
+    # ``all_prompt`` taps every prompt position: mark the prefix capture-
+    # touching (min position 0) so it is re-forwarded and its residual is
+    # captured — mirrors what ``_admit_capture`` stamps for ``all_prompt``.
+    sp.capture_touches_prompt = True
+    sp.capture_min_prompt_position = 0
+    request_id = f"patchsweep-capture-{source_run}-{uuid4().hex[:8]}"
+    final = None
+    async for out in eng.generate({"prompt": clean_prompt}, sp, request_id):
+        final = out
+    # capture_wait: hold until the source-store writes finalize (async), unless
+    # results already arrived inline (waiting then would block to timeout).
+    if not getattr(final, "capture_results", None) and hasattr(
+        eng, "wait_for_capture_results"
+    ):
+        await eng.wait_for_capture_results(request_id)
+    if final is None or not final.outputs or not final.outputs[0].logprobs:
+        return None
+    return final.outputs[0].logprobs[0]
+
+
 async def _resolve_grade_token(
     eng: EngineClient, token: str | None, token_id: int | None, what: str
 ) -> int | None:
@@ -225,17 +285,49 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         return _err("empty sweep grid (no layers or positions)")
     corrupt_val = cell_metric(corrupt_lp, body) if corrupt_lp else None
 
+    # One-call auto-capture: if the referenced run is confirmed missing and a
+    # clean_prompt was given, capture the clean run ourselves (hook + swept
+    # layers, all_prompt) with capture-wait durability, then proceed as if it
+    # had been captured explicitly. A missing run with no clean_prompt (or an
+    # existing run) falls through unchanged — the former 400s at
+    # validate_patch_sources below, the latter is reused as-is. On an unknown
+    # existence check (RPC failure -> None) we also fall through to the
+    # best-effort resolution path rather than force-capturing.
+    from vllm.v1.capture.patch_admission import (
+        PatchValidationError,
+        get_run_prompt_tokens,
+        patch_source_run_exists,
+        validate_patch_sources,
+    )
+
+    auto_captured = False
+    captured_source_run: str | None = None
+    auto_clean_val: float | None = None
+    if body.clean_prompt is not None:
+        run_exists = await patch_source_run_exists(eng, body.source_run)
+        if run_exists is False:
+            try:
+                clean_lp = await _auto_capture_clean(
+                    eng, body.clean_prompt, body.source_run, body.hook,
+                    layers, body.logprobs, grade_ids,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("patch_sweep auto-capture failed")
+                return _err(
+                    f"auto-capture of clean run {body.source_run!r} failed "
+                    f"({exc}); is the patch_source capture consumer enabled "
+                    f"(--capture-consumers patch_source)?",
+                    HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                )
+            auto_captured = True
+            captured_source_run = body.source_run
+            auto_clean_val = cell_metric(clean_lp, body) if clean_lp else None
+
     # Position alignment: map each dest position to its clean source position.
     # With clean_prompt given, the alignment handles length mismatches (common
     # prefix identity, common suffix shifted, differing middle skipped loudly).
     # Without it, refuse a length mismatch outright — assuming source == dest
     # across a divergence would sweep silently shifted positions.
-    from vllm.v1.capture.patch_admission import (
-        PatchValidationError,
-        get_run_prompt_tokens,
-        validate_patch_sources,
-    )
-
     skipped: list[dict] = []
     alignment_summary: dict | None = None
     if body.clean_prompt is not None:
@@ -373,7 +465,10 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
                 layer, pos, details,
             )
 
-    clean_val = body.clean_baseline
+    # When we auto-captured, the clean baseline is graded from the same
+    # internal clean generation (exactly like the corrupt baseline) so the
+    # caller needn't supply it; an explicit clean_baseline is used otherwise.
+    clean_val = auto_clean_val if auto_captured else body.clean_baseline
     if body.metric == "recovered":
         if clean_val is None or corrupt_val is None or abs(
             clean_val - corrupt_val
@@ -401,6 +496,8 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         skipped=skipped,
         alignment=alignment_summary,
         noise_floor=noise_floor,
+        auto_captured=auto_captured,
+        captured_source_run=captured_source_run,
     )
 
 

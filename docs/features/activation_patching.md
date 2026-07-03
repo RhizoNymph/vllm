@@ -77,7 +77,11 @@ capture = {
 ```
 
 Capture writes are asynchronous; set `capture_wait=True` on the clean request
-(HTTP) so the source store is durable before any patch references it.
+(HTTP) so the source store is durable before any patch references it. This
+explicit pre-capture is still required for probe / single-cell patch requests
+(`patch` on `SamplingParams`). For grid sweeps it is now *optional*: passing
+`clean_prompt` to `/v1/patch_sweep` lets the server auto-capture the clean run
+in the same call (see [Server-side sweeps](#server-side-sweeps)).
 
 ## Server-side sweeps
 
@@ -91,6 +95,34 @@ returns the assembled metric grid. Metrics: `logprob`, `logit_diff`
 The `PatchStudy` client
 (`examples/online_serving/openai_patch_client.py`) wraps capture + sweep for the
 coarse→fine "walk" of finding the causal sites.
+
+#### One-call auto-capture
+
+The common case — capture the clean run, then sweep the corrupt run against it —
+collapses to a single request. When a sweep references a `source_run` that does
+**not** yet exist in the source manifests *and* supplies `clean_prompt`, the
+server captures the clean run itself before running the grid:
+
+- The capture spec is derived from the grid: hook = the sweep's `hook`, layers =
+  the swept layer set, positions = `all_prompt` (mirrors the client's
+  `capture_clean`). It runs through the normal `patch_source` capture consumer,
+  so `--capture-consumers patch_source` must be enabled.
+- It uses `capture_wait` durability semantics internally, so the per-worker
+  source store is populated before any cell resolves against it — the classic
+  "forgot `capture_wait`, sweep 400s / silently no-ops" race is unrepresentable.
+- The clean baseline for the `recovered` metric is graded from that same
+  internal clean generation (exactly like the corrupt baseline, including exact
+  `logprob_token_ids` grading), so the caller needn't pass `clean_baseline`.
+- The response reports `auto_captured: true` and `captured_source_run` so
+  callers can distinguish a one-call sweep from one reusing a prior run.
+
+Existing runs are reused unchanged (no re-capture). A missing run captures under
+the requested `source_run` name; the store is run-id keyed, so two concurrent
+sweeps auto-capturing the same name are last-writer-wins (existence is
+re-checked after capture via the manifest refresh-on-miss). If a referenced run
+is missing and `clean_prompt` is **not** provided, the sweep still 400s
+(capture the clean run explicitly first). Explicit pre-capture (client
+`capture_clean` + `capture_wait`) keeps working unchanged.
 
 ### Position alignment
 
