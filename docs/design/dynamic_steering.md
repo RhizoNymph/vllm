@@ -871,12 +871,16 @@ layers of a 4–8B at large batch widths, prohibitive for 70B — so capture a
 curated handful of layers (or lean on the zero-capture `this_token` path), not
 everything.
 
-**Precedence** (operator wins, `steering_model_runner_mixin.py`): every
-declarative action is stamped `source="declarative"`; the runner records the
-owning source per request (`_req_override_source`) and rejects a declarative
-action for a request already owned by another (operator) source. Compose-on-top
-is a runner-side fold (`RequestSteeringOverride.compose_admitted` →
-`_resolve_request_steering(..., "decode")` + the gate delta). On request finish
+**Precedence** (operator wins, `steering_model_runner_mixin.py` for v1 and
+`gpu/steering_runner_mixin.py` for v2 — both `_apply_request_override`
+implementations are kept in lock-step): every declarative action is stamped
+`source="declarative"`; the runner records the owning source per request
+(`_req_override_source`) and rejects a declarative action for a request already
+owned by another (operator) source, and vice-versa the operator source takes
+over a declarative-owned request. Compose-on-top is a runner-side fold
+(`RequestSteeringOverride.compose_admitted` → `_resolve_request_steering(...,
+"decode")` + the gate delta; guarded so a missing-module `RuntimeError` becomes
+a structured rejection rather than crashing the engine). On request finish
 `release_dynamic_config` purges the row's per-row monitor + scale so nothing
 leaks.
 
