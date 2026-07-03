@@ -34,6 +34,7 @@ class _FakeManager:
         self.has_dynamic = False
         self.has_dynamic_tier = has_dynamic_tier
         self.has_monitor = False
+        self.has_row_monitor = False
         self.dynamic_tier_gain = 2.0
         self.max_dynamic_steering_configs = dyn_pool
         self.registered: list[tuple[int, str]] = []
