@@ -89,8 +89,27 @@ returns the assembled metric grid. Metrics: `logprob`, `logit_diff`
 (answer − foil), `recovered` `(patched − corrupt) / (clean − corrupt)`.
 
 The `PatchStudy` client
-(`examples/online_serving/openai_patch_client.py`) wraps capture + sweep for the
-coarse→fine "walk" of finding the causal sites.
+(`vllm.entrypoints.serve.patch.client`) wraps capture + sweep for the
+coarse→fine "walk" of finding the causal sites:
+
+```python
+from vllm.entrypoints.serve.patch.client import PatchStudy, Span
+```
+
+`examples/online_serving/openai_patch_client.py` is a runnable demo that imports
+from that module.
+
+### Substring positions
+
+Sweep positions are token indices, but tokenization is easy to get wrong by
+hand. `await study.positions_for(prompt, span, occurrence=0)` resolves a
+substring of a prompt to the token positions covering it — it tokenizes with the
+same `/tokenize` semantics the sweep uses and reconstructs per-token character
+offsets by incremental `/detokenize`, so the positions index the prompt exactly
+as the server sees it. A missing substring raises, and repeated matches must be
+disambiguated with `occurrence` (default 0 = first). A `Span("text",
+occurrence=0)` marker may also be passed directly in a sweep's `positions`
+(mixed with plain indices); each span is resolved against the corrupt prompt.
 
 ### Position alignment
 
@@ -103,8 +122,9 @@ shifted positions — so the sweep endpoint refuses a length mismatch unless
 the common token prefix maps by identity, the common token suffix maps by the
 length delta, and the differing middle (no positional correspondence) is
 skipped with per-position entries in `skipped` plus an `alignment` summary in
-the response. `PatchStudy` does the same client-side when the `CleanRun` handle
-(which records its prompt) is passed to the sweep.
+the response. `PatchStudy` does the same client-side — importing the shared
+`vllm.entrypoints.serve.patch.alignment` module (no duplicated copy) — when the
+`CleanRun` handle (which records its prompt) is passed to the sweep.
 
 ### Reproducibility
 
@@ -193,6 +213,7 @@ python -m vllm.entrypoints.openai.api_server \
 - Config / admission: `vllm/config/patch.py`, `vllm/sampling_params.py`
   (`patch` field), `vllm/v1/capture/patch_admission.py`, `vllm/v1/request.py`
   (prefix floor), `vllm/v1/core/sched/scheduler.py` (backpressure).
-- Endpoint / client: `vllm/entrypoints/serve/patch/`,
-  `examples/online_serving/openai_patch_client.py`.
+- Endpoint / client: `vllm/entrypoints/serve/patch/` (client:
+  `vllm/entrypoints/serve/patch/client.py`; runnable demo:
+  `examples/online_serving/openai_patch_client.py`).
 - GPU validation: `tests/gpu_patch_validate.py`.

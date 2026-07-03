@@ -2,31 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the PatchStudy client's pure logic (no server needed)."""
 
-import importlib.util
-import sys
-from pathlib import Path
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
-_MODULE_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "examples"
-    / "online_serving"
-    / "openai_patch_client.py"
-)
+import vllm.entrypoints.serve.patch.client as pc
 
-
-def _load_module():
-    spec = importlib.util.spec_from_file_location("openai_patch_client", _MODULE_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    # Register before exec so dataclass decorators can resolve __module__.
-    sys.modules["openai_patch_client"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-pc = _load_module()
+pytestmark = pytest.mark.cpu_test
 
 
 def _choice(top: dict[str, float]):
@@ -107,3 +90,140 @@ class TestSweepResult:
             grid=[[None], [-5.0]],
         )
         assert r.argmax_cell() == (1, 0)
+
+
+def _offsets(spans: list[str]) -> tuple[str, list[tuple[int, int]]]:
+    """Build (text, per-token char offsets) from consecutive token strings."""
+    text = ""
+    offsets = []
+    for s in spans:
+        offsets.append((len(text), len(text) + len(s)))
+        text += s
+    return text, offsets
+
+
+class TestResolveSpanPositions:
+    # "The Colosseum is" tokenized as leading-space subwords.
+    TOKENS = ["The", " Col", "os", "seum", " is"]
+
+    def test_single_token_span(self):
+        text, offsets = _offsets(self.TOKENS)
+        # "The" covers only position 0.
+        assert pc._resolve_span_positions(offsets, text, "The") == [0]
+
+    def test_multi_token_span(self):
+        text, offsets = _offsets(self.TOKENS)
+        # "Colosseum" spans the leading-space token plus its continuations.
+        assert pc._resolve_span_positions(offsets, text, "Colosseum") == [1, 2, 3]
+
+    def test_span_with_leading_space_matches_same_tokens(self):
+        text, offsets = _offsets(self.TOKENS)
+        assert pc._resolve_span_positions(offsets, text, " Colosseum") == [1, 2, 3]
+
+    def test_partial_token_overlap_included(self):
+        text, offsets = _offsets(self.TOKENS)
+        # "seu" lies inside token 3 only.
+        assert pc._resolve_span_positions(offsets, text, "seu") == [3]
+
+    def test_span_crossing_token_boundary(self):
+        text, offsets = _offsets(self.TOKENS)
+        # "osseum is" overlaps tokens 2, 3, 4.
+        assert pc._resolve_span_positions(offsets, text, "osseum is") == [2, 3, 4]
+
+    def test_not_found_raises(self):
+        text, offsets = _offsets(self.TOKENS)
+        with pytest.raises(ValueError, match="not found"):
+            pc._resolve_span_positions(offsets, text, "Rome")
+
+    def test_empty_span_raises(self):
+        text, offsets = _offsets(self.TOKENS)
+        with pytest.raises(ValueError, match="non-empty"):
+            pc._resolve_span_positions(offsets, text, "")
+
+    def test_multiple_occurrences_select_by_index(self):
+        text, offsets = _offsets(["a", "b", "a", "b"])  # "abab"
+        assert pc._resolve_span_positions(offsets, text, "a", 0) == [0]
+        assert pc._resolve_span_positions(offsets, text, "a", 1) == [2]
+
+    def test_occurrence_out_of_range_raises(self):
+        text, offsets = _offsets(["a", "b", "a", "b"])
+        with pytest.raises(ValueError, match="out of range"):
+            pc._resolve_span_positions(offsets, text, "a", 2)
+
+    def test_special_token_empty_span_never_selected(self):
+        # A BOS-like token detokenizes to "" (empty span) at position 0.
+        text, offsets = _offsets(["", "The", " cat"])
+        assert pc._resolve_span_positions(offsets, text, "The") == [1]
+
+
+class TestTokenCharOffsets:
+    def test_incremental_detokenize_builds_offsets(self, monkeypatch):
+        study = pc.PatchStudy.__new__(pc.PatchStudy)
+        study.model = "m"
+        # decode(ids[:k]) returns the concatenation of the first k pieces.
+        pieces = ["", "The", " cat"]
+
+        def fake_detok(ids):
+            return "".join(pieces[: len(ids)])
+
+        monkeypatch.setattr(study, "_detokenize", fake_detok)
+        text, offsets = study._token_char_offsets([1, 2, 3])
+        assert text == "The cat"
+        # BOS -> empty span; then "The" [0,3); then " cat" [3,7).
+        assert offsets == [(0, 0), (0, 3), (3, 7)]
+
+    def test_detokenize_failure_raises(self, monkeypatch):
+        study = pc.PatchStudy.__new__(pc.PatchStudy)
+        study.model = "m"
+        monkeypatch.setattr(study, "_detokenize", lambda ids: None)
+        with pytest.raises(RuntimeError, match="detokenize"):
+            study._token_char_offsets([1, 2])
+
+
+class TestPositionsFor:
+    def _study(self, monkeypatch, ids, pieces):
+        study = pc.PatchStudy.__new__(pc.PatchStudy)
+        study.model = "m"
+        monkeypatch.setattr(study, "_tokenize", lambda text: ids)
+        monkeypatch.setattr(
+            study, "_detokenize", lambda i: "".join(pieces[: len(i)])
+        )
+        return study
+
+    def test_positions_for(self, monkeypatch):
+        study = self._study(
+            monkeypatch, [1, 2, 3, 4], ["", "The", " Colos", "seum"]
+        )
+        got = asyncio.run(study.positions_for("The Colosseum", "Colosseum"))
+        assert got == [2, 3]
+
+    def test_positions_for_tokenize_failure(self, monkeypatch):
+        study = self._study(monkeypatch, None, [])
+        with pytest.raises(RuntimeError, match="tokenize"):
+            asyncio.run(study.positions_for("x", "y"))
+
+
+class TestResolvePositions:
+    def test_mixes_ints_and_spans_dedup_in_order(self, monkeypatch):
+        study = pc.PatchStudy.__new__(pc.PatchStudy)
+
+        async def fake_positions_for(prompt, span, *, occurrence=0):
+            return {"cat": [2, 3], "dog": [3, 5]}[span]
+
+        monkeypatch.setattr(study, "positions_for", fake_positions_for)
+        out = asyncio.run(
+            study._resolve_positions([0, pc.Span("cat"), pc.Span("dog")], "prompt")
+        )
+        # 0, then cat->2,3, then dog->3(dupe dropped),5.
+        assert out == [0, 2, 3, 5]
+
+    def test_single_span_marker(self, monkeypatch):
+        study = pc.PatchStudy.__new__(pc.PatchStudy)
+
+        async def fake_positions_for(prompt, span, *, occurrence=0):
+            assert occurrence == 1
+            return [4, 5]
+
+        monkeypatch.setattr(study, "positions_for", fake_positions_for)
+        out = asyncio.run(study._resolve_positions(pc.Span("cat", occurrence=1), "p"))
+        assert out == [4, 5]

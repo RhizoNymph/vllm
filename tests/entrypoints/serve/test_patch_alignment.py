@@ -2,10 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for clean/corrupt token-position alignment."""
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import pytest
 
 from vllm.entrypoints.serve.patch.alignment import align_token_positions
@@ -68,22 +64,15 @@ class TestUnequalLength:
         }
 
 
-class TestClientParity:
-    """The example client carries a standalone copy of the algorithm; the two
-    must agree on every case."""
+class TestClientUsesSharedAlignment:
+    """The client now imports the shared module rather than mirroring it; this
+    guards that the client references the same implementation and that it
+    behaves correctly across the alignment cases."""
 
-    def _client_align(self):
-        path = (
-            Path(__file__).resolve().parents[3]
-            / "examples"
-            / "online_serving"
-            / "openai_patch_client.py"
-        )
-        spec = importlib.util.spec_from_file_location("opc_align_test", path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["opc_align_test"] = mod
-        spec.loader.exec_module(mod)
-        return mod._align_token_positions
+    def test_client_imports_shared_symbol(self):
+        from vllm.entrypoints.serve.patch import client
+
+        assert client.align_token_positions is align_token_positions
 
     @pytest.mark.parametrize(
         "clean,corrupt",
@@ -96,9 +85,10 @@ class TestClientParity:
             ([], []),
         ],
     )
-    def test_parity(self, clean, corrupt):
-        client_align = self._client_align()
-        server = align_token_positions(clean, corrupt)
-        c_mapping, c_unaligned = client_align(clean, corrupt)
-        assert c_mapping == server.mapping
-        assert c_unaligned == server.unaligned
+    def test_alignment_maps_and_unaligned(self, clean, corrupt):
+        a = align_token_positions(clean, corrupt)
+        # Every dest position is either mapped or explicitly unaligned.
+        assert set(a.mapping) | set(a.unaligned) == set(range(len(corrupt)))
+        assert not (set(a.mapping) & set(a.unaligned))
+        # Mapped positions never point past the clean run.
+        assert all(0 <= v < len(clean) for v in a.mapping.values())
