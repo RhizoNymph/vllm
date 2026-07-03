@@ -29,6 +29,7 @@ declarative consumer reads those and drives the steering substrate.
 from __future__ import annotations
 
 import enum
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -356,6 +357,51 @@ def _resolve_source_dict(
     raise ValueError(f"vector source 'kind' must be 'name' or 'inline', got {skind!r}")
 
 
+def _validate_gate_semantics(gates: list[SteeringGate]) -> None:
+    """Reject gates the steering substrate cannot honor.
+
+    Structural validity (``resolve_gates``) is necessary but not
+    sufficient; these are the semantic constraints a well-formed request
+    must also satisfy so it never fails mid-flight on the worker:
+
+    - ``attenuate`` with ``when=probe`` and ``scope=this_token`` is
+      unsupported. Same-token conditional damping would need a per-row
+      gate of the form ``scale = 1 - (1 - strength)*gate``, but the
+      in-graph per-row monitor can only multiply a row's contribution
+      *toward zero* when the probe is LOW — the wrong shape for "damp when
+      the probe fires this token". Use ``next_step`` or
+      ``rest_of_request`` (host-evaluated) instead.
+    - a probe trigger's ``threshold`` and ``sharpness`` must be finite and
+      ``sharpness`` non-negative, matching the worker-side monitor
+      validation (:func:`validate_steering_monitor`) so a request that
+      passes the frontend can never have its paired row monitor rejected
+      on the step thread (which would strand the override applying every
+      token unconditionally).
+    """
+    for gate in gates:
+        if (
+            isinstance(gate.apply, AttenuateApply)
+            and isinstance(gate.when, ProbeWhen)
+            and gate.scope == GateScope.THIS_TOKEN
+        ):
+            raise ValueError(
+                "attenuate with when=probe and scope=this_token is not "
+                "supported: the in-graph per-row monitor cannot damp a row "
+                "only when the probe fires. Use scope=next_step or "
+                "rest_of_request (host-evaluated) instead."
+            )
+        if isinstance(gate.when, ProbeWhen):
+            if not math.isfinite(gate.when.threshold):
+                raise ValueError("probe threshold must be finite")
+            if not math.isfinite(gate.when.sharpness):
+                raise ValueError("probe sharpness must be finite")
+            if gate.when.sharpness < 0:
+                raise ValueError(
+                    f"probe sharpness must be non-negative, got "
+                    f"{gate.when.sharpness!r}"
+                )
+
+
 def build_steering_gates(
     raw: list[dict] | None,
     registry: _VectorRegistry | None,
@@ -391,6 +437,9 @@ def build_steering_gates(
         gates = msgspec.convert(prepared, type=list[SteeringGate])
     except msgspec.ValidationError as exc:
         raise ValueError(f"invalid steering gate spec: {exc}") from exc
+    # Fail fast on semantic problems the substrate cannot honor
+    # (unsupported combos, non-finite/negative probe params).
+    _validate_gate_semantics(gates)
     # Fail fast on structural problems the consumer would otherwise hit
     # (probe must name exactly one site; add must carry vectors). Normalize
     # non-ValueError unpack failures (e.g. ``np.dtype("garbage")`` raises

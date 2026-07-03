@@ -50,6 +50,15 @@ def _att(scope, strength=0.0):
     )
 
 
+def _att_probe(scope, strength=0.5):
+    return ResolvedGate(
+        scope=scope, when_kind="probe", probe_site=SITE,
+        probe_vec=np.ones(HIDDEN, dtype=np.float32),
+        threshold=0.0, sharpness=1.0, apply_kind="attenuate",
+        steer_vectors=None, strength=strength,
+    )
+
+
 def _req(rid, gates, *, phase="decode", cid=None):
     return StepRequestView(
         req_id=rid, start=0, end=1, phase=phase,
@@ -173,6 +182,25 @@ def test_conversation_bridges_a_later_gateless_turn():
     assert _types(acts) == ["RequestSteeringOverride"]
     assert acts[0].req_id == "t2"
     assert c._bridges == 1
+
+
+def test_attenuate_this_token_probe_skipped_not_applied():
+    # Unsupported combo reaching the consumer from a non-frontend producer must
+    # be skipped-and-warned, never applied unconditionally (Bug A).
+    c = _consumer()
+    acts = c.on_step(_view([_req("r", [_att_probe("this_token")])]))
+    assert acts is None
+    assert "r" not in c._armed
+    assert c._unsupported_combo_warned is True
+
+
+def test_attenuate_next_step_probe_still_host_evaluated():
+    # The non-this_token probe variant is supported (host-evaluated); a firing
+    # probe still installs the admitted override + scale.
+    c = _consumer(probe_sites=["5:post_block"])
+    tensors = {SITE: torch.ones(1, HIDDEN) * 10.0}  # high proj -> fires
+    acts = c.on_step(_view([_req("r", [_att_probe("next_step")], cid="k")], tensors))
+    assert _types(acts) == ["RequestSteeringOverride", "SteeringScaleUpdate"]
 
 
 def test_finished_request_state_pruned():

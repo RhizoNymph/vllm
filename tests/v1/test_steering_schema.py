@@ -169,6 +169,54 @@ def test_gate_type_is_msgspec_struct():
     assert isinstance(g, SteeringGate)
 
 
+def test_attenuate_this_token_probe_rejected():
+    # The substrate cannot damp a row only when the probe fires this token
+    # (the per-row monitor gates toward zero when the probe is LOW).
+    raw = [{
+        "when": {"kind": "probe", "probe": _inline(np.ones(HIDDEN), 5),
+                 "threshold": 0.0},
+        "scope": "this_token",
+        "apply": {"kind": "attenuate", "strength": 0.5},
+    }]
+    with pytest.raises(ValueError, match="attenuate"):
+        build_steering_gates(raw, None)
+
+
+def test_attenuate_this_token_always_still_allowed():
+    # Only the probe variant is unsupported; always+this_token+attenuate is fine.
+    raw = [{
+        "when": {"kind": "always"},
+        "scope": "this_token",
+        "apply": {"kind": "attenuate", "strength": 0.5},
+    }]
+    gates = build_steering_gates(raw, None)
+    assert len(gates) == 1
+
+
+@pytest.mark.parametrize("bad", [-1.0, float("inf"), float("nan")])
+def test_probe_bad_sharpness_rejected(bad):
+    raw = [{
+        "when": {"kind": "probe", "probe": _inline(np.ones(HIDDEN), 5),
+                 "threshold": 0.0, "sharpness": bad},
+        "scope": "this_token",
+        "apply": {"kind": "add", "steer": _inline(np.ones(HIDDEN), 5)},
+    }]
+    with pytest.raises(ValueError, match="sharpness"):
+        build_steering_gates(raw, None)
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+def test_probe_non_finite_threshold_rejected(bad):
+    raw = [{
+        "when": {"kind": "probe", "probe": _inline(np.ones(HIDDEN), 5),
+                 "threshold": bad},
+        "scope": "rest_of_request",
+        "apply": {"kind": "add", "steer": _inline(np.ones(HIDDEN), 5)},
+    }]
+    with pytest.raises(ValueError, match="threshold"):
+        build_steering_gates(raw, None)
+
+
 # --------------------------------------------------------------------------
 # Fail-safe admission (``resolve_gates_safe``) — a malformed payload that
 # bypassed the frontend dry-run must be skipped, not crash the engine core.

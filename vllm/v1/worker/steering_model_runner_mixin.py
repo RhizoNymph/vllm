@@ -1172,12 +1172,28 @@ class SteeringModelRunnerMixin:
         applied = 0
         rejected = 0
         updates: list[SteeringVectorUpdate] = []
+        # Declarative per-request overrides *installed* earlier in THIS batch,
+        # keyed by req_id. Used to fail closed when a paired per-row monitor is
+        # rejected: a declarative this_token+probe+add emits the (unconditional)
+        # override first and the per-row monitor second (the monitor's req_id
+        # resolves to the override's freshly-registered dyn row). If the monitor
+        # is rejected the override would otherwise stick and steer EVERY token
+        # unconditionally — the opposite of the client's probe-gated intent, and
+        # only a log line. Roll the override back instead. Scoped narrowly: same
+        # batch, same req_id, declarative source; operator flows are untouched.
+        declarative_installs: dict[str, RequestSteeringOverride] = {}
         for action in actions:
             if isinstance(action, SteeringVectorUpdate):
                 updates.append(action)
             elif isinstance(action, RequestSteeringOverride):
                 if self._apply_request_override(action, source=source):
                     applied += 1
+                    if source == DECLARATIVE_SOURCE and action.vectors is not None:
+                        declarative_installs[action.req_id] = action
+                    else:
+                        # A clear (or non-declarative source) supersedes any
+                        # tracked install for this request in this batch.
+                        declarative_installs.pop(action.req_id, None)
                 else:
                     rejected += 1
             elif isinstance(action, SteeringScaleUpdate):
@@ -1190,6 +1206,32 @@ class SteeringModelRunnerMixin:
                     applied += 1
                 else:
                     rejected += 1
+                    install = (
+                        declarative_installs.pop(action.req_id, None)
+                        if source == DECLARATIVE_SOURCE and action.req_id is not None
+                        else None
+                    )
+                    if install is not None:
+                        # Fail closed: undo the override this batch installed for
+                        # the request so its probe-gated steering is not applied
+                        # every token unconditionally.
+                        self._apply_request_override(
+                            RequestSteeringOverride(
+                                req_id=action.req_id,
+                                vectors=None,
+                                source=DECLARATIVE_SOURCE,
+                            ),
+                            source=source,
+                        )
+                        applied -= 1
+                        rejected += 1
+                        logger.warning(
+                            "declarative steering: rolled back per-request "
+                            "override for %s because its paired per-row monitor "
+                            "was rejected (failing closed rather than steering "
+                            "every token unconditionally)",
+                            action.req_id,
+                        )
             else:
                 rejected += 1
                 logger.warning(

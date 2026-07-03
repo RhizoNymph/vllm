@@ -845,6 +845,15 @@ bounded conversation latch/bridge and `_armed` lifecycle but overrides
   latches and bridges later turns.
 - `attenuate`: a per-request `SteeringScaleUpdate` (installing an admitted-only
   override first so the damp is per-request, not shared across a config row).
+  **`attenuate` with `when=probe` and `scope=this_token` is unsupported** and
+  rejected: same-token conditional damping would need a per-row gate of the form
+  `scale = 1 − (1 − strength)·gate`, but the per-row monitor (§8.1) can only
+  multiply a row's contribution *toward zero* when the probe is LOW — the wrong
+  shape for "damp when the probe fires this token". Clients get an HTTP 400 from
+  `build_steering_gates` (`_validate_gate_semantics`) telling them to use
+  `next_step` / `rest_of_request` (host-evaluated) instead; if such a gate still
+  reaches the worker from a non-frontend producer (offline, the Rust frontend)
+  the consumer skips-and-warns it once rather than attenuating unconditionally.
 
 **Probe sites & capture (`--declarative-probe-sites`).** The consumer's
 `global_capture_spec()` is a configured allow-list of `layer:hook` sites (config
@@ -883,6 +892,23 @@ over a declarative-owned request. Compose-on-top is a runner-side fold
 a structured rejection rather than crashing the engine). On request finish
 `release_dynamic_config` purges the row's per-row monitor + scale so nothing
 leaks.
+
+**Fail-closed for `this_token+probe+add`.** The override (unconditional) is
+emitted first and the per-row monitor (`req_id`-keyed) second — the ordering is
+forced because the monitor's `req_id` resolves to the override's
+freshly-registered `dyn_id`. `_apply_monitor_update` can still reject the monitor
+after the override applied (row monitor disabled, probe hidden-size mismatch,
+probe layer not steerable, non-finite/negative params), which would strand the
+override applying **every** token unconditionally — the opposite of the client's
+probe-gated intent. Two layers prevent this: the frontend validates
+`sharpness`/`threshold` (finite, `sharpness ≥ 0`) so a well-formed request can
+never hit rejection; and `_apply_steering_actions` **rolls the override back**
+(applies an equivalent clear) when a declarative-source `SteeringMonitorUpdate`
+targeting a `req_id` is rejected and an override for that same `req_id` was
+applied earlier in the same action batch — scoped to same batch / same req_id /
+declarative source, so operator flows are untouched. The request reverts to its
+admitted (static) decode steering; the probe-gated add is dropped, not applied
+blind.
 
 **Named vector registry** (frontend, `vllm/entrypoints/openai/steering/
 vector_registry.py` + admin routes `vllm/entrypoints/serve/steering/
