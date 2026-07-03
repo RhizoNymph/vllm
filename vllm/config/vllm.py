@@ -916,6 +916,50 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _maybe_imply_patch_source_consumer(self) -> None:
+        """Register the ``patch_source`` capture consumer when patching is on.
+
+        Activation patching sources its clean-run activations from a capture
+        routed through the ``patch_source`` consumer, so enabling patching
+        without that consumer silently drops every clean capture and later
+        sweeps fail with "run not found". Imply the consumer here, at the
+        config-finalization point shared by the online server and offline
+        ``LLM`` paths, so ``--enable-patching`` is sufficient on its own.
+
+        Idempotent: an explicit ``--capture-consumers patch_source`` is
+        preserved without duplication, and patching being disabled never adds
+        it. The implied spec is identical to the explicit one, so it flows
+        through the same registration path.
+        """
+        if self.patch_config is None:
+            return
+
+        from vllm.v1.capture.config import (
+            CaptureConsumersConfig,
+            CaptureConsumerSpec,
+        )
+
+        consumer_name = "patch_source"
+        if self.capture_consumers_config is None:
+            self.capture_consumers_config = CaptureConsumersConfig(
+                consumers=[CaptureConsumerSpec(name=consumer_name)]
+            )
+        elif not any(
+            spec.name == consumer_name
+            for spec in self.capture_consumers_config.consumers
+        ):
+            self.capture_consumers_config.consumers.append(
+                CaptureConsumerSpec(name=consumer_name)
+            )
+        else:
+            return
+
+        logger.info(
+            "activation patching enabled: implied capture consumer "
+            "(consumer=%s, reason=enable_patching)",
+            consumer_name,
+        )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1431,6 +1475,11 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
+
+        # Patching populates its source store from a clean capture routed
+        # through the ``patch_source`` consumer, so ``--enable-patching``
+        # implies that consumer. Run before capture-dependent finalization.
+        self._maybe_imply_patch_source_consumer()
 
         maybe_add_capture_split_op(
             self.compilation_config,

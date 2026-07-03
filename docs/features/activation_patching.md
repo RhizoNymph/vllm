@@ -148,14 +148,17 @@ python -m vllm.entrypoints.openai.api_server \
   --model <model> \
   --enable-patching \
   --max-patch-slots 64 \
-  --patch-source-cache-bytes 2000000000 \
-  --capture-consumers patch_source
+  --patch-source-cache-bytes 2000000000
 ```
 
-- `--enable-patching`: attach patch buffers + install the source store.
+- `--enable-patching`: attach patch buffers + install the source store, and
+  imply the `patch_source` capture consumer (below).
 - `--max-patch-slots`: per-`(layer, hook)` patch pool size (default 64).
 - `--patch-source-cache-bytes`: source-store byte budget.
 - `--capture-consumers patch_source`: register the clean-capture consumer.
+  Optional — `--enable-patching` implies it (identically, via the shared config
+  finalization point, so both the server and offline `LLM(...)` get it). Passing
+  it explicitly is still valid and never double-registers.
 
 ## Invariants
 
