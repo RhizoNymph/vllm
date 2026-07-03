@@ -5,6 +5,8 @@ Define activation steering functionality mixin for model runners.
 """
 
 import math
+import struct
+import zlib
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -42,6 +44,7 @@ from vllm.v1.worker.steering_action_queue import (
     apply_steering_updates,
     get_steering_action_queue,
     install_steering_action_queue,
+    steering_update_accepted,
     validate_steering_monitor,
     validate_steering_scale,
     validate_steering_vectors,
@@ -66,6 +69,112 @@ def _get_steering_ranks() -> tuple[int, int]:
         return (get_tp_group().rank_in_group, get_pp_group().rank_in_group)
     except Exception:
         return (0, 0)
+
+
+_U64_MASK = (1 << 64) - 1
+
+
+def _mix64(state: int, value: int) -> int:
+    """Fold ``value`` into ``state`` with a splitmix64-style mix.
+
+    Non-commutative (order-sensitive) and free of any process-seeded
+    randomness (``PYTHONHASHSEED`` never enters), so two workers folding
+    the same sequence reach the same u64 state. Used to accumulate the
+    rolling checksum of applied steering actions.
+    """
+    state = (state + (value & _U64_MASK) + 0x9E3779B97F4A7C15) & _U64_MASK
+    z = state
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _U64_MASK
+    return z ^ (z >> 31)
+
+
+def _array_digest(arr: "np.ndarray | None") -> bytes:
+    """Compact, bit-exact digest of a numpy array (shape + CRC of bytes).
+
+    Steering actions are host-side numpy built from rank-identical
+    inputs, so a bit-exact content digest is strictly stronger than a
+    norm and never diverges across ranks. Cheap: one CRC over the
+    contiguous float32 bytes.
+    """
+    if arr is None:
+        return b"none"
+    contig = np.ascontiguousarray(arr, dtype=np.float32)
+    return b"%b:%d" % (
+        repr(contig.shape).encode(),
+        zlib.crc32(contig.tobytes()) & 0xFFFFFFFF,
+    )
+
+
+def _vectors_digest(vectors: "dict | None") -> bytes:
+    """Deterministic digest of a ``{hook: {layer: ndarray}}`` vector dict."""
+    if vectors is None:
+        return b"none"
+    parts: list[bytes] = []
+    for hook in sorted(vectors):
+        for layer in sorted(vectors[hook]):
+            arr_digest = _array_digest(vectors[hook][layer])
+            parts.append(b"%b|%d|%b" % (hook.encode(), layer, arr_digest))
+    return b"@".join(parts)
+
+
+def _steering_action_digest(action) -> bytes:
+    """Order-independent, PYTHONHASHSEED-free digest of one action's content.
+
+    Pure function of the action's identifying fields (class name, target
+    req_id / config_hash / dyn_id, hook / layer, source) plus a bit-exact
+    digest of any vector / probe payload. Folded into the running
+    checksum only for actions that were actually applied.
+    """
+    name = type(action).__name__.encode()
+    if isinstance(action, SteeringVectorUpdate):
+        return b";".join(
+            (
+                name,
+                action.phase.encode(),
+                action.source.encode(),
+                _vectors_digest(action.vectors),
+            )
+        )
+    if isinstance(action, RequestSteeringOverride):
+        return b";".join(
+            (
+                name,
+                action.req_id.encode(),
+                b"1" if action.compose_admitted else b"0",
+                action.source.encode(),
+                _vectors_digest(action.vectors),
+            )
+        )
+    if isinstance(action, SteeringScaleUpdate):
+        return b";".join(
+            (
+                name,
+                struct.pack("<d", action.scale),
+                repr(action.config_hash).encode(),
+                repr(action.dyn_id).encode(),
+                repr(action.req_id).encode(),
+                b"1" if action.tier_gain else b"0",
+                action.source.encode(),
+            )
+        )
+    if isinstance(action, SteeringMonitorUpdate):
+        return b";".join(
+            (
+                name,
+                action.hook.encode(),
+                b"%d" % action.layer,
+                struct.pack("<d", action.threshold),
+                struct.pack("<d", action.sharpness),
+                b"1" if action.gate_rows else b"0",
+                repr(action.req_id).encode(),
+                repr(action.config_hash).encode(),
+                repr(action.dyn_id).encode(),
+                action.source.encode(),
+                _array_digest(action.probe),
+            )
+        )
+    return name
 
 
 if TYPE_CHECKING:
@@ -98,6 +207,14 @@ class SteeringModelRunnerMixin:
     _steerable_layers_cache: dict[int, nn.Module] | None = None
     _req_steering_phase: dict[str, str]
     _steering_index_dirty: bool
+    # Rolling determinism checksum of *applied* dynamic steering actions
+    # (u64) and the count of folds, plus a per-drain-batch ordinal. Class
+    # defaults cover the pre-init window (duck-typed test hosts that skip
+    # ``_init_steering_state``); the router compares these across ranks to
+    # detect a silent lock-step desync. See §6 of the design doc.
+    _steering_action_checksum: int = 0
+    _steering_action_count: int = 0
+    _steering_apply_batches: int = 0
     # Worker-side mirror of the API server's named steering module
     # registry.  Populated via ``register_steering_modules`` RPC during
     # API server bootstrap and on every /v1/steering/modules/{register,
@@ -221,6 +338,12 @@ class SteeringModelRunnerMixin:
         # Per-source applied/rejected counters for dynamic steering
         # actions (both transports), keyed by submitting source name.
         self._dynamic_steering_stats: dict[str, dict[str, int]] = {}
+        # Rolling checksum of every *applied* action, folded in application
+        # order with the drain-batch ordinal (see ``_fold_steering_action``).
+        # Compared across ranks at status time to catch a silent desync.
+        self._steering_action_checksum = 0
+        self._steering_action_count = 0
+        self._steering_apply_batches = 0
         # Live per-request dynamic decode overrides: req_id -> dyn_id in
         # the manager's dynamic pool. Pure routing state on top of the
         # admission machinery — admitted config hashes, refcounts, and
@@ -689,6 +812,12 @@ class SteeringModelRunnerMixin:
             "tp_rank": tp_rank,
             "pp_rank": pp_rank,
             "steering_initialized": mgr is not None,
+            # Rolling determinism checksum of applied actions (hex u64) and
+            # the fold count. The router compares these across ranks to
+            # detect a silent lock-step desync (§6). Plain primitives keep
+            # the status dict picklable across the collective_rpc boundary.
+            "action_checksum": f"{self._steering_action_checksum & _U64_MASK:016x}",
+            "action_count": self._steering_action_count,
         }
 
         # Async transport (Phase 0 queue).
@@ -1171,6 +1300,10 @@ class SteeringModelRunnerMixin:
         """
         applied = 0
         rejected = 0
+        # Per-drain-batch ordinal folded into the checksum so the same
+        # action applied in different steps yields a different digest.
+        batch_ordinal = self._steering_apply_batches + 1
+        self._steering_apply_batches = batch_ordinal
         updates: list[SteeringVectorUpdate] = []
         # Declarative per-request overrides *installed* earlier in THIS batch,
         # keyed by req_id. Used to fail closed when a paired per-row monitor is
@@ -1188,6 +1321,7 @@ class SteeringModelRunnerMixin:
             elif isinstance(action, RequestSteeringOverride):
                 if self._apply_request_override(action, source=source):
                     applied += 1
+                    self._fold_steering_action(action, batch_ordinal)
                     if source == DECLARATIVE_SOURCE and action.vectors is not None:
                         declarative_installs[action.req_id] = action
                     else:
@@ -1199,11 +1333,13 @@ class SteeringModelRunnerMixin:
             elif isinstance(action, SteeringScaleUpdate):
                 if self._apply_scale_update(action, source=source):
                     applied += 1
+                    self._fold_steering_action(action, batch_ordinal)
                 else:
                     rejected += 1
             elif isinstance(action, SteeringMonitorUpdate):
                 if self._apply_monitor_update(action, source=source):
                     applied += 1
+                    self._fold_steering_action(action, batch_ordinal)
                 else:
                     rejected += 1
                     install = (
@@ -1215,14 +1351,15 @@ class SteeringModelRunnerMixin:
                         # Fail closed: undo the override this batch installed for
                         # the request so its probe-gated steering is not applied
                         # every token unconditionally.
-                        self._apply_request_override(
-                            RequestSteeringOverride(
-                                req_id=action.req_id,
-                                vectors=None,
-                                source=DECLARATIVE_SOURCE,
-                            ),
-                            source=source,
+                        rollback = RequestSteeringOverride(
+                            req_id=action.req_id,
+                            vectors=None,
+                            source=DECLARATIVE_SOURCE,
                         )
+                        self._apply_request_override(rollback, source=source)
+                        # The rollback clear is itself an applied mutation; fold
+                        # it so the checksum records the full mutation sequence.
+                        self._fold_steering_action(rollback, batch_ordinal)
                         applied -= 1
                         rejected += 1
                         logger.warning(
@@ -1259,6 +1396,14 @@ class SteeringModelRunnerMixin:
                 )
                 applied += ok
                 rejected += bad
+                # Fold each update that was actually applied (same accept
+                # predicate ``apply_steering_updates`` uses) in list order.
+                if ok:
+                    for update in updates:
+                        if steering_update_accepted(
+                            update, self._steerable_layers_cache
+                        ):
+                            self._fold_steering_action(update, batch_ordinal)
 
         stats = self._dynamic_steering_stats.setdefault(
             source, {"applied": 0, "rejected": 0}
@@ -1266,6 +1411,24 @@ class SteeringModelRunnerMixin:
         stats["applied"] += applied
         stats["rejected"] += rejected
         return applied, rejected
+
+    def _fold_steering_action(self, action, batch_ordinal: int) -> None:
+        """Fold one *applied* action into the rolling determinism checksum.
+
+        Cheap (one CRC over a compact digest plus two integer mixes) and
+        called only when an action is actually applied, so idle steps pay
+        nothing. The digest is a pure, ``PYTHONHASHSEED``-free function of
+        the action content; the drain-batch ordinal makes the same action
+        applied in different steps fold to a different value. Every TP rank
+        in a stage applies the identical stream, so their checksums stay in
+        lock-step — a mismatch surfaces a silent per-rank fault.
+        """
+        digest = _steering_action_digest(action)
+        crc = zlib.crc32(digest) & 0xFFFFFFFF
+        chk = _mix64(self._steering_action_checksum, crc)
+        chk = _mix64(chk, batch_ordinal)
+        self._steering_action_checksum = chk
+        self._steering_action_count += 1
 
     def _apply_request_override(
         self,

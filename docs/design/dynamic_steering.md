@@ -614,6 +614,33 @@ Resolution by phase:
   boundary only (drain once per scheduler step, which the current drain
   point already guarantees).
 
+### 6.1 Determinism-divergence detector (implemented)
+
+The "cheap insurance" hash above is implemented as an always-on rolling
+checksum. In `_apply_steering_actions`, each action that is *actually*
+applied (rejected actions are excluded) is folded into a per-worker u64
+checksum: a `zlib.crc32` over a compact, `PYTHONHASHSEED`-free digest of
+the action's content (class, target `req_id`/`config_hash`/`dyn_id`,
+`hook`/`layer`, `source`, and a bit-exact shape+CRC of any vector/probe
+payload), mixed in application order with a per-drain-batch ordinal so
+"same actions, different step" differs. Because actions are host-side
+numpy built from rank-identical inputs, the digest is bit-exact rather
+than a norm — strictly stronger and never legitimately divergent across
+ranks. Cost is O(applied actions) and zero on idle steps.
+
+`get_dynamic_steering_status` exposes `action_checksum` (hex) and
+`action_count`; `GET /v1/steering/dynamic` compares them across workers
+via `check_action_determinism`. Comparison is scoped **within each PP
+stage** (grouped by `pp_rank`): TP ranks in a stage own identical layers
+and must match, while PP stages own disjoint layers and may legitimately
+differ. Sync-consumer-originated actions only exist at `pp == 1` anyway,
+where this reduces to an all-workers comparison. A mismatch does not 500;
+the response carries `determinism: {consistent: false, checksums: {...}}`
+and a rate-limited server-side ERROR fires. Granularity is **poll-time**:
+a desync is detected on the next status poll, not the step it occurs, so
+the checksum bounds (does not prevent) corrupted output — pair it with
+periodic polling for timely detection.
+
 ## 7. Steering identity, prefix caching, and phases
 
 The steering runtime's correctness rules (see

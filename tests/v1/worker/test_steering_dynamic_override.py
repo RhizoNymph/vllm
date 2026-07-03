@@ -744,3 +744,109 @@ def test_scale_update_rejects_multiple_targets():
         source="s",
     )
     assert (applied, rejected) == (0, 1)
+
+
+# ---------------------------------------------------------------------------
+# Applied-action determinism checksum (§6.1)
+# ---------------------------------------------------------------------------
+
+
+def _scale(req: str = "r1", scale: float = 2.0) -> SteeringScaleUpdate:
+    return SteeringScaleUpdate(scale=scale, req_id=req, source="test")
+
+
+def test_checksum_starts_zero_and_counts_applied():
+    host = _MixinHost([_decode_req()])
+    assert host._steering_action_checksum == 0
+    assert host._steering_action_count == 0
+    host._apply_steering_actions([_override()], source="s")
+    assert host._steering_action_count == 1
+    assert host._steering_action_checksum != 0
+
+
+def test_checksum_deterministic_across_fresh_hosts():
+    """Two fresh hosts applying the same sequence reach the same value."""
+    seq = lambda: [_override("r1", 5.0)]  # noqa: E731
+    h1 = _MixinHost([_decode_req()])
+    h2 = _MixinHost([_decode_req()])
+    h1._apply_steering_actions(seq(), source="s")
+    h2._apply_steering_actions(seq(), source="s")
+    assert h1._steering_action_checksum == h2._steering_action_checksum
+    assert h1._steering_action_count == h2._steering_action_count == 1
+
+
+def test_checksum_fixed_sequence_pythonhashseed_independent():
+    """Hardcoded expected value pins the algorithm: no ``hash()``, so
+    the checksum is independent of ``PYTHONHASHSEED`` (this value was
+    verified identical across seeds 0/1/12345)."""
+    host = _MixinHost([_decode_req()])
+    # Batch 1: override; batch 2: scale on the same request's dyn row.
+    host._apply_steering_actions(
+        [RequestSteeringOverride(req_id="r1", vectors=_vec(5.0), source="test")],
+        source="s",
+    )
+    host._apply_steering_actions([_scale("r1", 2.0)], source="s")
+    assert host._steering_action_count == 2
+    assert f"{host._steering_action_checksum:016x}" == "8bff19a99224e701"
+
+
+def test_checksum_sensitive_to_content():
+    h1 = _MixinHost([_decode_req()])
+    h2 = _MixinHost([_decode_req()])
+    h1._apply_steering_actions([_override("r1", 5.0)], source="s")
+    h2._apply_steering_actions([_override("r1", 7.0)], source="s")
+    assert h1._steering_action_checksum != h2._steering_action_checksum
+
+
+def test_checksum_sensitive_to_order():
+    h1 = _MixinHost([_decode_req("r1"), _decode_req("r2")])
+    h2 = _MixinHost([_decode_req("r1"), _decode_req("r2")])
+    # Same two actions, opposite order → different checksum.
+    h1._apply_steering_actions(
+        [_override("r1", 5.0), _override("r2", 6.0)], source="s"
+    )
+    h2._apply_steering_actions(
+        [_override("r2", 6.0), _override("r1", 5.0)], source="s"
+    )
+    assert h1._steering_action_checksum != h2._steering_action_checksum
+
+
+def test_checksum_sensitive_to_step_boundary():
+    """Same actions, one batch vs two, differ via the drain-batch ordinal."""
+    h1 = _MixinHost([_decode_req("r1"), _decode_req("r2")])
+    h2 = _MixinHost([_decode_req("r1"), _decode_req("r2")])
+    h1._apply_steering_actions(
+        [_override("r1", 5.0), _override("r2", 6.0)], source="s"
+    )
+    h2._apply_steering_actions([_override("r1", 5.0)], source="s")
+    h2._apply_steering_actions([_override("r2", 6.0)], source="s")
+    assert h1._steering_action_count == h2._steering_action_count == 2
+    assert h1._steering_action_checksum != h2._steering_action_checksum
+
+
+def test_checksum_rejected_actions_do_not_fold():
+    host = _MixinHost([_prefill_req()])  # override rejected for prefill req
+    applied, rejected = host._apply_steering_actions([_override()], source="s")
+    assert (applied, rejected) == (0, 1)
+    assert host._steering_action_count == 0
+    assert host._steering_action_checksum == 0
+
+
+def test_checksum_unknown_action_type_does_not_fold():
+    host = _MixinHost([_decode_req()])
+    host._apply_steering_actions([object()], source="s")
+    assert host._steering_action_count == 0
+    assert host._steering_action_checksum == 0
+
+
+def test_status_dict_exposes_checksum_fields():
+    host = _MixinHost([_decode_req()])
+    host._apply_steering_actions([_override()], source="s")
+    status = host.get_dynamic_steering_status()
+    assert status["action_count"] == 1
+    assert status["action_checksum"] == (
+        f"{host._steering_action_checksum:016x}"
+    )
+    # Hex u64: 16 chars, valid hex.
+    assert len(status["action_checksum"]) == 16
+    int(status["action_checksum"], 16)
