@@ -35,6 +35,7 @@ from abc import ABC, abstractmethod
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from vllm.logger import init_logger
 from vllm.v1.capture.consumer import SyncCaptureConsumer
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
@@ -47,6 +48,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.capture.step_view import StepCaptureView, StepRequestView
 
+logger = init_logger(__name__)
+
 
 class SteeringController(SyncCaptureConsumer, ABC):
     """Latching, conversation-scoped sync steering consumer.
@@ -57,15 +60,35 @@ class SteeringController(SyncCaptureConsumer, ABC):
 
     Recognized params:
 
-    - ``max_conversations`` (int, default 1024): bound on the latch map;
-      FIFO-evicted (oldest conversation dropped) when exceeded.
+    - ``max_conversations`` (int, default 1024): entry-count bound on the
+      latch map; FIFO-evicted (oldest conversation dropped) when exceeded.
+    - ``max_latched_bytes`` (int, default 256 MiB): payload-byte bound on the
+      latch map. Because a latched override pins full steering vectors (all
+      hooks x layers, float32) on every TP rank, an entry-count-only bound is
+      an unbounded host-memory exposure; this caps the aggregate. Enforced
+      alongside ``max_conversations`` (oldest-first eviction until both fit);
+      a single override larger than the cap is refused, not latched. See
+      docs/design/dynamic_steering.md (Trust model and multi-tenancy).
     """
 
     def __init__(self, vllm_config: VllmConfig, params: dict[str, Any]) -> None:
         super().__init__(vllm_config, params)
         self._max_conversations = max(1, int(params.get("max_conversations", 1024)))
+        # 256 MiB: a single-(hook, layer) latch at hidden=4096 float32 is
+        # ~16 KiB, so this comfortably holds many hundreds of typical latches,
+        # while stopping a pathological all-layer flood (a full-model latch can
+        # be tens of MiB) from pinning gigabytes of host memory on every rank.
+        self._max_latched_bytes = max(
+            1, int(params.get("max_latched_bytes", 256 * 1024 * 1024))
+        )
         # conv_id -> sticky override to (re)apply; persists across requests.
         self._latched: dict[str, RequestSteeringOverride] = {}
+        # conv_id -> approximate payload bytes of its latched override, and the
+        # running total, so eviction can enforce the byte cap in O(1).
+        self._latched_bytes: dict[str, int] = {}
+        self._latched_bytes_total = 0
+        # Rate-limit the oversized-latch refusal warning (log once).
+        self._oversize_logged = False
         # live req_ids already overridden this run (emit-once per request).
         self._armed: set[str] = set()
         self._triggers = 0
@@ -110,12 +133,62 @@ class SteeringController(SyncCaptureConsumer, ABC):
             self._residual_key = keys[0]
         return self._residual_key
 
+    @staticmethod
+    def _override_nbytes(override: RequestSteeringOverride) -> int:
+        """Approximate host bytes an override's vectors pin (0 if clearing)."""
+        if override.vectors is None:
+            return 0
+        return sum(
+            arr.nbytes
+            for layer_vecs in override.vectors.values()
+            for arr in layer_vecs.values()
+        )
+
+    def _drop_latched(self, cid: str) -> None:
+        """Remove a conversation's latch, releasing its accounted bytes."""
+        if cid in self._latched:
+            del self._latched[cid]
+            self._latched_bytes_total -= self._latched_bytes.pop(cid)
+
     def _latch(self, cid: str, override: RequestSteeringOverride) -> None:
-        """Record the conversation's sticky override, FIFO-evicting if full."""
-        if cid not in self._latched and len(self._latched) >= self._max_conversations:
-            # Drop the oldest conversation (dict preserves insertion order).
-            self._latched.pop(next(iter(self._latched)))
+        """Record the conversation's sticky override under both latch bounds.
+
+        FIFO-evicts oldest conversations until both the entry-count cap
+        (``max_conversations``) and the payload-byte cap (``max_latched_bytes``)
+        admit the newcomer. Eviction is a pure function of the latch sequence
+        (no time-based logic), so it is rank-deterministic. A single override
+        whose vectors alone exceed the byte cap is refused (rate-limit-logged):
+        the triggering request still steers this turn, only the cross-turn
+        conversation latch is dropped.
+        """
+        nbytes = self._override_nbytes(override)
+        if nbytes > self._max_latched_bytes:
+            if not self._oversize_logged:
+                self._oversize_logged = True
+                logger.warning(
+                    "steering latch refused: override for conversation %r is "
+                    "%d bytes, exceeding max_latched_bytes=%d; the request "
+                    "still steers this turn but the conversation will not be "
+                    "latched. Further refusals will not be logged.",
+                    cid,
+                    nbytes,
+                    self._max_latched_bytes,
+                )
+            # Drop any stale latch so bridging does not resurrect an older
+            # override in place of the now-oversized turn.
+            self._drop_latched(cid)
+            return
+        # Replacing an existing latch: release its bytes before re-accounting.
+        self._drop_latched(cid)
+        # Evict oldest-first until both caps admit the newcomer.
+        while self._latched and (
+            len(self._latched) + 1 > self._max_conversations
+            or self._latched_bytes_total + nbytes > self._max_latched_bytes
+        ):
+            self._drop_latched(next(iter(self._latched)))
         self._latched[cid] = override
+        self._latched_bytes[cid] = nbytes
+        self._latched_bytes_total += nbytes
 
     @staticmethod
     def _bridge_override(
@@ -167,6 +240,7 @@ class SteeringController(SyncCaptureConsumer, ABC):
     def status(self) -> dict[str, Any]:
         return {
             "latched_conversations": len(self._latched),
+            "latched_bytes": self._latched_bytes_total,
             "armed_requests": len(self._armed),
             "triggers": self._triggers,
             "bridges": self._bridges,

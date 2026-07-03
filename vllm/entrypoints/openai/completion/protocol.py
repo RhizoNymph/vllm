@@ -254,7 +254,11 @@ class CompletionRequest(OpenAIBaseModel):
         "request metadata (not a sampling parameter) and surfaced to "
         "worker-side capture consumers via StepRequestView.conversation_id so a "
         "dynamic-steering consumer can apply per-conversation (e.g. latched) "
-        "steering across the requests of one conversation.",
+        "steering across the requests of one conversation. It is an "
+        "unauthenticated global namespace: in a multi-client deployment the "
+        "operator or gateway must namespace ids per client (e.g. a "
+        "per-tenant prefix) so one client cannot inherit or pre-latch "
+        "another's steering.",
     )
 
     steering_name: str | None = Field(

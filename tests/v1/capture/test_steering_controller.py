@@ -10,6 +10,7 @@ threshold) so the tests exercise the base, not a specific consumer.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from unittest.mock import MagicMock
 
@@ -228,6 +229,101 @@ def test_controller_requires_decide_and_global_capture_spec():
 
     with pytest.raises(TypeError):
         _Incomplete(_cfg(), {})  # type: ignore[abstract]
+
+
+# --- latch byte bound ------------------------------------------------------
+
+# One trigger override latches a single (LAYER, HOOK) float32 vector of length
+# HIDDEN, so each latched conversation accounts for exactly this many bytes.
+VEC_BYTES = HIDDEN * 4
+
+
+def test_latched_bytes_tracks_payload():
+    ctl = _ctl()
+    ctl.on_step(_view([("r1", "c1", "decode", 1.0)]))
+    ctl.on_step(_view([("r2", "c2", "decode", 1.0)]))
+    assert ctl._latched_bytes_total == 2 * VEC_BYTES
+    assert ctl._latched_bytes == {"c1": VEC_BYTES, "c2": VEC_BYTES}
+    assert ctl.status()["latched_bytes"] == 2 * VEC_BYTES
+
+
+def test_count_cap_evicts_and_updates_byte_total():
+    ctl = _ctl(max_conversations=2)
+    for i in range(3):
+        ctl.on_step(_view([(f"r{i}", f"c{i}", "decode", 1.0)]))
+    # Count cap holds and the byte total tracks only the surviving latches.
+    assert len(ctl._latched) == 2 and "c0" not in ctl._latched
+    assert ctl._latched_bytes_total == 2 * VEC_BYTES
+    assert set(ctl._latched_bytes) == {"c1", "c2"}
+
+
+def test_byte_cap_evicts_oldest_until_fit():
+    # Room for exactly two latches; count cap left generous so the byte cap
+    # is what forces eviction.
+    ctl = _ctl(max_conversations=100, max_latched_bytes=2 * VEC_BYTES)
+    for i in range(3):
+        ctl.on_step(_view([(f"r{i}", f"c{i}", "decode", 1.0)]))
+    assert set(ctl._latched) == {"c1", "c2"} and "c0" not in ctl._latched
+    assert ctl._latched_bytes_total == 2 * VEC_BYTES
+
+
+def test_oversized_single_latch_refused_without_state_corruption(caplog):
+    # Byte cap below a single override's payload: latching is impossible.
+    ctl = _ctl(max_latched_bytes=VEC_BYTES - 1)
+    logging.getLogger("vllm").propagate = True
+    with caplog.at_level(logging.WARNING, logger="vllm.v1.capture.controller"):
+        acts = ctl.on_step(_view([("r1", "c1", "decode", 1.0)]))
+    # The triggering request still steers this turn ...
+    assert len(acts) == 1 and isinstance(acts[0], RequestSteeringOverride)
+    assert acts[0].req_id == "r1"
+    assert "r1" in ctl._armed and ctl.status()["triggers"] == 1
+    # ... but nothing is latched and byte accounting stays consistent (no leak).
+    assert ctl._latched == {} and ctl._latched_bytes == {}
+    assert ctl._latched_bytes_total == 0
+    assert ctl.status()["latched_bytes"] == 0
+    assert ctl._oversize_logged is True
+    assert any("latch refused" in r.getMessage() for r in caplog.records)
+    # A later turn of the same conversation is not bridged (nothing latched);
+    # below threshold it simply does nothing, and the engine does not crash.
+    assert ctl.on_step(_view([("r2", "c1", "decode", 0.0)])) is None
+
+
+def test_oversized_refusal_logged_once():
+    ctl = _ctl(max_latched_bytes=VEC_BYTES - 1)
+    ctl.on_step(_view([("r1", "c1", "decode", 1.0)]))
+    assert ctl._oversize_logged is True
+    # Second oversized refusal must not reset or re-arm the rate-limit flag.
+    ctl.on_step(_view([("r2", "c2", "decode", 1.0)]))
+    assert ctl._oversize_logged is True
+    assert ctl._latched == {} and ctl._latched_bytes_total == 0
+
+
+def test_relatch_same_conversation_does_not_double_count():
+    ctl = _ctl()
+    ctl.on_step(_view([("r1", "c1", "decode", 1.0)]))  # latch c1
+    # r1 finishes; a fresh request re-triggers on the SAME conversation. The
+    # old latch's bytes must be released before the new latch is accounted.
+    ctl.on_step(_view([("r2", "c1", "decode", 1.0)]))
+    assert list(ctl._latched) == ["c1"]
+    assert ctl._latched_bytes_total == VEC_BYTES
+
+
+def test_eviction_is_deterministic_across_identical_sequences():
+    seq = [(f"r{i}", f"c{i % 4}", "decode", 1.0) for i in range(12)]
+    finals = []
+    for _ in range(2):
+        ctl = _ctl(max_conversations=3, max_latched_bytes=2 * VEC_BYTES)
+        for row in seq:
+            ctl.on_step(_view([row]))
+        finals.append(
+            (
+                tuple(ctl._latched),
+                dict(ctl._latched_bytes),
+                ctl._latched_bytes_total,
+            )
+        )
+    # Same latch sequence -> identical final latch set, order, and byte total.
+    assert finals[0] == finals[1]
 
 
 if __name__ == "__main__":

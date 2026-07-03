@@ -919,6 +919,63 @@ a named vector grants no capability over the already-unauthenticated inline
 packed path (it's naming sugar, inert until referenced). Distinct from the
 module registry (§5.7) — single named probe/steer vectors, frontend-only.
 
+### 8.3 Trust model and multi-tenancy
+
+The dynamic-steering stack assumes a **single-tenant / trusted-client**
+deployment: every client that can reach the engine is trusted not to interfere
+with another client's steering state. It ships **no authentication or
+per-client isolation** of its own. The consequences and the operator's
+responsibilities:
+
+- **`conversation_id` is a global, client-chosen, unauthenticated namespace.**
+  It rides the request-metadata channel (§5.6) and keys the controller's latch
+  map (§5.7). There is no ownership check: any client that presents a given
+  `conversation_id` bridges (inherits) whatever steering is latched on it, and
+  any client can pre-latch steering onto an id another client will later use.
+  A guessed or reused id therefore lets one client steer — or read the steered
+  behavior of — another client's turns.
+
+  **Requirement for shared deployments.** In any multi-client deployment the
+  **operator (or a gateway sitting in front of vLLM) must namespace
+  `conversation_id`s per client** — e.g. prefix each id with an authenticated
+  client/tenant identifier — so ids from different clients can never collide.
+  vLLM does not and cannot do this itself: the id is opaque to it, and it has
+  no notion of client identity. Without per-client namespacing, treat the
+  latch as shared mutable state visible to every client.
+
+- **Latch bounds (memory + churn).** The latch map is bounded on two axes,
+  both enforced by the controller base (§5.7, `SteeringController._latch`):
+  an **entry count** (`max_conversations`, default 1024) and an **aggregate
+  payload-byte** bound (`max_latched_bytes`, default 256 MiB). The byte bound
+  exists because a latched override pins full steering vectors (all hooks x
+  layers, float32) on **every TP rank**, so a count-only bound is an unbounded
+  host-memory exposure. Eviction is **FIFO, oldest-first, until both caps
+  fit**, and a single override exceeding the byte cap alone is refused (the
+  triggering request still steers that turn; only cross-turn persistence is
+  dropped). Eviction is a pure function of the latch sequence (no time-based
+  logic), so it stays rank-deterministic. Two churn caveats follow from FIFO:
+  a client that opens a flood of fresh `conversation_id`s can **silently evict
+  every other client's latches** (they disengage without error), and a
+  well-behaved long-lived conversation can be evicted by unrelated churn. This
+  is a denial-of-persistence surface, not a correctness bug — another reason
+  shared deployments should gate/namespace ids at the edge.
+
+- **Named-vector registry is a shared mutable namespace.** The frontend
+  named-vector registry (§8.2, `vector_registry.py` + `vectors_router.py`)
+  keys vectors by a global name that any request may resolve against, and
+  `register`/`unregister` **silently overwrite/delete** an existing name. A
+  client can thus repoint or drop a name other clients' requests depend on.
+  It is deliberately **not behind the steering API key**: a named vector is
+  naming sugar over the already-unauthenticated inline packed path (§8.2) —
+  capability-equivalent to what any client can already send inline, so gating
+  the name but not the inline path would add no real protection. The integrity
+  caveat (shared, last-writer-wins names) stands, and the same per-client
+  namespacing / edge-gating guidance applies if names must be isolated.
+
+None of the above is behind authentication by design; hardening for a genuine
+multi-tenant deployment belongs at the operator/gateway layer in front of
+vLLM, not in this stack.
+
 ## 9. Test plan
 
 - **Phase 0 (on this branch)**: unit tests for queue mechanics, drain
