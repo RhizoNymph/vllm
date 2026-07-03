@@ -32,6 +32,7 @@ firing request's residual window.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from vllm.v1.capture.consumer import SyncCaptureConsumer
@@ -120,10 +121,12 @@ class SteeringController(SyncCaptureConsumer, ABC):
     def _bridge_override(
         latched: RequestSteeringOverride, req_id: str
     ) -> RequestSteeringOverride:
-        """A copy of the latched override rebound to ``req_id``."""
-        return RequestSteeringOverride(
-            req_id=req_id, vectors=latched.vectors, source=latched.source
-        )
+        """A copy of the latched override rebound to ``req_id``.
+
+        Preserves every other field (``compose_admitted``, ``source``, and any
+        future ones) so a bridged turn steers identically to the trigger turn.
+        """
+        return replace(latched, req_id=req_id)
 
     def on_step(self, view: StepCaptureView) -> list[SteeringAction] | None:
         actions: list[SteeringAction] = []
