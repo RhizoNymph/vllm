@@ -59,12 +59,6 @@ def resolve_layers(layers: list[int] | LayerRange) -> list[int]:
     return list(layers)
 
 
-def resolve_positions(positions: list[int] | str, num_prompt_tokens: int) -> list[int]:
-    if positions == "all_prompt":
-        return list(range(num_prompt_tokens))
-    return list(positions)
-
-
 def resolve_span_body_positions(
     tokenizer,
     prompt: str,

@@ -15,7 +15,6 @@ from vllm.entrypoints.serve.patch.api_router import (
     cell_metric,
     patch_sweep,
     resolve_layers,
-    resolve_positions,
     resolve_span_body_positions,
 )
 from vllm.entrypoints.serve.patch.protocol import (
@@ -50,12 +49,6 @@ class TestResolve:
 
     def test_layer_list(self):
         assert resolve_layers([1, 3, 5]) == [1, 3, 5]
-
-    def test_all_prompt(self):
-        assert resolve_positions("all_prompt", 4) == [0, 1, 2, 3]
-
-    def test_explicit_positions(self):
-        assert resolve_positions([0, 2], 9) == [0, 2]
 
 
 class TestAnswerLogprob:
@@ -403,6 +396,12 @@ def _run_span(eng, prompt, positions, **kw):
 
 
 class TestEndpointSpans:
+    def test_all_prompt_expands_to_full_axis(self):
+        eng = _span_engine("The cat", [0, 1])
+        resp = _run_span(eng, "The cat", "all_prompt")
+        assert not isinstance(resp, JSONResponse)
+        assert resp.positions == list(range(8))  # BOS + 7 chars
+
     def test_resolved_axis_is_span_positions(self):
         eng = _span_engine("The cat", [0, 1])
         resp = _run_span(eng, "The cat", [{"span": "cat"}])
