@@ -13,6 +13,7 @@ round-trips with one call.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 from http import HTTPStatus
 from typing import Any
@@ -27,6 +28,12 @@ from vllm.entrypoints.serve.patch.protocol import (
     LayerRange,
     PatchSweepRequest,
     PatchSweepResponse,
+    SpanPosition,
+)
+from vllm.entrypoints.serve.patch.spans import (
+    dedup_positions,
+    prompt_char_offsets,
+    resolve_span_positions,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import HOOK_POINT_TABLE_ATTR
@@ -56,6 +63,33 @@ def resolve_positions(positions: list[int] | str, num_prompt_tokens: int) -> lis
     if positions == "all_prompt":
         return list(range(num_prompt_tokens))
     return list(positions)
+
+
+def resolve_span_body_positions(
+    tokenizer,
+    prompt: str,
+    positions: list[int | SpanPosition],
+) -> list[int]:
+    """Resolve ``SpanPosition`` markers against ``prompt`` to token indices.
+
+    Plain ints pass through; each span expands to its covering token positions
+    (computed with the same tokenization the sweep uses). Expansion is
+    order-preserving with dedup across the whole list. Tokenizes only when a
+    span is present.
+
+    Raises:
+        ValueError: an empty span, a substring not found, or an out-of-range
+            occurrence (surfaced by the endpoint as a 400).
+    """
+    if not any(isinstance(p, SpanPosition) for p in positions):
+        return [int(p) for p in positions]
+    text, offsets = prompt_char_offsets(tokenizer, prompt)
+    return dedup_positions(
+        resolve_span_positions(offsets, text, p.span, p.occurrence)
+        if isinstance(p, SpanPosition)
+        else [int(p)]
+        for p in positions
+    )
 
 
 def answer_logprob(
@@ -220,8 +254,6 @@ async def _resolve_grade_token(
         return int(token_id)
     if token is None:
         return None
-    import inspect
-
     tokenizer = eng.get_tokenizer()
     if inspect.isawaitable(tokenizer):
         tokenizer = await tokenizer
@@ -280,7 +312,20 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         logger.exception("patch_sweep baseline failed")
         return _err(f"baseline generation failed: {exc}",
                     HTTPStatus.INTERNAL_SERVER_ERROR.value)
-    positions = resolve_positions(body.positions, n_prompt)
+    if body.positions == "all_prompt":
+        positions = list(range(n_prompt))
+    else:
+        # Substring spans resolve against the corrupt prompt (the destination
+        # run), tokenized exactly as the sweep tokenizes it.
+        tokenizer = eng.get_tokenizer()
+        if inspect.isawaitable(tokenizer):
+            tokenizer = await tokenizer
+        try:
+            positions = resolve_span_body_positions(
+                tokenizer, body.prompt, body.positions
+            )
+        except ValueError as exc:
+            return _err(str(exc))
     if not layers or not positions:
         return _err("empty sweep grid (no layers or positions)")
     corrupt_val = cell_metric(corrupt_lp, body) if corrupt_lp else None
@@ -331,8 +376,6 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     skipped: list[dict] = []
     alignment_summary: dict | None = None
     if body.clean_prompt is not None:
-        import inspect
-
         tokenizer = eng.get_tokenizer()
         if inspect.isawaitable(tokenizer):
             tokenizer = await tokenizer

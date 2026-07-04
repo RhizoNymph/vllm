@@ -16,8 +16,17 @@ from vllm.entrypoints.serve.patch.api_router import (
     patch_sweep,
     resolve_layers,
     resolve_positions,
+    resolve_span_body_positions,
 )
-from vllm.entrypoints.serve.patch.protocol import LayerRange, PatchSweepRequest
+from vllm.entrypoints.serve.patch.protocol import (
+    LayerRange,
+    PatchSweepRequest,
+    SpanPosition,
+)
+from vllm.entrypoints.serve.patch.spans import (
+    dedup_positions,
+    prompt_char_offsets,
+)
 
 
 def _lp(d: dict[int, tuple[float, str]]) -> dict[int, SimpleNamespace]:
@@ -258,3 +267,178 @@ class TestAutoCapture:
         # recovered = (cell - corrupt) / (clean - corrupt)
         expected = (_CELL_LP - _CORRUPT_LP) / (_CLEAN_LP - _CORRUPT_LP)
         assert abs(resp.grid[0][0] - expected) < 1e-9
+
+
+# ---- shared span-resolution math ------------------------------------------
+
+
+class TestDedupPositions:
+    def test_order_preserving_dedup(self):
+        # A span -> [5,6,7] mixed with an explicit 6 drops the duplicate.
+        assert dedup_positions([[5, 6, 7], [6]]) == [5, 6, 7]
+
+    def test_int_first_then_span(self):
+        assert dedup_positions([[6], [5, 6, 7]]) == [6, 5, 7]
+
+    def test_empty(self):
+        assert dedup_positions([]) == []
+
+
+class _FastTok:
+    """Fake fast tokenizer: BOS + one token per character.
+
+    Supports the offset-mapping fast path plus encode/decode, all consistent
+    (char per token, offsets index the original prompt, BOS -> empty span).
+    """
+
+    is_fast = True
+    BOS = 2  # distinct from any printable ord(c)
+
+    def encode(self, text, add_special_tokens=True):
+        ids = [self.BOS] if add_special_tokens else []
+        return ids + [ord(c) for c in text]
+
+    def decode(self, ids):
+        return "".join(chr(i) for i in ids if i != self.BOS)
+
+    def __call__(self, text, add_special_tokens=True, return_offsets_mapping=False):
+        ids = self.encode(text, add_special_tokens)
+        offsets, pos = [], 0
+        for i in ids:
+            if i == self.BOS:
+                offsets.append((0, 0))
+            else:
+                offsets.append((pos, pos + 1))
+                pos += 1
+        return {"input_ids": ids, "offset_mapping": offsets}
+
+
+class _SlowTok:
+    """Tokenizer with only encode/decode (no offset mapping): fallback path."""
+
+    def encode(self, text, add_special_tokens=True):
+        return [ord(c) for c in text]
+
+    def decode(self, ids):
+        return "".join(chr(i) for i in ids)
+
+
+class TestPromptCharOffsets:
+    def test_fast_path_offsets_and_bos(self):
+        text, offsets = prompt_char_offsets(_FastTok(), "hi")
+        assert text == "hi"
+        # BOS at (0,0); then 'h' [0,1); 'i' [1,2).
+        assert offsets == [(0, 0), (0, 1), (1, 2)]
+
+    def test_fallback_incremental_decode(self):
+        text, offsets = prompt_char_offsets(_SlowTok(), "hi")
+        assert text == "hi"
+        assert offsets == [(0, 1), (1, 2)]
+
+
+class TestResolveSpanBodyPositions:
+    def test_no_spans_passes_ints_through(self):
+        # No tokenization when there are no spans (tokenizer would raise here).
+        assert resolve_span_body_positions(None, "hi", [0, 2]) == [0, 2]
+
+    def test_single_token_span(self):
+        got = resolve_span_body_positions(
+            _FastTok(), "The cat", [SpanPosition(span="h")]
+        )
+        assert got == [2]  # BOS=0, T=1, h=2
+
+    def test_multi_token_span(self):
+        got = resolve_span_body_positions(
+            _FastTok(), "The cat", [SpanPosition(span="cat")]
+        )
+        assert got == [5, 6, 7]
+
+    def test_mixed_span_and_int_dedup_order(self):
+        got = resolve_span_body_positions(
+            _FastTok(), "The cat", [SpanPosition(span="cat"), 6]
+        )
+        assert got == [5, 6, 7]
+
+    def test_special_token_never_selected(self):
+        got = resolve_span_body_positions(
+            _FastTok(), "The cat", [SpanPosition(span="The")]
+        )
+        assert got == [1, 2, 3]
+        assert 0 not in got  # BOS excluded
+
+
+# ---- endpoint span resolution (mock engine + fast tokenizer) --------------
+
+
+def _span_engine(prompt, layers, hook="post_block"):
+    """Engine whose fast tokenizer resolves spans, with a matching run R1."""
+    tok = _FastTok()
+    n = len(tok.encode(prompt))
+    runs = [
+        {
+            "run_id": "R1",
+            "hook_layers": [[hook, layer] for layer in layers],
+            "positions": list(range(n)),
+            "num_prompt_tokens": n,
+        }
+    ]
+    eng = _MockEngine(runs=runs)
+    eng._tok = tok
+    return eng
+
+
+def _run_span(eng, prompt, positions, **kw):
+    patch_admission._PATCH_SOURCE_CACHE = patch_admission._PatchSourceCache()
+    base = dict(
+        prompt=prompt,
+        source_run="R1",
+        layers=[0, 1],
+        hook="post_block",
+        answer_token_id=5,
+        positions=positions,
+    )
+    base.update(kw)
+    body = PatchSweepRequest(**base)
+    return asyncio.run(patch_sweep(body, _raw_request(eng)))
+
+
+class TestEndpointSpans:
+    def test_resolved_axis_is_span_positions(self):
+        eng = _span_engine("The cat", [0, 1])
+        resp = _run_span(eng, "The cat", [{"span": "cat"}])
+        assert not isinstance(resp, JSONResponse)
+        assert resp.positions == [5, 6, 7]
+
+    def test_mixed_span_and_int(self):
+        eng = _span_engine("The cat", [0, 1])
+        resp = _run_span(eng, "The cat", [{"span": "cat"}, 6])
+        assert not isinstance(resp, JSONResponse)
+        assert resp.positions == [5, 6, 7]  # explicit 6 deduped
+
+    def test_bos_never_selected(self):
+        eng = _span_engine("The cat", [0, 1])
+        resp = _run_span(eng, "The cat", [{"span": "The"}])
+        assert not isinstance(resp, JSONResponse)
+        assert resp.positions == [1, 2, 3]
+        assert 0 not in resp.positions
+
+    def test_not_found_400(self):
+        eng = _span_engine("The cat", [0, 1])
+        resp = _run_span(eng, "The cat", [{"span": "dog"}])
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "not found" in json.loads(resp.body)["error"]
+
+    def test_empty_span_400(self):
+        eng = _span_engine("The cat", [0, 1])
+        resp = _run_span(eng, "The cat", [{"span": ""}])
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "non-empty" in json.loads(resp.body)["error"]
+
+    def test_occurrence_out_of_range_400(self):
+        eng = _span_engine("cat cat", [0, 1])
+        resp = _run_span(eng, "cat cat", [{"span": "cat", "occurrence": 2}])
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "out of range" in json.loads(resp.body)["error"]

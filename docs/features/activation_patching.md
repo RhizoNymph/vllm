@@ -106,14 +106,36 @@ from that module.
 ### Substring positions
 
 Sweep positions are token indices, but tokenization is easy to get wrong by
-hand. `await study.positions_for(prompt, span, occurrence=0)` resolves a
-substring of a prompt to the token positions covering it — it tokenizes with the
-same `/tokenize` semantics the sweep uses and reconstructs per-token character
-offsets by incremental `/detokenize`, so the positions index the prompt exactly
-as the server sees it. A missing substring raises, and repeated matches must be
-disambiguated with `occurrence` (default 0 = first). A `Span("text",
-occurrence=0)` marker may also be passed directly in a sweep's `positions`
-(mixed with plain indices); each span is resolved against the corrupt prompt.
+hand. A substring of the prompt can be given instead, resolved to the token
+positions covering it — the prompt is tokenized exactly as the sweep tokenizes
+it and each token is mapped to its character span, so the positions index the
+prompt as the server sees it. A missing substring raises, and repeated matches
+must be disambiguated with `occurrence` (default 0 = first).
+
+This works from both surfaces:
+
+- **Client:** pass a `Span("text", occurrence=0)` marker directly in a sweep's
+  `positions` (mixed with plain indices); each span resolves against the corrupt
+  prompt. `await study.positions_for(prompt, span, occurrence=0)` resolves one
+  explicitly. Client-side resolution uses `/tokenize` + incremental
+  `/detokenize` (the HTTP API exposes no char offsets). For `server_side=True`
+  sweeps the spans are forwarded to the server and resolved there.
+- **Raw HTTP:** `positions` accepts span objects mixed with integers, resolved
+  server-side against `prompt` (the destination run):
+
+  ```json
+  {"positions": [{"span": "Germany", "occurrence": 0}, 4]}
+  ```
+
+  The response's `positions` is the resolved integer axis (grid columns index
+  it). Server-side offsets come from the fast tokenizer's offset mapping (or
+  incremental detokenization as a fallback), tokenized identically to the sweep
+  so special tokens (e.g. BOS) map to an empty span and are never selected.
+  Expansion is order-preserving with dedup across the whole list. Empty spans,
+  missing substrings, and out-of-range occurrences are clean 400s.
+
+The pure resolution math lives in `vllm/entrypoints/serve/patch/spans.py`,
+shared by the endpoint and the client (no duplicated copy).
 
 #### One-call auto-capture
 
@@ -142,6 +164,33 @@ re-checked after capture via the manifest refresh-on-miss). If a referenced run
 is missing and `clean_prompt` is **not** provided, the sweep still 400s
 (capture the clean run explicitly first). Explicit pre-capture (client
 `capture_clean` + `capture_wait`) keeps working unchanged.
+
+`PatchStudy` wires this into one call: pass `clean_prompt` (the clean text) with
+`server_side=True` and no captured `clean`/`run`, and the client skips capture
+entirely — it generates a fresh per-call run name (the auto-capture taps only
+the swept layers, so a name reused across differing-layer grids would 400), sends
+the sweep, and lets the server auto-capture. Spans are forwarded and resolved
+server-side. `SweepResult.auto_captured` / `captured_source_run` report it.
+
+```python
+study = PatchStudy(model=MODEL, hook="post_block")
+result = await study.sweep_layers_positions(
+    corrupt_prompt,
+    clean_prompt=clean_prompt,          # one call: server captures the clean run
+    layers=range(20),
+    positions=[Span("Germany")],        # resolved server-side, no token indices
+    answer_token=" Berlin",
+    metric="recovered",
+    server_side=True,
+)
+assert result.auto_captured  # captured_source_run is the fresh run name
+```
+
+An existing run wins: passing a captured `clean` handle (or explicit `run=`)
+alongside `clean_prompt` reuses the run (the server re-captures nothing) and
+`clean_prompt` then only drives alignment. The per-cell fan-out path
+(`server_side=False`) has no capture endpoint, so `clean_prompt` there without a
+captured `clean` handle raises — call `capture_clean` first.
 
 ### Position alignment
 
@@ -248,7 +297,9 @@ python -m vllm.entrypoints.openai.api_server \
 - Config / admission: `vllm/config/patch.py`, `vllm/sampling_params.py`
   (`patch` field), `vllm/v1/capture/patch_admission.py`, `vllm/v1/request.py`
   (prefix floor), `vllm/v1/core/sched/scheduler.py` (backpressure).
-- Endpoint / client: `vllm/entrypoints/serve/patch/` (client:
-  `vllm/entrypoints/serve/patch/client.py`; runnable demo:
+- Endpoint / client: `vllm/entrypoints/serve/patch/` (endpoint:
+  `api_router.py`; request/response: `protocol.py`; client: `client.py`;
+  shared substring→position math: `spans.py`; position alignment:
+  `alignment.py`; runnable demo:
   `examples/online_serving/openai_patch_client.py`).
 - GPU validation: `tests/gpu_patch_validate.py`.
