@@ -47,6 +47,7 @@ from vllm.v1.worker.steering_action_queue import (
     validate_steering_vectors,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
+from vllm.v1.worker.steering_owner import RowOwner
 
 
 def _get_steering_ranks() -> tuple[int, int]:
@@ -765,7 +766,7 @@ class SteeringModelRunnerMixin:
                 "sites": {
                     hook: {
                         layer: {
-                            str(owner): {
+                            str(owner.legacy_key): {
                                 "threshold": cfg["threshold"],
                                 "sharpness": cfg["sharpness"],
                             }
@@ -1507,13 +1508,13 @@ class SteeringModelRunnerMixin:
                     f"request {action.req_id} has no live dynamic override to "
                     "attach a per-row monitor to"
                 )
-            owner_key: tuple = ("dyn", dyn_id)
+            owner_key: RowOwner = RowOwner.dyn(dyn_id)
         elif action.dyn_id is not None:
             if action.dyn_id not in mgr._dynamic_to_row:
                 return _reject(f"unknown dynamic row dyn_id={action.dyn_id}")
-            owner_key = ("dyn", action.dyn_id)
+            owner_key = RowOwner.dyn(action.dyn_id)
         else:
-            owner_key = ("config", int(action.config_hash), "decode")
+            owner_key = RowOwner.config(int(action.config_hash), "decode")
 
         if action.probe is None:
             mgr.clear_row_monitor(action.hook, action.layer, owner_key)
