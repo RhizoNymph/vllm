@@ -3,6 +3,7 @@
 """Unit tests for the PatchStudy client's pure logic (no server needed)."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -358,6 +359,79 @@ class TestServerSideOneCall:
             )
 
 
+def _summary_data(payload: dict) -> dict:
+    """Server response payload for a given request (auto-capture echoed)."""
+    return dict(
+        _SWEEP_RESP,
+        auto_captured=payload["clean_prompt"] is not None,
+        captured_source_run=payload["source_run"],
+    )
+
+
+def _sse_line(event: dict) -> str:
+    return "data: " + json.dumps(event)
+
+
+class _FakeStreamResp:
+    def __init__(self, lines: list[str]):
+        self._lines = lines
+        self.headers = {"content-type": "text/event-stream"}
+
+    def raise_for_status(self):
+        pass
+
+    async def aread(self):
+        return b""
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+class _StreamCtx:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FakeStreamClient:
+    """Serves /patch_sweep as both a plain POST and an SSE stream."""
+
+    streamed: list[dict] = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        return _FakeResp(_summary_data(json))
+
+    def stream(self, method, url, json=None, headers=None):
+        payload = json
+        _FakeStreamClient.streamed.append(payload)
+        data = _summary_data(payload)
+        lines = [_sse_line({"type": "start"})]
+        for i, layer in enumerate(data["layers"]):
+            for j, pos in enumerate(data["positions"]):
+                lines.append(_sse_line({
+                    "type": "cell", "hook": data["hook"], "layer": layer,
+                    "position": pos, "value": data["grid"][i][j],
+                }))
+        lines.append(_sse_line({"type": "summary", **data}))
+        lines.append("data: [DONE]")
+        return _StreamCtx(_FakeStreamResp(lines))
+
+
 class _FakeMultiHookClient:
     """Echoes a multi-hook (hook_grids) /patch_sweep response."""
 
@@ -501,6 +575,63 @@ class TestMultiHookClient:
                 study.sweep_layers_positions(
                     "c", layers=[0], positions=[0], answer_token=" P",
                     hooks=["pre_attn"],
+                )
+            )
+
+
+class TestServerSideStreaming:
+    def _patch(self, monkeypatch):
+        import httpx
+
+        _FakeStreamClient.streamed = []
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeStreamClient)
+
+    def test_on_cell_invoked_per_cell_and_result_matches(self, monkeypatch):
+        self._patch(monkeypatch)
+        study = _server_study()
+        seen: list[dict] = []
+        streamed = asyncio.run(
+            study.sweep_layers_positions(
+                "The cat",
+                run="R1",
+                layers=[0, 1],
+                positions=[5, 6, 7],
+                answer_token=" Paris",
+                server_side=True,
+                on_cell=seen.append,
+            )
+        )
+        # 2 layers x 3 positions = 6 cell events, each carrying hook.
+        assert len(seen) == 6
+        assert all(e["type"] == "cell" for e in seen)
+        assert all(e["hook"] == "post_block" for e in seen)
+        # stream=true was sent.
+        assert _FakeStreamClient.streamed[-1]["stream"] is True
+
+        plain = asyncio.run(
+            study.sweep_layers_positions(
+                "The cat",
+                run="R1",
+                layers=[0, 1],
+                positions=[5, 6, 7],
+                answer_token=" Paris",
+                server_side=True,
+            )
+        )
+        # Streamed result == non-streaming result (field by field).
+        assert streamed == plain
+
+    def test_on_cell_requires_server_side(self):
+        study = _server_study()
+        with pytest.raises(ValueError, match="server_side"):
+            asyncio.run(
+                study.sweep_layers_positions(
+                    "corrupt",
+                    run="R1",
+                    layers=[0],
+                    positions=[0],
+                    answer_token=" P",
+                    on_cell=lambda e: None,
                 )
             )
 

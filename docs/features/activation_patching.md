@@ -253,6 +253,44 @@ older deliberate captures first. Three mechanisms manage this:
   so a dropped run is not reported as still-existing — otherwise the next sweep
   would skip auto-capture and 400 on the now-absent run.
 
+### Streaming
+
+A large grid (all_prompt × many layers on a real prompt = 1000+ cells) holds one
+HTTP response open for minutes with no progress signal; a proxy/client timeout
+then loses a nearly-finished sweep. Passing `"stream": true` opts into an
+`text/event-stream` (SSE) response that emits results as cells land:
+
+- `data: {"type": "start", "layers": [...], "positions": [...], "hook": ...,
+  "metric": ..., "auto_captured": ..., "captured_source_run": ...}` — first, so
+  a consumer can size a live heatmap before any cell arrives.
+- `data: {"type": "cell", "hook": "post_block", "layer": 14, "position": 3,
+  "value": -0.37}` per cell as it completes (completion order — no ordering
+  promise). `hook` is always present and, for a [multi-hook
+  sweep](#multi-hook-sweeps), labels which hook's grid the cell belongs to.
+  A cell that voids mid-sweep (its patch failed to resolve on the workers)
+  re-emits as `{"type": "cell", ..., "value": null, "error": "..."}`, mirroring
+  how voided cells land in `skipped`.
+- `data: {"type": "summary", ...}` — the exact same payload as the non-streaming
+  `PatchSweepResponse` (assembled by the same code path), then `data: [DONE]`.
+
+**Pre-fan-out errors stay plain JSON.** Everything that 400s before the grid
+fan-out begins — bad hook/layers, span-resolution failure, alignment failure,
+missing source with no `clean_prompt` — still returns a normal JSON error
+response; the stream only starts once the fan-out actually runs. So a client
+must check the response `Content-Type` / status before parsing SSE.
+
+Cells run concurrently regardless of streaming; if the client disconnects
+mid-stream the server cancels the outstanding cell tasks (best-effort abort of
+their engine requests) rather than grinding through a dead sweep.
+
+`PatchStudy.sweep_layers_positions(..., server_side=True, on_cell=fn)` wires this
+in: passing an `on_cell(event_dict)` callback sends `stream: true`, invokes the
+callback per cell event, and builds the returned `SweepResult` from the summary
+event — identical to the non-streaming result. Without `on_cell` the sweep is
+non-streaming (unchanged). `on_cell` is server-side only. It composes with
+multi-hook sweeps: each cell event carries its own `hook`, and the streamed
+summary's `hook_grids` matches the non-streaming multi-hook response.
+
 ### Position alignment
 
 Patch entries pair a destination position (corrupt run) with a source position

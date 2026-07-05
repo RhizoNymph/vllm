@@ -36,6 +36,8 @@ Overview:
     /v1/patch_sweep endpoint fans a (layers × positions) grid through continuous
     batching for one-call causal-tracing sweeps; when the referenced source run
     is missing and clean_prompt is given it auto-captures the clean run first.
+    Large grids can stream per-cell results over SSE (stream: true / client
+    on_cell) so progress lands incrementally instead of one long-held response.
 
 Features Index:
   activation_capture:

@@ -82,6 +82,12 @@ class PatchSweepRequest(BaseModel):
     foil_token_id: int | None = None
     metric: Literal["logprob", "logit_diff", "recovered"] = "logprob"
     logprobs: int = Field(default=20, ge=1)
+    stream: bool = False
+    """Stream per-cell results over SSE (``text/event-stream``) as they land,
+    ending with a ``summary`` event carrying the full non-streaming response and
+    a ``[DONE]`` terminator. Pre-fan-out errors (bad hook/layers, span/alignment
+    failure, missing source) still return a plain JSON 400 — the stream only
+    starts once the grid fan-out begins. Off by default (single JSON response)."""
     # Clean baseline answer metric (from an explicit capture_clean) for the
     # recovered metric; the corrupt baseline is computed in-endpoint. Ignored
     # when the server auto-captures (the clean baseline is then graded from the

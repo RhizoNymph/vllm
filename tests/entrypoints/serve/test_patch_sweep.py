@@ -6,7 +6,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import vllm.v1.capture.patch_admission as patch_admission
 from vllm.entrypoints.serve.patch.api_router import (
@@ -408,6 +408,131 @@ class TestDropRoute:
         assert resp.status_code == 200
         # Cache no longer reports the dropped run present.
         assert asyncio.run(exists(eng, "R1")) is False
+
+
+# ---- streaming (SSE) sweep ------------------------------------------------
+
+
+def _drain_sse(resp: StreamingResponse) -> list[str]:
+    """Collect a StreamingResponse body into its raw ``data:`` payload lines."""
+
+    async def drain() -> str:
+        chunks = []
+        async for chunk in resp.body_iterator:
+            chunks.append(chunk if isinstance(chunk, str) else chunk.decode())
+        return "".join(chunks)
+
+    text = asyncio.run(drain())
+    return [
+        block[len("data: "):]
+        for block in text.split("\n\n")
+        if block.startswith("data: ")
+    ]
+
+
+def _sse_events(resp: StreamingResponse) -> tuple[list[dict], str]:
+    """Parse an SSE sweep stream into (json events, terminator)."""
+    payloads = _drain_sse(resp)
+    assert payloads[-1] == "[DONE]"
+    events = [json.loads(p) for p in payloads[:-1]]
+    return events, payloads[-1]
+
+
+class _VoidEngine(_MockEngine):
+    """Engine that reports the first patched cell as a resolution failure."""
+
+    def __init__(self, runs):
+        super().__init__(runs=runs)
+        self.patched_ids: list[str] = []
+
+    async def generate(self, prompt, sp, request_id):
+        if sp.patch:
+            self.patched_ids.append(request_id)
+        async for out in super().generate(prompt, sp, request_id):
+            yield out
+
+    async def collective_rpc(self, method, args=None):
+        if method == "pop_patch_resolution_failures" and self.patched_ids:
+            return [{self.patched_ids[0]: ["source evicted mid-sweep"]}]
+        return await super().collective_rpc(method, args)
+
+
+class TestStreamingSweep:
+    def test_stream_returns_sse_response(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, stream=True)
+        assert isinstance(resp, StreamingResponse)
+        assert resp.media_type == "text/event-stream"
+
+    def test_cell_events_equal_grid_size(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, stream=True)
+        events, done = _sse_events(resp)
+        assert done == "[DONE]"
+        assert events[0]["type"] == "start"
+        cells = [e for e in events if e["type"] == "cell"]
+        # grid is layers[0,1] x positions[0,1] = 4 cells.
+        assert len(cells) == 4
+        for c in cells:
+            assert c["hook"] == "post_block"
+            assert c["value"] == _CELL_LP
+            assert {"layer", "position"} <= c.keys()
+        assert events[-1]["type"] == "summary"
+
+    def test_summary_equals_nonstreaming(self):
+        # Same mock config run both ways -> byte-identical response payload.
+        eng_plain = _MockEngine(runs=_existing_run())
+        plain = _run(eng_plain, metric="logprob")
+        assert not isinstance(plain, JSONResponse)
+
+        eng_stream = _MockEngine(runs=_existing_run())
+        resp = _run(eng_stream, metric="logprob", stream=True)
+        events, _ = _sse_events(resp)
+        summary = next(e for e in events if e["type"] == "summary")
+        summary = {k: v for k, v in summary.items() if k != "type"}
+        assert summary == plain.model_dump()
+
+    def test_summary_equals_nonstreaming_recovered(self):
+        eng_plain = _MockEngine(runs=[])
+        plain = _run(eng_plain, clean_prompt="ab", metric="recovered")
+        eng_stream = _MockEngine(runs=[])
+        resp = _run(eng_stream, clean_prompt="ab", metric="recovered",
+                    stream=True)
+        events, _ = _sse_events(resp)
+        summary = next(e for e in events if e["type"] == "summary")
+        summary = {k: v for k, v in summary.items() if k != "type"}
+        assert summary == plain.model_dump()
+
+    def test_pre_fanout_error_is_plain_json_400(self):
+        # A missing run with no clean_prompt 400s before the stream starts.
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, stream=True)
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "patch source not found" in json.loads(resp.body)["error"]
+
+    def test_bad_hook_is_plain_json_400(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, hook="not_a_hook", stream=True)
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+
+    def test_voided_cell_emits_null_error_event(self):
+        eng = _VoidEngine(runs=_existing_run())
+        resp = _run(eng, stream=True)
+        events, _ = _sse_events(resp)
+        voided = [
+            e for e in events
+            if e["type"] == "cell" and e["value"] is None
+        ]
+        assert len(voided) == 1
+        assert voided[0]["error"] == "source evicted mid-sweep"
+        assert voided[0]["hook"] == "post_block"
+        assert {"layer", "position"} <= voided[0].keys()
+        # The summary reflects the void: a skipped entry + a null grid cell.
+        summary = next(e for e in events if e["type"] == "summary")
+        assert summary["skipped"]
+        assert any(None in row for row in summary["grid"])
 
 
 # ---- shared span-resolution math ------------------------------------------
