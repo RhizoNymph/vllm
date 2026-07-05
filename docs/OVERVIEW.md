@@ -78,13 +78,18 @@ declarative_per_request_steering:
     server-registered consumer. A built-in auto-registered consumer maps gates
     to the steering substrate: probe x this_token gates run in-graph via the
     per-row monitor; other scopes are host-latched (reusing SteeringController).
-    Vector sources are name-first (a frontend probe/steer registry + admin
-    endpoint) with an inline base64 packed escape hatch; operator consumers win
-    over client gates.
+    Vector sources are name-first (a probe/steer registry mirrored to every
+    worker) with an inline base64 packed escape hatch; a NamedVec rides the wire
+    un-inflated and resolves worker-side at admission. rest_of_conversation add
+    persists server-side by reference to a registered name (inline refused) and
+    bridges later turns by re-resolving the name with a digest guard; operator
+    consumers win over client gates.
   entry_points:
     - vllm/v1/steering_schema.py (gate schema + resolve/build)
     - vllm/v1/capture/declarative.py (DeclarativeSteeringConsumer)
-    - vllm/entrypoints/openai/steering/vector_registry.py (named vectors)
+    - vllm/v1/capture/controller.py (ByRefLatch + latch/bridge)
+    - vllm/v1/worker/steering_vector_registry.py (worker named-vector registry)
+    - vllm/entrypoints/openai/steering/vector_registry.py (frontend mirror)
     - vllm/entrypoints/serve/steering/vectors_router.py (admin endpoints)
   depends_on: [dynamic_steering, consumer_controller_base]
   doc: docs/design/dynamic_steering.md  # §8.2

@@ -542,9 +542,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "{kind:'probe', probe:<vec>, threshold, sharpness?}; `scope` is "
         "this_token|next_step|rest_of_request|rest_of_conversation; `apply` is "
         "{kind:'add', steer:<vec>, strength?} or {kind:'attenuate', strength}. "
-        "A <vec> is {kind:'name', name:<registered>} or "
-        "{kind:'inline', packed:{hook: SteeringHookPacked}} (base64). Applied by "
-        "the built-in declarative consumer with no server-registered consumer; "
+        "A <vec> is {kind:'name', name:<registered>} (register via "
+        "/v1/steering/vectors/register) or {kind:'inline', "
+        "packed:{hook: SteeringHookPacked}} (base64). scope=rest_of_conversation "
+        "with apply=add persists server-side and requires a named steer vector "
+        "(inline is rejected); ephemeral scopes accept inline. Applied by the "
+        "built-in declarative consumer with no server-registered consumer; "
         "requires the server to be started with --enable-steering.",
     )
 

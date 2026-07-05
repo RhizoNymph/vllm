@@ -47,6 +47,11 @@ from vllm.v1.worker.steering_action_queue import (
     validate_steering_vectors,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
+from vllm.v1.worker.steering_vector_registry import (
+    WorkerSteeringVectorRegistry,
+    get_worker_steering_vector_registry,
+    install_worker_steering_vector_registry,
+)
 
 
 def _get_steering_ranks() -> tuple[int, int]:
@@ -218,6 +223,14 @@ class SteeringModelRunnerMixin:
         self._steering_module_registry = {}
         self._steering_module_resolved_cache = {}
         self._steering_module_pinned_rows = {}
+        # Worker-resident named probe/steer vector registry (rank-replicated
+        # via ``collective_rpc``). Installed as a process-global so the sync
+        # steering consumer — no runner handle — can re-resolve a latch's
+        # referenced name at bridge time. Always present so ``NamedVec`` gate
+        # resolution and the register RPC have a target even when this worker
+        # has no steerable layers.
+        if get_worker_steering_vector_registry() is None:
+            install_worker_steering_vector_registry(WorkerSteeringVectorRegistry())
         # Per-source applied/rejected counters for dynamic steering
         # actions (both transports), keyed by submitting source name.
         self._dynamic_steering_stats: dict[str, dict[str, int]] = {}
@@ -1053,6 +1066,50 @@ class SteeringModelRunnerMixin:
             return
         for config_hash, phase in pinned:
             mgr.release_config(config_hash, phase)
+
+    # -----------------------------------------------------------------------
+    # Worker-side named probe/steer vector registry
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _worker_vector_registry() -> WorkerSteeringVectorRegistry:
+        """Return the process-global registry, installing one if absent.
+
+        Registration RPCs may (in principle) arrive before
+        ``_init_steering_state`` has installed the registry — e.g. a worker
+        with no steerable layers that took the early return. Installing on
+        demand keeps the register/unregister RPCs total across ranks so their
+        replicated state cannot diverge.
+        """
+        registry = get_worker_steering_vector_registry()
+        if registry is None:
+            registry = WorkerSteeringVectorRegistry()
+            install_worker_steering_vector_registry(registry)
+        return registry
+
+    def register_steering_vector_name(
+        self,
+        name: str,
+        kind: str,
+        packed: dict,
+        digest: str | None = None,
+    ) -> None:
+        """Worker-side handler for a named-vector register broadcast.
+
+        Stores the unpacked vectors and *digest* under ``name`` in the
+        ``kind`` namespace (``"probe"`` / ``"steer"``). Re-registering a name
+        replaces its content and digest. Mirrors ``/v1/steering/set``'s
+        rank-replicated collective_rpc mutation flow; the engine serializes
+        RPCs so every rank applies the same ordered sequence.
+        """
+        self._worker_vector_registry().register(name, kind, packed, digest)
+
+    def unregister_steering_vector_name(self, name: str, kind: str) -> bool:
+        """Worker-side handler for a named-vector unregister broadcast.
+
+        Returns ``True`` if the name existed in the ``kind`` namespace.
+        """
+        return self._worker_vector_registry().unregister(name, kind)
 
     def _resolve_request_steering(
         self,

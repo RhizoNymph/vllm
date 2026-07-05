@@ -21,7 +21,10 @@ What the base owns:
   :meth:`decide` (the *trigger*) is recorded for the conversation and applied
   to the firing request. Every later request of that conversation is *bridged*
   — overridden with the same vectors immediately, no re-trigger — so the
-  steering carries across turns. The latch map is bounded (FIFO eviction).
+  steering carries across turns. The latch map is a bounded LRU (a bridge
+  refreshes a conversation's recency; eviction drops the least-recently-used).
+  Operator latches store the raw override (byte accounted); the declarative
+  consumer stores a :class:`ByRefLatch` (name references, ~0 bytes).
 
 Subclasses implement :meth:`decide` (the trigger detector) and
 :meth:`global_capture_spec` (the monitored probe site); the base resolves the
@@ -32,23 +35,87 @@ firing request's residual window.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import replace
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
+from vllm.config.steering_types import merge_steering_specs
 from vllm.logger import init_logger
 from vllm.v1.capture.consumer import SyncCaptureConsumer
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
     SteeringAction,
 )
+from vllm.v1.worker.steering_vector_registry import (
+    get_worker_steering_vector_registry,
+)
 
 if TYPE_CHECKING:
+    import numpy as np
     import torch
 
     from vllm.config import VllmConfig
     from vllm.v1.capture.step_view import StepCaptureView, StepRequestView
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class LatchVectorRef:
+    """A reference to one server-registered steer vector for a latch.
+
+    Carries the registered ``name`` (in the ``kind`` namespace), the content
+    ``digest`` observed when the latch was installed, and the gate's
+    ``strength``. Bridging re-resolves ``name`` from the worker registry and
+    verifies ``digest`` before scaling by ``strength``, so a name re-registered
+    with different content mid-conversation is detected and the latch drops.
+    """
+
+    name: str
+    kind: str  # "steer"
+    digest: str
+    strength: float
+
+
+@dataclass(frozen=True)
+class ByRefLatch:
+    """A ``rest_of_conversation`` latch that persists *references*, not bytes.
+
+    The declarative consumer emits this for a client's persisted-scope ``add``
+    gates (guaranteed named by the frontend scope rule). It pins ~0 host bytes
+    — the vectors live in the rank-replicated worker registry — so it is exempt
+    from the byte cap that bounds :class:`RequestSteeringOverride`
+    (operator-authored, raw-vector) latches. Bridging resolves ``refs`` at
+    bridge time (:meth:`SteeringController._bridge_override`).
+    """
+
+    refs: tuple[LatchVectorRef, ...]
+    compose_admitted: bool
+    source: str
+
+
+# A latched entry is either an operator-authored raw-vector override (byte
+# accounted) or a declarative by-reference latch (~0 bytes). Making this a real
+# union keeps the two provenances — trusted operator bytes vs. client-named
+# references — distinct rather than a dict-with-flags.
+LatchEntry = RequestSteeringOverride | ByRefLatch
+
+
+def _scale_ref_vectors(
+    vectors: dict[str, dict[int, np.ndarray]], strength: float
+) -> dict[str, dict[int, np.ndarray]]:
+    """Copy ``vectors`` scaling every row by ``strength`` (dtype-preserving).
+
+    Matches :func:`vllm.v1.steering_schema._scale_vectors` so a bridged turn
+    reproduces the trigger turn's numerics bit-for-bit.
+    """
+    return {
+        hook: {
+            layer: (arr if strength == 1.0 else arr * arr.dtype.type(strength))
+            for layer, arr in layers.items()
+        }
+        for hook, layers in vectors.items()
+    }
 
 
 class SteeringController(SyncCaptureConsumer, ABC):
@@ -61,13 +128,16 @@ class SteeringController(SyncCaptureConsumer, ABC):
     Recognized params:
 
     - ``max_conversations`` (int, default 1024): entry-count bound on the
-      latch map; FIFO-evicted (oldest conversation dropped) when exceeded.
+      latch map; LRU-evicted (least-recently-used conversation dropped) when
+      exceeded.
     - ``max_latched_bytes`` (int, default 256 MiB): payload-byte bound on the
-      latch map. Because a latched override pins full steering vectors (all
-      hooks x layers, float32) on every TP rank, an entry-count-only bound is
-      an unbounded host-memory exposure; this caps the aggregate. Enforced
-      alongside ``max_conversations`` (oldest-first eviction until both fit);
-      a single override larger than the cap is refused, not latched. See
+      latch map. Because a :class:`RequestSteeringOverride` latch pins full
+      steering vectors (all hooks x layers, float32) on every TP rank, an
+      entry-count-only bound is an unbounded host-memory exposure; this caps
+      the aggregate. Enforced alongside ``max_conversations`` (LRU eviction
+      until both fit); a single override larger than the cap is refused, not
+      latched. :class:`ByRefLatch` entries cost ~0 bytes against this cap (the
+      vectors live in the worker registry, not the latch). See
       docs/design/dynamic_steering.md (Trust model and multi-tenancy).
     """
 
@@ -81,14 +151,22 @@ class SteeringController(SyncCaptureConsumer, ABC):
         self._max_latched_bytes = max(
             1, int(params.get("max_latched_bytes", 256 * 1024 * 1024))
         )
-        # conv_id -> sticky override to (re)apply; persists across requests.
-        self._latched: dict[str, RequestSteeringOverride] = {}
-        # conv_id -> approximate payload bytes of its latched override, and the
+        # conv_id -> sticky latch entry to (re)apply; persists across requests.
+        # LRU-ordered (most-recently bridged/latched last) so count/byte-cap
+        # eviction drops the least-recently-used conversation.
+        self._latched: OrderedDict[str, LatchEntry] = OrderedDict()
+        # conv_id -> approximate payload bytes of its latched entry, and the
         # running total, so eviction can enforce the byte cap in O(1).
+        # ByRefLatch entries record 0 (their vectors live in the registry).
         self._latched_bytes: dict[str, int] = {}
         self._latched_bytes_total = 0
         # Rate-limit the oversized-latch refusal warning (log once).
         self._oversize_logged = False
+        # Rate-limit the by-reference bridge-failure warning (log once): a
+        # latch whose name was unregistered or re-registered with different
+        # content mid-conversation disengages instead of steering with
+        # silently-changed content.
+        self._latch_ref_failed_warned = False
         # live req_ids already overridden this run (emit-once per request).
         self._armed: set[str] = set()
         self._triggers = 0
@@ -150,16 +228,37 @@ class SteeringController(SyncCaptureConsumer, ABC):
             del self._latched[cid]
             self._latched_bytes_total -= self._latched_bytes.pop(cid)
 
-    def _latch(self, cid: str, override: RequestSteeringOverride) -> None:
-        """Record the conversation's sticky override under both latch bounds.
+    def _store_latch(self, cid: str, entry: LatchEntry, nbytes: int) -> None:
+        """Store ``entry`` for ``cid`` under both caps (LRU eviction).
 
-        FIFO-evicts oldest conversations until both the entry-count cap
+        Evicts least-recently-used conversations until both the entry-count cap
         (``max_conversations``) and the payload-byte cap (``max_latched_bytes``)
-        admit the newcomer. Eviction is a pure function of the latch sequence
-        (no time-based logic), so it is rank-deterministic. A single override
-        whose vectors alone exceed the byte cap is refused (rate-limit-logged):
-        the triggering request still steers this turn, only the cross-turn
-        conversation latch is dropped.
+        admit the newcomer, then appends the newcomer as most-recently-used.
+        Eviction is a pure function of the latch/bridge sequence (no time-based
+        logic), so it is rank-deterministic.
+        """
+        # Replacing an existing latch: release its bytes before re-accounting.
+        self._drop_latched(cid)
+        # Evict LRU-first (front of the OrderedDict) until both caps admit it.
+        while self._latched and (
+            len(self._latched) + 1 > self._max_conversations
+            or self._latched_bytes_total + nbytes > self._max_latched_bytes
+        ):
+            self._drop_latched(next(iter(self._latched)))
+        # Append as most-recently-used (a replaced key keeps its old position
+        # in an OrderedDict, so move_to_end makes recency unconditional).
+        self._latched[cid] = entry
+        self._latched.move_to_end(cid)
+        self._latched_bytes[cid] = nbytes
+        self._latched_bytes_total += nbytes
+
+    def _latch(self, cid: str, override: RequestSteeringOverride) -> None:
+        """Record a conversation's sticky raw-vector override (ByValue).
+
+        Used by operator-authored :meth:`decide` subclasses (trusted raw
+        vectors). A single override whose vectors alone exceed the byte cap is
+        refused (rate-limit-logged): the triggering request still steers this
+        turn, only the cross-turn conversation latch is dropped.
         """
         nbytes = self._override_nbytes(override)
         if nbytes > self._max_latched_bytes:
@@ -178,28 +277,75 @@ class SteeringController(SyncCaptureConsumer, ABC):
             # override in place of the now-oversized turn.
             self._drop_latched(cid)
             return
-        # Replacing an existing latch: release its bytes before re-accounting.
-        self._drop_latched(cid)
-        # Evict oldest-first until both caps admit the newcomer.
-        while self._latched and (
-            len(self._latched) + 1 > self._max_conversations
-            or self._latched_bytes_total + nbytes > self._max_latched_bytes
-        ):
-            self._drop_latched(next(iter(self._latched)))
-        self._latched[cid] = override
-        self._latched_bytes[cid] = nbytes
-        self._latched_bytes_total += nbytes
+        self._store_latch(cid, override, nbytes)
 
-    @staticmethod
-    def _bridge_override(
-        latched: RequestSteeringOverride, req_id: str
-    ) -> RequestSteeringOverride:
-        """A copy of the latched override rebound to ``req_id``.
+    def _latch_by_ref(self, cid: str, entry: ByRefLatch) -> None:
+        """Record a conversation's by-reference latch (declarative, ~0 bytes).
 
-        Preserves every other field (``compose_admitted``, ``source``, and any
-        future ones) so a bridged turn steers identically to the trigger turn.
+        Exempt from the byte cap (its vectors live in the worker registry, not
+        the latch), so it never triggers the oversized-refusal path; the
+        count-cap LRU still applies.
         """
-        return replace(latched, req_id=req_id)
+        self._store_latch(cid, entry, 0)
+
+    def _bridge_override(
+        self, latched: LatchEntry, req_id: str
+    ) -> RequestSteeringOverride | None:
+        """Build the override to apply to a bridged turn, or ``None`` to drop.
+
+        - :class:`RequestSteeringOverride` (operator ByValue): a copy rebound
+          to ``req_id``, preserving every other field (``compose_admitted``,
+          ``source``, ...) so a bridged turn steers identically to the trigger.
+        - :class:`ByRefLatch` (declarative): re-resolve each referenced name
+          from the worker registry and verify its digest. On a missing name or
+          a digest mismatch (name re-registered with different content
+          mid-conversation) return ``None`` — the caller disengages the latch
+          rather than steering with silently-changed content.
+        """
+        if isinstance(latched, RequestSteeringOverride):
+            return replace(latched, req_id=req_id)
+        return self._resolve_by_ref(latched, req_id)
+
+    def _resolve_by_ref(
+        self, latched: ByRefLatch, req_id: str
+    ) -> RequestSteeringOverride | None:
+        """Resolve a :class:`ByRefLatch` to a live override, or ``None``."""
+        registry = get_worker_steering_vector_registry()
+
+        def _disengage(reason: str) -> None:
+            if not self._latch_ref_failed_warned:
+                self._latch_ref_failed_warned = True
+                logger.warning(
+                    "steering latch disengaged for a conversation: %s; the "
+                    "conversation will no longer be steered. Further "
+                    "disengagements will not be logged.",
+                    reason,
+                )
+
+        if registry is None:
+            _disengage("no worker vector registry is available")
+            return None
+        vectors: dict[str, dict[int, np.ndarray]] = {}
+        for ref in latched.refs:
+            resolved = registry.resolve_vectors(ref.name, ref.kind)
+            if resolved is None:
+                _disengage(f"referenced {ref.kind} vector {ref.name!r} is not "
+                           "registered")
+                return None
+            ref_vectors, digest = resolved
+            if digest != ref.digest:
+                _disengage(f"referenced {ref.kind} vector {ref.name!r} was "
+                           "re-registered with different content (digest "
+                           "mismatch)")
+                return None
+            scaled = _scale_ref_vectors(ref_vectors, ref.strength)
+            vectors = scaled if not vectors else merge_steering_specs(vectors, scaled)
+        return RequestSteeringOverride(
+            req_id=req_id,
+            vectors=vectors,
+            compose_admitted=latched.compose_admitted,
+            source=latched.source,
+        )
 
     def on_step(self, view: StepCaptureView) -> list[SteeringAction] | None:
         actions: list[SteeringAction] = []
@@ -217,7 +363,13 @@ class SteeringController(SyncCaptureConsumer, ABC):
                 continue
             if cid in self._latched:
                 # BRIDGE: a new request of an already-latched conversation.
-                actions.append(self._bridge_override(self._latched[cid], req.req_id))
+                bridged = self._bridge_override(self._latched[cid], req.req_id)
+                if bridged is None:
+                    # By-reference latch that no longer resolves: disengage.
+                    self._drop_latched(cid)
+                    continue
+                self._latched.move_to_end(cid)  # LRU: refresh recency
+                actions.append(bridged)
                 self._armed.add(req.req_id)
                 self._bridges += 1
                 continue

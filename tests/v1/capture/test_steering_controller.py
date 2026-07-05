@@ -308,6 +308,22 @@ def test_relatch_same_conversation_does_not_double_count():
     assert ctl._latched_bytes_total == VEC_BYTES
 
 
+def test_lru_bridge_refreshes_recency_before_eviction():
+    # Count cap of 2. Latch c0, c1; then BRIDGE c0 (a new request of c0
+    # refreshes its recency). Latching c2 must then evict the least-recently-
+    # used — c1 — leaving c0 alive. Pure FIFO would have evicted c0.
+    ctl = _ctl(max_conversations=2)
+    ctl.on_step(_view([("r0", "c0", "decode", 1.0)]))  # latch c0
+    ctl.on_step(_view([("r1", "c1", "decode", 1.0)]))  # latch c1
+    # A new request of c0, below threshold -> bridged (refreshes c0 recency).
+    acts = ctl.on_step(_view([("r0b", "c0", "decode", 0.0)]))
+    assert len(acts) == 1 and isinstance(acts[0], RequestSteeringOverride)
+    assert ctl.status()["bridges"] == 1
+    # Now c1 is least-recently-used; latching c2 evicts c1, not c0.
+    ctl.on_step(_view([("r2", "c2", "decode", 1.0)]))
+    assert set(ctl._latched) == {"c0", "c2"}
+
+
 def test_eviction_is_deterministic_across_identical_sequences():
     seq = [(f"r{i}", f"c{i % 4}", "decode", 1.0) for i in range(12)]
     finals = []

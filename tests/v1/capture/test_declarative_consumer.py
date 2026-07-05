@@ -8,9 +8,13 @@ engine) and asserts the emitted action sequence for each gate combination,
 plus the arming/latch/pulse lifecycle. CPU-only.
 """
 
+import base64
+
 import numpy as np
+import pytest
 import torch
 
+from vllm.config.steering_types import steering_vector_content_digest
 from vllm.v1.capture.declarative import (
     _PROBE_CACHE_MAX,
     DeclarativeSteeringConsumer,
@@ -19,13 +23,45 @@ from vllm.v1.capture.step_view import StepCaptureView, StepRequestView
 from vllm.v1.steering_schema import ResolvedGate
 from vllm.v1.worker.steering_action_queue import (
     DECLARATIVE_SOURCE,
-    RequestSteeringOverride,
     SteeringMonitorUpdate,
     SteeringScaleUpdate,
+)
+from vllm.v1.worker.steering_vector_registry import (
+    WorkerSteeringVectorRegistry,
+    get_worker_steering_vector_registry,
+    install_worker_steering_vector_registry,
 )
 
 HIDDEN = 4
 SITE = (5, "post_block")
+
+
+def _pack(vec, layer=5, hook="post_block"):
+    a = np.asarray(vec, dtype=np.float32)
+    return {
+        hook: {
+            "dtype": "float32",
+            "shape": [1, a.shape[0]],
+            "layer_indices": [layer],
+            "data": base64.b64encode(a.tobytes()).decode(),
+        }
+    }
+
+
+@pytest.fixture(autouse=True)
+def _fresh_worker_registry():
+    """Isolate the process-global worker vector registry per test."""
+    prev = get_worker_steering_vector_registry()
+    install_worker_steering_vector_registry(WorkerSteeringVectorRegistry())
+    yield get_worker_steering_vector_registry()
+    install_worker_steering_vector_registry(prev)
+
+
+def _register_steer(name, vec, layer=5):
+    """Register a steer vector on the worker registry; return its digest."""
+    packed = _pack(vec, layer)
+    get_worker_steering_vector_registry().register(name, "steer", packed)
+    return steering_vector_content_digest(packed)
 
 
 def _add(scope, when="always"):
@@ -39,6 +75,23 @@ def _add(scope, when="always"):
         apply_kind="add",
         steer_vectors={"post_block": {5: np.ones(HIDDEN, dtype=np.float32)}},
         strength=2.0,
+    )
+
+
+def _named_add(scope, name, digest, when="always", strength=1.0):
+    """An ``add`` ResolvedGate whose steer source is a registered name."""
+    return ResolvedGate(
+        scope=scope,
+        when_kind=when,
+        probe_site=SITE if when == "probe" else None,
+        probe_vec=np.ones(HIDDEN, dtype=np.float32) if when == "probe" else None,
+        threshold=0.0 if when == "probe" else None,
+        sharpness=1.0 if when == "probe" else None,
+        apply_kind="add",
+        steer_vectors={"post_block": {5: np.ones(HIDDEN, dtype=np.float32) * strength}},
+        strength=strength,
+        steer_name=name,
+        steer_digest=digest,
     )
 
 
@@ -99,18 +152,83 @@ def test_this_token_probe_attaches_row_monitor():
     assert (mon.layer, mon.hook) == SITE
 
 
-def test_rest_of_conversation_latches_and_bridges():
+def test_rest_of_conversation_latches_by_ref_and_bridges():
+    from vllm.v1.capture.controller import ByRefLatch
+
+    digest = _register_steer("s", np.ones(HIDDEN) * 2)
     c = _consumer(probe_sites=["5:post_block"])
     tensors = {SITE: torch.ones(1, HIDDEN) * 10.0}  # high proj -> fires
-    a1 = c.on_step(_view([_req("a", [_add("rest_of_conversation", "probe")], cid="k")],
-                         tensors))
+    a1 = c.on_step(
+        _view([_req("a", [_named_add("rest_of_conversation", "s", digest, "probe")],
+                    cid="k")], tensors)
+    )
     assert _types(a1) == ["RequestSteeringOverride"]
+    # Latched by reference, not by value.
     assert len(c._latched) == 1
-    # a NEW request of the same conversation is bridged (no re-trigger)
-    a2 = c.on_step(_view([_req("b", [_add("rest_of_conversation", "probe")], cid="k")],
-                         tensors))
+    entry = c._latched["k"]
+    assert isinstance(entry, ByRefLatch)
+    assert entry.refs[0].name == "s" and entry.refs[0].digest == digest
+    # ~0 bytes accounted for a by-reference latch.
+    assert c._latched_bytes["k"] == 0
+    # a NEW request of the same conversation is bridged (no re-trigger); the
+    # bridge re-resolves the name from the worker registry.
+    a2 = c.on_step(
+        _view([_req("b", [_named_add("rest_of_conversation", "s", digest, "probe")],
+                    cid="k")], tensors)
+    )
     assert _types(a2) == ["RequestSteeringOverride"]
+    assert a2[0].req_id == "b"
+    assert a2[0].compose_admitted is True
+    np.testing.assert_allclose(
+        np.asarray(a2[0].vectors["post_block"][5]), np.full(HIDDEN, 2.0)
+    )
     assert c._bridges == 1
+
+
+def test_rest_of_conversation_digest_mismatch_disengages():
+    from vllm.v1.capture.controller import ByRefLatch
+
+    digest = _register_steer("s", np.ones(HIDDEN) * 2)
+    c = _consumer(probe_sites=["5:post_block"])
+    tensors = {SITE: torch.ones(1, HIDDEN) * 10.0}
+    c.on_step(
+        _view([_req("a", [_named_add("rest_of_conversation", "s", digest, "probe")],
+                    cid="k")], tensors)
+    )
+    assert isinstance(c._latched["k"], ByRefLatch)
+    # Re-register the name with DIFFERENT content mid-conversation.
+    _register_steer("s", np.ones(HIDDEN) * 99)
+    # A later gateless turn must disengage (drop the latch), not steer with the
+    # silently-changed content.
+    acts = c.on_step(_view([_req("b", None, cid="k")]))
+    assert acts is None
+    assert "k" not in c._latched
+    assert c._latch_ref_failed_warned is True
+
+
+def test_rest_of_conversation_missing_name_disengages():
+    digest = _register_steer("s", np.ones(HIDDEN) * 2)
+    c = _consumer(probe_sites=["5:post_block"])
+    tensors = {SITE: torch.ones(1, HIDDEN) * 10.0}
+    c.on_step(
+        _view([_req("a", [_named_add("rest_of_conversation", "s", digest, "probe")],
+                    cid="k")], tensors)
+    )
+    # Unregister the name (e.g. an admin /unregister mid-conversation).
+    get_worker_steering_vector_registry().unregister("s", "steer")
+    acts = c.on_step(_view([_req("b", None, cid="k")]))
+    assert acts is None
+    assert "k" not in c._latched
+
+
+def test_inline_rest_of_conversation_skipped_and_warned():
+    # An inline (unnamed) rest_of_conversation add from a non-frontend producer
+    # must be skipped-and-warned, never latched by value.
+    c = _consumer(probe_sites=["5:post_block"])
+    acts = c.on_step(_view([_req("r", [_add("rest_of_conversation")], cid="k")]))
+    assert acts is None
+    assert c._latched == {}
+    assert c._inline_conversation_warned is True
 
 
 def test_host_probe_does_not_fire_below_threshold():
@@ -172,10 +290,13 @@ def test_conversation_bridges_a_later_gateless_turn():
     # A later turn of a latched conversation carries NO gates of its own but
     # must still be bridged (regression: the no-gate short-circuit used to run
     # before the bridge check, so gateless turns were skipped).
+    digest = _register_steer("s", np.ones(HIDDEN) * 2)
     c = _consumer(probe_sites=["5:post_block"])
     tensors = {SITE: torch.ones(1, HIDDEN) * 10.0}
-    c.on_step(_view([_req("t1", [_add("rest_of_conversation", "probe")], cid="k")],
-                    tensors))
+    c.on_step(
+        _view([_req("t1", [_named_add("rest_of_conversation", "s", digest, "probe")],
+                    cid="k")], tensors)
+    )
     assert len(c._latched) == 1
     # turn 2: same conversation, steering=None -> bridged, not skipped
     acts = c.on_step(_view([_req("t2", None, cid="k")]))

@@ -247,6 +247,33 @@ def normalize_layer_entry(
     )
 
 
+def steering_vector_content_digest(packed: SteeringVectorSpecPacked) -> str:
+    """Return a stable sha256 hex digest of a packed steering vector's content.
+
+    Canonical serialization: the packed ``{hook: SteeringHookPacked}`` dict
+    JSON-encoded with sorted keys and no whitespace. ``data`` is already a
+    base64 string and every other field is a plain scalar/list, so the encoding
+    is deterministic and identical wherever it is computed (frontend registry
+    and worker registry), giving both sides a matching content address.
+
+    Used to guard latch-by-reference: a ``rest_of_conversation`` latch stores
+    the registered name plus this digest, and a later turn is only bridged if
+    the name still resolves to the *same* content — a name re-registered with
+    different vectors mid-conversation is detected as a digest mismatch and the
+    latch disengages rather than silently steering with changed content.
+
+    Args:
+        packed: The ``{hook: SteeringHookPacked}`` packed spec.
+
+    Returns:
+        The lowercase hex sha256 digest of the canonical serialization.
+    """
+    import json
+
+    canonical = json.dumps(packed, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _scale_vector(vec: list[float] | np.ndarray, scale: float) -> np.ndarray:
     """Multiply *vec* by *scale*, returning a float64 numpy array.
 

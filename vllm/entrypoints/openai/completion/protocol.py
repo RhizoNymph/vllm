@@ -272,7 +272,10 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description="Declarative per-request steering gates: a list of "
         "{when, scope, apply}. See the chat completion `steering` field for "
-        "the gate schema. Applied by the built-in declarative consumer; "
+        "the gate schema. A vector source may be {kind:'name', name:...} "
+        "(registered via /v1/steering/vectors/register) or {kind:'inline', "
+        "packed:...}; scope=rest_of_conversation with apply=add requires a "
+        "named steer vector. Applied by the built-in declarative consumer; "
         "requires --enable-steering.",
     )
 
