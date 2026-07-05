@@ -321,9 +321,14 @@ class CaptureRunnerMixin:
         )
         if rmeta is not None and rmeta.steering is not None:
             from vllm.v1.steering_schema import resolve_gates_safe
+            from vllm.v1.worker.steering_vector_registry import (
+                get_worker_steering_vector_registry,
+            )
 
             self._sync_steering_gates[req_id] = resolve_gates_safe(
-                rmeta.steering, req_id
+                rmeta.steering,
+                req_id,
+                get_worker_steering_vector_registry(),
             )
         mgr = self._capture_manager
         if was_present:

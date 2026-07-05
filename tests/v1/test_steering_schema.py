@@ -88,9 +88,9 @@ def test_attenuate_gate():
 
 
 def test_request_metadata_msgpack_roundtrip():
-    gates = build_steering_gates(
-        [_add_gate("rest_of_conversation", probe=True)], None
-    )
+    # Inline sources are only allowed on ephemeral scopes now; use
+    # rest_of_request (rest_of_conversation requires a NamedVec, tested below).
+    gates = build_steering_gates([_add_gate("rest_of_request", probe=True)], None)
     rm = RequestMetadata(conversation_id="c1", steering=gates)
     assert rm.is_empty() is False
     dec = msgspec.msgpack.decode(msgspec.msgpack.encode(rm), type=RequestMetadata)
@@ -98,7 +98,7 @@ def test_request_metadata_msgpack_roundtrip():
     assert len(dec.steering) == 1
     # after decode, sources are still InlineVec and resolvable
     g = resolve_gates(dec.steering)[0]
-    assert g.scope == "rest_of_conversation"
+    assert g.scope == "rest_of_request"
     assert isinstance(dec.steering[0].when.probe, InlineVec)
 
 
@@ -353,3 +353,108 @@ def test_build_gates_bad_dtype_raises_valueerror():
     # Without the fix this leaks TypeError (np.dtype) -> HTTP 500.
     with pytest.raises(ValueError, match="steering gate spec"):
         build_steering_gates(raw, None)
+
+
+# --------------------------------------------------------------------------
+# Named vectors: the frontend leaves NamedVec un-inflated (validates
+# existence only); the worker registry resolves it. rest_of_conversation add
+# requires a name; ephemeral scopes keep inline.
+# --------------------------------------------------------------------------
+
+
+def _registry(**named):
+    """A worker registry populated with ``{name: (kind, vec, layer)}`` entries."""
+    from vllm.v1.worker.steering_vector_registry import (
+        WorkerSteeringVectorRegistry,
+    )
+
+    reg = WorkerSteeringVectorRegistry()
+    for name, (kind, vec, layer) in named.items():
+        reg.register(name, kind, _pack(vec, layer))
+    return reg
+
+
+def _name_gate(scope, *, probe=False, strength=1.0):
+    when = (
+        {"kind": "probe", "probe": {"kind": "name", "name": "p"}, "threshold": 0.0}
+        if probe
+        else {"kind": "always"}
+    )
+    return {
+        "when": when,
+        "scope": scope,
+        "apply": {
+            "kind": "add",
+            "steer": {"kind": "name", "name": "s"},
+            "strength": strength,
+        },
+    }
+
+
+def test_named_vec_passes_through_uninflated():
+    from vllm.v1.steering_schema import NamedVec
+
+    reg = _registry(
+        s=("steer", np.ones(HIDDEN) * 2, 5), p=("probe", np.ones(HIDDEN), 5)
+    )
+    gates = build_steering_gates([_name_gate("this_token", probe=True)], reg)
+    assert len(gates) == 1
+    # The wire form still carries the names — no inline inflation.
+    assert isinstance(gates[0].apply.steer, NamedVec)
+    assert gates[0].apply.steer.name == "s"
+    assert isinstance(gates[0].when.probe, NamedVec)
+    assert gates[0].when.probe.name == "p"
+
+
+def test_named_vec_resolves_against_registry_with_name_and_digest():
+    from vllm.config.steering_types import steering_vector_content_digest
+
+    reg = _registry(s=("steer", np.ones(HIDDEN) * 2, 5))
+    gates = build_steering_gates([_name_gate("rest_of_request", strength=3.0)], reg)
+    res = resolve_gates(gates, reg)[0]
+    # steer × strength = 2 * 3 = 6
+    np.testing.assert_allclose(res.steer_vectors["post_block"][5], np.full(HIDDEN, 6.0))
+    assert res.steer_name == "s"
+    assert res.steer_digest == steering_vector_content_digest(
+        _pack(np.ones(HIDDEN) * 2, 5)
+    )
+
+
+def test_rest_of_conversation_requires_named_steer():
+    reg = _registry(s=("steer", np.ones(HIDDEN), 5))
+    # inline steer + rest_of_conversation + add -> rejected
+    with pytest.raises(ValueError, match="registered vector name"):
+        build_steering_gates([_add_gate("rest_of_conversation")], reg)
+    # named steer + rest_of_conversation -> accepted
+    gates = build_steering_gates([_name_gate("rest_of_conversation")], reg)
+    assert len(gates) == 1
+
+
+def test_ephemeral_scopes_keep_inline():
+    for scope in ("this_token", "next_step", "rest_of_request"):
+        gates = build_steering_gates([_add_gate(scope)], None)
+        assert len(gates) == 1
+
+
+def test_unknown_named_vector_rejected_at_frontend():
+    reg = _registry(s=("steer", np.ones(HIDDEN), 5))
+    raw = [{
+        "when": {"kind": "always"},
+        "scope": "this_token",
+        "apply": {"kind": "add", "steer": {"kind": "name", "name": "missing"}},
+    }]
+    with pytest.raises(ValueError, match="unknown steer vector name"):
+        build_steering_gates(raw, reg)
+
+
+def test_resolve_gates_safe_skips_unknown_name_gracefully():
+    # A NamedVec that is not in the worker registry (race: unregistered
+    # between the frontend check and worker admission) must be skipped, not
+    # crash the engine core.
+    reg = _registry(s=("steer", np.ones(HIDDEN), 5))
+    gates = build_steering_gates([_name_gate("rest_of_request")], reg)
+    empty = _registry()  # worker no longer has the name
+    with _capture_warnings() as cap:
+        out = resolve_gates_safe(gates, req_id="racy", registry=empty)
+    assert out is None
+    assert any("racy" in m for m in cap.messages)

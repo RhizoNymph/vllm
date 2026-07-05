@@ -212,6 +212,18 @@ class WorkerBase:
     def release_pre_materialized_steering_module(self, name: str) -> None:
         raise NotImplementedError
 
+    def register_steering_vector_name(
+        self,
+        name: str,
+        kind: str,
+        packed: dict,
+        digest: str | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def unregister_steering_vector_name(self, name: str, kind: str) -> bool:
+        raise NotImplementedError
+
     @property
     def vocab_size(self) -> int:
         """Get vocabulary size from model configuration."""

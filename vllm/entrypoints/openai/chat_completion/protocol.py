@@ -528,7 +528,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "request metadata (not a sampling parameter) and surfaced to "
         "worker-side capture consumers via StepRequestView.conversation_id so a "
         "dynamic-steering consumer can apply per-conversation (e.g. latched) "
-        "steering across the requests of one conversation.",
+        "steering across the requests of one conversation. It is an "
+        "unauthenticated global namespace: in a multi-client deployment the "
+        "operator or gateway must namespace ids per client (e.g. a "
+        "per-tenant prefix) so one client cannot inherit or pre-latch "
+        "another's steering.",
     )
 
     steering: list[dict[str, Any]] | None = Field(
@@ -538,9 +542,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "{kind:'probe', probe:<vec>, threshold, sharpness?}; `scope` is "
         "this_token|next_step|rest_of_request|rest_of_conversation; `apply` is "
         "{kind:'add', steer:<vec>, strength?} or {kind:'attenuate', strength}. "
-        "A <vec> is {kind:'name', name:<registered>} or "
-        "{kind:'inline', packed:{hook: SteeringHookPacked}} (base64). Applied by "
-        "the built-in declarative consumer with no server-registered consumer; "
+        "A <vec> is {kind:'name', name:<registered>} (register via "
+        "/v1/steering/vectors/register) or {kind:'inline', "
+        "packed:{hook: SteeringHookPacked}} (base64). scope=rest_of_conversation "
+        "with apply=add persists server-side and requires a named steer vector "
+        "(inline is rejected); ephemeral scopes accept inline. Applied by the "
+        "built-in declarative consumer with no server-registered consumer; "
         "requires the server to be started with --enable-steering.",
     )
 

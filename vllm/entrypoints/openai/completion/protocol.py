@@ -254,7 +254,11 @@ class CompletionRequest(OpenAIBaseModel):
         "request metadata (not a sampling parameter) and surfaced to "
         "worker-side capture consumers via StepRequestView.conversation_id so a "
         "dynamic-steering consumer can apply per-conversation (e.g. latched) "
-        "steering across the requests of one conversation.",
+        "steering across the requests of one conversation. It is an "
+        "unauthenticated global namespace: in a multi-client deployment the "
+        "operator or gateway must namespace ids per client (e.g. a "
+        "per-tenant prefix) so one client cannot inherit or pre-latch "
+        "another's steering.",
     )
 
     steering_name: str | None = Field(
@@ -268,7 +272,10 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description="Declarative per-request steering gates: a list of "
         "{when, scope, apply}. See the chat completion `steering` field for "
-        "the gate schema. Applied by the built-in declarative consumer; "
+        "the gate schema. A vector source may be {kind:'name', name:...} "
+        "(registered via /v1/steering/vectors/register) or {kind:'inline', "
+        "packed:...}; scope=rest_of_conversation with apply=add requires a "
+        "named steer vector. Applied by the built-in declarative consumer; "
         "requires --enable-steering.",
     )
 

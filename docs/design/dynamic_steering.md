@@ -862,16 +862,36 @@ gates in `RequestMetadata.steering` (§5.6), each a **`when × scope × apply`**
 discriminator) so gates ride the `EngineCoreRequest` msgpack channel like
 `conversation_id`. A vector source is `{"kind":"name","name":...}` (a
 server-registered probe/steer vector) or `{"kind":"inline","packed":{hook:
-SteeringHookPacked}}` (the base64 escape hatch, §5.6). Names are resolved to
-inline packed at the **frontend** (`build_steering_gates` in
-`to_request_metadata`), so the worker only ever sees packed bytes — no
-worker-side registry. `resolve_gates` unpacks to numpy once at admission and
-surfaces `ResolvedGate`s on `StepRequestView.steering` (both runners). Admission
-wraps it in `resolve_gates_safe`: a malformed payload from a producer that
-bypassed the frontend dry-run (offline `LLM`, Rust frontend, msgpack skew) is
+SteeringHookPacked}}` (the base64 escape hatch, §5.6). **Name resolution is
+worker-side** (reversing the earlier "the worker only ever sees packed bytes —
+no worker-side registry" decision): `build_steering_gates` at the **frontend**
+(`to_request_metadata`) only *validates* a `NamedVec`'s existence and passes it
+through un-inflated, so the short name — not the full base64 blob — rides the
+wire. `resolve_gates` then resolves every source to numpy once at admission —
+`NamedVec` against the rank-replicated worker registry
+(`vllm/v1/worker/steering_vector_registry.py`), `InlineVec` by unpacking — and
+surfaces `ResolvedGate`s (carrying the resolved steer source's name + content
+digest) on `StepRequestView.steering` (both runners). The reversal is
+**required** by the persistence semantics below: a `rest_of_conversation` latch
+must re-resolve its vectors *at bridge time* from server-resident state, which
+means the worker has to own the name→vectors mapping. Admission wraps
+`resolve_gates` in `resolve_gates_safe`: a malformed payload, **or a `NamedVec`
+whose name is unknown to the worker** (a benign register/admission race), is
 **gracefully skipped and logged once** — the request proceeds without
 declarative steering rather than crashing the engine core (all TP ranks see the
-same bytes and fail identically, so the graceful path can't desync them).
+same bytes and the same replicated registry, so the graceful path can't desync
+them).
+
+**Scope rule: `rest_of_conversation` + `add` requires a `NamedVec`.** Such a
+gate is latched and bridged across later turns, so persisting the client's
+inline bytes would pin them in server memory indefinitely. `build_steering_gates`
+rejects an inline steer on that combination with an HTTP 400 (register the
+vector and reference it by name, or use `rest_of_request`); ephemeral scopes
+(`this_token`/`next_step`/`rest_of_request`) keep inline support unchanged, and
+`attenuate` gates carry no vectors and are unaffected. A non-frontend producer
+that still emits an inline `rest_of_conversation` add is skipped-and-warned by
+the consumer (it cannot be latched by reference). Auto-registration of inline
+payloads into a content-addressed store was considered and **deferred**.
 
 **Built-in consumer** (`vllm/v1/capture/declarative.py`,
 `DeclarativeSteeringConsumer`): subclasses `SteeringController` to reuse the
@@ -887,7 +907,8 @@ bounded conversation latch/bridge and `_armed` lifecycle but overrides
   **in-graph every decode token** (§8.1, free). Host-evaluated scopes
   (`next_step`/`rest_of_request`/`rest_of_conversation` + `probe`) evaluate the
   probe once on the CPU against the captured residual; `rest_of_conversation`
-  latches and bridges later turns.
+  latches **by reference** (a `ByRefLatch` of the gate's named steer vectors,
+  §8.3) and bridges later turns by re-resolving those names at bridge time.
 - `attenuate`: a per-request `SteeringScaleUpdate` (installing an admitted-only
   override first so the damp is per-request, not shared across a config row).
   **`attenuate` with `when=probe` and `scope=this_token` is unsupported** and
@@ -955,14 +976,102 @@ declarative source, so operator flows are untouched. The request reverts to its
 admitted (static) decode steering; the probe-gated add is dropped, not applied
 blind.
 
-**Named vector registry** (frontend, `vllm/entrypoints/openai/steering/
+**Named vector registry** (frontend mirror `vllm/entrypoints/openai/steering/
 vector_registry.py` + admin routes `vllm/entrypoints/serve/steering/
-vectors_router.py`): `POST /v1/steering/vectors/register|unregister`, `GET
-/v1/steering/vectors`, gated by dev mode (`VLLM_SERVER_DEV_MODE`). Unlike the
-module registry / `/v1/steering/set`, these are NOT behind the steering API key:
-a named vector grants no capability over the already-unauthenticated inline
-packed path (it's naming sugar, inert until referenced). Distinct from the
-module registry (§5.7) — single named probe/steer vectors, frontend-only.
+vectors_router.py`, worker mirror `vllm/v1/worker/steering_vector_registry.py`):
+`POST /v1/steering/vectors/register|unregister`, `GET /v1/steering/vectors`,
+gated by dev mode (`VLLM_SERVER_DEV_MODE`). Each register/unregister is
+**broadcast to every worker** via `engine.collective_rpc`
+(`register_steering_vector_name` / `unregister_steering_vector_name`, mirroring
+`/v1/steering/set`'s rank-replicated flow), so a `NamedVec` gate resolves
+worker-side; the frontend copy stays as the validating mirror (existence checks
++ listing). Both sides store a sha256 content digest
+(`steering_vector_content_digest`) over the canonical packed serialization, so
+latch-by-reference digests match across the worker boundary. Registration stays
+dev-mode gated and, unlike the module registry / `/v1/steering/set`, is **not**
+behind the steering API key — but note the registry is now *load-bearing* (the
+only path to a `rest_of_conversation` latch), so the auth deferral is a
+deliberate, revisitable choice (§8.3). Distinct from the module registry (§5.7)
+— single named probe/steer vectors.
+
+### 8.3 Trust model and multi-tenancy
+
+The dynamic-steering stack assumes a **single-tenant / trusted-client**
+deployment: every client that can reach the engine is trusted not to interfere
+with another client's steering state. It ships **no authentication or
+per-client isolation** of its own. The consequences and the operator's
+responsibilities:
+
+- **`conversation_id` is a global, client-chosen, unauthenticated namespace.**
+  It rides the request-metadata channel (§5.6) and keys the controller's latch
+  map (§5.7). There is no ownership check: any client that presents a given
+  `conversation_id` bridges (inherits) whatever steering is latched on it, and
+  any client can pre-latch steering onto an id another client will later use.
+  A guessed or reused id therefore lets one client steer — or read the steered
+  behavior of — another client's turns.
+
+  **Requirement for shared deployments.** In any multi-client deployment the
+  **operator (or a gateway sitting in front of vLLM) must namespace
+  `conversation_id`s per client** — e.g. prefix each id with an authenticated
+  client/tenant identifier — so ids from different clients can never collide.
+  vLLM does not and cannot do this itself: the id is opaque to it, and it has
+  no notion of client identity. Without per-client namespacing, treat the
+  latch as shared mutable state visible to every client.
+
+- **Latch bounds (memory + churn).** The latch map is bounded on two axes,
+  both enforced by the controller base (§5.7, `SteeringController`): an **entry
+  count** (`max_conversations`, default 1024) and an **aggregate payload-byte**
+  bound (`max_latched_bytes`, default 256 MiB). A latched entry is a tagged
+  union: an operator-authored `RequestSteeringOverride` (raw vectors, **byte
+  accounted**) or a declarative **`ByRefLatch`** (name references + digests,
+  ~0 bytes — the vectors live in the worker registry, so the byte cap does not
+  apply to it). The byte bound exists because a raw-vector latch pins full
+  steering vectors (all hooks x layers, float32) on **every TP rank**; by
+  latching *by reference*, the declarative path (the one clients drive) retires
+  that host-memory pressure entirely — a client can no longer inflate the
+  server's latch footprint with its own bytes, because a `rest_of_conversation`
+  add must name a server-resident vector. Eviction is now **LRU** (a bridge
+  refreshes a conversation's recency via `move_to_end`; the least-recently-used
+  entry is dropped until both caps fit); a single raw-vector override exceeding
+  the byte cap alone is still refused (the triggering request steers that turn;
+  only cross-turn persistence drops). Eviction is a pure function of the
+  latch/bridge sequence (no time-based logic), so it stays rank-deterministic.
+  LRU narrows — but does not eliminate — the churn caveat: a client that floods
+  fresh `conversation_id`s (while *bridging* none) can still evict idle
+  latches, though actively-bridged conversations now survive unrelated churn.
+  This is a denial-of-persistence surface, not a correctness bug — another
+  reason shared deployments should gate/namespace ids at the edge.
+
+- **Digest-guarded bridging.** A `ByRefLatch` stores, per referenced name, the
+  content digest observed when the latch was installed. Bridging a later turn
+  re-resolves the name from the worker registry and **verifies the digest**: a
+  name that was unregistered, or re-registered with *different* content
+  mid-conversation, fails the check and the latch **disengages** (drops, warns
+  once) rather than silently steering the conversation with changed content. So
+  the shared-registry integrity caveat below cannot corrupt a live
+  conversation's steering — the worst case is a clean disengage, never a
+  substituted vector.
+
+- **Named-vector registry is a shared, load-bearing mutable namespace.** The
+  registry (§8.2, frontend + worker mirrors) keys vectors by a global name that
+  any request may resolve against, and `register`/`unregister` **silently
+  overwrite/delete** an existing name. A client can thus repoint or drop a name
+  other clients depend on; digest-guarded bridging turns that into a disengage
+  (above), and admission of a fresh request naming a dropped vector is a
+  graceful skip (§8.2). The registry is now **load-bearing** — it is the *only*
+  way to express a `rest_of_conversation` latch (inline is refused) — yet it is
+  still deliberately **not behind the steering API key**: for the ephemeral
+  scopes a named vector remains capability-equivalent to the already-open inline
+  path, and adding auth is a follow-up (the latch is by reference, so an
+  unauthenticated register no longer *also* buys unbounded server memory). The
+  integrity caveat (shared, last-writer-wins names) stands; the same per-client
+  namespacing / edge-gating guidance applies if names must be isolated.
+
+None of the above is behind authentication by design; hardening for a genuine
+multi-tenant deployment belongs at the operator/gateway layer in front of
+vLLM, not in this stack. Auth on the registry, a client-visible
+latched/bridged/evicted signal, and auto-registration of inline payloads
+(content-addressed store) are all deferred follow-ups.
 
 ## 9. Test plan
 
