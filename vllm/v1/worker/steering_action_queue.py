@@ -468,6 +468,29 @@ def _validate_update(
     validate_steering_vectors(update.vectors, steerable_layers)
 
 
+def steering_update_accepted(
+    update: SteeringVectorUpdate,
+    steerable_layers: dict,
+    *,
+    allow_cache_unsafe_phases: bool = False,
+) -> bool:
+    """Return whether ``apply_steering_updates`` would apply ``update``.
+
+    Single source of truth (reuses ``_validate_update``) so the caller's
+    determinism checksum folds exactly the set that gets applied, without
+    duplicating the phase / vector validation logic.
+    """
+    try:
+        _validate_update(
+            update,
+            steerable_layers,
+            allow_cache_unsafe_phases=allow_cache_unsafe_phases,
+        )
+    except SteeringVectorError:
+        return False
+    return True
+
+
 def apply_steering_updates(
     updates: list[SteeringVectorUpdate],
     manager: SteeringManager,

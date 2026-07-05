@@ -4,8 +4,9 @@
 
 Unlike the global monitor (one probe per site), the per-row monitor stores a
 probe + ``[threshold, sharpness]`` keyed by the row's LOGICAL owner
-(``("config", hash, "decode")`` / ``("dyn", dyn_id)`` / ``("global",
-"decode")``), and at populate time scatters them into the per-(layer, hook)
+(``RowOwner.config(hash, "decode")`` / ``RowOwner.dyn(dyn_id)`` /
+``RowOwner.global_("decode")``), and at populate time scatters them into
+the per-(layer, hook)
 ``*_monitor_probe_table`` / ``*_monitor_row_params`` buffers in row-position
 order. Opt-in: the buffers are dummy ``(1, 1)`` until
 ``resize_steering_row_monitor_buffers`` is called. CPU-only, no engine.
@@ -25,6 +26,7 @@ from vllm.model_executor.layers.steering import (
     resize_steering_row_monitor_buffers,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
+from vllm.v1.worker.steering_owner import RowOwner
 
 HIDDEN = 8
 MAX_STATIC = 4
@@ -86,17 +88,19 @@ def test_set_clear_has_row_monitor():
     mgr = _mgr()
     assert mgr.has_row_monitor is False
     probe = torch.ones(HIDDEN)
-    mgr.set_row_monitor(_HP_S, 0, ("config", 7, "decode"), probe, 1.0, 2.0)
+    mgr.set_row_monitor(_HP_S, 0, RowOwner.config(7, "decode"), probe, 1.0, 2.0)
     assert mgr.has_row_monitor is True
-    mgr.clear_row_monitor(_HP_S, 0, ("config", 7, "decode"))
+    mgr.clear_row_monitor(_HP_S, 0, RowOwner.config(7, "decode"))
     assert mgr.has_row_monitor is False
 
 
 def test_clear_row_monitor_granularity():
     mgr = _mgr()
-    mgr.set_row_monitor(_HP_S, 0, ("config", 1, "decode"), torch.ones(HIDDEN), 0.0, 1.0)
-    mgr.set_row_monitor(_HP_S, 0, ("dyn", 5), torch.ones(HIDDEN), 0.0, 1.0)
-    mgr.clear_row_monitor(_HP_S, 0, ("dyn", 5))
+    mgr.set_row_monitor(
+        _HP_S, 0, RowOwner.config(1, "decode"), torch.ones(HIDDEN), 0.0, 1.0
+    )
+    mgr.set_row_monitor(_HP_S, 0, RowOwner.dyn(5), torch.ones(HIDDEN), 0.0, 1.0)
+    mgr.clear_row_monitor(_HP_S, 0, RowOwner.dyn(5))
     assert mgr.has_row_monitor is True  # config entry remains
     mgr.clear_row_monitor()  # clear all
     assert mgr.has_row_monitor is False
@@ -113,7 +117,7 @@ def test_populate_writes_probe_to_owner_row():
     ch = 4242
     row = _reg_decode_config(mgr, ch)
     probe = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    mgr.set_row_monitor(_HP_S, 0, ("config", ch, "decode"), probe, 3.0, 5.0)
+    mgr.set_row_monitor(_HP_S, 0, RowOwner.config(ch, "decode"), probe, 3.0, 5.0)
     mgr.populate_steering_tables({0: layer})
 
     assert _row_active(layer) is True
@@ -128,7 +132,7 @@ def test_populate_default_rows_pass_through():
     ch = 11
     _reg_decode_config(mgr, ch)
     mgr.set_row_monitor(
-        _HP_S, 0, ("config", ch, "decode"), torch.ones(HIDDEN), 0.0, 1.0
+        _HP_S, 0, RowOwner.config(ch, "decode"), torch.ones(HIDDEN), 0.0, 1.0
     )
     mgr.populate_steering_tables({0: layer})
 
@@ -157,7 +161,7 @@ def test_row_reassignment_relocates_probe():
     _reg_decode_config(mgr, ch_a)
     row_b = _reg_decode_config(mgr, ch_b)
     probe_b = torch.arange(HIDDEN, dtype=torch.float32)
-    mgr.set_row_monitor(_HP_S, 0, ("config", ch_b, "decode"), probe_b, 0.0, 1.0)
+    mgr.set_row_monitor(_HP_S, 0, RowOwner.config(ch_b, "decode"), probe_b, 0.0, 1.0)
     mgr.populate_steering_tables({0: layer})
     torch.testing.assert_close(_probe_tbl(layer)[row_b], probe_b)
 
@@ -182,7 +186,7 @@ def test_disabled_keeps_dummy_buffers_and_never_activates():
     _reg_decode_config(mgr, ch)
     # Even with a configured row monitor, a disabled layer must not activate.
     mgr.set_row_monitor(
-        _HP_S, 0, ("config", ch, "decode"), torch.ones(HIDDEN), 0.0, 1.0
+        _HP_S, 0, RowOwner.config(ch, "decode"), torch.ones(HIDDEN), 0.0, 1.0
     )
     mgr.populate_steering_tables({0: layer})
     assert _row_active(layer) is False
@@ -201,7 +205,7 @@ def test_apc_signature_folds_row_monitor():
     assert mgr.effective_decode_signature(None, ch) is None
 
     mgr.set_row_monitor(
-        _HP_S, 0, ("config", ch, "decode"), torch.ones(HIDDEN), 0.0, 1.0
+        _HP_S, 0, RowOwner.config(ch, "decode"), torch.ones(HIDDEN), 0.0, 1.0
     )
     sig = mgr.effective_decode_signature(None, ch)
     assert sig is not None
@@ -214,12 +218,12 @@ def test_apc_signature_changes_with_probe():
     ch = 888
     _reg_decode_config(mgr, ch)
     mgr.set_row_monitor(
-        _HP_S, 0, ("config", ch, "decode"), torch.ones(HIDDEN), 0.0, 1.0
+        _HP_S, 0, RowOwner.config(ch, "decode"), torch.ones(HIDDEN), 0.0, 1.0
     )
     sig1 = mgr.effective_decode_signature(None, ch)
     # Reconfigure the probe ⇒ the steered decode KV differs ⇒ new key.
     mgr.set_row_monitor(
-        _HP_S, 0, ("config", ch, "decode"), torch.full((HIDDEN,), 2.0), 0.0, 1.0
+        _HP_S, 0, RowOwner.config(ch, "decode"), torch.full((HIDDEN,), 2.0), 0.0, 1.0
     )
     sig2 = mgr.effective_decode_signature(None, ch)
     assert sig1 != sig2

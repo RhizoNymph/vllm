@@ -9,7 +9,7 @@ reading the live buffer values rather than baked-in constants.
 """
 
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from torch import nn
@@ -429,6 +429,76 @@ def resize_steering_row_monitor_buffers(layers, *, enable: bool) -> None:
             )
 
 
+class SteeringOpArgs(NamedTuple):
+    """Canonical positional order of the ``apply_steering`` op's 15 tensors.
+
+    The op takes 15 same-typed tensors; a transposition type-checks and only
+    fails behaviorally. This NamedTuple is the single source of truth for that
+    order — :func:`_emit_steering_op`, warmup, and tests build calls by
+    splatting it, so no site hand-lists the positional tensors. The registered
+    op, its fake, and the Triton wrapper keep flat signatures (torch custom-op
+    schemas require flat tensors) mirroring these fields; a schema-lock test
+    asserts ``_fields`` matches the registered op's argument names in order.
+    """
+
+    hidden_states: torch.Tensor
+    steering_table: torch.Tensor
+    steering_index: torch.Tensor
+    any_active: torch.Tensor
+    steering_scales: torch.Tensor
+    steering_dynamic_vec: torch.Tensor
+    steering_token_scales: torch.Tensor
+    steering_row_gate: torch.Tensor
+    steering_monitor_probe: torch.Tensor
+    steering_monitor_params: torch.Tensor
+    steering_monitor_active: torch.Tensor
+    steering_decode_mask: torch.Tensor
+    steering_monitor_probe_table: torch.Tensor
+    steering_monitor_row_params: torch.Tensor
+    steering_monitor_row_active: torch.Tensor
+
+
+def _build_steering_op_args(
+    module: nn.Module,
+    hook_point: SteeringHookPoint,
+    hidden_states: torch.Tensor,
+    monitor_active: torch.Tensor,
+) -> SteeringOpArgs:
+    """Assemble the canonical op args from a layer's steering buffers.
+
+    ``monitor_active`` is passed explicitly because the caller substitutes the
+    always-False ``steering_monitor_off`` flag in cross-layer monitor mode; all
+    other tensors are read from ``module`` for ``hook_point``.
+    """
+    return SteeringOpArgs(
+        hidden_states=hidden_states,
+        steering_table=getattr(module, HOOK_POINT_TABLE_ATTR[hook_point]),
+        steering_index=module.steering_index,
+        any_active=getattr(module, HOOK_POINT_ANY_ACTIVE_ATTR[hook_point]),
+        steering_scales=module.steering_scales,
+        steering_dynamic_vec=getattr(module, HOOK_POINT_DYNVEC_ATTR[hook_point]),
+        steering_token_scales=module.steering_token_scales,
+        steering_row_gate=module.steering_row_gate,
+        steering_monitor_probe=getattr(
+            module, HOOK_POINT_MONITOR_PROBE_ATTR[hook_point]
+        ),
+        steering_monitor_params=getattr(
+            module, HOOK_POINT_MONITOR_PARAMS_ATTR[hook_point]
+        ),
+        steering_monitor_active=monitor_active,
+        steering_decode_mask=module.steering_decode_mask,
+        steering_monitor_probe_table=getattr(
+            module, HOOK_POINT_ROW_PROBE_ATTR[hook_point]
+        ),
+        steering_monitor_row_params=getattr(
+            module, HOOK_POINT_ROW_PARAMS_ATTR[hook_point]
+        ),
+        steering_monitor_row_active=getattr(
+            module, HOOK_POINT_ROW_ACTIVE_ATTR[hook_point]
+        ),
+    )
+
+
 def _emit_steering_op(
     module: nn.Module,
     x: torch.Tensor,
@@ -477,21 +547,7 @@ def _emit_steering_op(
         # unconfigured monitor costs nothing.
         fused_active = monitor_active
     return torch.ops.vllm.apply_steering(
-        x,
-        getattr(module, HOOK_POINT_TABLE_ATTR[hook_point]),
-        module.steering_index,
-        getattr(module, HOOK_POINT_ANY_ACTIVE_ATTR[hook_point]),
-        module.steering_scales,
-        getattr(module, HOOK_POINT_DYNVEC_ATTR[hook_point]),
-        module.steering_token_scales,
-        module.steering_row_gate,
-        getattr(module, HOOK_POINT_MONITOR_PROBE_ATTR[hook_point]),
-        getattr(module, HOOK_POINT_MONITOR_PARAMS_ATTR[hook_point]),
-        fused_active,
-        module.steering_decode_mask,
-        getattr(module, HOOK_POINT_ROW_PROBE_ATTR[hook_point]),
-        getattr(module, HOOK_POINT_ROW_PARAMS_ATTR[hook_point]),
-        getattr(module, HOOK_POINT_ROW_ACTIVE_ATTR[hook_point]),
+        *_build_steering_op_args(module, hook_point, x, fused_active)
     )
 
 

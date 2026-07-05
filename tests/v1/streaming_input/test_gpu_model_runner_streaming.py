@@ -207,3 +207,86 @@ def test_e2e_streaming_with_multimodal_features(mock_model_runner_with_input_bat
 
     # Verify request was removed from InputBatch during update (avoids duplication)
     assert req_id not in runner.input_batch.req_id_to_index
+
+
+def test_streaming_re_add_refreshes_sync_metadata_stashes():
+    """A streaming re-add must refresh the sync-consumer metadata stashes.
+
+    Regression for the v1/v2 drift where ``_update_streaming_request`` never
+    refreshed ``_sync_conversation_ids`` / ``_sync_steering_gates``, so a
+    streaming continuation that changed the conversation id or declarative
+    gates kept serving the prior chunk's stale values (v2 already refreshes
+    them unconditionally in ``_capture_add_request``).
+    """
+    from vllm.v1.request_metadata import RequestMetadata
+    from vllm.v1.steering_schema import build_steering_gates, resolve_gates_safe
+
+    req_id = "streaming_meta_req"
+
+    runner = Mock(spec=GPUModelRunner)
+    runner.uses_mrope = False
+    runner.late_interaction_runner = Mock()
+    runner.input_batch = InputBatch(
+        max_num_reqs=10,
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        device="cpu",
+        pin_memory=False,
+        vocab_size=32000,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        logitsprocs=None,
+        is_pooling_model=False,
+    )
+    # Stale stashes left over from the prior chunk's registration.
+    runner._sync_conversation_ids = {req_id: "conv-old"}
+    runner._sync_steering_gates = {req_id: ["STALE"]}
+
+    req_state = CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=[1, 2, 3],
+        mm_features=[],
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+        generator=None,
+        block_ids=([0],),
+        num_computed_tokens=3,
+        output_token_ids=[9],
+    )
+    runner.requests = {req_id: req_state}
+    runner.input_batch.add_request(req_state)
+
+    gates = build_steering_gates(
+        [
+            {
+                "when": {"kind": "always"},
+                "scope": "rest_of_request",
+                "apply": {"kind": "attenuate", "strength": 0.25},
+            }
+        ],
+        None,
+    )
+
+    new_req_data = Mock()
+    new_req_data.prompt_token_ids = [1, 2, 3, 9, 4]
+    new_req_data.mm_features = []
+    new_req_data.prompt_embeds = None
+    new_req_data.sampling_params = SamplingParams(max_tokens=8)
+    new_req_data.pooling_params = None
+    new_req_data.block_ids = ([0, 1],)
+    new_req_data.num_computed_tokens = 4
+    new_req_data.prefill_steering_config_hash = 0
+    new_req_data.decode_steering_config_hash = 0
+    new_req_data.request_metadata = RequestMetadata(
+        conversation_id="conv-new", steering=gates
+    )
+
+    GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
+
+    # Conversation id refreshed to the continuation's value (not stale).
+    assert runner._sync_conversation_ids[req_id] == "conv-new"
+    # Declarative gates refreshed to the resolved continuation gates.
+    refreshed = runner._sync_steering_gates[req_id]
+    assert refreshed != ["STALE"]
+    assert refreshed is not None
+    assert len(refreshed) == len(resolve_gates_safe(gates, req_id))

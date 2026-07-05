@@ -504,7 +504,7 @@ class TestSchedulerAPCDecodeSignatures(unittest.TestCase):
         req = self._decode_request(sched)
         sched._req_decode_signature["r"] = self.SIG
         req.block_hash_decode_steering_config_hash = self.SIG
-        sched._set_request_block_hash_steering_overrides(req, set())
+        sched._set_request_block_hash_steering_overrides(req)
         self.assertEqual(req.block_hash_decode_steering_config_hash, self.SIG)
 
     def test_unknown_request_ignored(self):

@@ -373,13 +373,27 @@ index is hook-independent). The kernel
 (`steering_kernel.py::_apply_steering_kernel`) and the eager path load
 `scale = scales[row]` and compute `out = hidden + table[row] * scale`;
 `apply_steering`/`apply_steering_fake`/`apply_layer_steering` and the
-warmup carry the new arg. The `SteeringManager` keys scales by *logical
-owner* (`_global_scales[phase]`, `_config_scales[(hash, phase)]`,
-`_dynamic_scales[dyn_id]`) so they survive row reuse, and writes them in
+warmup carry the new arg. The `SteeringManager` keys scales by a typed
+*logical owner* — a frozen, totally-ordered `RowOwner`
+(`vllm/v1/worker/steering_owner.py`): `RowOwner.global_(phase)`,
+`RowOwner.config(hash, phase)`, `RowOwner.dyn(dyn_id)` — held in one
+`_row_scales: dict[RowOwner, float]` so they survive row reuse. (The
+legacy `_global_scales` / `_config_scales` / `_dynamic_scales` names are
+now thin read-only views over `_row_scales` for the status payload.) All
+owner-keyed runtime state (per-row scales **and** the per-row monitors of
+§8.1) is dropped through a single `_purge_owner(owner)` at release:
+`release_dynamic_config` and the **refcount-0 branch** of `release_config`
+(a live→0 transition) both call it, so a scale/monitor set for a content
+hash cannot silently re-apply to a future request that re-registers that
+hash. A scale *pre-armed* for a not-yet-registered hash is untouched
+(purge fires only on live→0). Scales are written in
 `populate_steering_tables` (alongside the tables) plus a cheap
-scales-only path `populate_steering_scales` gated by `_scales_dirty`
-(separate from `_tables_dirty` — the whole point: a strength change costs
-no table recompose, no vector H2D). The mixin calls the cheap path from
+scales-only path `populate_steering_scales`. Populate scheduling is a
+small `_DirtyState` (`content` / `membership` / `scales`) with the
+implications encoded in code (membership ⇒ content; a full populate clears
+scales too; the cheap path needs scales dirty and neither content nor
+membership) — the whole point: a strength change costs no table recompose,
+no vector H2D. The mixin calls the cheap path from
 `_update_steering_buffers` when only scales are dirty. **Row 0 and all
 prefill rows are pinned to 1.0** at populate (scaling them is meaningless
 or cache-unsafe per §7). API: `SteeringManager.set_global_scale` /
@@ -614,6 +628,33 @@ Resolution by phase:
   boundary only (drain once per scheduler step, which the current drain
   point already guarantees).
 
+### 6.1 Determinism-divergence detector (implemented)
+
+The "cheap insurance" hash above is implemented as an always-on rolling
+checksum. In `_apply_steering_actions`, each action that is *actually*
+applied (rejected actions are excluded) is folded into a per-worker u64
+checksum: a `zlib.crc32` over a compact, `PYTHONHASHSEED`-free digest of
+the action's content (class, target `req_id`/`config_hash`/`dyn_id`,
+`hook`/`layer`, `source`, and a bit-exact shape+CRC of any vector/probe
+payload), mixed in application order with a per-drain-batch ordinal so
+"same actions, different step" differs. Because actions are host-side
+numpy built from rank-identical inputs, the digest is bit-exact rather
+than a norm — strictly stronger and never legitimately divergent across
+ranks. Cost is O(applied actions) and zero on idle steps.
+
+`get_dynamic_steering_status` exposes `action_checksum` (hex) and
+`action_count`; `GET /v1/steering/dynamic` compares them across workers
+via `check_action_determinism`. Comparison is scoped **within each PP
+stage** (grouped by `pp_rank`): TP ranks in a stage own identical layers
+and must match, while PP stages own disjoint layers and may legitimately
+differ. Sync-consumer-originated actions only exist at `pp == 1` anyway,
+where this reduces to an all-workers comparison. A mismatch does not 500;
+the response carries `determinism: {consistent: false, checksums: {...}}`
+and a rate-limited server-side ERROR fires. Granularity is **poll-time**:
+a desync is detected on the next status poll, not the step it occurs, so
+the checksum bounds (does not prevent) corrupted output — pair it with
+periodic polling for timely detection.
+
 ## 7. Steering identity, prefix caching, and phases
 
 The steering runtime's correctness rules (see
@@ -764,11 +805,15 @@ Design mirrors the §5.3 per-row scale and the §5.2 override pool:
   without touching model files; `resize_steering_row_monitor_buffers` runs once
   from `_init_steering_state`). The flag is in `compute_hash` (buffer shape is
   baked into captured graphs).
-- **Manager** keys configs by logical owner (`("global","decode")` /
-  `("config", hash, "decode")` / `("dyn", dyn_id)`) so they survive row
-  reassignment, and scatters them in row-position order with the same
+- **Manager** keys configs by the typed logical owner
+  (`RowOwner.global_("decode")` / `RowOwner.config(hash, "decode")` /
+  `RowOwner.dyn(dyn_id)`, `vllm/v1/worker/steering_owner.py`) so they survive
+  row reassignment, and scatters them in row-position order with the same
   `indices` as the table write (`set_row_monitor`/`clear_row_monitor`/
-  `has_row_monitor`/`_build_row_probe_and_params`).
+  `has_row_monitor`/`_build_row_probe_and_params`). Per-row monitors are
+  purged with the owner's other runtime state via the single `_purge_owner`
+  at release (refcount-0 for configs; see §5.3), so a monitor never survives
+  a hash's release to re-apply to a re-registration.
 - **Action**: `SteeringMonitorUpdate` gains optional `req_id`/`config_hash`/
   `dyn_id` (at most one). None ⇒ the global monitor (unchanged); one set ⇒ a
   per-row monitor on that owner (`req_id` resolved to its live `dyn_id`).

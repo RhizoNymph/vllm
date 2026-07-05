@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import secrets
+import time
 from http import HTTPStatus
 
 from fastapi import APIRouter, FastAPI, Request
@@ -17,6 +18,7 @@ from vllm.config.steering_types import (
 )
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.steering._merge import (
+    check_action_determinism,
     deep_merge_status,
     normalize_worker_err,
 )
@@ -33,6 +35,27 @@ router = APIRouter()
 # validate-then-apply flow in /set cannot be interleaved with
 # another /set or /clear request.
 _steering_lock = asyncio.Lock()
+
+# Rate limit (seconds) for the applied-action determinism-divergence ERROR
+# log, so a client polling the status endpoint cannot flood the log.
+_DETERMINISM_LOG_INTERVAL_S = 60.0
+_last_determinism_log_s = 0.0
+
+
+def _log_determinism_divergence(checksums: dict) -> None:
+    """Log a cross-rank action-checksum divergence at ERROR (rate-limited)."""
+    global _last_determinism_log_s
+    now = time.monotonic()
+    if now - _last_determinism_log_s < _DETERMINISM_LOG_INTERVAL_S:
+        return
+    _last_determinism_log_s = now
+    logger.error(
+        "dynamic steering determinism violation: applied-action checksums "
+        "diverge across ranks (worker=checksum: %s). One rank's steering "
+        "tables have silently desynced from its siblings; outputs may be "
+        "corrupted. See docs/design/dynamic_steering.md §6.",
+        checksums,
+    )
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -496,7 +519,13 @@ async def get_dynamic_steering(raw_request: Request) -> JSONResponse:
 
     try:
         results = await engine.collective_rpc("get_dynamic_steering_status")
-        return JSONResponse(content={"workers": list(results)})
+        workers = list(results)
+        determinism = check_action_determinism(workers)
+        if not determinism["consistent"]:
+            _log_determinism_divergence(determinism["checksums"])
+        return JSONResponse(
+            content={"workers": workers, "determinism": determinism}
+        )
     except Exception as err:
         logger.exception("Failed to get dynamic steering status")
         return JSONResponse(
