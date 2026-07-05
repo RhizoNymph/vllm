@@ -26,8 +26,9 @@ See ``examples/online_serving/openai_patch_client.py`` for a runnable demo.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -416,6 +417,7 @@ class PatchStudy:
         clean: CleanRun | None = None,
         clean_prompt: str | None = None,
         server_side: bool = False,
+        on_cell: Callable[[dict], None] | None = None,
     ) -> SweepResult:
         """Fan out one patched request per (layer, position) cell.
 
@@ -444,6 +446,14 @@ class PatchStudy:
         ``/v1/patch_sweep`` request — the server expands and batches the cells
         internally (no per-cell HTTP round trips). Returns the same
         :class:`SweepResult`.
+
+        ``on_cell`` (``server_side=True`` only): when given, the request is sent
+        with ``stream=true`` and this callback is invoked with each cell event
+        dict (``{"type": "cell", "hook", "layer", "position", "value", ...}``)
+        as it lands, so a large grid can drive a live heatmap instead of holding
+        one response open for minutes. The returned :class:`SweepResult` is built
+        from the terminal summary event and is identical to the non-streaming
+        result. Without ``on_cell`` the sweep is non-streaming (unchanged).
         """
         hook = hook or self.hook
         layers = list(layers)
@@ -489,6 +499,13 @@ class PatchStudy:
                 metric=metric,
                 clean=clean,
                 clean_prompt=send_clean_prompt,
+                on_cell=on_cell,
+            )
+
+        if on_cell is not None:
+            raise ValueError(
+                "on_cell streaming is only supported for server_side=True "
+                "sweeps (the per-cell path has no single streamed response)."
             )
 
         if source_run is None:
@@ -636,12 +653,18 @@ class PatchStudy:
         metric: str,
         clean: CleanRun | None,
         clean_prompt: str | None,
+        on_cell: Callable[[dict], None] | None = None,
     ) -> SweepResult:
         """One POST to /v1/patch_sweep; the server expands + batches the grid.
 
         Spans in ``positions`` are forwarded as objects (the server resolves
         them against the corrupt prompt). ``clean_prompt`` drives server-side
         alignment and, when ``run`` is missing, one-call auto-capture.
+
+        With ``on_cell`` the request is sent with ``stream=true`` and the
+        response consumed as SSE: ``on_cell`` fires per cell event and the
+        result is built from the terminal ``summary`` event (identical to the
+        non-streaming response).
         """
         import httpx
 
@@ -671,14 +694,17 @@ class PatchStudy:
             "metric": metric,
             "logprobs": self.logprobs,
             "clean_baseline": clean_baseline,
+            "stream": on_cell is not None,
         }
         url = f"{self.base_url}/patch_sweep"
-        async with httpx.AsyncClient(timeout=None) as client:
-            resp = await client.post(
-                url, json=payload, headers={"Authorization": f"Bearer {self.api_key}"}
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        if on_cell is not None:
+            data = await self._stream_sweep(url, payload, headers, on_cell)
+        else:
+            async with httpx.AsyncClient(timeout=None) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
         notes = []
         if data.get("skipped"):
             notes.append(f"skipped={data['skipped']}")
@@ -696,6 +722,50 @@ class PatchStudy:
             auto_captured=data.get("auto_captured", False),
             captured_source_run=data.get("captured_source_run"),
         )
+
+    async def _stream_sweep(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict,
+        on_cell: Callable[[dict], None],
+    ) -> dict:
+        """POST a streaming sweep, invoke ``on_cell`` per cell, return summary.
+
+        Consumes the ``text/event-stream`` line by line: ``cell`` events fire
+        ``on_cell``; the ``summary`` event's payload (the full non-streaming
+        response) is returned; ``[DONE]`` ends the stream. A pre-fan-out error
+        still comes back as a plain JSON 400 (the server only streams once the
+        grid begins), surfaced here as an ``httpx`` error.
+        """
+        import httpx
+
+        summary: dict | None = None
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST", url, json=payload, headers=headers
+            ) as resp:
+                if resp.headers.get("content-type", "").startswith(
+                    "application/json"
+                ):
+                    await resp.aread()
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[len("data: "):]
+                    if data == "[DONE]":
+                        break
+                    event = json.loads(data)
+                    if event.get("type") == "cell":
+                        on_cell(event)
+                    elif event.get("type") == "summary":
+                        summary = event
+        if summary is None:
+            raise RuntimeError(
+                "patch_sweep stream ended without a summary event"
+            )
+        return summary
 
     @staticmethod
     def _metric(
