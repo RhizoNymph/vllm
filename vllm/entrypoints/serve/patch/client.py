@@ -30,10 +30,16 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from openai import AsyncOpenAI, OpenAI
 
 from vllm.entrypoints.serve.patch.alignment import align_token_positions
+from vllm.entrypoints.serve.patch.spans import (
+    dedup_positions,
+    incremental_char_offsets,
+    resolve_span_positions as _resolve_span_positions,
+)
 
 
 @dataclass
@@ -66,57 +72,6 @@ class Span:
     """Which match to use when ``text`` appears more than once (0 = first)."""
 
 
-def _resolve_span_positions(
-    token_offsets: Sequence[tuple[int, int]],
-    text: str,
-    span: str,
-    occurrence: int = 0,
-) -> list[int]:
-    """Token positions whose character span overlaps ``span`` within ``text``.
-
-    Args:
-        token_offsets: ``(char_start, char_end)`` per token position, indexing
-            into ``text`` (half-open, cumulative over the tokenized prompt).
-        text: The detokenized prompt the offsets index into.
-        span: The substring to cover.
-        occurrence: Which match to select when ``span`` appears multiple times.
-
-    Returns:
-        The ascending token positions overlapping the chosen match.
-
-    Raises:
-        ValueError: ``span`` is empty, not found, or ``occurrence`` is out of
-            range for the number of matches.
-    """
-    if not span:
-        raise ValueError("span must be a non-empty substring")
-    starts: list[int] = []
-    idx = text.find(span)
-    while idx != -1:
-        starts.append(idx)
-        idx = text.find(span, idx + 1)
-    if not starts:
-        raise ValueError(f"span {span!r} not found in prompt {text!r}")
-    if not 0 <= occurrence < len(starts):
-        raise ValueError(
-            f"span {span!r} occurs {len(starts)} time(s) in the prompt; "
-            f"occurrence={occurrence} is out of range"
-        )
-    char_start = starts[occurrence]
-    char_end = char_start + len(span)
-    positions = [
-        i
-        for i, (start, end) in enumerate(token_offsets)
-        if start < char_end and end > char_start
-    ]
-    if not positions:
-        raise ValueError(
-            f"span {span!r} matched chars [{char_start}, {char_end}) but "
-            f"covers no token position (empty/whitespace-only token span)"
-        )
-    return positions
-
-
 @dataclass
 class SweepResult:
     """A (layers x positions) grid of patching metrics."""
@@ -129,6 +84,12 @@ class SweepResult:
     clean: float | None = None
     corrupt: float | None = None
     notes: list[str] = field(default_factory=list)
+    auto_captured: bool = False
+    """True when a server-side sweep auto-captured the clean run in one call
+    (``clean_prompt`` given, ``source_run`` was missing) rather than reusing a
+    prior capture."""
+    captured_source_run: str | None = None
+    """The run handle a one-call auto-capture wrote under, else ``None``."""
 
     def to_numpy(self):
         import numpy as np
@@ -319,16 +280,7 @@ class PatchStudy:
             ``offsets[k]`` is the half-open ``(start, end)`` char span of token
             ``k`` in ``text``.
         """
-        offsets: list[tuple[int, int]] = []
-        prev_len = 0
-        text = ""
-        for k in range(1, len(ids) + 1):
-            text = self._detokenize(ids[:k])
-            if text is None:
-                raise RuntimeError("/detokenize unavailable; cannot map span")
-            offsets.append((prev_len, len(text)))
-            prev_len = len(text)
-        return text, offsets
+        return incremental_char_offsets(self._detokenize, ids)
 
     async def positions_for(
         self, prompt: str, span: str, *, occurrence: int = 0
@@ -368,20 +320,17 @@ class PatchStudy:
         Order is preserved and duplicates dropped.
         """
         items: Sequence[Any] = [positions] if isinstance(positions, Span) else positions
-        out: list[int] = []
-        seen: set[int] = set()
+        groups: list[list[int]] = []
         for item in items:
             if isinstance(item, Span):
-                resolved = await self.positions_for(
-                    prompt, item.text, occurrence=item.occurrence
+                groups.append(
+                    await self.positions_for(
+                        prompt, item.text, occurrence=item.occurrence
+                    )
                 )
             else:
-                resolved = [int(item)]
-            for pos in resolved:
-                if pos not in seen:
-                    seen.add(pos)
-                    out.append(pos)
-        return out
+                groups.append([int(item)])
+        return dedup_positions(groups)
 
     # ---- step 1: capture the clean run once --------------------------------
 
@@ -456,24 +405,40 @@ class PatchStudy:
         self,
         corrupt_prompt: str,
         *,
-        run: str,
+        run: str | None = None,
         layers: Sequence[int],
-        positions: Sequence[int] | Span,
+        positions: Sequence[int | Span] | Span,
         hook: str | None = None,
         alpha: float = 1.0,
         answer_token: str,
         foil_token: str | None = None,
         metric: str = "logprob",
         clean: CleanRun | None = None,
+        clean_prompt: str | None = None,
         server_side: bool = False,
     ) -> SweepResult:
         """Fan out one patched request per (layer, position) cell.
 
         ``positions`` accepts token indices and/or :class:`Span` markers; each
         span resolves to the corrupt-prompt token positions covering its text.
+        With ``server_side=True`` spans are forwarded to the server (resolved
+        there); the per-cell path resolves them client-side.
 
         ``metric``: ``"logprob"`` (P(answer)), ``"logit_diff"`` (answer - foil),
         or ``"recovered"`` ((patched - corrupt) / (clean - corrupt)).
+
+        The clean run to patch from is chosen as: explicit ``run=``, else the
+        ``clean`` handle's ``run_id``, else — for ``server_side=True`` with
+        ``clean_prompt`` — a fresh per-call run the server auto-captures (fresh
+        because the auto-capture taps only the swept layers, so reusing a name
+        across grids with different layers would 400).
+
+        ``clean_prompt``: the clean prompt text. With ``server_side=True`` and
+        no existing run it drives one-call auto-capture (the server captures it
+        before running the grid, and ``SweepResult.auto_captured`` /
+        ``captured_source_run`` report it); with an existing run it only aligns
+        positions. The per-cell path (``server_side=False``) cannot auto-capture
+        — pass a captured ``clean`` handle there instead.
 
         With ``server_side=True`` the whole grid is sent as a single
         ``/v1/patch_sweep`` request — the server expands and batches the cells
@@ -482,13 +447,39 @@ class PatchStudy:
         """
         hook = hook or self.hook
         layers = list(layers)
-        positions = await self._resolve_positions(positions, corrupt_prompt)
         notes: list[str] = []
 
+        # Effective source run: explicit run wins, else the clean handle's run.
+        source_run = run if run is not None else (
+            clean.run_id if clean is not None else None
+        )
+
+        if not server_side and clean_prompt is not None and clean is None:
+            raise ValueError(
+                "clean_prompt drives server-side auto-capture; the per-cell "
+                "path (server_side=False) has no capture endpoint — call "
+                "capture_clean() and pass clean=<CleanRun>, or set "
+                "server_side=True."
+            )
+
         if server_side:
+            # clean_prompt (explicit) wins over the clean handle's prompt.
+            send_clean_prompt = (
+                clean_prompt if clean_prompt is not None
+                else (clean.prompt if clean is not None else None)
+            )
+            if source_run is None:
+                if send_clean_prompt is None:
+                    raise ValueError(
+                        "server-side sweep needs run=, a captured clean=, or "
+                        "clean_prompt= for one-call auto-capture."
+                    )
+                # Fresh name per call: the server auto-captures only the swept
+                # layers, so a name reused across differing-layer grids 400s.
+                source_run = uuid4().hex
             return await self._sweep_server_side(
                 corrupt_prompt,
-                run=run,
+                run=source_run,
                 layers=layers,
                 positions=positions,
                 hook=hook,
@@ -497,7 +488,15 @@ class PatchStudy:
                 foil_token=foil_token,
                 metric=metric,
                 clean=clean,
+                clean_prompt=send_clean_prompt,
             )
+
+        if source_run is None:
+            raise ValueError(
+                "sweep needs run= (capture_clean() first) or server_side=True."
+            )
+        run = source_run
+        positions = await self._resolve_positions(positions, corrupt_prompt)
 
         grade_ids = self._grade_ids(answer_token, foil_token)
 
@@ -609,23 +608,45 @@ class PatchStudy:
             notes=notes,
         )
 
+    @staticmethod
+    def _encode_positions(
+        positions: Sequence[int | Span] | Span,
+    ) -> list[int | dict]:
+        """Forward positions to the server, spans as ``{span, occurrence}``."""
+        items = [positions] if isinstance(positions, Span) else positions
+        out: list[int | dict] = []
+        for item in items:
+            if isinstance(item, Span):
+                out.append({"span": item.text, "occurrence": item.occurrence})
+            else:
+                out.append(int(item))
+        return out
+
     async def _sweep_server_side(
         self,
         corrupt_prompt: str,
         *,
         run: str,
         layers: list[int],
-        positions: list[int],
+        positions: Sequence[int | Span] | Span,
         hook: str,
         alpha: float,
         answer_token: str,
         foil_token: str | None,
         metric: str,
         clean: CleanRun | None,
+        clean_prompt: str | None,
     ) -> SweepResult:
-        """One POST to /v1/patch_sweep; the server expands + batches the grid."""
+        """One POST to /v1/patch_sweep; the server expands + batches the grid.
+
+        Spans in ``positions`` are forwarded as objects (the server resolves
+        them against the corrupt prompt). ``clean_prompt`` drives server-side
+        alignment and, when ``run`` is missing, one-call auto-capture.
+        """
         import httpx
 
+        # An auto-capturing sweep grades the clean baseline itself; only send a
+        # precomputed baseline when reusing an explicit clean handle.
         clean_baseline = None
         if clean is not None:
             clean_baseline = (
@@ -638,11 +659,12 @@ class PatchStudy:
             "prompt": corrupt_prompt,
             "source_run": run,
             # The server aligns positions when the prompts tokenize to
-            # different lengths (and 400s a mismatch without clean_prompt).
-            "clean_prompt": clean.prompt if clean is not None else None,
+            # different lengths (and 400s a mismatch without clean_prompt);
+            # a missing run + clean_prompt triggers one-call auto-capture.
+            "clean_prompt": clean_prompt,
             "hook": hook,
             "layers": layers,
-            "positions": positions,
+            "positions": self._encode_positions(positions),
             "alpha": alpha,
             "answer_token": answer_token,
             "foil_token": foil_token,
@@ -671,6 +693,8 @@ class PatchStudy:
             clean=data.get("clean"),
             corrupt=data.get("corrupt"),
             notes=notes,
+            auto_captured=data.get("auto_captured", False),
+            captured_source_run=data.get("captured_source_run"),
         )
 
     @staticmethod

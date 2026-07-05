@@ -203,6 +203,161 @@ class TestPositionsFor:
             asyncio.run(study.positions_for("x", "y"))
 
 
+_SWEEP_RESP = {
+    "layers": [0, 1],
+    "positions": [5, 6, 7],
+    "hook": "post_block",
+    "metric": "logprob",
+    "grid": [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
+    "clean": -0.5,
+    "corrupt": -2.0,
+    "skipped": [],
+    "alignment": None,
+}
+
+
+class _FakeResp:
+    def __init__(self, data):
+        self._data = data
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._data
+
+
+class _FakeAsyncClient:
+    """Records every /patch_sweep payload; echoes an auto-capture response."""
+
+    payloads: list[dict] = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        _FakeAsyncClient.payloads.append(json)
+        data = dict(
+            _SWEEP_RESP,
+            auto_captured=json["clean_prompt"] is not None,
+            captured_source_run=json["source_run"],
+        )
+        return _FakeResp(data)
+
+
+def _server_study():
+    study = pc.PatchStudy.__new__(pc.PatchStudy)
+    study.model = "m"
+    study.base_url = "http://localhost:8000/v1"
+    study.api_key = "unused"
+    study.concurrency = 4
+    study.hook = "post_block"
+    study.logprobs = 20
+    return study
+
+
+class TestServerSideOneCall:
+    def _patch_httpx(self, monkeypatch):
+        import httpx
+
+        _FakeAsyncClient.payloads = []
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    def test_one_call_generates_run_and_forwards_spans(self, monkeypatch):
+        self._patch_httpx(monkeypatch)
+        study = _server_study()
+        res = asyncio.run(
+            study.sweep_layers_positions(
+                "The cat",
+                layers=[0, 1],
+                positions=[pc.Span("cat"), 4],
+                answer_token=" Paris",
+                clean_prompt="The clean cat",
+                server_side=True,
+            )
+        )
+        p = _FakeAsyncClient.payloads[-1]
+        # clean_prompt forwarded; spans forwarded as objects (not resolved).
+        assert p["clean_prompt"] == "The clean cat"
+        assert p["positions"] == [{"span": "cat", "occurrence": 0}, 4]
+        # A fresh uuid4-hex run was generated for auto-capture.
+        assert len(p["source_run"]) == 32
+        assert p["clean_baseline"] is None  # no clean handle => server grades it
+        # auto_captured / captured_source_run surfaced on the result.
+        assert res.auto_captured is True
+        assert res.captured_source_run == p["source_run"]
+
+    def test_run_is_fresh_per_call(self, monkeypatch):
+        self._patch_httpx(monkeypatch)
+        study = _server_study()
+        for _ in range(2):
+            asyncio.run(
+                study.sweep_layers_positions(
+                    "The cat",
+                    layers=[0],
+                    positions=[0],
+                    answer_token=" P",
+                    clean_prompt="clean",
+                    server_side=True,
+                )
+            )
+        runs = [p["source_run"] for p in _FakeAsyncClient.payloads]
+        assert runs[0] != runs[1]  # fresh per call
+
+    def test_existing_run_wins_over_autocapture(self, monkeypatch):
+        self._patch_httpx(monkeypatch)
+        study = _server_study()
+        clean = pc.CleanRun(
+            run_id="R1", num_prompt_tokens=3, hook="post_block", prompt="clean"
+        )
+        asyncio.run(
+            study.sweep_layers_positions(
+                "corrupt",
+                layers=[0],
+                positions=[0],
+                answer_token=" P",
+                clean=clean,
+                clean_prompt="explicit clean",
+                server_side=True,
+            )
+        )
+        p = _FakeAsyncClient.payloads[-1]
+        assert p["source_run"] == "R1"  # reuse, not a fresh uuid
+        assert p["clean_prompt"] == "explicit clean"  # drives alignment
+
+    def test_clean_prompt_per_cell_path_raises(self):
+        study = _server_study()
+        with pytest.raises(ValueError, match="server_side"):
+            asyncio.run(
+                study.sweep_layers_positions(
+                    "corrupt",
+                    layers=[0],
+                    positions=[0],
+                    answer_token=" P",
+                    clean_prompt="x",  # per-cell path cannot auto-capture
+                )
+            )
+
+    def test_server_side_without_run_or_clean_prompt_raises(self):
+        study = _server_study()
+        with pytest.raises(ValueError, match="run="):
+            asyncio.run(
+                study.sweep_layers_positions(
+                    "corrupt",
+                    layers=[0],
+                    positions=[0],
+                    answer_token=" P",
+                    server_side=True,
+                )
+            )
+
+
 class TestResolvePositions:
     def test_mixes_ints_and_spans_dedup_in_order(self, monkeypatch):
         study = pc.PatchStudy.__new__(pc.PatchStudy)

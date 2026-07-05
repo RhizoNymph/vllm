@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import asyncio
 
-from vllm.entrypoints.serve.patch.client import PatchStudy
+from vllm.entrypoints.serve.patch.client import PatchStudy, Span
 
 
 def _demo() -> None:
@@ -61,6 +61,28 @@ def _demo() -> None:
     )
     print("peak:", result.argmax_cell())
     print("top 5:", result.top(5))
+
+
+def _demo_one_call() -> None:
+    """One request, no explicit capture and no token indices.
+
+    ``clean_prompt`` + ``server_side=True`` makes the server capture the clean
+    run itself before running the grid; ``Span`` positions resolve server-side.
+    """
+    study = PatchStudy(model="google/gemma-3-4b-it")
+    result = asyncio.run(
+        study.sweep_layers_positions(
+            "The Colosseum is in the city of",
+            clean_prompt="The Eiffel Tower is in the city of",
+            layers=range(0, 34, 4),
+            positions=[Span("Colosseum")],
+            answer_token=" Paris",
+            metric="recovered",
+            server_side=True,
+        )
+    )
+    print("auto_captured:", result.auto_captured, result.captured_source_run)
+    print("peak:", result.argmax_cell())
 
 
 if __name__ == "__main__":

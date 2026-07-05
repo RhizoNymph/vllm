@@ -17,6 +17,20 @@ class LayerRange(BaseModel):
     step: int = Field(default=1, ge=1)
 
 
+class SpanPosition(BaseModel):
+    """A sweep position given as a substring of the corrupt prompt.
+
+    Resolved server-side to the token positions covering the substring — the
+    prompt is tokenized exactly as the sweep tokenizes it, each token mapped to
+    its character span, and the tokens overlapping ``span`` are selected. May
+    be mixed with plain integer positions.
+    """
+
+    span: str
+    occurrence: int = Field(default=0, ge=0)
+    """Which match to use when ``span`` appears more than once (0 = first)."""
+
+
 class PatchSweepRequest(BaseModel):
     """A whole ``(layers x positions)`` activation-patching sweep in one call.
 
@@ -46,7 +60,10 @@ class PatchSweepRequest(BaseModel):
     ``source_run`` is a 400 (capture the clean run explicitly first)."""
     hook: str = "post_block"
     layers: list[int] | LayerRange
-    positions: list[int] | Literal["all_prompt"] = "all_prompt"
+    positions: list[int | SpanPosition] | Literal["all_prompt"] = "all_prompt"
+    """Token indices, and/or ``{"span": str, "occurrence": int}`` substring
+    markers resolved server-side against ``prompt``. The response's
+    ``positions`` is the resolved integer axis."""
     alpha: float = 1.0
     # Grade by this answer token. Prefer the id (exact); else the string is
     # matched against the decoded top-k tokens (whitespace-tolerant).
