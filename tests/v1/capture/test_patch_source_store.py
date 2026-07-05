@@ -196,6 +196,17 @@ class TestLeases:
         store.lease_runs(["A"], ttl_seconds=60.0)  # renewal wins (max expiry)
         assert store._leased_locked("A") is True
 
+    def test_explicit_drop_succeeds_despite_lease(self):
+        # Unlike LRU eviction, an explicit owner drop frees a leased run and
+        # clears the lease so it cannot outlive the run.
+        store = PatchSourceStore(max_bytes=0)
+        store.put_row("A", 0, "post_block", 0, _row(4, 1.0), num_prompt_tokens=1)
+        store.lease_runs(["A"], ttl_seconds=60.0)
+        assert store._leased_locked("A") is True
+        assert store.drop_run("A") is True
+        assert not store.has_run("A")
+        assert "A" not in store._leases
+
 
 class TestResolutionFailureRegistry:
     def test_record_and_pop(self):

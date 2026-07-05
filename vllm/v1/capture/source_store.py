@@ -286,8 +286,16 @@ class PatchSourceStore:
         )
 
     def drop_run(self, run_id: str) -> bool:
+        """Explicitly free a run, returning whether it existed.
+
+        An explicit drop is an owner action (auto-drop after a one-call sweep,
+        or the DELETE route) and succeeds even if the run is leased — unlike
+        LRU eviction, which never touches a leased run. Any live lease is
+        dropped too so it cannot outlive the run.
+        """
         with self._lock:
             run = self._runs.pop(run_id, None)
+            self._leases.pop(run_id, None)
             if run is None:
                 return False
             self._resident_bytes -= run.resident_bytes

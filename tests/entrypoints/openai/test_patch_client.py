@@ -432,6 +432,153 @@ class _FakeStreamClient:
         return _StreamCtx(_FakeStreamResp(lines))
 
 
+class _FakeMultiHookClient:
+    """Echoes a multi-hook (hook_grids) /patch_sweep response."""
+
+    payloads: list[dict] = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        _FakeMultiHookClient.payloads.append(json)
+        data = dict(
+            _SWEEP_RESP,
+            hook="pre_attn",
+            grid=[[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
+            hook_grids=[
+                {"hook": "pre_attn",
+                 "grid": [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
+                 "argmax": None},
+                {"hook": "post_block",
+                 "grid": [[-2.0, -2.0, -2.0], [-2.0, -2.0, -2.0]],
+                 "argmax": None},
+            ],
+            auto_captured=False,
+            captured_source_run=None,
+        )
+        return _FakeResp(data)
+
+
+class TestKeepSourceAndDrop:
+    def _patch_httpx(self, monkeypatch):
+        import httpx
+
+        _FakeAsyncClient.payloads = []
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    def test_keep_source_forwarded(self, monkeypatch):
+        self._patch_httpx(monkeypatch)
+        study = _server_study()
+        asyncio.run(
+            study.sweep_layers_positions(
+                "c", layers=[0], positions=[0], answer_token=" P",
+                clean_prompt="clean", server_side=True, keep_source=True,
+            )
+        )
+        assert _FakeAsyncClient.payloads[-1]["keep_source"] is True
+
+    def test_keep_source_defaults_false(self, monkeypatch):
+        self._patch_httpx(monkeypatch)
+        study = _server_study()
+        asyncio.run(
+            study.sweep_layers_positions(
+                "c", layers=[0], positions=[0], answer_token=" P",
+                clean_prompt="clean", server_side=True,
+            )
+        )
+        assert _FakeAsyncClient.payloads[-1]["keep_source"] is False
+
+    def test_drop_run_success(self, monkeypatch):
+        import httpx
+
+        seen = {}
+
+        class _R:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"dropped": True}
+
+        def fake_request(method, url, headers=None, timeout=None):
+            seen["method"] = method
+            seen["url"] = url
+            return _R()
+
+        monkeypatch.setattr(httpx, "request", fake_request)
+        study = _server_study()
+        assert study.drop_run("R1") is True
+        assert seen["method"] == "DELETE"
+        assert seen["url"].endswith("/patch_source/R1")
+
+    def test_drop_run_404_returns_false(self, monkeypatch):
+        import httpx
+
+        class _R:
+            status_code = 404
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {}
+
+        monkeypatch.setattr(httpx, "request", lambda *a, **k: _R())
+        study = _server_study()
+        assert study.drop_run("ghost") is False
+
+    def test_drop_run_error_returns_false(self, monkeypatch):
+        import httpx
+
+        def boom(*a, **k):
+            raise RuntimeError("down")
+
+        monkeypatch.setattr(httpx, "request", boom)
+        study = _server_study()
+        assert study.drop_run("R1") is False
+
+
+class TestMultiHookClient:
+    def test_hooks_server_side_returns_dict(self, monkeypatch):
+        import httpx
+
+        _FakeMultiHookClient.payloads = []
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeMultiHookClient)
+        study = _server_study()
+        res = asyncio.run(
+            study.sweep_layers_positions(
+                "c", layers=[0, 1], positions=[5, 6, 7], answer_token=" P",
+                run="R1", server_side=True, hooks=["pre_attn", "post_block"],
+            )
+        )
+        assert isinstance(res, dict)
+        assert set(res) == {"pre_attn", "post_block"}
+        assert res["pre_attn"].hook == "pre_attn"
+        assert res["post_block"].grid == [[-2.0, -2.0, -2.0], [-2.0, -2.0, -2.0]]
+        assert _FakeMultiHookClient.payloads[-1]["hooks"] == [
+            "pre_attn", "post_block"
+        ]
+
+    def test_hooks_per_cell_path_raises(self):
+        study = _server_study()
+        with pytest.raises(ValueError, match="server_side"):
+            asyncio.run(
+                study.sweep_layers_positions(
+                    "c", layers=[0], positions=[0], answer_token=" P",
+                    hooks=["pre_attn"],
+                )
+            )
+
+
 class TestServerSideStreaming:
     def _patch(self, monkeypatch):
         import httpx
@@ -487,6 +634,122 @@ class TestServerSideStreaming:
                     on_cell=lambda e: None,
                 )
             )
+
+
+def _multi_hook_data(payload: dict) -> dict:
+    """Multi-hook (hook_grids) summary payload for a request's axes."""
+    layers = payload["layers"]
+    positions = payload["positions"]
+    hook_grids = [
+        {
+            "hook": hook,
+            "grid": [[val] * len(positions) for _ in layers],
+            "argmax": None,
+        }
+        for hook, val in (("pre_attn", -1.0), ("post_block", -2.0))
+    ]
+    return dict(
+        _SWEEP_RESP,
+        layers=layers,
+        positions=positions,
+        hook="pre_attn",
+        grid=hook_grids[0]["grid"],
+        hook_grids=hook_grids,
+        auto_captured=False,
+        captured_source_run=None,
+    )
+
+
+class _FakeMultiHookStreamClient:
+    """Serves a multi-hook /patch_sweep as both a plain POST and an SSE stream."""
+
+    streamed: list[dict] = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        return _FakeResp(_multi_hook_data(json))
+
+    def stream(self, method, url, json=None, headers=None):
+        _FakeMultiHookStreamClient.streamed.append(json)
+        data = _multi_hook_data(json)
+        lines = [_sse_line({"type": "start", "hooks": ["pre_attn",
+                                                       "post_block"]})]
+        for hg in data["hook_grids"]:
+            for i, layer in enumerate(data["layers"]):
+                for j, pos in enumerate(data["positions"]):
+                    lines.append(_sse_line({
+                        "type": "cell", "hook": hg["hook"], "layer": layer,
+                        "position": pos, "value": hg["grid"][i][j],
+                    }))
+        lines.append(_sse_line({"type": "summary", **data}))
+        lines.append("data: [DONE]")
+        return _StreamCtx(_FakeStreamResp(lines))
+
+
+class TestMultiHookStreaming:
+    def _patch(self, monkeypatch):
+        import httpx
+
+        _FakeMultiHookStreamClient.streamed = []
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeMultiHookStreamClient)
+
+    def test_on_cell_composes_with_hooks_and_matches_nonstreaming(
+        self, monkeypatch
+    ):
+        self._patch(monkeypatch)
+        study = _server_study()
+        seen: list[dict] = []
+        streamed = asyncio.run(
+            study.sweep_layers_positions(
+                "The cat",
+                run="R1",
+                layers=[0, 1],
+                positions=[5, 6, 7],
+                answer_token=" Paris",
+                server_side=True,
+                hooks=["pre_attn", "post_block"],
+                on_cell=seen.append,
+            )
+        )
+        # Multi-hook streaming returns a dict keyed by hook.
+        assert isinstance(streamed, dict)
+        assert set(streamed) == {"pre_attn", "post_block"}
+        # 2 hooks x 2 layers x 3 positions = 12 cell events, each labelled.
+        assert len(seen) == 12
+        labels = {(e["hook"], e["layer"], e["position"]) for e in seen}
+        assert labels == {
+            (hook, layer, pos)
+            for hook in ("pre_attn", "post_block")
+            for layer in (0, 1)
+            for pos in (5, 6, 7)
+        }
+        assert _FakeMultiHookStreamClient.streamed[-1]["stream"] is True
+
+        plain = asyncio.run(
+            study.sweep_layers_positions(
+                "The cat",
+                run="R1",
+                layers=[0, 1],
+                positions=[5, 6, 7],
+                answer_token=" Paris",
+                server_side=True,
+                hooks=["pre_attn", "post_block"],
+            )
+        )
+        # Streaming and non-streaming return identical dict structures.
+        assert isinstance(plain, dict)
+        assert set(streamed) == set(plain)
+        for hook in streamed:
+            assert streamed[hook].grid == plain[hook].grid
+            assert streamed[hook].hook == plain[hook].hook
 
 
 class TestResolvePositions:

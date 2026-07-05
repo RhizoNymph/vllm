@@ -417,8 +417,10 @@ class PatchStudy:
         clean: CleanRun | None = None,
         clean_prompt: str | None = None,
         server_side: bool = False,
+        hooks: Sequence[str] | None = None,
+        keep_source: bool = False,
         on_cell: Callable[[dict], None] | None = None,
-    ) -> SweepResult:
+    ) -> SweepResult | dict[str, SweepResult]:
         """Fan out one patched request per (layer, position) cell.
 
         ``positions`` accepts token indices and/or :class:`Span` markers; each
@@ -428,6 +430,18 @@ class PatchStudy:
 
         ``metric``: ``"logprob"`` (P(answer)), ``"logit_diff"`` (answer - foil),
         or ``"recovered"`` ((patched - corrupt) / (clean - corrupt)).
+
+        ``hooks`` (``server_side=True`` only): run the whole grid at each hook
+        (the classic attention-vs-MLP decomposition, shared corrupt baseline).
+        Returns ``dict[str, SweepResult]`` keyed by hook name instead of a
+        single :class:`SweepResult`. Passing ``hooks`` on the per-cell path
+        (``server_side=False``) raises ``ValueError``.
+
+        ``keep_source`` (``server_side=True`` one-call auto-capture only):
+        retain the fresh auto-captured run instead of dropping it after the
+        sweep. Kept runs are hook-complete (all injectable hooks captured), so
+        they can be reused across follow-up single-hook sweeps; drop them later
+        with :meth:`drop_run`.
 
         The clean run to patch from is chosen as: explicit ``run=``, else the
         ``clean`` handle's ``run_id``, else — for ``server_side=True`` with
@@ -451,13 +465,23 @@ class PatchStudy:
         with ``stream=true`` and this callback is invoked with each cell event
         dict (``{"type": "cell", "hook", "layer", "position", "value", ...}``)
         as it lands, so a large grid can drive a live heatmap instead of holding
-        one response open for minutes. The returned :class:`SweepResult` is built
-        from the terminal summary event and is identical to the non-streaming
-        result. Without ``on_cell`` the sweep is non-streaming (unchanged).
+        one response open for minutes. It composes with ``hooks``: each cell
+        event carries its own ``hook``. The returned value (a
+        :class:`SweepResult`, or ``dict[str, SweepResult]`` with ``hooks``) is
+        built from the terminal summary event and is identical to the
+        non-streaming result. Without ``on_cell`` the sweep is non-streaming
+        (unchanged).
         """
         hook = hook or self.hook
         layers = list(layers)
         notes: list[str] = []
+
+        if hooks is not None and not server_side:
+            raise ValueError(
+                "hooks (multi-hook sweep) needs server_side=True; the per-cell "
+                "path runs one hook at a time — set server_side=True or call "
+                "sweep_layers_positions once per hook."
+            )
 
         # Effective source run: explicit run wins, else the clean handle's run.
         source_run = run if run is not None else (
@@ -499,6 +523,8 @@ class PatchStudy:
                 metric=metric,
                 clean=clean,
                 clean_prompt=send_clean_prompt,
+                hooks=list(hooks) if hooks is not None else None,
+                keep_source=keep_source,
                 on_cell=on_cell,
             )
 
@@ -653,18 +679,22 @@ class PatchStudy:
         metric: str,
         clean: CleanRun | None,
         clean_prompt: str | None,
+        hooks: list[str] | None = None,
+        keep_source: bool = False,
         on_cell: Callable[[dict], None] | None = None,
-    ) -> SweepResult:
+    ) -> SweepResult | dict[str, SweepResult]:
         """One POST to /v1/patch_sweep; the server expands + batches the grid.
 
         Spans in ``positions`` are forwarded as objects (the server resolves
         them against the corrupt prompt). ``clean_prompt`` drives server-side
-        alignment and, when ``run`` is missing, one-call auto-capture.
+        alignment and, when ``run`` is missing, one-call auto-capture. With
+        ``hooks`` the response carries per-hook grids and this returns
+        ``dict[str, SweepResult]`` keyed by hook.
 
         With ``on_cell`` the request is sent with ``stream=true`` and the
-        response consumed as SSE: ``on_cell`` fires per cell event and the
-        result is built from the terminal ``summary`` event (identical to the
-        non-streaming response).
+        response consumed as SSE: ``on_cell`` fires per cell event (each carrying
+        its own ``hook``) and the result is built from the terminal ``summary``
+        event (identical to the non-streaming response, single- or multi-hook).
         """
         import httpx
 
@@ -694,8 +724,11 @@ class PatchStudy:
             "metric": metric,
             "logprobs": self.logprobs,
             "clean_baseline": clean_baseline,
+            "keep_source": keep_source,
             "stream": on_cell is not None,
         }
+        if hooks is not None:
+            payload["hooks"] = hooks
         url = f"{self.base_url}/patch_sweep"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         if on_cell is not None:
@@ -710,18 +743,29 @@ class PatchStudy:
             notes.append(f"skipped={data['skipped']}")
         if data.get("alignment"):
             notes.append(f"alignment={data['alignment']}")
-        return SweepResult(
-            layers=data["layers"],
-            positions=data["positions"],
-            hook=data["hook"],
-            metric_name=data["metric"],
-            grid=data["grid"],
-            clean=data.get("clean"),
-            corrupt=data.get("corrupt"),
-            notes=notes,
-            auto_captured=data.get("auto_captured", False),
-            captured_source_run=data.get("captured_source_run"),
-        )
+        auto_captured = data.get("auto_captured", False)
+        captured_source_run = data.get("captured_source_run")
+
+        def _result(hook: str, grid: list[list[float]]) -> SweepResult:
+            return SweepResult(
+                layers=data["layers"],
+                positions=data["positions"],
+                hook=hook,
+                metric_name=data["metric"],
+                grid=grid,
+                clean=data.get("clean"),
+                corrupt=data.get("corrupt"),
+                notes=notes,
+                auto_captured=auto_captured,
+                captured_source_run=captured_source_run,
+            )
+
+        if data.get("hook_grids"):
+            return {
+                hg["hook"]: _result(hg["hook"], hg["grid"])
+                for hg in data["hook_grids"]
+            }
+        return _result(data["hook"], data["grid"])
 
     async def _stream_sweep(
         self,
@@ -824,8 +868,27 @@ class PatchStudy:
             clean=clean,
         )
 
-    def drop_run(self, run: str) -> None:
-        """Best-effort source-run drop (no-op if the server lacks the route)."""
-        # A dedicated DELETE route is a server-side follow-up; until then the
-        # source store evicts whole runs by LRU/budget automatically.
-        pass
+    def drop_run(self, run: str) -> bool:
+        """Free a captured source run via ``DELETE /v1/patch_source/{run}``.
+
+        Returns ``True`` when a worker held the run and dropped it, ``False``
+        when the run was absent (404) or the request failed (a warning is
+        printed). One-call sweeps auto-drop their runs already; use this to
+        free a run kept with ``keep_source=True`` (or captured explicitly).
+        """
+        import httpx
+
+        url = f"{self.base_url}/patch_source/{run}"
+        try:
+            r = httpx.request(
+                "DELETE", url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=10.0,
+            )
+            if r.status_code == 404:
+                return False
+            r.raise_for_status()
+            return bool(r.json().get("dropped", False))
+        except Exception as exc:  # noqa: BLE001 — drop is best-effort
+            print(f"warning: drop_run({run!r}) failed ({exc})")
+            return False
