@@ -291,6 +291,29 @@ async def _sweep_events(
     grid: list[list[float | None]] = [[None] * len(positions) for _ in layers]
     cell_req_ids: dict[str, tuple[int, int, int, int]] = {}
 
+    # When we auto-captured, the clean baseline is graded from the same
+    # internal clean generation (exactly like the corrupt baseline) so the
+    # caller needn't supply it; an explicit clean_baseline is used otherwise.
+    # The recovered normalization is resolved up front so cell events and the
+    # assembled grid are on the same scale.
+    clean_val = auto_clean_val if auto_captured else body.clean_baseline
+    denom: float | None = None
+    if body.metric == "recovered":
+        if clean_val is None or corrupt_val is None or abs(
+            clean_val - corrupt_val
+        ) < 1e-9:
+            logger.warning(
+                "recovered metric needs clean_baseline + corrupt baseline "
+                "with clean != corrupt; returning raw logprob grid"
+            )
+        else:
+            denom = clean_val - corrupt_val
+
+    def to_metric(value: float | None) -> float | None:
+        if value is None or denom is None:
+            return value
+        return (value - corrupt_val) / denom
+
     async def run_cell(
         i: int, layer: int, j: int, pos: int
     ) -> tuple[int, int, int, int, float | None]:
@@ -330,13 +353,13 @@ async def _sweep_events(
     try:
         for fut in asyncio.as_completed(cell_tasks):
             i, layer, j, pos, value = await fut
-            grid[i][j] = value
+            grid[i][j] = to_metric(value)
             yield "cell", {
                 "type": "cell",
                 "hook": body.hook,
                 "layer": layer,
                 "position": pos,
-                "value": value,
+                "value": grid[i][j],
             }
         corrupt_val_batched = await baseline_task
     finally:
@@ -344,8 +367,11 @@ async def _sweep_events(
             if not task.done():
                 task.cancel()
 
+    # In recovered mode the floor is scaled into recovered units so it stays
+    # comparable to the grid it qualifies.
     noise_floor = (
         abs(corrupt_val_batched - corrupt_val)
+        / (abs(denom) if denom is not None else 1.0)
         if corrupt_val_batched is not None and corrupt_val is not None
         else None
     )
@@ -382,25 +408,6 @@ async def _sweep_events(
                 "value": None,
                 "error": reason,
             }
-
-    # When we auto-captured, the clean baseline is graded from the same
-    # internal clean generation (exactly like the corrupt baseline) so the
-    # caller needn't supply it; an explicit clean_baseline is used otherwise.
-    clean_val = auto_clean_val if auto_captured else body.clean_baseline
-    if body.metric == "recovered":
-        if clean_val is None or corrupt_val is None or abs(
-            clean_val - corrupt_val
-        ) < 1e-9:
-            logger.warning(
-                "recovered metric needs clean_baseline + corrupt baseline "
-                "with clean != corrupt; returning raw logprob grid"
-            )
-        else:
-            denom = clean_val - corrupt_val
-            grid = [
-                [None if v is None else (v - corrupt_val) / denom for v in row]
-                for row in grid
-            ]
 
     yield "summary", PatchSweepResponse(
         layers=layers,
