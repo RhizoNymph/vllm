@@ -6,13 +6,14 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import vllm.v1.capture.patch_admission as patch_admission
 from vllm.entrypoints.serve.patch.api_router import (
     answer_logprob,
     argmax_cell,
     cell_metric,
+    drop_patch_source,
     patch_sweep,
     resolve_layers,
     resolve_span_body_positions,
@@ -145,6 +146,7 @@ class _MockEngine:
         self._tok = _Tok()
         self.sampling_params = []
         self.waited = []
+        self.dropped = []
 
     def get_tokenizer(self):
         return self._tok
@@ -181,6 +183,12 @@ class _MockEngine:
             return [list(self.runs)]
         if method == "pop_patch_resolution_failures":
             return [{}]
+        if method == "drop_patch_source_run":
+            run_id = args[0]
+            self.dropped.append(run_id)
+            before = len(self.runs)
+            self.runs[:] = [r for r in self.runs if r["run_id"] != run_id]
+            return [len(self.runs) < before]
         return [None]
 
     async def wait_for_capture_results(self, request_id):
@@ -260,6 +268,343 @@ class TestAutoCapture:
         # recovered = (cell - corrupt) / (clean - corrupt)
         expected = (_CELL_LP - _CORRUPT_LP) / (_CLEAN_LP - _CORRUPT_LP)
         assert abs(resp.grid[0][0] - expected) < 1e-9
+
+
+def _gen_buckets(eng) -> tuple[int, int, int]:
+    """(capture, patched, unpatched-baseline) generation counts."""
+    capture = sum(1 for sp in eng.sampling_params if sp.capture is not None)
+    patched = sum(1 for sp in eng.sampling_params if sp.patch)
+    baseline = sum(
+        1 for sp in eng.sampling_params if sp.capture is None and not sp.patch
+    )
+    return capture, patched, baseline
+
+
+class TestMultiHook:
+    def test_empty_hooks_400(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, hooks=[])
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "non-empty" in json.loads(resp.body)["error"]
+
+    def test_bad_hook_in_hooks_400(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, hooks=["mlp_out"])
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "injectable" in json.loads(resp.body)["error"]
+
+    def test_single_hook_list_parity(self):
+        eng1 = _MockEngine(runs=_existing_run())
+        r1 = _run(eng1, hook="post_block")
+        eng2 = _MockEngine(runs=_existing_run())
+        r2 = _run(eng2, hooks=["post_block"])
+        # Same grid values; hook="post_block" has no hook_grids, the list form
+        # carries exactly one.
+        assert r2.grid == r1.grid
+        assert r2.hook == "post_block"
+        assert r1.hook_grids is None
+        assert [hg.hook for hg in r2.hook_grids] == ["post_block"]
+        assert r2.hook_grids[0].grid == r1.grid
+
+    def test_multi_hook_response_shape(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab", hooks=["pre_attn", "post_block"])
+        assert not isinstance(resp, JSONResponse)
+        assert [hg.hook for hg in resp.hook_grids] == ["pre_attn", "post_block"]
+        # Top-level grid/hook/argmax mirror the first hook.
+        assert resp.hook == "pre_attn"
+        assert resp.grid == resp.hook_grids[0].grid
+        for hg in resp.hook_grids:
+            assert len(hg.grid) == 2 and len(hg.grid[0]) == 2
+
+    def test_shared_baseline_and_argmax_computed_once(self):
+        eng = _MockEngine(runs=[])
+        _run(eng, clean_prompt="ab", hooks=["pre_attn", "post_attn", "post_block"])
+        capture, patched, baseline = _gen_buckets(eng)
+        # Baseline + noise-floor rerun are computed ONCE, not per hook.
+        assert baseline == 2
+        assert capture == 1
+        # Cells fan out across every (hook, layer, position).
+        assert patched == 3 * 2 * 2
+
+
+class TestHookCompleteAutoCapture:
+    def test_autocapture_taps_all_three_hooks(self):
+        eng = _MockEngine(runs=[])
+        _run(eng, clean_prompt="ab")  # single hook sweep still taps all hooks
+        cap = next(sp for sp in eng.sampling_params if sp.capture is not None)
+        hooks = cap.capture["patch_source"]["hooks"]
+        assert set(hooks) == {"pre_attn", "post_attn", "post_block"}
+        # Every hook covers the swept layer set.
+        for layers in hooks.values():
+            assert list(layers) == [0, 1]
+
+
+class TestAutoDrop:
+    def test_auto_drop_fires_after_autocapture(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab")
+        assert resp.auto_captured is True
+        assert "R1" in eng.dropped
+        assert not any(r["run_id"] == "R1" for r in eng.runs)
+
+    def test_keep_source_retains_run(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab", keep_source=True)
+        assert resp.auto_captured is True
+        assert resp.captured_source_run == "R1"
+        assert eng.dropped == []
+        assert any(r["run_id"] == "R1" for r in eng.runs)
+
+    def test_preexisting_run_never_dropped(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, clean_prompt="ab")  # reuses existing R1, no capture
+        assert resp.auto_captured is False
+        assert eng.dropped == []
+        assert any(r["run_id"] == "R1" for r in eng.runs)
+
+    def test_drop_then_resweep_reauto_captures(self):
+        # Cache coherence on the auto-drop path: a second identical sweep must
+        # auto-capture again (a stale positive cache would skip it and 400).
+        patch_admission._PATCH_SOURCE_CACHE = patch_admission._PatchSourceCache()
+        eng = _MockEngine(runs=[])
+
+        def _sweep():
+            body = PatchSweepRequest(
+                prompt="ab", source_run="R1", layers=[0, 1],
+                hook="post_block", answer_token_id=5, clean_prompt="ab",
+            )
+            return asyncio.run(patch_sweep(body, _raw_request(eng)))
+
+        r1 = _sweep()
+        assert r1.auto_captured is True
+        assert not any(r["run_id"] == "R1" for r in eng.runs)  # auto-dropped
+        r2 = _sweep()
+        assert r2.auto_captured is True
+
+
+class TestDropRoute:
+    def test_delete_drops_existing_run(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = asyncio.run(drop_patch_source("R1", _raw_request(eng)))
+        assert resp.status_code == 200
+        assert json.loads(resp.body)["dropped"] is True
+        assert not any(r["run_id"] == "R1" for r in eng.runs)
+
+    def test_delete_missing_run_404(self):
+        eng = _MockEngine(runs=[])
+        resp = asyncio.run(drop_patch_source("ghost", _raw_request(eng)))
+        assert resp.status_code == 404
+        assert "not found" in json.loads(resp.body)["error"]
+
+    def test_delete_invalidates_manifest_cache(self):
+        patch_admission._PATCH_SOURCE_CACHE = patch_admission._PatchSourceCache()
+        eng = _MockEngine(runs=_existing_run())
+        exists = patch_admission.patch_source_run_exists
+        assert asyncio.run(exists(eng, "R1")) is True  # populates cache
+        resp = asyncio.run(drop_patch_source("R1", _raw_request(eng)))
+        assert resp.status_code == 200
+        # Cache no longer reports the dropped run present.
+        assert asyncio.run(exists(eng, "R1")) is False
+
+
+# ---- streaming (SSE) sweep ------------------------------------------------
+
+
+def _drain_sse(resp: StreamingResponse) -> list[str]:
+    """Collect a StreamingResponse body into its raw ``data:`` payload lines."""
+
+    async def drain() -> str:
+        chunks = []
+        async for chunk in resp.body_iterator:
+            chunks.append(chunk if isinstance(chunk, str) else chunk.decode())
+        return "".join(chunks)
+
+    text = asyncio.run(drain())
+    return [
+        block[len("data: "):]
+        for block in text.split("\n\n")
+        if block.startswith("data: ")
+    ]
+
+
+def _sse_events(resp: StreamingResponse) -> tuple[list[dict], str]:
+    """Parse an SSE sweep stream into (json events, terminator)."""
+    payloads = _drain_sse(resp)
+    assert payloads[-1] == "[DONE]"
+    events = [json.loads(p) for p in payloads[:-1]]
+    return events, payloads[-1]
+
+
+class _VoidEngine(_MockEngine):
+    """Engine that reports the first patched cell as a resolution failure."""
+
+    def __init__(self, runs):
+        super().__init__(runs=runs)
+        self.patched_ids: list[str] = []
+
+    async def generate(self, prompt, sp, request_id):
+        if sp.patch:
+            self.patched_ids.append(request_id)
+        async for out in super().generate(prompt, sp, request_id):
+            yield out
+
+    async def collective_rpc(self, method, args=None):
+        if method == "pop_patch_resolution_failures" and self.patched_ids:
+            return [{self.patched_ids[0]: ["source evicted mid-sweep"]}]
+        return await super().collective_rpc(method, args)
+
+
+class TestStreamingSweep:
+    def test_stream_returns_sse_response(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, stream=True)
+        assert isinstance(resp, StreamingResponse)
+        assert resp.media_type == "text/event-stream"
+
+    def test_cell_events_equal_grid_size(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, stream=True)
+        events, done = _sse_events(resp)
+        assert done == "[DONE]"
+        assert events[0]["type"] == "start"
+        cells = [e for e in events if e["type"] == "cell"]
+        # grid is layers[0,1] x positions[0,1] = 4 cells.
+        assert len(cells) == 4
+        for c in cells:
+            assert c["hook"] == "post_block"
+            assert c["value"] == _CELL_LP
+            assert {"layer", "position"} <= c.keys()
+        assert events[-1]["type"] == "summary"
+
+    def test_summary_equals_nonstreaming(self):
+        # Same mock config run both ways -> byte-identical response payload.
+        eng_plain = _MockEngine(runs=_existing_run())
+        plain = _run(eng_plain, metric="logprob")
+        assert not isinstance(plain, JSONResponse)
+
+        eng_stream = _MockEngine(runs=_existing_run())
+        resp = _run(eng_stream, metric="logprob", stream=True)
+        events, _ = _sse_events(resp)
+        summary = next(e for e in events if e["type"] == "summary")
+        summary = {k: v for k, v in summary.items() if k != "type"}
+        assert summary == plain.model_dump()
+
+    def test_summary_equals_nonstreaming_recovered(self):
+        eng_plain = _MockEngine(runs=[])
+        plain = _run(eng_plain, clean_prompt="ab", metric="recovered")
+        eng_stream = _MockEngine(runs=[])
+        resp = _run(eng_stream, clean_prompt="ab", metric="recovered",
+                    stream=True)
+        events, _ = _sse_events(resp)
+        summary = next(e for e in events if e["type"] == "summary")
+        summary = {k: v for k, v in summary.items() if k != "type"}
+        assert summary == plain.model_dump()
+
+    def test_pre_fanout_error_is_plain_json_400(self):
+        # A missing run with no clean_prompt 400s before the stream starts.
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, stream=True)
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "patch source not found" in json.loads(resp.body)["error"]
+
+    def test_bad_hook_is_plain_json_400(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, hook="not_a_hook", stream=True)
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+
+    def test_voided_cell_emits_null_error_event(self):
+        eng = _VoidEngine(runs=_existing_run())
+        resp = _run(eng, stream=True)
+        events, _ = _sse_events(resp)
+        voided = [
+            e for e in events
+            if e["type"] == "cell" and e["value"] is None
+        ]
+        assert len(voided) == 1
+        assert voided[0]["error"] == "source evicted mid-sweep"
+        assert voided[0]["hook"] == "post_block"
+        assert {"layer", "position"} <= voided[0].keys()
+        # The summary reflects the void: a skipped entry + a null grid cell.
+        summary = next(e for e in events if e["type"] == "summary")
+        assert summary["skipped"]
+        assert any(None in row for row in summary["grid"])
+
+
+# ---- streaming x multi-hook x lifecycle (combined) ------------------------
+
+
+class TestStreamingMultiHook:
+    def test_cell_events_cover_every_hook_layer_position(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(
+            eng, clean_prompt="ab", hooks=["pre_attn", "post_block"],
+            stream=True,
+        )
+        assert isinstance(resp, StreamingResponse)
+        events, done = _sse_events(resp)
+        assert done == "[DONE]"
+        # start event carries the requested hooks list (additive, multi-hook).
+        assert events[0]["type"] == "start"
+        assert events[0]["hooks"] == ["pre_attn", "post_block"]
+        cells = [e for e in events if e["type"] == "cell"]
+        # 2 hooks x layers[0,1] x positions[0,1] = 8 cells, correctly labelled.
+        seen = {(c["hook"], c["layer"], c["position"]) for c in cells}
+        assert seen == {
+            (hook, layer, pos)
+            for hook in ("pre_attn", "post_block")
+            for layer in (0, 1)
+            for pos in (0, 1)
+        }
+        for c in cells:
+            assert c["hook"] in ("pre_attn", "post_block")
+
+    def test_streamed_summary_hook_grids_equal_nonstreaming(self):
+        # Same mock config both ways -> identical multi-hook summary.
+        eng_plain = _MockEngine(runs=[])
+        plain = _run(eng_plain, clean_prompt="ab",
+                     hooks=["pre_attn", "post_block"])
+        assert not isinstance(plain, JSONResponse)
+
+        eng_stream = _MockEngine(runs=[])
+        resp = _run(eng_stream, clean_prompt="ab",
+                    hooks=["pre_attn", "post_block"], stream=True)
+        events, _ = _sse_events(resp)
+        summary = next(e for e in events if e["type"] == "summary")
+        summary = {k: v for k, v in summary.items() if k != "type"}
+        assert summary == plain.model_dump()
+        assert [hg["hook"] for hg in summary["hook_grids"]] == [
+            "pre_attn", "post_block"
+        ]
+
+
+class TestAutoDropBothPaths:
+    def test_auto_drop_fires_nonstreaming(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab")
+        assert not isinstance(resp, JSONResponse)
+        assert resp.auto_captured is True
+        assert "R1" in eng.dropped  # drop RPC hit the engine
+
+    def test_auto_drop_fires_streaming(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab", stream=True)
+        assert isinstance(resp, StreamingResponse)
+        # The drop lives inside the generator (before the summary yields), so it
+        # only fires once the stream is actually consumed.
+        events, _ = _sse_events(resp)
+        assert any(e["type"] == "summary" for e in events)
+        assert "R1" in eng.dropped
+
+    def test_keep_source_streaming_retains_run(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab", keep_source=True, stream=True)
+        _sse_events(resp)
+        assert eng.dropped == []
 
 
 # ---- shared span-resolution math ------------------------------------------

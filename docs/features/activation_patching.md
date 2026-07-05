@@ -103,6 +103,36 @@ from vllm.entrypoints.serve.patch.client import PatchStudy, Span
 `examples/online_serving/openai_patch_client.py` is a runnable demo that imports
 from that module.
 
+### Multi-hook sweeps
+
+The classic attention-vs-MLP decomposition sweeps the *same* `(layers ×
+positions)` grid at several hooks. Two ways:
+
+- **One request (`hooks` field).** Pass `hooks: [..]` (each injectable —
+  `pre_attn`, `post_attn`, `post_block`; a bad or empty list is a 400) and the
+  grid runs at every hook. `hooks` wins over the single `hook` field; the
+  corrupt baseline and noise floor are computed **once** and shared across
+  hooks (only the patched cells fan out per hook, concurrently). The response
+  gains `hook_grids: [{hook, grid, argmax}, ..]` (one entry per hook, same
+  order); the top-level `grid`/`hook`/`argmax` mirror the first hook so
+  single-hook clients keep working. `positions`, `layers`, `clean`, `corrupt`,
+  `noise_floor`, `alignment`, and `skipped` stay top-level and shared (each
+  skipped cell carries its `hook`). `hooks=["post_block"]` matches
+  `hook="post_block"` bar the extra `hook_grids` entry.
+
+  `PatchStudy.sweep_layers_positions(..., server_side=True, hooks=[..])`
+  returns `dict[str, SweepResult]` keyed by hook name (a single-hook sweep
+  still returns one `SweepResult`). Passing `hooks` on the per-cell path
+  (`server_side=False`) raises `ValueError` — run one hook at a time or set
+  `server_side=True`.
+
+- **Sequential (reuse one hook-complete run).** Auto-capture taps **all** three
+  injectable hooks at the swept layers in one forward (see [One-call
+  auto-capture](#one-call-auto-capture)), so a run kept with `keep_source=True`
+  is reusable across follow-up single-hook sweeps at a *different* hook. Capture
+  once, then sweep it at each hook in turn, dropping it at the end with the
+  [DELETE route](#source-run-lifecycle).
+
 ### Substring positions
 
 Sweep positions are token indices, but tokenization is easy to get wrong by
@@ -144,10 +174,13 @@ collapses to a single request. When a sweep references a `source_run` that does
 **not** yet exist in the source manifests *and* supplies `clean_prompt`, the
 server captures the clean run itself before running the grid:
 
-- The capture spec is derived from the grid: hook = the sweep's `hook`, layers =
-  the swept layer set, positions = `all_prompt` (mirrors the client's
-  `capture_clean`). It runs through the normal `patch_source` capture consumer,
-  so `--capture-consumers patch_source` must be enabled.
+- The capture spec is derived from the grid: **all three injectable hooks**
+  (`pre_attn`, `post_attn`, `post_block`) at the swept layer set, positions =
+  `all_prompt` (one forward; the extra cost is only source-store bytes, which
+  the [lifecycle](#source-run-lifecycle) makes reclaimable). Tapping every hook
+  makes a *kept* run reusable for hook-comparison follow-up sweeps. It runs
+  through the normal `patch_source` capture consumer, so `--capture-consumers
+  patch_source` must be enabled.
 - It uses `capture_wait` durability semantics internally, so the per-worker
   source store is populated before any cell resolves against it — the classic
   "forgot `capture_wait`, sweep 400s / silently no-ops" race is unrepresentable.
@@ -167,10 +200,12 @@ is missing and `clean_prompt` is **not** provided, the sweep still 400s
 
 `PatchStudy` wires this into one call: pass `clean_prompt` (the clean text) with
 `server_side=True` and no captured `clean`/`run`, and the client skips capture
-entirely — it generates a fresh per-call run name (the auto-capture taps only
-the swept layers, so a name reused across differing-layer grids would 400), sends
-the sweep, and lets the server auto-capture. Spans are forwarded and resolved
-server-side. `SweepResult.auto_captured` / `captured_source_run` report it.
+entirely — it generates a fresh per-call run name (auto-capture covers only the
+swept layers, so a name reused across differing-layer grids would 400), sends
+the sweep, and lets the server auto-capture. The fresh run is auto-dropped when
+the sweep completes unless `keep_source=True` (see [lifecycle](#source-run-lifecycle)).
+Spans are forwarded and resolved server-side. `SweepResult.auto_captured` /
+`captured_source_run` report it.
 
 ```python
 study = PatchStudy(model=MODEL, hook="post_block")
@@ -191,6 +226,70 @@ alongside `clean_prompt` reuses the run (the server re-captures nothing) and
 `clean_prompt` then only drives alignment. The per-cell fan-out path
 (`server_side=False`) has no capture endpoint, so `clean_prompt` there without a
 captured `clean` handle raises — call `capture_clean` first.
+
+### Source-run lifecycle
+
+Clean runs live in the per-worker `PatchSourceStore` (whole-run LRU, budgeted by
+`--patch-source-cache-bytes`). One-call sweeps mint a **fresh uuid run per
+call**, so without cleanup they accumulate — and worse, a just-captured uuid run
+sits at the LRU *most-recently-used* end, so budget pressure evicts a user's
+older deliberate captures first. Three mechanisms manage this:
+
+- **Auto-drop (default).** After a sweep that auto-captured completes (response
+  assembled), the server drops the run it captured. `keep_source: true` retains
+  it instead — the response's `captured_source_run` then names a reusable,
+  hook-complete run (the sequential way to do a [multi-hook
+  study](#multi-hook-sweeps)). A **pre-existing** run is never dropped (only a
+  run this request auto-captured). Drop failures are logged, not request
+  failures.
+- **`DELETE /v1/patch_source/{run_id}`.** Frees a run from every worker's store
+  (`collective_rpc("drop_patch_source_run", ..)`, unioned across PP ranks):
+  `200 {"dropped": true}` if any rank held it, else `404`. An explicit owner
+  drop succeeds **even if the run is leased** (unlike LRU eviction, which never
+  touches a leased run); the lease is cleared with it. `PatchStudy.drop_run`
+  wraps the route and returns a `bool` (`False` on 404 / failure).
+- **Manifest-cache coherence.** The admission-side `_PatchSourceCache` caches
+  run manifests; both drop paths invalidate it (`invalidate_patch_source_run`)
+  so a dropped run is not reported as still-existing — otherwise the next sweep
+  would skip auto-capture and 400 on the now-absent run.
+
+### Streaming
+
+A large grid (all_prompt × many layers on a real prompt = 1000+ cells) holds one
+HTTP response open for minutes with no progress signal; a proxy/client timeout
+then loses a nearly-finished sweep. Passing `"stream": true` opts into an
+`text/event-stream` (SSE) response that emits results as cells land:
+
+- `data: {"type": "start", "layers": [...], "positions": [...], "hook": ...,
+  "metric": ..., "auto_captured": ..., "captured_source_run": ...}` — first, so
+  a consumer can size a live heatmap before any cell arrives.
+- `data: {"type": "cell", "hook": "post_block", "layer": 14, "position": 3,
+  "value": -0.37}` per cell as it completes (completion order — no ordering
+  promise). `hook` is always present and, for a [multi-hook
+  sweep](#multi-hook-sweeps), labels which hook's grid the cell belongs to.
+  A cell that voids mid-sweep (its patch failed to resolve on the workers)
+  re-emits as `{"type": "cell", ..., "value": null, "error": "..."}`, mirroring
+  how voided cells land in `skipped`.
+- `data: {"type": "summary", ...}` — the exact same payload as the non-streaming
+  `PatchSweepResponse` (assembled by the same code path), then `data: [DONE]`.
+
+**Pre-fan-out errors stay plain JSON.** Everything that 400s before the grid
+fan-out begins — bad hook/layers, span-resolution failure, alignment failure,
+missing source with no `clean_prompt` — still returns a normal JSON error
+response; the stream only starts once the fan-out actually runs. So a client
+must check the response `Content-Type` / status before parsing SSE.
+
+Cells run concurrently regardless of streaming; if the client disconnects
+mid-stream the server cancels the outstanding cell tasks (best-effort abort of
+their engine requests) rather than grinding through a dead sweep.
+
+`PatchStudy.sweep_layers_positions(..., server_side=True, on_cell=fn)` wires this
+in: passing an `on_cell(event_dict)` callback sends `stream: true`, invokes the
+callback per cell event, and builds the returned `SweepResult` from the summary
+event — identical to the non-streaming result. Without `on_cell` the sweep is
+non-streaming (unchanged). `on_cell` is server-side only. It composes with
+multi-hook sweeps: each cell event carries its own `hook`, and the streamed
+summary's `hook_grids` matches the non-streaming multi-hook response.
 
 ### Position alignment
 

@@ -59,6 +59,14 @@ class PatchSweepRequest(BaseModel):
     capture-then-sweep dance to a single request. Without it a missing
     ``source_run`` is a 400 (capture the clean run explicitly first)."""
     hook: str = "post_block"
+    hooks: list[str] | None = None
+    """Run the whole ``(layers x positions)`` grid at each of these hooks (the
+    classic attention-vs-MLP decomposition). When given (non-empty, each hook
+    injectable) it wins over ``hook``: the per-hook grids are returned in
+    ``hook_grids`` and the top-level ``grid``/``hook``/``argmax`` mirror the
+    first hook. The corrupt baseline and noise floor are computed once, shared
+    across hooks. ``hooks=["post_block"]`` matches ``hook="post_block"`` bar the
+    extra ``hook_grids`` entry."""
     layers: list[int] | LayerRange
     positions: list[int | SpanPosition] | Literal["all_prompt"] = "all_prompt"
     """Token indices, and/or ``{"span": str, "occurrence": int}`` substring
@@ -74,11 +82,34 @@ class PatchSweepRequest(BaseModel):
     foil_token_id: int | None = None
     metric: Literal["logprob", "logit_diff", "recovered"] = "logprob"
     logprobs: int = Field(default=20, ge=1)
+    stream: bool = False
+    """Stream per-cell results over SSE (``text/event-stream``) as they land,
+    ending with a ``summary`` event carrying the full non-streaming response and
+    a ``[DONE]`` terminator. Pre-fan-out errors (bad hook/layers, span/alignment
+    failure, missing source) still return a plain JSON 400 — the stream only
+    starts once the grid fan-out begins. Off by default (single JSON response)."""
     # Clean baseline answer metric (from an explicit capture_clean) for the
     # recovered metric; the corrupt baseline is computed in-endpoint. Ignored
     # when the server auto-captures (the clean baseline is then graded from the
     # internal clean generation).
     clean_baseline: float | None = None
+    keep_source: bool = False
+    """Retain an auto-captured clean run instead of dropping it after the
+    sweep. A one-call sweep captures a fresh uuid-named run and, by default,
+    drops it once the response is assembled (recent uuid runs otherwise sit at
+    the LRU most-recently-used end and evict a user's older deliberate captures
+    first). Set this to keep the run — the response's ``captured_source_run``
+    then names a reusable, hook-complete run (auto-capture taps all injectable
+    hooks), which is the sequential way to do a multi-hook study. A
+    pre-existing run is never dropped."""
+
+
+class HookGrid(BaseModel):
+    """One hook's ``(layers x positions)`` grid within a multi-hook sweep."""
+
+    hook: str
+    grid: list[list[float | None]]
+    argmax: dict | None = None
 
 
 class PatchSweepResponse(BaseModel):
@@ -108,3 +139,8 @@ class PatchSweepResponse(BaseModel):
     captured_source_run: str | None = None
     """The run handle the auto-capture wrote under (equals ``source_run``), or
     ``None`` when no auto-capture happened."""
+    hook_grids: list[HookGrid] | None = None
+    """Per-hook grids when ``hooks`` was requested (one entry per hook, same
+    order); ``None`` for the single-hook path. ``positions``, ``layers``,
+    ``clean``, ``corrupt``, ``noise_floor``, ``alignment`` and ``skipped`` stay
+    top-level and shared across hooks (skipped cells carry their ``hook``)."""

@@ -230,6 +230,18 @@ class _PatchSourceCache:
             )
         await self._maybe_lease(engine_client, {r[0] for r in refs})
 
+    def invalidate_run(self, run_id: str) -> None:
+        """Forget a run so its next existence check re-hits the workers.
+
+        Called after a run is dropped (auto-drop or DELETE). The positive
+        fast-path cache would otherwise keep reporting a dropped run present,
+        so a follow-up sweep would skip auto-capture and 400 on the now-absent
+        run. Refresh-on-miss then reflects the workers' true state.
+        """
+        self._runs.pop(run_id, None)
+        self._run_prompt_tokens.pop(run_id, None)
+        self._leased_at.pop(run_id, None)
+
     async def _maybe_lease(
         self, engine_client: EngineClient, runs: set[str]
     ) -> None:
@@ -272,6 +284,14 @@ async def get_run_prompt_tokens(
 ) -> int | None:
     """Prompt-token count of a captured source run (None if unknown)."""
     return await _PATCH_SOURCE_CACHE.run_prompt_tokens(run_id, engine_client)
+
+
+def invalidate_patch_source_run(run_id: str) -> None:
+    """Drop ``run_id`` from the entrypoint's manifest cache after a store drop.
+
+    Keeps the cache coherent with the workers so a dropped run is not reported
+    as still-existing (which would skip auto-capture and 400 the next sweep)."""
+    _PATCH_SOURCE_CACHE.invalidate_run(run_id)
 
 
 async def patch_source_run_exists(
