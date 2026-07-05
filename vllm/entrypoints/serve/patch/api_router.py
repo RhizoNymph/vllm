@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.patch.alignment import align_token_positions
 from vllm.entrypoints.serve.patch.protocol import (
+    HookGrid,
     LayerRange,
     PatchSweepRequest,
     PatchSweepResponse,
@@ -183,18 +184,19 @@ async def _auto_capture_clean(
     eng: EngineClient,
     clean_prompt: str,
     source_run: str,
-    hook: str,
     layers: list[int],
     logprobs: int,
     grade_token_ids: list[int] | None,
 ) -> dict[int, Any] | None:
     """Capture the clean run server-side, blocking until it is durable.
 
-    Mirrors the client's ``capture_clean``: taps ``hook`` at every swept
-    ``layer`` over ``all_prompt`` positions into ``source_run`` via the
-    ``patch_source`` capture consumer, then waits for the capture to finalize
-    (``capture_wait`` semantics) so the per-worker source store is populated
-    before any cell resolves against it.
+    Taps *every* injectable hook (``pre_attn``, ``post_attn``, ``post_block``)
+    at every swept ``layer`` over ``all_prompt`` positions into ``source_run``
+    via the ``patch_source`` capture consumer, then waits for the capture to
+    finalize (``capture_wait`` semantics) so the per-worker source store is
+    populated before any cell resolves against it. Tapping all hooks (one
+    forward, only extra source-store bytes) makes a kept run reusable for
+    hook-comparison follow-up sweeps at a different hook.
 
     Args:
         layers: The swept layer set (the capture covers exactly these sites).
@@ -214,7 +216,7 @@ async def _auto_capture_clean(
         capture={
             "patch_source": {
                 "run": source_run,
-                "hooks": {hook: list(layers)},
+                "hooks": {h: list(layers) for h in sorted(_INJECTABLE_HOOKS)},
                 "positions": "all_prompt",
             }
         },
@@ -260,6 +262,34 @@ async def _resolve_grade_token(
     return int(ids[0])
 
 
+async def _drop_patch_source_run(
+    eng: EngineClient, run_id: str
+) -> bool:
+    """Drop ``run_id`` from every worker's source store; return if any dropped.
+
+    Also invalidates the admission-side manifest cache so a subsequent
+    existence check no longer reports the run present (otherwise a follow-up
+    sweep would skip auto-capture and 400 on the now-absent run).
+    """
+    from vllm.v1.capture.patch_admission import invalidate_patch_source_run
+
+    results = await eng.collective_rpc(
+        "drop_patch_source_run", args=(run_id,)
+    )
+    invalidate_patch_source_run(run_id)
+    return any(bool(r) for r in (results or []))
+
+
+async def _drop_source_run_quiet(eng: EngineClient, run_id: str) -> None:
+    """Best-effort auto-drop: a failure is log-warn, not a request failure."""
+    try:
+        await _drop_patch_source_run(eng, run_id)
+    except Exception as exc:  # noqa: BLE001 — drop is best-effort
+        logger.warning(
+            "patch_sweep auto-drop of source run %r failed (%s)", run_id, exc
+        )
+
+
 @router.post("/v1/patch_sweep")
 async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     eng = engine_client(raw_request)
@@ -273,9 +303,22 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         body.foil_token is None and body.foil_token_id is None
     ):
         return _err("logit_diff metric requires foil_token / foil_token_id")
-    if body.hook not in _INJECTABLE_HOOKS:
-        return _err(f"hook {body.hook!r} not injectable; valid: "
-                    f"{sorted(_INJECTABLE_HOOKS)}")
+    # `hooks` (multi-hook) wins over the single `hook` in spirit; validate the
+    # effective hook set and dedup order-preserving.
+    if body.hooks is not None:
+        if not body.hooks:
+            return _err("hooks must be non-empty when provided")
+        bad = [h for h in body.hooks if h not in _INJECTABLE_HOOKS]
+        if bad:
+            return _err(f"hooks {bad} not injectable; valid: "
+                        f"{sorted(_INJECTABLE_HOOKS)}")
+        effective_hooks = list(dict.fromkeys(body.hooks))
+    else:
+        if body.hook not in _INJECTABLE_HOOKS:
+            return _err(f"hook {body.hook!r} not injectable; valid: "
+                        f"{sorted(_INJECTABLE_HOOKS)}")
+        effective_hooks = [body.hook]
+    multi_hook = body.hooks is not None
 
     num_layers = vllm_config.model_config.get_total_num_hidden_layers()
     layers = resolve_layers(body.layers)
@@ -347,7 +390,7 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         if run_exists is False:
             try:
                 clean_lp = await _auto_capture_clean(
-                    eng, body.clean_prompt, body.source_run, body.hook,
+                    eng, body.clean_prompt, body.source_run,
                     layers, body.logprobs, grade_ids,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -407,17 +450,19 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
             )
         source_for = lambda pos: pos  # noqa: E731 — identity alignment
 
-    # Validate every referenced source site exists (one combined spec).
+    # Validate every referenced source site exists (one combined spec, all
+    # hooks x layers x positions).
     probe = SamplingParams(
         patch=[
             {
                 "layer": layer,
-                "hook": body.hook,
+                "hook": hook,
                 "dest_position": pos,
                 "source_run": body.source_run,
                 "source_position": source_for(pos),
                 "alpha": body.alpha,
             }
+            for hook in effective_hooks
             for layer in layers
             for pos in positions
         ]
@@ -427,35 +472,39 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     except PatchValidationError as exc:
         return _err(str(exc))
 
-    # Fan out one patched variant per cell; the engine batches them.
-    grid: list[list[float | None]] = [
-        [None] * len(positions) for _ in layers
-    ]
-    cell_req_ids: dict[str, tuple[int, int, int, int]] = {}
+    # Fan out one patched variant per (hook, layer, position) cell; the engine
+    # batches them all. Cells across hooks are independent engine requests, so
+    # they fan out concurrently just like cells within one grid.
+    grids: dict[str, list[list[float | None]]] = {
+        hook: [[None] * len(positions) for _ in layers]
+        for hook in effective_hooks
+    }
+    cell_req_ids: dict[str, tuple[str, int, int, int, int]] = {}
 
-    async def run_cell(i: int, layer: int, j: int, pos: int) -> None:
+    async def run_cell(hook: str, i: int, layer: int, j: int, pos: int) -> None:
         patch = [
             {
                 "layer": layer,
-                "hook": body.hook,
+                "hook": hook,
                 "dest_position": pos,
                 "source_run": body.source_run,
                 "source_position": source_for(pos),
                 "alpha": body.alpha,
             }
         ]
-        request_id = f"patchsweep-{layer}-{pos}-{uuid4().hex[:8]}"
-        cell_req_ids[request_id] = (i, layer, j, pos)
+        request_id = f"patchsweep-{hook}-{layer}-{pos}-{uuid4().hex[:8]}"
+        cell_req_ids[request_id] = (hook, i, layer, j, pos)
         lp, _ = await _first_token_logprobs(
-            eng, body.prompt, patch, body.logprobs, f"{layer}-{pos}",
+            eng, body.prompt, patch, body.logprobs, f"{hook}-{layer}-{pos}",
             grade_ids, request_id,
         )
-        grid[i][j] = cell_metric(lp, body) if lp else None
+        grids[hook][i][j] = cell_metric(lp, body) if lp else None
 
     async def rerun_baseline() -> float | None:
         # Same unpatched request as the solo baseline, but batched with the
         # cells: the metric delta between the two IS the batch-nondeterminism
         # noise floor for this sweep (vLLM is not batch-invariant by default).
+        # Computed once, shared across hooks.
         lp, _ = await _first_token_logprobs(
             eng, body.prompt, None, body.logprobs, "noisefloor", grade_ids
         )
@@ -464,7 +513,8 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     _, corrupt_val_batched = await asyncio.gather(
         asyncio.gather(
             *(
-                run_cell(i, layer, j, pos)
+                run_cell(hook, i, layer, j, pos)
+                for hook in effective_hooks
                 for i, layer in enumerate(layers)
                 for j, pos in enumerate(positions)
             )
@@ -492,14 +542,15 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
             cell = cell_req_ids.get(req_id)
             if cell is None:
                 continue  # not one of this sweep's cells
-            i, layer, j, pos = cell
-            grid[i][j] = None
+            hook, i, layer, j, pos = cell
+            grids[hook][i][j] = None
             skipped.append(
-                {"layer": layer, "position": pos, "reason": "; ".join(details)}
+                {"hook": hook, "layer": layer, "position": pos,
+                 "reason": "; ".join(details)}
             )
             logger.error(
-                "patch_sweep cell (layer=%d, pos=%d) ran unpatched: %s",
-                layer, pos, details,
+                "patch_sweep cell (hook=%s, layer=%d, pos=%d) ran unpatched: %s",
+                hook, layer, pos, details,
             )
 
     # When we auto-captured, the clean baseline is graded from the same
@@ -516,26 +567,76 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
             )
         else:
             denom = clean_val - corrupt_val
-            grid = [
-                [None if v is None else (v - corrupt_val) / denom for v in row]
-                for row in grid
-            ]
+            grids = {
+                hook: [
+                    [None if v is None else (v - corrupt_val) / denom
+                     for v in row]
+                    for row in grid
+                ]
+                for hook, grid in grids.items()
+            }
 
-    return PatchSweepResponse(
+    # Top-level grid/hook/argmax mirror the first hook (single-hook contract);
+    # hook_grids carries every hook when `hooks` was requested.
+    primary = effective_hooks[0]
+    top_grid = grids[primary]
+    hook_grids = None
+    if multi_hook:
+        hook_grids = [
+            HookGrid(
+                hook=hook,
+                grid=grids[hook],
+                argmax=argmax_cell(grids[hook], layers, positions),
+            )
+            for hook in effective_hooks
+        ]
+
+    response = PatchSweepResponse(
         layers=layers,
         positions=positions,
-        hook=body.hook,
+        hook=primary,
         metric=body.metric,
-        grid=grid,
+        grid=top_grid,
         clean=clean_val,
         corrupt=corrupt_val,
-        argmax=argmax_cell(grid, layers, positions),
+        argmax=argmax_cell(top_grid, layers, positions),
         skipped=skipped,
         alignment=alignment_summary,
         noise_floor=noise_floor,
         auto_captured=auto_captured,
         captured_source_run=captured_source_run,
+        hook_grids=hook_grids,
     )
+
+    # Lifecycle: a one-call sweep captured a fresh uuid run; drop it now unless
+    # the caller asked to keep it (recent uuid runs sit at the MRU end of the
+    # source-store LRU and would otherwise evict a user's older deliberate
+    # captures first). Never drop a pre-existing run — only one we captured.
+    if auto_captured and captured_source_run is not None and not body.keep_source:
+        await _drop_source_run_quiet(eng, captured_source_run)
+
+    return response
+
+
+@router.delete("/v1/patch_source/{run_id}")
+async def drop_patch_source(run_id: str, raw_request: Request):
+    """Free a captured clean run from the per-worker source stores.
+
+    One-call sweeps auto-drop their fresh uuid runs, but a run kept with
+    ``keep_source`` (or captured explicitly) is freed here. Aggregates across
+    ranks: 200 ``{"dropped": true}`` if any rank held it, else 404.
+    """
+    eng = engine_client(raw_request)
+    try:
+        dropped = await _drop_patch_source_run(eng, run_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("patch_source drop failed")
+        return _err(f"drop of source run {run_id!r} failed: {exc}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR.value)
+    if not dropped:
+        return _err(f"patch source run {run_id!r} not found",
+                    HTTPStatus.NOT_FOUND.value)
+    return JSONResponse(content={"dropped": True})
 
 
 def attach_router(app: FastAPI) -> None:

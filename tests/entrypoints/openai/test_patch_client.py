@@ -358,6 +358,153 @@ class TestServerSideOneCall:
             )
 
 
+class _FakeMultiHookClient:
+    """Echoes a multi-hook (hook_grids) /patch_sweep response."""
+
+    payloads: list[dict] = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        _FakeMultiHookClient.payloads.append(json)
+        data = dict(
+            _SWEEP_RESP,
+            hook="pre_attn",
+            grid=[[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
+            hook_grids=[
+                {"hook": "pre_attn",
+                 "grid": [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
+                 "argmax": None},
+                {"hook": "post_block",
+                 "grid": [[-2.0, -2.0, -2.0], [-2.0, -2.0, -2.0]],
+                 "argmax": None},
+            ],
+            auto_captured=False,
+            captured_source_run=None,
+        )
+        return _FakeResp(data)
+
+
+class TestKeepSourceAndDrop:
+    def _patch_httpx(self, monkeypatch):
+        import httpx
+
+        _FakeAsyncClient.payloads = []
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    def test_keep_source_forwarded(self, monkeypatch):
+        self._patch_httpx(monkeypatch)
+        study = _server_study()
+        asyncio.run(
+            study.sweep_layers_positions(
+                "c", layers=[0], positions=[0], answer_token=" P",
+                clean_prompt="clean", server_side=True, keep_source=True,
+            )
+        )
+        assert _FakeAsyncClient.payloads[-1]["keep_source"] is True
+
+    def test_keep_source_defaults_false(self, monkeypatch):
+        self._patch_httpx(monkeypatch)
+        study = _server_study()
+        asyncio.run(
+            study.sweep_layers_positions(
+                "c", layers=[0], positions=[0], answer_token=" P",
+                clean_prompt="clean", server_side=True,
+            )
+        )
+        assert _FakeAsyncClient.payloads[-1]["keep_source"] is False
+
+    def test_drop_run_success(self, monkeypatch):
+        import httpx
+
+        seen = {}
+
+        class _R:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"dropped": True}
+
+        def fake_request(method, url, headers=None, timeout=None):
+            seen["method"] = method
+            seen["url"] = url
+            return _R()
+
+        monkeypatch.setattr(httpx, "request", fake_request)
+        study = _server_study()
+        assert study.drop_run("R1") is True
+        assert seen["method"] == "DELETE"
+        assert seen["url"].endswith("/patch_source/R1")
+
+    def test_drop_run_404_returns_false(self, monkeypatch):
+        import httpx
+
+        class _R:
+            status_code = 404
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {}
+
+        monkeypatch.setattr(httpx, "request", lambda *a, **k: _R())
+        study = _server_study()
+        assert study.drop_run("ghost") is False
+
+    def test_drop_run_error_returns_false(self, monkeypatch):
+        import httpx
+
+        def boom(*a, **k):
+            raise RuntimeError("down")
+
+        monkeypatch.setattr(httpx, "request", boom)
+        study = _server_study()
+        assert study.drop_run("R1") is False
+
+
+class TestMultiHookClient:
+    def test_hooks_server_side_returns_dict(self, monkeypatch):
+        import httpx
+
+        _FakeMultiHookClient.payloads = []
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeMultiHookClient)
+        study = _server_study()
+        res = asyncio.run(
+            study.sweep_layers_positions(
+                "c", layers=[0, 1], positions=[5, 6, 7], answer_token=" P",
+                run="R1", server_side=True, hooks=["pre_attn", "post_block"],
+            )
+        )
+        assert isinstance(res, dict)
+        assert set(res) == {"pre_attn", "post_block"}
+        assert res["pre_attn"].hook == "pre_attn"
+        assert res["post_block"].grid == [[-2.0, -2.0, -2.0], [-2.0, -2.0, -2.0]]
+        assert _FakeMultiHookClient.payloads[-1]["hooks"] == [
+            "pre_attn", "post_block"
+        ]
+
+    def test_hooks_per_cell_path_raises(self):
+        study = _server_study()
+        with pytest.raises(ValueError, match="server_side"):
+            asyncio.run(
+                study.sweep_layers_positions(
+                    "c", layers=[0], positions=[0], answer_token=" P",
+                    hooks=["pre_attn"],
+                )
+            )
+
+
 class TestResolvePositions:
     def test_mixes_ints_and_spans_dedup_in_order(self, monkeypatch):
         study = pc.PatchStudy.__new__(pc.PatchStudy)

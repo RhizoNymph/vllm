@@ -1031,6 +1031,22 @@ class Worker(WorkerBase):
         if store is not None:
             store.lease_runs(list(run_ids), float(ttl_seconds))
 
+    def drop_patch_source_run(self, run_id: str) -> bool:
+        """Drop ``run_id`` from this rank's source store, if present.
+
+        Called via ``collective_rpc`` by the sweep auto-drop and the
+        ``DELETE /v1/patch_source/{run_id}`` route. An explicit owner drop
+        succeeds even if the run is leased. Returns whether this rank held it;
+        the entrypoint unions across ranks (PP stores are layer-partitioned).
+        No-op (``False``) on ranks without an active store.
+        """
+        from vllm.v1.capture.source_store import get_active_patch_source_store
+
+        store = get_active_patch_source_store()
+        if store is None:
+            return False
+        return store.drop_run(run_id)
+
     def pop_patch_resolution_failures(self) -> dict[str, list[str]]:
         """Drain this rank's patch resolution-failure registry.
 

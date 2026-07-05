@@ -13,6 +13,7 @@ from vllm.entrypoints.serve.patch.api_router import (
     answer_logprob,
     argmax_cell,
     cell_metric,
+    drop_patch_source,
     patch_sweep,
     resolve_layers,
     resolve_span_body_positions,
@@ -145,6 +146,7 @@ class _MockEngine:
         self._tok = _Tok()
         self.sampling_params = []
         self.waited = []
+        self.dropped = []
 
     def get_tokenizer(self):
         return self._tok
@@ -181,6 +183,12 @@ class _MockEngine:
             return [list(self.runs)]
         if method == "pop_patch_resolution_failures":
             return [{}]
+        if method == "drop_patch_source_run":
+            run_id = args[0]
+            self.dropped.append(run_id)
+            before = len(self.runs)
+            self.runs[:] = [r for r in self.runs if r["run_id"] != run_id]
+            return [len(self.runs) < before]
         return [None]
 
     async def wait_for_capture_results(self, request_id):
@@ -260,6 +268,146 @@ class TestAutoCapture:
         # recovered = (cell - corrupt) / (clean - corrupt)
         expected = (_CELL_LP - _CORRUPT_LP) / (_CLEAN_LP - _CORRUPT_LP)
         assert abs(resp.grid[0][0] - expected) < 1e-9
+
+
+def _gen_buckets(eng) -> tuple[int, int, int]:
+    """(capture, patched, unpatched-baseline) generation counts."""
+    capture = sum(1 for sp in eng.sampling_params if sp.capture is not None)
+    patched = sum(1 for sp in eng.sampling_params if sp.patch)
+    baseline = sum(
+        1 for sp in eng.sampling_params if sp.capture is None and not sp.patch
+    )
+    return capture, patched, baseline
+
+
+class TestMultiHook:
+    def test_empty_hooks_400(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, hooks=[])
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "non-empty" in json.loads(resp.body)["error"]
+
+    def test_bad_hook_in_hooks_400(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, hooks=["mlp_out"])
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "injectable" in json.loads(resp.body)["error"]
+
+    def test_single_hook_list_parity(self):
+        eng1 = _MockEngine(runs=_existing_run())
+        r1 = _run(eng1, hook="post_block")
+        eng2 = _MockEngine(runs=_existing_run())
+        r2 = _run(eng2, hooks=["post_block"])
+        # Same grid values; hook="post_block" has no hook_grids, the list form
+        # carries exactly one.
+        assert r2.grid == r1.grid
+        assert r2.hook == "post_block"
+        assert r1.hook_grids is None
+        assert [hg.hook for hg in r2.hook_grids] == ["post_block"]
+        assert r2.hook_grids[0].grid == r1.grid
+
+    def test_multi_hook_response_shape(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab", hooks=["pre_attn", "post_block"])
+        assert not isinstance(resp, JSONResponse)
+        assert [hg.hook for hg in resp.hook_grids] == ["pre_attn", "post_block"]
+        # Top-level grid/hook/argmax mirror the first hook.
+        assert resp.hook == "pre_attn"
+        assert resp.grid == resp.hook_grids[0].grid
+        for hg in resp.hook_grids:
+            assert len(hg.grid) == 2 and len(hg.grid[0]) == 2
+
+    def test_shared_baseline_and_argmax_computed_once(self):
+        eng = _MockEngine(runs=[])
+        _run(eng, clean_prompt="ab", hooks=["pre_attn", "post_attn", "post_block"])
+        capture, patched, baseline = _gen_buckets(eng)
+        # Baseline + noise-floor rerun are computed ONCE, not per hook.
+        assert baseline == 2
+        assert capture == 1
+        # Cells fan out across every (hook, layer, position).
+        assert patched == 3 * 2 * 2
+
+
+class TestHookCompleteAutoCapture:
+    def test_autocapture_taps_all_three_hooks(self):
+        eng = _MockEngine(runs=[])
+        _run(eng, clean_prompt="ab")  # single hook sweep still taps all hooks
+        cap = next(sp for sp in eng.sampling_params if sp.capture is not None)
+        hooks = cap.capture["patch_source"]["hooks"]
+        assert set(hooks) == {"pre_attn", "post_attn", "post_block"}
+        # Every hook covers the swept layer set.
+        for layers in hooks.values():
+            assert list(layers) == [0, 1]
+
+
+class TestAutoDrop:
+    def test_auto_drop_fires_after_autocapture(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab")
+        assert resp.auto_captured is True
+        assert "R1" in eng.dropped
+        assert not any(r["run_id"] == "R1" for r in eng.runs)
+
+    def test_keep_source_retains_run(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab", keep_source=True)
+        assert resp.auto_captured is True
+        assert resp.captured_source_run == "R1"
+        assert eng.dropped == []
+        assert any(r["run_id"] == "R1" for r in eng.runs)
+
+    def test_preexisting_run_never_dropped(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = _run(eng, clean_prompt="ab")  # reuses existing R1, no capture
+        assert resp.auto_captured is False
+        assert eng.dropped == []
+        assert any(r["run_id"] == "R1" for r in eng.runs)
+
+    def test_drop_then_resweep_reauto_captures(self):
+        # Cache coherence on the auto-drop path: a second identical sweep must
+        # auto-capture again (a stale positive cache would skip it and 400).
+        patch_admission._PATCH_SOURCE_CACHE = patch_admission._PatchSourceCache()
+        eng = _MockEngine(runs=[])
+
+        def _sweep():
+            body = PatchSweepRequest(
+                prompt="ab", source_run="R1", layers=[0, 1],
+                hook="post_block", answer_token_id=5, clean_prompt="ab",
+            )
+            return asyncio.run(patch_sweep(body, _raw_request(eng)))
+
+        r1 = _sweep()
+        assert r1.auto_captured is True
+        assert not any(r["run_id"] == "R1" for r in eng.runs)  # auto-dropped
+        r2 = _sweep()
+        assert r2.auto_captured is True
+
+
+class TestDropRoute:
+    def test_delete_drops_existing_run(self):
+        eng = _MockEngine(runs=_existing_run())
+        resp = asyncio.run(drop_patch_source("R1", _raw_request(eng)))
+        assert resp.status_code == 200
+        assert json.loads(resp.body)["dropped"] is True
+        assert not any(r["run_id"] == "R1" for r in eng.runs)
+
+    def test_delete_missing_run_404(self):
+        eng = _MockEngine(runs=[])
+        resp = asyncio.run(drop_patch_source("ghost", _raw_request(eng)))
+        assert resp.status_code == 404
+        assert "not found" in json.loads(resp.body)["error"]
+
+    def test_delete_invalidates_manifest_cache(self):
+        patch_admission._PATCH_SOURCE_CACHE = patch_admission._PatchSourceCache()
+        eng = _MockEngine(runs=_existing_run())
+        exists = patch_admission.patch_source_run_exists
+        assert asyncio.run(exists(eng, "R1")) is True  # populates cache
+        resp = asyncio.run(drop_patch_source("R1", _raw_request(eng)))
+        assert resp.status_code == 200
+        # Cache no longer reports the dropped run present.
+        assert asyncio.run(exists(eng, "R1")) is False
 
 
 # ---- shared span-resolution math ------------------------------------------
