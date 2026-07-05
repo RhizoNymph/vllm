@@ -31,9 +31,10 @@ capture run.
   place before the forward, so a FULL cudagraph replay reads the step's values —
   no force-eager seam, unlike capture's dynamic gather).
 - **Server-side sweeps:** `POST /v1/patch_sweep` expands a `(layers × positions)`
-  grid into one densely-batched call.
+  grid (optionally × hooks) into one densely-batched call.
 
-End-to-end GPU-validated with real weights (eager + cudagraph):
+End-to-end GPU-validated with real weights (TP1/PP1 eager + cudagraph; the
+multi-rank configs eager):
 
 - **Qwen3-0.6B** (v2 runner, default): TP1/PP1, TP2/PP1, TP1/PP2.
 - **gemma3-4b** (v1 runner): TP1/PP1, TP2/PP1, TP1/PP2.
@@ -167,7 +168,7 @@ This works from both surfaces:
 The pure resolution math lives in `vllm/entrypoints/serve/patch/spans.py`,
 shared by the endpoint and the client (no duplicated copy).
 
-#### One-call auto-capture
+### One-call auto-capture
 
 The common case — capture the clean run, then sweep the corrupt run against it —
 collapses to a single request. When a sweep references a `source_run` that does
@@ -214,7 +215,7 @@ result = await study.sweep_layers_positions(
     clean_prompt=clean_prompt,          # one call: server captures the clean run
     layers=range(20),
     positions=[Span("Germany")],        # resolved server-side, no token indices
-    answer_token=" Berlin",
+    answer_token=" Paris",              # grade by the clean run's answer
     metric="recovered",
     server_side=True,
 )
@@ -262,11 +263,14 @@ then loses a nearly-finished sweep. Passing `"stream": true` opts into an
 
 - `data: {"type": "start", "layers": [...], "positions": [...], "hook": ...,
   "metric": ..., "auto_captured": ..., "captured_source_run": ...}` — first, so
-  a consumer can size a live heatmap before any cell arrives.
+  a consumer can size a live heatmap before any cell arrives (a multi-hook
+  sweep adds its `hooks` list).
 - `data: {"type": "cell", "hook": "post_block", "layer": 14, "position": 3,
   "value": -0.37}` per cell as it completes (completion order — no ordering
-  promise). `hook` is always present and, for a [multi-hook
-  sweep](#multi-hook-sweeps), labels which hook's grid the cell belongs to.
+  promise). Cell values are in the sweep metric's units — identical to the
+  summary grid (for `recovered`, already normalized). `hook` is always present
+  and, for a [multi-hook sweep](#multi-hook-sweeps), labels which hook's grid
+  the cell belongs to.
   A cell that voids mid-sweep (its patch failed to resolve on the workers)
   re-emits as `{"type": "cell", ..., "value": null, "error": "..."}`, mirroring
   how voided cells land in `skipped`.
@@ -328,8 +332,10 @@ typically orders of magnitude above the default noise floor.
    RPC → HTTP 400 on a genuinely-missing run/site), and sets the prefix-cache
    floor so patched prompt positions (and after) are re-forwarded.
 3. **Scheduler backpressure.** Per-`(layer, hook)` reserved-slot counts over the
-   running batch admit a waiting request only if every touched site stays ≤
-   `--max-patch-slots`, so a step can never overflow the pool.
+   running batch admit a waiting request only if every touched site stays within
+   the *usable* pool (`max_patch_slots - 1`; slot 0 is the passthrough
+   sentinel — `PatchConfig.usable_slots`), so a step can never overflow the
+   pool.
 4. **Resolution.** On admission each worker resolves its request's spec against
    its local `PatchSourceStore`, keeping only locally-owned layers (PP);
    TP rank 0 broadcasts the resolved vectors to its peers.
@@ -353,7 +359,9 @@ python -m vllm.entrypoints.openai.api_server \
 
 - `--enable-patching`: attach patch buffers + install the source store, and
   imply the `patch_source` capture consumer (below).
-- `--max-patch-slots`: per-`(layer, hook)` patch pool size (default 64).
+- `--max-patch-slots`: per-`(layer, hook)` patch pool size (default 64). Slot 0
+  is the passthrough sentinel, so one fewer is usable per step
+  (`PatchConfig.usable_slots`).
 - `--patch-source-cache-bytes`: source-store byte budget.
 - `--capture-consumers patch_source`: register the clean-capture consumer.
   Optional — `--enable-patching` implies it (identically, via the shared config

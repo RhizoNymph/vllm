@@ -33,7 +33,7 @@ Overview:
     Destination requests carry patch specs; the runner resolves source vectors
     and writes per-(layer, hook) buffers before the forward; the apply path
     overwrites/interpolates the residual, then steering adds on top. The
-    /v1/patch_sweep endpoint fans a (layers × positions) grid through continuous
+    /v1/patch_sweep endpoint fans a (hooks × layers × positions) grid through continuous
     batching for one-call causal-tracing sweeps; when the referenced source run
     is missing and clean_prompt is given it auto-captures the clean run first.
     Large grids can stream per-cell results over SSE (stream: true / client
@@ -58,7 +58,7 @@ Features Index:
     description: >
       Overwrite/interpolate residual activations at (layer, hook, position)
       sites with a prior clean run's captured activations — the causal-tracing
-      primitive. Includes a server-side (layers × positions) sweep endpoint.
+      primitive. Includes a server-side (hooks × layers × positions) sweep endpoint with SSE streaming and source-run lifecycle.
     entry_points:
       ["SamplingParams.patch", "--enable-patching", "POST /v1/patch_sweep"]
     depends_on: [activation_capture, activation_steering]
