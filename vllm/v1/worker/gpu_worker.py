@@ -1016,9 +1016,7 @@ class Worker(WorkerBase):
             for m in store.manifests()
         ]
 
-    def lease_patch_source_runs(
-        self, run_ids: list[str], ttl_seconds: float
-    ) -> None:
+    def lease_patch_source_runs(self, run_ids: list[str], ttl_seconds: float) -> None:
         """Protect ``run_ids`` from source-store eviction for ``ttl_seconds``.
 
         Called via ``collective_rpc`` by the admission path after validating a

@@ -186,15 +186,11 @@ class TestPositionsFor:
         study = pc.PatchStudy.__new__(pc.PatchStudy)
         study.model = "m"
         monkeypatch.setattr(study, "_tokenize", lambda text: ids)
-        monkeypatch.setattr(
-            study, "_detokenize", lambda i: "".join(pieces[: len(i)])
-        )
+        monkeypatch.setattr(study, "_detokenize", lambda i: "".join(pieces[: len(i)]))
         return study
 
     def test_positions_for(self, monkeypatch):
-        study = self._study(
-            monkeypatch, [1, 2, 3, 4], ["", "The", " Colos", "seum"]
-        )
+        study = self._study(monkeypatch, [1, 2, 3, 4], ["", "The", " Colos", "seum"])
         got = asyncio.run(study.positions_for("The Colosseum", "Colosseum"))
         assert got == [2, 3]
 
@@ -423,10 +419,17 @@ class _FakeStreamClient:
         lines = [_sse_line({"type": "start"})]
         for i, layer in enumerate(data["layers"]):
             for j, pos in enumerate(data["positions"]):
-                lines.append(_sse_line({
-                    "type": "cell", "hook": data["hook"], "layer": layer,
-                    "position": pos, "value": data["grid"][i][j],
-                }))
+                lines.append(
+                    _sse_line(
+                        {
+                            "type": "cell",
+                            "hook": data["hook"],
+                            "layer": layer,
+                            "position": pos,
+                            "value": data["grid"][i][j],
+                        }
+                    )
+                )
         lines.append(_sse_line({"type": "summary", **data}))
         lines.append("data: [DONE]")
         return _StreamCtx(_FakeStreamResp(lines))
@@ -453,12 +456,16 @@ class _FakeMultiHookClient:
             hook="pre_attn",
             grid=[[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
             hook_grids=[
-                {"hook": "pre_attn",
-                 "grid": [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
-                 "argmax": None},
-                {"hook": "post_block",
-                 "grid": [[-2.0, -2.0, -2.0], [-2.0, -2.0, -2.0]],
-                 "argmax": None},
+                {
+                    "hook": "pre_attn",
+                    "grid": [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
+                    "argmax": None,
+                },
+                {
+                    "hook": "post_block",
+                    "grid": [[-2.0, -2.0, -2.0], [-2.0, -2.0, -2.0]],
+                    "argmax": None,
+                },
             ],
             auto_captured=False,
             captured_source_run=None,
@@ -478,8 +485,13 @@ class TestKeepSourceAndDrop:
         study = _server_study()
         asyncio.run(
             study.sweep_layers_positions(
-                "c", layers=[0], positions=[0], answer_token=" P",
-                clean_prompt="clean", server_side=True, keep_source=True,
+                "c",
+                layers=[0],
+                positions=[0],
+                answer_token=" P",
+                clean_prompt="clean",
+                server_side=True,
+                keep_source=True,
             )
         )
         assert _FakeAsyncClient.payloads[-1]["keep_source"] is True
@@ -489,8 +501,12 @@ class TestKeepSourceAndDrop:
         study = _server_study()
         asyncio.run(
             study.sweep_layers_positions(
-                "c", layers=[0], positions=[0], answer_token=" P",
-                clean_prompt="clean", server_side=True,
+                "c",
+                layers=[0],
+                positions=[0],
+                answer_token=" P",
+                clean_prompt="clean",
+                server_side=True,
             )
         )
         assert _FakeAsyncClient.payloads[-1]["keep_source"] is False
@@ -556,24 +572,30 @@ class TestMultiHookClient:
         study = _server_study()
         res = asyncio.run(
             study.sweep_layers_positions(
-                "c", layers=[0, 1], positions=[5, 6, 7], answer_token=" P",
-                run="R1", server_side=True, hooks=["pre_attn", "post_block"],
+                "c",
+                layers=[0, 1],
+                positions=[5, 6, 7],
+                answer_token=" P",
+                run="R1",
+                server_side=True,
+                hooks=["pre_attn", "post_block"],
             )
         )
         assert isinstance(res, dict)
         assert set(res) == {"pre_attn", "post_block"}
         assert res["pre_attn"].hook == "pre_attn"
         assert res["post_block"].grid == [[-2.0, -2.0, -2.0], [-2.0, -2.0, -2.0]]
-        assert _FakeMultiHookClient.payloads[-1]["hooks"] == [
-            "pre_attn", "post_block"
-        ]
+        assert _FakeMultiHookClient.payloads[-1]["hooks"] == ["pre_attn", "post_block"]
 
     def test_hooks_per_cell_path_raises(self):
         study = _server_study()
         with pytest.raises(ValueError, match="server_side"):
             asyncio.run(
                 study.sweep_layers_positions(
-                    "c", layers=[0], positions=[0], answer_token=" P",
+                    "c",
+                    layers=[0],
+                    positions=[0],
+                    answer_token=" P",
                     hooks=["pre_attn"],
                 )
             )
@@ -680,15 +702,21 @@ class _FakeMultiHookStreamClient:
     def stream(self, method, url, json=None, headers=None):
         _FakeMultiHookStreamClient.streamed.append(json)
         data = _multi_hook_data(json)
-        lines = [_sse_line({"type": "start", "hooks": ["pre_attn",
-                                                       "post_block"]})]
+        lines = [_sse_line({"type": "start", "hooks": ["pre_attn", "post_block"]})]
         for hg in data["hook_grids"]:
             for i, layer in enumerate(data["layers"]):
                 for j, pos in enumerate(data["positions"]):
-                    lines.append(_sse_line({
-                        "type": "cell", "hook": hg["hook"], "layer": layer,
-                        "position": pos, "value": hg["grid"][i][j],
-                    }))
+                    lines.append(
+                        _sse_line(
+                            {
+                                "type": "cell",
+                                "hook": hg["hook"],
+                                "layer": layer,
+                                "position": pos,
+                                "value": hg["grid"][i][j],
+                            }
+                        )
+                    )
         lines.append(_sse_line({"type": "summary", **data}))
         lines.append("data: [DONE]")
         return _StreamCtx(_FakeStreamResp(lines))
@@ -701,9 +729,7 @@ class TestMultiHookStreaming:
         _FakeMultiHookStreamClient.streamed = []
         monkeypatch.setattr(httpx, "AsyncClient", _FakeMultiHookStreamClient)
 
-    def test_on_cell_composes_with_hooks_and_matches_nonstreaming(
-        self, monkeypatch
-    ):
+    def test_on_cell_composes_with_hooks_and_matches_nonstreaming(self, monkeypatch):
         self._patch(monkeypatch)
         study = _server_study()
         seen: list[dict] = []

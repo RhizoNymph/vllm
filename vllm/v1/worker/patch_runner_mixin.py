@@ -231,9 +231,7 @@ class PatchModelRunnerMixin:
                 warmup_apply_patch_kernel,
             )
 
-            compute_dtype = getattr(
-                self.vllm_config.model_config, "dtype", table_dtype
-            )
+            compute_dtype = getattr(self.vllm_config.model_config, "dtype", table_dtype)
             compilation_config = getattr(self.vllm_config, "compilation_config", None)
             capture_sizes = (
                 getattr(compilation_config, "cudagraph_capture_sizes", None)
@@ -349,9 +347,7 @@ class PatchModelRunnerMixin:
         # Rebuild the per-token index: zero the live window, scatter the slots.
         index_buf[:n_tokens].zero_()
         rows = torch.tensor(site.abs_rows, dtype=torch.long, device=index_buf.device)
-        slots = torch.arange(
-            1, n + 1, dtype=index_buf.dtype, device=index_buf.device
-        )
+        slots = torch.arange(1, n + 1, dtype=index_buf.dtype, device=index_buf.device)
         index_buf[rows] = slots
         flag_buf.fill_(True)
 

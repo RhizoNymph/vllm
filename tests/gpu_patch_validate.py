@@ -75,8 +75,12 @@ def main() -> None:
     ap.add_argument("--max-patch-slots", type=int, default=64)
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--pipeline-parallel-size", type=int, default=1)
-    ap.add_argument("--clean-prompt", default="The capital city of France is the city of")
-    ap.add_argument("--corrupt-prompt", default="The capital city of Japan is the city of")
+    ap.add_argument(
+        "--clean-prompt", default="The capital city of France is the city of"
+    )
+    ap.add_argument(
+        "--corrupt-prompt", default="The capital city of Japan is the city of"
+    )
     args = ap.parse_args()
 
     llm = LLM(
@@ -117,7 +121,9 @@ def main() -> None:
     # Unpatched baselines + capture each prompt's source.
     clean_lp = gen(
         clean_prompt,
-        SamplingParams(temperature=0.0, max_tokens=1, logprobs=20, capture=_cap("clean")),
+        SamplingParams(
+            temperature=0.0, max_tokens=1, logprobs=20, capture=_cap("clean")
+        ),
     )
     corrupt_lp = gen(
         corrupt_prompt,
@@ -141,7 +147,9 @@ def main() -> None:
         ),
     )
     d = _maxdiff(noop, corrupt_lp)
-    results.append(("A no-op alpha=0 (post_block, all sites)", d < 1e-3, f"max|d|={d:.4g}"))
+    results.append(
+        ("A no-op alpha=0 (post_block, all sites)", d < 1e-3, f"max|d|={d:.4g}")
+    )
 
     # B. self-identity @ pre_attn (exact)
     ident_pre = gen(
@@ -224,9 +232,12 @@ def main() -> None:
     full_pb = gen(
         corrupt_prompt,
         SamplingParams(
-            temperature=0.0, max_tokens=1, logprobs=20,
-            patch=_patch("post_block", n_layers, min(n_clean, n_corrupt), "clean",
-                         alpha=1.0),
+            temperature=0.0,
+            max_tokens=1,
+            logprobs=20,
+            patch=_patch(
+                "post_block", n_layers, min(n_clean, n_corrupt), "clean", alpha=1.0
+            ),
         ),
     )
     moved_pb = full_pb.get(clean_tok, -20.0) - corrupt_lp.get(clean_tok, -20.0)
@@ -320,8 +331,11 @@ def main() -> None:
             and v0 - tol <= vh <= v1 + tol  # monotone within tolerance
         )
         interior = (
-            v0 is not None and vh is not None and v1 is not None
-            and vh > v0 + 0.05 and vh < v1 - 0.05
+            v0 is not None
+            and vh is not None
+            and v1 is not None
+            and vh > v0 + 0.05
+            and vh < v1 - 0.05
         )
         results.append(
             (

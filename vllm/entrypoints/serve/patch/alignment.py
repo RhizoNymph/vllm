@@ -18,8 +18,8 @@ computes the safe correspondence:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -82,9 +82,7 @@ def align_token_positions(
 
     shift = n_clean - n_corrupt
     mapping: dict[int, int] = {i: i for i in range(prefix)}
-    mapping.update(
-        {i: i + shift for i in range(n_corrupt - suffix, n_corrupt)}
-    )
+    mapping.update({i: i + shift for i in range(n_corrupt - suffix, n_corrupt)})
     unaligned = list(range(prefix, n_corrupt - suffix))
     return PositionAlignment(
         mapping=mapping,

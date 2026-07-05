@@ -63,9 +63,7 @@ class PatchSourceConsumer(CaptureConsumer):
             OrderedDict()
         )
 
-    def validate_client_spec(
-        self, raw_spec: Any, ctx: CaptureContext
-    ) -> CaptureSpec:
+    def validate_client_spec(self, raw_spec: Any, ctx: CaptureContext) -> CaptureSpec:
         if not isinstance(raw_spec, dict):
             raise CaptureValidationError(
                 f"patch_source spec must be a dict, got {type(raw_spec).__name__}"
@@ -84,8 +82,7 @@ class PatchSourceConsumer(CaptureConsumer):
         hooks_raw = raw_spec.get("hooks")
         if not hooks_raw or not isinstance(hooks_raw, dict):
             raise CaptureValidationError(
-                "patch_source spec needs a non-empty 'hooks' dict "
-                "{hook: layers}"
+                "patch_source spec needs a non-empty 'hooks' dict {hook: layers}"
             )
         hooks: dict[str, list[int]] = {}
         for hook, layers in hooks_raw.items():

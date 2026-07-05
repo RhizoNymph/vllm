@@ -696,9 +696,7 @@ class Scheduler(SchedulerInterface):
         if self.patch_config:
             for req in self.running:
                 for site, n in req.patch_site_demand.items():
-                    scheduled_patch_sites[site] = (
-                        scheduled_patch_sites.get(site, 0) + n
-                    )
+                    scheduled_patch_sites[site] = scheduled_patch_sites.get(site, 0) + n
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
@@ -2175,9 +2173,7 @@ class Scheduler(SchedulerInterface):
                 and request.sampling_params is not None
                 and request.sampling_params.capture
             ):
-                self._capture_client_index[request.request_id] = (
-                    request.client_index
-                )
+                self._capture_client_index[request.request_id] = request.client_index
                 # Backstop bound (FIFO): drop the oldest entry if results were
                 # delivered in-band and never late-popped. Late results arrive
                 # within seconds, so live entries are never evicted in practice.

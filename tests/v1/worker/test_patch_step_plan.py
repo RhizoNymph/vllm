@@ -197,7 +197,7 @@ class TestBuildPatchStepPlan:
             usable = PatchConfig(max_patch_slots=max_slots).usable_slots
             assert usable == max_slots - 1
 
-            def _plan(n: int):
+            def _plan(n: int, max_slots: int = max_slots):
                 specs = {
                     "r0": [
                         PatchEntry(

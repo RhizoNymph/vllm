@@ -65,18 +65,13 @@ def resolve_patch_prefix_flags(
         layer = int(entry["layer"])
         if not (0 <= layer < ctx.num_hidden_layers):
             raise PatchValidationError(
-                f"patch[{i}]: layer {layer} out of range "
-                f"[0, {ctx.num_hidden_layers})"
+                f"patch[{i}]: layer {layer} out of range [0, {ctx.num_hidden_layers})"
             )
         dest = int(entry["dest_position"])
         if dest < 0:
-            raise PatchValidationError(
-                f"patch[{i}]: dest_position {dest} must be >= 0"
-            )
+            raise PatchValidationError(f"patch[{i}]: dest_position {dest} must be >= 0")
         if int(entry["source_position"]) < 0:
-            raise PatchValidationError(
-                f"patch[{i}]: source_position must be >= 0"
-            )
+            raise PatchValidationError(f"patch[{i}]: source_position must be >= 0")
         key = (layer, hook)
         site_counts[key] = site_counts.get(key, 0) + 1
         if max_patch_slots and site_counts[key] > max_patch_slots - 1:
@@ -140,9 +135,7 @@ class _PatchSourceCache:
         self._runs = agg
         self._run_prompt_tokens = num_prompt_tokens
 
-    async def run_exists(
-        self, run_id: str, engine_client: EngineClient
-    ) -> bool | None:
+    async def run_exists(self, run_id: str, engine_client: EngineClient) -> bool | None:
         """Whether ``run_id`` is present in the worker manifests (tri-state).
 
         Returns ``True`` (present), ``False`` (confirmed absent after a
@@ -242,9 +235,7 @@ class _PatchSourceCache:
         self._run_prompt_tokens.pop(run_id, None)
         self._leased_at.pop(run_id, None)
 
-    async def _maybe_lease(
-        self, engine_client: EngineClient, runs: set[str]
-    ) -> None:
+    async def _maybe_lease(self, engine_client: EngineClient, runs: set[str]) -> None:
         """Lease ``runs`` against eviction, renewing at most once per half-TTL.
 
         Best-effort: a failed lease RPC degrades to the resolution-failure
@@ -252,7 +243,8 @@ class _PatchSourceCache:
         """
         now = time.monotonic()
         stale = [
-            run for run in runs
+            run
+            for run in runs
             if now - self._leased_at.get(run, 0.0) > self.LEASE_TTL_S / 2
         ]
         if not stale:
@@ -279,9 +271,7 @@ async def validate_patch_sources(
     await _PATCH_SOURCE_CACHE.validate(sampling_params, engine_client)
 
 
-async def get_run_prompt_tokens(
-    engine_client: EngineClient, run_id: str
-) -> int | None:
+async def get_run_prompt_tokens(engine_client: EngineClient, run_id: str) -> int | None:
     """Prompt-token count of a captured source run (None if unknown)."""
     return await _PATCH_SOURCE_CACHE.run_prompt_tokens(run_id, engine_client)
 

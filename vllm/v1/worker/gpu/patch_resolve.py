@@ -102,8 +102,7 @@ def _resolve_local(candidates: list[dict], req_id: str) -> list[PatchEntry]:
                 f"source missing: run={source_run} layer={layer} "
                 f"hook={hook} pos={source_pos} (evicted or never captured)"
             )
-            logger.error("patch resolution for %s: %s; skipping entry",
-                         req_id, detail)
+            logger.error("patch resolution for %s: %s; skipping entry", req_id, detail)
             record_resolution_failure(req_id, detail)
             continue
         entries.append(

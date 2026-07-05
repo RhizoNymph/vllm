@@ -181,9 +181,9 @@ class PatchSourceStore:
 
     def _evict_to_budget_locked(self, *, protect: str | None = None) -> None:
         def over() -> bool:
-            return (
-                self._max_bytes > 0 and self._resident_bytes > self._max_bytes
-            ) or (self._max_runs is not None and len(self._runs) > self._max_runs)
+            return (self._max_bytes > 0 and self._resident_bytes > self._max_bytes) or (
+                self._max_runs is not None and len(self._runs) > self._max_runs
+            )
 
         # Walk the LRU order, skipping the run being written and any leased
         # run. If everything is protected, soft-exceed the budget (evicting a
@@ -245,9 +245,7 @@ class PatchSourceStore:
                 return None
             out: list[torch.Tensor] = []
             for key in requests:
-                row = run.rows.get(
-                    (int(key[0]), str(key[1]), int(key[2]))
-                )
+                row = run.rows.get((int(key[0]), str(key[1]), int(key[2])))
                 if row is None:
                     self._run_misses += 1
                     return None

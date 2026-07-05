@@ -111,9 +111,7 @@ class TestOnCapture:
                 _ctx("req0", num_prompt=3),
             )
             # 3 rows, one per prompt position, distinct values.
-            tensor = torch.stack(
-                [torch.full((8,), float(p)) for p in range(3)]
-            )
+            tensor = torch.stack([torch.full((8,), float(p)) for p in range(3)])
             c.on_capture(("req0", 2, "post_block"), tensor, {"client_request_id": "X"})
             for p in range(3):
                 row = store.get_row("R1", 2, "post_block", p)

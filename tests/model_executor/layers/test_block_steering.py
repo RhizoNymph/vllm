@@ -69,9 +69,7 @@ def test_block_capture_anchors_on_live_summands(monkeypatch):
     """
     seen: list[tuple[torch.Tensor, torch.Tensor, int, str]] = []
 
-    monkeypatch.setattr(
-        cap_mod, "get_active_capture_manager", lambda: object()
-    )
+    monkeypatch.setattr(cap_mod, "get_active_capture_manager", lambda: object())
     monkeypatch.setattr(
         steering_mod,
         "maybe_capture_residual_add",

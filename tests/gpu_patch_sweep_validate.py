@@ -54,8 +54,10 @@ def main() -> None:
         run="paris",
         answer_token=args.answer,
     )
-    print(f"clean: run={clean.run_id} n_prompt={clean.num_prompt_tokens} "
-          f"logprob={clean.clean_logprob}")
+    print(
+        f"clean: run={clean.run_id} n_prompt={clean.num_prompt_tokens} "
+        f"logprob={clean.clean_logprob}"
+    )
 
     corrupt = "The capital city of Japan is the city of"
     layers = list(range(0, 28, 4))
@@ -63,14 +65,24 @@ def main() -> None:
 
     per_cell = asyncio.run(
         study.sweep_layers_positions(
-            corrupt, run="paris", layers=layers, positions=positions,
-            answer_token=args.answer, metric="logprob", server_side=False,
+            corrupt,
+            run="paris",
+            layers=layers,
+            positions=positions,
+            answer_token=args.answer,
+            metric="logprob",
+            server_side=False,
         )
     )
     server = asyncio.run(
         study.sweep_layers_positions(
-            corrupt, run="paris", layers=layers, positions=positions,
-            answer_token=args.answer, metric="logprob", server_side=True,
+            corrupt,
+            run="paris",
+            layers=layers,
+            positions=positions,
+            answer_token=args.answer,
+            metric="logprob",
+            server_side=True,
         )
     )
 

@@ -126,8 +126,15 @@ def phase_b(model: str, out_path: str) -> None:
         )[0]
     )
     with open(out_path, "w") as f:
-        json.dump({"patched": patched, "unpatched_after": unpatched_after,
-                   "d0": d0, "n_prompt": len(corrupt_ids)}, f)
+        json.dump(
+            {
+                "patched": patched,
+                "unpatched_after": unpatched_after,
+                "d0": d0,
+                "n_prompt": len(corrupt_ids),
+            },
+            f,
+        )
 
 
 def main() -> None:
@@ -150,15 +157,25 @@ def main() -> None:
     b_path = os.path.join(tmp, "poison_phase_b.json")
     for phase, path in (("a", a_path), ("b", b_path)):
         r = subprocess.run(
-            [sys.executable, os.path.abspath(__file__), "--model", args.model,
-             "--phase", phase, "--out", path],
+            [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--model",
+                args.model,
+                "--phase",
+                phase,
+                "--out",
+                path,
+            ],
             env=os.environ.copy(),
         )
         if r.returncode != 0:
             raise SystemExit(f"phase {phase} failed")
 
-    ground = {int(k): v for k, v in json.load(open(a_path)).items()}
-    b = json.load(open(b_path))
+    with open(a_path) as f:
+        ground = {int(k): v for k, v in json.load(f).items()}
+    with open(b_path) as f:
+        b = json.load(f)
     patched = {int(k): v for k, v in b["patched"].items()}
     unpatched_after = {int(k): v for k, v in b["unpatched_after"].items()}
 

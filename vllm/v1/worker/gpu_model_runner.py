@@ -2041,9 +2041,7 @@ class GPUModelRunner(
             # results silently vanish -- requests then never report capture
             # results at all.
             with self._pending_capture_results_lock:
-                self._pending_capture_results.setdefault(req_id, {}).update(
-                    named
-                )
+                self._pending_capture_results.setdefault(req_id, {}).update(named)
 
         mgr.finalize_request_async(req_id, _on_complete)
 

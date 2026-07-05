@@ -115,13 +115,9 @@ def cell_metric(
     first_token_logprobs: dict[int, Any], req: PatchSweepRequest
 ) -> float | None:
     """``logprob`` or ``logit_diff`` (``recovered`` is normalized later)."""
-    ans = answer_logprob(
-        first_token_logprobs, req.answer_token_id, req.answer_token
-    )
+    ans = answer_logprob(first_token_logprobs, req.answer_token_id, req.answer_token)
     if req.metric == "logit_diff":
-        foil = answer_logprob(
-            first_token_logprobs, req.foil_token_id, req.foil_token
-        )
+        foil = answer_logprob(first_token_logprobs, req.foil_token_id, req.foil_token)
         if ans is None or foil is None:
             return None
         return ans - foil
@@ -264,9 +260,7 @@ async def _resolve_grade_token(
     return int(ids[0])
 
 
-async def _drop_patch_source_run(
-    eng: EngineClient, run_id: str
-) -> bool:
+async def _drop_patch_source_run(eng: EngineClient, run_id: str) -> bool:
     """Drop ``run_id`` from every worker's source store; return if any dropped.
 
     Also invalidates the admission-side manifest cache so a subsequent
@@ -275,9 +269,7 @@ async def _drop_patch_source_run(
     """
     from vllm.v1.capture.patch_admission import invalidate_patch_source_run
 
-    results = await eng.collective_rpc(
-        "drop_patch_source_run", args=(run_id,)
-    )
+    results = await eng.collective_rpc("drop_patch_source_run", args=(run_id,))
     invalidate_patch_source_run(run_id)
     return any(bool(r) for r in (results or []))
 
@@ -326,8 +318,7 @@ async def _sweep_events(
     summary yields, and again best-effort on early close.
     """
     grids: dict[str, list[list[float | None]]] = {
-        hook: [[None] * len(positions) for _ in layers]
-        for hook in effective_hooks
+        hook: [[None] * len(positions) for _ in layers] for hook in effective_hooks
     }
     cell_req_ids: dict[str, tuple[str, int, int, int, int]] = {}
 
@@ -339,9 +330,11 @@ async def _sweep_events(
     clean_val = auto_clean_val if auto_captured else body.clean_baseline
     denom: float | None = None
     if body.metric == "recovered":
-        if clean_val is None or corrupt_val is None or abs(
-            clean_val - corrupt_val
-        ) < 1e-9:
+        if (
+            clean_val is None
+            or corrupt_val is None
+            or abs(clean_val - corrupt_val) < 1e-9
+        ):
             logger.warning(
                 "recovered metric needs clean_baseline + corrupt baseline "
                 "with clean != corrupt; returning raw logprob grid"
@@ -370,8 +363,13 @@ async def _sweep_events(
         request_id = f"patchsweep-{hook}-{layer}-{pos}-{uuid4().hex[:8]}"
         cell_req_ids[request_id] = (hook, i, layer, j, pos)
         lp, _ = await _first_token_logprobs(
-            eng, body.prompt, patch, body.logprobs, f"{hook}-{layer}-{pos}",
-            grade_ids, request_id,
+            eng,
+            body.prompt,
+            patch,
+            body.logprobs,
+            f"{hook}-{layer}-{pos}",
+            grade_ids,
+            request_id,
         )
         return hook, i, layer, j, pos, (cell_metric(lp, body) if lp else None)
 
@@ -397,11 +395,7 @@ async def _sweep_events(
         if drop_done:
             return
         drop_done = True
-        if (
-            auto_captured
-            and captured_source_run is not None
-            and not body.keep_source
-        ):
+        if auto_captured and captured_source_run is not None and not body.keep_source:
             await _drop_source_run_quiet(eng, captured_source_run)
 
     cell_tasks = [
@@ -416,13 +410,16 @@ async def _sweep_events(
             for fut in asyncio.as_completed(cell_tasks):
                 hook, i, layer, j, pos, value = await fut
                 grids[hook][i][j] = to_metric(value)
-                yield "cell", {
-                    "type": "cell",
-                    "hook": hook,
-                    "layer": layer,
-                    "position": pos,
-                    "value": grids[hook][i][j],
-                }
+                yield (
+                    "cell",
+                    {
+                        "type": "cell",
+                        "hook": hook,
+                        "layer": layer,
+                        "position": pos,
+                        "value": grids[hook][i][j],
+                    },
+                )
             corrupt_val_batched = await baseline_task
         finally:
             for task in (*cell_tasks, baseline_task):
@@ -446,13 +443,9 @@ async def _sweep_events(
         # positions.) Each voided cell also re-emits as a null-valued cell event
         # (streaming), carrying its own hook.
         try:
-            failure_maps = await eng.collective_rpc(
-                "pop_patch_resolution_failures"
-            )
+            failure_maps = await eng.collective_rpc("pop_patch_resolution_failures")
         except Exception as exc:  # noqa: BLE001 — backstop is best-effort
-            logger.warning(
-                "patch resolution-failure drain RPC failed (%s)", exc
-            )
+            logger.warning("patch resolution-failure drain RPC failed (%s)", exc)
             failure_maps = None
         for rank_failures in failure_maps or []:
             for req_id, details in (rank_failures or {}).items():
@@ -463,22 +456,26 @@ async def _sweep_events(
                 grids[hook][i][j] = None
                 reason = "; ".join(details)
                 skipped.append(
-                    {"hook": hook, "layer": layer, "position": pos,
-                     "reason": reason}
+                    {"hook": hook, "layer": layer, "position": pos, "reason": reason}
                 )
                 logger.error(
-                    "patch_sweep cell (hook=%s, layer=%d, pos=%d) ran "
-                    "unpatched: %s",
-                    hook, layer, pos, details,
+                    "patch_sweep cell (hook=%s, layer=%d, pos=%d) ran unpatched: %s",
+                    hook,
+                    layer,
+                    pos,
+                    details,
                 )
-                yield "cell", {
-                    "type": "cell",
-                    "hook": hook,
-                    "layer": layer,
-                    "position": pos,
-                    "value": None,
-                    "error": reason,
-                }
+                yield (
+                    "cell",
+                    {
+                        "type": "cell",
+                        "hook": hook,
+                        "layer": layer,
+                        "position": pos,
+                        "value": None,
+                        "error": reason,
+                    },
+                )
 
         # Top-level grid/hook/argmax mirror the first hook (single-hook
         # contract); hook_grids carries every hook when `hooks` was requested.
@@ -500,21 +497,24 @@ async def _sweep_events(
         # yield in an async generator is not reliably executed.
         await _maybe_drop()
 
-        yield "summary", PatchSweepResponse(
-            layers=layers,
-            positions=positions,
-            hook=primary,
-            metric=body.metric,
-            grid=top_grid,
-            clean=clean_val,
-            corrupt=corrupt_val,
-            argmax=argmax_cell(top_grid, layers, positions),
-            skipped=skipped,
-            alignment=alignment_summary,
-            noise_floor=noise_floor,
-            auto_captured=auto_captured,
-            captured_source_run=captured_source_run,
-            hook_grids=hook_grids,
+        yield (
+            "summary",
+            PatchSweepResponse(
+                layers=layers,
+                positions=positions,
+                hook=primary,
+                metric=body.metric,
+                grid=top_grid,
+                clean=clean_val,
+                corrupt=corrupt_val,
+                argmax=argmax_cell(top_grid, layers, positions),
+                skipped=skipped,
+                alignment=alignment_summary,
+                noise_floor=noise_floor,
+                auto_captured=auto_captured,
+                captured_source_run=captured_source_run,
+                hook_grids=hook_grids,
+            ),
         )
     finally:
         # Disconnect guard: if the consumer closed the generator early
@@ -524,9 +524,7 @@ async def _sweep_events(
         await _maybe_drop()
 
 
-async def _sweep_sse(
-    start_event: dict, **gen_kwargs
-) -> AsyncGenerator[str, None]:
+async def _sweep_sse(start_event: dict, **gen_kwargs) -> AsyncGenerator[str, None]:
     """Serialize the sweep event stream as SSE (``text/event-stream``).
 
     Emits a ``start`` event (grid shape / resolved axes) so consumers can size a
@@ -564,13 +562,15 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
             return _err("hooks must be non-empty when provided")
         bad = [h for h in body.hooks if h not in _INJECTABLE_HOOKS]
         if bad:
-            return _err(f"hooks {bad} not injectable; valid: "
-                        f"{sorted(_INJECTABLE_HOOKS)}")
+            return _err(
+                f"hooks {bad} not injectable; valid: {sorted(_INJECTABLE_HOOKS)}"
+            )
         effective_hooks = list(dict.fromkeys(body.hooks))
     else:
         if body.hook not in _INJECTABLE_HOOKS:
-            return _err(f"hook {body.hook!r} not injectable; valid: "
-                        f"{sorted(_INJECTABLE_HOOKS)}")
+            return _err(
+                f"hook {body.hook!r} not injectable; valid: {sorted(_INJECTABLE_HOOKS)}"
+            )
         effective_hooks = [body.hook]
     multi_hook = body.hooks is not None
 
@@ -590,8 +590,7 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         )
     except ValueError as exc:
         return _err(str(exc))
-    grade_ids = [t for t in (body.answer_token_id, body.foil_token_id)
-                 if t is not None]
+    grade_ids = [t for t in (body.answer_token_id, body.foil_token_id) if t is not None]
 
     # Corrupt baseline (no patch) — also fixes the prompt length for
     # "all_prompt" position resolution.
@@ -601,8 +600,9 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("patch_sweep baseline failed")
-        return _err(f"baseline generation failed: {exc}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR.value)
+        return _err(
+            f"baseline generation failed: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR.value
+        )
     if body.positions == "all_prompt":
         positions = list(range(n_prompt))
     else:
@@ -644,8 +644,12 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         if run_exists is False:
             try:
                 clean_lp = await _auto_capture_clean(
-                    eng, body.clean_prompt, body.source_run,
-                    layers, body.logprobs, grade_ids,
+                    eng,
+                    body.clean_prompt,
+                    body.source_run,
+                    layers,
+                    body.logprobs,
+                    grade_ids,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("patch_sweep auto-capture failed")
@@ -781,11 +785,14 @@ async def drop_patch_source(run_id: str, raw_request: Request):
         dropped = await _drop_patch_source_run(eng, run_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("patch_source drop failed")
-        return _err(f"drop of source run {run_id!r} failed: {exc}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR.value)
+        return _err(
+            f"drop of source run {run_id!r} failed: {exc}",
+            HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
     if not dropped:
-        return _err(f"patch source run {run_id!r} not found",
-                    HTTPStatus.NOT_FOUND.value)
+        return _err(
+            f"patch source run {run_id!r} not found", HTTPStatus.NOT_FOUND.value
+        )
     return JSONResponse(content={"dropped": True})
 
 

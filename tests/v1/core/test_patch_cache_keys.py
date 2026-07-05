@@ -99,11 +99,15 @@ class TestGenPatchExtraHashKeys:
         req_b = _req([_entry(layer=7, dest=4)])
         tokens = list(range(16))
         ha = hash_block_tokens(
-            sha256_cbor, None, tokens,
+            sha256_cbor,
+            None,
+            tokens,
             tuple(_gen_patch_extra_hash_keys(req_a, 0, 16)),
         )
         hb = hash_block_tokens(
-            sha256_cbor, None, tokens,
+            sha256_cbor,
+            None,
+            tokens,
             tuple(_gen_patch_extra_hash_keys(req_b, 0, 16)),
         )
         h_clean = hash_block_tokens(sha256_cbor, None, tokens, None)
@@ -115,11 +119,15 @@ class TestGenPatchExtraHashKeys:
         req_b = _req([_entry()])
         tokens = list(range(16))
         ha = hash_block_tokens(
-            sha256_cbor, None, tokens,
+            sha256_cbor,
+            None,
+            tokens,
             tuple(_gen_patch_extra_hash_keys(req_a, 16, 32)),
         )
         hb = hash_block_tokens(
-            sha256_cbor, None, tokens,
+            sha256_cbor,
+            None,
+            tokens,
             tuple(_gen_patch_extra_hash_keys(req_b, 16, 32)),
         )
         assert ha == hb

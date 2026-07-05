@@ -37,9 +37,7 @@ def _lp(d: dict[int, tuple[float, str]]) -> dict[int, SimpleNamespace]:
 
 
 def _req(**kw) -> PatchSweepRequest:
-    base = dict(
-        prompt="x", source_run="R1", layers=[0], metric="logprob"
-    )
+    base = dict(prompt="x", source_run="R1", layers=[0], metric="logprob")
     base.update(kw)
     return PatchSweepRequest(**base)
 
@@ -107,9 +105,9 @@ class TestArgmax:
 
 # ---- endpoint auto-capture flow (mocked engine) ---------------------------
 
-_CLEAN_LP = -0.5   # answer logprob for the internal clean (capture) generation
+_CLEAN_LP = -0.5  # answer logprob for the internal clean (capture) generation
 _CORRUPT_LP = -2.0  # answer logprob for the unpatched baseline
-_CELL_LP = -1.0    # answer logprob for a patched cell
+_CELL_LP = -1.0  # answer logprob for a patched cell
 
 
 class _Tok:
@@ -373,8 +371,12 @@ class TestAutoDrop:
 
         def _sweep():
             body = PatchSweepRequest(
-                prompt="ab", source_run="R1", layers=[0, 1],
-                hook="post_block", answer_token_id=5, clean_prompt="ab",
+                prompt="ab",
+                source_run="R1",
+                layers=[0, 1],
+                hook="post_block",
+                answer_token_id=5,
+                clean_prompt="ab",
             )
             return asyncio.run(patch_sweep(body, _raw_request(eng)))
 
@@ -424,7 +426,7 @@ def _drain_sse(resp: StreamingResponse) -> list[str]:
 
     text = asyncio.run(drain())
     return [
-        block[len("data: "):]
+        block[len("data: ") :]
         for block in text.split("\n\n")
         if block.startswith("data: ")
     ]
@@ -496,8 +498,7 @@ class TestStreamingSweep:
         eng_plain = _MockEngine(runs=[])
         plain = _run(eng_plain, clean_prompt="ab", metric="recovered")
         eng_stream = _MockEngine(runs=[])
-        resp = _run(eng_stream, clean_prompt="ab", metric="recovered",
-                    stream=True)
+        resp = _run(eng_stream, clean_prompt="ab", metric="recovered", stream=True)
         events, _ = _sse_events(resp)
         summary = next(e for e in events if e["type"] == "summary")
         summary = {k: v for k, v in summary.items() if k != "type"}
@@ -521,10 +522,7 @@ class TestStreamingSweep:
         eng = _VoidEngine(runs=_existing_run())
         resp = _run(eng, stream=True)
         events, _ = _sse_events(resp)
-        voided = [
-            e for e in events
-            if e["type"] == "cell" and e["value"] is None
-        ]
+        voided = [e for e in events if e["type"] == "cell" and e["value"] is None]
         assert len(voided) == 1
         assert voided[0]["error"] == "source evicted mid-sweep"
         assert voided[0]["hook"] == "post_block"
@@ -542,7 +540,9 @@ class TestStreamingMultiHook:
     def test_cell_events_cover_every_hook_layer_position(self):
         eng = _MockEngine(runs=[])
         resp = _run(
-            eng, clean_prompt="ab", hooks=["pre_attn", "post_block"],
+            eng,
+            clean_prompt="ab",
+            hooks=["pre_attn", "post_block"],
             stream=True,
         )
         assert isinstance(resp, StreamingResponse)
@@ -566,19 +566,20 @@ class TestStreamingMultiHook:
     def test_streamed_summary_hook_grids_equal_nonstreaming(self):
         # Same mock config both ways -> identical multi-hook summary.
         eng_plain = _MockEngine(runs=[])
-        plain = _run(eng_plain, clean_prompt="ab",
-                     hooks=["pre_attn", "post_block"])
+        plain = _run(eng_plain, clean_prompt="ab", hooks=["pre_attn", "post_block"])
         assert not isinstance(plain, JSONResponse)
 
         eng_stream = _MockEngine(runs=[])
-        resp = _run(eng_stream, clean_prompt="ab",
-                    hooks=["pre_attn", "post_block"], stream=True)
+        resp = _run(
+            eng_stream, clean_prompt="ab", hooks=["pre_attn", "post_block"], stream=True
+        )
         events, _ = _sse_events(resp)
         summary = next(e for e in events if e["type"] == "summary")
         summary = {k: v for k, v in summary.items() if k != "type"}
         assert summary == plain.model_dump()
         assert [hg["hook"] for hg in summary["hook_grids"]] == [
-            "pre_attn", "post_block"
+            "pre_attn",
+            "post_block",
         ]
 
 

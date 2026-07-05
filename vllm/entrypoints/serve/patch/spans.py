@@ -118,9 +118,7 @@ def incremental_char_offsets(
     return text, offsets
 
 
-def prompt_char_offsets(
-    tokenizer, prompt: str
-) -> tuple[str, list[tuple[int, int]]]:
+def prompt_char_offsets(tokenizer, prompt: str) -> tuple[str, list[tuple[int, int]]]:
     """``(text, per-token char offsets)`` for ``prompt``, in-process.
 
     Tokenizes exactly as the sweep does (``add_special_tokens=True``, matching
@@ -131,9 +129,7 @@ def prompt_char_offsets(
     and are never selected.
     """
     try:
-        enc = tokenizer(
-            prompt, add_special_tokens=True, return_offsets_mapping=True
-        )
+        enc = tokenizer(prompt, add_special_tokens=True, return_offsets_mapping=True)
         offsets = [tuple(o) for o in enc["offset_mapping"]]
         return prompt, offsets
     except (TypeError, KeyError, ValueError, NotImplementedError, AttributeError):

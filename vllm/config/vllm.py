@@ -107,6 +107,7 @@ def maybe_add_capture_split_op(
     if CAPTURE_RESIDUAL_SPLIT_OP not in splitting_ops:
         splitting_ops.append(CAPTURE_RESIDUAL_SPLIT_OP)
 
+
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "Qwen3ForCausalLM",

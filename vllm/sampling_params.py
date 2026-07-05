@@ -707,9 +707,7 @@ class SamplingParams(
                 )
             for req_field in required:
                 if req_field not in entry:
-                    raise ValueError(
-                        f"patch[{i}] missing required key {req_field!r}"
-                    )
+                    raise ValueError(f"patch[{i}] missing required key {req_field!r}")
             if not isinstance(entry["layer"], int):
                 raise ValueError(f"patch[{i}]['layer'] must be an int")
             if not isinstance(entry["hook"], str):

@@ -39,6 +39,8 @@ from vllm.entrypoints.serve.patch.alignment import align_token_positions
 from vllm.entrypoints.serve.patch.spans import (
     dedup_positions,
     incremental_char_offsets,
+)
+from vllm.entrypoints.serve.patch.spans import (
     resolve_span_positions as _resolve_span_positions,
 )
 
@@ -208,8 +210,11 @@ class PatchStudy:
         try:
             r = httpx.post(
                 f"{self._root_url()}/tokenize",
-                json={"model": self.model, "prompt": token,
-                      "add_special_tokens": False},
+                json={
+                    "model": self.model,
+                    "prompt": token,
+                    "add_special_tokens": False,
+                },
                 timeout=10.0,
             )
             r.raise_for_status()
@@ -217,18 +222,29 @@ class PatchStudy:
             if len(ids) == 1:
                 token_id = int(ids[0])
             else:
-                print(f"warning: {token!r} tokenizes to {len(ids)} tokens; "
-                      f"grading falls back to top-k matching")
+                print(
+                    f"warning: {token!r} tokenizes to {len(ids)} tokens; "
+                    f"grading falls back to top-k matching"
+                )
         except Exception as exc:  # noqa: BLE001 - fallback is functional
-            print(f"warning: /tokenize failed ({exc}); grading falls back "
-                  f"to top-k matching")
+            print(
+                f"warning: /tokenize failed ({exc}); grading falls back "
+                f"to top-k matching"
+            )
         self._token_id_cache[token] = token_id
         return token_id
 
-    def _grade_ids(self, answer_token: str | None,
-                   foil_token: str | None = None) -> list[int] | None:
-        ids = [i for i in (self._grade_token_id(answer_token),
-                           self._grade_token_id(foil_token)) if i is not None]
+    def _grade_ids(
+        self, answer_token: str | None, foil_token: str | None = None
+    ) -> list[int] | None:
+        ids = [
+            i
+            for i in (
+                self._grade_token_id(answer_token),
+                self._grade_token_id(foil_token),
+            )
+            if i is not None
+        ]
         return ids or None
 
     def _tokenize(self, text: str) -> list[int] | None:
@@ -238,8 +254,7 @@ class PatchStudy:
         try:
             r = httpx.post(
                 f"{self._root_url()}/tokenize",
-                json={"model": self.model, "prompt": text,
-                      "add_special_tokens": True},
+                json={"model": self.model, "prompt": text, "add_special_tokens": True},
                 timeout=10.0,
             )
             r.raise_for_status()
@@ -380,9 +395,7 @@ class PatchStudy:
         )
         choice = resp.choices[0]
         clean_lp = (
-            _answer_logprob(choice, answer_token)
-            if answer_token is not None
-            else None
+            _answer_logprob(choice, answer_token) if answer_token is not None else None
         )
         clean_diff = None
         if answer_token is not None and foil_token is not None:
@@ -484,8 +497,8 @@ class PatchStudy:
             )
 
         # Effective source run: explicit run wins, else the clean handle's run.
-        source_run = run if run is not None else (
-            clean.run_id if clean is not None else None
+        source_run = (
+            run if run is not None else (clean.run_id if clean is not None else None)
         )
 
         if not server_side and clean_prompt is not None and clean is None:
@@ -499,7 +512,8 @@ class PatchStudy:
         if server_side:
             # clean_prompt (explicit) wins over the clean handle's prompt.
             send_clean_prompt = (
-                clean_prompt if clean_prompt is not None
+                clean_prompt
+                if clean_prompt is not None
                 else (clean.prompt if clean is not None else None)
             )
             if source_run is None:
@@ -569,9 +583,7 @@ class PatchStudy:
                     "warning: /tokenize unavailable; positions assumed aligned"
                 )
 
-        async with AsyncOpenAI(
-            base_url=self.base_url, api_key=self.api_key
-        ) as aclient:
+        async with AsyncOpenAI(base_url=self.base_url, api_key=self.api_key) as aclient:
             sem = asyncio.Semaphore(self.concurrency)
 
             async def grade(patch: list[dict] | None) -> float | None:
@@ -633,10 +645,7 @@ class PatchStudy:
                     notes.append("clean==corrupt baseline; recovered undefined")
                 else:
                     grid = [
-                        [
-                            None if v is None else (v - corrupt_val) / denom
-                            for v in row
-                        ]
+                        [None if v is None else (v - corrupt_val) / denom for v in row]
                         for row in grid
                     ]
 
@@ -762,8 +771,7 @@ class PatchStudy:
 
         if data.get("hook_grids"):
             return {
-                hg["hook"]: _result(hg["hook"], hg["grid"])
-                for hg in data["hook_grids"]
+                hg["hook"]: _result(hg["hook"], hg["grid"]) for hg in data["hook_grids"]
             }
         return _result(data["hook"], data["grid"])
 
@@ -785,30 +793,26 @@ class PatchStudy:
         import httpx
 
         summary: dict | None = None
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "POST", url, json=payload, headers=headers
-            ) as resp:
-                if resp.headers.get("content-type", "").startswith(
-                    "application/json"
-                ):
-                    await resp.aread()
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[len("data: "):]
-                    if data == "[DONE]":
-                        break
-                    event = json.loads(data)
-                    if event.get("type") == "cell":
-                        on_cell(event)
-                    elif event.get("type") == "summary":
-                        summary = event
+        async with (
+            httpx.AsyncClient(timeout=None) as client,
+            client.stream("POST", url, json=payload, headers=headers) as resp,
+        ):
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                await resp.aread()
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[len("data: ") :]
+                if data == "[DONE]":
+                    break
+                event = json.loads(data)
+                if event.get("type") == "cell":
+                    on_cell(event)
+                elif event.get("type") == "summary":
+                    summary = event
         if summary is None:
-            raise RuntimeError(
-                "patch_sweep stream ended without a summary event"
-            )
+            raise RuntimeError("patch_sweep stream ended without a summary event")
         return summary
 
     @staticmethod
@@ -849,9 +853,7 @@ class PatchStudy:
         """Re-sweep a dense neighborhood around the peak (or ``around``)."""
         center = around or result.argmax_cell()
         c_layer, c_pos = center
-        layers = list(
-            range(max(0, c_layer - layer_radius), c_layer + layer_radius + 1)
-        )
+        layers = list(range(max(0, c_layer - layer_radius), c_layer + layer_radius + 1))
         positions = list(
             range(max(0, c_pos - position_radius), c_pos + position_radius + 1)
         )
@@ -881,7 +883,8 @@ class PatchStudy:
         url = f"{self.base_url}/patch_source/{run}"
         try:
             r = httpx.request(
-                "DELETE", url,
+                "DELETE",
+                url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 timeout=10.0,
             )

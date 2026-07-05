@@ -314,7 +314,7 @@ def warmup_apply_patch_kernel(
         residual_view = residual_buf[:n]
         # Index alternates slot 0 (passthrough) and slot 1 (gather) so both
         # per-token branches are exercised within a single launch.
-        index_view = (torch.arange(n, device=device, dtype=torch.int32) % 2)
+        index_view = torch.arange(n, device=device, dtype=torch.int32) % 2
         # Inactive (whole-step short-circuit), then active.
         active_flag.fill_(False)
         torch.ops.vllm.apply_patch(
