@@ -134,31 +134,38 @@ regimes.
 ### Dynamic steering (in-progress branch)
 
 The activation-conditioned steering stack (see Roadmap) is benchmarked on its
-own branch — gemma-3-4b, RTX 3090 with locked clocks, CUDA graphs on, overhead
-flat across batch 1–32:
+own branch — 50-cell sweep, gemma-3-4b on an RTX 3090, CUDA graphs on, every
+cell verified at locked clocks (no thermal confound), single steered site.
+Overhead vs the same build with features off, essentially flat across batch
+1–32:
 
-| Configuration | Overhead vs own baseline |
+| Configuration | Overhead (batch 1 → 32) |
 |---|---|
-| Steering compiled in, idle | 0% |
-| Global-tier dynamic (in-graph gate) | ~+1.5% |
-| Per-request dynamic (override pool) | ~+2.3% |
-| Static per-request steering | ~+2.7% |
-| Async transport (capture → D2H → dispatch pipeline) | +5–6.7% |
+| Sync capture consumer (per-step GPU view) | +0.2–0.3% |
+| Global dynamic tier (sync-consumer driven) | ~+2% |
+| Global tier + in-graph monitor | ~+2% |
+| Async capture transport | +3.0–3.6% |
+| Per-request override pool | +3.1–3.6% |
+| Override pool + per-row in-graph monitor | +3.0–3.9% |
+| Async steering (full capture → D2H → dispatch → steer loop) | +5.7–7.4% |
 
-- The ordering is the point: the dynamic paths cost *less* than static
-  per-request steering, and the in-graph monitor is effectively free — it
-  reads persistent buffers inside the replayed graph. Async is the outlier
-  because it pays for the full capture-gather/D2H/dispatch pipeline; sync and
-  in-graph paths don't.
+- **In-graph monitoring is free.** The global monitor adds nothing over the
+  tier it gates, and the per-row monitor — every request carrying its own
+  probe and threshold for per-token conditional steering — stays within
+  +0.3pp of the plain override pool at every batch size. Deciding *when* to
+  steer inside the replayed graph costs nothing measurable on top of the
+  steering itself.
+- **Steering everywhere is cheap.** A site-count sweep (1 → 34 steered
+  `(layer, hook)` sites) shows the cost is fixed-cost-dominated with a tiny
+  linear slope (~0.03pp/site for the tier, ~0.05pp/site for the override
+  pool): steering all 34 layers costs only ~1.5pp more than steering one
+  site, and cost tracks total site count, not layer/hook composition.
+- Async arms are the outliers because they pay the full
+  capture-gather/D2H/dispatch pipeline; the sync and in-graph paths read
+  persistent buffers in place.
 - Sync-consumer actuation on a 31B model: **~0.05 ms/step** (~0.16% of a 31 ms
   decode step) by CUDA-event measurement; serving A/B within noise. The
   one-time ~117 ms probe/cuBLAS init is pre-paid by a warmup hook.
-- The residual cost is a roughly fixed ~8 ms/step of host work: ~3–5% on a
-  small host-bound model, approaching 0% on large GPU-bound models.
-- An earlier apparent +8.6% CUDA-graph regression at decode batch >16 was
-  root-caused as a node-specific measurement confound — nsys showed
-  byte-identical GPU kernel time across arms, and it did not reproduce on
-  other nodes, models, or the merged branch under locked clocks.
 
 ## Quickstart
 
@@ -228,8 +235,9 @@ list in the [steering guide](docs/features/steering.md#supported-scope).
   pass* via `sigmoid(sharpness · (residual · probe − threshold))` — plus the
   APC-correctness notification so dynamically-steered decode KV isn't falsely
   reused. GPU-validated on gemma4-31B across TP=1, TP=2 (cross-node), and PP=2;
-  overhead measured under CUDA graphs — the dynamic paths cost less than static
-  per-request steering (see [Performance](#performance)).
+  overhead measured under CUDA graphs — in-graph monitoring is free and
+  steering all layers costs ~1.5pp more than steering one
+  (see [Performance](#performance)).
 - **Activation patching at scale** *(after that)* — transplanting/overwriting
   captured activations across runs as a first-class, high-throughput operation.
   Direction marker; details not yet pinned down.
