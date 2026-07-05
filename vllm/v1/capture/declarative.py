@@ -49,7 +49,11 @@ import torch
 
 from vllm.config.steering_types import merge_steering_specs
 from vllm.logger import init_logger
-from vllm.v1.capture.controller import SteeringController
+from vllm.v1.capture.controller import (
+    ByRefLatch,
+    LatchVectorRef,
+    SteeringController,
+)
 from vllm.v1.worker.steering_action_queue import (
     DECLARATIVE_SOURCE,
     RequestSteeringOverride,
@@ -142,6 +146,10 @@ class DeclarativeSteeringConsumer(SteeringController):
         ] = OrderedDict()
         self._missing_site_warned = False
         self._unsupported_combo_warned = False
+        # Rate-limit the warning for an inline rest_of_conversation add gate
+        # reaching the consumer from a non-frontend producer (the frontend
+        # rejects the combo; such a gate cannot be latched by reference).
+        self._inline_conversation_warned = False
         self._gate_errors = 0
 
     # -- SyncCaptureConsumer interface -------------------------------------
@@ -250,7 +258,14 @@ class DeclarativeSteeringConsumer(SteeringController):
                 and cid is not None
                 and cid in self._latched
             ):
-                actions.append(self._bridge_override(self._latched[cid], rid))
+                bridged = self._bridge_override(self._latched[cid], rid)
+                if bridged is None:
+                    # By-reference latch that no longer resolves (name dropped
+                    # or re-registered with different content): disengage.
+                    self._drop_latched(cid)
+                    continue
+                self._latched.move_to_end(cid)  # LRU: refresh recency
+                actions.append(bridged)
                 self._armed.add(rid)
                 self._bridges += 1
                 continue
@@ -283,7 +298,7 @@ class DeclarativeSteeringConsumer(SteeringController):
 
         merged_add: dict | None = None
         add_scope_rank = -1
-        latch_add = False
+        latch_refs: list[LatchVectorRef] = []
         row_monitor: SteeringMonitorUpdate | None = None
         attenuate_strength: float | None = None
 
@@ -299,14 +314,35 @@ class DeclarativeSteeringConsumer(SteeringController):
             if gate.apply_kind == "add":
                 if not gate.steer_vectors:
                     continue
+                if gate.scope == "rest_of_conversation":
+                    # Persisted across turns → must latch by reference to a
+                    # registered name (the frontend guarantees this). An inline
+                    # payload reaching here comes from a non-frontend producer;
+                    # skip-and-warn rather than pinning client bytes server-side.
+                    if gate.steer_name is None or gate.steer_digest is None:
+                        if not self._inline_conversation_warned:
+                            self._inline_conversation_warned = True
+                            logger.warning(
+                                "declarative steering: rest_of_conversation add "
+                                "with an inline (unnamed) steer vector is "
+                                "unsupported; gate skipped. Register the vector "
+                                "and reference it by name."
+                            )
+                        continue
+                    latch_refs.append(
+                        LatchVectorRef(
+                            name=gate.steer_name,
+                            kind="steer",
+                            digest=gate.steer_digest,
+                            strength=float(gate.strength),
+                        )
+                    )
                 merged_add = (
                     dict(gate.steer_vectors)
                     if merged_add is None
                     else merge_steering_specs(merged_add, gate.steer_vectors)
                 )
                 add_scope_rank = max(add_scope_rank, _SCOPE_RANK[gate.scope])
-                if gate.scope == "rest_of_conversation":
-                    latch_add = True
                 if (
                     gate.when_kind == "probe"
                     and gate.scope == "this_token"
@@ -346,8 +382,18 @@ class DeclarativeSteeringConsumer(SteeringController):
             actions.append(override)
             if row_monitor is not None:
                 actions.append(row_monitor)
-            if latch_add and cid is not None:
-                self._latch(cid, override)
+            if latch_refs and cid is not None:
+                # Latch by reference: persist the registered names + digests,
+                # not the client's bytes. Bridged turns re-resolve at bridge
+                # time and disengage on a digest mismatch.
+                self._latch_by_ref(
+                    cid,
+                    ByRefLatch(
+                        refs=tuple(latch_refs),
+                        compose_admitted=True,
+                        source=DECLARATIVE_SOURCE,
+                    ),
+                )
             # Lifetime: next_step alone → one-step pulse; anything sticky
             # (this_token/rest_of_request/rest_of_conversation) → keep for the
             # request. rest_of_conversation additionally latched above.

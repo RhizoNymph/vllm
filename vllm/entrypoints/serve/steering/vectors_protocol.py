@@ -16,7 +16,11 @@ class RegisterVectorRequest(BaseModel):
     )
     packed: dict[str, Any] = Field(
         description="The vector(s) as a {hook: SteeringHookPacked} packed spec "
-        "(base64). A 'probe' must resolve to exactly one (hook, layer)."
+        "(base64). A 'probe' must resolve to exactly one (hook, layer). "
+        "Registration is broadcast to every worker so a {kind:'name'} gate "
+        "resolves worker-side; a name is also the only way to express a "
+        "rest_of_conversation add gate (which persists server-side by "
+        "reference to this name, not by inlining the client's bytes)."
     )
 
 
