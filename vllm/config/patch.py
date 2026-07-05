@@ -23,6 +23,19 @@ class PatchConfig:
     Sources are referenced by run handle across a sweep, so size this to hold at
     least one full clean run's captured activations. Evicted whole-run (LRU)."""
 
+    @property
+    def usable_slots(self) -> int:
+        """Per-site slots actually available to patches in one step.
+
+        Slot 0 is the passthrough sentinel, so the worker's step-plan builder
+        and the HTTP admission check both cap at ``max_patch_slots - 1``. Every
+        capacity gate (scheduler backpressure included) must reserve against
+        this number, not ``max_patch_slots`` — an off-by-one here breaches the
+        strict no-overflow invariant and the worker's loud raise kills the
+        engine.
+        """
+        return self.max_patch_slots - 1
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

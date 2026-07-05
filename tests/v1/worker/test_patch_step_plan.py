@@ -185,6 +185,45 @@ class TestBuildPatchStepPlan:
                 max_patch_slots=3,
             )
 
+    def test_scheduler_reservation_matches_worker_capacity(self):
+        # The scheduler backpressure reserves against
+        # PatchConfig.usable_slots; the worker's step plan must accept exactly
+        # that many same-site patches and raise at one more. An off-by-one
+        # between the two admits a step the worker then kills the engine over.
+        from vllm.config.patch import PatchConfig
+
+        h = 4
+        for max_slots in (2, 3, 8, 64):
+            usable = PatchConfig(max_patch_slots=max_slots).usable_slots
+            assert usable == max_slots - 1
+
+            def _plan(n: int):
+                specs = {
+                    "r0": [
+                        PatchEntry(
+                            layer=0,
+                            hook=POST_BLOCK,
+                            dest_pos=p,
+                            source=_vec(h, 1.0),
+                        )
+                        for p in range(n)
+                    ]
+                }
+                return build_patch_step_plan(
+                    req_ids=["r0"],
+                    num_computed=[0],
+                    num_scheduled=[n + 1],
+                    token_offsets=[0],
+                    specs=specs,
+                    local_layers=frozenset({0}),
+                    max_patch_slots=max_slots,
+                )
+
+            plan = _plan(usable)
+            assert len(plan[(0, POST_BLOCK)].abs_rows) == usable
+            with pytest.raises(PatchPoolOverflow):
+                _plan(usable + 1)
+
 
 class _FakeRunner(PatchModelRunnerMixin):
     """Minimal harness: register patch buffers on a few fake layers."""

@@ -781,7 +781,10 @@ class Scheduler(SchedulerInterface):
                 if self.patch_config:
                     demand = request.patch_site_demand
                     if demand:
-                        max_slots = self.patch_config.max_patch_slots
+                        # Usable pool, not max_patch_slots: slot 0 is the
+                        # passthrough sentinel, so the worker step-plan holds
+                        # one fewer patch than the buffer has rows.
+                        max_slots = self.patch_config.usable_slots
                         if any(
                             scheduled_patch_sites.get(site, 0) + n > max_slots
                             for site, n in demand.items()
