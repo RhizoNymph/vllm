@@ -72,6 +72,7 @@ from vllm.v1.worker.steering_action_queue import (
     install_steering_action_queue,
 )
 from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
+from vllm.v1.worker.steering_owner import RowOwner
 
 HIDDEN = 8
 HOOK = "post_block"
@@ -223,7 +224,7 @@ class RecordingManager:
         self._dynamic_sig.pop(dyn_id, None)
         if self._dynamic_scales.pop(dyn_id, None) is not None:
             self._scales_dirty = True
-        owner = ("dyn", dyn_id)
+        owner = RowOwner.dyn(dyn_id)
         for key in [k for k in self._row_monitor_owners if k[2] == owner]:
             del self._row_monitor_owners[key]
         self._tables_dirty = True
@@ -863,7 +864,7 @@ SCENARIOS: dict[str, tuple] = {
             ("register", 9, "decode"),
             ("register_dyn", 1),
             ("set_dyn_scale", 1, 0.25),
-            ("set_row_monitor", HOOK, 0, ("dyn", 1)),
+            ("set_row_monitor", HOOK, 0, RowOwner.dyn(1)),
         ],
         _chk_scale_and_monitor,
     ),
@@ -874,7 +875,7 @@ SCENARIOS: dict[str, tuple] = {
             ("register", 9, "decode"),
             ("register_dyn", 1),
             ("set_dyn_scale", 1, 0.5),
-            ("set_row_monitor", HOOK, 0, ("dyn", 1)),
+            ("set_row_monitor", HOOK, 0, RowOwner.dyn(1)),
             ("release_dyn", 1),
             ("release", 9, "decode"),
         ],
