@@ -535,6 +535,78 @@ class TestStreamingSweep:
         assert any(None in row for row in summary["grid"])
 
 
+# ---- streaming x multi-hook x lifecycle (combined) ------------------------
+
+
+class TestStreamingMultiHook:
+    def test_cell_events_cover_every_hook_layer_position(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(
+            eng, clean_prompt="ab", hooks=["pre_attn", "post_block"],
+            stream=True,
+        )
+        assert isinstance(resp, StreamingResponse)
+        events, done = _sse_events(resp)
+        assert done == "[DONE]"
+        # start event carries the requested hooks list (additive, multi-hook).
+        assert events[0]["type"] == "start"
+        assert events[0]["hooks"] == ["pre_attn", "post_block"]
+        cells = [e for e in events if e["type"] == "cell"]
+        # 2 hooks x layers[0,1] x positions[0,1] = 8 cells, correctly labelled.
+        seen = {(c["hook"], c["layer"], c["position"]) for c in cells}
+        assert seen == {
+            (hook, layer, pos)
+            for hook in ("pre_attn", "post_block")
+            for layer in (0, 1)
+            for pos in (0, 1)
+        }
+        for c in cells:
+            assert c["hook"] in ("pre_attn", "post_block")
+
+    def test_streamed_summary_hook_grids_equal_nonstreaming(self):
+        # Same mock config both ways -> identical multi-hook summary.
+        eng_plain = _MockEngine(runs=[])
+        plain = _run(eng_plain, clean_prompt="ab",
+                     hooks=["pre_attn", "post_block"])
+        assert not isinstance(plain, JSONResponse)
+
+        eng_stream = _MockEngine(runs=[])
+        resp = _run(eng_stream, clean_prompt="ab",
+                    hooks=["pre_attn", "post_block"], stream=True)
+        events, _ = _sse_events(resp)
+        summary = next(e for e in events if e["type"] == "summary")
+        summary = {k: v for k, v in summary.items() if k != "type"}
+        assert summary == plain.model_dump()
+        assert [hg["hook"] for hg in summary["hook_grids"]] == [
+            "pre_attn", "post_block"
+        ]
+
+
+class TestAutoDropBothPaths:
+    def test_auto_drop_fires_nonstreaming(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab")
+        assert not isinstance(resp, JSONResponse)
+        assert resp.auto_captured is True
+        assert "R1" in eng.dropped  # drop RPC hit the engine
+
+    def test_auto_drop_fires_streaming(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab", stream=True)
+        assert isinstance(resp, StreamingResponse)
+        # The drop lives inside the generator (before the summary yields), so it
+        # only fires once the stream is actually consumed.
+        events, _ = _sse_events(resp)
+        assert any(e["type"] == "summary" for e in events)
+        assert "R1" in eng.dropped
+
+    def test_keep_source_streaming_retains_run(self):
+        eng = _MockEngine(runs=[])
+        resp = _run(eng, clean_prompt="ab", keep_source=True, stream=True)
+        _sse_events(resp)
+        assert eng.dropped == []
+
+
 # ---- shared span-resolution math ------------------------------------------
 
 

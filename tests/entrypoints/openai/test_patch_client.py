@@ -636,6 +636,122 @@ class TestServerSideStreaming:
             )
 
 
+def _multi_hook_data(payload: dict) -> dict:
+    """Multi-hook (hook_grids) summary payload for a request's axes."""
+    layers = payload["layers"]
+    positions = payload["positions"]
+    hook_grids = [
+        {
+            "hook": hook,
+            "grid": [[val] * len(positions) for _ in layers],
+            "argmax": None,
+        }
+        for hook, val in (("pre_attn", -1.0), ("post_block", -2.0))
+    ]
+    return dict(
+        _SWEEP_RESP,
+        layers=layers,
+        positions=positions,
+        hook="pre_attn",
+        grid=hook_grids[0]["grid"],
+        hook_grids=hook_grids,
+        auto_captured=False,
+        captured_source_run=None,
+    )
+
+
+class _FakeMultiHookStreamClient:
+    """Serves a multi-hook /patch_sweep as both a plain POST and an SSE stream."""
+
+    streamed: list[dict] = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        return _FakeResp(_multi_hook_data(json))
+
+    def stream(self, method, url, json=None, headers=None):
+        _FakeMultiHookStreamClient.streamed.append(json)
+        data = _multi_hook_data(json)
+        lines = [_sse_line({"type": "start", "hooks": ["pre_attn",
+                                                       "post_block"]})]
+        for hg in data["hook_grids"]:
+            for i, layer in enumerate(data["layers"]):
+                for j, pos in enumerate(data["positions"]):
+                    lines.append(_sse_line({
+                        "type": "cell", "hook": hg["hook"], "layer": layer,
+                        "position": pos, "value": hg["grid"][i][j],
+                    }))
+        lines.append(_sse_line({"type": "summary", **data}))
+        lines.append("data: [DONE]")
+        return _StreamCtx(_FakeStreamResp(lines))
+
+
+class TestMultiHookStreaming:
+    def _patch(self, monkeypatch):
+        import httpx
+
+        _FakeMultiHookStreamClient.streamed = []
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeMultiHookStreamClient)
+
+    def test_on_cell_composes_with_hooks_and_matches_nonstreaming(
+        self, monkeypatch
+    ):
+        self._patch(monkeypatch)
+        study = _server_study()
+        seen: list[dict] = []
+        streamed = asyncio.run(
+            study.sweep_layers_positions(
+                "The cat",
+                run="R1",
+                layers=[0, 1],
+                positions=[5, 6, 7],
+                answer_token=" Paris",
+                server_side=True,
+                hooks=["pre_attn", "post_block"],
+                on_cell=seen.append,
+            )
+        )
+        # Multi-hook streaming returns a dict keyed by hook.
+        assert isinstance(streamed, dict)
+        assert set(streamed) == {"pre_attn", "post_block"}
+        # 2 hooks x 2 layers x 3 positions = 12 cell events, each labelled.
+        assert len(seen) == 12
+        labels = {(e["hook"], e["layer"], e["position"]) for e in seen}
+        assert labels == {
+            (hook, layer, pos)
+            for hook in ("pre_attn", "post_block")
+            for layer in (0, 1)
+            for pos in (5, 6, 7)
+        }
+        assert _FakeMultiHookStreamClient.streamed[-1]["stream"] is True
+
+        plain = asyncio.run(
+            study.sweep_layers_positions(
+                "The cat",
+                run="R1",
+                layers=[0, 1],
+                positions=[5, 6, 7],
+                answer_token=" Paris",
+                server_side=True,
+                hooks=["pre_attn", "post_block"],
+            )
+        )
+        # Streaming and non-streaming return identical dict structures.
+        assert isinstance(plain, dict)
+        assert set(streamed) == set(plain)
+        for hook in streamed:
+            assert streamed[hook].grid == plain[hook].grid
+            assert streamed[hook].hook == plain[hook].hook
+
+
 class TestResolvePositions:
     def test_mixes_ints_and_spans_dedup_in_order(self, monkeypatch):
         study = pc.PatchStudy.__new__(pc.PatchStudy)
