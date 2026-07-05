@@ -206,6 +206,46 @@ def _choose_block_h(hidden_size: int) -> int:
     return 1 << (hidden_size - 1).bit_length()
 
 
+def _steering_kernel_strides(
+    hidden_states: torch.Tensor,
+    steering_table: torch.Tensor,
+    steering_scales: torch.Tensor,
+    steering_dynamic_vec: torch.Tensor,
+    steering_token_scales: torch.Tensor,
+    steering_row_gate: torch.Tensor,
+    steering_monitor_probe: torch.Tensor,
+    steering_decode_mask: torch.Tensor,
+    steering_monitor_probe_table: torch.Tensor,
+    steering_monitor_row_params: torch.Tensor,
+    out: torch.Tensor,
+) -> tuple[int, ...]:
+    """Derive the kernel's stride scalars from its tensors, in launch order.
+
+    The launch interleaves ~16 stride scalars with 15 same-typed tensors — the
+    highest-risk transposition site. Generating the strides here from the
+    tensors (rather than hand-zipping them at the call) keeps each stride paired
+    with its tensor; the returned tuple is splatted so the emitted launch is
+    byte-identical to the explicit list.
+    """
+    return (
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        steering_table.stride(0),
+        steering_table.stride(1),
+        steering_scales.stride(0),
+        steering_dynamic_vec.stride(0),
+        steering_token_scales.stride(0),
+        steering_row_gate.stride(0),
+        steering_monitor_probe.stride(0),
+        steering_decode_mask.stride(0),
+        steering_monitor_probe_table.stride(0),
+        steering_monitor_probe_table.stride(1),
+        steering_monitor_row_params.stride(0),
+        out.stride(0),
+        out.stride(1),
+    )
+
+
 def apply_steering_triton(
     hidden_states: torch.Tensor,
     steering_table: torch.Tensor,
@@ -266,21 +306,19 @@ def apply_steering_triton(
         out,
         N,
         H,
-        hidden_states.stride(0),
-        hidden_states.stride(1),
-        steering_table.stride(0),
-        steering_table.stride(1),
-        steering_scales.stride(0),
-        steering_dynamic_vec.stride(0),
-        steering_token_scales.stride(0),
-        steering_row_gate.stride(0),
-        steering_monitor_probe.stride(0),
-        steering_decode_mask.stride(0),
-        steering_monitor_probe_table.stride(0),
-        steering_monitor_probe_table.stride(1),
-        steering_monitor_row_params.stride(0),
-        out.stride(0),
-        out.stride(1),
+        *_steering_kernel_strides(
+            hidden_states,
+            steering_table,
+            steering_scales,
+            steering_dynamic_vec,
+            steering_token_scales,
+            steering_row_gate,
+            steering_monitor_probe,
+            steering_decode_mask,
+            steering_monitor_probe_table,
+            steering_monitor_row_params,
+            out,
+        ),
         BLOCK_H=block_h,
     )
     return out
@@ -355,6 +393,7 @@ def warmup_apply_steering_kernel(
     compute_dtype: torch.dtype,
     device: torch.device,
     capture_sizes: list[int] | None = None,
+    row_monitor_enabled: bool = False,
 ) -> None:
     """JIT-compile the kernel ahead of CUDA graph capture.
 
@@ -380,6 +419,16 @@ def warmup_apply_steering_kernel(
     inactive branch and the active branch share the same compiled
     artifact (the flag is a tensor, not a constexpr) but driving both
     flags is cheap insurance.
+
+    *row_monitor_enabled* must match the runner's per-row-monitor state so
+    warmup compiles the specialization the runtime actually hits. Triton
+    specializes integer args on ``== 1`` (constexpr) and divisibility-by-16,
+    so the per-row probe table's leading stride (``rp_stride_r``) selects the
+    variant: ``1`` for the registered ``(1, 1)`` dummy the default config keeps
+    vs ``hidden_size`` for the full ``(rows, hidden)`` table when the row
+    monitor is enabled. Allocating the wrong-size buffer here compiles a
+    variant the runtime never triggers, leaving the first real forward to JIT —
+    exactly the served-window cost warmup exists to prevent.
 
     Total compile count and cumulative warmup wall-clock are logged at
     INFO so the cost is visible.
@@ -416,61 +465,57 @@ def warmup_apply_steering_kernel(
     mactive_flag = torch.zeros(1, dtype=torch.bool, device=device)
     dmask_buf = torch.zeros(max_n, dtype=torch.float32, device=device)
     # Per-row monitor buffers (inactive during warmup; same compiled artifact).
-    rprobe_buf = torch.zeros(
-        max(table_rows, 1), hidden_size, dtype=torch.float32, device=device
-    )
-    rparams_buf = (
-        torch.tensor([-1.0e30, 1.0], dtype=torch.float32, device=device)
-        .expand(max(table_rows, 1), 2)
-        .clone()
-    )
+    # The shapes MUST match what the runtime keeps for this config, or Triton
+    # specializes the probe table's leading stride into a different variant (see
+    # docstring): the registered ``(1, 1)`` / ``(1, 2)`` dummies when the row
+    # monitor is disabled (the default), the resized ``(rows, hidden)`` /
+    # ``(rows, 2)`` tables when it is enabled.
+    if row_monitor_enabled:
+        rprobe_buf = torch.zeros(
+            max(table_rows, 1), hidden_size, dtype=torch.float32, device=device
+        )
+        rparams_buf = (
+            torch.tensor([-1.0e30, 1.0], dtype=torch.float32, device=device)
+            .expand(max(table_rows, 1), 2)
+            .clone()
+        )
+    else:
+        rprobe_buf = torch.zeros(1, 1, dtype=torch.float32, device=device)
+        rparams_buf = torch.tensor(
+            [[-1.0e30, 1.0]], dtype=torch.float32, device=device
+        )
     ractive_flag = torch.zeros(1, dtype=torch.bool, device=device)
+
+    from vllm.model_executor.layers.steering import SteeringOpArgs
 
     t0 = time.perf_counter()
     for n in sizes:
-        hidden_view = hidden_buf[:n]
-        index_view = index_buf[:n]
-        tscale_view = tscale_buf[:n]
-        rgate_view = rgate_buf[:n]
-        dmask_view = dmask_buf[:n]
+        # ``active_flag`` is mutated in place between launches, so a single
+        # args tuple per shape drives both the inactive and active branches
+        # (they share the compiled artifact — the flag is a tensor).
+        args = SteeringOpArgs(
+            hidden_states=hidden_buf[:n],
+            steering_table=table_buf,
+            steering_index=index_buf[:n],
+            any_active=active_flag,
+            steering_scales=scales_buf,
+            steering_dynamic_vec=dvec_buf,
+            steering_token_scales=tscale_buf[:n],
+            steering_row_gate=rgate_buf[:n],
+            steering_monitor_probe=probe_buf,
+            steering_monitor_params=mparams_buf,
+            steering_monitor_active=mactive_flag,
+            steering_decode_mask=dmask_buf[:n],
+            steering_monitor_probe_table=rprobe_buf,
+            steering_monitor_row_params=rparams_buf,
+            steering_monitor_row_active=ractive_flag,
+        )
         # Inactive path first — exercises the short-circuit branch.
         active_flag.fill_(False)
-        torch.ops.vllm.apply_steering(
-            hidden_view,
-            table_buf,
-            index_view,
-            active_flag,
-            scales_buf,
-            dvec_buf,
-            tscale_view,
-            rgate_view,
-            probe_buf,
-            mparams_buf,
-            mactive_flag,
-            dmask_view,
-            rprobe_buf,
-            rparams_buf,
-            ractive_flag,
-        )
+        torch.ops.vllm.apply_steering(*args)
         # Active path — exercises the gather + add.
         active_flag.fill_(True)
-        torch.ops.vllm.apply_steering(
-            hidden_view,
-            table_buf,
-            index_view,
-            active_flag,
-            scales_buf,
-            dvec_buf,
-            tscale_view,
-            rgate_view,
-            probe_buf,
-            mparams_buf,
-            mactive_flag,
-            dmask_view,
-            rprobe_buf,
-            rparams_buf,
-            ractive_flag,
-        )
+        torch.ops.vllm.apply_steering(*args)
     # Block until every JIT compile (and cuLibraryLoadData) has retired so
     # the wall-clock measurement and cache-size readback reflect reality.
     torch.accelerator.synchronize()

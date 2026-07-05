@@ -517,6 +517,7 @@ class SteeringModelRunnerMixin:
                 compute_dtype=compute_dtype,
                 device=table_device,
                 capture_sizes=list(capture_sizes) if capture_sizes else None,
+                row_monitor_enabled=self._row_monitor_enabled,
             )
 
             # Warm the in-graph monitor kernel (Phase 2, §8) too — the

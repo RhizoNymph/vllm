@@ -22,6 +22,7 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
+    SteeringOpArgs,
     apply_block_steering,
     apply_layer_steering,
     register_steering_buffers,
@@ -232,6 +233,22 @@ def test_apply_steering_op_schema_has_full_arity():
     assert len(schema.arguments) == 15, (
         f"apply_steering op has {len(schema.arguments)} args; "
         "callers in _emit_steering_op must match exactly"
+    )
+
+
+def test_steering_op_args_fields_match_schema_order():
+    """``SteeringOpArgs`` is the single source of truth for the op's positional
+    tensor order; its ``_fields`` must equal the registered op schema's argument
+    names in order. A drift here means a builder site (``_emit_steering_op``,
+    warmup, tests) would splat tensors into transposed op positions — a bug that
+    only fails behaviorally, never at type-check."""
+    import vllm.model_executor.layers.steering  # noqa: F401  registers the op
+
+    schema = torch.ops.vllm.apply_steering.default._schema
+    schema_names = tuple(arg.name for arg in schema.arguments)
+    assert SteeringOpArgs._fields == schema_names, (
+        f"SteeringOpArgs fields {SteeringOpArgs._fields} drifted from the "
+        f"apply_steering op schema {schema_names}"
     )
 
 
