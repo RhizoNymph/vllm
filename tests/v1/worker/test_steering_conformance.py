@@ -599,9 +599,11 @@ class V2Host(SteeringRunnerMixin):
         self._steering_add_request(new_req_data)
 
     def step(self, scheduled):
-        input_batch = self._build_input_batch()
-        self._update_steering_buffers_v2(
-            SimpleNamespace(num_scheduled_tokens=dict(scheduled)), input_batch
+        # v2 sets ``self.input_batch`` before the shared hot path; the v2
+        # ``_steering_batch_view`` override reads it + ``req_states``.
+        self.input_batch = self._build_input_batch()
+        self._update_steering_buffers(
+            SimpleNamespace(num_scheduled_tokens=dict(scheduled))
         )
         for r, n in scheduled.items():
             self._computed[self._slot[r]] += n
@@ -1033,6 +1035,63 @@ def test_preempt_and_finish_same_step_no_double_release():
         assert h._req_dynamic_decode == {}
         assert not h._steering_manager.has_dynamic
         assert (9, "decode") not in h._steering_manager.config_to_row
+
+
+# ---------------------------------------------------------------------------
+# Device-buffer byte-equality (de-fork step E)
+# ---------------------------------------------------------------------------
+#
+# The scenario harness above asserts the two runners drive the manager with
+# equal EVENT logs. This asserts the complementary, stronger property for the
+# unified per-step hot path: the SAME scenario produces byte-identical
+# device-bound steering buffers — the per-token tensors a CUDA-graph replay
+# actually reads. A mixed prefill+decode batch with a live dynamic override
+# exercises steering_index (prefill row, dynamic-override row), decode_mask
+# (per-token decode vs prefill), and row_gate (reset to 1.0), so the
+# comparison is non-trivial across positions.
+
+
+def _s_buffer_content_mixed(h):
+    # r1 keeps prefilling this step (2 + 3 = 5 < 6): admitted prefill row.
+    h.admit("r1", 7, 9, 6, 2)
+    # r2 is a full prefix-cache hit -> admitted straight into decode.
+    h.admit("r2", 0, 5, 4, 4)
+    # A live override routes r2's decode tokens to its dynamic-pool row.
+    h.apply_action(RequestSteeringOverride(req_id="r2", vectors=_vec(3.0)))
+    # One mixed step: r1 gets 3 prefill tokens, r2 gets 1 decode token.
+    h.step({"r1": 3, "r2": 1})
+
+
+def test_buffer_contents_elementwise_equal():
+    """The unified hot path writes byte-identical device buffers on both runners.
+
+    The conformance harness checks manager events; this checks the per-token
+    buffers the forward (and its CUDA-graph replay) reads — the strongest CPU
+    proof the unification is byte-faithful.
+    """
+    h1 = _run(make_v1, _s_buffer_content_mixed)
+    h2 = _run(make_v2, _s_buffer_content_mixed)
+    layer1 = h1._steerable_layers_cache[0]
+    layer2 = h2._steerable_layers_cache[0]
+    for name in (
+        "steering_index",
+        "steering_token_scales",
+        "steering_row_gate",
+        "steering_decode_mask",
+    ):
+        b1 = getattr(layer1, name)
+        b2 = getattr(layer2, name)
+        assert torch.equal(b1, b2), (
+            f"{name} diverged v1 vs v2:\n  v1={b1[:8].tolist()}\n  v2={b2[:8].tolist()}"
+        )
+
+    # Sanity: the batch actually populated the buffers (not an all-zero compare).
+    # Batch order [r1 (3 prefill tokens), r2 (1 decode token)].
+    idx = layer1.steering_index
+    assert idx[:3].tolist() != [0, 0, 0]  # r1's prefill row
+    assert int(idx[3]) != 0  # r2's dynamic-override row
+    assert layer1.steering_decode_mask[:4].tolist() == [0.0, 0.0, 0.0, 1.0]
+    assert torch.all(layer1.steering_row_gate == 1.0)
 
 
 if __name__ == "__main__":

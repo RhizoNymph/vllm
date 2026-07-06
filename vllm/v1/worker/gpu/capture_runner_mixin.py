@@ -680,7 +680,7 @@ class CaptureRunnerMixin:
         Consumer exceptions are isolated; returned steering actions apply inline
         through ``_apply_steering_actions`` (the steering mixin, resolved on the
         concrete runner) so they are visible to the next step's
-        ``_update_steering_buffers_v2``.
+        ``_update_steering_buffers``.
 
         Two timings are kept per consumer in ``_sync_consumer_stats``: a
         wall-clock ``perf_counter`` span (a diagnostic that absorbs the forward

@@ -1231,9 +1231,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
 
             # Populate steering tables + per-token index before the forward.
             # The buffers are persistent, so a FULL cudagraph replay reads this
-            # step's values — no force-eager needed.
+            # step's values — no force-eager needed. The shared hot path reads
+            # the batch through ``self.input_batch`` (set here; v2 keeps no
+            # persistent input batch) + the v2 ``_steering_batch_view`` override.
             if self._steering_manager is not None:
-                self._update_steering_buffers_v2(scheduler_output, input_batch)
+                self.input_batch = input_batch
+                self._update_steering_buffers(scheduler_output)
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1373,7 +1376,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
 
         # Sync-execution consumers: run on EVERY rank (outside the rank-0-only
         # manager guard above), post-forward, so returned steering actions are
-        # applied before the next step's ``_update_steering_buffers_v2``. The
+        # applied before the next step's ``_update_steering_buffers``. The
         # global capture buffers are still valid here (the next forward
         # overwrites them); ``num_computed_tokens`` has not yet advanced, so the
         # view reads start-of-step state matching the forward layout. Skipped on
@@ -1484,7 +1487,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMix
             # Capture results finalized (off-thread) since the last step.
             capture_results=self._drain_capture_results(),
             # Dynamic-steering APC: effective-decode-signature deltas computed
-            # in ``_update_steering_buffers_v2`` this step (None when steering
+            # in ``_update_steering_buffers`` this step (None when steering
             # is inactive).
             steering_decode_signatures=(
                 getattr(self, "_pending_decode_sigs", None) or None

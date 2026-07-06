@@ -51,6 +51,7 @@ from vllm.v1.worker.steering_action_queue import (
     validate_steering_scale,
     validate_steering_vectors,
 )
+from vllm.v1.worker.steering_batch_view import SteeringBatchView
 from vllm.v1.worker.steering_manager import SteeringManager
 from vllm.v1.worker.steering_owner import RowOwner
 from vllm.v1.worker.steering_vector_registry import (
@@ -316,6 +317,12 @@ class SteeringModelRunnerMixin:
     # Phase 2 row gate; mirror the gate scratches above.
     _steering_decode_mask_scratch: np.ndarray | None = None
     _steering_decode_mask_pinned: torch.Tensor | None = None
+    # Reusable per-step batch view (the de-fork seam between v1's batch-ordered
+    # ``input_batch`` columns and v2's ``idx_mapping`` + ``RequestState``). One
+    # instance mutated in place each step -> no per-step allocation. The v1
+    # identity slot->row map is grown lazily to the batch size and cached.
+    _steering_bview: SteeringBatchView | None = None
+    _steering_idx_identity: np.ndarray | None = None
 
     # Attributes provided by the concrete model runner that mixes this
     # class in.  Declared here purely so static type checking can see
@@ -1806,8 +1813,42 @@ class SteeringModelRunnerMixin:
         if dyn_id is not None and self._steering_manager is not None:
             self._steering_manager.release_dynamic_config(dyn_id)
 
+    def _steering_batch_view(self) -> SteeringBatchView:
+        """Build the per-step batch view for the unified hot path (v1 default).
+
+        v1's per-request arrays are batch-ordered, so the slot->state-row map
+        is the identity; ``num_computed_tokens_cpu`` / ``num_prompt_tokens``
+        index directly by batch position. The v2 runner overrides this to
+        route through ``idx_mapping`` + ``RequestState``. Returns one reusable
+        instance mutated in place — the identity map is grown lazily to the
+        batch size, so steady state allocates nothing.
+        """
+        ib = self.input_batch
+        num_reqs = ib.num_reqs
+        ident = self._steering_idx_identity
+        if ident is None or ident.shape[0] < num_reqs:
+            ident = np.arange(max(num_reqs, 1), dtype=np.int64)
+            self._steering_idx_identity = ident
+        bv = self._steering_bview
+        if bv is None:
+            bv = SteeringBatchView(
+                num_reqs=num_reqs,
+                req_ids=ib.req_ids,
+                idx_np=ident,
+                num_computed_np=ib.num_computed_tokens_cpu,
+                num_prompt_np=ib.num_prompt_tokens,
+            )
+            self._steering_bview = bv
+        else:
+            bv.num_reqs = num_reqs
+            bv.req_ids = ib.req_ids
+            bv.idx_np = ident
+            bv.num_computed_np = ib.num_computed_tokens_cpu
+            bv.num_prompt_np = ib.num_prompt_tokens
+        return bv
+
     def _compute_decode_signature_deltas(
-        self, scheduler_output: "SchedulerOutput"
+        self, scheduler_output: "SchedulerOutput", bview: SteeringBatchView
     ) -> dict[str, int]:
         """Per-request effective-decode-signature *deltas* for the scheduler.
 
@@ -1821,31 +1862,41 @@ class SteeringModelRunnerMixin:
         ``Scheduler.update_from_output`` (rank 0's output is canonical; the
         signature is rank-identical). See
         docs/design/dynamic_steering_apc_notification.md.
+
+        Reads only the broadcast ``scheduler_output`` and rank-replicated
+        state (``bview`` + ``_steering_reqs``), so the result is
+        TP-deterministic. The base decode hash comes from ``_steering_reqs``
+        (the canonical per-request steering identity), not any batch column.
         """
         mgr = self._steering_manager
         if mgr is None:
             return {}
+        reqs = self._steering_reqs
+        num_reqs = bview.num_reqs
+        req_ids = bview.req_ids
+        idx_np = bview.idx_np
+        num_computed_np = bview.num_computed_np
+        prompt_len_np = bview.num_prompt_np
         deltas: dict[str, int] = {}
         seen: set[str] = set()
-        num_reqs = self.input_batch.num_reqs
-        req_ids = self.input_batch.req_ids
         for i in range(num_reqs):
             req_id = req_ids[i]
             if req_id is None:
                 continue
             if scheduler_output.num_scheduled_tokens.get(req_id, 0) == 0:
                 continue
-            req_index = self.input_batch.req_id_to_index.get(req_id)
-            if req_index is None:
-                continue
-            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
-            num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+            req_idx = int(idx_np[i])
+            num_computed = int(num_computed_np[req_idx])
+            rs = reqs.get(req_id)
+            num_prompt = (
+                rs.num_prompt_tokens if rs is not None else int(prompt_len_np[req_idx])
+            )
             if num_computed < num_prompt:
                 # Prefill: decode steering (and its signature) does not apply;
                 # prefill cache keys are admission-fixed and already correct.
                 continue
             seen.add(req_id)
-            base = int(self.input_batch.request_decode_steering_hash[req_index])
+            base = rs.decode_hash if rs is not None else 0
             dyn_id = self._req_dynamic_decode.get(req_id)
             sig = mgr.effective_decode_signature(dyn_id, base)
             report_val = base if sig is None else sig
@@ -1873,6 +1924,13 @@ class SteeringModelRunnerMixin:
         function short-circuits — model code (e.g. Gemma3) registers
         per-layer steering_table buffers unconditionally so the forward
         path stays branch-free.
+
+        This is the shared per-step hot path for both runners. The only
+        runner-specific state — batch order + per-request token counts — is
+        read through :meth:`_steering_batch_view`; per-request steering
+        identity (hashes + phase) comes from the canonical ``_steering_reqs``
+        store. The body reads only the broadcast ``scheduler_output`` and
+        rank-replicated state, so every buffer it writes is TP-deterministic.
         """
         if self._steering_manager is None or not self._steerable_layers_cache:
             self._pending_decode_sigs = {}
@@ -1902,6 +1960,14 @@ class SteeringModelRunnerMixin:
                 queue=action_queue,
             )
 
+        bview = self._steering_batch_view()
+        reqs = self._steering_reqs
+        num_reqs = bview.num_reqs
+        req_ids = bview.req_ids
+        idx_np = bview.idx_np
+        num_computed_np = bview.num_computed_np
+        prompt_len_np = bview.num_prompt_np
+
         # Short-circuit when no steering state is actually active. The model
         # runner allocates per-layer steering buffers (zero-initialized) and
         # the forward path always calls apply_steering, but if no per-request
@@ -1924,14 +1990,12 @@ class SteeringModelRunnerMixin:
         # (config_to_row stays empty, so the short-circuit keeps firing). The
         # admitted prefill config is registered at admission and shows up in
         # config_to_row, but a decode-only request has none — hence the
-        # explicit batch scan here.
-        n_active = self.input_batch.num_reqs
-        batch_has_per_request_steering = bool(
-            n_active > 0
-            and (
-                self.input_batch.request_prefill_steering_hash[:n_active].any()
-                or self.input_batch.request_decode_steering_hash[:n_active].any()
-            )
+        # explicit batch scan here. A missed predicate below silently serves
+        # stale buffers, so the list must stay exhaustive.
+        batch_has_per_request_steering = any(
+            (rs := reqs.get(req_ids[i])) is not None
+            and (rs.prefill_hash != 0 or rs.decode_hash != 0)
+            for i in range(num_reqs)
         )
         if (
             not batch_has_per_request_steering
@@ -1987,7 +2051,7 @@ class SteeringModelRunnerMixin:
             # Nothing dynamic is active; revert any request still reported as
             # dynamically steered back to its admitted decode key.
             self._pending_decode_sigs = self._compute_decode_signature_deltas(
-                scheduler_output
+                scheduler_output, bview
             )
             return
 
@@ -2014,9 +2078,6 @@ class SteeringModelRunnerMixin:
         # Get the shared steering_index buffer (all layers share one tensor)
         any_layer = next(iter(self._steerable_layers_cache.values()))
         steering_index = cast(torch.Tensor, any_layer.steering_index)
-
-        num_reqs = self.input_batch.num_reqs
-        req_ids = self.input_batch.req_ids
 
         # Vectorized build: walk requests once to record each request's
         # table row + token count into pre-allocated CPU int64 scratch
@@ -2068,10 +2129,14 @@ class SteeringModelRunnerMixin:
             if n_tokens == 0:
                 continue
 
-            req_index = self.input_batch.req_id_to_index.get(req_id)
-            if req_index is None:
-                # Request not in batch yet (shouldn't happen but guard).
-                # Row 0 is the no-steering sentinel.
+            req_idx = int(idx_np[i])
+            # Defensive (v1 parity): a request scheduled this step whose batch
+            # state row can't be resolved (a scheduler/runner race) routes to
+            # row 0 — the no-steer sentinel — and shields the array reads below
+            # from an out-of-range index. Never fires under the normal
+            # invariant (every scheduled request has a valid state row); cheap
+            # to keep.
+            if req_idx < 0 or req_idx >= num_computed_np.shape[0]:
                 rows_scratch[active_count] = 0
                 n_tokens_scratch[active_count] = n_tokens
                 tier_gain_scratch[active_count] = 0.0
@@ -2079,16 +2144,24 @@ class SteeringModelRunnerMixin:
                 active_count += 1
                 continue
 
-            # Determine phase from num_computed vs num_prompt
-            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
-            num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
-            is_prefilling = num_computed < num_prompt
+            # Steering identity (hashes + prompt length + phase) comes from the
+            # canonical per-request store. An untracked request (no per-request
+            # config) routes with hash 0 so any global vectors apply — the
+            # manager maps hash 0 to the global prefill/decode row (or the row-0
+            # no-steer sentinel when no globals are set).
+            num_computed = int(num_computed_np[req_idx])
+            rs = reqs.get(req_id)
+            if rs is not None:
+                num_prompt = rs.num_prompt_tokens
+                prefill_hash = rs.prefill_hash
+                decode_hash = rs.decode_hash
+            else:
+                num_prompt = int(prompt_len_np[req_idx])
+                prefill_hash = 0
+                decode_hash = 0
 
-            if is_prefilling:
-                # Prefill: use prefill steering hash
-                prefill_hash = int(
-                    self.input_batch.request_prefill_steering_hash[req_index]
-                )
+            if num_computed < num_prompt:
+                # Prefill: use prefill steering hash.
                 row = self._steering_manager.get_row_for_config(
                     prefill_hash, is_prefill=True
                 )
@@ -2102,10 +2175,10 @@ class SteeringModelRunnerMixin:
                 # Check if this request will transition to decode after
                 # this step's tokens are processed. Must happen in this
                 # same pass — the registration / refcount semantics are
-                # externally observable.
-                num_computed_after = num_computed + n_tokens
-                if num_computed_after >= num_prompt:
-                    self._handle_steering_transition(req_id, req_index, prefill_hash)
+                # externally observable. Only tracked requests transition
+                # (an untracked request has no config to release/register).
+                if rs is not None and num_computed + n_tokens >= num_prompt:
+                    self._steering_transition(rs)
             else:
                 # Decode: a live dynamic override routes this request's
                 # tokens to its dynamic-pool row INSTEAD of the admitted
@@ -2116,9 +2189,6 @@ class SteeringModelRunnerMixin:
                 if dyn_id is not None:
                     row = self._steering_manager.get_dynamic_row(dyn_id)
                 else:
-                    decode_hash = int(
-                        self.input_batch.request_decode_steering_hash[req_index]
-                    )
                     row = self._steering_manager.get_row_for_config(
                         decode_hash, is_prefill=False
                     )
@@ -2215,7 +2285,7 @@ class SteeringModelRunnerMixin:
         # steering state as applied THIS step — before any sync consumer
         # mutates it for the next step).
         self._pending_decode_sigs = self._compute_decode_signature_deltas(
-            scheduler_output
+            scheduler_output, bview
         )
 
     # -----------------------------------------------------------------------
@@ -2374,26 +2444,6 @@ class SteeringModelRunnerMixin:
                     locally_owned_layers=self._locally_owned_layers,
                 )
         rs.phase = "decode"
-
-    def _handle_steering_transition(
-        self,
-        req_id: str,
-        req_index: int,
-        prefill_hash: int,
-    ) -> None:
-        """Thin shim over :meth:`_steering_transition` for v1's hot path.
-
-        v1's ``_update_steering_buffers`` loop still routes off the input-
-        batch hash columns (unified separately in de-fork step E) and calls
-        this at the prefill->decode boundary with the batch-derived
-        ``prefill_hash``. The canonical transition reads ``_steering_reqs``
-        instead — written from the same ``NewRequestData`` at admission, so
-        the two can never disagree. ``req_index`` / ``prefill_hash`` are
-        retained only to keep the call-site signature stable.
-        """
-        rs = self._steering_reqs.get(req_id)
-        if rs is not None:
-            self._steering_transition(rs)
 
     def _reset_steering_for_resumption(
         self,

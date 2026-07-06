@@ -130,13 +130,14 @@ only rank-identical inputs.
    `finish_requests`. v1's former `_register_initial_steering_config` /
    `_refresh_streaming_steering` / `_release_finished_steering_configs` /
    `_req_steering_phase` and v2's private `_SteeringReqState` copy are gone.
-   v1's `_update_steering_buffers` still routes off the input-batch hash columns
-   (unified separately in step E); `_handle_steering_transition` is now a thin
-   shim over `_steering_transition` reading `_steering_reqs` (the columns and the
-   store can't disagree — both written at admission from the same
-   `NewRequestData`). The cross-runner conformance harness
-   (`tests/v1/worker/test_steering_conformance.py`) asserts both runners drive
-   the manager identically across the whole lifecycle.
+   The per-step hot path is unified too (de-fork step E, below): both runners
+   run one shared `_update_steering_buffers` that reads per-request steering
+   identity from `_steering_reqs` only. v1's former `_handle_steering_transition`
+   shim (a bridge from the batch hash columns to `_steering_transition`) and the
+   v1 input-batch hash columns themselves are gone. The cross-runner conformance
+   harness (`tests/v1/worker/test_steering_conformance.py`) asserts both runners
+   drive the manager identically across the whole lifecycle *and* write
+   byte-identical device buffers.
 
    **Preemption unified on release-at-preemption (de-fork step D).** Both
    runners now RELEASE a preempted request's config rows *and* any per-request
@@ -155,9 +156,19 @@ only rank-identical inputs.
    releases exactly once (the union is a set; `_steering_finish_requests` pops
    the canonical state idempotently).
 
-   **Dynamic-steering parity (v1 → v2).** `_update_steering_buffers_v2` is at full
-   parity with v1's `_update_steering_buffers`. Beyond the per-token
-   `steering_index` it now builds, every step:
+   **Unified per-step hot path (de-fork step E).** Both runners run one shared
+   `SteeringModelRunnerMixin._update_steering_buffers`. The only runner-specific
+   input — batch order + per-request token counts — is read through a
+   `SteeringBatchView` (`vllm/v1/worker/steering_batch_view.py`), a reusable
+   holder each runner mutates in place once per step (zero per-step allocation).
+   `_steering_batch_view` is the seam: v1 builds it from its batch-ordered
+   `input_batch` columns (identity slot→row map); the v2 subclass overrides it to
+   read `input_batch.idx_mapping_np` + `req_states` (`num_computed_tokens_np` /
+   `prompt_len.np`). Steering identity (hashes + phase) comes from `_steering_reqs`
+   only, which retired v1's input-batch hash columns
+   (`request_prefill_steering_hash` / `request_decode_steering_hash` and the
+   `steering_hash_to_request_ids` index — the hot path was their only reader).
+   The shared body, beyond the per-token `steering_index`, every step:
    - **§5.4 dynamic tier** — `steering_token_scales` (gain for decode tokens of a
      tier-active state, `0` for prefill = §7 cache safety) via the same
      per-request → `np.repeat` → pinned-H2D pattern as the index.
@@ -167,15 +178,16 @@ only rank-identical inputs.
    - **Dynamic override pool** — a live `_req_dynamic_decode[req_id]` routes that
      request's decode tokens to its pool row (`get_dynamic_row`) instead of the
      admitted decode row; overrides drop on finish / preempt / streaming re-add.
-     `_apply_request_override` is overridden to read the decode-only phase guard
-     from v2's `req_states` (`req_id_to_index` + `num_computed_tokens_np` /
+     The shared `_apply_request_override` reads the decode-only phase guard
+     through `_steering_req_position`, which the v2 subclass overrides to read
+     v2's `req_states` (`req_id_to_index` + `num_computed_tokens_np` /
      `prompt_len.np`).
    - **Async transport** — drains the in-process `SteeringActionQueue` at the top
      (before the nothing-active short-circuit, so a drained update can activate
      steering) via the shared `_apply_steering_actions`.
-   - **APC notification** — `_compute_decode_signature_deltas_v2` folds admitted
-     decode config + override / tier / monitor into an effective signature and
-     reports only changed signatures; the v2 runner attaches them on
+   - **APC notification** — the shared `_compute_decode_signature_deltas` folds
+     admitted decode config + override / tier / monitor into an effective
+     signature and reports only changed signatures; the runner attaches them on
      `ModelRunnerOutput.steering_decode_signatures`.
    - **Short-circuit predicates** — extended to `has_dynamic` / `has_dynamic_tier`
      / `has_monitor` (the tier-only latent bug fix) and the active→inactive
