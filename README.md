@@ -59,6 +59,114 @@ engineering:
   layouts because on a network mount throughput is governed by file count
   (metadata RPCs), not bytes.
 
+## Performance
+
+Everything below is measured against an unmodified baseline (same build,
+features disabled). Methodology and profiling deep-dives are in the two
+write-ups: [Activation Steering in vLLM](https://www.rhizonymph.com/blog/activation-steering/)
+· [Part 2](https://www.rhizonymph.com/blog/activation-steering-boogaloo/).
+
+### Steering overhead
+
+Gemma-3-27B on A100 — 64–128 prompts, concurrency 8–16, `max_tokens=256`,
+vs. disabled baseline (TTFT 111 ms, TPOT 37.4 ms):
+
+| Mode | ΔTTFT | ΔTPOT | ΔE2E latency |
+|---|---|---|---|
+| Enabled, no active configs | −6.6 ms | ±0.0% | −0.1% |
+| Named (pre-registered) vectors, all requests steered | +0.1 ms | +0.0% | +0.0% |
+| Inline shared vectors, all requests steered | +50.5 ms | +0.5% | +1.7% |
+| **Worst case: 16 distinct inline per-request configs** | +70.7 ms | **+1.3%** | **+2.7%** |
+
+- CUDA graphs stay intact in every mode — 6.1–6.8× over eager on the same
+  workload — and per-token cost is flat: the only real cost is per-request
+  submission, which amortizes with output length (worst case on the 4B model:
+  +17.3% E2EL at 64 output tokens → +1.7% at 2048).
+- Memory: ~522 KB per steering config on the 4B model, <0.15% of weights VRAM.
+- The worst case started at **+22% E2EL**. Getting to +2.7% took: a binary wire
+  format for inline vectors (TTFT −77–79%, throughput +22–30% — the bottleneck
+  was ~87k Python floats per request materialized in the server event loop),
+  worker-side named-vector resolution (~599 KB → 214 bytes per request),
+  batched registration (79.6 → 15.6 ms per request), and a fused Triton
+  gather-add kernel (~40% less HBM traffic at the op).
+
+### Capture overhead and filesystem throughput
+
+Fixed-clock A/B runs, Gemma-3 on RTX 3090s, NFS over a 20 GbE bond:
+
+- Non-capturing traffic on a capture-enabled server keeps full CUDA-graph
+  speed: eager is forced only on steps that actually gather (replacing a
+  blanket always-eager cost of +14% TPOT).
+- Per-request (non-global) capture is performant too, via three graph-safety
+  tiers measured on a dense per-request capture workload: server-global specs
+  on the persistent-buffer path cut the decode-step penalty **+287% → +11%**;
+  the `--capture-graphsafe-key` allowlist takes per-request taps from
+  **+400% → +14%** (sparse capture flat); and on the v2 runner,
+  piecewise-graph fallback caps the worst no-allowlist case at ~+107%
+  instead of +293%.
+- End-to-end cost for requests that *do* capture: **−2% throughput**, down from
+  −23% before step-gating and non-blocking finalize; capture-request TTFT
+  1391 → 877 ms.
+- Filesystem consumer throughput is governed by file count (metadata RPCs),
+  not bytes — measured at 32 requests × 24 layers, fp32:
+
+| Layout | Files written | Throughput | Finalize p50 |
+|---|---|---|---|
+| `per_file` | 768 | 29 MB/s | 2.26 s |
+| `packed` | 32 | 142 MB/s | 469 ms |
+| `sharded` | 8 | 505 MB/s | 6.6 ms |
+
+Large-file capture sustains 331–372 MB/s to the NFS mount — ~93% of its
+measured 398 MB/s disk bound.
+
+### Prefix caching preserved
+
+Steering keeps automatic prefix caching intact rather than disabling it
+(gemma-3-4b-it, RTX 3090, ~1500-token shared prefix, concurrency 24):
+unsteered, shared-config, and decode-only-steered traffic all hold a 98%
+cache hit rate and the full ~4× TTFT / ~3–3.8× throughput benefit of APC.
+Decode-only steering never forks prompt KV by construction. A distinct
+prefill config per request drops the hit rate to 23% — the cache key forks
+because the KV genuinely differs under different steering; that fork is the
+correctness contract, and outputs were verified deterministic across cache
+regimes.
+
+### Dynamic steering (in-progress branch)
+
+The activation-conditioned steering stack (see Roadmap) is benchmarked on its
+own branch — 50-cell sweep, gemma-3-4b on an RTX 3090, CUDA graphs on, every
+cell verified at locked clocks (no thermal confound), single steered site.
+Overhead vs the same build with features off, essentially flat across batch
+1–32:
+
+| Configuration | Overhead (batch 1 → 32) |
+|---|---|
+| Sync capture consumer (per-step GPU view) | +0.2–0.3% |
+| Global dynamic tier (sync-consumer driven) | ~+2% |
+| Global tier + in-graph monitor | ~+2% |
+| Async capture transport | +3.0–3.6% |
+| Per-request override pool | +3.1–3.6% |
+| Override pool + per-row in-graph monitor | +3.0–3.9% |
+| Async steering (full capture → D2H → dispatch → steer loop) | +5.7–7.4% |
+
+- **In-graph monitoring is free.** The global monitor adds nothing over the
+  tier it gates, and the per-row monitor — every request carrying its own
+  probe and threshold for per-token conditional steering — stays within
+  +0.3pp of the plain override pool at every batch size. Deciding *when* to
+  steer inside the replayed graph costs nothing measurable on top of the
+  steering itself.
+- **Steering everywhere is cheap.** A site-count sweep (1 → 34 steered
+  `(layer, hook)` sites) shows the cost is fixed-cost-dominated with a tiny
+  linear slope (~0.03pp/site for the tier, ~0.05pp/site for the override
+  pool): steering all 34 layers costs only ~1.5pp more than steering one
+  site, and cost tracks total site count, not layer/hook composition.
+- Async arms are the outliers because they pay the full
+  capture-gather/D2H/dispatch pipeline; the sync and in-graph paths read
+  persistent buffers in place.
+- Sync-consumer actuation on a 31B model: **~0.05 ms/step** (~0.16% of a 31 ms
+  decode step) by CUDA-event measurement; serving A/B within noise. The
+  one-time ~117 ms probe/cuBLAS init is pre-paid by a warmup hook.
+
 ## Quickstart
 
 **Steering** — global state over HTTP, or per-request via `SamplingParams`:
@@ -126,7 +234,10 @@ list in the [steering guide](docs/features/steering.md#supported-scope).
   in-graph monitor that gates a dynamic steering tier *within the same forward
   pass* via `sigmoid(sharpness · (residual · probe − threshold))` — plus the
   APC-correctness notification so dynamically-steered decode KV isn't falsely
-  reused. GPU-validated on gemma4-31B across TP=1, TP=2 (cross-node), and PP=2.
+  reused. GPU-validated on gemma4-31B across TP=1, TP=2 (cross-node), and PP=2;
+  overhead measured under CUDA graphs — in-graph monitoring is free and
+  steering all layers costs ~1.5pp more than steering one
+  (see [Performance](#performance)).
 - **Activation patching at scale** *(after that)* — transplanting/overwriting
   captured activations across runs as a first-class, high-throughput operation.
   Direction marker; details not yet pinned down.
