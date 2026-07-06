@@ -78,11 +78,12 @@ class _Host(SteeringModelRunnerMixin):
         )
         self._steerable_layers_cache = {0: _Layer()}
         self._locally_owned_layers = frozenset({0})
-        self._req_steering_phase = {}
+        self._steering_reqs = {}
         self._steering_index_dirty = False
         self.input_batch = _FakeInputBatch(reqs)
         self.requests = {}
         self._req_dynamic_decode = {}
+        self._req_override_source = {}
         self._req_decode_sig_reported = {}
         self._pending_decode_sigs = {}
         self._steering_rows_scratch = np.zeros(8, dtype=np.int64)
@@ -111,6 +112,19 @@ def test_decode_only_request_defeats_nothing_active_short_circuit():
         max_tokens=4, decode_steering_vectors={_HP: {0: [1.0] * HIDDEN}}
     )
     host.requests = {"r1": SimpleNamespace(sampling_params=sp)}
+    # Admission populates the canonical _steering_reqs store (decode-only, so
+    # nothing is registered yet; phase starts "prefill").
+    host._steering_add_request(
+        SimpleNamespace(
+            req_id="r1",
+            sampling_params=sp,
+            prefill_steering_config_hash=0,
+            decode_steering_config_hash=decode_hash,
+            prompt_token_ids=list(range(8)),
+            prompt_embeds=None,
+            num_computed_tokens=6,
+        )
+    )
     # Nothing registered yet — pre-fix this short-circuits and never registers.
     assert not host._steering_manager.config_to_row
     # 6 + 2 >= 8 ⇒ prefill completes this step ⇒ prefill->decode transition.
@@ -119,7 +133,7 @@ def test_decode_only_request_defeats_nothing_active_short_circuit():
         "decode-only request's config was never registered — the short-circuit "
         "swallowed the prefill->decode transition"
     )
-    assert host._req_steering_phase.get("r1") == "decode"
+    assert host._steering_reqs["r1"].phase == "decode"
 
 
 def test_no_steering_still_short_circuits():
@@ -130,7 +144,7 @@ def test_no_steering_still_short_circuits():
     )
     host._update_steering_buffers(_FakeSchedulerOutput({"r1": 2}))
     assert not host._steering_manager.config_to_row
-    assert "r1" not in host._req_steering_phase
+    assert "r1" not in host._steering_reqs
 
 
 if __name__ == "__main__":

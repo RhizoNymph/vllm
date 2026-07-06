@@ -10,6 +10,7 @@ apply/validate matrix, steering-index routing, and cleanup hooks.
 CPU-only, no engine.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -26,7 +27,10 @@ from vllm.v1.worker.steering_action_queue import (
     SteeringVectorUpdate,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
-from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
+from vllm.v1.worker.steering_model_runner_mixin import (
+    SteeringModelRunnerMixin,
+    _SteeringReqState,
+)
 
 HIDDEN = 8
 MAX_STATIC = 4
@@ -270,7 +274,7 @@ class _MixinHost(SteeringModelRunnerMixin):
         self._dynamic_steering_stats = {}
         self._req_dynamic_decode = {}
         self._req_override_source = {}
-        self._req_steering_phase = {}
+        self._steering_reqs = {}
         self._steering_index_dirty = False
         self.input_batch = _FakeInputBatch(reqs)
         self.requests = {}
@@ -428,6 +432,19 @@ def test_decode_only_request_defeats_nothing_active_short_circuit():
         decode_steering_vectors={_HP: {0: [1.0] * HIDDEN}},
     )
     host.requests = {"r1": SimpleNamespace(sampling_params=sp)}
+    # Admission populates the canonical _steering_reqs store (prefill_hash=0
+    # decode-only ⇒ nothing registered yet, phase "prefill").
+    host._steering_add_request(
+        SimpleNamespace(
+            req_id="r1",
+            sampling_params=sp,
+            prefill_steering_config_hash=0,
+            decode_steering_config_hash=decode_hash,
+            prompt_token_ids=list(range(8)),
+            prompt_embeds=None,
+            num_computed_tokens=6,
+        )
+    )
     # Nothing registered yet — pre-fix this short-circuits and never registers.
     assert not host._steering_manager.config_to_row
     # 6 + 2 >= 8 ⇒ prefill completes this step ⇒ transition fires.
@@ -436,7 +453,7 @@ def test_decode_only_request_defeats_nothing_active_short_circuit():
         "decode-only request's config was never registered — the short-circuit "
         "swallowed the prefill->decode transition"
     )
-    assert host._req_steering_phase.get("r1") == "decode"
+    assert host._steering_reqs["r1"].phase == "decode"
 
 
 def test_decode_routing_uses_dynamic_row_and_admitted_state_untouched():
@@ -446,6 +463,17 @@ def test_decode_routing_uses_dynamic_row_and_admitted_state_untouched():
         config_hash=77, vectors=_vec(1.0), phase="decode"
     )
     assert mgr.config_refcounts[(77, "decode")] == 1
+    # The unified hot path reads the admitted decode hash from the canonical
+    # ``_steering_reqs`` store (not the input-batch column). The manager row is
+    # registered manually above, so track the request directly to avoid a
+    # second register_config that would perturb the refcount assertions.
+    host._steering_reqs["r1"] = _SteeringReqState(
+        sampling_params=object(),
+        prefill_hash=0,
+        decode_hash=77,
+        num_prompt_tokens=8,
+        phase="decode",
+    )
 
     host._apply_steering_actions([_override(value=5.0)], source="s")
     dyn_row = mgr.get_dynamic_row(host._req_dynamic_decode["r1"])
@@ -571,7 +599,7 @@ def test_clearing_monitor_deactivates_flag_on_transition():
 def test_finished_request_releases_override():
     host = _MixinHost([_decode_req()])
     host._apply_steering_actions([_override()], source="s")
-    host._release_finished_steering_configs({"r1"})
+    host._steering_finish_requests({"r1"})
     assert host._req_dynamic_decode == {}
     assert not host._steering_manager.has_dynamic
 
@@ -579,8 +607,14 @@ def test_finished_request_releases_override():
 def test_resumption_into_prefill_drops_override():
     host = _MixinHost([_decode_req()])
     host._apply_steering_actions([_override()], source="s")
+    # Resume re-enters prefill: release-at-preemption already freed the config,
+    # so re-registration drops any surviving override. sampling_params=None +
+    # zero hashes means nothing is re-registered — the override drop is what we
+    # assert here (intent unchanged from the pre-de-fork test).
     req_state = MagicMock()
     req_state.num_prompt_tokens = 8
+    req_state.sampling_params = None
+    req_state.prefill_steering_config_hash = 0
     req_state.decode_steering_config_hash = 0
     host._reset_steering_for_resumption("r1", req_state, new_num_computed_tokens=0)
     assert host._req_dynamic_decode == {}
@@ -590,16 +624,19 @@ def test_resumption_into_prefill_drops_override():
 def test_streaming_refresh_drops_override():
     host = _MixinHost([_decode_req()])
     host._apply_steering_actions([_override()], source="s")
-    new_req_data = MagicMock()
-    new_req_data.sampling_params = None
-    host._refresh_streaming_steering(
-        "r1",
-        new_req_data,
-        old_prefill_hash=0,
-        old_decode_hash=0,
-        new_prefill_hash=0,
-        new_decode_hash=0,
+    # Streaming re-adds route through the canonical admission path; a re-add
+    # with no steering (sampling_params=None, zero hashes) still drops the
+    # prior decode-run override.
+    new_req_data = SimpleNamespace(
+        req_id="r1",
+        sampling_params=None,
+        prefill_steering_config_hash=0,
+        decode_steering_config_hash=0,
+        prompt_token_ids=list(range(8)),
+        prompt_embeds=None,
+        num_computed_tokens=0,
     )
+    host._steering_add_request(new_req_data)
     assert host._req_dynamic_decode == {}
     assert not host._steering_manager.has_dynamic
 
@@ -612,7 +649,7 @@ def test_no_leaks_after_override_churn():
             [_override("r1", 1.0), _override("r2", 2.0)], source="s"
         )
         host._apply_steering_actions([_override("r1", None)], source="s")
-        host._release_finished_steering_configs({"r2"})
+        host._steering_finish_requests({"r2"})
     assert host._req_dynamic_decode == {}
     assert not mgr.has_dynamic
     assert len(mgr._dynamic_free_rows) == MAX_DYNAMIC

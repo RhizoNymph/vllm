@@ -160,9 +160,8 @@ class TestRefcountAfterPreMaterialize:
         snapshot_refcounts = dict(stub._steering_manager.config_refcounts)
 
         # The request hot path goes through ``register_config`` directly
-        # with the resolved vectors (mirrors what
-        # ``_register_initial_steering_config`` does after
-        # ``_resolve_request_steering`` returns the cached array).
+        # with the resolved vectors (mirrors what ``_steering_add_request``
+        # does after ``_resolve_request_steering`` returns the cached array).
         sp = SamplingParams(steering_module_ref=("m", 1.0))
         for phase in ("prefill", "decode"):
             resolved = stub._resolve_request_steering(sp, phase)
