@@ -205,6 +205,8 @@ class _AddGlue(CaptureRunnerMixin):
         self._capture_step_gate = gate
         self._capture_manager = mgr
         self._sync_conversation_ids = {}
+        # Mirrors capture_runner_mixin.py:113 self._sync_steering_gates = {}
+        self._sync_steering_gates = {}
         self.registered_calls = []
 
     # Stub the full registration machinery; only the branching is under test.
@@ -218,7 +220,11 @@ def _new_req(req_id, capture, conversation_id=None, request_metadata=_UNSET):
     # conversation_id now travels on request_metadata, not sampling_params.
     # Pass ``request_metadata=None`` to exercise the no-metadata (offline) path.
     if request_metadata is _UNSET:
-        request_metadata = SimpleNamespace(conversation_id=conversation_id)
+        # steering mirrors RequestMetadata.steering (request_metadata.py:56),
+        # read by _capture_add_request as rmeta.steering.
+        request_metadata = SimpleNamespace(
+            conversation_id=conversation_id, steering=None
+        )
     return SimpleNamespace(
         req_id=req_id,
         sampling_params=SimpleNamespace(capture=capture),
@@ -338,6 +344,8 @@ class _SyncGlue(CaptureRunnerMixin):
         self._sync_step_counter = 0
         self._sync_timing_events = None  # CPU: wall-time accounting path
         self._sync_conversation_ids = {}
+        # Mirrors capture_runner_mixin.py:113 self._sync_steering_gates = {}
+        self._sync_steering_gates = {}
         self.applied = []
 
     # The steering mixin provides this on the real runner (resolved via MRO).
