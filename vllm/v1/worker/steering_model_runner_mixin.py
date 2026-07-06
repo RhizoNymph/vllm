@@ -1516,6 +1516,23 @@ class SteeringModelRunnerMixin:
         self._steering_action_checksum = chk
         self._steering_action_count += 1
 
+    def _steering_req_position(self, req_id: str) -> tuple[int, int] | None:
+        """Return ``(num_computed_tokens, num_prompt_tokens)`` for ``req_id``.
+
+        The de-fork seam for the per-request decode-only phase guard: the
+        shared override apply reads batch position through this hook instead
+        of touching a runner-specific batch structure. Returns ``None`` when
+        the request is not in the current batch. This default is the v1
+        implementation (``self.input_batch``); the v2 runner overrides it to
+        read its ``req_states``.
+        """
+        req_index = self.input_batch.req_id_to_index.get(req_id)
+        if req_index is None:
+            return None
+        num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+        num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+        return num_computed, num_prompt
+
     def _apply_request_override(
         self,
         action: "RequestSteeringOverride",
@@ -1574,11 +1591,10 @@ class SteeringModelRunnerMixin:
                 mgr.release_dynamic_config(existing_dyn_id)
             return True
 
-        req_index = self.input_batch.req_id_to_index.get(req_id)
-        if req_index is None:
+        position = self._steering_req_position(req_id)
+        if position is None:
             return _reject("request is not in the batch")
-        num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
-        num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
+        num_computed, num_prompt = position
         if num_computed < num_prompt:
             return _reject(
                 "request is still prefilling (overrides are decode-only; "
@@ -1592,8 +1608,8 @@ class SteeringModelRunnerMixin:
         # this worker; keep prior state rather than escaping the boundary.
         vectors = action.vectors
         if action.compose_admitted:
-            req_state = self.requests.get(req_id)
-            sp = req_state.sampling_params if req_state is not None else None
+            rs = self._steering_reqs.get(req_id)
+            sp = rs.sampling_params if rs is not None else None
             if sp is not None:
                 try:
                     admitted = self._resolve_request_steering(sp, "decode")
@@ -2303,9 +2319,7 @@ class SteeringModelRunnerMixin:
                 )
             rs.phase = "prefill"
 
-    def _steering_finish_requests(
-        self, req_ids: "set[str] | list[str]"
-    ) -> None:
+    def _steering_finish_requests(self, req_ids: "set[str] | list[str]") -> None:
         """Release configs for finished (or preempted) requests.
 
         Preempted requests are released too: they re-enter through the

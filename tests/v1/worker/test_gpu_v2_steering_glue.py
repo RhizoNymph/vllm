@@ -21,6 +21,7 @@ from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
 )
 from vllm.v1.worker.gpu.steering_runner_mixin import SteeringRunnerMixin
+from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 
 
 class _FakeManager:
@@ -676,3 +677,41 @@ def test_monitor_update_by_req_id_yields_to_operator_owner_v2():
         hook="pre_attn", layer=0, probe=None, req_id="d", source="declarative"
     )
     assert glue._apply_monitor_update(mon, source="declarative") is False
+
+
+# ---- de-fork step F: shared override reads batch position via one accessor ----
+
+
+def _v1_position_host(order, computed, prompt):
+    """Bare v1 mixin host exposing only the ``input_batch`` fields the
+    ``_steering_req_position`` accessor reads."""
+    host = SteeringModelRunnerMixin.__new__(SteeringModelRunnerMixin)
+    host.input_batch = SimpleNamespace(
+        req_id_to_index={r: i for i, r in enumerate(order)},
+        num_computed_tokens_cpu=np.asarray(computed, dtype=np.int32),
+        num_prompt_tokens=np.asarray(prompt, dtype=np.int32),
+    )
+    return host
+
+
+def test_steering_req_position_v1_v2_parity():
+    # Same logical batch state: two requests, one decode (computed >= prompt),
+    # one prefill (computed < prompt), plus one not in the batch.
+    order = ["d", "p"]
+    computed = [10, 3]
+    prompt = [10, 8]
+
+    v1 = _v1_position_host(order, computed, prompt)
+    v2 = _make_glue(num_computed=computed, prompt_len=prompt)
+    v2.req_states.req_id_to_index = {r: i for i, r in enumerate(order)}
+
+    for req_id in order:
+        assert v1._steering_req_position(req_id) == v2._steering_req_position(req_id), (
+            req_id
+        )
+    # Decode request: computed 10 >= prompt 10; prefill: 3 < 8.
+    assert v1._steering_req_position("d") == (10, 10)
+    assert v1._steering_req_position("p") == (3, 8)
+    # Not in the batch -> both return None.
+    assert v1._steering_req_position("ghost") is None
+    assert v2._steering_req_position("ghost") is None
