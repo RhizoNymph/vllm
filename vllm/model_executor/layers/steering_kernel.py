@@ -336,15 +336,35 @@ def _default_warmup_sizes() -> list[int]:
     return [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 
 
+def _jit_device_caches() -> dict | None:
+    """Normalize the kernel's per-device JIT cache across Triton versions.
+
+    Triton < 3.6: ``JITFunction.cache`` is ``{device: {key: kernel}}``.
+    Triton >= 3.6: renamed to ``device_caches`` with per-device tuple
+    values whose FIRST element is the ``{key: kernel}`` dict. Returns a
+    ``{device: {key: kernel}}`` view, or None when the kernel has no
+    cache attribute (Triton disabled in the importing process).
+    """
+    cache = getattr(_apply_steering_kernel, "cache", None)
+    if cache is None:
+        cache = getattr(_apply_steering_kernel, "device_caches", None)
+    if cache is None:
+        return None
+    return {
+        dev: (dc[0] if isinstance(dc, tuple) and dc else dc)
+        for dev, dc in cache.items()
+    }
+
+
 def _dump_jit_cache_keys() -> None:
     """One-shot diagnostic — log the keys present in the kernel cache.
 
-    Enabled when ``VLLM_STEERING_DUMP_JIT_CACHE=1``.  Walks
-    ``_apply_steering_kernel.cache`` (a per-device dict from Triton's
-    JITFunction) and emits each variant key at INFO so a benchmark run
-    can reveal what specializations Triton actually built.
+    Enabled when ``VLLM_STEERING_DUMP_JIT_CACHE=1``.  Walks the kernel's
+    per-device JIT cache (see :func:`_jit_device_caches`) and emits each
+    variant key at INFO so a benchmark run can reveal what
+    specializations Triton actually built.
     """
-    cache = getattr(_apply_steering_kernel, "cache", None)
+    cache = _jit_device_caches()
     if cache is None:
         logger.info(
             "steering JIT cache dump requested but kernel has no cache "
@@ -371,10 +391,16 @@ def _dump_jit_cache_keys() -> None:
 def _kernel_cache_size() -> int:
     """Return the total number of compiled variants across all devices.
 
-    Returns 0 when the kernel has not yet been built (no ``cache``
-    attribute, e.g. when Triton is disabled in the importing process).
+    Returns 0 when the kernel has not yet been built (no cache attribute,
+    e.g. when Triton is disabled in the importing process). Triton < 3.6
+    exposes ``JITFunction.cache`` as ``{device: {key: kernel}}``; Triton
+    >= 3.6 renamed it to ``device_caches`` with per-device tuple values
+    whose FIRST element is the ``{key: kernel}`` dict. A probe that reads
+    the wrong attribute silently reports 0 forever, which makes every
+    warmup cache-idempotency check vacuous — handle both layouts via
+    :func:`_jit_device_caches`.
     """
-    cache = getattr(_apply_steering_kernel, "cache", None)
+    cache = _jit_device_caches()
     if cache is None:
         return 0
     total = 0
