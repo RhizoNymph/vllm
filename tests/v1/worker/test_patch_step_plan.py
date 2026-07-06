@@ -229,8 +229,8 @@ class _FakeRunner(PatchModelRunnerMixin):
     """Minimal harness: register patch buffers on a few fake layers."""
 
     def __init__(self, n_layers: int, hidden: int, max_slots: int, max_tokens: int):
-        self._patch_specs = {}
-        self._patch_touched_sites = set()
+        self._patch_specs: dict[str, list[PatchEntry]] = {}
+        self._patch_touched_sites: set[tuple[int, SteeringHookPoint]] = set()
         self._patch_index_dirty = False
         self._patchable_layers = {}
         for li in range(n_layers):

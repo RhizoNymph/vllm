@@ -452,17 +452,17 @@ class OpenAIServingCompletion(OpenAIServing):
             if (
                 request.capture
                 and getattr(request, "capture_wait", False)
-                and final_res_batch
-                and not final_res_batch[0].capture_results
+                and final_res_batch_checked
+                and not final_res_batch_checked[0].capture_results
                 and hasattr(self.engine_client, "wait_for_capture_results")
             ):
                 # Capture writes are asynchronous; hold the response until
                 # this request's results finalize (files durable).
                 late = await self.engine_client.wait_for_capture_results(
-                    final_res_batch[0].request_id
+                    final_res_batch_checked[0].request_id
                 )
                 if late:
-                    final_res_batch[0].capture_results = late
+                    final_res_batch_checked[0].capture_results = late
 
             response = self.request_output_to_completion_response(
                 final_res_batch_checked,

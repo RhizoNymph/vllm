@@ -16,7 +16,7 @@ import asyncio
 import inspect
 import json
 import math
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
 from typing import Any
 from uuid import uuid4
@@ -79,7 +79,7 @@ def resolve_span_body_positions(
             occurrence (surfaced by the endpoint as a 400).
     """
     if not any(isinstance(p, SpanPosition) for p in positions):
-        return [int(p) for p in positions]
+        return [int(p) for p in positions if isinstance(p, int)]
     text, offsets = prompt_char_offsets(tokenizer, prompt)
     return dedup_positions(
         resolve_span_positions(offsets, text, p.span, p.occurrence)
@@ -174,8 +174,8 @@ async def _first_token_logprobs(
     async for out in eng.generate({"prompt": prompt}, sp, request_id):
         final = out
     if final is None or not final.outputs or not final.outputs[0].logprobs:
-        return None, len(final.prompt_token_ids) if final else 0
-    return final.outputs[0].logprobs[0], len(final.prompt_token_ids)
+        return None, len(final.prompt_token_ids or []) if final else 0
+    return final.outputs[0].logprobs[0], len(final.prompt_token_ids or [])
 
 
 async def _auto_capture_clean(
@@ -248,7 +248,8 @@ async def _resolve_grade_token(
         return int(token_id)
     if token is None:
         return None
-    tokenizer = eng.get_tokenizer()
+    # get_tokenizer is on the concrete engine, not the EngineClient ABC.
+    tokenizer = eng.get_tokenizer()  # type: ignore[attr-defined]
     if inspect.isawaitable(tokenizer):
         tokenizer = await tokenizer
     ids = tokenizer.encode(token, add_special_tokens=False)
@@ -345,6 +346,8 @@ async def _sweep_events(
     def to_metric(value: float | None) -> float | None:
         if value is None or denom is None:
             return value
+        # denom is only set when corrupt_val is non-None (see above).
+        assert corrupt_val is not None
         return (value - corrupt_val) / denom
 
     async def run_cell(
@@ -608,7 +611,8 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     else:
         # Substring spans resolve against the corrupt prompt (the destination
         # run), tokenized exactly as the sweep tokenizes it.
-        tokenizer = eng.get_tokenizer()
+        # get_tokenizer is on the concrete engine, not the EngineClient ABC.
+        tokenizer = eng.get_tokenizer()  # type: ignore[attr-defined]
         if inspect.isawaitable(tokenizer):
             tokenizer = await tokenizer
         try:
@@ -671,7 +675,8 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     skipped: list[dict] = []
     alignment_summary: dict | None = None
     if body.clean_prompt is not None:
-        tokenizer = eng.get_tokenizer()
+        # get_tokenizer is on the concrete engine, not the EngineClient ABC.
+        tokenizer = eng.get_tokenizer()  # type: ignore[attr-defined]
         if inspect.isawaitable(tokenizer):
             tokenizer = await tokenizer
         align = align_token_positions(
@@ -679,7 +684,8 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
             tokenizer.encode(body.prompt),
         )
         alignment_summary = align.summary()
-        aligned, dropped = [], []
+        aligned: list[int] = []
+        dropped: list[int] = []
         for pos in positions:
             (aligned if align.source_for(pos) is not None else dropped).append(pos)
         for pos in dropped:
@@ -696,7 +702,7 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
                 "no alignable positions: the prompts share no common token "
                 "prefix/suffix at the requested positions"
             )
-        source_for = align.source_for
+        source_for: Callable[[int], int | None] = align.source_for
     else:
         run_len = await get_run_prompt_tokens(eng, body.source_run)
         if run_len is not None and run_len != n_prompt:

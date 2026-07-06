@@ -83,7 +83,7 @@ class SweepResult:
     positions: list[int]
     hook: str
     metric_name: str
-    grid: list[list[float]]  # grid[i][j] for layers[i], positions[j]
+    grid: list[list[float | None]]  # grid[i][j] for layers[i], positions[j]
     clean: float | None = None
     corrupt: float | None = None
     notes: list[str] = field(default_factory=list)
@@ -119,10 +119,10 @@ class SweepResult:
     def top(self, k: int = 5) -> list[tuple[int, int, float]]:
         """Top-``k`` ``(layer, position, metric)`` cells by metric."""
         cells = [
-            (layer, pos, self.grid[i][j])
+            (layer, pos, v)
             for i, layer in enumerate(self.layers)
             for j, pos in enumerate(self.positions)
-            if self.grid[i][j] is not None
+            if (v := self.grid[i][j]) is not None
         ]
         cells.sort(key=lambda c: c[2], reverse=True)
         return cells[:k]
@@ -333,7 +333,7 @@ class PatchStudy:
         return _resolve_span_positions(offsets, text, span, occurrence)
 
     async def _resolve_positions(
-        self, positions: Sequence[int] | Span | str, prompt: str
+        self, positions: Sequence[int | Span] | Span | str, prompt: str
     ) -> list[int]:
         """Expand any :class:`Span` markers in ``positions`` against ``prompt``.
 
@@ -568,7 +568,7 @@ class PatchStudy:
                 "sweep needs run= (capture_clean() first) or server_side=True."
             )
         run = source_run
-        positions = await self._resolve_positions(positions, corrupt_prompt)
+        resolved = await self._resolve_positions(positions, corrupt_prompt)
 
         grade_ids = self._grade_ids(answer_token, foil_token)
 
@@ -585,9 +585,9 @@ class PatchStudy:
                 alignment = align_token_positions(ids_clean, ids_corrupt)
                 source_map = alignment.mapping
                 unaligned = set(alignment.unaligned)
-                dropped = [p for p in positions if p in unaligned]
+                dropped = [p for p in resolved if p in unaligned]
                 if dropped:
-                    positions = [p for p in positions if p not in unaligned]
+                    resolved = [p for p in resolved if p not in unaligned]
                     notes.append(
                         f"skipped unaligned positions {dropped} (clean/corrupt "
                         f"token spans differ there; no positional "
@@ -638,7 +638,7 @@ class PatchStudy:
                 return await grade(patch)
 
             tasks = [
-                [asyncio.create_task(cell(layer, pos)) for pos in positions]
+                [asyncio.create_task(cell(layer, pos)) for pos in resolved]
                 for layer in layers
             ]
             grid = [[await t for t in row] for row in tasks]
@@ -666,7 +666,7 @@ class PatchStudy:
 
         return SweepResult(
             layers=layers,
-            positions=positions,
+            positions=resolved,
             hook=hook,
             metric_name=metric,
             grid=grid,
@@ -733,7 +733,7 @@ class PatchStudy:
                 if metric == "logit_diff"
                 else clean.clean_logprob
             )
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "prompt": corrupt_prompt,
             "source_run": run,
@@ -772,7 +772,7 @@ class PatchStudy:
         auto_captured = data.get("auto_captured", False)
         captured_source_run = data.get("captured_source_run")
 
-        def _result(hook: str, grid: list[list[float]]) -> SweepResult:
+        def _result(hook: str, grid: list[list[float | None]]) -> SweepResult:
             return SweepResult(
                 layers=data["layers"],
                 positions=data["positions"],
@@ -875,7 +875,7 @@ class PatchStudy:
         positions = list(
             range(max(0, c_pos - position_radius), c_pos + position_radius + 1)
         )
-        return await self.sweep_layers_positions(
+        zoomed = await self.sweep_layers_positions(
             corrupt_prompt,
             run=run,
             layers=layers,
@@ -887,6 +887,9 @@ class PatchStudy:
             metric=metric or result.metric_name,
             clean=clean,
         )
+        # Single-hook per-cell path always yields one SweepResult (no `hooks`).
+        assert isinstance(zoomed, SweepResult)
+        return zoomed
 
     def drop_run(self, run: str) -> bool:
         """Free a captured source run via ``DELETE /v1/patch_source/{run}``.

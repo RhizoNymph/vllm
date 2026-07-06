@@ -26,6 +26,7 @@ from vllm.v1.worker.patch_runner_mixin import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
 
@@ -37,6 +38,10 @@ class PatchRunnerMixin(PatchModelRunnerMixin):
     runner-agnostic and live in :class:`PatchModelRunnerMixin`; this subclass
     adds only the v2-coupled per-step batch-view projection.
     """
+
+    if TYPE_CHECKING:
+        # Provided by the concrete v2 runner this mixin is mixed into.
+        req_states: RequestState
 
     def _update_patch_buffers_v2(
         self, scheduler_output: SchedulerOutput, input_batch: InputBatch
