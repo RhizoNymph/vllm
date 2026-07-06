@@ -93,6 +93,11 @@ class SweepResult:
     prior capture."""
     captured_source_run: str | None = None
     """The run handle a one-call auto-capture wrote under, else ``None``."""
+    noise_floor: float | None = None
+    """Batch-nondeterminism floor from a server-side sweep: |corrupt baseline
+    re-run inside the cell batch − solo|, in the metric's units. Grid
+    differences at or below it are not meaningful. ``None`` on the per-cell
+    path."""
 
     def to_numpy(self):
         import numpy as np
@@ -328,13 +333,22 @@ class PatchStudy:
         return _resolve_span_positions(offsets, text, span, occurrence)
 
     async def _resolve_positions(
-        self, positions: Sequence[int] | Span, prompt: str
+        self, positions: Sequence[int] | Span | str, prompt: str
     ) -> list[int]:
         """Expand any :class:`Span` markers in ``positions`` against ``prompt``.
 
-        Plain ints pass through; spans resolve to their covering positions.
-        Order is preserved and duplicates dropped.
+        Plain ints pass through; spans resolve to their covering positions;
+        ``"all_prompt"`` expands to every prompt token position. Order is
+        preserved and duplicates dropped.
         """
+        if positions == "all_prompt":
+            ids = self._tokenize(prompt)
+            if ids is None:
+                raise RuntimeError(
+                    "positions='all_prompt' needs the /tokenize endpoint to "
+                    "count prompt tokens"
+                )
+            return list(range(len(ids)))
         items: Sequence[Any] = [positions] if isinstance(positions, Span) else positions
         groups: list[list[int]] = []
         for item in items:
@@ -421,7 +435,7 @@ class PatchStudy:
         *,
         run: str | None = None,
         layers: Sequence[int],
-        positions: Sequence[int | Span] | Span,
+        positions: Sequence[int | Span] | Span | str,
         hook: str | None = None,
         alpha: float = 1.0,
         answer_token: str,
@@ -436,7 +450,8 @@ class PatchStudy:
     ) -> SweepResult | dict[str, SweepResult]:
         """Fan out one patched request per (layer, position) cell.
 
-        ``positions`` accepts token indices and/or :class:`Span` markers; each
+        ``positions`` accepts token indices, :class:`Span` markers, or
+        ``"all_prompt"`` (every prompt token position); each
         span resolves to the corrupt-prompt token positions covering its text.
         With ``server_side=True`` spans are forwarded to the server (resolved
         there); the per-cell path resolves them client-side.
@@ -662,9 +677,11 @@ class PatchStudy:
 
     @staticmethod
     def _encode_positions(
-        positions: Sequence[int | Span] | Span,
-    ) -> list[int | dict]:
+        positions: Sequence[int | Span] | Span | str,
+    ) -> list[int | dict] | str:
         """Forward positions to the server, spans as ``{span, occurrence}``."""
+        if positions == "all_prompt":
+            return "all_prompt"
         items = [positions] if isinstance(positions, Span) else positions
         out: list[int | dict] = []
         for item in items:
@@ -680,7 +697,7 @@ class PatchStudy:
         *,
         run: str,
         layers: list[int],
-        positions: Sequence[int | Span] | Span,
+        positions: Sequence[int | Span] | Span | str,
         hook: str,
         alpha: float,
         answer_token: str,
@@ -767,6 +784,7 @@ class PatchStudy:
                 notes=notes,
                 auto_captured=auto_captured,
                 captured_source_run=captured_source_run,
+                noise_floor=data.get("noise_floor"),
             )
 
         if data.get("hook_grids"):

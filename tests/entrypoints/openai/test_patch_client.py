@@ -802,3 +802,62 @@ class TestResolvePositions:
         monkeypatch.setattr(study, "positions_for", fake_positions_for)
         out = asyncio.run(study._resolve_positions(pc.Span("cat", occurrence=1), "p"))
         assert out == [4, 5]
+
+
+class TestAllPromptPositions:
+    def test_encode_passes_all_prompt_through(self):
+        assert pc.PatchStudy._encode_positions("all_prompt") == "all_prompt"
+
+    def test_resolve_expands_via_tokenize(self, monkeypatch):
+        study = pc.PatchStudy.__new__(pc.PatchStudy)
+        monkeypatch.setattr(study, "_tokenize", lambda text: [1, 2, 3, 4])
+        out = asyncio.run(study._resolve_positions("all_prompt", "p"))
+        assert out == [0, 1, 2, 3]
+
+    def test_resolve_raises_without_tokenize(self, monkeypatch):
+        study = pc.PatchStudy.__new__(pc.PatchStudy)
+        monkeypatch.setattr(study, "_tokenize", lambda text: None)
+        with pytest.raises(RuntimeError):
+            asyncio.run(study._resolve_positions("all_prompt", "p"))
+
+
+class TestNoiseFloorSurfaced:
+    def test_server_side_result_carries_noise_floor(self, monkeypatch):
+        study = _server_study()
+        seen = {}
+
+        class _Client:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                seen.update(json)
+                data = _summary_data(json)
+                data["noise_floor"] = 0.042
+                return _FakeResp(data)
+
+        monkeypatch.setattr(
+            pc, "httpx", SimpleNamespace(AsyncClient=_Client), raising=False
+        )
+        import httpx as real_httpx
+
+        monkeypatch.setattr(real_httpx, "AsyncClient", _Client)
+        monkeypatch.setattr(study, "_grade_ids", lambda a, f: None)
+        res = asyncio.run(
+            study.sweep_layers_positions(
+                "corrupt",
+                run="R1",
+                layers=[0, 1],
+                positions="all_prompt",
+                answer_token=" x",
+                server_side=True,
+            )
+        )
+        assert res.noise_floor == 0.042
+        assert seen["positions"] == "all_prompt"
