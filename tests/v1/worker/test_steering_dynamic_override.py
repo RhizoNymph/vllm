@@ -27,7 +27,10 @@ from vllm.v1.worker.steering_action_queue import (
     SteeringVectorUpdate,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
-from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
+from vllm.v1.worker.steering_model_runner_mixin import (
+    SteeringModelRunnerMixin,
+    _SteeringReqState,
+)
 
 HIDDEN = 8
 MAX_STATIC = 4
@@ -460,6 +463,17 @@ def test_decode_routing_uses_dynamic_row_and_admitted_state_untouched():
         config_hash=77, vectors=_vec(1.0), phase="decode"
     )
     assert mgr.config_refcounts[(77, "decode")] == 1
+    # The unified hot path reads the admitted decode hash from the canonical
+    # ``_steering_reqs`` store (not the input-batch column). The manager row is
+    # registered manually above, so track the request directly to avoid a
+    # second register_config that would perturb the refcount assertions.
+    host._steering_reqs["r1"] = _SteeringReqState(
+        sampling_params=object(),
+        prefill_hash=0,
+        decode_hash=77,
+        num_prompt_tokens=8,
+        phase="decode",
+    )
 
     host._apply_steering_actions([_override(value=5.0)], source="s")
     dyn_row = mgr.get_dynamic_row(host._req_dynamic_decode["r1"])
