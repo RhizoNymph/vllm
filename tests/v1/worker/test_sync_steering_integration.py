@@ -11,6 +11,7 @@ queue and sync returns).
 """
 
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -18,6 +19,9 @@ import torch
 
 from vllm.v1.capture.manager import CaptureManager
 from vllm.v1.capture.types import CaptureSpec
+from vllm.v1.worker.gpu.capture_runner_mixin import (
+    CaptureRunnerMixin as _V2CaptureMixin,
+)
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.steering_action_queue import SteeringVectorUpdate
 from vllm.v1.worker.steering_manager import SteeringManager
@@ -70,7 +74,17 @@ def _slim_manager(keys=((1, "post_block"),)) -> CaptureManager:
 
 
 class _RunnerStub:
-    """Duck-typed receiver for the unbound runner methods under test."""
+    """Duck-typed receiver for the unbound runner methods under test.
+
+    The shared step-capture view builder / sync-consumer loop live on
+    ``CaptureRunnerMixin``; the two runner-specific hooks
+    (``_iter_step_capture_rows`` / ``_step_view_token_ids``) are the v1 runner's
+    implementations, which read ``self.input_batch``.
+    """
+
+    # v1's per-step hooks; the shared builder calls back into these.
+    _iter_step_capture_rows = GPUModelRunner._iter_step_capture_rows
+    _step_view_token_ids = GPUModelRunner._step_view_token_ids
 
     def __init__(self, reqs, monitor_keys=((1, "post_block"),)):
         self.input_batch = _FakeInputBatch(reqs)
@@ -85,8 +99,10 @@ class _RunnerStub:
         self._sync_steering_gates: dict[str, list | None] = {}
         self.applied_calls = []
 
-    def _build_step_capture_view(self, scheduler_output):
-        return GPUModelRunner._build_step_capture_view(self, scheduler_output)
+    def _build_step_capture_view(self, scheduler_output, input_batch=None):
+        return GPUModelRunner._build_step_capture_view(
+            self, scheduler_output, input_batch
+        )
 
     def _run_sync_consumers(self, scheduler_output):
         return GPUModelRunner._run_sync_consumers(self, scheduler_output)
@@ -163,6 +179,106 @@ def test_step_view_tensor_is_zero_copy_of_buffer():
     # Zero-copy: writing through the buffer is visible in the view.
     mgr.global_buffer((1, "post_block"))[0].fill_(7.0)
     assert bool((view_tensor[0] == 7.0).all())
+
+
+# ---------------------------------------------------------------------------
+# _build_step_capture_view parity across the v1 and v2 runner hooks
+# ---------------------------------------------------------------------------
+
+
+class _FakeV2InputBatch:
+    """v2 forward-batch layout: contiguous ``query_start_loc`` offsets plus an
+    ``idx_mapping`` from batch row to the ``req_states`` slot."""
+
+    def __init__(self, req_ids, query_start_loc, idx_mapping):
+        self.num_reqs = len(req_ids)
+        self.req_ids = list(req_ids)
+        self.query_start_loc_np = np.asarray(query_start_loc, dtype=np.int64)
+        self.idx_mapping_np = np.asarray(idx_mapping, dtype=np.int64)
+
+
+class _V2RunnerStub:
+    """Duck-typed receiver driving the v2 runner's per-step hooks through the
+    shared ``_build_step_capture_view``."""
+
+    _iter_step_capture_rows = _V2CaptureMixin._iter_step_capture_rows
+    _step_view_token_ids = _V2CaptureMixin._step_view_token_ids
+
+    def __init__(self, req_ids, num_computed, num_prompt, monitor_keys):
+        self.req_states = SimpleNamespace(
+            num_computed_tokens_np=np.asarray(num_computed, dtype=np.int32),
+            prompt_len=SimpleNamespace(np=np.asarray(num_prompt, dtype=np.int32)),
+        )
+        self._sync_capture_buffers = _slim_manager(monitor_keys)
+        self._sync_monitor_keys = sorted(monitor_keys)
+        self._sync_step_counter = 0
+        self._sync_conversation_ids: dict[str, str | None] = {}
+        self._sync_steering_gates: dict[str, list | None] = {}
+
+    def _build_step_capture_view(self, scheduler_output, input_batch):
+        return _V2CaptureMixin._build_step_capture_view(
+            self, scheduler_output, input_batch
+        )
+
+
+@pytest.mark.parametrize(
+    "reqs",
+    [
+        # (req_id, num_computed, num_prompt, scheduled)
+        [("a", 4, 10, 3), ("b", 12, 8, 1)],  # prefill + decode
+        [("a", 0, 4, 4)],  # single full-prefill
+        [("a", 8, 8, 1), ("b", 3, 6, 3), ("c", 20, 5, 1)],  # decode/prefill/decode
+    ],
+)
+def test_step_view_parity_v1_v2_hooks(reqs):
+    monitor_keys = ((1, "post_block"),)
+    scheduled = {r[0]: r[3] for r in reqs}
+    sched_out = _FakeSchedulerOutput(scheduled)
+
+    v1 = _RunnerStub(
+        reqs=[
+            {"req_id": r[0], "num_computed": r[1], "num_prompt": r[2]} for r in reqs
+        ],
+        monitor_keys=monitor_keys,
+    )
+    v1.input_batch.token_ids_cpu = np.stack(
+        [np.arange(64, dtype=np.int64) + 1000 * i for i in range(len(reqs))]
+    )
+    v1_view = v1._build_step_capture_view(sched_out)
+
+    # Same logical batch expressed in v2's layout: contiguous qsl offsets and a
+    # 1:1 batch-row -> req_states-slot mapping.
+    offsets = [0]
+    for r in reqs:
+        offsets.append(offsets[-1] + r[3])
+    v2_ib = _FakeV2InputBatch(
+        req_ids=[r[0] for r in reqs],
+        query_start_loc=offsets,
+        idx_mapping=list(range(len(reqs))),
+    )
+    v2 = _V2RunnerStub(
+        req_ids=[r[0] for r in reqs],
+        num_computed=[r[1] for r in reqs],
+        num_prompt=[r[2] for r in reqs],
+        monitor_keys=monitor_keys,
+    )
+    v2_view = v2._build_step_capture_view(sched_out, v2_ib)
+
+    # Spans / phases / conversation-id / gates must be identical across runners.
+    def _key(v):
+        return [
+            (r.req_id, r.start, r.end, r.phase, r.conversation_id, r.steering)
+            for r in v.requests
+        ]
+
+    assert _key(v1_view) == _key(v2_view)
+    assert v1_view.step == v2_view.step
+
+    # token_ids diverge by design: populated on v1, empty on v2.
+    for r in v1_view.requests:
+        assert r.token_ids.shape == (r.end - r.start,)
+    for r in v2_view.requests:
+        assert r.token_ids.shape == (0,)
 
 
 # ---------------------------------------------------------------------------

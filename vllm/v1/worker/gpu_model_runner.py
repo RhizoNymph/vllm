@@ -6,7 +6,7 @@ import gc
 import itertools
 import threading
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
@@ -137,7 +137,6 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.capture.types import CaptureResult
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -195,6 +194,7 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
+from vllm.v1.worker.capture_runner_mixin import CaptureRunnerMixin
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
@@ -419,6 +419,7 @@ class ExecuteModelState(NamedTuple):
 
 class GPUModelRunner(
     LoRAModelRunnerMixin,
+    CaptureRunnerMixin,
     SteeringModelRunnerMixin,
     KVConnectorModelRunnerMixin,
     ECConnectorModelRunnerMixin,
@@ -514,290 +515,10 @@ class GPUModelRunner(
             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
         )
 
-        # Per-request activation capture.
-        # Capture manager + tables are populated when
-        # ``capture_consumers_config`` is non-empty.  Each consumer is
-        # addressed by its config order index; ``_capture_name_to_index``
-        # lets the runner translate ``sampling_params.capture``'s
-        # name-keyed client specs into the index-keyed dict the manager
-        # expects, and the inverse map drives the nested
-        # ``RequestOutput.capture_results`` shape on finalize.
-        self._capture_manager: Any = None
-        self._capture_validators: tuple[Any, ...] = ()
-        self._capture_name_to_index: dict[str, int] = {}
-        self._capture_index_to_name: dict[int, str] = {}
-        # Pending terminal results keyed by request id → consumer name →
-        # ``CaptureResult``.  Drained onto every ``ModelRunnerOutput``.
-        # Written by the manager's finalize thread (via the async finalize
-        # callback) and drained on the step thread, so all access is
-        # guarded by ``_pending_capture_results_lock``.
-        self._pending_capture_results: dict[str, dict[str, CaptureResult]] = {}
-        self._pending_capture_results_lock = threading.Lock()
-        # Set on *every* rank (capturer or not). Drives the per-step
-        # force-eager decision in ``execute_model`` via
-        # ``_capture_step_gate``, which every rank evaluates identically
-        # from the broadcast ``scheduler_output`` — so no cross-rank
-        # collective is needed and all ranks stay in lockstep on
-        # ``num_tokens_padded``. Independent of the capturer gate, which
-        # only controls who installs a manager.
-        self._capture_feature_enabled = (
-            self.vllm_config.capture_consumers_config is not None
-        )
-        # Rank-replicated force-eager predicate. Built on every rank
-        # (capturer or not) so the eager-vs-cudagraph choice agrees across
-        # the TP/PP topology without a per-step collective. ``None`` when
-        # the capture feature is disabled.
-        self._capture_step_gate: Any = None
-        # Sync-execution consumers (``execution="sync"``): constructed
-        # on EVERY TP rank, run on the step thread post-forward via
-        # ``_run_sync_consumers``, reading the persistent global
-        # capture buffers. ``_sync_capture_buffers`` is whichever
-        # manager owns those buffers on this rank — the full manager on
-        # TP rank 0, a slim (buffers-only) manager elsewhere. See
-        # docs/design/dynamic_steering.md §5.1.
-        self._sync_consumers: list[tuple[str, Any]] = []
-        self._sync_capture_buffers: Any = None
-        self._sync_monitor_keys: list[tuple[int, str]] = []
-        self._sync_consumer_stats: dict[str, dict[str, Any]] = {}
-        # req_id -> client conversation id (``RequestMetadata.conversation_id``),
-        # surfaced on the per-step ``StepRequestView`` so a sync consumer can
-        # latch a steering decision across the turns of one conversation.
-        self._sync_conversation_ids: dict[str, str | None] = {}
-        # Declarative per-request steering gates, unpacked to numpy once at
-        # admission and surfaced on ``StepRequestView.steering`` for the
-        # built-in declarative steering consumer.
-        self._sync_steering_gates: dict[str, list | None] = {}
-        self._sync_step_counter = 0
-        # Per-consumer CUDA event pairs measuring the *added* GPU time of
-        # ``on_step`` — the GEMV + tiny D2H the consumer enqueues — rather
-        # than the wall-clock ``perf_counter`` span, which absorbs the
-        # forward-pass GPU drain (the consumer's D2H is the step's first
-        # CUDA sync point). ``None`` off CUDA (e.g. CPU tests); populated
-        # below once we know sync consumers are active on a CUDA device.
-        # See ``_run_sync_consumers`` and docs/design/dynamic_steering.md §9.
-        self._sync_timing_events: (
-            dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] | None
-        ) = None
-        if self.vllm_config.capture_consumers_config is not None:
-            from vllm.model_executor.layers.activation_capture import (
-                set_active_capture_manager,
-            )
-            from vllm.v1.capture.step_gate import CaptureStepGate
-
-            # Global capture specs no longer force eager: they ride a
-            # CUDA-graph-safe persistent-buffer path (a fixed-shape
-            # full-residual copy baked into each graph at warmup — see
-            # ``CaptureManager._global_buffers`` / ``on_hook``). The gate
-            # therefore forces eager only when a per-request *client* spec
-            # captures this step; global-only and plain steps keep full
-            # cudagraph speed.
-            # The graph-safe per-request allowlist (a rank-identical config
-            # value) lets a client spec tapping only allowlisted keys ride the
-            # persistent-buffer path and skip eager too. Built with the global,
-            # unfiltered key set so every rank reaches the same decision.
-            _gs_keys = frozenset(
-                getattr(
-                    self.vllm_config.capture_consumers_config,
-                    "graphsafe_keys",
-                    None,
-                )
-                or ()
-            )
-            self._capture_step_gate = CaptureStepGate(graphsafe_keys=_gs_keys)
-
-            # Capturer-rank gate. The replicated residual hooks
-            # (pre_attn/post_attn/post_block) read the residual stream after
-            # the tensor-parallel all-reduce / MoE combine, so it is
-            # byte-identical across the tensor-parallel group within each
-            # (data-parallel, pipeline) cell. Exactly one rank — TP rank 0
-            # — captures it; every other rank installs no manager and runs
-            # the cold path, so the graph-local capture op never enters its
-            # compiled graph (divergent per-rank graphs are safe because
-            # the op carries no collective). Each pipeline stage's TP rank 0
-            # captures the layers that stage owns; the engine merges the
-            # per-stage results.
-            if get_tp_group().rank_in_group != 0:
-                from vllm.v1.capture import registry as _capture_registry
-                from vllm.v1.capture.manager import CaptureManager
-
-                # Sync consumers exist on every rank; async consumers
-                # must NOT be constructed here (their constructors have
-                # side effects — writer threads, open files).
-                self._sync_consumers = _capture_registry.build_sync_consumers(
-                    self.vllm_config
-                )
-                if not self._sync_consumers:
-                    set_active_capture_manager(None)
-                else:
-                    # Buffers-only manager: gives this rank the same
-                    # graph-baked full-residual ``copy_`` for the sync
-                    # monitor keys that rank 0 gets, with no dispatch
-                    # pipeline. The runner's ``_capture_manager`` stays
-                    # None so every existing rank-0-only call site
-                    # (register/build_step_plan/finalize) short-circuits.
-                    slim_mgr = CaptureManager(
-                        consumers=(),
-                        consumer_specs=(),
-                        extra_global_specs=tuple(
-                            c.global_capture_spec()
-                            for _, c in self._sync_consumers
-                        ),
-                        num_hidden_layers=(
-                            self.model_config.get_total_num_hidden_layers()
-                        ),
-                        local_layer_range=(
-                            self.model_config.get_layers_start_end_indices(
-                                self.vllm_config.parallel_config
-                            )
-                        ),
-                        hidden_size=self.model_config.get_hidden_size(),
-                        model_dtype=self.model_config.dtype,
-                        device=self.device,
-                        max_num_tokens=self.max_num_tokens,
-                        slim=True,
-                    )
-                    self._sync_capture_buffers = slim_mgr
-                    set_active_capture_manager(slim_mgr)
-            else:
-                from vllm.v1.capture import registry as _capture_registry
-                from vllm.v1.capture.manager import CaptureManager
-
-                # Pre-constructed driver-side instances ride on the
-                # ``CaptureConsumersConfig.instances`` field populated by
-                # the ``LLM`` constructor.  Dict-form consumers come
-                # through ``config.consumers`` as before; both paths are
-                # handled by ``build_consumers``.
-                instances = list(self.vllm_config.capture_consumers_config.instances)
-
-                (
-                    sinks,
-                    validators,
-                    name_to_index,
-                    sync_consumers,
-                ) = _capture_registry.build_consumers(
-                    self.vllm_config, consumer_instances=instances
-                )
-                self._sync_consumers = sync_consumers
-
-                # Gather each consumer's global spec.  The batched-adapter
-                # path reaches the ``CaptureConsumer`` via the validator;
-                # direct sink consumers (e.g. ``FilesystemConsumer``)
-                # expose the method on themselves — ``_select_validator``
-                # points the validator tuple at whichever object carries
-                # ``validate_client_spec`` / ``global_capture_spec``.
-                global_specs: list[Any] = []
-                for validator in validators:
-                    spec = None
-                    try:
-                        if hasattr(validator, "global_capture_spec"):
-                            spec = validator.global_capture_spec()
-                    except Exception:
-                        spec = None
-                    global_specs.append(spec)
-
-                cc_config = self.vllm_config.capture_consumers_config
-                self._capture_manager = CaptureManager(
-                    consumers=sinks,
-                    consumer_specs=tuple(global_specs),
-                    # Sync consumers' monitor keys get persistent
-                    # buffers without sink slots; they read the buffers
-                    # directly on the step thread.
-                    extra_global_specs=tuple(
-                        c.global_capture_spec() for _, c in sync_consumers
-                    ),
-                    # Global layer count for validation; the local slice
-                    # this pipeline stage owns drives spec filtering so it
-                    # captures and finalizes only its own layers.
-                    num_hidden_layers=self.model_config.get_total_num_hidden_layers(),
-                    local_layer_range=(
-                        self.model_config.get_layers_start_end_indices(
-                            self.vllm_config.parallel_config
-                        )
-                    ),
-                    hidden_size=self.model_config.get_hidden_size(),
-                    model_dtype=self.model_config.dtype,
-                    device=self.device,
-                    # Sizes the persistent global-capture buffers; the
-                    # warmup full-residual copy never exceeds the largest
-                    # cudagraph descriptor, which is bounded by this.
-                    max_num_tokens=self.max_num_tokens,
-                    dispatch_queue_size=getattr(cc_config, "dispatch_queue_size", 256),
-                    overload_policy=getattr(cc_config, "overload_policy", "spill"),
-                    spill_dir=getattr(cc_config, "spill_dir", None),
-                    spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
-                    graphsafe_keys=getattr(cc_config, "graphsafe_keys", None),
-                )
-                self._capture_validators = validators
-                self._capture_name_to_index = dict(name_to_index)
-                self._capture_index_to_name = {
-                    idx: name for name, idx in name_to_index.items()
-                }
-
-                # Install as the process-global active capture manager so
-                # the ``capture_residual`` custom op finds it from inside
-                # the compiled forward graph.
-                set_active_capture_manager(self._capture_manager)
-                # Sync consumers on rank 0 read the full manager's
-                # buffers.
-                self._sync_capture_buffers = self._capture_manager
-
-            # Sorted union of every sync consumer's monitored
-            # (layer, hook) keys — deterministic iteration order for the
-            # per-step view build on every rank.
-            if self._sync_consumers:
-                monitor_keys: set[tuple[int, str]] = set()
-                for _name, sync_consumer in self._sync_consumers:
-                    sync_spec = sync_consumer.global_capture_spec()
-                    for hook_name, layers in sync_spec.hooks.items():
-                        monitor_keys.update(
-                            (int(layer), hook_name) for layer in layers
-                        )
-                self._sync_monitor_keys = sorted(monitor_keys)
-                from vllm.v1.capture.config import graphsafe_buffer_bytes
-
-                footprint = graphsafe_buffer_bytes(
-                    num_keys=len(self._sync_monitor_keys),
-                    max_num_tokens=self.max_num_tokens,
-                    hidden_size=self.model_config.get_hidden_size(),
-                    dtype_bytes=self.model_config.dtype.itemsize,
-                )
-                logger.info(
-                    "sync capture consumers active: %s (monitor keys: %s; "
-                    "persistent capture buffers: %d sites x %d tokens x %d "
-                    "hidden = %.1f MiB VRAM)",
-                    [name for name, _ in self._sync_consumers],
-                    self._sync_monitor_keys,
-                    len(self._sync_monitor_keys),
-                    self.max_num_tokens,
-                    self.model_config.get_hidden_size(),
-                    footprint / (1024 * 1024),
-                )
-                # CUDA-event timers for the honest per-step added GPU cost.
-                if getattr(self.device, "type", None) == "cuda":
-                    self._sync_timing_events = {
-                        name: (
-                            torch.cuda.Event(enable_timing=True),
-                            torch.cuda.Event(enable_timing=True),
-                        )
-                        for name, _ in self._sync_consumers
-                    }
-
-            # Install the activation store (prefix-cache/capture reuse layer)
-            # when a budget is configured. Same process as the scheduler under
-            # the TP1/PP1 UniProcExecutor, so one shared instance bridges the
-            # scheduler's reuse decision and the worker's write-through/serve.
-            budget = self.vllm_config.capture_consumers_config.activation_cache_bytes
-            if budget > 0:
-                from vllm.v1.capture.activation_store import (
-                    ActivationStore,
-                    set_active_activation_store,
-                )
-
-                set_active_activation_store(ActivationStore(max_bytes=budget))
-                logger.info(
-                    "Capture activation store enabled: budget=%.3f GB",
-                    budget / 1_000_000_000,
-                )
+        # Per-request activation capture. Builds the capture managers /
+        # rank-replicated force-eager gate / activation store and the
+        # sync-consumer bookkeeping; a no-op when capture is unconfigured.
+        self._init_capture_state()
 
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
@@ -1432,8 +1153,6 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-            self._sync_conversation_ids.pop(req_id, None)
-            self._sync_steering_gates.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1444,22 +1163,15 @@ class GPUModelRunner(
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
-            # Drop the request from the rank-replicated force-eager gate
-            # on every rank (capturer or not), mirroring the broadcast
-            # ``finished_req_ids`` so the gate stays consistent across the
-            # TP/PP topology.
-            if self._capture_step_gate is not None:
-                self._capture_step_gate.drop(req_id)
-            # Finalize activation capture for this request before the
-            # persistent batch drops it. The finalize runs on the manager's
-            # finalize thread (off this step thread); its callback stashes
-            # the ``{consumer_name: CaptureResult}`` dict on
-            # ``_pending_capture_results`` so a later ``ModelRunnerOutput``
-            # can ferry it to the scheduler → engine core → output
-            # processor if it is ready in time (best-effort; the captured
-            # data on disk is unaffected either way).
-            if self._capture_manager is not None:
-                self._finalize_capture_for_request_async(req_id)
+            # Drop the request from the rank-replicated force-eager gate and
+            # finalize its activation capture before the persistent batch drops
+            # it. The finalize runs on the manager's finalize thread (off this
+            # step thread); its callback stashes the ``{consumer_name:
+            # CaptureResult}`` dict on ``_pending_capture_results`` so a later
+            # ``ModelRunnerOutput`` can ferry it to the scheduler → engine core
+            # → output processor if it is ready in time (best-effort; the
+            # captured data on disk is unaffected either way).
+            self._capture_finish_request(req_id)
             self.input_batch.remove_request(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
@@ -1552,41 +1264,18 @@ class GPUModelRunner(
                 decode_steering_config_hash=(new_req_data.decode_steering_config_hash),
             )
             self.requests[req_id] = req_state
-            rmeta = new_req_data.request_metadata
-            self._sync_conversation_ids[req_id] = (
-                rmeta.conversation_id if rmeta is not None else None
-            )
-            if rmeta is not None and rmeta.steering is not None:
-                from vllm.v1.steering_schema import resolve_gates_safe
-                from vllm.v1.worker.steering_vector_registry import (
-                    get_worker_steering_vector_registry,
-                )
-
-                self._sync_steering_gates[req_id] = resolve_gates_safe(
-                    rmeta.steering,
-                    req_id,
-                    get_worker_steering_vector_registry(),
-                )
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
-            # Admit the request for activation capture, if the feature
-            # is enabled and the request asked for it via the
-            # capture-consumers framework.  Admission failures are
-            # recorded on the manager and surfaced later as a terminal
-            # ``CaptureResult.status == "error"`` — they never abort
+            # Admit the request into the capture control plane: stash the
+            # sync-consumer metadata (conversation id + declarative steering
+            # gates), track it in the rank-replicated force-eager gate on every
+            # rank (capturer or not), and register it with the manager on the
+            # capturer rank. ``was_present`` is False — v1 routes streaming
+            # re-adds through ``_update_streaming_request`` above. Admission
+            # failures are recorded on the manager and surfaced later as a
+            # terminal ``CaptureResult.status == "error"``; they never abort
             # text generation (spec invariant 7).
-            #
-            # Track the request in the rank-replicated force-eager gate on
-            # *every* rank (capturer or not), reading the client capture
-            # spec that rides in ``sampling_params`` on all ranks. This is
-            # what lets the eager-vs-cudagraph decision agree across the
-            # TP/PP topology without a collective.
-            if self._capture_step_gate is not None and sampling_params is not None:
-                self._capture_step_gate.register(
-                    req_id, getattr(sampling_params, "capture", None)
-                )
-            if self._capture_manager is not None and sampling_params is not None:
-                self._register_capture_request(new_req_data, req_state)
+            self._capture_add_request(new_req_data, was_present=False)
 
             # Register the initial-phase steering config for this new
             # request.  Handles the direct-to-decode case (full prefix
@@ -1853,201 +1542,6 @@ class GPUModelRunner(
         else:
             return None
 
-    def _register_capture_request(
-        self,
-        new_req_data: "NewRequestData",
-        req_state: Any,
-    ) -> None:
-        """Admit a new request into the capture-consumers framework.
-
-        Resolves consumer names in ``sampling_params.capture`` (a
-        ``dict[name, raw_spec | CaptureSpec]``) against the runner's
-        registry. Each name is looked up in
-        ``_capture_name_to_index``; unknown names are recorded as
-        admission errors. Raw specs are validated against the
-        consumer's ``validate_client_spec`` with the post-prefix-cache
-        ``num_computed_tokens``.
-
-        The request is registered with the manager iff it gains either
-        (a) at least one per-request client spec, or (b) a global spec
-        from some consumer.  Admission errors never abort text
-        generation — they surface as
-        ``CaptureResult(status="error")`` on finalize.
-        """
-        assert self._capture_manager is not None
-        mgr = self._capture_manager
-
-        sp = new_req_data.sampling_params
-        if sp is None:
-            return
-
-        prompt_len = length_from_prompt_token_ids_or_embeds(
-            new_req_data.prompt_token_ids,
-            new_req_data.prompt_embeds,
-        )
-
-        # Build a fresh ``CaptureContext`` — validators read this to
-        # sanity-check per-request specs against the request's actual
-        # shape (prefix cache, layer count, dtype width, ...).
-        try:
-            element_size_bytes = get_dtype_size(self.model_config.dtype)
-        except Exception:
-            element_size_bytes = 2
-
-        from vllm.v1.capture.activation_store import pop_pending_serve
-        from vllm.v1.capture.errors import CaptureValidationError
-        from vllm.v1.capture.types import (
-            CaptureContext,
-            CaptureSpec,
-            VllmInternalRequestId,
-            capture_expert_parallel_size,
-        )
-
-        # Step A serve: when the scheduler reserved a whole-prefix store
-        # serve, the prompt prefix was reused from the KV cache (num_computed
-        # advanced over it) and its residuals come from the store, not the
-        # forward. Validate against num_computed=0 so the validator does not
-        # reject those positions; the forward then naturally captures only the
-        # positions inside its step window (the generated tail), and the
-        # served prompt rows are injected after registration.
-        served_rows = pop_pending_serve(new_req_data.req_id)
-        ctx_num_computed = (
-            0 if served_rows is not None else new_req_data.num_computed_tokens
-        )
-
-        parallel_config = self.vllm_config.parallel_config
-        ctx = CaptureContext(
-            vllm_internal_request_id=VllmInternalRequestId(new_req_data.req_id),
-            num_prompt_tokens=prompt_len,
-            num_computed_tokens=ctx_num_computed,
-            # Global layer count: client specs reference global layer
-            # indices, so admission must validate against the full layer
-            # space even on a pipeline stage that owns only a slice.
-            num_hidden_layers=self.model_config.get_total_num_hidden_layers(),
-            hidden_size=self.model_config.get_hidden_size(),
-            element_size_bytes=element_size_bytes,
-            tensor_parallel_size=parallel_config.tensor_parallel_size,
-            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
-            expert_parallel_size=capture_expert_parallel_size(parallel_config),
-            data_parallel_size=parallel_config.data_parallel_size,
-        )
-
-        raw_client = getattr(sp, "capture", None)
-        client_specs: dict[int, CaptureSpec] = {}
-
-        if raw_client:
-            if not isinstance(raw_client, dict):
-                mgr.record_request_error(
-                    new_req_data.req_id,
-                    (
-                        "SamplingParams.capture must be a dict keyed by "
-                        f"consumer name, got {type(raw_client).__name__}"
-                    ),
-                )
-                return
-
-            for name, raw in raw_client.items():
-                idx = self._capture_name_to_index.get(name)
-                if idx is None:
-                    mgr.record_request_error(
-                        new_req_data.req_id,
-                        (
-                            f"capture consumer {name!r} is not registered; "
-                            f"known consumers: "
-                            f"{sorted(self._capture_name_to_index)}"
-                        ),
-                    )
-                    logger.warning(
-                        "capture admission rejected req=%s: unknown consumer %s",
-                        new_req_data.req_id,
-                        name,
-                    )
-                    return
-
-                if isinstance(raw, CaptureSpec):
-                    client_specs[idx] = raw
-                    continue
-
-                validator = self._capture_validators[idx]
-                try:
-                    resolved = validator.validate_client_spec(raw, ctx)
-                except CaptureValidationError as exc:
-                    mgr.record_request_error(new_req_data.req_id, str(exc))
-                    logger.warning(
-                        "capture admission rejected req=%s consumer=%s: %s",
-                        new_req_data.req_id,
-                        name,
-                        exc,
-                    )
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    # A buggy validator should never take down the
-                    # request — surface it as an admission error.
-                    mgr.record_request_error(
-                        new_req_data.req_id,
-                        f"consumer {name!r} validator raised: {exc}",
-                    )
-                    logger.warning(
-                        "capture admission rejected req=%s consumer=%s: %s",
-                        new_req_data.req_id,
-                        name,
-                        exc,
-                    )
-                    return
-
-                client_specs[idx] = resolved
-
-        # Sidecar fields the manager echoes to each consumer on finalize.
-        sidecar_fields: dict[str, Any] = {
-            "vllm_internal_request_id": new_req_data.req_id,
-            # Client-supplied request id for universal attribution. Falls
-            # back to the internal id if randomization was disabled / the
-            # client id is unavailable (None-safe).
-            "client_request_id": (
-                new_req_data.client_request_id
-                if new_req_data.client_request_id is not None
-                else new_req_data.req_id
-            ),
-            "prompt_token_ids": (
-                list(new_req_data.prompt_token_ids)
-                if new_req_data.prompt_token_ids is not None
-                else []
-            ),
-        }
-
-        try:
-            mgr.register_request(
-                new_req_data.req_id,
-                client_specs=client_specs,
-                num_prompt_tokens=prompt_len,
-                sidecar_fields=sidecar_fields,
-                block_hashes=new_req_data.capture_block_hashes,
-                hash_block_size=new_req_data.capture_hash_block_size,
-            )
-            if served_rows is not None:
-                mgr.serve_from_store(new_req_data.req_id, served_rows)
-        except ValueError as exc:
-            mgr.record_request_error(new_req_data.req_id, str(exc))
-            logger.warning(
-                "capture register rejected req=%s: %s", new_req_data.req_id, exc
-            )
-
-    def _finalize_capture_step(self) -> None:
-        """Dispatch captured rows to every consumer's sink.
-
-        Runs after the forward pass.  The manager's
-        ``dispatch_step_captures`` fan-outs chunks to every sink
-        whose bit is set in the plan's per-entry ``consumer_mask``;
-        consumer errors are isolated so a failing sink never stops
-        delivery to the others.
-        """
-        if self._capture_manager is None:
-            return
-        plan = self._capture_manager.consume_step_plan()
-        if plan is None:
-            return
-        self._capture_manager.dispatch_step_captures(plan)
-
     def _build_capture_batch_view(self, scheduler_output: "SchedulerOutput"):
         """Project ``input_batch`` into a :class:`CaptureBatchView`."""
         from vllm.v1.capture.plan import CaptureBatchView
@@ -2094,26 +1588,16 @@ class GPUModelRunner(
             token_offsets=token_offsets,
         )
 
-    def _build_step_capture_view(self, scheduler_output: "SchedulerOutput"):
-        """Build the :class:`StepCaptureView` for sync consumers.
+    def _iter_step_capture_rows(self, scheduler_output, input_batch=None):
+        """Enumerate this step's batch rows for the shared step-capture view.
 
-        Every input is rank-identical — ``scheduler_output`` is
-        broadcast, and the ``input_batch`` arrays consulted here are
-        maintained on every rank by ``_update_states`` — so the view
-        (and any pure consumer decision derived from it) agrees across
-        the TP group without communication.
+        v1 walks its persistent ``input_batch`` in batch order, accumulating
+        contiguous scheduled-token offsets; per-request phase counts come from
+        the ``input_batch`` CPU arrays. A request not yet in the batch advances
+        the offset but exposes no view (mirrors ``_build_capture_batch_view``).
+        The ``input_batch`` argument is unused: v1 reads ``self.input_batch``.
         """
-        from vllm.v1.capture.step_view import StepCaptureView, StepRequestView
-
-        num_tokens = int(scheduler_output.total_num_scheduled_tokens)
-        tensors: dict[tuple[int, str], torch.Tensor] = {}
-        for key in self._sync_monitor_keys:
-            buf = self._sync_capture_buffers.global_buffer(key)
-            if buf is not None:
-                tensors[key] = buf[:num_tokens]
-
         num_scheduled_map = scheduler_output.num_scheduled_tokens
-        requests: list[StepRequestView] = []
         token_offset = 0
         for i in range(self.input_batch.num_reqs):
             req_id = self.input_batch.req_ids[i]
@@ -2122,233 +1606,27 @@ class GPUModelRunner(
                 continue
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
-                # Mirror ``_build_capture_batch_view``: not in the batch
-                # yet — advance the offset, expose no request view.
                 token_offset += n_tokens
                 continue
             num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
             num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
-            token_ids = np.asarray(
-                self.input_batch.token_ids_cpu[
-                    req_index, num_computed : num_computed + n_tokens
-                ]
-            ).copy()
-            requests.append(
-                StepRequestView(
-                    req_id=req_id,
-                    start=token_offset,
-                    end=token_offset + n_tokens,
-                    phase="prefill" if num_computed < num_prompt else "decode",
-                    token_ids=token_ids,
-                    conversation_id=self._sync_conversation_ids.get(req_id),
-                    steering=self._sync_steering_gates.get(req_id),
-                )
+            yield (
+                req_id,
+                token_offset,
+                token_offset + n_tokens,
+                num_computed,
+                num_prompt,
+                req_index,
             )
             token_offset += n_tokens
 
-        return StepCaptureView(
-            step=self._sync_step_counter,
-            tensors=tensors,
-            requests=requests,
-        )
-
-    def _run_sync_consumers(self, scheduler_output: "SchedulerOutput") -> None:
-        """Run every sync consumer's ``on_step`` on the step thread.
-
-        Called post-forward (after capture dispatch) on **every** TP
-        rank. Consumer exceptions are isolated; returned steering
-        actions apply inline through the mixin's
-        ``_apply_steering_actions`` so they are visible to the next
-        step's ``_update_steering_buffers``.
-
-        Observability (docs/design/dynamic_steering.md §5.5, §9): two
-        timings are kept per consumer in ``_sync_consumer_stats``.
-
-        - ``total_ms``/``max_ms`` are the wall-clock ``perf_counter``
-          span. The consumer's ``.cpu()`` D2H is the step's *first* CUDA
-          sync point, so this wall time absorbs the forward pass's GPU
-          drain — it is a misleading proxy for added cost and is kept
-          only as a diagnostic.
-        - ``gpu_total_ms``/``gpu_max_ms`` are the CUDA-event GPU time of
-          *only* the consumer's own enqueued work (the GEMV + D2H),
-          measured between two events that both sit behind the forward in
-          the stream queue, so the forward drain is excluded. This is the
-          honest added cost. The pair is read one step late (the prior
-          step's events are guaranteed complete by now), so the read
-          never blocks and never forces a sync onto the critical path;
-          ``gpu_*`` therefore lags wall time by exactly one step.
-
-        A bounded ring of recent ``(step, wall_ms, n_actions)`` tuples is
-        kept for the ``/v1/steering/dynamic`` endpoint. The budget check
-        (consumer attr ``sync_budget_ms``, default 5.0) charges the
-        CUDA-event GPU time when available — not the drain-inflated wall
-        time — and is metric + warning only, never an automatic disable
-        (a disable trigger would itself need to be rank-replicated).
-        """
-        self._sync_step_counter += 1
-        view = self._build_step_capture_view(scheduler_output)
-        events_by_name = getattr(self, "_sync_timing_events", None)
-        for name, consumer in self._sync_consumers:
-            stats = self._sync_consumer_stats.setdefault(
-                name,
-                {
-                    "steps": 0,
-                    "total_ms": 0.0,
-                    "max_ms": 0.0,
-                    "gpu_steps": 0,
-                    "gpu_total_ms": 0.0,
-                    "gpu_max_ms": 0.0,
-                    "gpu_last_ms": None,
-                    "over_budget_steps": 0,
-                    "ring": deque(maxlen=256),
-                    "_gpu_armed": False,
-                    "_last_budget_warn": 0.0,
-                },
-            )
-            events = events_by_name.get(name) if events_by_name is not None else None
-
-            # Deferred read: events recorded on this consumer's PREVIOUS
-            # step are *usually* complete now (a full forward has run
-            # since), so ``elapsed_time`` normally neither blocks nor forces
-            # a sync. But "a forward has run" only guarantees CPU-side
-            # enqueue, not GPU-side completion: a consumer whose ``on_step``
-            # does no D2H (so never forces a sync) lets the CPU race ahead
-            # of the GPU, leaving the end event incomplete. Reading
-            # ``elapsed_time`` then raises and would crash the engine.
-            # Guard with a non-blocking ``query()`` and just drop the
-            # sample when not ready — this is a best-effort metric.
-            gpu_ms: float | None = None
-            if events is not None and stats["_gpu_armed"] and events[1].query():
-                gpu_ms = events[0].elapsed_time(events[1])
-                stats["gpu_steps"] += 1
-                stats["gpu_total_ms"] += gpu_ms
-                stats["gpu_max_ms"] = max(stats["gpu_max_ms"], gpu_ms)
-                stats["gpu_last_ms"] = round(gpu_ms, 3)
-
-            if events is not None:
-                events[0].record()
-            t0 = time.perf_counter()
-            try:
-                actions = consumer.on_step(view)
-            except Exception:
-                logger.exception(
-                    "sync capture consumer %s failed in on_step; "
-                    "continuing without its actions",
-                    name,
-                )
-                actions = None
-            wall_ms = (time.perf_counter() - t0) * 1000.0
-            if events is not None:
-                events[1].record()
-                stats["_gpu_armed"] = True
-
-            stats["steps"] += 1
-            stats["total_ms"] += wall_ms
-            stats["max_ms"] = max(stats["max_ms"], wall_ms)
-            n_actions = len(actions) if actions else 0
-            stats["ring"].append(
-                (self._sync_step_counter, round(wall_ms, 3), n_actions)
-            )
-
-            # Charge the honest added GPU cost when we have a CUDA-event
-            # reading; off CUDA (CPU tests) fall back to wall time.
-            charge_ms = gpu_ms if events is not None else wall_ms
-            budget_ms = float(getattr(consumer, "sync_budget_ms", 5.0))
-            if charge_ms is not None and charge_ms > budget_ms:
-                stats["over_budget_steps"] += 1
-                now = time.monotonic()
-                if now - stats["_last_budget_warn"] >= 5.0:
-                    stats["_last_budget_warn"] = now
-                    logger.warning(
-                        "sync capture consumer %s on_step used %.2f ms of GPU "
-                        "time (budget %.2f ms, %d over-budget steps so far); "
-                        "this runs on the model-runner critical path",
-                        name,
-                        charge_ms,
-                        budget_ms,
-                        stats["over_budget_steps"],
-                    )
-            if actions:
-                self._apply_steering_actions(actions, source=name)
-
-    def _warmup_sync_consumers(self) -> None:
-        """Let each sync consumer warm device-side compute before the
-        first real ``on_step``.
-
-        A consumer's first ``on_step`` GEMV pays a one-time init cost
-        (cuBLAS handle creation, lazy kernel JIT) — measured at ~117 ms
-        for the example probe controller on a 3090. ``on_step`` runs on
-        the model-runner critical path, so that cost lands on the first
-        served step, skews the ``gpu_*`` timing average, and trips the
-        over-budget warning once. Running it here (during graph capture,
-        with the full runtime CUDA context) moves it off the hot path.
-
-        Optional and duck-typed (``warmup(device, dtype)``); isolated so
-        a consumer that raises cannot abort model setup. Skipped under
-        ``enforce_eager`` (no ``capture_model``); the one-time cost is
-        then paid on the first real step, which is acceptable for
-        eager/debug runs.
-        """
-        for name, consumer in self._sync_consumers:
-            warmup = getattr(consumer, "warmup", None)
-            if not callable(warmup):
-                continue
-            try:
-                warmup(self.device, self.dtype)
-            except Exception:
-                logger.exception(
-                    "sync capture consumer %s warmup failed; continuing", name
-                )
-
-    def drain_pending_capture_results(self) -> dict:
-        """Swap out capture results that finalized since the last drain.
-
-        Called via collective_rpc from the engine core's idle loop so
-        ``capture_wait`` clients receive results even when no further
-        engine steps run (results normally ride ``ModelRunnerOutput``).
-        """
-        with self._pending_capture_results_lock:
-            pending = self._pending_capture_results
-            self._pending_capture_results = {}
-        return pending
-
-    def _finalize_capture_for_request_async(self, req_id: str) -> None:
-        """Drive the capture manager to finalize *req_id* off the step thread.
-
-        The manager pops the request's capture state here (on the step
-        thread) and runs the blocking finalize on its finalize thread. The
-        callback maps consumer indices to names and stashes the
-        ``{consumer_name: CaptureResult}`` dict on
-        ``_pending_capture_results`` (under the lock, since it fires on the
-        finalize thread) for a later ``ModelRunnerOutput`` to drain. A
-        no-op when the manager never saw the request.
-        """
-        mgr = self._capture_manager
-        if mgr is None:
-            return
-
-        index_to_name = self._capture_index_to_name
-
-        def _on_complete(indexed: dict[int, "CaptureResult"]) -> None:
-            if not indexed:
-                return
-            named = {
-                index_to_name.get(idx, f"consumer_{idx}"): result
-                for idx, result in indexed.items()
-            }
-            # Resolve the stash dict at CALL time, not closure-creation time:
-            # the per-step drain (and ``drain_pending_capture_results``) swap
-            # ``self._pending_capture_results`` for a fresh dict, so a
-            # reference captured here is orphaned by the time the finalize
-            # thread fires (~seconds later, after writer fsync) and the
-            # results silently vanish -- requests then never report capture
-            # results at all.
-            with self._pending_capture_results_lock:
-                self._pending_capture_results.setdefault(req_id, {}).update(
-                    named
-                )
-
-        mgr.finalize_request_async(req_id, _on_complete)
+    def _step_view_token_ids(self, row_index, num_computed, n_tokens):
+        """Copy this request's CPU input-token window for the step view."""
+        return np.asarray(
+            self.input_batch.token_ids_cpu[
+                row_index, num_computed : num_computed + n_tokens
+            ]
+        ).copy()
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -5566,15 +4844,8 @@ class GPUModelRunner(
         # requests that have dropped out of the persistent batch; we flush
         # whatever is ready here so it rides on a ``ModelRunnerOutput``.
         # Best-effort: a result not yet ready simply attaches to a later
-        # step's output (or not at all). The lock guards against the
-        # finalize thread writing while we swap the dict out.
-        capture_results_for_step: dict[str, dict[str, CaptureResult]]
-        with self._pending_capture_results_lock:
-            if self._pending_capture_results:
-                capture_results_for_step = self._pending_capture_results
-                self._pending_capture_results = {}
-            else:
-                capture_results_for_step = {}
+        # step's output (or not at all).
+        capture_results_for_step = self._drain_capture_results()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(

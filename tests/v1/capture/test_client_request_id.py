@@ -211,6 +211,12 @@ class _RecordingManager:
 def _fake_v1_runner(mgr: _RecordingManager):
     from types import SimpleNamespace
 
+    parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        enable_expert_parallel=False,
+    )
     return SimpleNamespace(
         _capture_manager=mgr,
         _capture_name_to_index={},
@@ -220,14 +226,8 @@ def _fake_v1_runner(mgr: _RecordingManager):
             get_total_num_hidden_layers=lambda: 4,
             get_hidden_size=lambda: 8,
         ),
-        vllm_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(
-                tensor_parallel_size=1,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                enable_expert_parallel=False,
-            )
-        ),
+        parallel_config=parallel_config,
+        vllm_config=SimpleNamespace(parallel_config=parallel_config),
     )
 
 
@@ -236,7 +236,7 @@ def _drive_v1_register(nrd: NewRequestData) -> dict:
 
     mgr = _RecordingManager()
     runner = _fake_v1_runner(mgr)
-    GPUModelRunner._register_capture_request(runner, nrd, None)
+    GPUModelRunner._register_capture_request(runner, nrd)
     assert not mgr.errors, mgr.errors
     assert nrd.req_id in mgr.registered
     return mgr.registered[nrd.req_id]
