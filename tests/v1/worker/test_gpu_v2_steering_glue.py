@@ -20,8 +20,18 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_MONITOR_ACTIVE_ATTR,
     SteeringHookPoint,
 )
-from vllm.v1.worker.gpu.steering_runner_mixin import SteeringRunnerMixin
+from vllm.v1.worker.gpu.capture_runner_mixin import CaptureRunnerMixin
 from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
+
+
+class _V2SteeringHost(CaptureRunnerMixin, SteeringModelRunnerMixin):
+    """Test host mirroring the v2 runner's steering MRO.
+
+    The steering control plane is fully shared on ``SteeringModelRunnerMixin``;
+    the two v2 batch-state accessor overrides (``_steering_batch_view`` /
+    ``_steering_req_position``) live on ``CaptureRunnerMixin``. This mirrors
+    production ``GPUModelRunner(..., CaptureRunnerMixin, SteeringModelRunnerMixin)``.
+    """
 
 
 class _FakeManager:
@@ -127,7 +137,7 @@ def _make_glue(
     max_tokens=16,
     max_seqs=8,
 ):
-    glue = SteeringRunnerMixin.__new__(SteeringRunnerMixin)
+    glue = _V2SteeringHost.__new__(_V2SteeringHost)
     glue._steering_manager = _FakeManager(
         has_globals=has_globals, has_dynamic_tier=has_dynamic_tier, dyn_pool=dyn_pool
     )
@@ -527,7 +537,7 @@ def _decode_override_glue(req_id: str = "d", hidden: int = 1):
 
 
 def test_apply_request_override_compose_folds_admitted():
-    from vllm.v1.worker.gpu.steering_runner_mixin import _SteeringReqState
+    from vllm.v1.worker.steering_model_runner_mixin import _SteeringReqState
     from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
 
     glue = _decode_override_glue()
@@ -559,7 +569,7 @@ def test_apply_request_override_compose_folds_admitted():
 
 
 def test_apply_request_override_no_compose_registers_raw():
-    from vllm.v1.worker.gpu.steering_runner_mixin import _SteeringReqState
+    from vllm.v1.worker.steering_model_runner_mixin import _SteeringReqState
     from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
 
     glue = _decode_override_glue()

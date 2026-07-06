@@ -7,9 +7,9 @@ plane is currently forked across two GPU model runners:
 
 * v1 -- ``vllm/v1/worker/gpu_model_runner.py`` +
   ``vllm/v1/worker/steering_model_runner_mixin.py``
-* v2 -- ``vllm/v1/worker/gpu/model_runner.py`` +
-  ``vllm/v1/worker/gpu/steering_runner_mixin.py`` (inherits parts of the v1
-  mixin)
+* v2 -- ``vllm/v1/worker/gpu/model_runner.py`` (the shared
+  ``vllm/v1/worker/steering_model_runner_mixin.py`` control plane + two v2
+  batch-state accessor overrides on ``gpu/capture_runner_mixin.py``)
 
 That fork has already produced three drift bugs (an override apply losing
 ``compose_admitted`` + precedence on v2, fixed in PR #224; capture
@@ -62,7 +62,7 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_ROW_ACTIVE_ATTR,
     SteeringHookPoint,
 )
-from vllm.v1.worker.gpu.steering_runner_mixin import SteeringRunnerMixin
+from vllm.v1.worker.gpu.capture_runner_mixin import CaptureRunnerMixin
 from vllm.v1.worker.steering_action_queue import (
     RequestSteeringOverride,
     SteeringMonitorUpdate,
@@ -529,7 +529,7 @@ class V1Host(SteeringModelRunnerMixin):
         return list(self._steering_manager.events)
 
 
-class V2Host(SteeringRunnerMixin):
+class V2Host(CaptureRunnerMixin, SteeringModelRunnerMixin):
     runner = "v2"
 
     def __init__(self, max_steering_configs=4, max_dynamic=2, row_monitor=False):
