@@ -5,6 +5,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from typing import Any
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -141,7 +142,7 @@ class _MockEngine:
                 get_total_num_hidden_layers=lambda: num_layers
             ),
         )
-        self._tok = _Tok()
+        self._tok: Any = _Tok()
         self.sampling_params = []
         self.waited = []
         self.dropped = []

@@ -110,9 +110,10 @@ def incremental_char_offsets(
     prev_len = 0
     text = ""
     for k in range(1, len(ids) + 1):
-        text = decode(ids[:k])
-        if text is None:
+        decoded = decode(ids[:k])
+        if decoded is None:
             raise RuntimeError("detokenize unavailable; cannot map span")
+        text = decoded
         offsets.append((prev_len, len(text)))
         prev_len = len(text)
     return text, offsets
