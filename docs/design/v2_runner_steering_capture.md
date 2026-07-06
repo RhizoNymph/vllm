@@ -109,11 +109,18 @@ only rank-identical inputs.
    `_finalize_capture_for_request_async`, output drain, activation store.
    Tests: `tests/v1/worker/test_gpu_v2_capture_glue.py`.
 2. **Steering control plane** — DONE (CPU-tested, GPU pending).
-   `gpu/steering_runner_mixin.py` (`SteeringRunnerMixin`, a subclass of
-   `SteeringModelRunnerMixin` that reuses init / discovery / validation / the
-   public RPC API / `_resolve_request_steering` and overrides only the
-   v1-state-coupled paths). No force-eager seam (persistent buffers).
-   `gpu_worker.py` already forwards the RPCs to `self.model_runner.*`.
+   Fully shared on `SteeringModelRunnerMixin` (de-fork complete, step H): the
+   v2 runner mixes it in directly
+   (`GPUModelRunner(..., CaptureRunnerMixin, SteeringModelRunnerMixin)`) and the
+   per-runner steering surface is just two batch-state accessor overrides —
+   `_steering_batch_view` (the per-step hot path's view) and
+   `_steering_req_position` (the override-apply decode-only phase guard) — which
+   read v2's `req_states` + `input_batch` instead of v1's batch-ordered columns.
+   They live on `gpu/capture_runner_mixin.py`, colocated with the capture glue
+   that already owns those same v2 arrays; the former
+   `gpu/steering_runner_mixin.py` (`SteeringRunnerMixin`) is deleted. No
+   force-eager seam (persistent buffers). `gpu_worker.py` already forwards the
+   RPCs to `self.model_runner.*`.
    Tests: `tests/v1/worker/test_gpu_v2_steering_glue.py`.
 
    **Canonical per-request steering state (de-fork step C).** The per-request
@@ -162,9 +169,9 @@ only rank-identical inputs.
    `SteeringBatchView` (`vllm/v1/worker/steering_batch_view.py`), a reusable
    holder each runner mutates in place once per step (zero per-step allocation).
    `_steering_batch_view` is the seam: v1 builds it from its batch-ordered
-   `input_batch` columns (identity slot→row map); the v2 subclass overrides it to
-   read `input_batch.idx_mapping_np` + `req_states` (`num_computed_tokens_np` /
-   `prompt_len.np`). Steering identity (hashes + phase) comes from `_steering_reqs`
+   `input_batch` columns (identity slot→row map); the v2 runner overrides it
+   (on `gpu/capture_runner_mixin.py`) to read `input_batch.idx_mapping_np` +
+   `req_states` (`num_computed_tokens_np` / `prompt_len.np`). Steering identity (hashes + phase) comes from `_steering_reqs`
    only, which retired v1's input-batch hash columns
    (`request_prefill_steering_hash` / `request_decode_steering_hash` and the
    `steering_hash_to_request_ids` index — the hot path was their only reader).
@@ -179,9 +186,9 @@ only rank-identical inputs.
      request's decode tokens to its pool row (`get_dynamic_row`) instead of the
      admitted decode row; overrides drop on finish / preempt / streaming re-add.
      The shared `_apply_request_override` reads the decode-only phase guard
-     through `_steering_req_position`, which the v2 subclass overrides to read
-     v2's `req_states` (`req_id_to_index` + `num_computed_tokens_np` /
-     `prompt_len.np`).
+     through `_steering_req_position`, which the v2 runner overrides (on
+     `gpu/capture_runner_mixin.py`) to read v2's `req_states` (`req_id_to_index`
+     + `num_computed_tokens_np` / `prompt_len.np`).
    - **Async transport** — drains the in-process `SteeringActionQueue` at the top
      (before the nothing-active short-circuit, so a drained update can activate
      steering) via the shared `_apply_steering_actions`.
