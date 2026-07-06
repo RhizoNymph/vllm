@@ -1145,9 +1145,16 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        # Release the currently-active steering config for finished
-        # requests before popping state so hashes remain accessible.
-        self._release_finished_steering_configs(scheduler_output.finished_req_ids)
+        # Release steering configs for finished AND preempted requests
+        # (release-at-preemption; a resumed request re-registers a fresh
+        # prefill config through _reset_steering_for_resumption). Reads only
+        # the canonical _steering_reqs store, so it is order-independent w.r.t.
+        # the request-state pops below.
+        finished_and_preempted: set[str] = set(scheduler_output.finished_req_ids)
+        preempted_req_ids = scheduler_output.preempted_req_ids
+        if preempted_req_ids:
+            finished_and_preempted |= preempted_req_ids
+        self._steering_finish_requests(finished_and_preempted)
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -1280,7 +1287,7 @@ class GPUModelRunner(
             # Register the initial-phase steering config for this new
             # request.  Handles the direct-to-decode case (full prefix
             # cache hit) and capacity-exhaustion deferral.
-            self._register_initial_steering_config(req_id, new_req_data, req_state)
+            self._steering_add_request(new_req_data)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1733,25 +1740,15 @@ class GPUModelRunner(
             )
 
         # Refresh steering config hashes for the re-added request.
-        # Streaming re-adds go back through prefill, so we must release
-        # the old phase config, update the hashes on CachedRequestState,
-        # and re-register the new prefill config.
-        old_prefill_hash = req_state.prefill_steering_config_hash
-        old_decode_hash = req_state.decode_steering_config_hash
-        new_prefill_hash = new_req_data.prefill_steering_config_hash
-        new_decode_hash = new_req_data.decode_steering_config_hash
-
-        req_state.prefill_steering_config_hash = new_prefill_hash
-        req_state.decode_steering_config_hash = new_decode_hash
-
-        self._refresh_streaming_steering(
-            req_id,
-            new_req_data,
-            old_prefill_hash,
-            old_decode_hash,
-            new_prefill_hash,
-            new_decode_hash,
+        # Streaming re-adds go back through prefill: _steering_add_request
+        # releases the prior instance's config + any dynamic override before
+        # registering the new prefill config from the updated NewRequestData.
+        req_state.prefill_steering_config_hash = (
+            new_req_data.prefill_steering_config_hash
         )
+        req_state.decode_steering_config_hash = new_req_data.decode_steering_config_hash
+
+        self._steering_add_request(new_req_data)
 
         if self.uses_mrope:
             self._init_mrope_positions(req_state)
