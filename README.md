@@ -131,6 +131,36 @@ because the KV genuinely differs under different steering; that fork is the
 correctness contract, and outputs were verified deterministic across cache
 regimes.
 
+### Activation patching sweeps vs TransformerLens
+
+The one-call `/v1/patch_sweep` endpoint benchmarked against TransformerLens
+3.5.1 running the identical causal-tracing study (Qwen3-0.6B bf16, RTX 3090,
+clean/corrupt denoising at `resid_post`/`post_block`, all-prompt × all-28-layer
+grid, exact answer-token grading). "TL naive" is the per-cell loop a researcher
+typically writes; "TL batched" is a hand-optimized baseline batching cells
+across positions, one forward per layer:
+
+| Prompt | Cells | TL naive | TL batched | `/v1/patch_sweep` | vs batched |
+|---|---|---|---|---|---|
+| 5 tokens | 140 | 6.8 s | 1.46 s | **1.11 s** | 1.3× |
+| 40 tokens | 1,120 | 53.3 s | 2.55 s | **1.97 s** | 1.3× |
+| 204 tokens | 5,712 | ~10 min | 53.5 s | **24.0 s** | **2.2×** |
+
+- The gap over the batched baseline **grows with prompt length**, structurally:
+  TransformerLens recomputes the full prompt in every forward, while prefix
+  caching lets each cell recompute only the suffix from its patch position
+  down. The naive loop is launch-bound at a flat ~21 cells/s.
+- The batched baseline also required chunking to survive at 204 tokens —
+  `run_with_hooks` materializes full `[batch, seq, vocab]` logits (~12 GB
+  unchunked); the sweep endpoint needs no such tuning at any scale (scheduler
+  backpressure handles thousand-cell grids in one call).
+- The sweep numbers *include* HTTP, server-side clean-run auto-capture, both
+  baselines, the batch-noise-floor rerun, and source cleanup; both tools
+  measured warm (model load / server start excluded).
+- The comparison doubles as an independent correctness check: both tools
+  produce the same recovered-heatmap argmax cell, and clean baselines agree to
+  ~0.002 logprob on the short pair (−0.417 vs −0.419).
+
 ### Dynamic steering (in-progress branch)
 
 The activation-conditioned steering stack (see Roadmap) is benchmarked on its
