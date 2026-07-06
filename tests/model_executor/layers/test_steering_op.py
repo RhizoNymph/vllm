@@ -20,7 +20,14 @@ rather than going through the registered custom op (which requires the
 full vllm build).
 """
 
+import pytest
 import torch
+
+from vllm.model_executor.layers.steering import (
+    SteeringOpArgs,
+    apply_steering,
+    steering_monitor,
+)
 
 
 def _apply_steering(
@@ -345,3 +352,108 @@ class TestDynamicTierTerm:
         result = _apply_full(hidden, table, index, scales, dvec, tscales)
         # row (1.0) + tier (5.0) = 6.0
         assert torch.allclose(result, torch.full((2, 4), 6.0))
+
+
+def _eager_args(
+    hidden: torch.Tensor,
+    table: torch.Tensor,
+    index: torch.Tensor,
+    **overrides,
+) -> SteeringOpArgs:
+    """Build the 15 ``apply_steering`` tensors with inert defaults.
+
+    Monitors off, scales 1.0, tier 0, ``any_active`` True. ``overrides``
+    replace individual fields by name (e.g. ``steering_dynamic_vec=...``).
+    """
+    n, h = hidden.shape[0], hidden.shape[1]
+    rows = table.shape[0]
+    args = SteeringOpArgs(
+        hidden_states=hidden,
+        steering_table=table,
+        steering_index=index,
+        any_active=torch.tensor([True]),
+        steering_scales=torch.ones(rows, dtype=torch.float32),
+        steering_dynamic_vec=torch.zeros(h, dtype=torch.float32),
+        steering_token_scales=torch.zeros(n, dtype=torch.float32),
+        steering_row_gate=torch.ones(n, dtype=torch.float32),
+        steering_monitor_probe=torch.zeros(h, dtype=torch.float32),
+        steering_monitor_params=torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32),
+        steering_monitor_active=torch.tensor([False]),
+        steering_decode_mask=torch.zeros(n, dtype=torch.float32),
+        steering_monitor_probe_table=torch.zeros(1, 1, dtype=torch.float32),
+        steering_monitor_row_params=torch.tensor(
+            [[-1.0e30, 1.0]], dtype=torch.float32
+        ),
+        steering_monitor_row_active=torch.tensor([False]),
+    )
+    return args._replace(**overrides)
+
+
+class TestEagerDtypeParity:
+    """Eager output dtype/cast-order parity with the frozen Triton kernel."""
+
+    @pytest.mark.parametrize("hdtype", [torch.bfloat16, torch.float16])
+    def test_output_dtype_matches_hidden_with_fp32_table(self, hdtype):
+        """A mismatched fp32 table + low-precision hidden must not promote
+        the eager output to fp32 (matches the kernel + ``empty_like`` fake)."""
+        hidden = torch.randn(4, 8, dtype=hdtype)
+        table = torch.randn(6, 8, dtype=torch.float32)  # fp32 table
+        index = torch.tensor([1, 2, 3, 1], dtype=torch.long)
+        out = apply_steering(*_eager_args(hidden, table, index))
+        assert out.dtype == hdtype
+
+    def test_tier_term_matches_kernel_cast_order(self):
+        """The kernel computes the tier as ``dvec.to(h) * tscale.to(h)`` — a
+        low-precision multiply. Eager must match that cast order exactly, not
+        multiply in fp32 and cast the product. Zeroing hidden + table isolates
+        the tier so ``out == tier``."""
+        hdtype = torch.bfloat16
+        hidden = torch.zeros(1, 4, dtype=hdtype)
+        table = torch.zeros(6, 4, dtype=torch.float32)
+        index = torch.zeros(1, dtype=torch.long)
+        # 0.1/0.3 are not bf16-exact, so bf16(0.1)*bf16(0.3) != bf16(0.1*0.3).
+        dvec = torch.tensor([0.1, 0.2, 0.3, 0.7], dtype=torch.float32)
+        tscale = torch.tensor([0.3], dtype=torch.float32)
+        out = apply_steering(
+            *_eager_args(
+                hidden,
+                table,
+                index,
+                steering_dynamic_vec=dvec,
+                steering_token_scales=tscale,
+            )
+        )
+        tier_ref = dvec.to(hdtype).unsqueeze(0) * tscale.to(hdtype).unsqueeze(-1)
+        torch.testing.assert_close(out, tier_ref, atol=0.0, rtol=0.0)
+
+
+class TestMonitorParamsGuard:
+    """A ``(2,)`` monitor-params buffer must fail loudly on both paths — the
+    kernel reads slot 2 (``gate_rows``) unconditionally, so a short buffer
+    would silently OOB-read on GPU."""
+
+    def test_apply_steering_rejects_two_element_params(self):
+        hidden = torch.zeros(2, 4)
+        table = torch.zeros(6, 4)
+        index = torch.zeros(2, dtype=torch.long)
+        with pytest.raises(ValueError):
+            apply_steering(
+                *_eager_args(
+                    hidden,
+                    table,
+                    index,
+                    steering_monitor_params=torch.tensor([0.0, 1.0]),
+                )
+            )
+
+    def test_steering_monitor_rejects_two_element_params(self):
+        with pytest.raises(ValueError):
+            steering_monitor(
+                torch.zeros(1, 4),
+                torch.zeros(4),
+                torch.tensor([0.0, 1.0]),  # (2,) — missing gate_rows
+                torch.tensor([True]),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.ones(1),
+            )

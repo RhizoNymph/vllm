@@ -486,6 +486,52 @@ populate time instead). Two implementations, by phase:
   `test_steering_op.py::TestDynamicTierTerm`, token-gate + short-circuit
   tests in the override suite.
 
+#### Gating-buffer invariant table (do not unify)
+
+The kernel's additive terms are driven by six per-token / per-row gating
+buffers. They *look* unifiable — several are `(max_tokens,)` fp32
+multipliers — but each carries a distinct `(writer, default value,
+cache-safety invariant)` triple, and collapsing them would force a single
+default and destroy one of the invariants. The table is sourced from
+`register_steering_buffers` (`steering.py`), the kernel docstrings
+(`steering_kernel.py`), and the runner's per-step writes
+(`steering_model_runner_mixin.py`).
+
+| Buffer | Shape | Writer | Default + reset discipline | Safety invariant it carries |
+| --- | --- | --- | --- | --- |
+| `steering_index` | `(max_tokens,)` int64 | runner per-step (token→row build; zeroed on nothing-active) | `0`; rebuilt every step | Row `0` is the all-zeros sentinel; each token maps to exactly one *exclusive* row, so the tier cannot be a row (§5.4). |
+| `steering_scales` | `(max_configs + 3,)` fp32 | manager `populate` / `populate_steering_scales` | `1.0`; rewritten on scale change only | `1.0` reproduces unscaled steering; per-row, layer-shared across hooks (the row index is hook-independent). |
+| `steering_table_{hook}_dynvec` | `(hidden,)` fp32 | manager `populate` (from `dynamic_tier_vectors`) | `0.0`; rewritten on tier change | Default `0` ⇒ the tier term `dvec * token_scales` contributes nothing; per-`(layer, hook)`. |
+| `steering_token_scales` | `(max_tokens,)` fp32 | runner per-step **overwrite** (`dynamic_tier_gain` decode / `0` prefill+inactive) **and** in-graph monitor **RMW multiply** | `0.0`; overwritten every step (the per-step reset) | **`0` for prefill ⇒ the tier is decode-only and prefix-cache-safe** (`0 × gate == 0` for any probe). The monitor *multiplies*, so the reset must be an overwrite. |
+| `steering_row_gate` | `(max_tokens,)` fp32 | runner per-step reset `fill_(1.0)` **and** in-graph monitor **RMW multiply** | `1.0`; reset to `1.0` every step | **Prefill tokens stay `1.0` ⇒ prefill rows (which feed prefix-cache keys) are never gated**; `1.0` = full strength. |
+| `steering_decode_mask` | `(max_tokens,)` fp32 | runner per-step (`1.0` decode / `0.0` prefill) | `0.0`; rewritten every step | Read-only for the monitor; `mask·gate + (1−mask)` makes the row-gate reduction apply to decode tokens only, leaving prefill at `1.0`. |
+
+Three sigmoid variants read these buffers, and are likewise **not**
+unified in the kernel because they differ in writer and scope:
+
+- **Global fused monitor** (`apply_steering`, `steering_monitor_probe` +
+  `steering_monitor_params = [threshold, sharpness, gate_rows]`): computes
+  the gate in-register and folds it into `token_scales` (always) and
+  `row_gate` (when `gate_rows`); non-mutating, same-hook.
+- **Per-row fused monitor** (`apply_steering`,
+  `steering_monitor_probe_table` + `steering_monitor_row_params`): a
+  per-request gate from each token's own row's probe, folded into the row
+  term decode-only; in-register, same-hook.
+- **Cross-layer standalone monitor** (the `steering_monitor` op): *mutates*
+  the shared `token_scales` / `row_gate` buffers so later layers/hooks read
+  the gate ("detect at L, gate at layers ≥ L").
+
+**Conclusion — do not unify.** The `row_gate = 1.0` / `token_scales = 0.0`
+default asymmetry is not incidental: it *is* the prefill/prefix-cache
+safety. The tier gate defaults `0` so an unwritten or prefill token adds no
+tier (`0 × gate == 0`), while the row gate defaults `1` so an unwritten or
+prefill row applies at full strength and its prefix-cache key stays stable.
+A single shared buffer would force one default and silently break the other
+invariant. The three sigmoids differ in writer (in-register vs shared-buffer
+RMW) and scope (same-hook vs cross-layer, global vs per-request), so fusing
+them in the kernel would couple otherwise-independent cache-safety
+guarantees.
+
 ### 5.5 Configuration surface
 
 - **No new plugin system.** Sync consumers register under the existing

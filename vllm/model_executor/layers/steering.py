@@ -70,8 +70,9 @@ HOOK_POINT_DYNVEC_ATTR: dict[SteeringHookPoint, str] = {
 }
 
 # Per-hook in-graph monitor buffers (Phase 2, §8). At a probe site one
-# ``(layer, hook)`` carries a probe vector ``(hidden,)``, a ``(2,)`` param
-# buffer ``[threshold, sharpness]``, and a single-element bool ``active``
+# ``(layer, hook)`` carries a probe vector ``(hidden,)``, a ``(3,)`` param
+# buffer ``[threshold, sharpness, gate_rows]``, and a single-element bool
+# ``active``
 # flag. The monitor op reads the residual at this hook and writes a
 # per-token gate into the shared ``steering_token_scales`` buffer, which
 # the §5.4 dynamic tier then multiplies by. Derived from the table
@@ -177,7 +178,8 @@ def register_steering_buffers(
             persistent=False,
         )
         # Per-hook in-graph monitor buffers (Phase 2, §8). The probe is a
-        # fp32 (hidden,) detector vector; params is [threshold, sharpness];
+        # fp32 (hidden,) detector vector; params is
+        # [threshold, sharpness, gate_rows];
         # active is a bool flag the monitor op reads at launch and uses to
         # short-circuit (a tensor, not a Python bool, so the compiled graph
         # topology stays stable). All default to the inactive/no-op state —
@@ -714,6 +716,16 @@ def apply_steering(
     (``mutates_args=["hidden_states"]``) so the op can elide the output
     copy entirely.
     """
+    # ``steering_monitor_params`` is a ``(3,)`` buffer
+    # ``[threshold, sharpness, gate_rows]``; both the Triton kernel and the
+    # eager path read slot 2 unconditionally. Fail loudly on both paths so a
+    # hand-built ``(2,)`` buffer never silently OOB-reads slot 2 on GPU.
+    if steering_monitor_params.numel() < 3:
+        raise ValueError(
+            "steering_monitor_params must have >= 3 elements "
+            "[threshold, sharpness, gate_rows]; got shape "
+            f"{tuple(steering_monitor_params.shape)}"
+        )
     if hidden_states.is_cuda:
         from vllm.model_executor.layers.steering_kernel import (
             apply_steering_triton,
@@ -778,12 +790,25 @@ def apply_steering(
     # Per-row scale (fp32, default 1.0) × per-token row gate (default 1.0);
     # both broadcast over hidden dim. The row gate keeps prefill rows at
     # full strength (1.0) and lets the monitor gate decode rows per token.
-    scale = steering_scales[rows].unsqueeze(-1).to(steering_table.dtype)
-    rgate = rgate_t.unsqueeze(-1).to(steering_table.dtype)
-    out = hidden_states + steering_table[rows] * scale * rgate
-    # Dedicated dynamic tier: dvec * per-token gate (0 ⇒ no-op).
-    tier = steering_dynamic_vec.unsqueeze(0) * tscale.unsqueeze(-1)
-    return out + tier.to(out.dtype)
+    #
+    # Cast every factor to ``hidden_states.dtype`` and multiply in that dtype,
+    # mirroring the frozen Triton kernel's cast order
+    # (``t_vals.to(h) * scale.to(h) * rgate.to(h)``). This keeps the eager
+    # output dtype equal to the hidden dtype — matching the CUDA path and
+    # ``apply_steering_fake``'s ``empty_like`` — instead of letting torch type
+    # promotion widen an fp32-table row term (``hidden + fp32``) to fp32.
+    h_dtype = hidden_states.dtype
+    scale = steering_scales[rows].unsqueeze(-1).to(h_dtype)
+    rgate = rgate_t.unsqueeze(-1).to(h_dtype)
+    out = hidden_states + steering_table[rows].to(h_dtype) * scale * rgate
+    # Dedicated dynamic tier: dvec * per-token gate (0 ⇒ no-op). Cast both
+    # factors to the hidden dtype BEFORE the multiply, matching the kernel's
+    # ``d_vals.to(h) * tscale.to(h)`` (a low-precision multiply). The kernel's
+    # cast order is the frozen reference, so eager follows it rather than
+    # multiplying in fp32 and casting the product.
+    tier = steering_dynamic_vec.unsqueeze(0).to(h_dtype)
+    tier = tier * tscale.unsqueeze(-1).to(h_dtype)
+    return out + tier
 
 
 def apply_steering_fake(
@@ -849,6 +874,15 @@ def steering_monitor(
     is a no-op. The op mutates ``steering_token_scales`` and
     ``steering_row_gate`` and returns ``None``.
     """
+    # ``params`` is a ``(3,)`` buffer ``[threshold, sharpness, gate_rows]``;
+    # the Triton kernel reads slot 2 unconditionally, so reject a short buffer
+    # loudly on both paths rather than OOB-reading slot 2 on GPU.
+    if params.numel() < 3:
+        raise ValueError(
+            "steering_monitor params must have >= 3 elements "
+            "[threshold, sharpness, gate_rows]; got shape "
+            f"{tuple(params.shape)}"
+        )
     if hidden_states.is_cuda:
         from vllm.model_executor.layers.steering_monitor_kernel import (
             steering_monitor_triton,
@@ -873,7 +907,7 @@ def steering_monitor(
         return
     threshold = params[0]
     sharpness = params[1]
-    gate_rows = bool(params[2].item()) if params.shape[0] > 2 else False
+    gate_rows = bool(params[2].item())
     score = hidden_states.to(torch.float32) @ probe.to(torch.float32)
     gate = torch.sigmoid(sharpness * (score - threshold))
     steering_token_scales[:n] = steering_token_scales[:n] * gate.to(
