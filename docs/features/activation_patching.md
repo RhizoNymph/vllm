@@ -33,8 +33,8 @@ capture run.
 - **Server-side sweeps:** `POST /v1/patch_sweep` expands a `(layers × positions)`
   grid (optionally × hooks) into one densely-batched call.
 
-End-to-end GPU-validated with real weights (TP1/PP1 eager + cudagraph; the
-multi-rank configs eager):
+End-to-end GPU-validated with real weights (eager + cudagraph, including the
+multi-rank configs):
 
 - **Qwen3-0.6B** (v2 runner, default): TP1/PP1, TP2/PP1, TP1/PP2.
 - **gemma3-4b** (v1 runner): TP1/PP1, TP2/PP1, TP1/PP2.
