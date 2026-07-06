@@ -181,6 +181,24 @@ def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
     }
 
 
+def _messages_have_multimodal(messages) -> bool:
+    """True if any message carries a non-text content part (image/audio/...).
+
+    Used to reject patch+multimodal BEFORE chat rendering: rendering registers
+    each image in the frontend's multimodal sender cache, so rejecting after
+    it leaves the cache claiming the engine holds items it never received —
+    poisoning later requests that reuse the same image.
+    """
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") != "text":
+                return True
+    return False
+
+
 def _make_prompt_tokens_details(
     enable_prompt_tokens_details: bool,
     num_cached_tokens: int | None,
@@ -367,6 +385,20 @@ class OpenAIServingChat(OpenAIServing):
                 request.tools,
                 chat_template_kwargs=chat_template_kwargs,
             )
+        # Patch + multimodal is rejected BEFORE rendering (see
+        # _messages_have_multimodal for why after is too late); the
+        # placeholder-count check in _admit_patch stays as a backstop.
+        if getattr(request, "patch", None) and _messages_have_multimodal(
+            request.messages
+        ):
+            return self.create_error_response(
+                "activation patching is not supported with multimodal "
+                "prompts (positions include image placeholder tokens); "
+                "use a text-only prompt",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="patch",
+            )
+
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
