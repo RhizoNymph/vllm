@@ -20,7 +20,18 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_MONITOR_ACTIVE_ATTR,
     SteeringHookPoint,
 )
-from vllm.v1.worker.gpu.steering_runner_mixin import SteeringRunnerMixin
+from vllm.v1.worker.gpu.capture_runner_mixin import CaptureRunnerMixin
+from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
+
+
+class _V2SteeringHost(CaptureRunnerMixin, SteeringModelRunnerMixin):
+    """Test host mirroring the v2 runner's steering MRO.
+
+    The steering control plane is fully shared on ``SteeringModelRunnerMixin``;
+    the two v2 batch-state accessor overrides (``_steering_batch_view`` /
+    ``_steering_req_position``) live on ``CaptureRunnerMixin``. This mirrors
+    production ``GPUModelRunner(..., CaptureRunnerMixin, SteeringModelRunnerMixin)``.
+    """
 
 
 class _FakeManager:
@@ -126,7 +137,7 @@ def _make_glue(
     max_tokens=16,
     max_seqs=8,
 ):
-    glue = SteeringRunnerMixin.__new__(SteeringRunnerMixin)
+    glue = _V2SteeringHost.__new__(_V2SteeringHost)
     glue._steering_manager = _FakeManager(
         has_globals=has_globals, has_dynamic_tier=has_dynamic_tier, dyn_pool=dyn_pool
     )
@@ -250,7 +261,8 @@ def test_update_buffers_builds_per_token_index_and_transition():
     )
     sched = SimpleNamespace(num_scheduled_tokens={"d": 1, "p": 3})
 
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
 
     steering_index = glue._steerable_layers_cache[0].steering_index
     # d -> row 5 (1 token); p -> row 7 (3 tokens); tail zeroed.
@@ -271,7 +283,8 @@ def test_global_steering_applies_to_untracked_request():
     )
     sched = SimpleNamespace(num_scheduled_tokens={"g": 5})
 
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
 
     steering_index = glue._steerable_layers_cache[0].steering_index
     # Prefilling (computed 0 < prompt 5) with globals -> global prefill row 1.
@@ -291,7 +304,8 @@ def test_update_buffers_short_circuit_zeroes_dirty_index():
     )
     sched = SimpleNamespace(num_scheduled_tokens={})
 
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
 
     assert layer.steering_index.sum().item() == 0
     assert glue._steering_index_dirty is False
@@ -328,7 +342,8 @@ def test_dynamic_tier_gates_decode_tokens_only():
     )
     sched = SimpleNamespace(num_scheduled_tokens={"d": 1, "p": 3})
 
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
 
     layer = glue._steerable_layers_cache[0]
     # d is a decode token -> gain 2.0; p's 3 prefill tokens -> 0.
@@ -349,7 +364,8 @@ def test_tier_only_state_defeats_short_circuit():
     )
     sched = SimpleNamespace(num_scheduled_tokens={"d": 1})
 
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
 
     layer = glue._steerable_layers_cache[0]
     # Untracked decode request with no per-request/global config -> row 0, but
@@ -376,7 +392,8 @@ def test_dynamic_override_routes_decode_to_pool_row():
     )
     sched = SimpleNamespace(num_scheduled_tokens={"d": 1})
 
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
 
     steering_index = glue._steerable_layers_cache[0].steering_index
     # Decode routed to the override pool row, NOT the admitted decode row 5.
@@ -452,20 +469,23 @@ def test_decode_signature_delta_reports_override_then_reverts():
     )
     sched = SimpleNamespace(num_scheduled_tokens={"d": 1})
 
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
     # First step with the override -> a non-admitted signature is reported.
     assert "d" in glue._pending_decode_sigs
     folded = glue._pending_decode_sigs["d"]
     assert folded != 5
 
     # Same override next step -> no change, nothing reported.
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
     assert "d" not in glue._pending_decode_sigs
 
     # Drop the override -> revert to the admitted decode hash 5.
     glue._req_dynamic_decode.pop("d")
     glue._steering_manager.release_dynamic_config(dyn_id)
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
     assert glue._pending_decode_sigs.get("d") == 5
 
 
@@ -486,7 +506,8 @@ def test_scales_dirty_takes_cheap_populate_path():
     )
     sched = SimpleNamespace(num_scheduled_tokens={"d": 1})
 
-    glue._update_steering_buffers_v2(sched, input_batch)
+    glue.input_batch = input_batch
+    glue._update_steering_buffers(sched)
 
     # Cheap path taken: scales repopulated, no full table recompose.
     assert mgr.scales_populated == 1
@@ -516,7 +537,7 @@ def _decode_override_glue(req_id: str = "d", hidden: int = 1):
 
 
 def test_apply_request_override_compose_folds_admitted():
-    from vllm.v1.worker.gpu.steering_runner_mixin import _SteeringReqState
+    from vllm.v1.worker.steering_model_runner_mixin import _SteeringReqState
     from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
 
     glue = _decode_override_glue()
@@ -548,7 +569,7 @@ def test_apply_request_override_compose_folds_admitted():
 
 
 def test_apply_request_override_no_compose_registers_raw():
-    from vllm.v1.worker.gpu.steering_runner_mixin import _SteeringReqState
+    from vllm.v1.worker.steering_model_runner_mixin import _SteeringReqState
     from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
 
     glue = _decode_override_glue()
@@ -676,3 +697,41 @@ def test_monitor_update_by_req_id_yields_to_operator_owner_v2():
         hook="pre_attn", layer=0, probe=None, req_id="d", source="declarative"
     )
     assert glue._apply_monitor_update(mon, source="declarative") is False
+
+
+# ---- de-fork step F: shared override reads batch position via one accessor ----
+
+
+def _v1_position_host(order, computed, prompt):
+    """Bare v1 mixin host exposing only the ``input_batch`` fields the
+    ``_steering_req_position`` accessor reads."""
+    host = SteeringModelRunnerMixin.__new__(SteeringModelRunnerMixin)
+    host.input_batch = SimpleNamespace(
+        req_id_to_index={r: i for i, r in enumerate(order)},
+        num_computed_tokens_cpu=np.asarray(computed, dtype=np.int32),
+        num_prompt_tokens=np.asarray(prompt, dtype=np.int32),
+    )
+    return host
+
+
+def test_steering_req_position_v1_v2_parity():
+    # Same logical batch state: two requests, one decode (computed >= prompt),
+    # one prefill (computed < prompt), plus one not in the batch.
+    order = ["d", "p"]
+    computed = [10, 3]
+    prompt = [10, 8]
+
+    v1 = _v1_position_host(order, computed, prompt)
+    v2 = _make_glue(num_computed=computed, prompt_len=prompt)
+    v2.req_states.req_id_to_index = {r: i for i, r in enumerate(order)}
+
+    for req_id in order:
+        assert v1._steering_req_position(req_id) == v2._steering_req_position(req_id), (
+            req_id
+        )
+    # Decode request: computed 10 >= prompt 10; prefill: 3 < 8.
+    assert v1._steering_req_position("d") == (10, 10)
+    assert v1._steering_req_position("p") == (3, 8)
+    # Not in the batch -> both return None.
+    assert v1._steering_req_position("ghost") is None
+    assert v2._steering_req_position("ghost") is None

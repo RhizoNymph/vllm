@@ -830,8 +830,8 @@ strides + warmup), `steering.py` (3 attr maps + dummy buffers +
 `resize_steering_row_monitor_buffers` + 15-arg op + eager per-row block),
 `steering_manager.py` (`_row_monitor` state + set/clear/has + populate +
 signature fold), `steering_action_queue.py` (targeting + validation),
-`steering_model_runner_mixin.py` + `gpu/steering_runner_mixin.py` (per-row
-apply branch + short-circuit + transition deactivation + status),
+`steering_model_runner_mixin.py` (shared per-row apply branch + short-circuit
++ transition deactivation + status; both runners drive it),
 `config/steering.py` (`enable_row_monitor`).
 
 **Wiring:** `vllm/model_executor/layers/steering_monitor_kernel.py`
@@ -946,9 +946,9 @@ layers of a 4–8B at large batch widths, prohibitive for 70B — so capture a
 curated handful of layers (or lean on the zero-capture `this_token` path), not
 everything.
 
-**Precedence** (operator wins, `steering_model_runner_mixin.py` for v1 and
-`gpu/steering_runner_mixin.py` for v2 — both `_apply_request_override`
-implementations are kept in lock-step): every declarative action is stamped
+**Precedence** (operator wins; one shared `_apply_request_override` on
+`steering_model_runner_mixin.py` drives both runners): every declarative action
+is stamped
 `source="declarative"`; the runner records the owning source per request
 (`_req_override_source`) and rejects a declarative action for a request already
 owned by another (operator) source, and vice-versa the operator source takes

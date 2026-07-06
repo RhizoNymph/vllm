@@ -67,7 +67,7 @@ class _Host(SteeringModelRunnerMixin):
         self._req_override_source = {}
         self._row_monitor_enabled = row_monitor
         self.input_batch = _FakeInputBatch(reqs)
-        self.requests = {}
+        self._steering_reqs = {}
 
 
 def _decode(req_id: str = "r1") -> dict:

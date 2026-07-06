@@ -30,6 +30,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.worker.steering_batch_view import SteeringBatchView
 
 if TYPE_CHECKING:
     from vllm.v1.capture.plan import CaptureBatchView
@@ -680,7 +681,7 @@ class CaptureRunnerMixin:
         Consumer exceptions are isolated; returned steering actions apply inline
         through ``_apply_steering_actions`` (the steering mixin, resolved on the
         concrete runner) so they are visible to the next step's
-        ``_update_steering_buffers_v2``.
+        ``_update_steering_buffers``.
 
         Two timings are kept per consumer in ``_sync_consumer_stats``: a
         wall-clock ``perf_counter`` span (a diagnostic that absorbs the forward
@@ -844,3 +845,61 @@ class CaptureRunnerMixin:
         :meth:`_drain_capture_results`.
         """
         return self._drain_capture_results()
+
+    # ---- v2 steering batch-state accessors ---------------------------------
+    #
+    # The steering control plane is fully shared on ``SteeringModelRunnerMixin``
+    # (one hot path, one override apply). Its only runner-specific inputs are
+    # two batch-state reads, whose v1 defaults read v1's batch-ordered
+    # ``input_batch`` columns. The v2 runner overrides them here — colocated
+    # with the capture glue because they read exactly the same v2 ``req_states``
+    # + ``input_batch`` layout this mixin already owns (see
+    # ``_build_step_capture_view``): batch order + slot->row map from
+    # ``input_batch`` (``idx_mapping_np``) and per-request token counts from
+    # ``req_states`` (``num_computed_tokens_np`` / ``prompt_len.np``).
+
+    def _steering_batch_view(self) -> SteeringBatchView:
+        """v2 batch view for the shared per-step steering hot path.
+
+        Overrides :meth:`SteeringModelRunnerMixin._steering_batch_view` to read
+        v2's layout instead of v1's batch-ordered ``input_batch`` columns.
+        Returns one reusable instance mutated in place — no per-step allocation.
+
+        The unified body reaches ``input_batch`` through ``self.input_batch``,
+        set by the runner just before the call (v2 keeps no persistent
+        ``self.input_batch``).
+        """
+        ib = self.input_batch
+        rs = self.req_states
+        bv = self._steering_bview
+        if bv is None:
+            bv = SteeringBatchView(
+                num_reqs=ib.num_reqs,
+                req_ids=ib.req_ids,
+                idx_np=ib.idx_mapping_np,
+                num_computed_np=rs.num_computed_tokens_np,
+                num_prompt_np=rs.prompt_len.np,
+            )
+            self._steering_bview = bv
+        else:
+            bv.num_reqs = ib.num_reqs
+            bv.req_ids = ib.req_ids
+            bv.idx_np = ib.idx_mapping_np
+            bv.num_computed_np = rs.num_computed_tokens_np
+            bv.num_prompt_np = rs.prompt_len.np
+        return bv
+
+    def _steering_req_position(self, req_id: str) -> tuple[int, int] | None:
+        """v2 batch-position accessor for the shared override apply.
+
+        Overrides :meth:`SteeringModelRunnerMixin._steering_req_position` to
+        read v2's ``req_states`` (``req_id_to_index`` + ``num_computed_tokens_np``
+        / ``prompt_len.np``) instead of v1's ``self.input_batch``. Returns
+        ``None`` when the request is not in the current batch.
+        """
+        req_idx = self.req_states.req_id_to_index.get(req_id)
+        if req_idx is None:
+            return None
+        num_computed = int(self.req_states.num_computed_tokens_np[req_idx])
+        num_prompt = int(self.req_states.prompt_len.np[req_idx])
+        return num_computed, num_prompt
