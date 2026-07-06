@@ -38,6 +38,10 @@ import time
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.steering_kernel import (
+    _choose_block_h,
+    _default_warmup_sizes,
+)
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
@@ -104,15 +108,6 @@ def _steering_monitor_kernel(
         tl.store(rg_ptr, tl.load(rg_ptr) * (dm * gate + (1.0 - dm)))
 
 
-def _choose_block_h(hidden_size: int) -> int:
-    """Pick a ``BLOCK_H`` for the reduction; mirrors steering_kernel.py."""
-    if hidden_size >= 2048:
-        return 2048
-    if hidden_size <= 1:
-        return 1
-    return 1 << (hidden_size - 1).bit_length()
-
-
 def steering_monitor_triton(
     hidden_states: torch.Tensor,
     probe: torch.Tensor,
@@ -175,7 +170,9 @@ def warmup_steering_monitor_kernel(
     """
     if device.type != "cuda":
         return
-    sizes = capture_sizes if capture_sizes else [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    # Share the apply-steering kernel's fallback shape list (the union of the
+    # two former lists) so both kernels warm up the same batch dims.
+    sizes = capture_sizes if capture_sizes else _default_warmup_sizes()
     sizes = sorted({int(s) for s in sizes if int(s) > 0})
     if not sizes:
         return

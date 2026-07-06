@@ -330,7 +330,8 @@ def _default_warmup_sizes() -> list[int]:
     Mirrors the powers-of-two and small-batch shapes that vLLM commonly
     captures when ``cudagraph_capture_sizes`` is left to its default.
     Used only when the caller cannot pass an explicit list (e.g.
-    standalone tests).
+    standalone tests). Also reused by the monitor kernel's warmup
+    (``steering_monitor_kernel``) so both share one fallback shape list.
     """
     return [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 
