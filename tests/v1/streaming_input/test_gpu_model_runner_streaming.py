@@ -28,6 +28,15 @@ def mock_model_runner_with_input_batch():
     runner.requests = {}
     runner.max_num_reqs = 10
     runner.max_model_len = 1024
+    # Mirrors gpu_model_runner.py:825 self.late_interaction_runner =
+    # LateInteractionRunner(); an instance attr the spec-based Mock lacks.
+    runner.late_interaction_runner = Mock()
+    # Sync-consumer metadata stashes the runner inherits from
+    # CaptureRunnerMixin.__init__ (capture_runner_mixin.py:109 and :113);
+    # _update_streaming_request refreshes them, but Mock(spec=...) never runs
+    # __init__ so the instance attrs are absent.
+    runner._sync_conversation_ids = {}
+    runner._sync_steering_gates = {}
 
     # Create a real InputBatch for e2e testing
     runner.input_batch = InputBatch(
