@@ -112,12 +112,48 @@ only rank-identical inputs.
    `gpu/steering_runner_mixin.py` (`SteeringRunnerMixin`, a subclass of
    `SteeringModelRunnerMixin` that reuses init / discovery / validation / the
    public RPC API / `_resolve_request_steering` and overrides only the
-   v1-state-coupled paths). Keeps its own `_steering_reqs` per-request state;
-   `_steering_add_request` (register + streaming re-add), `_steering_finish_requests`
-   (release on finish/preempt), `_update_steering_buffers_v2` (transition +
-   per-token index). No force-eager seam (persistent buffers). `gpu_worker.py`
-   already forwards the RPCs to `self.model_runner.*`.
+   v1-state-coupled paths). No force-eager seam (persistent buffers).
+   `gpu_worker.py` already forwards the RPCs to `self.model_runner.*`.
    Tests: `tests/v1/worker/test_gpu_v2_steering_glue.py`.
+
+   **Canonical per-request steering state (de-fork step C).** The per-request
+   steering identity + phase now lives in one shared store,
+   `SteeringModelRunnerMixin._steering_reqs: dict[str, _SteeringReqState]`,
+   populated identically on both runners from the broadcast `NewRequestData`.
+   The whole lifecycle is shared and runner-agnostic:
+   `_steering_add_request` (admission + streaming re-add),
+   `_steering_register_request` (the register-fresh core, also used by resume),
+   `_steering_finish_requests` (release on finish/preempt),
+   `_steering_release_state`, `_steering_transition` (prefill→decode), and
+   `_reset_steering_for_resumption` (v1 resume re-register). v1 drives them from
+   `_update_states` / `_update_streaming_request`; v2 from `add_requests` /
+   `finish_requests`. v1's former `_register_initial_steering_config` /
+   `_refresh_streaming_steering` / `_release_finished_steering_configs` /
+   `_req_steering_phase` and v2's private `_SteeringReqState` copy are gone.
+   v1's `_update_steering_buffers` still routes off the input-batch hash columns
+   (unified separately in step E); `_handle_steering_transition` is now a thin
+   shim over `_steering_transition` reading `_steering_reqs` (the columns and the
+   store can't disagree — both written at admission from the same
+   `NewRequestData`). The cross-runner conformance harness
+   (`tests/v1/worker/test_steering_conformance.py`) asserts both runners drive
+   the manager identically across the whole lifecycle.
+
+   **Preemption unified on release-at-preemption (de-fork step D).** Both
+   runners now RELEASE a preempted request's config rows *and* any per-request
+   dynamic override at preemption time (the finish site unions
+   `finished_req_ids` with `scheduler_output.preempted_req_ids`), then
+   re-register a fresh prefill config on resume — v1 via
+   `_reset_steering_for_resumption`, v2 via the `add_requests` new-request path.
+   Previously v1 HELD its rows across preemption (releasing only at resume);
+   that pinned pool rows for the duration of the preemption. The scheduler
+   already agrees: `_preempt_request` (`scheduler.py:1256`) resets
+   `num_computed_tokens = 0` and drops the decode-signature tracking, and the
+   waiting-queue admission loop (`scheduler.py:705–718`, `:762–790`) reserves the
+   resumed request's prefill + decode steering rows before re-admitting it, so
+   the re-registration's `register_config` cannot overflow (the same guarantee
+   v2 already relied on). A request both preempted and finished in one step
+   releases exactly once (the union is a set; `_steering_finish_requests` pops
+   the canonical state idempotently).
 
    **Dynamic-steering parity (v1 → v2).** `_update_steering_buffers_v2` is at full
    parity with v1's `_update_steering_buffers`. Beyond the per-token

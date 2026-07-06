@@ -10,12 +10,15 @@ validation, the public RPC API (``set_steering_vectors`` etc., which
 ``gpu_worker`` already forwards to ``self.model_runner``), and
 ``_resolve_request_steering``.
 
-Only three v1 methods read v1-runner state (``self.input_batch`` /
-``self.requests``): the per-step ``_update_steering_buffers`` hot path, the
-prefill->decode transition, and finished-config release. v2 retains no
-``CachedRequestState`` dict, so this subclass keeps its own per-request steering
-state (populated from ``NewRequestData`` in ``add_requests``) and reimplements
-those three against v2's ``InputBatch`` + ``RequestState``.
+The per-request steering lifecycle (admission, streaming re-add, transition,
+finish/preempt release, resume) is now shared: both runners drive the
+canonical ``self._steering_reqs`` store on :class:`SteeringModelRunnerMixin`
+(``_steering_add_request`` / ``_steering_finish_requests`` / ...), populated
+identically from the broadcast ``NewRequestData``. This subclass overrides only
+the genuinely v2-coupled paths: the per-step ``_update_steering_buffers_v2`` hot
+path, the effective-decode-signature deltas, and the dynamic-override apply —
+all of which read v2's ``InputBatch`` + ``RequestState`` instead of v1's
+``self.input_batch`` / ``self.requests``.
 
 Steering needs no force-eager seam: the per-layer tables and ``steering_index``
 are persistent buffers written in place before the forward, so a FULL cudagraph
@@ -26,7 +29,6 @@ See ``docs/design/v2_runner_steering_capture.md`` for the full contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -41,172 +43,40 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_ROW_ACTIVE_ATTR,
     SteeringHookPoint,
 )
-from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.worker.steering_action_queue import (
     DECLARATIVE_SOURCE,
     get_steering_action_queue,
     validate_steering_vectors,
 )
-from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
+from vllm.v1.worker.steering_model_runner_mixin import (
+    SteeringModelRunnerMixin,
+    _SteeringReqState,
+)
+
+# Re-exported for callers (and tests) that import the per-request steering
+# state dataclass from the v2 module. It now lives in the shared mixin so both
+# runners populate one canonical ``self._steering_reqs`` store.
+__all__ = ["SteeringRunnerMixin", "_SteeringReqState"]
 
 if TYPE_CHECKING:
-    from vllm.sampling_params import SamplingParams
-    from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.steering_action_queue import RequestSteeringOverride
 
 logger = init_logger(__name__)
 
 
-@dataclass
-class _SteeringReqState:
-    """Per-request steering state the v2 runner must retain itself.
-
-    v2 does not keep ``sampling_params`` or the steering hashes past
-    ``add_requests``, so we capture what the transition / release / resolve
-    paths need: the params (for re-resolving the decode tier lazily), both
-    config hashes, the prompt length (for the prefill->decode boundary), and
-    the currently-registered phase.
-    """
-
-    sampling_params: SamplingParams
-    prefill_hash: int
-    decode_hash: int
-    num_prompt_tokens: int
-    phase: str  # "prefill" | "decode"
-
-
 class SteeringRunnerMixin(SteeringModelRunnerMixin):
     """v2 steering control plane. Mixes the shared steering logic in via the
     v1 mixin and overrides only the v2-runner-coupled paths.
 
-    Assumes the concrete runner provides ``req_states`` (v2 ``RequestState``)
-    in addition to everything :class:`SteeringModelRunnerMixin` needs.
+    The per-request steering lifecycle (add / finish / transition / release /
+    resume) and its ``self._steering_reqs`` store live on the shared
+    :class:`SteeringModelRunnerMixin`; both runners drive them identically.
+    This subclass only reimplements the per-step buffer build, the
+    effective-decode-signature deltas, and the override apply against v2's
+    ``req_states`` (v2 ``RequestState``).
     """
-
-    _steering_reqs: dict[str, _SteeringReqState]
-
-    def _init_steering_state(self) -> None:
-        super()._init_steering_state()
-        self._steering_reqs = {}
-
-    # ---- request lifecycle -------------------------------------------------
-
-    def _steering_add_request(self, new_req_data: NewRequestData) -> None:
-        """Track a newly admitted request and register its initial config.
-
-        Also covers streaming re-adds: ``add_requests`` removes the prior
-        instance first, so any state we already held for this id is released
-        before the fresh prefill config is registered.
-        """
-        mgr = self._steering_manager
-        if mgr is None:
-            return
-
-        # Streaming re-add / stale state: release whatever we held before.
-        # A re-add goes back through prefill, so any live dynamic decode
-        # override belongs to the finished decode run and is dropped (the
-        # driving policy re-engages on the continuation's decode).
-        self._drop_request_dynamic_override(new_req_data.req_id)
-        old = self._steering_reqs.pop(new_req_data.req_id, None)
-        if old is not None:
-            self._steering_release_state(old)
-
-        sp = new_req_data.sampling_params
-        prefill_hash = new_req_data.prefill_steering_config_hash
-        decode_hash = new_req_data.decode_steering_config_hash
-        if sp is None or (prefill_hash == 0 and decode_hash == 0):
-            return
-
-        num_prompt = length_from_prompt_token_ids_or_embeds(
-            new_req_data.prompt_token_ids,
-            new_req_data.prompt_embeds,
-        )
-        rs = _SteeringReqState(
-            sampling_params=sp,
-            prefill_hash=prefill_hash,
-            decode_hash=decode_hash,
-            num_prompt_tokens=num_prompt,
-            phase="prefill",
-        )
-        self._steering_reqs[new_req_data.req_id] = rs
-
-        # A full prefix-cache hit admits the request directly into decode; the
-        # scheduler reserves the matching row, so register_config is expected to
-        # succeed (a RuntimeError indicates a scheduler accounting bug).
-        if new_req_data.num_computed_tokens >= num_prompt:
-            effective_decode = self._resolve_request_steering(sp, "decode")
-            if decode_hash != 0 and effective_decode:
-                mgr.register_config(
-                    decode_hash,
-                    effective_decode,
-                    phase="decode",
-                    locally_owned_layers=self._locally_owned_layers,
-                )
-            rs.phase = "decode"
-        else:
-            # Normal: start in prefill; the decode config is registered lazily
-            # at the prefill->decode boundary in _update_steering_buffers_v2.
-            effective_prefill = self._resolve_request_steering(sp, "prefill")
-            if prefill_hash != 0 and effective_prefill:
-                mgr.register_config(
-                    prefill_hash,
-                    effective_prefill,
-                    phase="prefill",
-                    locally_owned_layers=self._locally_owned_layers,
-                )
-            rs.phase = "prefill"
-
-    def _steering_finish_requests(self, req_ids: set[str] | list[str]) -> None:
-        """Release configs for finished (or preempted) requests.
-
-        Preempted requests are released too: they re-enter through
-        ``add_requests`` on resume, which re-registers a fresh prefill config.
-        """
-        if self._steering_manager is None:
-            return
-        for req_id in req_ids:
-            # Drop any live dynamic decode override (routing state local to the
-            # finished/preempted decode run); preempted requests re-register a
-            # fresh prefill config on resume.
-            self._drop_request_dynamic_override(req_id)
-            rs = self._steering_reqs.pop(req_id, None)
-            if rs is not None:
-                self._steering_release_state(rs)
-
-    def _steering_release_state(self, rs: _SteeringReqState) -> None:
-        """Release the config for whichever phase ``rs`` is currently in."""
-        mgr = self._steering_manager
-        if mgr is None:
-            return
-        if rs.phase == "prefill" and rs.prefill_hash != 0:
-            mgr.release_config(rs.prefill_hash, "prefill")
-        elif rs.phase == "decode" and rs.decode_hash != 0:
-            mgr.release_config(rs.decode_hash, "decode")
-
-    def _steering_transition(self, rs: _SteeringReqState) -> None:
-        """Handle a request crossing the prefill->decode boundary this step.
-
-        Releases the prefill config and registers the decode config so it is
-        ready for the next step's table population. The scheduler reserves the
-        decode row at the step prefill completes, so register_config succeeds.
-        """
-        mgr = self._steering_manager
-        assert mgr is not None
-        if rs.prefill_hash != 0:
-            mgr.release_config(rs.prefill_hash, "prefill")
-        if rs.decode_hash != 0:
-            effective_decode = self._resolve_request_steering(
-                rs.sampling_params, "decode"
-            )
-            if effective_decode:
-                mgr.register_config(
-                    rs.decode_hash,
-                    effective_decode,
-                    phase="decode",
-                    locally_owned_layers=self._locally_owned_layers,
-                )
-        rs.phase = "decode"
 
     # ---- per-step buffer / index maintenance -------------------------------
 

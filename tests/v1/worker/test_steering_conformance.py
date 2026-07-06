@@ -31,18 +31,16 @@ suite asserts the two hosts' event logs are EQUAL -- the strongest form. Most
 scenarios run through :func:`_run` + the equality assertion in
 :func:`test_conformance`.
 
-Preemption -- pinned divergence
--------------------------------
-DECIDED: the de-fork will unify on v2's release-at-preemption. Today v1 HOLDS
-its config rows + any per-request override across a preemption (releasing them
-only at resume, via ``_reset_steering_for_resumption``) while v2 RELEASES
-everything at preemption time (``_steering_finish_requests`` is called with
-finished + preempted). :func:`test_preemption_pinned_divergence` pins the
-CURRENT per-runner behavior with the named constants ``_V1_PREEMPT_EVENTS`` /
-``_V2_PREEMPT_EVENTS``. When de-fork step D lands, flip ``_V1_PREEMPT_EVENTS``
-to equal ``_V2_PREEMPT_EVENTS`` (a one-constant change) and the test encodes
-the unified contract. The NET register/release work across preempt+resume is
-already identical between the runners -- only the TIMING differs.
+Preemption -- unified on release-at-preemption
+----------------------------------------------
+De-fork step D landed: both runners RELEASE a preempted request's config rows
++ any per-request override at preemption time (``_steering_finish_requests``
+called with finished + preempted) and re-register a fresh prefill config on
+resume. :func:`test_preemption_unified` asserts the two runners drive the
+manager identically across the whole preempt+resume region -- the same
+elementwise-equal artifact as every other scenario. (Previously v1 HELD its
+rows across preemption and released only at resume; that divergence, pinned by
+the former ``_V1_PREEMPT_EVENTS`` constant, is now gone.)
 
 CPU-only, no GPU, no network. No production code is imported for
 re-implementation: the value is exercising the real mixin code paths.
@@ -390,7 +388,7 @@ class V1Host(SteeringModelRunnerMixin):
         self._dynamic_steering_stats = {}
         self._req_dynamic_decode = {}
         self._req_override_source = {}
-        self._req_steering_phase = {}
+        self._steering_reqs = {}
         self._steering_index_dirty = False
         self._row_monitor_enabled = row_monitor
         self.requests = {}
@@ -442,14 +440,15 @@ class V1Host(SteeringModelRunnerMixin):
             decode_steering_config_hash=decode_hash,
         )
         new_req_data = SimpleNamespace(
+            req_id=req_id,
             sampling_params=sp,
             prefill_steering_config_hash=prefill_hash,
             decode_steering_config_hash=decode_hash,
+            prompt_token_ids=list(range(prompt_len)),
+            prompt_embeds=None,
             num_computed_tokens=num_computed,
         )
-        self._register_initial_steering_config(
-            req_id, new_req_data, self.requests[req_id]
-        )
+        self._steering_add_request(new_req_data)
 
     def step(self, scheduled):
         self._update_steering_buffers(
@@ -470,8 +469,10 @@ class V1Host(SteeringModelRunnerMixin):
         return res
 
     def preempt(self, req_ids):
-        # v1 HOLDS: no steering release at preemption. Rows + override stay
-        # registered until resume drives ``_reset_steering_for_resumption``.
+        # Unified release-at-preemption (de-fork step D): v1 releases the
+        # config rows + any dynamic override at preemption, mirroring v2. The
+        # request re-registers a fresh prefill config on resume.
+        self._steering_finish_requests(list(req_ids))
         for r in req_ids:
             if r in self._order:
                 self._order.remove(r)
@@ -487,7 +488,7 @@ class V1Host(SteeringModelRunnerMixin):
 
     def stream_readd(self, req_id, new_prefill_hash, new_decode_hash, new_computed=0):
         old = self._reqs[req_id]
-        old_prefill, old_decode = old["prefill_hash"], old["decode_hash"]
+        prompt_len = old["num_prompt"]
         old.update(
             prefill_hash=new_prefill_hash,
             decode_hash=new_decode_hash,
@@ -496,22 +497,27 @@ class V1Host(SteeringModelRunnerMixin):
         self.input_batch = self._build_batch()
         sp = object()
         self.requests[req_id] = SimpleNamespace(
-            num_prompt_tokens=old["num_prompt"],
+            num_prompt_tokens=prompt_len,
             sampling_params=sp,
             prefill_steering_config_hash=new_prefill_hash,
             decode_steering_config_hash=new_decode_hash,
         )
-        self._refresh_streaming_steering(
-            req_id,
-            SimpleNamespace(sampling_params=sp),
-            old_prefill,
-            old_decode,
-            new_prefill_hash,
-            new_decode_hash,
+        # Streaming re-adds route back through the canonical admission path,
+        # which releases the prior instance before registering the new config.
+        self._steering_add_request(
+            SimpleNamespace(
+                req_id=req_id,
+                sampling_params=sp,
+                prefill_steering_config_hash=new_prefill_hash,
+                decode_steering_config_hash=new_decode_hash,
+                prompt_token_ids=list(range(prompt_len)),
+                prompt_embeds=None,
+                num_computed_tokens=new_computed,
+            )
         )
 
     def finish(self, req_ids):
-        self._release_finished_steering_configs(set(req_ids))
+        self._steering_finish_requests(set(req_ids))
         for r in req_ids:
             if r in self._order:
                 self._order.remove(r)
@@ -952,16 +958,12 @@ def test_conformance(name):
 
 
 # ---------------------------------------------------------------------------
-# Preemption -- PINNED DIVERGENCE with a documented target.
+# Preemption -- UNIFIED on release-at-preemption (de-fork step D).
 # ---------------------------------------------------------------------------
 #
-# DECIDED: the de-fork unifies on v2's release-at-preemption. The v1
-# expectation below pins CURRENT behavior (v1 HOLDS rows across preemption).
-# When de-fork step D lands, flip ``_V1_PREEMPT_EVENTS`` to equal
-# ``_V2_PREEMPT_EVENTS`` (a one-constant change) and this test encodes the
-# unified contract.
-_V1_PREEMPT_EVENTS: list[tuple] = []  # CURRENT: v1 emits nothing at preempt
-_V2_PREEMPT_EVENTS: list[tuple] = [
+# Both runners release a preempted request's config rows + dynamic override at
+# preemption and re-register a fresh prefill config on resume.
+_PREEMPT_EVENTS: list[tuple] = [
     ("release_dyn", 1),
     ("release", 9, "decode"),
 ]
@@ -983,23 +985,54 @@ def _run_preemption(make):
     return at_preempt, mid_state, region
 
 
-def test_preemption_pinned_divergence():
+def test_preemption_unified():
     v1_preempt, v1_mid, v1_region = _run_preemption(make_v1)
     v2_preempt, v2_mid, v2_region = _run_preemption(make_v2)
 
-    # At preempt time the runners DIVERGE (the pinned target of de-fork step D).
-    assert v1_preempt == _V1_PREEMPT_EVENTS  # DECIDED: flip to v2 at step D
-    assert v2_preempt == _V2_PREEMPT_EVENTS
+    # Both runners release the config row + override AT preemption.
+    assert v1_preempt == _PREEMPT_EVENTS
+    assert v2_preempt == _PREEMPT_EVENTS
 
-    # State DURING preemption: v1 holds the config row + override; v2 freed
-    # both. This is the observable consequence of the timing difference.
-    assert v1_mid == (True, True)  # v1: rows held across preemption
-    assert v2_mid == (False, False)  # v2: released at preemption
+    # State DURING preemption: both freed the config row + dynamic override
+    # (release-at-preemption). A preempted request no longer pins pool rows.
+    assert v1_mid == (False, False)
+    assert v2_mid == (False, False)
 
-    # The NET register/release work across preempt+resume is already identical
-    # between the runners -- only the TIMING differs. After step D the two
-    # regions become elementwise equal.
-    assert sorted(v1_region) == sorted(v2_region)
+    # The whole preempt+resume region is now elementwise identical between the
+    # runners -- the same strongest-form artifact as every other scenario.
+    assert v1_region == v2_region
+    assert v1_region == [
+        ("release_dyn", 1),
+        ("release", 9, "decode"),
+        ("register", 7, "prefill"),
+    ]
+
+
+def test_preempt_and_finish_same_step_no_double_release():
+    """A request both preempted and finished in one step must release its
+    steering exactly once. The finish site unions finished + preempted ids;
+    ``_steering_finish_requests`` pops the canonical state, so the second id in
+    the union is a no-op (no double release_config / release_dyn)."""
+    for make in (make_v1, make_v2):
+        h = make(max_dynamic=2)
+        h.admit("r1", 7, 9, 10, 0)
+        h.step({"r1": 10})  # -> decode
+        h.step({"r1": 1})
+        h.apply_action(RequestSteeringOverride(req_id="r1", vectors=_vec(5.0)))
+        i0 = len(h.events())
+        # Same step: the runner passes finished UNION preempted. Model that as
+        # a single finish call over the deduplicated union (a set), then a
+        # second finish over the same id to prove idempotence.
+        h._steering_finish_requests({"r1"})
+        h._steering_finish_requests({"r1"})
+        released = h.events()[i0:]
+        assert released == [
+            ("release_dyn", 1),
+            ("release", 9, "decode"),
+        ], f"{make.__name__}: expected exactly one release, got {released}"
+        assert h._req_dynamic_decode == {}
+        assert not h._steering_manager.has_dynamic
+        assert (9, "decode") not in h._steering_manager.config_to_row
 
 
 if __name__ == "__main__":
