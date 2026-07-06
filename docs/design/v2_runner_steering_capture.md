@@ -103,11 +103,22 @@ only rank-identical inputs.
 ## Workstreams
 
 1. **Capture control plane** — DONE (CPU-tested, GPU pending).
-   `gpu/capture_runner_mixin.py` (`CaptureRunnerMixin`): init, gate,
-   force-eager seam, `_build_capture_{gate,batch}_view`,
-   `_register_capture_request`, `_finalize_capture_step`,
-   `_finalize_capture_for_request_async`, output drain, activation store.
-   Tests: `tests/v1/worker/test_gpu_v2_capture_glue.py`.
+   The runner-agnostic control plane is shared with the v1 runner in
+   `vllm/v1/worker/capture_runner_mixin.py` (`CaptureRunnerMixin`):
+   `_init_capture_state`, `_register_capture_request`, `_capture_add_request`,
+   `_capture_finish_request`, `_finalize_capture_step`,
+   `_finalize_capture_for_request_async`, the sync-consumer step loop
+   (`_build_step_capture_view` / `_run_sync_consumers` / `_warmup_sync_consumers`),
+   and the result drains. Both runners implement two hooks the shared step-view
+   builder calls: `_iter_step_capture_rows` (v1 walks `input_batch` accumulating
+   offsets; v2 reads `query_start_loc_np` + `req_states`) and
+   `_step_view_token_ids` (v1 copies the CPU token window; v2 returns empty).
+   `gpu/capture_runner_mixin.py` (`CaptureRunnerMixin`) subclasses the shared
+   mixin and keeps only the genuinely-v2 pieces: the force-eager gate view and
+   gather-plan view (`_build_capture_{gate,batch}_view`, `_capture_gate_decision`,
+   `_capture_build_plan`), which must be built before v2's `InputBatch` exists,
+   plus the two hooks above. Tests: `tests/v1/worker/test_gpu_v2_capture_glue.py`,
+   `tests/v1/worker/test_sync_steering_integration.py`.
 2. **Steering control plane** — DONE (CPU-tested, GPU pending).
    Fully shared on `SteeringModelRunnerMixin` (de-fork complete, step H): the
    v2 runner mixes it in directly
