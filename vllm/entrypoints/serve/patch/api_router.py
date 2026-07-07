@@ -142,6 +142,129 @@ def _err(msg: str, code: int = HTTPStatus.BAD_REQUEST.value) -> JSONResponse:
     return JSONResponse(content={"error": msg}, status_code=code)
 
 
+def _make_capture_cell_patch(
+    body: PatchSweepRequest, source_for: Callable[[int], int | None]
+) -> Callable[[str, int, int], list[dict]]:
+    """Capture-sourced per-cell patch: the run's stored activation at the
+    aligned source position, plus any shared per-dim mask."""
+
+    def cell_patch(hook: str, layer: int, pos: int) -> list[dict]:
+        entry: dict[str, Any] = {
+            "layer": layer,
+            "hook": hook,
+            "dest_position": pos,
+            "source_run": body.source_run,
+            "source_position": source_for(pos),
+            "alpha": body.alpha,
+        }
+        if body.mask is not None:
+            entry["mask"] = body.mask
+        return [entry]
+
+    return cell_patch
+
+
+def _make_vector_cell_patch(
+    body: PatchSweepRequest,
+) -> Callable[[str, int, int], list[dict]]:
+    """Vector-sourced per-cell patch: the same client source (``source_module``
+    or ``source_inline``) + shared mask patched at every cell's site."""
+
+    def cell_patch(hook: str, layer: int, pos: int) -> list[dict]:
+        entry: dict[str, Any] = {
+            "layer": layer,
+            "hook": hook,
+            "dest_position": pos,
+            "alpha": body.alpha,
+        }
+        if body.source_module is not None:
+            entry["source_module"] = body.source_module
+        else:
+            entry["source_inline"] = body.source_inline
+        if body.mask is not None:
+            entry["mask"] = body.mask
+        return [entry]
+
+    return cell_patch
+
+
+def _validate_sweep_vectors(body: PatchSweepRequest, vllm_config) -> str | None:
+    """Reuse the SamplingParams structural validator on a representative cell
+    (exactly-one-of source, mask shape, packed ``patch_vectors``, inline
+    index-in-range), then the hidden-size width check for inline rows."""
+    entry: dict[str, Any] = {
+        "layer": 0,
+        "hook": "post_block",
+        "dest_position": 0,
+        "alpha": body.alpha,
+    }
+    if body.source_module is not None:
+        entry["source_module"] = body.source_module
+    elif body.source_inline is not None:
+        entry["source_inline"] = body.source_inline
+    else:
+        entry["source_run"] = body.source_run
+        entry["source_position"] = 0
+    if body.mask is not None:
+        entry["mask"] = body.mask
+    try:
+        SamplingParams(patch=[entry], patch_vectors=body.patch_vectors)
+    except ValueError as exc:
+        return str(exc)
+    if body.patch_vectors is not None:
+        uses_inline = body.source_inline is not None or (
+            body.mask is not None and body.mask.get("inline") is not None
+        )
+        if uses_inline:
+            hidden = vllm_config.model_config.get_hidden_size()
+            width = int(body.patch_vectors["shape"][1])
+            if width != hidden:
+                return (
+                    f"patch_vectors width {width} != hook width {hidden} "
+                    f"(residual-stream hooks are hidden_size-wide)"
+                )
+    return None
+
+
+def _validate_vector_source(
+    body: PatchSweepRequest, raw_request: Request, vllm_config, vector_sourced: bool
+) -> str | None:
+    """Validate the sweep's source mode. Returns an error message or ``None``.
+
+    Capture-sourced sweeps need ``source_run``; vector-sourced sweeps need
+    exactly one of ``source_module`` / ``source_inline`` (and reject
+    capture-only knobs + the recovered metric)."""
+    if not vector_sourced:
+        if body.source_run is None:
+            return (
+                "source_run is required for a capture-sourced sweep (or set "
+                "source_module / source_inline for a vector-sourced sweep)"
+            )
+        return _validate_sweep_vectors(body, vllm_config)
+    if body.source_module is not None and body.source_inline is not None:
+        return "set exactly one of source_module / source_inline"
+    if body.source_run is not None:
+        return "source_run cannot be combined with a vector source"
+    if body.clean_prompt is not None:
+        return "clean_prompt is capture-sourced; omit it for vector-sourced sweeps"
+    if body.metric == "recovered":
+        return (
+            "recovered metric needs a clean baseline, which is unavailable for "
+            "vector-sourced sweeps"
+        )
+    if body.source_module is not None and body.source_module != "zeros":
+        registry = getattr(raw_request.app.state, "steering_module_registry", None)
+        if registry is None or registry.get(body.source_module) is None:
+            avail = registry.list_modules() if registry is not None else []
+            return (
+                f"unknown source_module {body.source_module!r}; "
+                f"available: {avail or 'none'}"
+            )
+    if body.source_inline is not None and body.patch_vectors is None:
+        return "source_inline requires patch_vectors"
+    return _validate_sweep_vectors(body, vllm_config)
+
+
 # ---- endpoint -------------------------------------------------------------
 
 
@@ -153,6 +276,7 @@ async def _first_token_logprobs(
     tag: str,
     grade_token_ids: list[int] | None = None,
     request_id: str | None = None,
+    patch_vectors: dict | None = None,
 ) -> tuple[dict[int, Any] | None, int]:
     """Run one short greedy generation; return (first-token logprobs, n_prompt).
 
@@ -161,12 +285,14 @@ async def _first_token_logprobs(
     dict, independent of top-k rank. Without it, an answer outside the top-k
     silently graded as ``None`` (top-k boundary flicker). The engine requires
     ``logprobs == len(logprob_token_ids)`` when ids are given (ids replace
-    top-k)."""
+    top-k). ``patch_vectors`` (the request-level packed table) rides along for
+    ``source_inline`` / mask ``inline`` cells."""
     sp = SamplingParams(
         temperature=0.0,
         max_tokens=1,
         logprobs=len(grade_token_ids) if grade_token_ids else logprobs,
         patch=patch,
+        patch_vectors=patch_vectors,
         logprob_token_ids=grade_token_ids,
     )
     request_id = request_id or f"patchsweep-{tag}-{uuid4().hex[:8]}"
@@ -292,7 +418,8 @@ async def _sweep_events(
     multi_hook: bool,
     layers: list[int],
     positions: list[int],
-    source_for,
+    cell_patch: Callable[[str, int, int], list[dict]],
+    patch_vectors: dict | None,
     grade_ids: list[int],
     corrupt_val: float | None,
     auto_captured: bool,
@@ -353,16 +480,7 @@ async def _sweep_events(
     async def run_cell(
         hook: str, i: int, layer: int, j: int, pos: int
     ) -> tuple[str, int, int, int, int, float | None]:
-        patch = [
-            {
-                "layer": layer,
-                "hook": hook,
-                "dest_position": pos,
-                "source_run": body.source_run,
-                "source_position": source_for(pos),
-                "alpha": body.alpha,
-            }
-        ]
+        patch = cell_patch(hook, layer, pos)
         request_id = f"patchsweep-{hook}-{layer}-{pos}-{uuid4().hex[:8]}"
         cell_req_ids[request_id] = (hook, i, layer, j, pos)
         lp, _ = await _first_token_logprobs(
@@ -373,6 +491,7 @@ async def _sweep_events(
             f"{hook}-{layer}-{pos}",
             grade_ids,
             request_id,
+            patch_vectors=patch_vectors,
         )
         return hook, i, layer, j, pos, (cell_metric(lp, body) if lp else None)
 
@@ -582,6 +701,14 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     if any(not (0 <= layer < num_layers) for layer in layers):
         return _err(f"layer out of range [0, {num_layers})")
 
+    # Source mode: a sweep is either capture-sourced (source_run, existing
+    # behavior) or vector-sourced (a client-provided source_module / inline
+    # value patched identically into every cell — no capture, no clean run).
+    vector_sourced = body.source_module is not None or body.source_inline is not None
+    err = _validate_vector_source(body, raw_request, vllm_config, vector_sourced)
+    if err is not None:
+        return _err(err)
+
     # Resolve answer/foil to token ids once; every generation then scores them
     # exactly via logprob_token_ids (no top-k dependence, no None flicker).
     try:
@@ -624,6 +751,30 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
     if not layers or not positions:
         return _err("empty sweep grid (no layers or positions)")
     corrupt_val = cell_metric(corrupt_lp, body) if corrupt_lp else None
+
+    # Vector-sourced sweeps carry their value with the request: no auto-capture,
+    # no clean run, no source-manifest existence check, no alignment (positions
+    # are the dest run's own). Every cell patches its site from the same client
+    # source + mask.
+    if vector_sourced:
+        skipped: list[dict] = []
+        return await _dispatch_sweep(
+            eng=eng,
+            body=body,
+            effective_hooks=effective_hooks,
+            multi_hook=multi_hook,
+            layers=layers,
+            positions=positions,
+            cell_patch=_make_vector_cell_patch(body),
+            patch_vectors=body.patch_vectors,
+            grade_ids=grade_ids,
+            corrupt_val=corrupt_val,
+            auto_captured=False,
+            captured_source_run=None,
+            auto_clean_val=None,
+            skipped=skipped,
+            alignment_summary=None,
+        )
 
     # One-call auto-capture: if the referenced run is confirmed missing and a
     # clean_prompt was given, capture the clean run ourselves (all injectable
@@ -737,18 +888,18 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         return _err(str(exc))
 
     # Fan out one patched variant per (hook, layer, position) cell; the engine
-    # batches them. The fan-out + response assembly live in a single generator
-    # both paths share: streaming serializes each event to SSE, non-streaming
-    # drains the summary. The auto-drop lifecycle lives inside the generator so
-    # both paths (and early disconnects) free the auto-captured run.
-    gen_kwargs: dict = dict(
+    # batches them. Streaming and non-streaming share one assembly generator
+    # (see _dispatch_sweep). The auto-drop lifecycle lives inside the generator
+    # so both paths (and early disconnects) free the auto-captured run.
+    return await _dispatch_sweep(
         eng=eng,
         body=body,
         effective_hooks=effective_hooks,
         multi_hook=multi_hook,
         layers=layers,
         positions=positions,
-        source_for=source_for,
+        cell_patch=_make_capture_cell_patch(body, source_for),
+        patch_vectors=body.patch_vectors,
         grade_ids=grade_ids,
         corrupt_val=corrupt_val,
         auto_captured=auto_captured,
@@ -757,17 +908,27 @@ async def patch_sweep(body: PatchSweepRequest, raw_request: Request):
         skipped=skipped,
         alignment_summary=alignment_summary,
     )
+
+
+async def _dispatch_sweep(**gen_kwargs):
+    """Route an assembled sweep to SSE (``stream``) or a single JSON response.
+
+    Both consume the shared :func:`_sweep_events` generator; the streaming path
+    serializes each event to SSE, the non-streaming path drains the summary.
+    """
+    body = gen_kwargs["body"]
+    effective_hooks = gen_kwargs["effective_hooks"]
     if body.stream:
         start_event = {
             "type": "start",
-            "layers": layers,
-            "positions": positions,
+            "layers": gen_kwargs["layers"],
+            "positions": gen_kwargs["positions"],
             "hook": effective_hooks[0],
             "metric": body.metric,
-            "auto_captured": auto_captured,
-            "captured_source_run": captured_source_run,
+            "auto_captured": gen_kwargs["auto_captured"],
+            "captured_source_run": gen_kwargs["captured_source_run"],
         }
-        if multi_hook:
+        if gen_kwargs["multi_hook"]:
             start_event["hooks"] = effective_hooks
         return StreamingResponse(
             _sweep_sse(start_event, **gen_kwargs),
