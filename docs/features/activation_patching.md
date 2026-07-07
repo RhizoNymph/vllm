@@ -55,8 +55,18 @@ answer.
   the *precise* prefix-cache floor (APC position-windowing) rather than failing
   safe to no-reuse as it did before. Source existence is not pre-checked at
   admission on these paths — a missing source is caught by the worker
-  resolution-failure registry backstop. Sweeps are Python-only (see the Rust
-  frontend's README for the not-ported surface and the rationale).
+  resolution-failure registry backstop.
+- **Rust frontend, server-side sweeps:** the `/v1/patch_sweep` surface is served
+  through the Rust frontend by an auto-spawned Python **patch sidecar**. When
+  vLLM launches with the Rust frontend and `--enable-patching`, the driver also
+  starts one loopback Python `api_server` (`--patch-sidecar-port`, default
+  auto-picked) attached to the *same* engines as a second engine client — one
+  weight set, one KV cache, one shared worker-side `PatchSourceStore` — and the
+  Rust server reverse-proxies `POST /v1/patch_sweep` and
+  `DELETE /v1/patch_source/{run_id}` to it, streaming SSE chunks through
+  unbuffered and propagating client disconnect upstream. Set
+  `VLLM_RUST_PATCH_SIDECAR=0` to skip the sidecar; the Rust frontend then
+  returns HTTP 501 for those routes. See the Rust frontend's README for details.
 
 ## Request API
 
