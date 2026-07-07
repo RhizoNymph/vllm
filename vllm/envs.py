@@ -146,6 +146,7 @@ if TYPE_CHECKING:
     V_SCALE_CONSTANT: int = 100
     VLLM_USE_RUST_FRONTEND: bool = False
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
+    VLLM_RUST_PATCH_SIDECAR: bool = True
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
@@ -1292,6 +1293,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the binary installed with the vllm package. Only used when
     # VLLM_USE_RUST_FRONTEND=1.
     "VLLM_RUST_FRONTEND_PATH": lambda: _resolve_rust_frontend_path(),
+    # When the Rust frontend is used together with activation patching
+    # (--enable-patching), vLLM additionally spawns an internal loopback
+    # Python api_server (the "patch sidecar") attached to the same engines and
+    # the Rust server reverse-proxies the /v1/patch_sweep routes to it. Set to
+    # 0 to skip the sidecar; the Rust frontend then returns HTTP 501 for those
+    # routes.
+    "VLLM_RUST_PATCH_SIDECAR": lambda: bool(
+        int(os.getenv("VLLM_RUST_PATCH_SIDECAR", "1"))
+    ),
     # If set, vllm will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`

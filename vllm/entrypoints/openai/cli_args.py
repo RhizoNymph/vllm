@@ -420,6 +420,15 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "Defaults to data_parallel_size if not specified.",
     )
     parser.add_argument(
+        "--patch-sidecar-port",
+        type=int,
+        default=0,
+        help="Loopback port for the internal activation-patching sidecar "
+        "api_server spawned when the Rust frontend is used with "
+        "--enable-patching. 0 (default) auto-picks a free port. Ignored "
+        "without the Rust frontend or when VLLM_RUST_PATCH_SIDECAR=0.",
+    )
+    parser.add_argument(
         "--config",
         help="Read CLI options from a config file. "
         "Must be a YAML with the following options: "

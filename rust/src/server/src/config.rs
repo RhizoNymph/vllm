@@ -166,6 +166,11 @@ pub struct Config {
     /// Named steering modules to load at startup and broadcast to the engine
     /// workers, so requests can reference them by `steering_name`.
     pub steering_modules: Vec<SteeringModulePath>,
+    /// Base URL of the internal activation-patching sidecar (a loopback Python
+    /// api_server attached to the same engines). When set, the frontend
+    /// reverse-proxies the `/v1/patch_sweep` and `/v1/patch_source/{run_id}`
+    /// routes to it; when `None`, those routes return HTTP 501.
+    pub patch_sidecar_url: Option<String>,
 }
 
 impl Config {

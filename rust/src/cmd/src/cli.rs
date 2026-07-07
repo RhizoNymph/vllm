@@ -309,6 +309,7 @@ impl SharedRuntimeArgs {
         coordinator_address: Option<String>,
         engine_start_index: u32,
         engine_count: usize,
+        patch_sidecar_url: Option<String>,
     ) -> Config {
         let ready_timeout = self.ready_timeout();
         let shutdown_timeout = self.shutdown_timeout();
@@ -346,6 +347,7 @@ impl SharedRuntimeArgs {
             grpc_port: self.grpc_port,
             shutdown_timeout,
             steering_modules: self.steering_modules,
+            patch_sidecar_url,
         }
     }
 
@@ -394,6 +396,9 @@ impl SharedRuntimeArgs {
             grpc_port: self.grpc_port,
             shutdown_timeout,
             steering_modules: self.steering_modules,
+            // The managed `serve` path runs Python as a headless engine only;
+            // there is no separate patch sidecar to proxy to.
+            patch_sidecar_url: None,
         }
     }
 
@@ -489,6 +494,12 @@ pub struct FrontendArgs {
     #[arg(long, default_value_t = 1)]
     pub engine_count: usize,
 
+    /// Base URL of the internal activation-patching sidecar (a loopback Python
+    /// api_server on the same engines). When set, the frontend reverse-proxies
+    /// the patch-study routes to it; otherwise those routes return HTTP 501.
+    #[arg(long)]
+    pub patch_sidecar_url: Option<String>,
+
     /// Shared frontend arguments as one JSON object.
     #[arg(long = "args-json", value_parser = parse_runtime_args_json, value_name = "JSON")]
     pub runtime: SharedRuntimeArgs,
@@ -504,6 +515,7 @@ impl FrontendArgs {
             self.coordinator_address,
             self.engine_start_index,
             self.engine_count,
+            self.patch_sidecar_url,
         )
     }
 }

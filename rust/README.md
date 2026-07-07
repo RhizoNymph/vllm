@@ -124,31 +124,49 @@ curl http://127.0.0.1:8000/v1/completions \
   }'
 ```
 
-### What is not available through the Rust frontend
+### Server-side sweeps via the patch sidecar
 
-Only the **per-request** patch path is ported. The server-side sweep
-orchestration is **deliberately not** ported to Rust — it is a large,
-research-workflow-specific surface (`POST /v1/patch_sweep` plus one-call
+The full server-side sweep surface (`POST /v1/patch_sweep` plus one-call
 auto-capture, substring→position resolution, multi-hook grids, SSE streaming,
 the `DELETE /v1/patch_source/{run_id}` source-run lifecycle route, and the
-`PatchStudy` client). None of these exist through Rust. Also absent:
+`PatchStudy` client) **is** available through the Rust frontend, served by an
+auto-spawned Python **patch sidecar**:
+
+- When vLLM launches the Rust frontend **and** patching is enabled
+  (`--enable-patching`), the driver additionally spawns **one** ordinary Python
+  `api_server` bound to loopback (`127.0.0.1:<port>`, `--patch-sidecar-port`,
+  default auto-picked) attached to the **same engines** as a second engine
+  client. There is no second engine set — one set of weights, one KV cache, one
+  worker-side `PatchSourceStore` shared by both frontends.
+- The Rust server **reverse-proxies** `POST /v1/patch_sweep` and
+  `DELETE /v1/patch_source/{run_id}` to the sidecar: it forwards the method,
+  path, body, and relevant headers and streams the response back
+  **incrementally** (the sweep endpoint's `text/event-stream` SSE chunks pass
+  through as they land, never buffered). A client disconnect drops the upstream
+  connection so the Python side cancels the in-flight sweep's GPU work.
+- **Opt out** with `VLLM_RUST_PATCH_SIDECAR=0`: the sidecar is not spawned and
+  the Rust frontend returns **HTTP 501** for the sweep routes (pointing back at
+  this section). The sidecar is also absent whenever patching is disabled.
+
+The per-request `patch=` path above is served natively by Rust and does **not**
+go through the sidecar. Still absent on the Rust-native path (per-request only):
 
 - **Admission-time `400`s for a missing source run.** The Python serving layer
   pre-checks source existence via an engine RPC; the engine-side admission the
   Rust path uses does not. A missing source instead surfaces (loudly) at worker
   resolution via the resolution-failure registry backstop, not as an up-front
-  request rejection.
+  request rejection. (Sweeps proxied to the sidecar keep the Python `400`s.)
 - **The multimodal guard.** Rejecting patch specs on multimodal prompts is a
-  frontend concern and is not enforced on the Rust path.
+  frontend concern and is not enforced on the Rust-native per-request path.
 
-**Decision.** Sweep orchestration stays Python-only: the maintenance cost of a
-parity port outweighs current research-workflow demand, and the primitive that
-matters for programmatic patching (per-request `patch=`) is fully available. For
-grid sweeps / causal-tracing studies, run the Python `vllm.entrypoints.openai.api_server`.
-If Rust-served sweeps ever become a real need, the escalation ladder is: (1) run
-the Python api_server alongside the Rust frontend, (2) reverse-proxy just the
-`/v1/patch_sweep` route from Rust to Python, (3) lift sweep orchestration into a
-shared, frontend-agnostic layer both call.
+**Decision record.** Sweep *orchestration* itself stays Python-only — a parity
+port to Rust is not worth the maintenance cost. The sidecar realizes escalation
+tier 2 (reverse-proxy `/v1/patch_sweep` from Rust to Python) of the original
+ladder and supersedes the earlier "run the Python `api_server` separately"
+tier-1 workaround: one launch now gives the Rust frontend the whole sweep
+surface with a single engine set. Tier 3 (lifting orchestration into a shared,
+frontend-agnostic layer both call) remains a future option if a Rust-native
+implementation is ever justified.
 
 ### gRPC
 
