@@ -259,6 +259,10 @@ pub struct ChatCompletionRequest {
     /// Per-request activation-patching spec (list of site entries), forwarded
     /// verbatim to engine-core for offline admission
     pub patch: Option<Value>,
+
+    /// Request-level packed table of client-provided patch vectors referenced
+    /// by a patch entry's `source_inline` / mask `inline`, forwarded verbatim
+    pub patch_vectors: Option<Value>,
 }
 
 impl Default for ChatCompletionRequest {
@@ -328,6 +332,7 @@ impl Default for ChatCompletionRequest {
             steering_name: None,
             capture: None,
             patch: None,
+            patch_vectors: None,
         }
     }
 }

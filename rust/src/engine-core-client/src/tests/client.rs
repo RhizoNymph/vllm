@@ -2556,6 +2556,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             steering_module_ref: None,
             capture: None,
             patch: None,
+            patch_vectors: None,
         },
     );
 
