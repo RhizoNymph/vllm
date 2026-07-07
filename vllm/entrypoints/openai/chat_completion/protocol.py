@@ -502,7 +502,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "dest_position, source_run, source_position, alpha?} — overwrite "
             "(alpha=1) or interpolate toward the destination activation at "
             "(layer, hook, dest_position) with the clean run `source_run`'s "
-            "activation at `source_position`. Graded via normal logprobs."
+            "activation at `source_position`. Instead of source_run a client "
+            "may set source_module (named steering module or 'zeros') or "
+            "source_inline (a row of patch_vectors); an optional per-entry mask "
+            "restricts the patch to a subset of dims. Graded via normal "
+            "logprobs."
+        ),
+    )
+    patch_vectors: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Request-level packed table of client-provided patch vectors "
+            "referenced by a patch entry's source_inline / mask.inline row "
+            "index. Binary wire form: {dtype, shape:[n_rows, width], data: "
+            "base64}."
         ),
     )
 
@@ -780,6 +793,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             sampling_params.capture = dict(self.capture)
         if self.patch is not None:
             sampling_params.patch = [dict(e) for e in self.patch]
+        if self.patch_vectors is not None:
+            sampling_params.patch_vectors = dict(self.patch_vectors)
         return sampling_params
 
     @model_validator(mode="before")

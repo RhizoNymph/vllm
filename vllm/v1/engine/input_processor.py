@@ -520,6 +520,13 @@ class InputProcessor:
         Those are frontend concerns — engine-side, a missing source is caught
         (loudly) by the worker resolution-failure registry as a backstop, and
         the offline/multimodal combination is out of scope.
+
+        The new client-provided source kinds are structurally validated here
+        (exactly-one-of source, mask shape, packed ``patch_vectors``, inline
+        index-in-range/width). Offline has no frontend steering registry, so
+        ``source_module`` names (other than the reserved ``zeros``) CANNOT be
+        existence-checked here — a bad name surfaces loudly via the worker
+        resolution-failure registry (``named_module_exists`` is left ``None``).
         """
         from vllm.v1.capture.admission import build_capture_context
         from vllm.v1.capture.patch_admission import (
