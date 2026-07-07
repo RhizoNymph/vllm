@@ -357,6 +357,11 @@ pub struct EngineCoreSamplingParams {
     /// spec into prefix-cache flags (offline admission).
     #[serde(default)]
     pub capture: Option<serde_json::Value>,
+    /// Per-request activation-patching spec: a list of site entries. Forwarded
+    /// verbatim; engine-core's input processor resolves the raw spec into
+    /// prefix-cache flags (offline admission).
+    #[serde(default)]
+    pub patch: Option<serde_json::Value>,
 }
 
 impl EngineCoreSamplingParams {
@@ -390,6 +395,7 @@ impl EngineCoreSamplingParams {
             decode_steering_vectors: None,
             steering_module_ref: None,
             capture: None,
+            patch: None,
         }
     }
 }
@@ -681,6 +687,52 @@ mod tests {
             "layer key must be an integer, got {layer_key:?}"
         );
         assert_eq!(layer_key.as_u64(), Some(7));
+    }
+
+    #[test]
+    fn patch_spec_is_forwarded_verbatim_as_a_list() {
+        let spec = serde_json::json!([
+            {
+                "layer": 14,
+                "hook": "post_block",
+                "dest_position": 6,
+                "source_run": "clean",
+                "source_position": 6,
+                "alpha": 1.0,
+            }
+        ]);
+        let params = EngineCoreSamplingParams {
+            patch: Some(spec.clone()),
+            ..EngineCoreSamplingParams::for_test()
+        };
+
+        // `patch` serializes as a msgpack array under the `patch` field name,
+        // and round-trips back to the same JSON list engine-core admits.
+        let bytes = encode_msgpack(&params).unwrap();
+        let value = decode_value(&bytes).unwrap();
+        let map = match value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let get = |key: &str| map.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v);
+        assert!(
+            matches!(get("patch"), Some(Value::Array(_))),
+            "patch must forward as a msgpack array"
+        );
+
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.patch, Some(spec));
+    }
+
+    #[test]
+    fn patch_defaults_to_none_when_absent() {
+        // A request without a patch spec leaves the field `None`, so a missing
+        // `patch` key in the wire payload decodes cleanly (serde default).
+        let params = EngineCoreSamplingParams::for_test();
+        assert!(params.patch.is_none());
+        let decoded: EngineCoreSamplingParams =
+            decode_msgpack(&encode_msgpack(&params).unwrap()).unwrap();
+        assert!(decoded.patch.is_none());
     }
 
     #[test]

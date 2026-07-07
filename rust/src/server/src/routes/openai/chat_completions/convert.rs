@@ -146,6 +146,7 @@ pub(super) fn prepare_chat_request(
             decode_steering_vectors,
             steering_name: request.steering_name,
             capture: request.capture,
+            patch: request.patch,
         },
         chat_options: ChatOptions {
             generation_prompt_mode,

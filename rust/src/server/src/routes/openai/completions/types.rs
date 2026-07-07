@@ -189,6 +189,10 @@ pub struct CompletionRequest {
     /// name
     pub capture: Option<Value>,
 
+    /// Per-request activation-patching spec (list of site entries), forwarded
+    /// verbatim to engine-core for offline admission
+    pub patch: Option<Value>,
+
     /// Additional fields
     #[serde(flatten)]
     pub other: Map<String, Value>,

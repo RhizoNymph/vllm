@@ -255,6 +255,10 @@ pub struct ChatCompletionRequest {
     /// Per-request opt-in for activation-capture consumers, keyed by consumer
     /// name
     pub capture: Option<Value>,
+
+    /// Per-request activation-patching spec (list of site entries), forwarded
+    /// verbatim to engine-core for offline admission
+    pub patch: Option<Value>,
 }
 
 impl Default for ChatCompletionRequest {
@@ -323,6 +327,7 @@ impl Default for ChatCompletionRequest {
             decode_steering_vectors: None,
             steering_name: None,
             capture: None,
+            patch: None,
         }
     }
 }
