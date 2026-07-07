@@ -742,6 +742,142 @@ def _run_span(eng, prompt, positions, **kw):
     return asyncio.run(patch_sweep(body, _raw_request(eng)))
 
 
+# ---- vector-sourced sweeps (no capture run) -------------------------------
+
+
+class _FakeRegistry:
+    def __init__(self, names):
+        self._names = dict.fromkeys(names, object())
+
+    def get(self, name):
+        return self._names.get(name)
+
+    def list_modules(self):
+        return list(self._names)
+
+
+def _raw_request_reg(eng, registry=None):
+    state = SimpleNamespace(engine_client=eng, steering_module_registry=registry)
+    return SimpleNamespace(app=SimpleNamespace(state=state))
+
+
+def _vec_engine(num_layers=12, hidden_size=8):
+    eng = _MockEngine(runs=[], num_layers=num_layers)
+    eng.vllm_config.model_config.get_hidden_size = lambda: hidden_size
+    return eng
+
+
+def _pack_rows(rows, width):
+    import numpy as np
+    import pybase64 as base64
+
+    arr = np.zeros((rows, width), dtype=np.float32)
+    return {
+        "dtype": "float32",
+        "shape": [rows, width],
+        "data": base64.b64encode(arr.tobytes()).decode("ascii"),
+    }
+
+
+def _run_vec(eng, registry=None, **kw):
+    patch_admission._PATCH_SOURCE_CACHE = patch_admission._PatchSourceCache()
+    base = dict(prompt="ab", layers=[0, 1], hook="post_block", answer_token_id=5)
+    base.update(kw)
+    body = PatchSweepRequest(**base)
+    return asyncio.run(patch_sweep(body, _raw_request_reg(eng, registry)))
+
+
+class TestVectorSourcedSweep:
+    def test_zeros_happy_path_no_capture(self):
+        eng = _vec_engine()
+        resp = _run_vec(eng, source_module="zeros")
+        assert not isinstance(resp, JSONResponse)
+        assert resp.auto_captured is False
+        assert resp.captured_source_run is None
+        assert not any(sp.capture is not None for sp in eng.sampling_params)
+        assert eng.dropped == []
+        # grid populated (2 layers x 2 positions), each patched cell.
+        assert len(resp.grid) == 2 and len(resp.grid[0]) == 2
+        assert resp.grid[0][0] == _CELL_LP
+        # every cell request carried a source_module=zeros patch (no source_run).
+        patched = [sp for sp in eng.sampling_params if sp.patch]
+        assert patched
+        for sp in patched:
+            e = sp.patch[0]
+            assert e["source_module"] == "zeros"
+            assert "source_run" not in e
+
+    def test_recovered_metric_400(self):
+        eng = _vec_engine()
+        resp = _run_vec(eng, source_module="zeros", metric="recovered")
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "recovered" in json.loads(resp.body)["error"]
+
+    def test_unknown_source_module_400(self):
+        eng = _vec_engine()
+        resp = _run_vec(eng, registry=_FakeRegistry(["good"]), source_module="bad")
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "unknown source_module" in json.loads(resp.body)["error"]
+
+    def test_known_source_module_ok(self):
+        eng = _vec_engine()
+        resp = _run_vec(eng, registry=_FakeRegistry(["good"]), source_module="good")
+        assert not isinstance(resp, JSONResponse)
+        assert resp.grid[0][0] == _CELL_LP
+
+    def test_source_inline_forwards_patch_vectors(self):
+        eng = _vec_engine(hidden_size=8)
+        pv = _pack_rows(2, 8)
+        resp = _run_vec(eng, source_inline=1, patch_vectors=pv)
+        assert not isinstance(resp, JSONResponse)
+        patched = [sp for sp in eng.sampling_params if sp.patch]
+        assert patched
+        for sp in patched:
+            assert sp.patch[0]["source_inline"] == 1
+            assert sp.patch_vectors == pv
+
+    def test_source_inline_width_mismatch_400(self):
+        eng = _vec_engine(hidden_size=8)
+        resp = _run_vec(eng, source_inline=0, patch_vectors=_pack_rows(1, 4))
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        assert "width" in json.loads(resp.body)["error"]
+
+    def test_source_inline_without_table_400(self):
+        eng = _vec_engine()
+        resp = _run_vec(eng, source_inline=0)
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+
+    def test_streaming_parity_with_nonstreaming(self):
+        eng_plain = _vec_engine()
+        plain = _run_vec(eng_plain, source_module="zeros")
+        assert not isinstance(plain, JSONResponse)
+        eng_stream = _vec_engine()
+        resp = _run_vec(eng_stream, source_module="zeros", stream=True)
+        assert isinstance(resp, StreamingResponse)
+        events, _ = _sse_events(resp)
+        summary = next(e for e in events if e["type"] == "summary")
+        summary = {k: v for k, v in summary.items() if k != "type"}
+        assert summary == plain.model_dump()
+
+    def test_source_run_and_vector_conflict_400(self):
+        eng = _vec_engine()
+        resp = _run_vec(eng, source_module="zeros", source_run="R1")
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+
+    def test_mask_zeros_ablation(self):
+        eng = _vec_engine()
+        resp = _run_vec(eng, source_module="zeros", mask={"indices": [0, 2]})
+        assert not isinstance(resp, JSONResponse)
+        patched = [sp for sp in eng.sampling_params if sp.patch]
+        for sp in patched:
+            assert sp.patch[0]["mask"] == {"indices": [0, 2]}
+
+
 class TestEndpointSpans:
     def test_all_prompt_expands_to_full_axis(self):
         eng = _span_engine("The cat", [0, 1])

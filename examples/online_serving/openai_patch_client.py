@@ -143,6 +143,26 @@ async def walk(model: str, base_url: str, num_layers: int) -> None:
         vals = " ".join(f"{v:+.2f}" if v is not None else "  ? " for v in res.grid[0])
         print(f"  {hook:>10}: {vals}")
 
+    # 4. Ablation sweep: no clean run needed. Zero-ablate a couple of residual
+    #    dims across the peak region and watch the answer logprob move. The same
+    #    call shape works with source="<named steering module>" or a packed
+    #    patch_vectors table (study.pack_vectors(...) + source_inline=<row>).
+    ablate = await study.ablation_sweep(
+        CORRUPT,
+        source="zeros",
+        mask={"indices": [12, 40]},
+        layers=range(lo, hi),
+        positions=[Span(SPAN)],
+        answer_token=ANSWER,
+        metric="logprob",
+    )
+    print(f"4. zero-ablation of dims 12,40 (layers {lo}..{hi - 1} @ '{SPAN}')")
+    for i, layer in enumerate(ablate.layers):
+        vals = " ".join(
+            f"{v:+.2f}" if v is not None else "  ? " for v in ablate.grid[i]
+        )
+        print(f"  L{layer:>2}: {vals}")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
