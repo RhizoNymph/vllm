@@ -90,3 +90,23 @@ pub enum Error {
     #[error(transparent)]
     Shared(Arc<Self>),
 }
+
+impl Error {
+    /// Whether this error is a per-frame decode failure of an engine-core
+    /// output message, as opposed to a fatal transport/engine condition.
+    ///
+    /// A single undecodable output frame (e.g. after a wire-format drift) must
+    /// not tear down the whole client: the output dispatcher logs and skips it
+    /// so subsequent frames for other requests keep flowing. Transport failures
+    /// and the engine-dead sentinel are fatal and are not classified here.
+    pub fn is_output_frame_decode_failure(&self) -> bool {
+        match self {
+            Self::Decode { .. }
+            | Self::ValueDecode(_)
+            | Self::ExtValueDecode { .. }
+            | Self::UnsupportedAuxFrames { .. } => true,
+            Self::Shared(inner) => inner.is_output_frame_decode_failure(),
+            _ => false,
+        }
+    }
+}

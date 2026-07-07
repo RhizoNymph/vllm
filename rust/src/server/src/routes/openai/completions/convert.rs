@@ -139,6 +139,7 @@ pub(super) fn prepare_completion_request(
             decode_steering_vectors,
             steering_name: request.steering_name,
             capture: request.capture,
+            patch: request.patch,
         },
         decode_options: TextDecodeOptions {
             skip_special_tokens: request.skip_special_tokens,

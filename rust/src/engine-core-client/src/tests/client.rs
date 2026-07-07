@@ -422,13 +422,6 @@ fn is_engine_core_dead(error: &Error) -> bool {
     }
 }
 
-fn is_decode_error(error: &Error) -> bool {
-    match error {
-        Error::Decode { .. } | Error::ExtValueDecode { .. } => true,
-        Error::Shared(error) => is_decode_error(error),
-        _ => false,
-    }
-}
 
 fn is_unexpected_dispatcher_output(error: &Error) -> bool {
     match error {
@@ -472,10 +465,11 @@ fn multipart_logprob_output_frames(request_id: &str) -> Vec<bytes::Bytes> {
             Value::Nil,
             Value::from(EngineCoreFinishReason::Length as u8),
         ])]),
-        Value::Nil,
-        Value::from(0.0),
-        Value::Nil,
-        Value::Array(vec![Value::from(request_id)]),
+        Value::Nil,             // scheduler_stats
+        Value::from(0.0),       // timestamp
+        Value::Nil,             // utility_output
+        Value::Map(vec![]),     // late_capture_results (empty map, real wire)
+        Value::Array(vec![Value::from(request_id)]), // finished_requests
     ]);
 
     vec![
@@ -1336,21 +1330,37 @@ async fn dropping_multiple_live_streams_aborts_all_in_a_burst() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dispatcher_failure_propagates_to_streams_and_future_calls() {
+async fn undecodable_output_frame_is_skipped_without_wedging_client() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-fail".to_vec();
+    let engine_id = b"engine-skip-bad-frame".to_vec();
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
         engine_id.clone(),
         |dealer, push| {
             Box::pin(async move {
-                let _ = recv_engine_message(dealer).await;
-                let _ = recv_engine_message(dealer).await;
+                let add = recv_engine_message(dealer).await;
+                assert_eq!(add[0].as_ref(), &[0x00]);
+                let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
 
+                // An undecodable frame must NOT wedge the client: the dispatcher
+                // logs and skips it, then keeps processing later frames.
                 push.send(ZmqMessage::from(vec![0xc1])).await.unwrap();
+                send_outputs(
+                    push,
+                    EngineCoreOutputs {
+                        outputs: vec![request_output(
+                            &request.request_id,
+                            vec![7, 8],
+                            Some(EngineCoreFinishReason::Length),
+                        )],
+                        finished_requests: Some(BTreeSet::from([request.request_id.clone()])),
+                        ..Default::default()
+                    },
+                )
+                .await;
             })
         },
     );
@@ -1368,33 +1378,18 @@ async fn dispatcher_failure_propagates_to_streams_and_future_calls() {
     )
     .await;
 
-    let mut stream_1 = client.call(sample_request_with_id("req-1")).await.unwrap();
-    let mut stream_2 = client.call(sample_request_with_id("req-2")).await.unwrap();
-
-    let error_1 = timeout(Duration::from_secs(1), stream_1.next())
+    let mut stream = client.call(sample_request_with_id("req-1")).await.unwrap();
+    let output = timeout(Duration::from_secs(1), stream.next())
         .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
-    let error_2 = timeout(Duration::from_secs(1), stream_2.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
-    assert!(is_decode_error(&error_1));
-    assert!(is_decode_error(&error_2));
-    assert!(is_decode_error(
-        client.health_error().as_deref().expect("health error recorded")
-    ));
+        .expect("output arrives after the skipped bad frame")
+        .expect("request stream stays open")
+        .expect("valid output delivered");
+    assert_eq!(output.output.new_token_ids, vec![7, 8]);
 
-    let abort_error = client.abort(&["req-1".to_string()]).await.unwrap_err();
-    assert!(is_decode_error(&abort_error));
-
-    let add_error = match client.call(sample_request_with_id("req-3")).await {
-        Ok(_) => panic!("expected dispatcher closed error"),
-        Err(error) => error,
-    };
-    assert!(is_decode_error(&add_error));
+    // The client stayed healthy and still accepts new work.
+    assert!(client.is_healthy());
+    assert!(client.health_error().is_none());
+    let _new_stream = client.call(sample_request_with_id("req-2")).await.unwrap();
 
     let _ = shutdown_tx.send(());
     engine_task.await.unwrap();
@@ -1527,11 +1522,11 @@ async fn call_utility_failure_message_surfaces_as_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dispatcher_failure_propagates_to_waiting_utility_calls() {
+async fn undecodable_frame_does_not_fail_waiting_utility_calls() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-utility-dispatcher-fail".to_vec();
+    let engine_id = b"engine-utility-skip-bad-frame".to_vec();
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
@@ -1540,8 +1535,28 @@ async fn dispatcher_failure_propagates_to_waiting_utility_calls() {
             Box::pin(async move {
                 let utility = recv_engine_message(dealer).await;
                 assert_eq!(utility[0].as_ref(), &[0x03]);
+                let payload = decode_value(&utility[1]);
+                let array = match payload {
+                    Value::Array(array) => array,
+                    other => panic!("expected utility payload array, got {other:?}"),
+                };
+                let call_id = array[1].as_u64().expect("call_id");
 
+                // An undecodable frame is skipped; the still-waiting utility call
+                // is resolved by the following valid frame.
                 push.send(ZmqMessage::from(vec![0xc1])).await.unwrap();
+                send_outputs(
+                    push,
+                    EngineCoreOutputs {
+                        utility_output: Some(UtilityOutput {
+                            call_id: call_id.into(),
+                            failure_message: None,
+                            result: Some(utility_result_value(true)),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await;
             })
         },
     );
@@ -1552,18 +1567,17 @@ async fn dispatcher_failure_propagates_to_waiting_utility_calls() {
             1,
             "test-model",
             Duration::from_secs(2),
-            0,
+            5,
             None,
         ),
         &ipc,
     )
     .await;
 
-    let error = client.call_utility::<bool, _>("is_sleeping", ()).await.unwrap_err();
-    assert!(is_decode_error(&error));
-    assert!(is_decode_error(
-        client.health_error().as_deref().expect("health error recorded")
-    ));
+    let is_sleeping = client.call_utility::<bool, _>("is_sleeping", ()).await.unwrap();
+    assert_eq!(is_sleeping, vec![true]);
+    assert!(client.is_healthy());
+    assert!(client.health_error().is_none());
 
     let _ = shutdown_tx.send(());
     engine_task.await.unwrap();
@@ -1677,23 +1691,43 @@ async fn engine_core_dead_sentinel_marks_client_unhealthy_and_sticks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn output_loop_failure_marks_client_unhealthy_and_records_first_error() {
+async fn consecutive_undecodable_output_frames_are_all_skipped() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-output-failure".to_vec();
+    let engine_id = b"engine-output-skip-bad-frames".to_vec();
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
         handshake_address.clone(),
         engine_id.clone(),
-        |_dealer, push| {
+        |dealer, push| {
             Box::pin(async move {
+                let add = recv_engine_message(dealer).await;
+                assert_eq!(add[0].as_ref(), &[0x00]);
+                let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
+
+                // Several undecodable frames in a row must all be skipped without
+                // tearing down the loop.
                 send_output_frames(
                     push,
                     vec![
                         bytes::Bytes::from_static(b"frame-1"),
                         bytes::Bytes::from_static(b"frame-2"),
                     ],
+                )
+                .await;
+                push.send(ZmqMessage::from(vec![0xc1])).await.unwrap();
+                send_outputs(
+                    push,
+                    EngineCoreOutputs {
+                        outputs: vec![request_output(
+                            &request.request_id,
+                            vec![9],
+                            Some(EngineCoreFinishReason::Length),
+                        )],
+                        finished_requests: Some(BTreeSet::from([request.request_id.clone()])),
+                        ..Default::default()
+                    },
                 )
                 .await;
             })
@@ -1713,19 +1747,16 @@ async fn output_loop_failure_marks_client_unhealthy_and_records_first_error() {
     )
     .await;
 
-    timeout(Duration::from_secs(2), async {
-        while client.is_healthy() {
-            let _ = client.call_utility::<bool, _>("is_sleeping", ()).await;
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("wait for unhealthy client");
+    let mut stream = client.call(sample_request_with_id("req-1")).await.unwrap();
+    let output = timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("output arrives after several skipped bad frames")
+        .expect("request stream stays open")
+        .expect("valid output delivered");
+    assert_eq!(output.output.new_token_ids, vec![9]);
 
-    assert!(!client.is_healthy());
-    assert!(is_decode_error(
-        client.health_error().as_deref().expect("health error recorded")
-    ));
+    assert!(client.is_healthy());
+    assert!(client.health_error().is_none());
 
     let _ = shutdown_tx.send(());
     engine_task.await.unwrap();
@@ -2524,6 +2555,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             decode_steering_vectors: None,
             steering_module_ref: None,
             capture: None,
+            patch: None,
         },
     );
 
@@ -2577,6 +2609,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             scheduler_stats: None,
             timestamp: 0.0,
             utility_output: None,
+            late_capture_results: {},
             finished_requests: Some(
                 {
                     "req-1",

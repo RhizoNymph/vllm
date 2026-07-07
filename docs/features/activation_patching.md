@@ -43,6 +43,21 @@ Both prove no-op / self-identity are bit-exact, cross-run replace reproduces the
 clean run within bf16 accumulation, and single-site denoising surfaces the clean
 answer.
 
+## Frontends
+
+- **Python OpenAI server** (`vllm.entrypoints.openai.api_server`): the full
+  surface — per-request `patch=`, admission-time source-existence `400`s, the
+  multimodal guard, and the server-side `/v1/patch_sweep` grid sweeps (with
+  auto-capture, substring positions, multi-hook grids, SSE streaming, and the
+  source-run lifecycle route).
+- **Offline `LLM()`** and the **Rust frontend**: per-request `patch=` with
+  engine-side admission (`vllm/v1/engine/input_processor.py`), which now stamps
+  the *precise* prefix-cache floor (APC position-windowing) rather than failing
+  safe to no-reuse as it did before. Source existence is not pre-checked at
+  admission on these paths — a missing source is caught by the worker
+  resolution-failure registry backstop. Sweeps are Python-only (see the Rust
+  frontend's README for the not-ported surface and the rationale).
+
 ## Request API
 
 A patch spec is a list of site entries on `SamplingParams`:
@@ -402,8 +417,10 @@ python -m vllm.entrypoints.openai.api_server \
   `vllm/v1/capture/consumers/patch_source.py`,
   `vllm/v1/worker/gpu/patch_resolve.py`.
 - Config / admission: `vllm/config/patch.py`, `vllm/sampling_params.py`
-  (`patch` field), `vllm/v1/capture/patch_admission.py`, `vllm/v1/request.py`
-  (prefix floor), `vllm/v1/core/sched/scheduler.py` (backpressure).
+  (`patch` field), `vllm/v1/capture/patch_admission.py`,
+  `vllm/v1/engine/input_processor.py` (`_resolve_patch_prefix_flags` — offline /
+  Rust / non-OpenAI engine-side admission), `vllm/v1/request.py` (prefix floor),
+  `vllm/v1/core/sched/scheduler.py` (backpressure).
 - Endpoint / client: `vllm/entrypoints/serve/patch/` (endpoint:
   `api_router.py`; request/response: `protocol.py`; client: `client.py`;
   shared substring→position math: `spans.py`; position alignment:

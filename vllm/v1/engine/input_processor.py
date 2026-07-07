@@ -371,6 +371,26 @@ class InputProcessor:
                 prompt_embeds,
             )
 
+        # Offline patch admission: resolve the per-request patch spec into
+        # prefix-cache reuse flags (the OpenAI path does this in
+        # ``_admit_patch``). Idempotent — served requests arrive already
+        # stamped and skip this; it only fires for offline / direct ``LLM``
+        # requests. Unlike capture's best-effort resolution, an invalid offline
+        # patch spec raises ``ValueError`` (rejecting the request): patch
+        # entries carry explicit positions validated against the model's real
+        # shape, so a bad spec is a hard client error.
+        if (
+            sampling_params is not None
+            and sampling_params.patch
+            and sampling_params.patch_touches_prompt is None
+        ):
+            self._resolve_patch_prefix_flags(
+                request_id,
+                sampling_params,
+                prompt_token_ids,
+                prompt_embeds,
+            )
+
         # Multimodal related.
         mm_features: list[MultiModalFeatureSpec] | None = None
 
@@ -476,6 +496,56 @@ class InputProcessor:
                 request_id,
                 exc,
             )
+
+    def _resolve_patch_prefix_flags(
+        self,
+        request_id: str,
+        sampling_params: SamplingParams,
+        prompt_token_ids: list[int] | None,
+        prompt_embeds: Any,
+    ) -> None:
+        """Offline analogue of the serving layer's ``_admit_patch``.
+
+        Resolves ``sampling_params.patch`` into the prefix-cache reuse flags
+        (``patch_touches_prompt`` / ``patch_min_prompt_position``) so offline
+        (and any non-OpenAI) requests get the same precise APC windowing served
+        requests get. Unlike the best-effort capture path, an invalid patch
+        spec raises ``ValueError`` — patch entries carry explicit
+        ``dest_position`` ints validated against the model's real shape, so a
+        bad spec is a hard client error that must fail loud (the engine rejects
+        the request, mirroring the serving layer's 400).
+
+        Deliberately narrower than the serving layer's ``_admit_patch``: it does
+        NOT run the source-manifest existence pre-check or the multimodal guard.
+        Those are frontend concerns — engine-side, a missing source is caught
+        (loudly) by the worker resolution-failure registry as a backstop, and
+        the offline/multimodal combination is out of scope.
+        """
+        from vllm.v1.capture.admission import build_capture_context
+        from vllm.v1.capture.patch_admission import (
+            PatchValidationError,
+            resolve_patch_prefix_flags,
+        )
+
+        patch_config = getattr(self.vllm_config, "patch_config", None)
+        if patch_config is None:
+            raise ValueError(
+                "A patch spec was provided but patching is not enabled. Start "
+                "vLLM with --enable-patching to use per-request activation "
+                "patching."
+            )
+
+        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+            prompt_token_ids, prompt_embeds
+        )
+        ctx = build_capture_context(self.vllm_config, num_prompt_tokens, request_id)
+        max_patch_slots = getattr(patch_config, "max_patch_slots", 0)
+        try:
+            resolve_patch_prefix_flags(
+                sampling_params, ctx, max_patch_slots=max_patch_slots
+            )
+        except PatchValidationError as exc:
+            raise ValueError(str(exc)) from exc
 
     def _validate_prompt_len(
         self,
