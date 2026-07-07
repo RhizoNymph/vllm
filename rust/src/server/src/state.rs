@@ -49,6 +49,40 @@ pub struct AppState {
     server_load: AtomicU64,
     /// Dynamic LoRA adapter registry.
     lora_manager: LoraManager,
+    /// Reverse-proxy target for the activation-patching sweep routes, when a
+    /// Python patch sidecar was spawned alongside this frontend.
+    patch_sidecar: Option<PatchSidecar>,
+}
+
+/// Reverse-proxy target for the activation-patching sweep routes.
+///
+/// Holds the sidecar's base URL and a shared HTTP client. The client is reused
+/// across requests so streaming (SSE) proxying keeps a warm connection pool.
+#[derive(Clone)]
+pub(crate) struct PatchSidecar {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl PatchSidecar {
+    /// Construct a sidecar target directly from a base URL (test helper).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Absolute upstream URL for a sidecar path (e.g. `/v1/patch_sweep`).
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    /// Shared HTTP client used to forward requests to the sidecar.
+    pub(crate) fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
 }
 
 impl AppState {
@@ -76,7 +110,25 @@ impl AppState {
             steering_mutation_lock: Mutex::new(()),
             server_load: AtomicU64::new(0),
             lora_manager: LoraManager::new(),
+            patch_sidecar: None,
         }
+    }
+
+    /// Configure the activation-patching sidecar reverse-proxy target.
+    ///
+    /// `base_url` is trimmed of a trailing `/` so path joining is exact. A
+    /// `None` (or empty) URL leaves the sweep routes returning HTTP 501.
+    pub fn with_patch_sidecar_url(mut self, base_url: Option<String>) -> Self {
+        self.patch_sidecar = base_url.filter(|url| !url.is_empty()).map(|url| PatchSidecar {
+            base_url: url.trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        });
+        self
+    }
+
+    /// The configured patch sidecar reverse-proxy target, if any.
+    pub(crate) fn patch_sidecar(&self) -> Option<&PatchSidecar> {
+        self.patch_sidecar.as_ref()
     }
 
     /// Set HTTP/API-server behavior switches.
