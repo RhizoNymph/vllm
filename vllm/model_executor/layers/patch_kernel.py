@@ -26,13 +26,14 @@ Both kernels mirror the steering kernel contract: one program per token row
 (``grid = (N,)``), a masked ``BLOCK_H`` walk over the hidden dim, a freshly
 allocated output (never in place) to keep ``torch.compile`` value semantics,
 and two passthrough layers — a whole-step ``any_active`` short-circuit and a
-per-token ``slot == 0`` skip. Slot 0 is the passthrough sentinel; ``alpha[0]``
-is pinned to ``0.0`` so even a stray index on slot 0 yields the input.
+per-token ``slot == 0`` skip. Slot 0 is the passthrough sentinel; ``alpha``
+row 0 is pinned to all-zeros so even a stray index on slot 0 yields the input.
 
 Layout assumptions match the steering kernel: row-contiguous ``[N, H]`` tensors
 in compute dtype; ``table`` row-contiguous ``[num_slots, H]`` cast to the
 hidden dtype inside the kernel; ``index`` int32 (only the first ``N`` entries
-read); ``alpha`` fp32 ``[num_slots]``.
+read); ``alpha`` fp32 ``[num_slots, H]`` (per-dim ``alpha * mask``; row 0
+all-zeros so a stray slot-0 index yields the input).
 """
 
 from __future__ import annotations
@@ -63,15 +64,19 @@ def _apply_patch_kernel(
     h_stride_h,
     t_stride_r,
     t_stride_h,
+    a_stride_r,
+    a_stride_h,
     o_stride_n,
     o_stride_h,
     BLOCK_H: tl.constexpr,
 ):
     """Single-tensor lerp: ``out[i] = lerp(hidden[i], table[idx[i]], a[idx[i]])``.
 
-    The ``slot == 0`` branch is uniform within a program (one program per row,
-    every lane reads the same ``slot``), so it introduces no warp divergence
-    and skips the table gather + cast entirely for unpatched rows.
+    ``a`` is a per-**dimension** weight row (``alpha * mask`` folded into one
+    ``(slots, H)`` table), loaded alongside the table row in the ``BLOCK_H``
+    walk. The ``slot == 0`` branch is uniform within a program (one program per
+    row, every lane reads the same ``slot``), so it introduces no warp
+    divergence and skips the table + alpha gather entirely for unpatched rows.
     """
     pid_n = tl.program_id(axis=0)
     if pid_n >= N:
@@ -94,15 +99,15 @@ def _apply_patch_kernel(
             tl.store(out_row_ptr + h_idx * o_stride_h, h_vals, mask=mask)
         return
 
-    alpha = tl.load(alpha_ptr + slot)
     table_row_ptr = table_ptr + slot * t_stride_r
+    alpha_row_ptr = alpha_ptr + slot * a_stride_r
 
     for h_off in range(0, H, BLOCK_H):
         h_idx = h_off + tl.arange(0, BLOCK_H)
         mask = h_idx < H
         h_vals = tl.load(hidden_row_ptr + h_idx * h_stride_h, mask=mask)
         t_vals = tl.load(table_row_ptr + h_idx * t_stride_h, mask=mask)
-        a = alpha.to(h_vals.dtype)
+        a = tl.load(alpha_row_ptr + h_idx * a_stride_h, mask=mask).to(h_vals.dtype)
         # Precise lerp form: exact at the endpoints (a==1 -> table, a==0 -> hs),
         # unlike ``h + a*(t-h)`` which loses the endpoints to rounding.
         result = (1.0 - a) * h_vals + a * t_vals.to(h_vals.dtype)
@@ -126,6 +131,8 @@ def _apply_patch_block_kernel(
     r_stride_h,
     t_stride_r,
     t_stride_h,
+    a_stride_r,
+    a_stride_h,
     o_stride_n,
     o_stride_h,
     BLOCK_H: tl.constexpr,
@@ -134,7 +141,9 @@ def _apply_patch_block_kernel(
 
     ``out_res[i] = res[i] + a[idx[i]] * (table[idx[i]] - (res[i] + hidden[i]))``
     so that ``out_res + hidden == lerp(res + hidden, table, a)``. ``hidden`` is
-    not modified (the caller's deferred add still lands correctly).
+    not modified (the caller's deferred add still lands correctly). ``a`` is a
+    per-**dimension** weight row (``alpha * mask``) loaded in the ``BLOCK_H``
+    walk.
     """
     pid_n = tl.program_id(axis=0)
     if pid_n >= N:
@@ -156,9 +165,9 @@ def _apply_patch_block_kernel(
             tl.store(out_row_ptr + h_idx * o_stride_h, r_vals, mask=mask)
         return
 
-    alpha = tl.load(alpha_ptr + slot)
     hidden_row_ptr = hidden_ptr + pid_n * h_stride_n
     table_row_ptr = table_ptr + slot * t_stride_r
+    alpha_row_ptr = alpha_ptr + slot * a_stride_r
 
     for h_off in range(0, H, BLOCK_H):
         h_idx = h_off + tl.arange(0, BLOCK_H)
@@ -166,7 +175,7 @@ def _apply_patch_block_kernel(
         r_vals = tl.load(residual_row_ptr + h_idx * r_stride_h, mask=mask)
         h_vals = tl.load(hidden_row_ptr + h_idx * h_stride_h, mask=mask)
         t_vals = tl.load(table_row_ptr + h_idx * t_stride_h, mask=mask)
-        a = alpha.to(r_vals.dtype)
+        a = tl.load(alpha_row_ptr + h_idx * a_stride_h, mask=mask).to(r_vals.dtype)
         # out_res such that out_res + h == lerp(r + h, table, a). Written as
         # (1-a)*r + a*(t-h) so a==0 yields r exactly (passthrough).
         result = (1.0 - a) * r_vals + a * (t_vals.to(r_vals.dtype) - h_vals)
@@ -206,6 +215,8 @@ def apply_patch_triton(
         hidden_states.stride(1),
         patch_table.stride(0),
         patch_table.stride(1),
+        patch_alpha.stride(0),
+        patch_alpha.stride(1),
         out.stride(0),
         out.stride(1),
         BLOCK_H=block_h,
@@ -246,6 +257,8 @@ def apply_patch_block_triton(
         residual.stride(1),
         patch_table.stride(0),
         patch_table.stride(1),
+        patch_alpha.stride(0),
+        patch_alpha.stride(1),
         out.stride(0),
         out.stride(1),
         BLOCK_H=block_h,
@@ -305,7 +318,11 @@ def warmup_apply_patch_kernel(
     hidden_buf = torch.zeros(max_n, hidden_size, dtype=compute_dtype, device=device)
     residual_buf = torch.zeros(max_n, hidden_size, dtype=compute_dtype, device=device)
     table_buf = torch.zeros(n_slots, hidden_size, dtype=table_dtype, device=device)
-    alpha_buf = torch.zeros(n_slots, dtype=torch.float32, device=device)
+    # Per-dim alpha: give slot 1 a non-uniform (masked) row so graph capture
+    # compiles the real per-dim gather + lerp path, not a constant-alpha one.
+    alpha_buf = torch.zeros(n_slots, hidden_size, dtype=torch.float32, device=device)
+    if n_slots > 1:
+        alpha_buf[1, ::2] = 1.0
     active_flag = torch.zeros(1, dtype=torch.bool, device=device)
 
     t0 = time.perf_counter()
