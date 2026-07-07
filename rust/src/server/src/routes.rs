@@ -7,6 +7,7 @@ mod load;
 mod lora;
 mod metrics;
 pub(crate) mod openai;
+mod patch;
 mod pause;
 mod server_info;
 mod sleep;
@@ -86,6 +87,13 @@ fn build_router_with_options(
         .route(
             "/v1/steering/modules/{name}",
             delete(steering::unregister_steering_module),
+        )
+        // Activation-patching sweep surface: reverse-proxied to the Python
+        // patch sidecar when configured, otherwise 501.
+        .route("/v1/patch_sweep", post(patch::patch_sweep))
+        .route(
+            "/v1/patch_source/{run_id}",
+            delete(patch::drop_patch_source),
         )
         .route("/inference/v1/generate", post(inference::generate));
 

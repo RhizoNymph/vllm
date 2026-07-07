@@ -481,6 +481,7 @@ fn frontend_args_accept_json() {
                     ),
                     engine_start_index: 0,
                     engine_count: 1,
+                    patch_sidecar_url: None,
                     runtime: SharedRuntimeArgs {
                         model: "Qwen/Qwen3-0.6B",
                         tokenizer: None,
@@ -1147,6 +1148,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             grpc_port: None,
             shutdown_timeout: 0ns,
             steering_modules: [],
+            patch_sidecar_url: None,
         }
     "#]]
     .assert_debug_eq(&Config {
@@ -1230,6 +1232,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             grpc_port: None,
             shutdown_timeout: 0ns,
             steering_modules: [],
+            patch_sidecar_url: None,
         }
     "#]]
     .assert_debug_eq(&config);
@@ -1331,6 +1334,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             grpc_port: None,
             shutdown_timeout: 0ns,
             steering_modules: [],
+            patch_sidecar_url: None,
         }
     "#]]
     .assert_debug_eq(&config);

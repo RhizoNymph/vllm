@@ -118,6 +118,9 @@ pub struct SamplingParams {
     /// Per-request opt-in for activation-capture consumers, keyed by consumer
     /// name. Forwarded verbatim to engine-core for offline admission.
     pub capture: Option<Value>,
+    /// Per-request activation-patching spec (list of site entries). Forwarded
+    /// verbatim to engine-core for offline admission.
+    pub patch: Option<Value>,
 }
 
 #[allow(clippy::derivable_impls)] // more explicit
@@ -150,6 +153,7 @@ impl Default for SamplingParams {
             decode_steering_vectors: None,
             steering_name: None,
             capture: None,
+            patch: None,
         }
     }
 }

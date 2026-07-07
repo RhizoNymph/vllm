@@ -113,7 +113,8 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_server_info(ServerInfoSnapshot::from_config(config))
             .with_api_keys(config.api_keys.clone())
             .with_cors(config.cors.clone())
-            .with_steering_module_names(steering_module_names),
+            .with_steering_module_names(steering_module_names)
+            .with_patch_sidecar_url(config.patch_sidecar_url.clone()),
     ))
 }
 

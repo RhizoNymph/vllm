@@ -52,6 +52,7 @@ from vllm.config import (
     ObservabilityConfig,
     OffloadConfig,
     ParallelConfig,
+    PatchConfig,
     PoolerConfig,
     PrefetchOffloadConfig,
     ProfilerConfig,
@@ -596,6 +597,10 @@ class EngineArgs:
     # Steering fields
     enable_steering: bool = False
     max_steering_configs: int = SteeringConfig.max_steering_configs
+    # Patching fields
+    enable_patching: bool = False
+    max_patch_slots: int = PatchConfig.max_patch_slots
+    patch_source_cache_bytes: int = PatchConfig.patch_source_cache_bytes
 
     # --capture-consumers is repeatable (action="append"); when unset the
     # whole capture-consumer pipeline stays disabled.
@@ -1459,6 +1464,27 @@ class EngineArgs:
             **steering_kwargs["max_steering_configs"],
         )
 
+        # Patching related configs
+        patch_kwargs = get_kwargs(PatchConfig)
+        patch_group = parser.add_argument_group(
+            title="PatchConfig",
+            description=PatchConfig.__doc__,
+        )
+        patch_group.add_argument(
+            "--enable-patching",
+            action=argparse.BooleanOptionalAction,
+            help="If True, enable activation patching (clean-run source "
+            "capture + per-request injection).",
+        )
+        patch_group.add_argument(
+            "--max-patch-slots",
+            **patch_kwargs["max_patch_slots"],
+        )
+        patch_group.add_argument(
+            "--patch-source-cache-bytes",
+            **patch_kwargs["patch_source_cache_bytes"],
+        )
+
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
         observability_group = parser.add_argument_group(
@@ -2192,6 +2218,15 @@ class EngineArgs:
             else None
         )
 
+        patch_config = (
+            PatchConfig(
+                max_patch_slots=self.max_patch_slots,
+                patch_source_cache_bytes=self.patch_source_cache_bytes,
+            )
+            if self.enable_patching
+            else None
+        )
+
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context,
             model_config,
@@ -2530,6 +2565,7 @@ class EngineArgs:
             lora_config=lora_config,
             capture_consumers_config=capture_consumers_config,
             steering_config=steering_config,
+            patch_config=patch_config,
             speculative_config=speculative_config,
             diffusion_config=diffusion_config,
             structured_outputs_config=self.structured_outputs_config,

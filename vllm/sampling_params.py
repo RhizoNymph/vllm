@@ -415,6 +415,31 @@ class SamplingParams(
     serve. Set by ``_admit_capture`` alongside ``capture_store_hook_layers``.
     Not client-settable."""
 
+    patch: list[dict[str, Any]] | None = None
+    """Per-request activation-patching spec: a list of site entries, each
+    ``{"layer": int, "hook": str, "dest_position": int, "source_run": str,
+    "source_position": int, "alpha": float = 1.0}``. Each entry overwrites
+    (``alpha == 1``) or interpolates toward the destination's activation at
+    ``(layer, hook, dest_position)`` with the clean run ``source_run``'s
+    activation at ``source_position``.
+
+    Validation at construction is strictly structural (list of dicts with the
+    required keys/types). Layer/hook/source existence and pool capacity are
+    validated at the entrypoint against the model + source store; the worker
+    resolves source vectors from the per-rank source store."""
+
+    patch_touches_prompt: bool | None = None
+    """Whether this request patches any prompt-range position. Resolved at
+    admission (mirrors ``capture_touches_prompt``); drives prefix-cache reuse
+    via :meth:`vllm.v1.request.Request.get_skip_reading_prefix_cache`. ``None``
+    (offline path) is treated conservatively as prompt-touching. Not
+    client-settable."""
+
+    patch_min_prompt_position: int | None = None
+    """Lowest prompt position this request patches, or ``None``. Prefix-cache
+    reuse is clamped to this position so it (and later positions) are
+    re-forwarded and the patch hook fires. Not client-settable."""
+
     steering_vectors: SteeringVectorSpec | None = None
     """Base steering vectors applied to both prefill and decode phases.
     Keyed by hook point name (pre_attn, post_attn, post_block), then
@@ -498,6 +523,7 @@ class SamplingParams(
         max_tokens: int | None = 16,
         min_tokens: int = 0,
         logprobs: int | None = None,
+        logprob_token_ids: list[int] | None = None,
         prompt_logprobs: int | None = None,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
@@ -510,6 +536,7 @@ class SamplingParams(
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
         capture: dict[str, Any] | None = None,
+        patch: list[dict[str, Any]] | None = None,
         steering_vectors: SteeringVectorSpec | None = None,
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
@@ -544,6 +571,7 @@ class SamplingParams(
             max_tokens=max_tokens,
             min_tokens=min_tokens,
             logprobs=logprobs,
+            logprob_token_ids=logprob_token_ids,
             prompt_logprobs=prompt_logprobs,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
@@ -556,6 +584,7 @@ class SamplingParams(
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
             capture=capture,
+            patch=patch,
             steering_vectors=steering_vectors,
             prefill_steering_vectors=prefill_steering_vectors,
             decode_steering_vectors=decode_steering_vectors,
@@ -604,6 +633,7 @@ class SamplingParams(
 
         self._verify_args()
         self._validate_capture()
+        self._validate_patch()
 
         if self.temperature < _SAMPLING_EPS:
             # Zero temperature means greedy sampling.
@@ -653,6 +683,44 @@ class SamplingParams(
                     "capture keys must be strings (consumer names), got "
                     f"{type(key).__name__} ({key!r})"
                 )
+
+    def _validate_patch(self) -> None:
+        """Structural check on ``patch``.
+
+        Only verifies the shape at construction (a list of dicts with the
+        required keys/types). Layer/hook/source existence and pool capacity are
+        validated at the entrypoint against the model + source store, keeping
+        this module free of patch-framework imports.
+        """
+        patch = self.patch
+        if patch is None:
+            return
+        if not isinstance(patch, list):
+            raise ValueError(
+                f"patch must be a list of site dicts, got {type(patch).__name__}"
+            )
+        required = ("layer", "hook", "dest_position", "source_run", "source_position")
+        for i, entry in enumerate(patch):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"patch[{i}] must be a dict, got {type(entry).__name__}"
+                )
+            for req_field in required:
+                if req_field not in entry:
+                    raise ValueError(f"patch[{i}] missing required key {req_field!r}")
+            if not isinstance(entry["layer"], int):
+                raise ValueError(f"patch[{i}]['layer'] must be an int")
+            if not isinstance(entry["hook"], str):
+                raise ValueError(f"patch[{i}]['hook'] must be a str")
+            if not isinstance(entry["dest_position"], int):
+                raise ValueError(f"patch[{i}]['dest_position'] must be an int")
+            if not isinstance(entry["source_run"], str):
+                raise ValueError(f"patch[{i}]['source_run'] must be a str")
+            if not isinstance(entry["source_position"], int):
+                raise ValueError(f"patch[{i}]['source_position'] must be an int")
+            alpha = entry.get("alpha", 1.0)
+            if not isinstance(alpha, (int, float)):
+                raise ValueError(f"patch[{i}]['alpha'] must be a number")
 
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):
@@ -1029,6 +1097,54 @@ class SamplingParams(
             self.effective_decode_steering,
             module_ref=self.steering_module_ref,
         )
+
+    @cached_property
+    def patch_site_demand(self) -> dict[tuple[int, str], int]:
+        """Per-``(layer, hook)`` patch-slot demand for this request.
+
+        Counts the distinct patched ``dest_position``s at each site. A single
+        forward step can compute all of a request's positions at a site at once
+        (a prefill chunk), so this count is the request's worst-case slot draw
+        at that site — what the scheduler reserves to keep the per-site pool
+        from overflowing (see ``Scheduler``). Empty when no patching."""
+        if not self.patch:
+            return {}
+        demand: dict[tuple[int, str], int] = {}
+        for entry in self.patch:
+            key = (int(entry["layer"]), str(entry["hook"]))
+            seen = demand.setdefault(key, 0)
+            demand[key] = seen + 1
+        return demand
+
+    @cached_property
+    def patch_kv_taint(self) -> tuple[int, int] | None:
+        """``(min_dest_position, spec_hash)`` for patch-aware prefix caching.
+
+        A patched activation at position ``p`` changes the KV written at ``p``
+        and (via attention in later layers) at every subsequent position, so
+        blocks containing any position ``>= min_dest_position`` must not share
+        cache entries with unpatched runs. ``spec_hash`` is a deterministic
+        digest of the full spec (stable across processes, unlike ``hash()``),
+        folded into those blocks' hashes: distinct specs get distinct KV
+        chains, while blocks strictly below the patch floor stay shareable.
+        ``None`` when the request patches nothing."""
+        if not self.patch:
+            return None
+        import hashlib
+
+        entries = sorted(
+            (
+                int(e["layer"]),
+                str(e["hook"]),
+                int(e["dest_position"]),
+                str(e["source_run"]),
+                int(e["source_position"]),
+                float(e.get("alpha", 1.0)),
+            )
+            for e in self.patch
+        )
+        digest = hashlib.sha256(repr(entries).encode()).digest()
+        return min(e[2] for e in entries), int.from_bytes(digest[:8], "big")
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:

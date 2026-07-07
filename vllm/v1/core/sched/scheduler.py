@@ -82,6 +82,7 @@ class Scheduler(SchedulerInterface):
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.steering_config = vllm_config.steering_config
+        self.patch_config = vllm_config.patch_config
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
@@ -683,6 +684,20 @@ class Scheduler(SchedulerInterface):
                         (req.decode_steering_config_hash, "decode")
                     )
 
+        # Per-(layer, hook) patch-slot reservation (backpressure). Patch slots
+        # are ephemeral per step, but a request's positions at a site can all
+        # land in one prefill chunk, so we conservatively reserve each running
+        # request's full per-site demand for its lifetime. A waiting request is
+        # held below if admitting it would push any site past max_patch_slots,
+        # so a step can never overflow the pool (the worker's strict raise then
+        # only fires on a single request that alone exceeds the pool — already
+        # rejected at the OpenAI entrypoint).
+        scheduled_patch_sites: dict[tuple[int, str], int] = {}
+        if self.patch_config:
+            for req in self.running:
+                for site, n in req.patch_site_demand.items():
+                    scheduled_patch_sites[site] = scheduled_patch_sites.get(site, 0) + n
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
@@ -750,6 +765,27 @@ class Scheduler(SchedulerInterface):
                         if (
                             len(scheduled_steering_configs) + len(new_unique)
                             > self.steering_config.max_steering_configs
+                        ):
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+
+                # Patch-slot capacity (backpressure). Hold the request if
+                # admitting it would push any patched site past the pool, so a
+                # request that asked for patching waits for slots rather than
+                # crashing a step. A request whose own per-site demand exceeds
+                # the pool is rejected at admission (entrypoint), so it never
+                # deadlocks here.
+                if self.patch_config:
+                    demand = request.patch_site_demand
+                    if demand:
+                        # Usable pool, not max_patch_slots: slot 0 is the
+                        # passthrough sentinel, so the worker step-plan holds
+                        # one fewer patch than the buffer has rows.
+                        max_slots = self.patch_config.usable_slots
+                        if any(
+                            scheduled_patch_sites.get(site, 0) + n > max_slots
+                            for site, n in demand.items()
                         ):
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
@@ -1063,6 +1099,13 @@ class Scheduler(SchedulerInterface):
                     if request.decode_steering_config_hash != 0:
                         scheduled_steering_configs.add(
                             (request.decode_steering_config_hash, "decode")
+                        )
+                if self.patch_config:
+                    # Reserve this request's per-site slots so later requests in
+                    # the same step see them (mirrors the running scan above).
+                    for site, n in request.patch_site_demand.items():
+                        scheduled_patch_sites[site] = (
+                            scheduled_patch_sites.get(site, 0) + n
                         )
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
@@ -2130,9 +2173,7 @@ class Scheduler(SchedulerInterface):
                 and request.sampling_params is not None
                 and request.sampling_params.capture
             ):
-                self._capture_client_index[request.request_id] = (
-                    request.client_index
-                )
+                self._capture_client_index[request.request_id] = request.client_index
                 # Backstop bound (FIFO): drop the oldest entry if results were
                 # delivered in-band and never late-popped. Late results arrive
                 # within seconds, so live entries are never evicted in practice.

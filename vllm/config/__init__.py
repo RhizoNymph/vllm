@@ -34,6 +34,7 @@ from vllm.config.offload import (
     UVAOffloadConfig,
 )
 from vllm.config.parallel import EPLBConfig, ParallelConfig
+from vllm.config.patch import PatchConfig
 from vllm.config.pooler import PoolerConfig
 from vllm.config.profiler import ProfilerConfig
 from vllm.config.reasoning import ReasoningConfig
@@ -123,6 +124,8 @@ __all__ = [
     "SpeechToTextParams",
     # From vllm.config.steering
     "SteeringConfig",
+    # From vllm.config.patch
+    "PatchConfig",
     # From vllm.config.structured_outputs
     "StructuredOutputsConfig",
     # From vllm.config.profiler

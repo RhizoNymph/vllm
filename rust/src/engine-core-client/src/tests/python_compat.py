@@ -107,6 +107,10 @@ class EngineCoreOutputs(
     scheduler_stats: object | None = None
     timestamp: float = 0.0
     utility_output: object | None = None
+    # Async-finalized capture results, keyed by request_id then consumer name.
+    # array_like slot 5 (between utility_output and finished_requests); mirrors
+    # vllm.v1.engine.EngineCoreOutputs so the fixture matches the real wire.
+    late_capture_results: dict = msgspec.field(default_factory=dict)
     finished_requests: set[str] | None = None
     wave_complete: int | None = None
     start_wave: int | None = None
@@ -277,7 +281,10 @@ def engine_output_wire(
 
 
 def engine_outputs_wire(output):
-    return [0, [output], None, 0.0, None, ["req-1"]]
+    # [engine_index, outputs, scheduler_stats, timestamp, utility_output,
+    #  late_capture_results, finished_requests] -- late_capture_results is the
+    #  array_like slot 5 (empty map) added upstream; matches the real wire.
+    return [0, [output], None, 0.0, None, {}, ["req-1"]]
 
 
 inline_logprobs = engine_outputs_wire(

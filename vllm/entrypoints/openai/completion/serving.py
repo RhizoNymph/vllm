@@ -168,6 +168,46 @@ class OpenAIServingCompletion(OpenAIServing):
             )
         return None
 
+    def _admit_patch(
+        self,
+        *,
+        sampling_params: SamplingParams,
+        engine_input: EngineInput,
+        request_id: str,
+    ) -> ErrorResponse | None:
+        """Validate the patch spec and stamp prefix-cache flags."""
+        from vllm.v1.capture.patch_admission import (
+            PatchValidationError,
+            resolve_patch_prefix_flags,
+        )
+
+        if not sampling_params.patch:
+            return None
+        try:
+            num_prompt_tokens = self._extract_prompt_len(engine_input)
+            ctx = build_capture_context(
+                self.engine_client.vllm_config, num_prompt_tokens, request_id
+            )
+        except Exception as exc:
+            return self.create_error_response(
+                f"patch: failed to read request shape: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="patch",
+            )
+        patch_config = getattr(self.engine_client.vllm_config, "patch_config", None)
+        max_patch_slots = (
+            getattr(patch_config, "max_patch_slots", 0) if patch_config else 0
+        )
+        try:
+            resolve_patch_prefix_flags(
+                sampling_params, ctx, max_patch_slots=max_patch_slots
+            )
+        except PatchValidationError as exc:
+            return self.create_error_response(
+                str(exc), status_code=HTTPStatus.BAD_REQUEST, param="patch"
+            )
+        return None
+
     async def render_completion_request(
         self,
         request: CompletionRequest,
@@ -313,6 +353,30 @@ class OpenAIServingCompletion(OpenAIServing):
                 if error_response is not None:
                     return error_response
 
+            if isinstance(sampling_params, SamplingParams) and sampling_params.patch:
+                error_response = self._admit_patch(
+                    sampling_params=sampling_params,
+                    engine_input=engine_input,
+                    request_id=request_id_item,
+                )
+                if error_response is not None:
+                    return error_response
+                # Reject (HTTP 400) if a referenced patch source run/site does
+                # not exist, instead of silently completing unpatched.
+                from vllm.v1.capture.patch_admission import (
+                    PatchValidationError,
+                    validate_patch_sources,
+                )
+
+                try:
+                    await validate_patch_sources(self.engine_client, sampling_params)
+                except PatchValidationError as exc:
+                    return self.create_error_response(
+                        str(exc),
+                        status_code=HTTPStatus.BAD_REQUEST,
+                        param="patch",
+                    )
+
             self._log_inputs(
                 request_id_item,
                 engine_input,
@@ -388,17 +452,17 @@ class OpenAIServingCompletion(OpenAIServing):
             if (
                 request.capture
                 and getattr(request, "capture_wait", False)
-                and final_res_batch
-                and not final_res_batch[0].capture_results
+                and final_res_batch_checked
+                and not final_res_batch_checked[0].capture_results
                 and hasattr(self.engine_client, "wait_for_capture_results")
             ):
                 # Capture writes are asynchronous; hold the response until
                 # this request's results finalize (files durable).
                 late = await self.engine_client.wait_for_capture_results(
-                    final_res_batch[0].request_id
+                    final_res_batch_checked[0].request_id
                 )
                 if late:
-                    final_res_batch[0].capture_results = late
+                    final_res_batch_checked[0].capture_results = late
 
             response = self.request_output_to_completion_response(
                 final_res_batch_checked,

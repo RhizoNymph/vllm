@@ -495,6 +495,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "asynchronous and may land after the response."
         ),
     )
+    patch: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Activation-patching sites. Each entry: {layer, hook, "
+            "dest_position, source_run, source_position, alpha?} — overwrite "
+            "(alpha=1) or interpolate toward the destination activation at "
+            "(layer, hook, dest_position) with the clean run `source_run`'s "
+            "activation at `source_position`. Graded via normal logprobs."
+        ),
+    )
 
     # Per-request inline steering vectors in binary wire format.  Each entry
     # is ``{dtype, shape, layer_indices, data: base64, scales?}`` — see
@@ -768,6 +778,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # internal reference across requests.
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)
+        if self.patch is not None:
+            sampling_params.patch = [dict(e) for e in self.patch]
         return sampling_params
 
     @model_validator(mode="before")

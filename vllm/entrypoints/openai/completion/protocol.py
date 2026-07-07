@@ -99,6 +99,14 @@ class CompletionRequest(OpenAIBaseModel):
     )
     allowed_token_ids: list[int] | None = None
     prompt_logprobs: int | None = None
+    logprob_token_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "Specific token IDs to return logprobs for on each generated "
+            "token, regardless of whether they fall in the top-`logprobs`. "
+            "Exact scoring for label/answer tokens (e.g. logit-diff metrics)."
+        ),
+    )
     # --8<-- [end:completion-sampling-params]
 
     # --8<-- [start:completion-extra-params]
@@ -219,6 +227,17 @@ class CompletionRequest(OpenAIBaseModel):
             "request's capture results have finalized (files durable), then "
             "report them in `capture_results`. Capture writes are otherwise "
             "asynchronous and may land after the response."
+        ),
+    )
+    patch: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Activation-patching sites. Each entry: {layer, hook, "
+            "dest_position, source_run, source_position, alpha?} — overwrite "
+            "(alpha=1) or interpolate toward the destination activation at "
+            "(layer, hook, dest_position) with the clean run `source_run`'s "
+            "activation at `source_position`. The result is graded via normal "
+            "logprobs; no extra response field."
         ),
     )
 
@@ -384,6 +403,7 @@ class CompletionRequest(OpenAIBaseModel):
             stop=self.stop,
             stop_token_ids=self.stop_token_ids,
             logprobs=self.logprobs,
+            logprob_token_ids=self.logprob_token_ids,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,
@@ -411,6 +431,8 @@ class CompletionRequest(OpenAIBaseModel):
         )
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)
+        if self.patch is not None:
+            sampling_params.patch = [dict(e) for e in self.patch]
         return sampling_params
 
     @model_validator(mode="before")

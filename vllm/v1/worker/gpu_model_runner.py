@@ -206,6 +206,10 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.patch_runner_mixin import (
+    PatchModelRunnerMixin,
+    _PatchBatchView,
+)
 from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -420,6 +424,7 @@ class ExecuteModelState(NamedTuple):
 class GPUModelRunner(
     LoRAModelRunnerMixin,
     SteeringModelRunnerMixin,
+    PatchModelRunnerMixin,
     KVConnectorModelRunnerMixin,
     ECConnectorModelRunnerMixin,
 ):
@@ -1301,6 +1306,8 @@ class GPUModelRunner(
         # Release the currently-active steering config for finished
         # requests before popping state so hashes remain accessible.
         self._release_finished_steering_configs(scheduler_output.finished_req_ids)
+        # Drop patch specs for finished requests.
+        self._patch_finish_requests(scheduler_output.finished_req_ids)
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -1449,6 +1456,9 @@ class GPUModelRunner(
             # request.  Handles the direct-to-decode case (full prefix
             # cache hit) and capacity-exhaustion deferral.
             self._register_initial_steering_config(req_id, new_req_data, req_state)
+            # Resolve the request's patch spec into per-layer source vectors
+            # (rank-local; only locally-owned layers are kept).
+            self._patch_add_request(new_req_data)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1881,6 +1891,50 @@ class GPUModelRunner(
                 "capture register rejected req=%s: %s", new_req_data.req_id, exc
             )
 
+    def _update_patch_buffers(self, scheduler_output: "SchedulerOutput") -> None:
+        """Write this step's patch buffers from per-request specs (v1 runner).
+
+        Projects the v1 ``input_batch`` + cached request states into the
+        runner-agnostic ``_PatchBatchView`` (req ids, per-request num-computed /
+        num-scheduled, and flat-batch token offsets), then delegates to the
+        shared ``_write_patch_step``. Mirrors the v2 ``_update_patch_buffers_v2``
+        and the v1 capture/steering per-step wiring.
+        """
+        if not self._patchable_layers or self._patch_max_slots <= 0:
+            return
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return
+
+        req_ids = self.input_batch.req_ids
+        num_scheduled_map = scheduler_output.num_scheduled_tokens
+        computed_cpu = self.input_batch.num_computed_tokens_cpu
+        req_id_to_index = self.input_batch.req_id_to_index
+
+        view_req_ids: list[str] = []
+        num_computed: list[int] = []
+        num_scheduled: list[int] = []
+        token_offsets: list[int] = []
+        offset = 0
+        for i in range(num_reqs):
+            req_id = req_ids[i]
+            n_tokens = int(num_scheduled_map.get(req_id, 0))
+            req_index = req_id_to_index.get(req_id, i)
+            view_req_ids.append(req_id)
+            num_computed.append(int(computed_cpu[req_index]))
+            num_scheduled.append(n_tokens)
+            token_offsets.append(offset)
+            offset += n_tokens
+
+        self._write_patch_step(
+            _PatchBatchView(
+                req_ids=view_req_ids,
+                num_computed=num_computed,
+                num_scheduled=num_scheduled,
+                token_offsets=token_offsets,
+            )
+        )
+
     def _finalize_capture_step(self) -> None:
         """Dispatch captured rows to every consumer's sink.
 
@@ -1987,9 +2041,7 @@ class GPUModelRunner(
             # results silently vanish -- requests then never report capture
             # results at all.
             with self._pending_capture_results_lock:
-                self._pending_capture_results.setdefault(req_id, {}).update(
-                    named
-                )
+                self._pending_capture_results.setdefault(req_id, {}).update(named)
 
         mgr.finalize_request_async(req_id, _on_complete)
 
@@ -4853,6 +4905,10 @@ class GPUModelRunner(
 
         # Update per-request steering tables and index before forward.
         self._update_steering_buffers(scheduler_output)
+        # Write per-(layer, hook) patch buffers from per-request specs. Like
+        # steering, persistent buffers => a FULL cudagraph replay reads this
+        # step's values (no force-eager seam).
+        self._update_patch_buffers(scheduler_output)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -5745,6 +5801,8 @@ class GPUModelRunner(
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
 
+        # (Patch buffers self-register during the model build from the current
+        # VllmConfig context — no runner-side setup; see patch.py.)
         try:
             with DeviceMemoryProfiler() as m:
                 time_before_load = time.perf_counter()
@@ -5865,6 +5923,9 @@ class GPUModelRunner(
         # comm-buffer setup; the manager only needs access to the
         # registered steering buffers on each decoder layer.
         self._init_steering_state()
+        # Same for activation patching: discover patchable layers, install the
+        # source store, and warm the patch kernels (no-op when patching is off).
+        self._init_patch_state()
 
         if (
             self.vllm_config.compilation_config.mode

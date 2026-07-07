@@ -43,6 +43,13 @@ def register_vllm_serve_api_routers(app: FastAPI):
 
     attach_steering_modules_router(app)
 
+    from vllm.entrypoints.serve.patch.api_router import (
+        attach_router as attach_patch_sweep_router,
+    )
+
+    attach_patch_sweep_router(app)
+
+
 def register_vllm_dev_api_routers(app: FastAPI):
     logger.warning(
         "SECURITY WARNING: Development endpoints are enabled! "
