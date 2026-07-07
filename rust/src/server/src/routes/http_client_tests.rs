@@ -119,6 +119,7 @@ fn engine_outputs_for_request(
         scheduler_stats: None,
         timestamp: 0.0,
         utility_output: None,
+        late_capture_results: Default::default(),
         finished_requests: None,
         wave_complete: None,
         start_wave: None,

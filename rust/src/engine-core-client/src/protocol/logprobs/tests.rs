@@ -26,10 +26,11 @@ fn output_wire_with_custom_fields(
             Value::Nil,
             Value::from(EngineCoreFinishReason::Length as u8),
         ])]),
-        Value::Nil,
-        Value::from(0.0),
-        Value::Nil,
-        Value::Array(vec![Value::from("req-1")]),
+        Value::Nil,        // scheduler_stats
+        Value::from(0.0),  // timestamp
+        Value::Nil,        // utility_output
+        Value::Map(vec![]), // late_capture_results (empty map, matches real wire)
+        Value::Array(vec![Value::from("req-1")]), // finished_requests
     ])
 }
 

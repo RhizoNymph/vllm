@@ -53,7 +53,8 @@ impl EngineCoreOutputs {
     pub fn classify(self) -> ClassifiedEngineCoreOutputs {
         let has_request_payload = !self.outputs.is_empty()
             || self.scheduler_stats.is_some()
-            || self.finished_requests.is_some();
+            || self.finished_requests.is_some()
+            || !self.late_capture_results.is_empty();
 
         match (
             has_request_payload,
@@ -243,6 +244,7 @@ mod tests {
                             result: None,
                         },
                     ),
+                    late_capture_results: {},
                     finished_requests: None,
                     wave_complete: None,
                     start_wave: None,

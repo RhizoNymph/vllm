@@ -362,6 +362,7 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
                         scheduler_stats: None,
                         timestamp: 0.0,
                         utility_output: None,
+                        late_capture_results: Default::default(),
                         finished_requests: None,
                         wave_complete: None,
                         start_wave: None,

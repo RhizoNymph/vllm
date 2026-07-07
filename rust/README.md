@@ -157,13 +157,32 @@ does not carry a `patch` field yet: the proto's `capture` uses a
 `google.protobuf.Struct` (a JSON object), but a patch spec is a JSON *list*, so
 gRPC support needs a new proto field plus list-shaped conversion — deferred.
 
-### Known limitation: logprobs
+### Output wire-format re-sync (logprobs now decode)
 
-Requesting `logprobs` through the Rust frontend is a known pre-existing issue
-(returns HTTP 500 in live serving). This matters for patching because grading a
-sweep is logprob-based. Investigation found the Rust decode / wire-resolution /
-response-assembly paths structurally sound and CPU-test-covered (they return
-typed errors, not panics, on any shape mismatch), so there is no contained
-CPU-reproducible fix; the failure needs a live engine emitting logprobs frames
-to capture the exact shape mismatch. Tracked as a separate limitation, not
-addressed by patch support.
+The previously documented "logprobs return HTTP 500" symptom was not a
+logprobs-specific bug: the Rust `EngineCoreOutputs` protocol structs had drifted
+from the Python `msgspec` wire format after a large upstream merge, so the
+frontend failed to decode *every* `EngineCoreOutputs` frame (even a plain
+1-token completion). The concrete drift: upstream appended a
+`late_capture_results` field to the `array_like` `EngineCoreOutputs` tuple,
+between `utility_output` and `finished_requests`. It arrives as a (usually
+empty) map at tuple index 5; the Rust struct decoded that map against
+`finished_requests` (a set) and failed with "invalid type: map, expected a
+sequence". Because a single failed decode used to tear down the dispatcher, one
+bad frame wedged the client permanently.
+
+Fixed by adding `late_capture_results` to `EngineCoreOutputs` (decoded
+permissively into `HashMap<String, HashMap<String, CaptureResult>>`, ignored by
+the frontend for now) and re-syncing `SchedulerStats` with the upstream
+`waiting_lora_adapters` / `running_lora_adapters` maps. With the outer tuple
+aligned, logprobs decode through the existing wire path: `LogprobsLists` /
+`LogprobsTensors` are `NamedTuple`s of `(dtype, shape, data)` ndarray/tensor
+triples, where `data` is either an inline `CUSTOM_TYPE_RAW_VIEW` (ext code 3)
+byte blob for small tensors or an aux-frame index for large ones sent zero-copy
+over multipart ZMQ. Both forms, `<i8`/`<f4` dtypes, and little/big/native
+endianness are handled by the array decoder. Live GPU validation of the full
+serving path is performed separately.
+
+The output dispatcher no longer wedges on a bad frame: a per-frame decode
+failure is logged and skipped so outputs for other requests keep flowing; only
+fatal transport / engine-dead conditions tear down the registries.
