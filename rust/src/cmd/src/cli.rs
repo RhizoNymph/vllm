@@ -219,6 +219,15 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub api_key: Vec<String>,
 
+    /// If provided, mutating steering endpoints (module register/unregister)
+    /// require one of these keys as the Authorization bearer token. Mirrors
+    /// the Python frontend's `--steering-api-key`.
+    #[educe(Debug(ignore))]
+    #[arg(long, env = "VLLM_STEERING_API_KEY", value_delimiter = ' ')]
+    #[serde_as(as = "DefaultOnNull<OneOrMany<_>>")]
+    #[serde(default)]
+    pub steering_api_key: Vec<String>,
+
     /// Disable periodic logging of engine statistics (throughput, queue depth,
     /// cache usage).
     #[arg(long)]
@@ -295,6 +304,11 @@ impl SharedRuntimeArgs {
         {
             self.api_key.push(api_key);
         }
+        if self.steering_api_key.is_empty()
+            && let Ok(steering_api_key) = std::env::var("VLLM_STEERING_API_KEY")
+        {
+            self.steering_api_key.push(steering_api_key);
+        }
     }
 
     /// Build the OpenAI-server config for the Python-bootstrap worker contract.
@@ -343,6 +357,7 @@ impl SharedRuntimeArgs {
             api_server_options,
             cors,
             api_keys: self.api_key,
+            steering_api_keys: self.steering_api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
@@ -392,6 +407,7 @@ impl SharedRuntimeArgs {
             api_server_options,
             cors,
             api_keys: self.api_key,
+            steering_api_keys: self.steering_api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,

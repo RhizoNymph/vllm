@@ -38,6 +38,10 @@ pub struct AppState {
     server_info: Option<ServerInfoSnapshot>,
     /// SHA-256 hashes of API keys accepted as bearer tokens for guarded routes.
     api_key_hashes: Vec<ApiKeyHash>,
+    /// SHA-256 hashes of the steering API keys gating mutating steering
+    /// endpoints (module register/unregister). Empty means unauthenticated,
+    /// mirroring the Python frontend's `--steering-api-key` behavior.
+    steering_api_key_hashes: Vec<ApiKeyHash>,
     /// Names of steering modules currently registered with the engine workers.
     /// Seeded at startup and mutated by the runtime steering endpoints; requests
     /// referencing an unknown `steering_name` are rejected up front.
@@ -106,6 +110,7 @@ impl AppState {
             cors: CorsConfig::default(),
             server_info: None,
             api_key_hashes: Vec::new(),
+            steering_api_key_hashes: Vec::new(),
             steering_module_names: RwLock::new(HashSet::new()),
             steering_mutation_lock: Mutex::new(()),
             server_load: AtomicU64::new(0),
@@ -173,6 +178,24 @@ impl AppState {
 
     pub(crate) fn api_key_hashes(&self) -> &[ApiKeyHash] {
         &self.api_key_hashes
+    }
+
+    /// Configure the steering API keys gating mutating steering endpoints.
+    pub fn with_steering_api_keys(mut self, keys: Vec<String>) -> Self {
+        self.steering_api_key_hashes = keys
+            .into_iter()
+            .filter(|key| !key.is_empty())
+            .map(|key| hash_api_key(&key))
+            .collect();
+        self
+    }
+
+    pub(crate) fn has_steering_api_keys(&self) -> bool {
+        !self.steering_api_key_hashes.is_empty()
+    }
+
+    pub(crate) fn steering_api_key_hashes(&self) -> &[ApiKeyHash] {
+        &self.steering_api_key_hashes
     }
 
     /// Seed the set of steering modules registered with the engine workers.

@@ -119,10 +119,10 @@ content is rejected before rendering). For exact answer-token grading use the
 completions-only `logprob_token_ids` field (the requested ids replace top-k);
 chat exposes top-k `logprobs` only.
 
-To patch from a *named* vector, register a steering module once (the
-registration route is mounted only under `VLLM_SERVER_DEV_MODE=1`) and
-reference it — the same handle can be steered with (add) or patched in
-(replace):
+To patch from a *named* vector, register a steering module once (a steering
+mutation — send the `Authorization: Bearer <key>` header if the server sets
+`--steering-api-key`) and reference it — the same handle can be steered with
+(add) or patched in (replace):
 
 ```bash
 curl -s localhost:8000/v1/steering/modules/register \
