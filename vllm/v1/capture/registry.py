@@ -121,9 +121,13 @@ def _load_entry_points() -> dict[str, type[CaptureConsumer]]:
 def _builtin_consumers() -> dict[str, type[CaptureConsumer]]:
     """vLLM's in-tree consumers, registered under reserved (leading-underscore)
     names independent of the entry-point/dist-info state."""
+    from vllm.v1.capture.consumers.patch_source import PatchSourceConsumer
     from vllm.v1.capture.declarative import DeclarativeSteeringConsumer
 
-    return {"_declarative_steering": DeclarativeSteeringConsumer}
+    return {
+        "_declarative_steering": DeclarativeSteeringConsumer,
+        "patch_source": PatchSourceConsumer,
+    }
 
 
 def load_consumer_class(name: str) -> type[CaptureConsumer]:
