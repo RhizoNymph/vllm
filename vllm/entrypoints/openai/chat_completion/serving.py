@@ -4,7 +4,7 @@
 import asyncio
 import io
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -506,10 +506,15 @@ class OpenAIServingChat(OpenAIServing):
                     return error_response
 
             if isinstance(sampling_params, SamplingParams) and sampling_params.patch:
+                from vllm.v1.capture.patch_admission import (
+                    make_named_module_existence,
+                )
+
                 error_response = self._admit_patch(
                     sampling_params=sampling_params,
                     engine_input=engine_input,
                     request_id=sub_request_id,
+                    named_module_exists=make_named_module_existence(raw_request),
                 )
                 if error_response is not None:
                     return error_response
@@ -672,6 +677,7 @@ class OpenAIServingChat(OpenAIServing):
         sampling_params: SamplingParams,
         engine_input: EngineInput,
         request_id: str,
+        named_module_exists: Callable[[str], bool] | None = None,
     ) -> ErrorResponse | None:
         """Validate the patch spec and stamp prefix-cache flags."""
         from vllm.v1.capture.patch_admission import (
@@ -709,7 +715,10 @@ class OpenAIServingChat(OpenAIServing):
         )
         try:
             resolve_patch_prefix_flags(
-                sampling_params, ctx, max_patch_slots=max_patch_slots
+                sampling_params,
+                ctx,
+                max_patch_slots=max_patch_slots,
+                named_module_exists=named_module_exists,
             )
         except PatchValidationError as exc:
             return self.create_error_response(

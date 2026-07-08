@@ -124,3 +124,98 @@ class TestOfflinePatchPrefixFlags:
 
         with pytest.raises(ValueError, match="patching is not enabled"):
             proc._resolve_patch_prefix_flags("r", sp, [0] * 10, None)
+
+
+def _pack(rows, width):
+    import numpy as np
+    import pybase64 as base64
+
+    arr = np.zeros((rows, width), dtype=np.float32)
+    return {
+        "dtype": "float32",
+        "shape": [rows, width],
+        "data": base64.b64encode(arr.tobytes()).decode("ascii"),
+    }
+
+
+class TestOfflineNewSourceKinds:
+    """Offline parity for module / inline sources: structural validation +
+    floors. Named modules pass structurally (no frontend registry offline)."""
+
+    def test_named_module_passes_structurally_and_stamps_floor(self) -> None:
+        proc = _processor(SimpleNamespace(max_patch_slots=64))
+        sp = SamplingParams(
+            patch=[
+                {
+                    "layer": 2,
+                    "hook": "post_block",
+                    "dest_position": 4,
+                    "source_module": "anything",  # not registry-checked offline
+                }
+            ]
+        )
+        proc._resolve_patch_prefix_flags("r", sp, [0] * 10, None)
+        assert sp.patch_touches_prompt is True
+        assert sp.patch_min_prompt_position == 4
+
+    def test_zeros_module_ok(self) -> None:
+        proc = _processor(SimpleNamespace(max_patch_slots=64))
+        sp = SamplingParams(
+            patch=[
+                {
+                    "layer": 1,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_module": "zeros",
+                }
+            ]
+        )
+        proc._resolve_patch_prefix_flags("r", sp, [0] * 10, None)
+        assert sp.patch_touches_prompt is True
+
+    def test_inline_width_match_ok(self) -> None:
+        proc = _processor(SimpleNamespace(max_patch_slots=64))
+        sp = SamplingParams(
+            patch=[
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_inline": 0,
+                }
+            ],
+            patch_vectors=_pack(1, 16),
+        )
+        proc._resolve_patch_prefix_flags("r", sp, [0] * 10, None)
+        assert sp.patch_touches_prompt is True
+
+    def test_inline_width_mismatch_raises(self) -> None:
+        proc = _processor(SimpleNamespace(max_patch_slots=64))
+        sp = SamplingParams(
+            patch=[
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_inline": 0,
+                }
+            ],
+            patch_vectors=_pack(1, 4),  # != hidden_size 16
+        )
+        with pytest.raises(ValueError, match="width"):
+            proc._resolve_patch_prefix_flags("r", sp, [0] * 10, None)
+
+    def test_inline_index_out_of_range_raises(self) -> None:
+        # source_inline out of range is structural -> raises at construction.
+        with pytest.raises(ValueError, match="out of range"):
+            SamplingParams(
+                patch=[
+                    {
+                        "layer": 0,
+                        "hook": "post_block",
+                        "dest_position": 0,
+                        "source_inline": 9,
+                    }
+                ],
+                patch_vectors=_pack(1, 16),
+            )

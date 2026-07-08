@@ -695,7 +695,7 @@ class PatchStudy:
         self,
         corrupt_prompt: str,
         *,
-        run: str,
+        run: str | None,
         layers: list[int],
         positions: Sequence[int | Span] | Span | str,
         hook: str,
@@ -708,6 +708,10 @@ class PatchStudy:
         hooks: list[str] | None = None,
         keep_source: bool = False,
         on_cell: Callable[[dict], None] | None = None,
+        source_module: str | None = None,
+        source_inline: int | None = None,
+        mask: dict | None = None,
+        patch_vectors: dict | None = None,
     ) -> SweepResult | dict[str, SweepResult]:
         """One POST to /v1/patch_sweep; the server expands + batches the grid.
 
@@ -736,11 +740,6 @@ class PatchStudy:
         payload: dict[str, Any] = {
             "model": self.model,
             "prompt": corrupt_prompt,
-            "source_run": run,
-            # The server aligns positions when the prompts tokenize to
-            # different lengths (and 400s a mismatch without clean_prompt);
-            # a missing run + clean_prompt triggers one-call auto-capture.
-            "clean_prompt": clean_prompt,
             "hook": hook,
             "layers": layers,
             "positions": self._encode_positions(positions),
@@ -749,10 +748,27 @@ class PatchStudy:
             "foil_token": foil_token,
             "metric": metric,
             "logprobs": self.logprobs,
-            "clean_baseline": clean_baseline,
-            "keep_source": keep_source,
             "stream": on_cell is not None,
         }
+        # Vector-sourced (client-provided value, no capture run) vs
+        # capture-sourced (a stored clean run + optional auto-capture).
+        vector_sourced = source_module is not None or source_inline is not None
+        if source_module is not None:
+            payload["source_module"] = source_module
+        if source_inline is not None:
+            payload["source_inline"] = source_inline
+        if mask is not None:
+            payload["mask"] = mask
+        if patch_vectors is not None:
+            payload["patch_vectors"] = patch_vectors
+        if not vector_sourced:
+            payload["source_run"] = run
+            # The server aligns positions when the prompts tokenize to
+            # different lengths (and 400s a mismatch without clean_prompt);
+            # a missing run + clean_prompt triggers one-call auto-capture.
+            payload["clean_prompt"] = clean_prompt
+            payload["clean_baseline"] = clean_baseline
+            payload["keep_source"] = keep_source
         if hooks is not None:
             payload["hooks"] = hooks
         url = f"{self.base_url}/patch_sweep"
@@ -890,6 +906,101 @@ class PatchStudy:
         # Single-hook per-cell path always yields one SweepResult (no `hooks`).
         assert isinstance(zoomed, SweepResult)
         return zoomed
+
+    # ---- client-provided (vector) sources ----------------------------------
+
+    @staticmethod
+    def pack_vectors(array, dtype: str = "float32") -> dict:
+        """Pack a 2-D ``(n_rows, width)`` numpy array into the ``patch_vectors``
+        wire dict (base64 binary form the server decodes once per request).
+
+        Args:
+            array: A 2-D array-like; each row is a candidate patch vector or a
+                graded mask (mask values in ``[0, 1]``).
+            dtype: Wire dtype — ``float32`` | ``float16`` | ``bfloat16``.
+        """
+        import numpy as np
+        import pybase64 as base64
+
+        np_dtype = {"float32": np.float32, "float16": np.float16}.get(dtype)
+        arr = np.asarray(array)
+        if arr.ndim != 2:
+            raise ValueError(f"patch_vectors array must be 2-D, got {arr.ndim}-D")
+        if dtype == "bfloat16":
+            # numpy has no native bfloat16; pack via torch to the raw bytes.
+            import torch
+
+            t = torch.as_tensor(np.asarray(arr, dtype=np.float32)).to(torch.bfloat16)
+            raw = t.contiguous().view(torch.uint8).numpy().tobytes()
+        elif np_dtype is not None:
+            raw = np.ascontiguousarray(arr, dtype=np_dtype).tobytes()
+        else:
+            raise ValueError(
+                f"dtype {dtype!r} must be float32 | float16 | bfloat16"
+            )
+        return {
+            "dtype": dtype,
+            "shape": [int(arr.shape[0]), int(arr.shape[1])],
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+
+    async def ablation_sweep(
+        self,
+        corrupt_prompt: str,
+        *,
+        layers: Sequence[int],
+        positions: Sequence[int | Span] | Span | str,
+        source: str = "zeros",
+        source_inline: int | None = None,
+        mask: dict | None = None,
+        patch_vectors: dict | None = None,
+        hook: str | None = None,
+        alpha: float = 1.0,
+        answer_token: str,
+        foil_token: str | None = None,
+        metric: str = "logprob",
+        hooks: Sequence[str] | None = None,
+        on_cell: Callable[[dict], None] | None = None,
+    ) -> SweepResult | dict[str, SweepResult]:
+        """Vector-sourced server-side sweep — no clean run, no auto-capture.
+
+        Every ``(layer, position)`` cell is patched from the SAME client source:
+        a named steering module (``source=<name>``), the reserved ``"zeros"``
+        row (default — neuron/dim clamping when paired with ``mask``), or a row
+        of ``patch_vectors`` (``source_inline=<row>``). A ``mask``
+        (``{"indices": [...]}`` or ``{"inline": row}``) restricts the patch to a
+        subset of dims. The ``recovered`` metric is unavailable (no clean run).
+
+        Example (zero-ablate a set of residual dims across a grid)::
+
+            result = await study.ablation_sweep(
+                prompt, source="zeros",
+                mask={"indices": [12, 40, 815]},
+                layers=range(20), positions=[Span("Paris")],
+                answer_token=" France",
+            )
+        """
+        hook = hook or self.hook
+        source_module = None if source_inline is not None else source
+        return await self._sweep_server_side(
+            corrupt_prompt,
+            run=None,
+            layers=list(layers),
+            positions=positions,
+            hook=hook,
+            alpha=alpha,
+            answer_token=answer_token,
+            foil_token=foil_token,
+            metric=metric,
+            clean=None,
+            clean_prompt=None,
+            hooks=list(hooks) if hooks is not None else None,
+            on_cell=on_cell,
+            source_module=source_module,
+            source_inline=source_inline,
+            mask=mask,
+            patch_vectors=patch_vectors,
+        )
 
     def drop_run(self, run: str) -> bool:
         """Free a captured source run via ``DELETE /v1/patch_source/{run}``.

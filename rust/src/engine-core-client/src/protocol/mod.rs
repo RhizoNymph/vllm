@@ -362,6 +362,12 @@ pub struct EngineCoreSamplingParams {
     /// prefix-cache flags (offline admission).
     #[serde(default)]
     pub patch: Option<serde_json::Value>,
+    /// Request-level packed table of client-provided patch vectors, referenced
+    /// by a patch entry's `source_inline` / mask `inline` row index. Forwarded
+    /// verbatim (base64 binary wire form) like `patch`; omit-when-None keeps the
+    /// wire payload compatible with clients that never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_vectors: Option<serde_json::Value>,
 }
 
 impl EngineCoreSamplingParams {
@@ -396,6 +402,7 @@ impl EngineCoreSamplingParams {
             steering_module_ref: None,
             capture: None,
             patch: None,
+            patch_vectors: None,
         }
     }
 }
@@ -835,6 +842,31 @@ mod tests {
         let decoded: EngineCoreSamplingParams =
             decode_msgpack(&encode_msgpack(&params).unwrap()).unwrap();
         assert!(decoded.patch.is_none());
+    }
+
+    #[test]
+    fn patch_vectors_forwarded_verbatim_and_omitted_when_none() {
+        // The packed table forwards verbatim under `patch_vectors` (like
+        // `patch`), and its key is omitted from the wire payload when None.
+        let table = serde_json::json!({
+            "dtype": "float32",
+            "shape": [2, 4],
+            "data": "AAAAAA==",
+        });
+        let params = EngineCoreSamplingParams {
+            patch_vectors: Some(table.clone()),
+            ..EngineCoreSamplingParams::for_test()
+        };
+        let bytes = encode_msgpack(&params).unwrap();
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.patch_vectors, Some(table));
+
+        // Absent by default: the key is skipped, decodes cleanly to None.
+        let plain = EngineCoreSamplingParams::for_test();
+        assert!(plain.patch_vectors.is_none());
+        let decoded: EngineCoreSamplingParams =
+            decode_msgpack(&encode_msgpack(&plain).unwrap()).unwrap();
+        assert!(decoded.patch_vectors.is_none());
     }
 
     #[test]

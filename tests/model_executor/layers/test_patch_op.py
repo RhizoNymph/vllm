@@ -7,7 +7,10 @@ Activation patching overwrites (``alpha == 1``) or interpolates toward
 
     out[t] = lerp(hs[t], table[idx[t]], alpha[idx[t]])
 
-Slot 0 is the passthrough sentinel (``alpha[0] == 0``). ``post_block`` uses a
+``alpha`` is a per-**dimension** weight table ``(max_slots, hidden)`` — the
+optional per-dim ``mask`` folded into ``alpha * mask``, so a masked subset of
+dims is patched and the rest pass through with a single kernel path. Slot 0 is
+the passthrough sentinel (``alpha`` row 0 all-zeros). ``post_block`` uses a
 two-tensor op that reconstructs the deferred-MLP-add block output
 (``residual + hidden``) so replace/lerp lands on the true block output.
 
@@ -43,6 +46,11 @@ def _active(flag: bool) -> torch.Tensor:
     return torch.tensor([flag], dtype=torch.bool)
 
 
+def _alpha(scalars: list[float], h: int) -> torch.Tensor:
+    """Per-dim alpha table from per-slot scalar weights (uniform across dims)."""
+    return torch.stack([torch.full((h,), float(s)) for s in scalars])
+
+
 class TestApplyPatchSingleTensor:
     """CPU eager path of the single-tensor lerp op."""
 
@@ -52,7 +60,7 @@ class TestApplyPatchSingleTensor:
         hidden = torch.randn(n, h)
         table = torch.randn(3, h)
         table[0] = 0.0
-        alpha = torch.tensor([0.0, 1.0, 1.0])
+        alpha = _alpha([0.0, 1.0, 1.0], h)
         index = torch.tensor([0, 1, 2, 1], dtype=torch.int32)
 
         out = apply_patch(hidden, table, index, alpha, _active(True))
@@ -68,7 +76,7 @@ class TestApplyPatchSingleTensor:
         hidden = torch.ones(n, h)
         table = torch.zeros(3, h)
         table[1] = torch.full((h,), 4.0)
-        alpha = torch.tensor([0.0, 0.25, 0.0])
+        alpha = _alpha([0.0, 0.25, 0.0], h)
         index = torch.tensor([1, 1], dtype=torch.int32)
 
         out = apply_patch(hidden, table, index, alpha, _active(True))
@@ -81,18 +89,57 @@ class TestApplyPatchSingleTensor:
         hidden = torch.randn(n, h)
         table = torch.randn(2, h)
         table[0] = 999.0  # must never be read for slot-0 rows
-        alpha = torch.tensor([0.0, 1.0])
+        alpha = _alpha([0.0, 1.0], h)
         index = torch.zeros(n, dtype=torch.int32)
 
         out = apply_patch(hidden, table, index, alpha, _active(True))
         assert torch.allclose(out, hidden)
+
+    def test_alpha_row_zero_is_passthrough(self):
+        """Alpha row 0 all-zeros: a stray slot-0 index never reads the table."""
+        n, h = 2, 4
+        hidden = torch.randn(n, h)
+        table = torch.full((2, h), 5.0)
+        alpha = torch.zeros(2, h)  # row 0 all-zeros invariant
+        alpha[1] = 1.0
+        index = torch.zeros(n, dtype=torch.int32)  # all slot 0
+        out = apply_patch(hidden, table, index, alpha, _active(True))
+        assert torch.allclose(out, hidden)
+
+    def test_per_dim_mask_patches_subset(self):
+        """A per-dim alpha (mask) patches only its dims; others pass through."""
+        n, h = 1, 6
+        hidden = torch.zeros(n, h)
+        table = torch.zeros(2, h)
+        table[1] = torch.arange(1.0, h + 1)  # [1,2,3,4,5,6]
+        # Mask even dims (alpha=1 there), leave odd dims untouched (alpha=0).
+        alpha = torch.zeros(2, h)
+        alpha[1, ::2] = 1.0
+        index = torch.ones(n, dtype=torch.int32)
+        out = apply_patch(hidden, table, index, alpha, _active(True))
+        expected = torch.zeros(h)
+        expected[::2] = table[1][::2]
+        assert torch.allclose(out[0], expected)
+
+    def test_graded_mask_half(self):
+        """A graded (0.5) mask value interpolates that dim halfway."""
+        n, h = 1, 4
+        hidden = torch.full((n, h), 2.0)
+        table = torch.zeros(2, h)
+        table[1] = torch.full((h,), 6.0)
+        alpha = torch.zeros(2, h)
+        alpha[1] = torch.tensor([0.0, 0.5, 1.0, 0.5])
+        index = torch.ones(n, dtype=torch.int32)
+        out = apply_patch(hidden, table, index, alpha, _active(True))
+        # lerp(2, 6, a): a=0 -> 2, a=0.5 -> 4, a=1 -> 6
+        assert torch.allclose(out[0], torch.tensor([2.0, 4.0, 6.0, 4.0]))
 
     def test_any_active_false_is_clone(self):
         """any_active False returns a clone of hidden, ignoring the table."""
         n, h = 4, 8
         hidden = torch.randn(n, h)
         table = torch.randn(3, h)  # arbitrary garbage
-        alpha = torch.tensor([0.0, 1.0, 1.0])
+        alpha = _alpha([0.0, 1.0, 1.0], h)
         index = torch.tensor([1, 2, 1, 2], dtype=torch.int32)
 
         out = apply_patch(hidden, table, index, alpha, _active(False))
@@ -106,7 +153,7 @@ class TestApplyPatchSingleTensor:
         table = torch.zeros(3, h)
         table[1] = torch.full((h,), 7.0)
         table[2] = torch.full((h,), -3.0)
-        alpha = torch.tensor([0.0, 1.0, 1.0])
+        alpha = _alpha([0.0, 1.0, 1.0], h)
         index = torch.tensor([0, 1, 0, 2, 0], dtype=torch.int32)
 
         out = apply_patch(hidden, table, index, alpha, _active(True))
@@ -122,7 +169,7 @@ class TestApplyPatchSingleTensor:
         hidden = torch.ones(n, h)
         table = torch.zeros(3, h)
         table[1] = torch.full((h,), 5.0)
-        alpha = torch.tensor([0.0, 1.0, 0.0])
+        alpha = _alpha([0.0, 1.0, 0.0], h)
         index = torch.full((100,), 2, dtype=torch.int32)  # out-of-range padding
         index[:n] = 1
 
@@ -133,7 +180,7 @@ class TestApplyPatchSingleTensor:
         n, h = 5, 16
         hidden = torch.randn(n, h, dtype=torch.float32)
         table = torch.randn(4, h, dtype=torch.float32)
-        alpha = torch.zeros(4)
+        alpha = torch.zeros(4, h)
         index = torch.zeros(n, dtype=torch.int32)
 
         out = apply_patch(hidden, table, index, alpha, _active(True))
@@ -145,7 +192,7 @@ class TestApplyPatchSingleTensor:
         n, h = 2, 4
         hidden = torch.zeros(n, h)
         table = torch.zeros(3, h)
-        alpha = torch.zeros(3)
+        alpha = torch.zeros(3, h)
         index = torch.zeros(n, dtype=torch.int32)
 
         out1 = apply_patch(hidden, table, index, alpha, _active(True))
@@ -173,7 +220,7 @@ class TestApplyPatchBlock:
         residual = torch.randn(n, h)
         table = torch.randn(3, h)
         table[0] = 0.0
-        alpha = torch.tensor([0.0, 1.0, 1.0])
+        alpha = _alpha([0.0, 1.0, 1.0], h)
         index = torch.tensor([0, 1, 2, 1], dtype=torch.int32)
 
         out_res = apply_patch_block(
@@ -193,7 +240,7 @@ class TestApplyPatchBlock:
         residual = torch.full((n, h), 1.0)  # block_out = 3.0
         table = torch.zeros(2, h)
         table[1] = torch.full((h,), 7.0)
-        alpha = torch.tensor([0.0, 0.5])
+        alpha = _alpha([0.0, 0.5], h)
         index = torch.ones(n, dtype=torch.int32)
 
         out_res = apply_patch_block(
@@ -203,6 +250,28 @@ class TestApplyPatchBlock:
         # lerp(3, 7, 0.5) = 5
         assert torch.allclose(block_out, torch.full((n, h), 5.0))
 
+    def test_block_masked_reconstruction(self):
+        """A per-dim mask patches the block output on a subset of dims only.
+
+        The unmasked dims must reconstruct to the ORIGINAL block output
+        (residual + hidden), the masked dims to the source.
+        """
+        n, h = 1, 6
+        hidden = torch.randn(n, h)
+        residual = torch.randn(n, h)
+        table = torch.randn(2, h)
+        alpha = torch.zeros(2, h)
+        alpha[1, ::2] = 1.0  # patch even dims (replace), odd dims untouched
+        index = torch.ones(n, dtype=torch.int32)
+
+        out_res = apply_patch_block(
+            hidden, residual, table, index, alpha, _active(True)
+        )
+        block_out = out_res + hidden
+        orig_block = residual + hidden
+        assert torch.allclose(block_out[0, ::2], table[1][::2], atol=1e-6)
+        assert torch.allclose(block_out[0, 1::2], orig_block[0, 1::2], atol=1e-6)
+
     def test_hidden_states_untouched(self):
         """The op returns a new residual and never mutates hidden_states."""
         n, h = 3, 4
@@ -210,7 +279,7 @@ class TestApplyPatchBlock:
         hidden_orig = hidden.clone()
         residual = torch.randn(n, h)
         table = torch.randn(2, h)
-        alpha = torch.tensor([0.0, 1.0])
+        alpha = _alpha([0.0, 1.0], h)
         index = torch.ones(n, dtype=torch.int32)
 
         apply_patch_block(hidden, residual, table, index, alpha, _active(True))
@@ -221,7 +290,7 @@ class TestApplyPatchBlock:
         hidden = torch.randn(n, h)
         residual = torch.randn(n, h)
         table = torch.full((2, h), 999.0)
-        alpha = torch.tensor([0.0, 1.0])
+        alpha = _alpha([0.0, 1.0], h)
         index = torch.zeros(n, dtype=torch.int32)
 
         out_res = apply_patch_block(
@@ -234,7 +303,7 @@ class TestApplyPatchBlock:
         hidden = torch.randn(n, h)
         residual = torch.randn(n, h)
         table = torch.full((2, h), 999.0)
-        alpha = torch.tensor([0.0, 1.0])
+        alpha = _alpha([0.0, 1.0], h)
         index = torch.ones(n, dtype=torch.int32)
 
         out_res = apply_patch_block(
@@ -261,14 +330,14 @@ class TestRegisterPatchBuffers:
             index = getattr(mod, PATCH_INDEX_ATTR[hp])
             flag = getattr(mod, PATCH_ANY_ACTIVE_ATTR[hp])
             assert table.shape == (max_slots, hidden_size)
-            assert alpha.shape == (max_slots,)
+            assert alpha.shape == (max_slots, hidden_size)
             assert alpha.dtype == torch.float32
             assert index.shape == (max_tokens,)
             assert index.dtype == torch.int32
             assert flag.shape == (1,)
             assert flag.dtype == torch.bool
-            # alpha[0] passthrough invariant
-            assert float(alpha[0]) == 0.0
+            # alpha row 0 passthrough invariant
+            assert torch.all(alpha[0] == 0.0)
 
     def test_disabled_is_noop(self):
         mod = nn.Module()

@@ -140,6 +140,7 @@ pub(super) fn prepare_completion_request(
             steering_name: request.steering_name,
             capture: request.capture,
             patch: request.patch,
+            patch_vectors: request.patch_vectors,
         },
         decode_options: TextDecodeOptions {
             skip_special_tokens: request.skip_special_tokens,

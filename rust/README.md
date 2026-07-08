@@ -111,6 +111,18 @@ offline request is admitted here instead. An invalid spec (bad hook,
 out-of-range layer, per-site overflow, or patching not enabled) is rejected by
 the engine.
 
+**Client-provided patch values** ride through Rust for free. In addition to
+`source_run` (a capture run), a patch entry may source its value from a named
+steering module (`"source_module": "<name>"`), the reserved zero row
+(`"source_module": "zeros"`), or a row of a request-level packed
+`patch_vectors` table (`"source_inline": <row>`); an optional per-entry `mask`
+(`{"indices": [...]}` or `{"inline": <row>}`) restricts the patch to a subset
+of dims. The `patch_vectors` table is a sibling request field forwarded
+verbatim southbound exactly like `patch` (omitted from the wire when unset).
+Named-module *name* existence is only pre-validated on the Python OpenAI
+frontend (its steering registry); over Rust an unknown name surfaces via the
+worker resolution-failure backstop.
+
 ```bash
 curl http://127.0.0.1:8000/v1/completions \
   -H "Content-Type: application/json" \
@@ -122,7 +134,22 @@ curl http://127.0.0.1:8000/v1/completions \
        "source_run": "clean", "source_position": 6, "alpha": 1.0}
     ]
   }'
+
+# Zero-ablate residual dims 12 and 40 at layer 14 (no capture run needed):
+curl http://127.0.0.1:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "prompt": "The Eiffel Tower is in",
+    "patch": [
+      {"layer": 14, "hook": "post_block", "dest_position": 6,
+       "source_module": "zeros", "mask": {"indices": [12, 40]}}
+    ]
+  }'
 ```
+
+The sweep-endpoint additions (vector-sourced ablation sweeps) ride the existing
+Python patch sidecar below — no Rust changes are needed for them.
 
 ### Server-side sweeps via the patch sidecar
 

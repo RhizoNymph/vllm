@@ -57,10 +57,14 @@ Features Index:
   activation_patching:
     description: >
       Overwrite/interpolate residual activations at (layer, hook, position)
-      sites with a prior clean run's captured activations — the causal-tracing
-      primitive. Includes a server-side (hooks × layers × positions) sweep endpoint with SSE streaming and source-run lifecycle.
+      sites with a source vector — a prior clean run's captured activations
+      (causal tracing), a named steering module / reserved "zeros", or a
+      client-provided packed patch_vectors row — optionally through a per-dim
+      mask (alpha·mask folded into a per-dim alpha table). Includes a
+      server-side (hooks × layers × positions) sweep endpoint (capture- or
+      vector-sourced) with SSE streaming and source-run lifecycle.
     entry_points:
-      ["SamplingParams.patch", "--enable-patching", "POST /v1/patch_sweep"]
+      ["SamplingParams.patch", "SamplingParams.patch_vectors", "--enable-patching", "POST /v1/patch_sweep"]
     depends_on: [activation_capture, activation_steering]
     doc: docs/features/activation_patching.md
 ```

@@ -43,8 +43,25 @@ class PatchSweepRequest(BaseModel):
     model: str | None = None
     prompt: str
     """The corrupted/destination prompt swept over."""
-    source_run: str
-    """Clean-run handle whose stored activations are patched in."""
+    source_run: str | None = None
+    """Clean-run handle whose stored activations are patched in (capture-sourced
+    sweep). Optional: a vector-sourced sweep sets ``source_module`` or
+    ``source_inline`` instead and leaves this (and ``clean_prompt``) unset."""
+    source_module: str | None = None
+    """Vector-sourced sweep: patch every cell from the BASE ``vectors`` tier of
+    this named steering module at the cell's ``(hook, layer)``. The reserved
+    name ``"zeros"`` resolves to a zero row (neuron clamping via ``mask``)."""
+    source_inline: int | None = None
+    """Vector-sourced sweep: patch every cell from this row index of the
+    request-level ``patch_vectors`` table."""
+    mask: dict | None = None
+    """Optional per-dim mask restricting the patch to a subset of dims (composes
+    with any source kind). ``{"indices": [int, ...]}`` (sparse 0/1) or
+    ``{"inline": row}`` (a graded row of ``patch_vectors``, values in [0,1])."""
+    patch_vectors: dict | None = None
+    """Request-level packed table shared by every cell, referenced by
+    ``source_inline`` / mask ``inline``. Binary wire form:
+    ``{dtype, shape:[n_rows, width], data: base64}``."""
     clean_prompt: str | None = None
     """The clean prompt ``source_run`` was captured from.
 

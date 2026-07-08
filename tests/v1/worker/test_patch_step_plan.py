@@ -41,12 +41,23 @@ def _vec(h: int, fill: float) -> torch.Tensor:
     return torch.full((h,), fill)
 
 
+def _ones(h: int) -> torch.Tensor:
+    """Full-replace per-dim alpha row (alpha == 1 on every dim)."""
+    return torch.ones(h, dtype=torch.float32)
+
+
 class TestBuildPatchStepPlan:
     def test_prefill_single_site(self):
         h = 4
         specs = {
             "r0": [
-                PatchEntry(layer=3, hook=POST_BLOCK, dest_pos=2, source=_vec(h, 1.0))
+                PatchEntry(
+                    layer=3,
+                    hook=POST_BLOCK,
+                    dest_pos=2,
+                    source=_vec(h, 1.0),
+                    alpha_row=_ones(h),
+                )
             ]
         }
         plan = build_patch_step_plan(
@@ -61,11 +72,18 @@ class TestBuildPatchStepPlan:
         assert set(plan) == {(3, POST_BLOCK)}
         site = plan[(3, POST_BLOCK)]
         assert site.abs_rows == [2]  # offset 0 + (2 - 0)
-        assert site.alphas == [1.0]
+        assert len(site.alpha_rows) == 1
+        assert torch.allclose(site.alpha_rows[0], _ones(h))
 
     def test_chunked_prefill_only_fires_in_window(self):
         h = 4
-        entry = PatchEntry(layer=1, hook=POST_BLOCK, dest_pos=10, source=_vec(h, 1.0))
+        entry = PatchEntry(
+            layer=1,
+            hook=POST_BLOCK,
+            dest_pos=10,
+            source=_vec(h, 1.0),
+            alpha_row=_ones(h),
+        )
         # Chunk 1: positions [0, 8) -> not yet.
         plan1 = build_patch_step_plan(
             req_ids=["r0"],
@@ -92,7 +110,13 @@ class TestBuildPatchStepPlan:
     def test_decode_position(self):
         h = 4
         # Decode step: num_computed == dest_pos, num_scheduled == 1.
-        entry = PatchEntry(layer=2, hook=POST_BLOCK, dest_pos=20, source=_vec(h, 1.0))
+        entry = PatchEntry(
+            layer=2,
+            hook=POST_BLOCK,
+            dest_pos=20,
+            source=_vec(h, 1.0),
+            alpha_row=_ones(h),
+        )
         plan = build_patch_step_plan(
             req_ids=["r0"],
             num_computed=[20],
@@ -108,7 +132,13 @@ class TestBuildPatchStepPlan:
         h = 4
         specs = {
             "r1": [
-                PatchEntry(layer=0, hook=POST_BLOCK, dest_pos=1, source=_vec(h, 1.0))
+                PatchEntry(
+                    layer=0,
+                    hook=POST_BLOCK,
+                    dest_pos=1,
+                    source=_vec(h, 1.0),
+                    alpha_row=_ones(h),
+                )
             ]
         }
         # r0 and r2 have no spec; r1 is patched at its position 1.
@@ -127,9 +157,27 @@ class TestBuildPatchStepPlan:
         h = 4
         specs = {
             "r0": [
-                PatchEntry(layer=0, hook=POST_BLOCK, dest_pos=1, source=_vec(h, 1.0)),
-                PatchEntry(layer=0, hook=POST_BLOCK, dest_pos=2, source=_vec(h, 2.0)),
-                PatchEntry(layer=1, hook=PRE_ATTN, dest_pos=1, source=_vec(h, 3.0)),
+                PatchEntry(
+                    layer=0,
+                    hook=POST_BLOCK,
+                    dest_pos=1,
+                    source=_vec(h, 1.0),
+                    alpha_row=_ones(h),
+                ),
+                PatchEntry(
+                    layer=0,
+                    hook=POST_BLOCK,
+                    dest_pos=2,
+                    source=_vec(h, 2.0),
+                    alpha_row=_ones(h),
+                ),
+                PatchEntry(
+                    layer=1,
+                    hook=PRE_ATTN,
+                    dest_pos=1,
+                    source=_vec(h, 3.0),
+                    alpha_row=_ones(h),
+                ),
             ]
         }
         plan = build_patch_step_plan(
@@ -142,14 +190,23 @@ class TestBuildPatchStepPlan:
             max_patch_slots=8,
         )
         assert plan[(0, POST_BLOCK)].abs_rows == [1, 2]  # two slots, same site
-        assert plan[(0, POST_BLOCK)].alphas == [1.0, 1.0]
+        assert len(plan[(0, POST_BLOCK)].alpha_rows) == 2
+        assert all(
+            torch.allclose(a, _ones(h)) for a in plan[(0, POST_BLOCK)].alpha_rows
+        )
         assert plan[(1, PRE_ATTN)].abs_rows == [1]
 
     def test_non_local_layer_skipped(self):
         h = 4
         specs = {
             "r0": [
-                PatchEntry(layer=5, hook=POST_BLOCK, dest_pos=0, source=_vec(h, 1.0))
+                PatchEntry(
+                    layer=5,
+                    hook=POST_BLOCK,
+                    dest_pos=0,
+                    source=_vec(h, 1.0),
+                    alpha_row=_ones(h),
+                )
             ]
         }
         # Layer 5 is owned by another PP rank -> skipped here.
@@ -170,7 +227,13 @@ class TestBuildPatchStepPlan:
         # (max_patch_slots=3 -> slots 1,2 usable).
         specs = {
             "r0": [
-                PatchEntry(layer=0, hook=POST_BLOCK, dest_pos=p, source=_vec(h, 1.0))
+                PatchEntry(
+                    layer=0,
+                    hook=POST_BLOCK,
+                    dest_pos=p,
+                    source=_vec(h, 1.0),
+                    alpha_row=_ones(h),
+                )
                 for p in range(3)
             ]
         }
@@ -205,6 +268,7 @@ class TestBuildPatchStepPlan:
                             hook=POST_BLOCK,
                             dest_pos=p,
                             source=_vec(h, 1.0),
+                            alpha_row=_ones(h),
                         )
                         for p in range(n)
                     ]
@@ -265,7 +329,15 @@ class TestWritePatchStep:
         runner = _FakeRunner(n_layers=2, hidden=h, max_slots=8, max_tokens=64)
         src = _vec(h, 9.0)
         runner._patch_specs = {
-            "r0": [PatchEntry(layer=1, hook=POST_BLOCK, dest_pos=2, source=src)]
+            "r0": [
+                PatchEntry(
+                    layer=1,
+                    hook=POST_BLOCK,
+                    dest_pos=2,
+                    source=src,
+                    alpha_row=_ones(h),
+                )
+            ]
         }
         view = _PatchBatchView(
             req_ids=["r0"],
@@ -295,7 +367,13 @@ class TestWritePatchStep:
         runner = _FakeRunner(n_layers=1, hidden=h, max_slots=8, max_tokens=64)
         runner._patch_specs = {
             "r0": [
-                PatchEntry(layer=0, hook=POST_BLOCK, dest_pos=1, source=_vec(h, 5.0))
+                PatchEntry(
+                    layer=0,
+                    hook=POST_BLOCK,
+                    dest_pos=1,
+                    source=_vec(h, 5.0),
+                    alpha_row=_ones(h),
+                )
             ]
         }
         view = _PatchBatchView(
@@ -323,7 +401,13 @@ class TestWritePatchStep:
         runner = _FakeRunner(n_layers=2, hidden=h, max_slots=8, max_tokens=64)
         runner._patch_specs = {
             "r0": [
-                PatchEntry(layer=0, hook=POST_BLOCK, dest_pos=1, source=_vec(h, 5.0))
+                PatchEntry(
+                    layer=0,
+                    hook=POST_BLOCK,
+                    dest_pos=1,
+                    source=_vec(h, 5.0),
+                    alpha_row=_ones(h),
+                )
             ]
         }
         view = _PatchBatchView(
@@ -334,7 +418,13 @@ class TestWritePatchStep:
 
         runner._patch_specs = {
             "r0": [
-                PatchEntry(layer=1, hook=POST_BLOCK, dest_pos=1, source=_vec(h, 5.0))
+                PatchEntry(
+                    layer=1,
+                    hook=POST_BLOCK,
+                    dest_pos=1,
+                    source=_vec(h, 5.0),
+                    alpha_row=_ones(h),
+                )
             ]
         }
         runner._write_patch_step(view)

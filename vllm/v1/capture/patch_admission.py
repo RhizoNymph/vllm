@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -32,9 +33,29 @@ logger = init_logger(__name__)
 
 _INJECTABLE_HOOKS = frozenset(h.value for h in HOOK_POINT_TABLE_ATTR)
 
+# Reserved built-in source-module name (zero row); never registry-validated.
+_ZEROS_MODULE = "zeros"
+
 
 class PatchValidationError(ValueError):
     """Raised when a patch spec fails admission validation (-> HTTP 400)."""
+
+
+def make_named_module_existence(
+    raw_request,
+) -> Callable[[str], bool] | None:
+    """Build a ``source_module`` existence check from the request's steering
+    module registry (``app.state.steering_module_registry``), or ``None`` when
+    no registry is attached (steering disabled / offline). Reuses the same
+    registry the ``steering_name`` frontend path validates against."""
+    registry = (
+        None
+        if raw_request is None
+        else getattr(raw_request.app.state, "steering_module_registry", None)
+    )
+    if registry is None:
+        return None
+    return lambda name: registry.get(name) is not None
 
 
 def resolve_patch_prefix_flags(
@@ -42,16 +63,49 @@ def resolve_patch_prefix_flags(
     ctx: CaptureContext,
     *,
     max_patch_slots: int,
+    named_module_exists: Callable[[str], bool] | None = None,
 ) -> None:
     """Validate ``sampling_params.patch`` and stamp prefix-cache flags in place.
 
-    Raises :class:`PatchValidationError` on an invalid hook, out-of-range
-    layer, negative position, or a single-request per-site demand exceeding the
-    pool (strict policy).
+    Raises :class:`PatchValidationError` on a structural error, an invalid
+    hook, out-of-range layer, negative position, an unknown named module
+    (when ``named_module_exists`` is provided), an inline-row width mismatch, or
+    a single-request per-site demand exceeding the pool (strict policy).
+
+    Args:
+        named_module_exists: Optional callable resolving a ``source_module``
+            name against the frontend's steering-module registry. When provided
+            (online path), each entry's module (except the reserved ``zeros``)
+            is existence-checked -> 400 on a miss. When ``None`` (offline / no
+            registry) named modules pass structurally; a bad name surfaces later
+            via the worker resolution-failure registry.
+
+    The prefix floor (``patch_touches_prompt`` / ``patch_min_prompt_position``)
+    is driven by dest positions and is source-kind independent.
     """
     spec = sampling_params.patch
     if not spec:
         return
+
+    # Structural gate (exactly-one-of source kind, mask shape, packed
+    # patch_vectors table, inline index-in-range). On the HTTP path patch /
+    # patch_vectors are set post-construction so this is the first structural
+    # check; re-running it offline is idempotent.
+    try:
+        sampling_params._validate_patch()
+    except ValueError as exc:
+        raise PatchValidationError(str(exc)) from exc
+
+    hidden_size = getattr(ctx, "hidden_size", None)
+    pv = sampling_params.patch_vectors
+    pv_width = int(pv["shape"][1]) if pv else None
+
+    def _check_inline_width(i: int) -> None:
+        if pv_width is not None and hidden_size is not None and pv_width != hidden_size:
+            raise PatchValidationError(
+                f"patch[{i}]: patch_vectors width {pv_width} != hook width "
+                f"{hidden_size} (residual-stream hooks are hidden_size-wide)"
+            )
 
     prompt_floors: list[int] = []
     site_counts: dict[tuple[int, str], int] = {}
@@ -70,8 +124,28 @@ def resolve_patch_prefix_flags(
         dest = int(entry["dest_position"])
         if dest < 0:
             raise PatchValidationError(f"patch[{i}]: dest_position {dest} must be >= 0")
-        if int(entry["source_position"]) < 0:
-            raise PatchValidationError(f"patch[{i}]: source_position must be >= 0")
+
+        if entry.get("source_run") is not None:
+            if int(entry["source_position"]) < 0:
+                raise PatchValidationError(f"patch[{i}]: source_position must be >= 0")
+        elif entry.get("source_module") is not None:
+            name = str(entry["source_module"])
+            if (
+                named_module_exists is not None
+                and name != _ZEROS_MODULE
+                and not named_module_exists(name)
+            ):
+                raise PatchValidationError(
+                    f"patch[{i}]: unknown source_module {name!r} "
+                    f"(not registered as a steering module)"
+                )
+        elif entry.get("source_inline") is not None:
+            _check_inline_width(i)
+
+        mask = entry.get("mask")
+        if mask and mask.get("inline") is not None:
+            _check_inline_width(i)
+
         key = (layer, hook)
         site_counts[key] = site_counts.get(key, 0) + 1
         if max_patch_slots and site_counts[key] > max_patch_slots - 1:
@@ -190,6 +264,8 @@ class _PatchSourceCache:
         spec = sampling_params.patch
         if not spec:
             return
+        # Only capture-sourced entries reference the source store; module /
+        # inline entries carry their value with the request.
         refs = [
             (
                 str(e["source_run"]),
@@ -198,7 +274,10 @@ class _PatchSourceCache:
                 int(e["source_position"]),
             )
             for e in spec
+            if e.get("source_run") is not None
         ]
+        if not refs:
+            return
         if self._missing(refs) is None:
             await self._maybe_lease(engine_client, {r[0] for r in refs})
             return  # all cached-present

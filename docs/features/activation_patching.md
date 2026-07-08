@@ -90,6 +90,166 @@ at `(layer, hook, dest_position)` toward `source_run`'s activation at
 `source_position`. The interpolation is the precise form `(1-a)*h + a*source`
 (endpoint-exact at `alpha == 1`).
 
+### Standalone per-request use (outside a study)
+
+`patch` (and `patch_vectors`) are ordinary per-request sampling fields, not a
+study concept: any `/v1/completions` or `/v1/chat/completions` request — or an
+offline `SamplingParams` — can carry them, with no sweep endpoint, capture run,
+or client library involved. Only the carrying request is intervened on (per-row
+gating in a mixed continuous batch); sampling, streaming, stop handling, and
+everything else behave normally. `dest_position` is the 0-based logical token
+position (prompt positions first; generated positions continue the count and
+are patched on the step that computes them).
+
+Zero-ablate two residual dims for a single completion and grade the answer —
+no prior capture needed:
+
+```bash
+curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' -d '{
+  "model": "Qwen/Qwen3-0.6B",
+  "prompt": "The capital of France is",
+  "max_tokens": 1, "temperature": 0.0, "logprobs": 5,
+  "patch": [{"layer": 14, "hook": "post_block", "dest_position": 4,
+             "source_module": "zeros", "mask": {"indices": [12, 815]}}]
+}'
+```
+
+The same `patch` field works on chat requests (text-only: patch + multimodal
+content is rejected before rendering). For exact answer-token grading use the
+completions-only `logprob_token_ids` field (the requested ids replace top-k);
+chat exposes top-k `logprobs` only.
+
+To patch from a *named* vector, register a steering module once (the
+registration route is mounted only under `VLLM_SERVER_DEV_MODE=1`) and
+reference it — the same handle can be steered with (add) or patched in
+(replace):
+
+```bash
+curl -s localhost:8000/v1/steering/modules/register \
+  -H 'Content-Type: application/json' -d '{
+  "name": "dataset_mean",
+  "vectors": {"post_block": {"14": {"vector": [/* hidden_size floats */]}}}
+}'
+# then, on any request:
+#   "patch": [{"layer": 14, "hook": "post_block", "dest_position": 4,
+#              "source_module": "dataset_mean"}]
+```
+
+Offline, the same spec rides `SamplingParams` directly:
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="Qwen/Qwen3-0.6B", enable_patching=True)
+out = llm.generate(
+    "The capital of France is",
+    SamplingParams(
+        max_tokens=1, temperature=0.0, logprobs=5,
+        patch=[{"layer": 14, "hook": "post_block", "dest_position": 4,
+                "source_module": "zeros", "mask": {"indices": [12, 815]}}],
+    ),
+)
+```
+
+Capture-sourced entries (`source_run`/`source_position`) work per-request the
+same way — run the clean prompt once with the `patch_source` capture spec and
+`capture_wait=True` (see below), then reference the run from any later request.
+
+Per-request safety properties, all automatic: patched KV is taint-keyed
+(`patch_kv_taint`) so it can never be served to, or poison, other requests via
+the prefix cache; prompt positions at or above the lowest patched position are
+recomputed while the prefix below still reuses cache; a single request whose
+per-site demand exceeds the usable pool (`--max-patch-slots` minus the
+passthrough slot) is rejected with a 400, and concurrent patched requests are
+queued by scheduler backpressure rather than failed.
+
+### Patch value sources
+
+The source vector need not come from a capture run. Each entry sets **exactly
+one** source kind:
+
+- **`source_run` + `source_position`** — a prior server-side capture run's
+  stored activation (the classic causal-tracing path above).
+- **`source_module: "<name>"`** — resolved worker-side against the existing
+  *named steering module* registry (no new registry). The value is the module's
+  BASE `vectors` tier row at the same `(hook, layer)` the entry patches; a
+  `{"vector": [...], "scale": s}` registry entry resolves to `s * vector`.
+- **`source_module: "zeros"`** — a reserved built-in: a zero row of the hook's
+  width. Needs no registry and no store, so it works everywhere including
+  offline (`LLM(...)`). Zero-ablate residual dims by pairing it with a `mask`.
+- **`source_inline: <row_index>`** — an index into a request-level packed table
+  `patch_vectors` (see below). Packed-only (no raw float-list form — inline
+  float lists caused a large E2EL regression; the base64 packed form avoids it).
+
+`alpha` defaults `1.0` and applies to every kind.
+
+#### Per-dim masks
+
+An optional **`mask`** (composes with **any** source kind, including
+`source_run`) restricts the patch to a subset of dims:
+
+```
+out_d = hs_d + alpha * m_d * (src_d - hs_d)
+```
+
+Because `alpha * mask` is just a per-dimension `alpha`, a mask needs no separate
+kernel path — it is folded into the per-dim alpha row at staging time (unmasked
+entries stage a constant `alpha` fill). Wire forms per entry:
+
+- `{"indices": [int, ...]}` — sparse; expanded worker-side to a 0/1 mask.
+- `{"inline": <row_index>}` — a row of `patch_vectors` (values in `[0, 1]`,
+  graded/soft masks allowed).
+
+#### Packed `patch_vectors` table
+
+`source_inline` and mask `inline` index a request-level field carried verbatim
+on `SamplingParams` and decoded **once per request** at worker-side resolution.
+It uses the same binary wire encoding as `SteeringHookPacked`
+(`vllm/config/steering_types.py`) minus `layer_indices`/`scales`:
+
+```json
+{"dtype": "float32|float16|bfloat16", "shape": [n_rows, width],
+ "data": "<base64 contiguous bytes>"}
+```
+
+`width` must equal the hook width (`hidden_size` for all three injectable
+hooks). Structural errors (bad base64, shape/length mismatch, out-of-range row
+index, wrong width) are rejected at admission (HTTP 400); malformed structure on
+the direct `SamplingParams` path raises `ValueError`.
+
+#### Neuron / dim clamping
+
+To pin specific residual dims to zero across a run, combine `source_module:
+"zeros"` with a `mask`:
+
+```python
+patch = [{"layer": 14, "hook": "post_block", "dest_position": 6,
+          "source_module": "zeros", "mask": {"indices": [12, 40, 815]}}]
+```
+
+The injectable hooks are the **residual-stream** sites
+(`pre_attn`/`post_attn`/`post_block`), so this clamps residual dims.
+`mlp_in`/`mlp_out` remain capture-only, so MLP-width neuron clamping is out of
+scope.
+
+#### Offline named-module caveat
+
+Named-module *name* existence is validated at admission only when a frontend
+steering registry is present (the OpenAI server). Offline (`LLM(...)`) has no
+such registry, so a `source_module` name other than `"zeros"` cannot be
+admission-checked; a bad name surfaces loudly via the worker resolution-failure
+registry (the request runs unpatched and its output is not trusted). Structural
+validation (source-kind exclusivity, mask shape, packed table) still runs
+offline.
+
+#### Registry reuse rationale
+
+`source_module` deliberately reuses the steering module registry rather than
+introducing a patch-specific one: named modules already broadcast to every
+worker (so TP rank 0 can resolve and broadcast like any other source), already
+carry the `{hook: {layer: entry}}` shape patching addresses by `(hook, layer)`,
+and already have a frontend existence check to mirror.
+
 The clean run is captured once via the `patch_source` capture consumer:
 
 ```python
@@ -117,6 +277,27 @@ continuously-batched engine (the shared corrupt-prompt prefix is reused via
 prefix caching; each variant is patched at its own site via per-row gating), and
 returns the assembled metric grid. Metrics: `logprob`, `logit_diff`
 (answer − foil), `recovered` `(patched − corrupt) / (clean − corrupt)`.
+
+### Vector-sourced (ablation) sweeps
+
+A sweep is either **capture-sourced** (the default — `source_run` names a stored
+clean run, with optional one-call auto-capture) or **vector-sourced**: every
+cell is patched from the *same* client-provided value (`source_module` — a named
+module or `"zeros"` — or `source_inline` into a request-level `patch_vectors`
+table), optionally through a shared `mask`. A vector-sourced sweep sets exactly
+one of `source_module` / `source_inline` and leaves `source_run` / `clean_prompt`
+unset; the server skips auto-capture, the source-manifest existence check, and
+the source-run lifecycle (nothing to drop). The unpatched corrupt run is still
+measured as the baseline. The `recovered` metric needs a clean baseline and is
+**400**'d for vector-sourced sweeps; the raw metrics (`logprob`, `logit_diff`)
+work unchanged, and streaming (`stream: true`) behaves identically. Named
+`source_module` names are validated against the server's steering registry
+(400 with the available names on a miss).
+
+`PatchStudy.ablation_sweep(prompt, source="zeros", mask={"indices": [...]},
+layers=..., positions=...)` drives this from the client;
+`PatchStudy.pack_vectors(array)` packs a numpy array into the `patch_vectors`
+wire dict.
 
 The `PatchStudy` client
 (`vllm.entrypoints.serve.patch.client`) wraps capture + sweep for the

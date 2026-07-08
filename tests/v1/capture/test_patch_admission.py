@@ -116,6 +116,284 @@ class TestPatchSiteDemand:
         assert SamplingParams().patch_site_demand == {}
 
 
+def _pack(rows, width, dtype="float32"):
+    import numpy as np
+    import pybase64 as base64
+
+    arr = np.zeros((rows, width), dtype=np.float32)
+    return {
+        "dtype": dtype,
+        "shape": [rows, width],
+        "data": base64.b64encode(arr.tobytes()).decode("ascii"),
+    }
+
+
+def _sp_http(patch, patch_vectors=None):
+    """Mirror the HTTP path: patch / patch_vectors are set post-construction,
+    so structural validation first runs at admission (not at construction)."""
+    sp = SamplingParams()
+    sp.patch = patch
+    sp.patch_vectors = patch_vectors
+    return sp
+
+
+class TestSamplingParamsStructural:
+    """Construction-time (offline / direct) structural validation."""
+
+    def test_run_kind_ok(self):
+        SamplingParams(patch=[_entry()])  # source_run + source_position
+
+    def test_module_kind_ok(self):
+        SamplingParams(
+            patch=[
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_module": "m",
+                }
+            ]
+        )
+
+    def test_inline_kind_ok(self):
+        SamplingParams(
+            patch=[
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_inline": 0,
+                }
+            ],
+            patch_vectors=_pack(1, 8),
+        )
+
+    def test_no_source_kind_rejected(self):
+        with pytest.raises(ValueError):
+            SamplingParams(
+                patch=[{"layer": 0, "hook": "post_block", "dest_position": 0}]
+            )
+
+    def test_two_source_kinds_rejected(self):
+        with pytest.raises(ValueError):
+            SamplingParams(
+                patch=[
+                    {
+                        "layer": 0,
+                        "hook": "post_block",
+                        "dest_position": 0,
+                        "source_run": "R1",
+                        "source_position": 0,
+                        "source_module": "m",
+                    }
+                ]
+            )
+
+    def test_inline_without_table_rejected(self):
+        with pytest.raises(ValueError):
+            SamplingParams(
+                patch=[
+                    {
+                        "layer": 0,
+                        "hook": "post_block",
+                        "dest_position": 0,
+                        "source_inline": 0,
+                    }
+                ]
+            )
+
+    def test_mask_both_forms_rejected(self):
+        with pytest.raises(ValueError):
+            SamplingParams(
+                patch=[
+                    {
+                        "layer": 0,
+                        "hook": "post_block",
+                        "dest_position": 0,
+                        "source_module": "zeros",
+                        "mask": {"indices": [1], "inline": 0},
+                    }
+                ],
+                patch_vectors=_pack(1, 8),
+            )
+
+    def test_bad_patch_vectors_dtype_rejected(self):
+        with pytest.raises(ValueError):
+            SamplingParams(patch_vectors={"dtype": "int8", "shape": [1, 4], "data": ""})
+
+
+class TestNewSourceKindsAdmission:
+    def test_unknown_source_module_rejected(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 2,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_module": "x",
+                }
+            ]
+        )
+        with pytest.raises(PatchValidationError):
+            resolve_patch_prefix_flags(
+                sp, _ctx(10), max_patch_slots=64, named_module_exists=lambda n: False
+            )
+
+    def test_known_source_module_passes(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 2,
+                    "hook": "post_block",
+                    "dest_position": 3,
+                    "source_module": "x",
+                }
+            ]
+        )
+        resolve_patch_prefix_flags(
+            sp, _ctx(10), max_patch_slots=64, named_module_exists=lambda n: n == "x"
+        )
+        assert sp.patch_touches_prompt is True
+        assert sp.patch_min_prompt_position == 3  # floor from dest, source-agnostic
+
+    def test_zeros_module_never_registry_checked(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 2,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_module": "zeros",
+                }
+            ]
+        )
+        # callable rejects everything, but "zeros" bypasses the check.
+        resolve_patch_prefix_flags(
+            sp, _ctx(10), max_patch_slots=64, named_module_exists=lambda n: False
+        )
+
+    def test_inline_width_mismatch_rejected(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_inline": 0,
+                }
+            ],
+            patch_vectors=_pack(1, 4),  # width 4 != ctx.hidden_size 16
+        )
+        with pytest.raises(PatchValidationError):
+            resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+
+    def test_inline_width_match_passes(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_inline": 0,
+                }
+            ],
+            patch_vectors=_pack(1, 16),
+        )
+        resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+
+    def test_bad_base64_rejected(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_inline": 0,
+                }
+            ],
+            patch_vectors={"dtype": "float32", "shape": [1, 16], "data": "@@notb64"},
+        )
+        with pytest.raises(PatchValidationError):
+            resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+
+    def test_shape_mismatch_rejected(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_inline": 0,
+                }
+            ],
+            patch_vectors=_pack(1, 16) | {"shape": [2, 16]},  # data too short
+        )
+        with pytest.raises(PatchValidationError):
+            resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+
+    def test_inline_index_out_of_range_rejected(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_inline": 5,
+                }
+            ],
+            patch_vectors=_pack(1, 16),
+        )
+        with pytest.raises(PatchValidationError):
+            resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+
+    def test_mask_negative_index_rejected(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_module": "zeros",
+                    "mask": {"indices": [-1]},
+                }
+            ]
+        )
+        with pytest.raises(PatchValidationError):
+            resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+
+    def test_two_source_kinds_rejected(self):
+        sp = _sp_http(
+            [
+                {
+                    "layer": 0,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_module": "zeros",
+                    "source_inline": 0,
+                }
+            ],
+            patch_vectors=_pack(1, 16),
+        )
+        with pytest.raises(PatchValidationError):
+            resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+
+    def test_floor_source_kind_independent(self):
+        # A vector-sourced (zeros) prompt patch still stamps the prefix floor.
+        sp = _sp_http(
+            [
+                {
+                    "layer": 1,
+                    "hook": "post_block",
+                    "dest_position": 5,
+                    "source_module": "zeros",
+                }
+            ]
+        )
+        resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+        assert sp.patch_touches_prompt is True
+        assert sp.patch_min_prompt_position == 5
+
+
 class _FakeEngine:
     """Minimal engine_client stub: collective_rpc returns per-rank manifests."""
 

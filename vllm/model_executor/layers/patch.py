@@ -120,9 +120,14 @@ def register_patch_buffers(
     check that ``torch.compile`` traces as a constant branch.
 
     ``patch_table`` rows are in the model compute dtype (``dtype``) so the
-    gather needs no cast. Slot 0 is the passthrough sentinel and ``alpha[0]``
-    stays ``0.0`` for its whole lifetime (the passthrough invariant the CPU
+    gather needs no cast. Slot 0 is the passthrough sentinel and ``alpha`` row 0
+    stays all-zeros for its whole lifetime (the passthrough invariant the CPU
     fallback relies on). The index is per-(layer, hook) and int32.
+
+    ``patch_alpha`` is a per-**dimension** weight: ``(max_slots, hidden_size)``
+    fp32. A per-dim alpha is exactly ``alpha * mask`` folded into one buffer, so
+    masked patches (restrict to a subset of dims) and graded masks need no
+    separate kernel path — an unmasked entry stages a constant ``alpha`` row.
     """
     if max_patch_slots <= 0:
         return
@@ -133,10 +138,10 @@ def register_patch_buffers(
             torch.zeros(max_patch_slots, hidden_size, dtype=table_dtype),
             persistent=False,
         )
-        # alpha[0] == 0.0 (passthrough invariant); zeros() satisfies it.
+        # alpha row 0 == 0 (passthrough invariant); zeros() satisfies it.
         module.register_buffer(
             PATCH_ALPHA_ATTR[hp],
-            torch.zeros(max_patch_slots, dtype=torch.float32),
+            torch.zeros(max_patch_slots, hidden_size, dtype=torch.float32),
             persistent=False,
         )
         module.register_buffer(
@@ -254,9 +259,10 @@ def apply_patch(
     ``patch_table`` is ``(max_slots, hidden)`` with slot 0 the passthrough
     sentinel. ``patch_index`` is ``(max_tokens,)`` int32 mapping each token row
     to a slot (0 = passthrough); only the first ``N`` entries are read.
-    ``patch_alpha`` is ``(max_slots,)`` fp32 with ``alpha[0] == 0``.
-    ``any_active`` is a single-element bool; ``False`` skips the gather and
-    emits a copy. Output is always a fresh tensor (graph value semantics).
+    ``patch_alpha`` is ``(max_slots, hidden)`` fp32 (per-dim ``alpha * mask``)
+    with row 0 all-zeros. ``any_active`` is a single-element bool; ``False``
+    skips the gather and emits a copy. Output is always a fresh tensor (graph
+    value semantics).
     """
     if hidden_states.is_cuda:
         from vllm.model_executor.layers.patch_kernel import apply_patch_triton
@@ -268,9 +274,9 @@ def apply_patch(
         return hidden_states.clone()
     n = hidden_states.shape[0]
     slots = patch_index[:n].long()
-    # alpha[0] == 0 makes slot-0 rows passthrough without a branch. Precise lerp
-    # form ``(1-a)*h + a*t`` is exact at the endpoints (a==1 -> table).
-    alpha = patch_alpha[slots].unsqueeze(1).to(hidden_states.dtype)
+    # alpha row 0 == 0 makes slot-0 rows passthrough without a branch. Precise
+    # lerp form ``(1-a)*h + a*t`` is exact at the endpoints (a==1 -> table).
+    alpha = patch_alpha[slots].to(hidden_states.dtype)
     gathered = patch_table[slots].to(hidden_states.dtype)
     return (1 - alpha) * hidden_states + alpha * gathered
 
@@ -320,7 +326,7 @@ def apply_patch_block(
         return residual.clone()
     n = residual.shape[0]
     slots = patch_index[:n].long()
-    alpha = patch_alpha[slots].unsqueeze(1).to(residual.dtype)
+    alpha = patch_alpha[slots].to(residual.dtype)
     gathered = patch_table[slots].to(residual.dtype)
     # out_res + hidden == lerp(residual + hidden, table, alpha); written so
     # alpha==0 yields residual exactly (passthrough).

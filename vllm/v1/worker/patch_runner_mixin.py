@@ -66,27 +66,31 @@ class PatchEntry:
     """One resolved patch site for a request: overwrite/lerp ``hook`` at
     ``layer`` for the request's logical position ``dest_pos`` with ``source``.
 
-    ``source`` is a CPU 1-D tensor of shape ``(hidden,)`` (the clean-run
-    activation). ``alpha`` is the interpolation weight (1.0 = full replace).
+    ``source`` is a CPU 1-D tensor of shape ``(hidden,)`` (the resolved source
+    activation, from a capture run, a named module, ``zeros``, or an inline
+    row). ``alpha_row`` is a CPU 1-D fp32 tensor of shape ``(hidden,)``: the
+    per-dimension interpolation weight ``alpha * mask`` (all-``alpha`` when
+    unmasked, ``1.0`` = full replace). A per-dim weight folds the optional mask
+    into the same lerp with no separate kernel path.
     """
 
     layer: int
     hook: SteeringHookPoint
     dest_pos: int
     source: torch.Tensor
-    alpha: float = 1.0
+    alpha_row: torch.Tensor
 
 
 @dataclass
 class SitePlan:
     """Per-(layer, hook) work for one step. Slot ``k`` (1-based) corresponds to
-    ``abs_rows[k-1]`` / ``sources[k-1]`` / ``alphas[k-1]``; slot 0 is the
+    ``abs_rows[k-1]`` / ``sources[k-1]`` / ``alpha_rows[k-1]``; slot 0 is the
     untouched passthrough sentinel.
     """
 
     abs_rows: list[int] = field(default_factory=list)
     sources: list[torch.Tensor] = field(default_factory=list)
-    alphas: list[float] = field(default_factory=list)
+    alpha_rows: list[torch.Tensor] = field(default_factory=list)
 
 
 def build_patch_step_plan(
@@ -136,7 +140,7 @@ def build_patch_step_plan(
                 )
             site.abs_rows.append(offset + (entry.dest_pos - start))
             site.sources.append(entry.source)
-            site.alphas.append(entry.alpha)
+            site.alpha_rows.append(entry.alpha_row)
     return plan
 
 
@@ -263,12 +267,29 @@ class PatchModelRunnerMixin:
 
         from vllm.v1.worker.gpu.patch_resolve import resolve_patch_entries
 
+        # The named-module source kind reuses the steering module registry the
+        # runner also carries (both mixins live on the same runner); ``zeros``
+        # and inline sources need only the hook width (== hidden_size).
+        module_registry = getattr(self, "_steering_module_registry", None)
+        hidden_size = self._patch_hidden_size()
         entries = resolve_patch_entries(
             new_req_data,
             local_layers=self._locally_owned_patch_layers,
+            module_registry=module_registry,
+            hidden_size=hidden_size,
         )
         if entries:
             self._patch_specs[new_req_data.req_id] = entries
+
+    def _patch_hidden_size(self) -> int:
+        """Hook width for ``zeros`` / inline sources (all three hooks are
+        residual-width == hidden_size). Read from a patch table so it matches
+        the buffers exactly, falling back to the model config."""
+        for mod in self._patchable_layers.values():
+            table = getattr(mod, PATCH_TABLE_ATTR[SteeringHookPoint.POST_BLOCK], None)
+            if table is not None:
+                return int(table.shape[1])
+        return int(self.vllm_config.model_config.get_hidden_size())
 
     def _patch_finish_requests(self, req_ids: set[str] | list[str]) -> None:
         """Drop specs for finished/preempted requests.
@@ -341,7 +362,11 @@ class PatchModelRunnerMixin:
             device=table.device, dtype=table.dtype
         )
         table[1 : n + 1].copy_(src, non_blocking=True)
-        alpha_host = torch.tensor(site.alphas, dtype=torch.float32)
+        # Per-dim alpha rows (alpha * mask) into the matching slots. Row 0 stays
+        # all-zeros (passthrough); staging here never touches it.
+        alpha_host = torch.stack([a.reshape(-1) for a in site.alpha_rows]).to(
+            torch.float32
+        )
         alpha_buf[1 : n + 1].copy_(alpha_host.to(alpha_buf.device), non_blocking=True)
 
         # Rebuild the per-token index: zero the live window, scatter the slots.

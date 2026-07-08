@@ -193,6 +193,10 @@ pub struct CompletionRequest {
     /// verbatim to engine-core for offline admission
     pub patch: Option<Value>,
 
+    /// Request-level packed table of client-provided patch vectors referenced
+    /// by a patch entry's `source_inline` / mask `inline`, forwarded verbatim
+    pub patch_vectors: Option<Value>,
+
     /// Additional fields
     #[serde(flatten)]
     pub other: Map<String, Value>,
