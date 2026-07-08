@@ -179,12 +179,27 @@ class InputProcessor:
             or params.prefill_steering_vectors is not None
             or params.decode_steering_vectors is not None
         )
-        if has_steering and not self.steering_config:
+        if not has_steering:
+            return
+        if not self.steering_config:
             raise ValueError(
                 "Per-request steering vectors were provided but steering "
                 "is not enabled. Start the server with --enable-steering "
                 "to use per-request steering vectors."
             )
+        # Width gate: SamplingParams validation is model-blind, and a
+        # wrong-width row shape-crashes the worker's steering table
+        # population — reject here (frontend process, request-level error)
+        # on every path: online HTTP, offline LLM(), and the Rust frontend.
+        from vllm.config.steering_types import validate_spec_row_widths
+
+        expected = self.model_config.get_hidden_size()
+        for field_name, spec in (
+            ("steering_vectors", params.steering_vectors),
+            ("prefill_steering_vectors", params.prefill_steering_vectors),
+            ("decode_steering_vectors", params.decode_steering_vectors),
+        ):
+            validate_spec_row_widths(spec, expected, field_name=field_name)
 
     def _get_mm_identifier(
         self,
