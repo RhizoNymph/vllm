@@ -347,9 +347,7 @@ class SteeringManager:
 
     @property
     def _global_scales(self) -> dict[str, float]:
-        return {
-            o.phase: s for o, s in self._row_scales.items() if o.kind == "global"
-        }
+        return {o.phase: s for o, s in self._row_scales.items() if o.kind == "global"}
 
     @property
     def _config_scales(self) -> dict[tuple[int, str], float]:
@@ -714,7 +712,26 @@ class SteeringManager:
         target = self._global_dict_for_phase(phase)
         if hook_point not in target:
             target[hook_point] = {}
-        target[hook_point][layer_idx] = vector.clone()
+        stored = vector.clone()
+        # Global vectors are produced on the CONTROL-PLANE thread (the HTTP
+        # ``set_steering_vectors`` RPC) but consumed by
+        # ``populate_steering_tables`` on the STEP thread. Under the classic
+        # Ray executor those are different threads with distinct default CUDA
+        # streams (the compiled DAG runs the model on its own background
+        # thread), and CUDA only orders work within a stream. The producing
+        # H2D + this ``clone()`` are enqueued on the RPC thread's stream; the
+        # step thread's ``index_copy_`` into the layer table can otherwise run
+        # before that copy drains, baking a stale/garbage row and silently
+        # no-op'ing base-tier steering. Per-request configs never hit this
+        # because they are both produced and consumed on the step thread (see
+        # ``_stack_vectors_to_device``'s same-stream invariant). Synchronize
+        # here so the tensor's memory is fully materialized before the manager
+        # exposes it for cross-thread reads. This is a rare control-plane op,
+        # so the sync cost is irrelevant; the single-rank / non-CUDA paths are
+        # unaffected.
+        if stored.is_cuda:
+            torch.cuda.synchronize(stored.device)
+        target[hook_point][layer_idx] = stored
         # Global rows 1, 2 and all per-request rows depend on this state.
         self._dirty.mark_content()
 
