@@ -581,7 +581,13 @@ class OfflineInferenceMixin:
             torch_dtype = self.llm_engine.model_config.dtype
         except AttributeError:
             return  # Engine not fully initialised — let the slow path handle it.
-        maybe_pack_inline_steering_for_request(sp, torch_dtype)
+        try:
+            expected_row_width = self.llm_engine.model_config.get_hidden_size()
+        except AttributeError:
+            expected_row_width = None
+        maybe_pack_inline_steering_for_request(
+            sp, torch_dtype, expected_row_width=expected_row_width
+        )
 
     def _run_engine(
         self,

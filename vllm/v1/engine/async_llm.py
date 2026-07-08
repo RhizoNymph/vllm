@@ -315,7 +315,15 @@ class AsyncLLM(EngineClient):
             except AttributeError:
                 torch_dtype = None
             if torch_dtype is not None:
-                maybe_pack_inline_steering_for_request(params, torch_dtype)
+                try:
+                    expected_row_width = (
+                        self.vllm_config.model_config.get_hidden_size()
+                    )
+                except AttributeError:
+                    expected_row_width = None
+                maybe_pack_inline_steering_for_request(
+                    params, torch_dtype, expected_row_width=expected_row_width
+                )
 
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill

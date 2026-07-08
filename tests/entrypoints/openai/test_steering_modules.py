@@ -18,6 +18,7 @@ from starlette.datastructures import State
 from vllm.config.steering_types import (
     SteeringVectorSpec,
     merge_steering_specs,
+    validate_spec_row_widths,
 )
 from vllm.entrypoints.openai.api_server import init_app_state
 from vllm.entrypoints.openai.steering.registry import (
@@ -286,6 +287,67 @@ class TestSteeringModuleRegistry:
                 },
             )
 
+    # --- row-width validation ---
+    # Wrong-width rows pass finiteness validation but shape-crash the
+    # worker's steering table population, so registration must reject them
+    # when the registry knows the model's row width.
+
+    @pytest.mark.asyncio
+    async def test_register_wrong_width_list_rejected(self):
+        registry = SteeringModuleRegistry(expected_row_width=4)
+        with pytest.raises(ValueError, match="width 2 != expected"):
+            await registry.register(
+                name="narrow",
+                vectors={"post_block": {0: [1.0, 2.0]}},
+            )
+
+    @pytest.mark.asyncio
+    async def test_register_wrong_width_scaled_entry_rejected(self):
+        registry = SteeringModuleRegistry(expected_row_width=4)
+        with pytest.raises(ValueError, match="prefill_vectors.*width 3"):
+            await registry.register(
+                name="narrow",
+                prefill_vectors={
+                    "pre_attn": {1: {"vector": [1.0, 2.0, 3.0], "scale": 2.0}}
+                },
+            )
+
+    @pytest.mark.asyncio
+    async def test_register_wrong_width_packed_rejected(self):
+        import base64
+
+        import numpy as np
+
+        rows = np.ones((1, 2), dtype=np.float32)
+        packed = {
+            "dtype": "float32",
+            "shape": [1, 2],
+            "layer_indices": [0],
+            "data": base64.b64encode(rows.tobytes()).decode("ascii"),
+        }
+        registry = SteeringModuleRegistry(expected_row_width=4)
+        with pytest.raises(ValueError, match="width 2 != expected"):
+            await registry.register(name="narrow", vectors={"post_block": packed})
+
+    @pytest.mark.asyncio
+    async def test_register_correct_width_accepted(self):
+        registry = SteeringModuleRegistry(expected_row_width=3)
+        await registry.register(
+            name="ok",
+            vectors={"post_block": {0: [1.0, 2.0, 3.0]}},
+        )
+        assert registry.get("ok") is not None
+
+    @pytest.mark.asyncio
+    async def test_register_no_width_configured_is_permissive(self):
+        registry = SteeringModuleRegistry()
+        await registry.register(
+            name="anywidth",
+            vectors={"post_block": {0: [1.0, 2.0]}},
+        )
+        assert registry.get("anywidth") is not None
+
+
     # --- load_from_file tests ---
 
     @pytest.mark.asyncio
@@ -402,9 +464,8 @@ class TestSteeringModuleRegistry:
         """A JSON file may carry a SteeringHookPacked blob per tier; the
         loader detects the shape and decodes it to legacy int-keyed
         ``list[float]`` form before the registry sees it."""
-        import pybase64 as base64
-
         import numpy as np
+        import pybase64 as base64
 
         vec = np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
         stacked = np.stack([vec], axis=0)
@@ -438,9 +499,8 @@ class TestSteeringModuleRegistry:
     async def test_load_from_file_packed_with_scales(self):
         """Per-row ``scales`` from the packed file are pre-applied at
         unpack time, mirroring the per-request packed path."""
-        import pybase64 as base64
-
         import numpy as np
+        import pybase64 as base64
 
         vec = np.asarray([1.0, 2.0], dtype=np.float32)
         stacked = np.stack([vec], axis=0)
@@ -683,3 +743,36 @@ class TestResolveForRequest:
         assert err is not None
         assert "Invalid steering composition for module 'named'" in err
         assert "different lengths: 2 vs 1" in err
+
+
+class TestValidateSpecRowWidths:
+    """Unit tests for the shared width-validation helper."""
+
+    def test_none_and_empty_pass(self):
+        validate_spec_row_widths(None, 4, field_name="f")
+        validate_spec_row_widths({}, 4, field_name="f")
+
+    def test_matching_widths_pass(self):
+        validate_spec_row_widths(
+            {"pre_attn": {0: [1.0, 2.0], 1: {"vector": [3.0, 4.0], "scale": 0.5}}},
+            2,
+            field_name="f",
+        )
+
+    def test_mismatch_names_site_and_widths(self):
+        with pytest.raises(ValueError, match=r"f\['pre_attn'\]\[1\]: vector width 3"):
+            validate_spec_row_widths(
+                {"pre_attn": {0: [1.0, 2.0], 1: [1.0, 2.0, 3.0]}},
+                2,
+                field_name="f",
+            )
+
+    def test_ndarray_entry(self):
+        import numpy as np
+
+        with pytest.raises(ValueError, match="width 3"):
+            validate_spec_row_widths(
+                {"post_block": {0: np.ones(3, dtype=np.float32)}},
+                8,
+                field_name="f",
+            )
