@@ -1684,3 +1684,96 @@ class TestStackVectorsAsyncH2D:
         assert out.device == torch.device("cpu")
         assert out.shape == (2, 3)
         assert torch.allclose(out, torch.tensor(host, dtype=torch.float32))
+
+
+class TestGlobalVectorCrossThreadStreamSafety:
+    """``update_global_vectors`` must make CUDA global vectors safe for
+    cross-thread consumption.
+
+    Global (base/prefill/decode) vectors are produced on the HTTP
+    ``set_steering_vectors`` control-plane thread, but consumed by
+    ``populate_steering_tables`` on the step thread. Under the classic Ray
+    executor those are different threads with distinct default CUDA streams
+    (the compiled DAG runs the model on its own background thread). CUDA only
+    orders work within a stream, so the producing H2D must be synchronized
+    before the manager exposes the tensor — otherwise the step thread's
+    ``index_copy_`` can bake a stale row and base-tier steering silently
+    no-ops. See the fix in ``SteeringManager.update_global_vectors``.
+    """
+
+    def test_cuda_global_vector_synchronizes_producing_stream(self, monkeypatch):
+        """A CUDA global vector must trigger a device synchronize so the
+        producing stream is drained before cross-thread consumption."""
+        mgr = _make_manager()
+        calls: list[object] = []
+        monkeypatch.setattr(
+            torch.cuda, "synchronize", lambda device=None: calls.append(device)
+        )
+
+        class _FakeCudaTensor:
+            is_cuda = True
+            device = "cuda:0"
+
+            def clone(self):
+                return self
+
+        mgr.update_global_vectors(
+            hook_point=_HP, layer_idx=0, vector=_FakeCudaTensor(), phase="base"
+        )
+        assert calls == ["cuda:0"], (
+            "update_global_vectors must synchronize the producing CUDA "
+            "stream so a step-thread consumer never reads a stale row"
+        )
+
+    def test_cpu_global_vector_does_not_synchronize(self, monkeypatch):
+        """A CPU global vector must NOT synchronize (no cross-stream hazard,
+        and single-rank / CPU-only topologies stay cheap)."""
+        mgr = _make_manager()
+        calls: list[object] = []
+        monkeypatch.setattr(
+            torch.cuda, "synchronize", lambda device=None: calls.append(device)
+        )
+        mgr.update_global_vectors(
+            hook_point=_HP,
+            layer_idx=0,
+            vector=torch.ones(HIDDEN_SIZE),
+            phase="base",
+        )
+        assert calls == []
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cross_thread_base_tier_lands_in_table(self):
+        """End-to-end reproduction: produce a base-tier CUDA vector on one
+        thread, consume it (populate) on another. The table row must reflect
+        the vector. Pre-fix this races the cross-stream H2D and can leave the
+        row stale; the synchronize makes it deterministic.
+        """
+        import threading
+
+        cuda_device = torch.device("cuda:0")
+        mgr = _make_manager(device=cuda_device)
+        base_vec = torch.ones(HIDDEN_SIZE, device=cuda_device) * 7.0
+
+        # Producer runs on its own thread (its own default stream), mirroring
+        # the classic-Ray control-plane RPC thread.
+        def _produce():
+            mgr.update_global_vectors(
+                hook_point=_HP, layer_idx=0, vector=base_vec, phase="base"
+            )
+
+        t = threading.Thread(target=_produce)
+        t.start()
+        t.join()
+
+        # Consumer (populate) runs on the main thread's stream.
+        layers = _make_layers(mgr, layer_indices=[0])
+        for mod in layers.values():
+            mod.to(cuda_device)
+        mgr.populate_steering_tables(layers)
+        torch.cuda.synchronize()
+
+        table = getattr(layers[0], _TABLE_ATTR)
+        # Row 1 (prefill effective) and row 2 (decode effective) both carry
+        # the base vector when no phase-specific tier is set.
+        assert torch.allclose(table[1].cpu(), base_vec.cpu())
+        assert torch.allclose(table[2].cpu(), base_vec.cpu())
