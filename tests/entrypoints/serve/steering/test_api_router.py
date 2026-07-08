@@ -6,13 +6,12 @@ Tests cover three-tier steering (base, prefill, decode) with co-located
 scale format support.
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-import vllm.envs as envs
 from vllm.entrypoints.serve.steering.api_router import (
     _normalize_spec,
     attach_router,
@@ -507,21 +506,15 @@ class TestNormalizeSpec:
 
 
 class TestAttachRouter:
-    def test_attached_in_dev_mode(self):
+    def test_attached_unconditionally(self):
+        # Steering routes are not dev-mode endpoints: mutation routes carry
+        # their own auth (--steering-api-key) and reads are harmless.
         app = FastAPI()
-        with patch.object(envs, "VLLM_SERVER_DEV_MODE", True):
-            attach_router(app)
+        attach_router(app)
         paths = {r.path for r in app.routes}
         assert "/v1/steering/set" in paths
         assert "/v1/steering/clear" in paths
         assert "/v1/steering" in paths
-
-    def test_not_attached_without_dev_mode(self):
-        app = FastAPI()
-        with patch.object(envs, "VLLM_SERVER_DEV_MODE", False):
-            attach_router(app)
-        paths = {r.path for r in app.routes}
-        assert "/v1/steering/set" not in paths
 
 
 # --- steering API key auth ---

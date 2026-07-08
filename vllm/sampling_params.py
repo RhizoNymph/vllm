@@ -415,6 +415,40 @@ class SamplingParams(
     serve. Set by ``_admit_capture`` alongside ``capture_store_hook_layers``.
     Not client-settable."""
 
+    patch: list[dict[str, Any]] | None = None
+    """Per-request activation-patching spec: a list of site entries, each
+    ``{"layer": int, "hook": str, "dest_position": int, "source_run": str,
+    "source_position": int, "alpha": float = 1.0}``. Each entry overwrites
+    (``alpha == 1``) or interpolates toward the destination's activation at
+    ``(layer, hook, dest_position)`` with the clean run ``source_run``'s
+    activation at ``source_position``.
+
+    Validation at construction is strictly structural (list of dicts with the
+    required keys/types). Layer/hook/source existence and pool capacity are
+    validated at the entrypoint against the model + source store; the worker
+    resolves source vectors from the per-rank source store."""
+
+    patch_touches_prompt: bool | None = None
+    """Whether this request patches any prompt-range position. Resolved at
+    admission (mirrors ``capture_touches_prompt``); drives prefix-cache reuse
+    via :meth:`vllm.v1.request.Request.get_skip_reading_prefix_cache`. ``None``
+    (offline path) is treated conservatively as prompt-touching. Not
+    client-settable."""
+
+    patch_min_prompt_position: int | None = None
+    """Lowest prompt position this request patches, or ``None``. Prefix-cache
+    reuse is clamped to this position so it (and later positions) are
+    re-forwarded and the patch hook fires. Not client-settable."""
+
+    patch_vectors: dict[str, Any] | None = None
+    """Request-level packed table of client-provided patch vectors, referenced
+    by a patch entry's ``source_inline`` / mask ``inline`` row index. Same
+    binary wire form as ``SteeringHookPacked`` minus layer_indices/scales:
+    ``{"dtype": "float32|float16|bfloat16", "shape": [n_rows, width],
+    "data": "<base64 contiguous bytes>"}``. Travels verbatim and is decoded
+    once per request at worker-side resolution. Deliberately packed-only (no
+    raw float-list form — inline float lists caused a large E2EL regression)."""
+
     steering_vectors: SteeringVectorSpec | None = None
     """Base steering vectors applied to both prefill and decode phases.
     Keyed by hook point name (pre_attn, post_attn, post_block), then
@@ -498,6 +532,7 @@ class SamplingParams(
         max_tokens: int | None = 16,
         min_tokens: int = 0,
         logprobs: int | None = None,
+        logprob_token_ids: list[int] | None = None,
         prompt_logprobs: int | None = None,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
@@ -510,6 +545,8 @@ class SamplingParams(
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
         capture: dict[str, Any] | None = None,
+        patch: list[dict[str, Any]] | None = None,
+        patch_vectors: dict[str, Any] | None = None,
         steering_vectors: SteeringVectorSpec | None = None,
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
@@ -544,6 +581,7 @@ class SamplingParams(
             max_tokens=max_tokens,
             min_tokens=min_tokens,
             logprobs=logprobs,
+            logprob_token_ids=logprob_token_ids,
             prompt_logprobs=prompt_logprobs,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
@@ -556,6 +594,8 @@ class SamplingParams(
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
             capture=capture,
+            patch=patch,
+            patch_vectors=patch_vectors,
             steering_vectors=steering_vectors,
             prefill_steering_vectors=prefill_steering_vectors,
             decode_steering_vectors=decode_steering_vectors,
@@ -604,6 +644,7 @@ class SamplingParams(
 
         self._verify_args()
         self._validate_capture()
+        self._validate_patch()
 
         if self.temperature < _SAMPLING_EPS:
             # Zero temperature means greedy sampling.
@@ -653,6 +694,171 @@ class SamplingParams(
                     "capture keys must be strings (consumer names), got "
                     f"{type(key).__name__} ({key!r})"
                 )
+
+    def _validate_patch(self) -> None:
+        """Structural check on ``patch`` (and ``patch_vectors``).
+
+        Verifies shape at construction: a list of dicts with the common keys,
+        exactly one source kind per entry (``source_run`` + ``source_position``
+        | ``source_module`` | ``source_inline``), an optional ``mask``
+        (``{"indices": [...]}`` or ``{"inline": row}``), and — when present — a
+        structurally-valid packed ``patch_vectors`` table whose every referenced
+        row index is in range. Layer/hook/source existence, named-module
+        existence, inline widths and pool capacity are validated at the
+        entrypoint against the model + registries, keeping this module free of
+        patch-framework imports.
+        """
+        patch = self.patch
+        if patch is None:
+            if self.patch_vectors is not None:
+                self._validate_patch_vectors_table()
+            return
+        if not isinstance(patch, list):
+            raise ValueError(
+                f"patch must be a list of site dicts, got {type(patch).__name__}"
+            )
+        n_rows = self._validate_patch_vectors_table()
+        for i, entry in enumerate(patch):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"patch[{i}] must be a dict, got {type(entry).__name__}"
+                )
+            for req_field in ("layer", "hook", "dest_position"):
+                if req_field not in entry:
+                    raise ValueError(f"patch[{i}] missing required key {req_field!r}")
+            if not isinstance(entry["layer"], int):
+                raise ValueError(f"patch[{i}]['layer'] must be an int")
+            if not isinstance(entry["hook"], str):
+                raise ValueError(f"patch[{i}]['hook'] must be a str")
+            if not isinstance(entry["dest_position"], int):
+                raise ValueError(f"patch[{i}]['dest_position'] must be an int")
+            alpha = entry.get("alpha", 1.0)
+            if not isinstance(alpha, (int, float)):
+                raise ValueError(f"patch[{i}]['alpha'] must be a number")
+            self._validate_patch_source_kind(i, entry, n_rows)
+            self._validate_patch_mask(i, entry.get("mask"), n_rows)
+
+    def _validate_patch_source_kind(
+        self, i: int, entry: dict, n_rows: int | None
+    ) -> None:
+        """Enforce exactly-one-of source kinds and their per-field types."""
+        has_run = entry.get("source_run") is not None
+        has_module = entry.get("source_module") is not None
+        has_inline = entry.get("source_inline") is not None
+        n_kinds = sum((has_run, has_module, has_inline))
+        if n_kinds != 1:
+            raise ValueError(
+                f"patch[{i}] must set exactly one source kind — "
+                f"(source_run + source_position) | source_module | "
+                f"source_inline; got {n_kinds}"
+            )
+        if has_run:
+            if not isinstance(entry["source_run"], str):
+                raise ValueError(f"patch[{i}]['source_run'] must be a str")
+            if "source_position" not in entry:
+                raise ValueError(
+                    f"patch[{i}]: source_run requires source_position"
+                )
+            if not isinstance(entry["source_position"], int):
+                raise ValueError(f"patch[{i}]['source_position'] must be an int")
+        elif has_module:
+            if not isinstance(entry["source_module"], str):
+                raise ValueError(f"patch[{i}]['source_module'] must be a str")
+        else:  # has_inline
+            idx = entry["source_inline"]
+            if not isinstance(idx, int):
+                raise ValueError(f"patch[{i}]['source_inline'] must be an int")
+            self._require_patch_row(i, "source_inline", idx, n_rows)
+
+    def _validate_patch_mask(
+        self, i: int, mask: Any, n_rows: int | None
+    ) -> None:
+        """Structural check on an optional per-entry ``mask``."""
+        if mask is None:
+            return
+        if not isinstance(mask, dict):
+            raise ValueError(f"patch[{i}]['mask'] must be a dict")
+        has_indices = mask.get("indices") is not None
+        has_inline = mask.get("inline") is not None
+        if has_indices == has_inline:
+            raise ValueError(
+                f"patch[{i}]['mask'] must set exactly one of "
+                f"'indices' | 'inline'"
+            )
+        if has_indices:
+            indices = mask["indices"]
+            if not isinstance(indices, list):
+                raise ValueError(f"patch[{i}]['mask']['indices'] must be a list")
+            for j in indices:
+                if not isinstance(j, int) or j < 0:
+                    raise ValueError(
+                        f"patch[{i}]['mask']['indices'] must be non-negative ints"
+                    )
+        else:
+            idx = mask["inline"]
+            if not isinstance(idx, int):
+                raise ValueError(f"patch[{i}]['mask']['inline'] must be an int")
+            self._require_patch_row(i, "mask.inline", idx, n_rows)
+
+    def _require_patch_row(
+        self, i: int, what: str, idx: int, n_rows: int | None
+    ) -> None:
+        """A ``source_inline`` / mask inline index must reference a real row."""
+        if n_rows is None:
+            raise ValueError(
+                f"patch[{i}]: {what} index {idx} requires patch_vectors"
+            )
+        if not (0 <= idx < n_rows):
+            raise ValueError(
+                f"patch[{i}]: {what} index {idx} out of range [0, {n_rows})"
+            )
+
+    def _validate_patch_vectors_table(self) -> int | None:
+        """Structurally validate ``patch_vectors``; return its ``n_rows``.
+
+        ``None`` when no table is set. Raises on malformed keys, dtype, shape,
+        or a base64 payload whose byte length disagrees with ``shape``/dtype.
+        """
+        pv = self.patch_vectors
+        if pv is None:
+            return None
+        if not isinstance(pv, dict):
+            raise ValueError("patch_vectors must be a dict")
+        for key in ("dtype", "shape", "data"):
+            if key not in pv:
+                raise ValueError(f"patch_vectors missing required key {key!r}")
+        itemsize = {"float32": 4, "float16": 2, "bfloat16": 2}.get(str(pv["dtype"]))
+        if itemsize is None:
+            raise ValueError(
+                f"patch_vectors.dtype {pv['dtype']!r} must be one of "
+                f"float32 | float16 | bfloat16"
+            )
+        shape = pv["shape"]
+        if (
+            not isinstance(shape, (list, tuple))
+            or len(shape) != 2
+            or not all(isinstance(s, int) and s >= 0 for s in shape)
+        ):
+            raise ValueError(
+                "patch_vectors.shape must be [n_rows, width] of non-negative ints"
+            )
+        if not isinstance(pv["data"], str):
+            raise ValueError("patch_vectors.data must be a base64 string")
+        import binascii
+
+        import pybase64 as base64
+
+        try:
+            raw = base64.b64decode(pv["data"])
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"patch_vectors.data is not valid base64: {exc}") from exc
+        expected = int(shape[0]) * int(shape[1]) * itemsize
+        if len(raw) != expected:
+            raise ValueError(
+                f"patch_vectors.data length {len(raw)} != expected {expected} "
+                f"(shape={list(shape)}, dtype={pv['dtype']})"
+            )
+        return int(shape[0])
 
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):
@@ -1029,6 +1235,71 @@ class SamplingParams(
             self.effective_decode_steering,
             module_ref=self.steering_module_ref,
         )
+
+    @cached_property
+    def patch_site_demand(self) -> dict[tuple[int, str], int]:
+        """Per-``(layer, hook)`` patch-slot demand for this request.
+
+        Counts the distinct patched ``dest_position``s at each site. A single
+        forward step can compute all of a request's positions at a site at once
+        (a prefill chunk), so this count is the request's worst-case slot draw
+        at that site — what the scheduler reserves to keep the per-site pool
+        from overflowing (see ``Scheduler``). Empty when no patching."""
+        if not self.patch:
+            return {}
+        demand: dict[tuple[int, str], int] = {}
+        for entry in self.patch:
+            key = (int(entry["layer"]), str(entry["hook"]))
+            seen = demand.setdefault(key, 0)
+            demand[key] = seen + 1
+        return demand
+
+    @cached_property
+    def patch_kv_taint(self) -> tuple[int, int] | None:
+        """``(min_dest_position, spec_hash)`` for patch-aware prefix caching.
+
+        A patched activation at position ``p`` changes the KV written at ``p``
+        and (via attention in later layers) at every subsequent position, so
+        blocks containing any position ``>= min_dest_position`` must not share
+        cache entries with unpatched runs. ``spec_hash`` is a deterministic
+        digest of the full spec (stable across processes, unlike ``hash()``),
+        folded into those blocks' hashes: distinct specs get distinct KV
+        chains, while blocks strictly below the patch floor stay shareable.
+        ``None`` when the request patches nothing."""
+        if not self.patch:
+            return None
+        import hashlib
+
+        # Include every source kind + mask so distinct sources get distinct KV
+        # chains; a client-provided value's identity lives in patch_vectors, so
+        # fold the packed payload in too (different rows -> different KV).
+        entries = sorted(
+            (
+                int(e["layer"]),
+                str(e["hook"]),
+                int(e["dest_position"]),
+                str(e.get("source_run") or ""),
+                (
+                    int(e["source_position"])
+                    if e.get("source_position") is not None
+                    else -1
+                ),
+                str(e.get("source_module") or ""),
+                (
+                    int(e["source_inline"])
+                    if e.get("source_inline") is not None
+                    else -1
+                ),
+                repr(e.get("mask")),
+                float(e.get("alpha", 1.0)),
+            )
+            for e in self.patch
+        )
+        payload = repr(entries)
+        if self.patch_vectors is not None:
+            payload += repr(self.patch_vectors.get("data"))
+        digest = hashlib.sha256(payload.encode()).digest()
+        return min(e[2] for e in entries), int.from_bytes(digest[:8], "big")
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:

@@ -180,12 +180,27 @@ class InputProcessor:
             or params.prefill_steering_vectors is not None
             or params.decode_steering_vectors is not None
         )
-        if has_steering and not self.steering_config:
+        if not has_steering:
+            return
+        if not self.steering_config:
             raise ValueError(
                 "Per-request steering vectors were provided but steering "
                 "is not enabled. Start the server with --enable-steering "
                 "to use per-request steering vectors."
             )
+        # Width gate: SamplingParams validation is model-blind, and a
+        # wrong-width row shape-crashes the worker's steering table
+        # population — reject here (frontend process, request-level error)
+        # on every path: online HTTP, offline LLM(), and the Rust frontend.
+        from vllm.config.steering_types import validate_spec_row_widths
+
+        expected = self.model_config.get_hidden_size()
+        for field_name, spec in (
+            ("steering_vectors", params.steering_vectors),
+            ("prefill_steering_vectors", params.prefill_steering_vectors),
+            ("decode_steering_vectors", params.decode_steering_vectors),
+        ):
+            validate_spec_row_widths(spec, expected, field_name=field_name)
 
     def _get_mm_identifier(
         self,
@@ -373,6 +388,26 @@ class InputProcessor:
                 prompt_embeds,
             )
 
+        # Offline patch admission: resolve the per-request patch spec into
+        # prefix-cache reuse flags (the OpenAI path does this in
+        # ``_admit_patch``). Idempotent — served requests arrive already
+        # stamped and skip this; it only fires for offline / direct ``LLM``
+        # requests. Unlike capture's best-effort resolution, an invalid offline
+        # patch spec raises ``ValueError`` (rejecting the request): patch
+        # entries carry explicit positions validated against the model's real
+        # shape, so a bad spec is a hard client error.
+        if (
+            sampling_params is not None
+            and sampling_params.patch
+            and sampling_params.patch_touches_prompt is None
+        ):
+            self._resolve_patch_prefix_flags(
+                request_id,
+                sampling_params,
+                prompt_token_ids,
+                prompt_embeds,
+            )
+
         # Multimodal related.
         mm_features: list[MultiModalFeatureSpec] | None = None
 
@@ -479,6 +514,63 @@ class InputProcessor:
                 request_id,
                 exc,
             )
+
+    def _resolve_patch_prefix_flags(
+        self,
+        request_id: str,
+        sampling_params: SamplingParams,
+        prompt_token_ids: list[int] | None,
+        prompt_embeds: Any,
+    ) -> None:
+        """Offline analogue of the serving layer's ``_admit_patch``.
+
+        Resolves ``sampling_params.patch`` into the prefix-cache reuse flags
+        (``patch_touches_prompt`` / ``patch_min_prompt_position``) so offline
+        (and any non-OpenAI) requests get the same precise APC windowing served
+        requests get. Unlike the best-effort capture path, an invalid patch
+        spec raises ``ValueError`` — patch entries carry explicit
+        ``dest_position`` ints validated against the model's real shape, so a
+        bad spec is a hard client error that must fail loud (the engine rejects
+        the request, mirroring the serving layer's 400).
+
+        Deliberately narrower than the serving layer's ``_admit_patch``: it does
+        NOT run the source-manifest existence pre-check or the multimodal guard.
+        Those are frontend concerns — engine-side, a missing source is caught
+        (loudly) by the worker resolution-failure registry as a backstop, and
+        the offline/multimodal combination is out of scope.
+
+        The new client-provided source kinds are structurally validated here
+        (exactly-one-of source, mask shape, packed ``patch_vectors``, inline
+        index-in-range/width). Offline has no frontend steering registry, so
+        ``source_module`` names (other than the reserved ``zeros``) CANNOT be
+        existence-checked here — a bad name surfaces loudly via the worker
+        resolution-failure registry (``named_module_exists`` is left ``None``).
+        """
+        from vllm.v1.capture.admission import build_capture_context
+        from vllm.v1.capture.patch_admission import (
+            PatchValidationError,
+            resolve_patch_prefix_flags,
+        )
+
+        patch_config = getattr(self.vllm_config, "patch_config", None)
+        if patch_config is None:
+            raise ValueError(
+                "A patch spec was provided but patching is not enabled. Start "
+                "vLLM with --enable-patching to use per-request activation "
+                "patching."
+            )
+
+        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+            prompt_token_ids, prompt_embeds
+        )
+        ctx = build_capture_context(self.vllm_config, num_prompt_tokens, request_id)
+        max_patch_slots = getattr(patch_config, "max_patch_slots", 0)
+        try:
+            resolve_patch_prefix_flags(
+                sampling_params, ctx, max_patch_slots=max_patch_slots
+            )
+        except PatchValidationError as exc:
+            raise ValueError(str(exc)) from exc
 
     def _validate_prompt_len(
         self,

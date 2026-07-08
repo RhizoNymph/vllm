@@ -134,6 +134,58 @@ class TestMaybePack:
             202.0,
         ]
 
+    def test_wrong_width_rejected_before_packing(self):
+        # The packer clears the inline fields, so it is the ONE seam every
+        # inline-steering request crosses before the multiprocessing
+        # boundary — wrong-width rows must be rejected here or they
+        # shape-crash the worker's steering table population.
+        import pytest
+
+        sp = SamplingParams(
+            max_tokens=1,
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
+        )
+        with pytest.raises(ValueError, match="width 2 != expected"):
+            maybe_pack_inline_steering_for_request(
+                sp, torch.float32, expected_row_width=8
+            )
+        # Nothing was packed or cleared: the request never leaves admission.
+        assert sp.steering_vectors is not None
+        assert sp._effective_prefill_steering_packed is None
+
+    def test_wrong_width_phase_tier_rejected(self):
+        import pytest
+
+        sp = SamplingParams(
+            max_tokens=1,
+            prefill_steering_vectors={"pre_attn": {3: [1.0, 2.0, 3.0]}},
+        )
+        with pytest.raises(
+            ValueError, match=r"prefill_steering_vectors\['pre_attn'\]\[3\]"
+        ):
+            maybe_pack_inline_steering_for_request(
+                sp, torch.float32, expected_row_width=8
+            )
+
+    def test_matching_width_packs(self):
+        sp = SamplingParams(
+            max_tokens=1,
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
+        )
+        maybe_pack_inline_steering_for_request(
+            sp, torch.float32, expected_row_width=2
+        )
+        assert sp.steering_vectors is None
+        assert sp._effective_prefill_steering_packed is not None
+
+    def test_no_width_configured_is_permissive(self):
+        sp = SamplingParams(
+            max_tokens=1,
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
+        )
+        maybe_pack_inline_steering_for_request(sp, torch.float32)
+        assert sp._effective_prefill_steering_packed is not None
+
     def test_idempotent_when_already_packed(self):
         sp = SamplingParams(
             max_tokens=1,
@@ -216,7 +268,9 @@ class TestMsgspecRoundtrip:
 
     def test_packed_payload_smaller_than_unpacked(self):
         """Sanity: the packed wire form is smaller than the unpacked one."""
-        vectors = {"post_block": {i: [float(j) for j in range(2560)] for i in range(34)}}
+        vectors = {
+            "post_block": {i: [float(j) for j in range(2560)] for i in range(34)}
+        }
         sp_unpacked = SamplingParams(max_tokens=1, steering_vectors=vectors)
         sp_packed = SamplingParams(max_tokens=1, steering_vectors=vectors)
         maybe_pack_inline_steering_for_request(sp_packed, torch.float32)

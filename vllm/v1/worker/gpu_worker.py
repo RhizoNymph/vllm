@@ -991,6 +991,71 @@ class Worker(WorkerBase):
     def clear_steering_vectors(self) -> None:
         return self.model_runner.clear_steering_vectors()
 
+    def get_patch_source_manifests(self) -> list[dict]:
+        """Serializable manifests of this rank's patch source store.
+
+        Called via ``collective_rpc`` from the OpenAI entrypoint to validate
+        that a patch request's ``source_run`` (and its sites) exist before
+        admission. Returns ``[]`` when no source store is active on this rank
+        (e.g. non-capturer TP ranks); the entrypoint unions across ranks so PP
+        layer-partitioned stores combine into the full picture.
+        """
+        from vllm.v1.capture.source_store import get_active_patch_source_store
+
+        store = get_active_patch_source_store()
+        if store is None:
+            return []
+        return [
+            {
+                "run_id": m.run_id,
+                "num_prompt_tokens": m.num_prompt_tokens,
+                "hidden_size": m.hidden_size,
+                "hook_layers": [[hook, layer] for (hook, layer) in m.hook_layers],
+                "positions": list(m.positions),
+            }
+            for m in store.manifests()
+        ]
+
+    def lease_patch_source_runs(self, run_ids: list[str], ttl_seconds: float) -> None:
+        """Protect ``run_ids`` from source-store eviction for ``ttl_seconds``.
+
+        Called via ``collective_rpc`` by the admission path after validating a
+        patch request, closing the admission→resolution eviction race. No-op on
+        ranks without an active store.
+        """
+        from vllm.v1.capture.source_store import get_active_patch_source_store
+
+        store = get_active_patch_source_store()
+        if store is not None:
+            store.lease_runs(list(run_ids), float(ttl_seconds))
+
+    def drop_patch_source_run(self, run_id: str) -> bool:
+        """Drop ``run_id`` from this rank's source store, if present.
+
+        Called via ``collective_rpc`` by the sweep auto-drop and the
+        ``DELETE /v1/patch_source/{run_id}`` route. An explicit owner drop
+        succeeds even if the run is leased. Returns whether this rank held it;
+        the entrypoint unions across ranks (PP stores are layer-partitioned).
+        No-op (``False``) on ranks without an active store.
+        """
+        from vllm.v1.capture.source_store import get_active_patch_source_store
+
+        store = get_active_patch_source_store()
+        if store is None:
+            return False
+        return store.drop_run(run_id)
+
+    def pop_patch_resolution_failures(self) -> dict[str, list[str]]:
+        """Drain this rank's patch resolution-failure registry.
+
+        Called via ``collective_rpc`` by the sweep endpoint after a sweep; any
+        request listed here ran UNPATCHED (source missing at resolution) and
+        its cell must be voided rather than reported as a patched result.
+        """
+        from vllm.v1.worker.gpu.patch_resolve import pop_resolution_failures
+
+        return pop_resolution_failures()
+
     def list_steerable_layers(self) -> dict[int, list[str]]:
         return self.model_runner.list_steerable_layers()
 

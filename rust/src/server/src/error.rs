@@ -19,6 +19,9 @@ pub enum ApiError {
     ModelNotFound { model: String },
     /// The request body could not be parsed as valid JSON.
     JsonParseError { message: String },
+    /// The request lacks a required bearer credential (e.g. the steering
+    /// API key on mutating steering endpoints).
+    Unauthorized { message: String },
     /// An unexpected internal failure happened before streaming started.
     ServerError { message: String },
 }
@@ -31,6 +34,7 @@ impl ApiError {
             Self::ModelNotFound { .. } => StatusCode::NOT_FOUND,
             Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::JsonParseError { .. } => StatusCode::BAD_REQUEST,
+            Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
         }
     }
 
@@ -61,6 +65,12 @@ impl ApiError {
                 error_type: "invalid_request_error".to_string(),
                 param: None,
                 code: Some("json_parse_error".to_string()),
+            },
+            Self::Unauthorized { message } => ErrorDetail {
+                message: message.clone(),
+                error_type: "unauthorized".to_string(),
+                param: None,
+                code: Some("unauthorized".to_string()),
             },
         };
 

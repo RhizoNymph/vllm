@@ -53,6 +53,7 @@ logging = "vllm.v1.capture.consumers.logging:LoggingConsumer"
 # Built-in declarative per-request steering consumer (also registered in-tree
 # via registry._builtin_consumers so it resolves without a reinstall).
 _declarative_steering = "vllm.v1.capture.declarative:DeclarativeSteeringConsumer"
+patch_source = "vllm.v1.capture.consumers.patch_source:PatchSourceConsumer"
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

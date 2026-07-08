@@ -44,6 +44,7 @@ from .model import ModelConfig
 from .observability import ObservabilityConfig
 from .offload import OffloadConfig
 from .parallel import ParallelConfig
+from .patch import PatchConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
@@ -105,6 +106,7 @@ def maybe_add_capture_split_op(
         return
     if CAPTURE_RESIDUAL_SPLIT_OP not in splitting_ops:
         splitting_ops.append(CAPTURE_RESIDUAL_SPLIT_OP)
+
 
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
@@ -365,6 +367,8 @@ class VllmConfig:
     or programmatically via ``LLM(capture_consumers=...)``."""
     steering_config: SteeringConfig | None = None
     """Per-request activation steering configuration."""
+    patch_config: PatchConfig | None = None
+    """Activation-patching configuration. ``None`` disables patching."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
     diffusion_config: DiffusionConfig | None = None
@@ -497,6 +501,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.steering_config:
             vllm_factors.append(self.steering_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.patch_config:
+            vllm_factors.append(self.patch_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.speculative_config:
@@ -945,6 +953,50 @@ class VllmConfig:
             params["probe_sites"] = list(sc.declarative_probe_sites)
         consumers.append(
             CaptureConsumerSpec(name="_declarative_steering", params=params)
+        )
+
+    def _maybe_imply_patch_source_consumer(self) -> None:
+        """Register the ``patch_source`` capture consumer when patching is on.
+
+        Activation patching sources its clean-run activations from a capture
+        routed through the ``patch_source`` consumer, so enabling patching
+        without that consumer silently drops every clean capture and later
+        sweeps fail with "run not found". Imply the consumer here, at the
+        config-finalization point shared by the online server and offline
+        ``LLM`` paths, so ``--enable-patching`` is sufficient on its own.
+
+        Idempotent: an explicit ``--capture-consumers patch_source`` is
+        preserved without duplication, and patching being disabled never adds
+        it. The implied spec is identical to the explicit one, so it flows
+        through the same registration path.
+        """
+        if self.patch_config is None:
+            return
+
+        from vllm.v1.capture.config import (
+            CaptureConsumersConfig,
+            CaptureConsumerSpec,
+        )
+
+        consumer_name = "patch_source"
+        if self.capture_consumers_config is None:
+            self.capture_consumers_config = CaptureConsumersConfig(
+                consumers=[CaptureConsumerSpec(name=consumer_name)]
+            )
+        elif not any(
+            spec.name == consumer_name
+            for spec in self.capture_consumers_config.consumers
+        ):
+            self.capture_consumers_config.consumers.append(
+                CaptureConsumerSpec(name=consumer_name)
+            )
+        else:
+            return
+
+        logger.info(
+            "activation patching enabled: implied capture consumer "
+            "(consumer=%s, reason=enable_patching)",
+            consumer_name,
         )
 
     def __post_init__(self):
@@ -1464,6 +1516,11 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
+
+        # Patching populates its source store from a clean capture routed
+        # through the ``patch_source`` consumer, so ``--enable-patching``
+        # implies that consumer. Run before capture-dependent finalization.
+        self._maybe_imply_patch_source_consumer()
 
         maybe_add_capture_split_op(
             self.compilation_config,

@@ -10,7 +10,6 @@ from http import HTTPStatus
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-import vllm.envs as envs
 from vllm.config.steering_types import (
     SteeringVectorSpec,
     coerce_steering_spec,
@@ -535,6 +534,4 @@ async def get_dynamic_steering(raw_request: Request) -> JSONResponse:
 
 
 def attach_router(app: FastAPI):
-    if not envs.VLLM_SERVER_DEV_MODE:
-        return
     app.include_router(router)

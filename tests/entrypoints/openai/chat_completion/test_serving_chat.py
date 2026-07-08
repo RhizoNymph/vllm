@@ -2126,3 +2126,38 @@ async def test_streaming_n_gt1_independent_tool_parsers():
             f"Choice {choice_idx}: expected finish_reason='tool_calls', "
             f"got '{reasons[0]}'"
         )
+
+
+def test_messages_have_multimodal():
+    from vllm.entrypoints.openai.chat_completion.serving import (
+        _messages_have_multimodal,
+    )
+
+    # String content and text-only part lists are not multimodal.
+    assert not _messages_have_multimodal([{"role": "user", "content": "hi"}])
+    assert not _messages_have_multimodal(
+        [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    )
+    # Any non-text part (image/audio/video/embeds) is: patch+multimodal must
+    # be rejected BEFORE rendering registers the item in the mm sender cache,
+    # or later requests reusing the same image hit a receiver-cache miss.
+    assert _messages_have_multimodal(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "d"}},
+                    {"type": "text", "text": "hi"},
+                ],
+            }
+        ]
+    )
+    assert _messages_have_multimodal(
+        [
+            {"role": "system", "content": "s"},
+            {
+                "role": "user",
+                "content": [{"type": "input_audio", "input_audio": {}}],
+            },
+        ]
+    )

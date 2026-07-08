@@ -22,6 +22,7 @@ from vllm.config.steering_types import (
     coerce_steering_spec,
     merge_steering_specs,
     normalize_layer_entry,
+    validate_spec_row_widths,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
@@ -42,10 +43,19 @@ class SteeringModule:
 class SteeringModuleRegistry:
     """Registry for named steering vector configurations."""
 
-    def __init__(self, valid_layer_indices: set[int] | None = None) -> None:
+    def __init__(
+        self,
+        valid_layer_indices: set[int] | None = None,
+        expected_row_width: int | None = None,
+    ) -> None:
         self._modules: dict[str, SteeringModule] = {}
         self._lock = asyncio.Lock()
         self._valid_layer_indices = valid_layer_indices
+        # Steering row width (== model hidden size). When set, registration
+        # rejects wrong-width vectors — such rows otherwise broadcast to
+        # workers, pre-materialize into the steering row table, and
+        # shape-crash the engine at the next table population.
+        self._expected_row_width = expected_row_width
 
     async def register(
         self,
@@ -75,7 +85,11 @@ class SteeringModuleRegistry:
             raise ValueError(f"Steering module '{name}' has no vectors in any tier")
 
         # Validate hook point names and entry format
-        for spec in [vectors, prefill_vectors, decode_vectors]:
+        for tier_name, spec in [
+            ("vectors", vectors),
+            ("prefill_vectors", prefill_vectors),
+            ("decode_vectors", decode_vectors),
+        ]:
             if spec:
                 invalid = set(spec.keys()) - VALID_HOOK_POINT_NAMES
                 if invalid:
@@ -94,6 +108,12 @@ class SteeringModuleRegistry:
                             layer_idx=layer_idx,
                             entry=entry,
                         )
+                if self._expected_row_width is not None:
+                    validate_spec_row_widths(
+                        spec,
+                        self._expected_row_width,
+                        field_name=f"module {name!r} {tier_name}",
+                    )
 
         module = SteeringModule(
             name=name,

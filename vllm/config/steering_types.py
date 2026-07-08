@@ -274,6 +274,35 @@ def steering_vector_content_digest(packed: SteeringVectorSpecPacked) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def validate_spec_row_widths(
+    spec: dict | None,
+    expected_width: int,
+    *,
+    field_name: str,
+) -> None:
+    """Raise ``ValueError`` when any vector in *spec* is not
+    ``expected_width`` wide.
+
+    Wrong-width rows pass structural validation (finite floats) but
+    shape-crash the worker's steering table population
+    (``populate_steering_tables`` stacks all active rows), killing the
+    engine — so every seam that accepts client vectors must width-check
+    before anything is broadcast or admitted. Entries may be bare lists,
+    ``{"vector", "scale"}`` dicts, or ndarrays (packed-form decode).
+    """
+    if not spec:
+        return
+    for hook_name, layers in spec.items():
+        for layer_idx, entry in layers.items():
+            vector, _ = normalize_layer_entry(entry)
+            if len(vector) != expected_width:
+                raise ValueError(
+                    f"{field_name}[{hook_name!r}][{layer_idx}]: vector width "
+                    f"{len(vector)} != expected steering row width "
+                    f"{expected_width} (model hidden size)"
+                )
+
+
 def _scale_vector(vec: list[float] | np.ndarray, scale: float) -> np.ndarray:
     """Multiply *vec* by *scale*, returning a float64 numpy array.
 
@@ -621,6 +650,7 @@ def hash_steering_config(
 def maybe_pack_inline_steering_for_request(
     sp: SamplingParams,
     torch_dtype: object,
+    expected_row_width: int | None = None,
 ) -> None:
     """Pre-resolve + pack inline steering vectors on *sp* in-place.
 
@@ -660,6 +690,21 @@ def maybe_pack_inline_steering_for_request(
         or sp._effective_decode_steering_packed is not None
     ):
         return
+
+    # Width gate. This runs before the inline fields are cleared (step 3),
+    # making it the one seam every inline-steering request crosses — the
+    # engine-side validator never sees the raw specs after packing. A
+    # wrong-width row would otherwise shape-crash the worker's steering
+    # table population and kill the engine.
+    if expected_row_width is not None:
+        for field_name, spec in (
+            ("steering_vectors", sp.steering_vectors),
+            ("prefill_steering_vectors", sp.prefill_steering_vectors),
+            ("decode_steering_vectors", sp.decode_steering_vectors),
+        ):
+            validate_spec_row_widths(
+                spec, expected_row_width, field_name=field_name
+            )
 
     np_dtype = _torch_dtype_to_pack_dtype(torch_dtype)
 

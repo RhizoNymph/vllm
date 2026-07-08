@@ -581,6 +581,30 @@ def _gen_steering_extra_hash_keys(
         return [decode_hash]
 
 
+def _gen_patch_extra_hash_keys(
+    request: "Request", start_token_idx: int, end_token_idx: int
+) -> list[int]:
+    """Generate extra keys for activation-patching-aware prefix caching.
+
+    A patched request's KV differs from the unpatched run at every position
+    ``>= min_dest_position`` (the patch mutates the residual there, and
+    attention propagates it to all later positions), so those blocks must not
+    be registered under — or served from — the vanilla token-hash chain.
+    Blocks strictly below the patch floor are byte-identical to the unpatched
+    run and stay shareable (this preserves the corrupt-prefix sharing that
+    makes patch sweeps cheap). Distinct specs get distinct chains; a repeated
+    identical cell may share its own prior blocks (consistent by construction).
+    """
+    sp = request.sampling_params
+    taint = sp.patch_kv_taint if sp is not None else None
+    if taint is None:
+        return []
+    min_pos, spec_hash = taint
+    if end_token_idx <= min_pos:
+        return []  # block is entirely below the patch floor: untainted
+    return [spec_hash]
+
+
 def generate_block_hash_extra_keys(
     request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int
 ) -> tuple[tuple[Any, ...] | None, int]:
@@ -612,6 +636,9 @@ def generate_block_hash_extra_keys(
     steering_extra_keys: list[int] = _gen_steering_extra_hash_keys(
         request, start_token_idx, end_token_idx
     )
+    patch_extra_keys: list[int] = _gen_patch_extra_hash_keys(
+        request, start_token_idx, end_token_idx
+    )
 
     extra_keys: list[Any] = (
         lora_extra_keys
@@ -619,6 +646,7 @@ def generate_block_hash_extra_keys(
         + cache_salt_keys
         + prompt_embeds_keys
         + steering_extra_keys
+        + patch_extra_keys
     )
 
     if not extra_keys:

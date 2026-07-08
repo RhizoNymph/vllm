@@ -373,7 +373,9 @@ async def init_app_state(
             SteeringModuleRegistry,
         )
 
-        steering_registry = SteeringModuleRegistry()
+        steering_registry = SteeringModuleRegistry(
+            expected_row_width=vllm_config.model_config.get_hidden_size(),
+        )
         if getattr(args, "steering_modules", None):
             for module in getattr(args, "steering_modules", None) or []:
                 await steering_registry.load_from_file(module.name, module.path)

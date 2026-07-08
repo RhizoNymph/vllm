@@ -357,6 +357,17 @@ pub struct EngineCoreSamplingParams {
     /// spec into prefix-cache flags (offline admission).
     #[serde(default)]
     pub capture: Option<serde_json::Value>,
+    /// Per-request activation-patching spec: a list of site entries. Forwarded
+    /// verbatim; engine-core's input processor resolves the raw spec into
+    /// prefix-cache flags (offline admission).
+    #[serde(default)]
+    pub patch: Option<serde_json::Value>,
+    /// Request-level packed table of client-provided patch vectors, referenced
+    /// by a patch entry's `source_inline` / mask `inline` row index. Forwarded
+    /// verbatim (base64 binary wire form) like `patch`; omit-when-None keeps the
+    /// wire payload compatible with clients that never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_vectors: Option<serde_json::Value>,
 }
 
 impl EngineCoreSamplingParams {
@@ -390,6 +401,8 @@ impl EngineCoreSamplingParams {
             decode_steering_vectors: None,
             steering_module_ref: None,
             capture: None,
+            patch: None,
+            patch_vectors: None,
         }
     }
 }
@@ -471,7 +484,12 @@ impl EngineCoreRequest {
 ///
 /// Original Python definition:
 /// <https://github.com/vllm-project/vllm/blob/d3af8c18317c0dc008d42e4367fbb9045cfb7bf6/vllm/v1/engine/__init__.py#L154-L184>
-#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
+// Decoded with a hand-written seq visitor (not `Deserialize_tuple`) so the
+// frontend tolerates BOTH shorter tuples (upstream `omit_defaults` elides
+// trailing defaults) AND longer tuples (upstream appends a new `array_like`
+// field the frontend does not know yet): unknown trailing elements are drained
+// instead of raising a decode error. See `deserialize_output_seq` below.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, DefaultFromSerde)]
 pub struct EngineCoreOutput {
     pub request_id: String,
     pub new_token_ids: Vec<u32>,
@@ -520,11 +538,59 @@ impl EngineCoreOutput {
     }
 }
 
+impl<'de> Deserialize<'de> for EngineCoreOutput {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OutputVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for OutputVisitor {
+            type Value = EngineCoreOutput;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an EngineCoreOutput array_like tuple")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                // Missing trailing elements fall back to defaults (omit_defaults);
+                // any elements past the known fields are drained (forward-compat).
+                let output = EngineCoreOutput {
+                    request_id: seq.next_element()?.unwrap_or_default(),
+                    new_token_ids: seq.next_element()?.unwrap_or_default(),
+                    new_logprobs: seq.next_element()?.unwrap_or_default(),
+                    new_prompt_logprobs_tensors: seq.next_element()?.unwrap_or_default(),
+                    pooling_output: seq.next_element()?.unwrap_or_default(),
+                    finish_reason: seq.next_element()?.unwrap_or_default(),
+                    stop_reason: seq.next_element()?.unwrap_or_default(),
+                    capture_results: seq.next_element()?.unwrap_or_default(),
+                    events: seq.next_element()?.unwrap_or_default(),
+                    kv_transfer_params: seq.next_element()?.unwrap_or_default(),
+                    trace_headers: seq.next_element()?.unwrap_or_default(),
+                    prefill_stats: seq.next_element()?.unwrap_or_default(),
+                    routed_experts: seq.next_element()?.unwrap_or_default(),
+                    num_nans_in_logits: seq.next_element()?.unwrap_or_default(),
+                };
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(output)
+            }
+        }
+
+        deserializer.deserialize_seq(OutputVisitor)
+    }
+}
+
 /// Batch of engine-core outputs returned to a frontend client.
 ///
 /// Original Python definition:
 /// <https://github.com/vllm-project/vllm/blob/f22d6e026798a74e6542a52ef776c054f2de572a/vllm/v1/engine/__init__.py#L186-L214>
-#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
+// See `EngineCoreOutput`: decoded with a hand-written seq visitor so the
+// frontend tolerates both shorter and longer `array_like` tuples across
+// upstream wire-format changes.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, DefaultFromSerde)]
 pub struct EngineCoreOutputs {
     #[serde(default)]
     pub engine_index: u32,
@@ -537,6 +603,15 @@ pub struct EngineCoreOutputs {
     pub timestamp: f64,
     #[serde(default)]
     pub utility_output: Option<UtilityOutput>,
+    /// Capture results that finalized AFTER their request finished (writes are
+    /// asynchronous). Keyed by `request_id`, then by consumer name. The Rust
+    /// frontend does not yet route these to `capture_wait` waiters, but the
+    /// field MUST be present so the `array_like` tuple stays aligned with the
+    /// Python `EngineCoreOutputs` wire layout (it sits between `utility_output`
+    /// and `finished_requests`). Decoded permissively; an empty map is the
+    /// common case.
+    #[serde(default)]
+    pub late_capture_results: HashMap<String, HashMap<String, CaptureResult>>,
     #[serde(default)]
     pub finished_requests: Option<BTreeSet<String>>,
     /// In DP mode, signals that the current wave finished and engines are
@@ -547,6 +622,46 @@ pub struct EngineCoreOutputs {
     /// wave needs to start in other engines.
     #[serde(default)]
     pub start_wave: Option<u32>,
+}
+
+impl<'de> Deserialize<'de> for EngineCoreOutputs {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OutputsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for OutputsVisitor {
+            type Value = EngineCoreOutputs;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an EngineCoreOutputs array_like tuple")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                // Missing trailing elements fall back to defaults (omit_defaults);
+                // any elements past the known fields are drained (forward-compat).
+                let outputs = EngineCoreOutputs {
+                    engine_index: seq.next_element()?.unwrap_or_default(),
+                    outputs: seq.next_element()?.unwrap_or_default(),
+                    scheduler_stats: seq.next_element()?.unwrap_or_default(),
+                    timestamp: seq.next_element()?.unwrap_or_default(),
+                    utility_output: seq.next_element()?.unwrap_or_default(),
+                    late_capture_results: seq.next_element()?.unwrap_or_default(),
+                    finished_requests: seq.next_element()?.unwrap_or_default(),
+                    wave_complete: seq.next_element()?.unwrap_or_default(),
+                    start_wave: seq.next_element()?.unwrap_or_default(),
+                };
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(outputs)
+            }
+        }
+
+        deserializer.deserialize_seq(OutputsVisitor)
+    }
 }
 
 /// Encode a Rust value into msgpack using the protocol crate's serde model.
@@ -684,6 +799,77 @@ mod tests {
     }
 
     #[test]
+    fn patch_spec_is_forwarded_verbatim_as_a_list() {
+        let spec = serde_json::json!([
+            {
+                "layer": 14,
+                "hook": "post_block",
+                "dest_position": 6,
+                "source_run": "clean",
+                "source_position": 6,
+                "alpha": 1.0,
+            }
+        ]);
+        let params = EngineCoreSamplingParams {
+            patch: Some(spec.clone()),
+            ..EngineCoreSamplingParams::for_test()
+        };
+
+        // `patch` serializes as a msgpack array under the `patch` field name,
+        // and round-trips back to the same JSON list engine-core admits.
+        let bytes = encode_msgpack(&params).unwrap();
+        let value = decode_value(&bytes).unwrap();
+        let map = match value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let get = |key: &str| map.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v);
+        assert!(
+            matches!(get("patch"), Some(Value::Array(_))),
+            "patch must forward as a msgpack array"
+        );
+
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.patch, Some(spec));
+    }
+
+    #[test]
+    fn patch_defaults_to_none_when_absent() {
+        // A request without a patch spec leaves the field `None`, so a missing
+        // `patch` key in the wire payload decodes cleanly (serde default).
+        let params = EngineCoreSamplingParams::for_test();
+        assert!(params.patch.is_none());
+        let decoded: EngineCoreSamplingParams =
+            decode_msgpack(&encode_msgpack(&params).unwrap()).unwrap();
+        assert!(decoded.patch.is_none());
+    }
+
+    #[test]
+    fn patch_vectors_forwarded_verbatim_and_omitted_when_none() {
+        // The packed table forwards verbatim under `patch_vectors` (like
+        // `patch`), and its key is omitted from the wire payload when None.
+        let table = serde_json::json!({
+            "dtype": "float32",
+            "shape": [2, 4],
+            "data": "AAAAAA==",
+        });
+        let params = EngineCoreSamplingParams {
+            patch_vectors: Some(table.clone()),
+            ..EngineCoreSamplingParams::for_test()
+        };
+        let bytes = encode_msgpack(&params).unwrap();
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.patch_vectors, Some(table));
+
+        // Absent by default: the key is skipped, decodes cleanly to None.
+        let plain = EngineCoreSamplingParams::for_test();
+        assert!(plain.patch_vectors.is_none());
+        let decoded: EngineCoreSamplingParams =
+            decode_msgpack(&encode_msgpack(&plain).unwrap()).unwrap();
+        assert!(decoded.patch_vectors.is_none());
+    }
+
+    #[test]
     fn engine_core_output_capture_results_sit_at_tuple_index_7() {
         let output = EngineCoreOutput {
             request_id: "r".to_string(),
@@ -762,6 +948,165 @@ mod tests {
             decoded.finished_requests,
             Some(BTreeSet::from(["req-1".to_string()]))
         );
+    }
+
+    /// Reproduces the real engine-core `EngineCoreOutputs` wire frame captured
+    /// live from the Python engine. The regression this pins: the outer tuple
+    /// carries `late_capture_results` (an `array_like` field appended upstream)
+    /// as an empty map at index 5, between `utility_output` and
+    /// `finished_requests`. Before the field existed on the Rust side, that map
+    /// was decoded against `finished_requests: Option<set>` and failed with
+    /// "invalid type: map, expected a sequence", wedging the whole client.
+    ///
+    /// The inner `EngineCoreOutput` also mirrors the live shape: `events` is a
+    /// list of MAPS (plain msgspec Struct), `prefill_stats` is a MAP
+    /// (dataclass), `capture_results` is an empty map, and the trailing
+    /// `EngineCoreOutputs` fields (`wave_complete`, `start_wave`) are omitted
+    /// (`omit_defaults`), so the sequence is shorter than the full field count.
+    #[test]
+    fn decodes_real_engine_core_outputs_frame_with_late_capture_results() {
+        // Inner EngineCoreOutput as an array_like tuple (14 slots), matching the
+        // live plain-completion dump.
+        let event = |ty: u8, ts: f64| {
+            Value::Map(vec![
+                (Value::from("type"), Value::from(ty)),
+                (Value::from("timestamp"), Value::from(ts)),
+            ])
+        };
+        let prefill_stats = Value::Map(vec![
+            (Value::from("num_prompt_tokens"), Value::from(5u32)),
+            (Value::from("num_computed_tokens"), Value::from(5u32)),
+            (Value::from("num_cached_tokens"), Value::from(0u32)),
+            (Value::from("num_local_cached_tokens"), Value::from(0u32)),
+            (Value::from("num_external_cached_tokens"), Value::from(0u32)),
+        ]);
+        let inner = Value::Array(vec![
+            Value::from("cmpl-fcdb0f49-f04b1c4e"), // request_id
+            Value::Array(vec![Value::from(12095u32)]), // new_token_ids
+            Value::Nil,                            // new_logprobs
+            Value::Nil,                            // new_prompt_logprobs_tensors
+            Value::Nil,                            // pooling_output
+            Value::from(1u8),                      // finish_reason (Length)
+            Value::Nil,                            // stop_reason
+            Value::Map(vec![]),                    // capture_results (empty map)
+            Value::Array(vec![event(1, 1495680.63), event(2, 1495680.63)]), // events (list of maps)
+            Value::Nil,                            // kv_transfer_params
+            Value::Nil,                            // trace_headers
+            prefill_stats,                         // prefill_stats (map)
+            Value::Nil,                            // routed_experts
+            Value::from(0u32),                     // num_nans_in_logits
+        ]);
+
+        // Real scheduler_stats is a dataclass -> named map with every field
+        // present; reuse the Rust encoder to produce that exact map shape.
+        let scheduler_stats =
+            decode_value(&encode_msgpack(&SchedulerStats::default()).unwrap()).unwrap();
+        assert!(scheduler_stats.is_map());
+
+        // Outer EngineCoreOutputs: only the first 7 slots are present; the
+        // trailing wave_complete/start_wave are elided by omit_defaults.
+        let outer = Value::Array(vec![
+            Value::from(0u32),          // engine_index
+            Value::Array(vec![inner]),  // outputs
+            scheduler_stats,            // scheduler_stats (map)
+            Value::from(1495680.686869659f64), // timestamp
+            Value::Nil,                 // utility_output
+            Value::Map(vec![]),         // late_capture_results (empty map) <- regression
+            Value::Nil,                 // finished_requests
+        ]);
+
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &outer).unwrap();
+
+        let decoded: EngineCoreOutputs = decode_msgpack(&bytes)
+            .expect("a real engine-core outputs frame (late_capture_results map) must decode");
+
+        assert_eq!(decoded.engine_index, 0);
+        assert_eq!(decoded.outputs.len(), 1);
+        let output = &decoded.outputs[0];
+        assert_eq!(output.request_id, "cmpl-fcdb0f49-f04b1c4e");
+        assert_eq!(output.new_token_ids, vec![12095]);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Length));
+        assert_eq!(
+            output.events.as_ref().map(|events| events.len()),
+            Some(2)
+        );
+        assert_eq!(output.events.as_ref().unwrap()[1].r#type, EngineCoreEventType::Scheduled);
+        assert_eq!(output.prefill_stats.as_ref().unwrap().num_prompt_tokens, 5);
+        assert!(decoded.late_capture_results.is_empty());
+        assert!(decoded.scheduler_stats.is_some());
+        // Elided trailing fields fall back to their defaults.
+        assert_eq!(decoded.wave_complete, None);
+        assert_eq!(decoded.start_wave, None);
+    }
+
+    /// A non-empty `late_capture_results` map decodes into the nested
+    /// `{request_id: {consumer: CaptureResult}}` form and keeps the tuple
+    /// aligned so `finished_requests` still decodes after it.
+    #[test]
+    fn decodes_engine_core_outputs_with_populated_late_capture_results() {
+        let capture_result = Value::Map(vec![
+            (Value::from("status"), Value::from("ok")),
+            (
+                Value::from("payload"),
+                Value::Map(vec![(
+                    Value::from("paths"),
+                    Value::Array(vec![Value::from("/tmp/a.bin")]),
+                )]),
+            ),
+        ]);
+        let late = Value::Map(vec![(
+            Value::from("cmpl-late"),
+            Value::Map(vec![(Value::from("filesystem"), capture_result)]),
+        )]);
+        let outer = Value::Array(vec![
+            Value::from(0u32),           // engine_index
+            Value::Array(vec![]),        // outputs
+            Value::Nil,                  // scheduler_stats
+            Value::from(1.0f64),         // timestamp
+            Value::Nil,                  // utility_output
+            late,                        // late_capture_results (populated)
+            Value::Array(vec![Value::from("cmpl-late")]), // finished_requests
+        ]);
+
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &outer).unwrap();
+        let decoded: EngineCoreOutputs = decode_msgpack(&bytes).unwrap();
+
+        assert_eq!(
+            decoded.late_capture_results["cmpl-late"]["filesystem"].status,
+            "ok"
+        );
+        assert_eq!(
+            decoded.finished_requests,
+            Some(BTreeSet::from(["cmpl-late".to_string()]))
+        );
+    }
+
+    /// Forward-compatibility: if upstream appends a NEW trailing field to the
+    /// `array_like` `EngineCoreOutputs` tuple, the Rust decoder must not break.
+    /// A sequence LONGER than the known field count decodes by ignoring the
+    /// extra trailing element(s).
+    #[test]
+    fn decodes_engine_core_outputs_with_extra_trailing_field() {
+        let outer = Value::Array(vec![
+            Value::from(0u32),          // engine_index
+            Value::Array(vec![]),       // outputs
+            Value::Nil,                 // scheduler_stats
+            Value::from(1.0f64),        // timestamp
+            Value::Nil,                 // utility_output
+            Value::Map(vec![]),         // late_capture_results
+            Value::Nil,                 // finished_requests
+            Value::Nil,                 // wave_complete
+            Value::Nil,                 // start_wave
+            Value::from(true),          // hypothetical future trailing field
+        ]);
+
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &outer).unwrap();
+        let decoded: EngineCoreOutputs = decode_msgpack(&bytes)
+            .expect("an EngineCoreOutputs frame with an unknown trailing field must still decode");
+        assert_eq!(decoded.engine_index, 0);
     }
 
     #[test]

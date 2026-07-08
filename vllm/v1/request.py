@@ -347,12 +347,22 @@ class Request:
             return 0
         return self.sampling_params.decode_steering_config_hash
 
+    @cached_property
+    def patch_site_demand(self) -> dict[tuple[int, str], int]:
+        """Per-``(layer, hook)`` patch-slot demand. Delegates to
+        ``SamplingParams.patch_site_demand`` (itself cached). Empty when no
+        patching. Used by the scheduler for per-site capacity backpressure."""
+        if self.sampling_params is None:
+            return {}
+        return self.sampling_params.patch_site_demand
+
     def invalidate_steering_hashes(self) -> None:
         """Clear cached steering hashes so they recompute from current
         sampling_params.  Must be called whenever sampling_params is
         replaced (e.g. streaming session updates)."""
         self.__dict__.pop("prefill_steering_config_hash", None)
         self.__dict__.pop("decode_steering_config_hash", None)
+        self.__dict__.pop("patch_site_demand", None)
 
     def get_skip_reading_prefix_cache(self) -> bool:
         # A capture-bearing request whose classification is unknown skips
@@ -377,6 +387,16 @@ class Request:
             and self.sampling_params.capture_touches_prompt is None
         ):
             return True
+        # Same reasoning for activation patching: an unclassified patch request
+        # (offline path) might overwrite a prompt-range activation, which only
+        # fires when that position is re-forwarded — so skip reuse wholesale
+        # until classification (patch_touches_prompt) is known.
+        if (
+            self.sampling_params is not None
+            and self.sampling_params.patch
+            and self.sampling_params.patch_touches_prompt is None
+        ):
+            return True
         if (
             self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None
@@ -390,22 +410,33 @@ class Request:
         return False
 
     def get_capture_prefix_cache_limit(self) -> int | None:
-        """Upper bound on prefix-cache hit length imposed by capture.
+        """Upper bound on prefix-cache hit length imposed by capture/patching.
 
         A prompt-touching capture must re-forward from its lowest captured
-        prompt position so that position's residual is produced; positions
-        strictly below it may still be served from cache. Returns that floor
-        as a cap on the cache-hit length, or ``None`` when no capture clamp
-        applies (no capture, generated-only, or unclassified — the
-        unclassified case is instead handled by
-        :meth:`get_skip_reading_prefix_cache` skipping reuse entirely).
+        prompt position so that position's residual is produced; a prompt-range
+        patch must likewise re-forward from its lowest patched position so the
+        injection hook fires. Positions strictly below the floor may still be
+        served from cache. Returns the lower of the capture and patch floors,
+        or ``None`` when neither clamp applies (the unclassified case is
+        instead handled by :meth:`get_skip_reading_prefix_cache`).
         """
         sp = self.sampling_params
-        if sp is None or not sp.capture:
+        if sp is None:
             return None
-        if sp.capture_touches_prompt is not True:
-            return None
-        return sp.capture_min_prompt_position
+        limits: list[int] = []
+        if (
+            sp.capture
+            and sp.capture_touches_prompt is True
+            and sp.capture_min_prompt_position is not None
+        ):
+            limits.append(sp.capture_min_prompt_position)
+        if (
+            sp.patch
+            and sp.patch_touches_prompt is True
+            and sp.patch_min_prompt_position is not None
+        ):
+            limits.append(sp.patch_min_prompt_position)
+        return min(limits) if limits else None
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)

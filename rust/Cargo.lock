@@ -5887,6 +5887,7 @@ dependencies = [
  "llm-multimodal",
  "prost",
  "prost-types",
+ "reqwest",
  "rmp-serde",
  "rmpv",
  "serde",

@@ -97,6 +97,7 @@ from vllm.v1.worker.gpu.lora_utils import (
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.patch_runner_mixin import PatchRunnerMixin
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -120,7 +121,10 @@ logger = init_logger(__name__)
 
 
 class GPUModelRunner(
-    LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringModelRunnerMixin
+    LoRAModelRunnerMixin,
+    CaptureRunnerMixin,
+    SteeringModelRunnerMixin,
+    PatchRunnerMixin,
 ):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -279,6 +283,8 @@ class GPUModelRunner(
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
+        # (Patch buffers self-register during the model build from the current
+        # VllmConfig context — no runner-side setup; see patch.py.)
         self.eplb.prepare_load()
         eplb_models_added = False
         with DeviceMemoryProfiler() as m:
@@ -379,6 +385,9 @@ class GPUModelRunner(
         # Activation-steering control plane. Discovers steerable layers on the
         # loaded model and builds the SteeringManager (no-op when disabled).
         self._init_steering_state()
+        # Activation-patching control plane. Discovers patchable layers and
+        # warms the patch kernels (no-op when patching disabled).
+        self._init_patch_state()
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -778,6 +787,8 @@ class GPUModelRunner(
         # resumed request re-registers a fresh prefill config via add_requests.
         if self._steering_manager is not None:
             self._steering_finish_requests(finished_req_ids)
+        if self._patchable_layers:
+            self._patch_finish_requests(finished_req_ids)
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 
@@ -846,6 +857,9 @@ class GPUModelRunner(
             # Register the request's steering config (rank-local; deterministic
             # across the TP/PP topology from the broadcast scheduler output).
             self._steering_add_request(new_req_data)
+            # Resolve the request's patch spec into per-layer source vectors
+            # (rank-local; only locally-owned layers are kept).
+            self._patch_add_request(new_req_data)
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
@@ -1239,6 +1253,11 @@ class GPUModelRunner(
             if self._steering_manager is not None:
                 self.input_batch = input_batch
                 self._update_steering_buffers(scheduler_output)
+            # Write per-(layer, hook) patch buffers from per-request specs.
+            # Persistent buffers => FULL cudagraph replay reads this step's
+            # values; no force-eager seam (unlike capture's dynamic gather).
+            if self._patchable_layers:
+                self._update_patch_buffers_v2(scheduler_output, input_batch)
 
             if self.lora_config:
                 # Activate LoRA adapters.

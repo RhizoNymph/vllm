@@ -341,6 +341,53 @@ fn serve_passes_api_keys_into_config() {
 }
 
 #[test]
+fn serve_passes_steering_api_keys_into_config() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--steering-api-key",
+        "steer-a",
+        "--steering-api-key",
+        "steer-b",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    let config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
+    assert_eq!(config.steering_api_keys, vec!["steer-a", "steer-b"]);
+    let debug = format!("{config:#?}");
+    assert!(debug.contains("steering_api_keys: [<redacted>; 2]"));
+    assert!(!debug.contains("steer-a"));
+}
+
+#[test]
+fn frontend_args_json_accepts_steering_api_key_list() {
+    // The Python launcher forwards `--steering-api-key` via --args-json.
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "frontend",
+        "--listen-fd",
+        "3",
+        "--input-address",
+        "ipc:///tmp/input.sock",
+        "--output-address",
+        "ipc:///tmp/output.sock",
+        "--args-json",
+        r#"{"model_tag":"Qwen/Qwen3-0.6B","steering_api_key":["s1","s2"]}"#,
+    ])
+    .unwrap();
+
+    let Command::Frontend(args) = cli.command else {
+        panic!("expected frontend args");
+    };
+    let config = args.into_config();
+    assert_eq!(config.steering_api_keys, vec!["s1", "s2"]);
+}
+
+#[test]
 fn frontend_args_json_accepts_api_key_string() {
     let cli = Cli::try_parse_from([
         "vllm-rs",
@@ -481,6 +528,7 @@ fn frontend_args_accept_json() {
                     ),
                     engine_start_index: 0,
                     engine_count: 1,
+                    patch_sidecar_url: None,
                     runtime: SharedRuntimeArgs {
                         model: "Qwen/Qwen3-0.6B",
                         tokenizer: None,
@@ -1143,10 +1191,12 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
                 allow_credentials: false,
             },
             api_keys: [],
+            steering_api_keys: [],
             disable_log_stats: false,
             grpc_port: None,
             shutdown_timeout: 0ns,
             steering_modules: [],
+            patch_sidecar_url: None,
         }
     "#]]
     .assert_debug_eq(&Config {
@@ -1226,10 +1276,12 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
                 allow_credentials: false,
             },
             api_keys: [],
+            steering_api_keys: [],
             disable_log_stats: false,
             grpc_port: None,
             shutdown_timeout: 0ns,
             steering_modules: [],
+            patch_sidecar_url: None,
         }
     "#]]
     .assert_debug_eq(&config);
@@ -1327,10 +1379,12 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
                 allow_credentials: false,
             },
             api_keys: [],
+            steering_api_keys: [],
             disable_log_stats: false,
             grpc_port: None,
             shutdown_timeout: 0ns,
             steering_modules: [],
+            patch_sidecar_url: None,
         }
     "#]]
     .assert_debug_eq(&config);

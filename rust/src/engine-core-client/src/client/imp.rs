@@ -335,7 +335,22 @@ pub(crate) async fn run_output_dispatcher_loop(
                 None => Err(dispatcher_closed!(
                     "engine-core output dispatcher channel closed"
                 )),
-            }?;
+            };
+
+            // A single undecodable frame must not wedge the client. Log loudly
+            // and skip it so outputs for other requests keep flowing; only
+            // fatal transport/engine-dead errors tear down the registries.
+            let outputs = match outputs {
+                Ok(outputs) => outputs,
+                Err(error) if error.is_output_frame_decode_failure() => {
+                    warn!(
+                        error = %error.as_report(),
+                        "skipping undecodable engine-core output frame; keeping dispatcher alive"
+                    );
+                    continue;
+                }
+                Err(error) => Err::<EngineCoreOutputs, _>(error)?,
+            };
 
             match outputs.classify() {
                 ClassifiedEngineCoreOutputs::RequestBatch(batch) => {
@@ -454,6 +469,71 @@ mod tests {
         ));
 
         inner.close_registries(Arc::new(client_closed!("shutdown")));
+        assert!(matches!(
+            inner.health_error().as_deref(),
+            Some(Error::EngineCoreDead)
+        ));
+    }
+
+    /// A single undecodable output frame must not wedge the dispatcher: the
+    /// loop logs and skips it, stays healthy, and still delivers a subsequent
+    /// valid frame to the registered request. This is the regression that made
+    /// the Rust frontend unusable when its protocol structs drifted from the
+    /// Python wire format.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatcher_survives_undecodable_frame() {
+        let inner = Arc::new(test_inner().await);
+        let (_engine_id, mut output_rx) = inner
+            .register_request("req-1".to_string(), None, None)
+            .expect("request registers");
+
+        let (tx, rx) = mpsc::channel(8);
+        let dispatcher = tokio::spawn(run_output_dispatcher_loop(inner.clone(), rx));
+
+        // Frame 1: an undecodable frame (simulating a wire-format drift).
+        tx.send(Err(Error::Decode {
+            target_type: "EngineCoreOutputs",
+            message: "invalid type: map, expected a sequence".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        // Frame 2: a valid, terminal output for the registered request.
+        let outputs = EngineCoreOutputs {
+            outputs: vec![EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: vec![42],
+                finish_reason: Some(crate::protocol::EngineCoreFinishReason::Length),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        tx.send(Ok(outputs)).await.unwrap();
+
+        // The dispatcher survived the bad frame and delivered the good one.
+        let delivered = output_rx.recv().await.expect("request stream still open");
+        let stream_output = delivered.expect("valid output delivered");
+        assert_eq!(stream_output.output.request_id, "req-1");
+        assert_eq!(stream_output.output.new_token_ids, vec![42]);
+        assert!(inner.is_healthy(), "decode failure must not mark unhealthy");
+
+        // Dropping the sender closes the channel, which is the terminal path.
+        drop(tx);
+        dispatcher.await.unwrap();
+    }
+
+    /// A fatal transport/engine-dead error IS terminal: the dispatcher exits and
+    /// tears down the registries so callers observe the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatcher_stops_on_fatal_engine_error() {
+        let inner = Arc::new(test_inner().await);
+        let (tx, rx) = mpsc::channel(8);
+        let dispatcher = tokio::spawn(run_output_dispatcher_loop(inner.clone(), rx));
+
+        tx.send(Err(Error::EngineCoreDead)).await.unwrap();
+        dispatcher.await.unwrap();
+
+        assert!(!inner.is_healthy());
         assert!(matches!(
             inner.health_error().as_deref(),
             Some(Error::EngineCoreDead)

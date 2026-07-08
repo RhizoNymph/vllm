@@ -219,6 +219,15 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub api_key: Vec<String>,
 
+    /// If provided, mutating steering endpoints (module register/unregister)
+    /// require one of these keys as the Authorization bearer token. Mirrors
+    /// the Python frontend's `--steering-api-key`.
+    #[educe(Debug(ignore))]
+    #[arg(long, env = "VLLM_STEERING_API_KEY", value_delimiter = ' ')]
+    #[serde_as(as = "DefaultOnNull<OneOrMany<_>>")]
+    #[serde(default)]
+    pub steering_api_key: Vec<String>,
+
     /// Disable periodic logging of engine statistics (throughput, queue depth,
     /// cache usage).
     #[arg(long)]
@@ -295,6 +304,11 @@ impl SharedRuntimeArgs {
         {
             self.api_key.push(api_key);
         }
+        if self.steering_api_key.is_empty()
+            && let Ok(steering_api_key) = std::env::var("VLLM_STEERING_API_KEY")
+        {
+            self.steering_api_key.push(steering_api_key);
+        }
     }
 
     /// Build the OpenAI-server config for the Python-bootstrap worker contract.
@@ -309,6 +323,7 @@ impl SharedRuntimeArgs {
         coordinator_address: Option<String>,
         engine_start_index: u32,
         engine_count: usize,
+        patch_sidecar_url: Option<String>,
     ) -> Config {
         let ready_timeout = self.ready_timeout();
         let shutdown_timeout = self.shutdown_timeout();
@@ -342,10 +357,12 @@ impl SharedRuntimeArgs {
             api_server_options,
             cors,
             api_keys: self.api_key,
+            steering_api_keys: self.steering_api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
             steering_modules: self.steering_modules,
+            patch_sidecar_url,
         }
     }
 
@@ -390,10 +407,14 @@ impl SharedRuntimeArgs {
             api_server_options,
             cors,
             api_keys: self.api_key,
+            steering_api_keys: self.steering_api_key,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
             steering_modules: self.steering_modules,
+            // The managed `serve` path runs Python as a headless engine only;
+            // there is no separate patch sidecar to proxy to.
+            patch_sidecar_url: None,
         }
     }
 
@@ -489,6 +510,12 @@ pub struct FrontendArgs {
     #[arg(long, default_value_t = 1)]
     pub engine_count: usize,
 
+    /// Base URL of the internal activation-patching sidecar (a loopback Python
+    /// api_server on the same engines). When set, the frontend reverse-proxies
+    /// the patch-study routes to it; otherwise those routes return HTTP 501.
+    #[arg(long)]
+    pub patch_sidecar_url: Option<String>,
+
     /// Shared frontend arguments as one JSON object.
     #[arg(long = "args-json", value_parser = parse_runtime_args_json, value_name = "JSON")]
     pub runtime: SharedRuntimeArgs,
@@ -504,6 +531,7 @@ impl FrontendArgs {
             self.coordinator_address,
             self.engine_start_index,
             self.engine_count,
+            self.patch_sidecar_url,
         )
     }
 }

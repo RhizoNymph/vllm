@@ -180,6 +180,8 @@ class APIServerProcessManager:
         target_server_fn: Callable | None = None,
         stats_update_address: str | None = None,
         tensor_queue: Queue | None = None,
+        client_index_start: int = 0,
+        client_count: int | None = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -199,10 +201,18 @@ class APIServerProcessManager:
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address
             tensor_queue: Optional tensor IPC queue for sharing MM tensors
+            client_index_start: Engine client index of the first server in this
+                group. Used when another frontend (e.g. the Rust server) owns
+                lower client indices, so this group's engine-output routing does
+                not collide with it.
+            client_count: Total number of engine clients across all frontends.
+                Defaults to ``num_servers`` when this manager owns every client.
         """
         self.listen_address = listen_address
         self.sock = sock
         self.args = args
+
+        total_clients = num_servers if client_count is None else client_count
 
         spawn_context = multiprocessing.get_context("spawn")
         self.processes: list[BaseProcess] = []
@@ -211,11 +221,12 @@ class APIServerProcessManager:
         for i, in_addr, out_addr in zip(
             range(num_servers), input_addresses, output_addresses
         ):
+            client_index = client_index_start + i
             client_config: dict[str, Any] = {
                 "input_address": in_addr,
                 "output_address": out_addr,
-                "client_count": num_servers,
-                "client_index": i,
+                "client_count": total_clients,
+                "client_index": client_index,
             }
             if stats_update_address is not None:
                 client_config["stats_update_address"] = stats_update_address
@@ -228,7 +239,7 @@ class APIServerProcessManager:
 
             proc = spawn_context.Process(
                 target=target_server_fn or run_api_server_worker_proc,
-                name=f"ApiServer_{i}",
+                name=f"ApiServer_{client_index}",
                 args=(listen_address, sock, args, client_config),
             )
             self.processes.append(proc)
@@ -339,6 +350,7 @@ class RustFrontendProcessManager:
         engine_start_index: int,
         engine_count: int,
         stats_update_address: str | None = None,
+        patch_sidecar_url: str | None = None,
     ):
         import os
         import subprocess
@@ -362,6 +374,8 @@ class RustFrontendProcessManager:
         ]
         if stats_update_address is not None:
             cmd.extend(["--coordinator-address", stats_update_address])
+        if patch_sidecar_url is not None:
+            cmd.extend(["--patch-sidecar-url", patch_sidecar_url])
         from vllm.entrypoints.serve.utils.api_utils import jsonify_non_default_args
 
         args_json = json.dumps(
@@ -392,6 +406,30 @@ class RustFrontendProcessManager:
     def shutdown(self, timeout: float | None = None) -> None:
         if self._finalizer.detach() is not None:
             _shutdown_subprocesses(self.processes, timeout=timeout)
+
+
+class CompositeProcessManager:
+    """Aggregate several frontend process managers behind one interface.
+
+    Presents the union of the wrapped managers' ``processes`` (so a single
+    :func:`wait_for_completion_or_failure` monitors all of them) and fans
+    ``shutdown`` out to each. Used to run the Rust frontend alongside the
+    internal activation-patching sidecar api_server as one logical frontend.
+    """
+
+    def __init__(
+        self,
+        managers: "list[APIServerProcessManager | RustFrontendProcessManager]",
+    ):
+        self._managers = managers
+
+    @property
+    def processes(self) -> list[Any]:
+        return [proc for manager in self._managers for proc in manager.processes]
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        for manager in self._managers:
+            manager.shutdown(timeout=timeout)
 
 
 class _SubprocessWrapper:
@@ -508,7 +546,8 @@ def run_api_server_worker_proc(
 
 
 def wait_for_completion_or_failure(
-    api_server_manager: "APIServerProcessManager | RustFrontendProcessManager",
+    api_server_manager: "APIServerProcessManager | RustFrontendProcessManager"
+    " | CompositeProcessManager",
     engine_manager: Union["CoreEngineProcManager", "CoreEngineActorManager"]
     | None = None,
     coordinator: "DPCoordinator | None" = None,

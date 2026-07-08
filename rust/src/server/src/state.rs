@@ -38,6 +38,10 @@ pub struct AppState {
     server_info: Option<ServerInfoSnapshot>,
     /// SHA-256 hashes of API keys accepted as bearer tokens for guarded routes.
     api_key_hashes: Vec<ApiKeyHash>,
+    /// SHA-256 hashes of the steering API keys gating mutating steering
+    /// endpoints (module register/unregister). Empty means unauthenticated,
+    /// mirroring the Python frontend's `--steering-api-key` behavior.
+    steering_api_key_hashes: Vec<ApiKeyHash>,
     /// Names of steering modules currently registered with the engine workers.
     /// Seeded at startup and mutated by the runtime steering endpoints; requests
     /// referencing an unknown `steering_name` are rejected up front.
@@ -49,6 +53,40 @@ pub struct AppState {
     server_load: AtomicU64,
     /// Dynamic LoRA adapter registry.
     lora_manager: LoraManager,
+    /// Reverse-proxy target for the activation-patching sweep routes, when a
+    /// Python patch sidecar was spawned alongside this frontend.
+    patch_sidecar: Option<PatchSidecar>,
+}
+
+/// Reverse-proxy target for the activation-patching sweep routes.
+///
+/// Holds the sidecar's base URL and a shared HTTP client. The client is reused
+/// across requests so streaming (SSE) proxying keeps a warm connection pool.
+#[derive(Clone)]
+pub(crate) struct PatchSidecar {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl PatchSidecar {
+    /// Construct a sidecar target directly from a base URL (test helper).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Absolute upstream URL for a sidecar path (e.g. `/v1/patch_sweep`).
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    /// Shared HTTP client used to forward requests to the sidecar.
+    pub(crate) fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
 }
 
 impl AppState {
@@ -72,11 +110,30 @@ impl AppState {
             cors: CorsConfig::default(),
             server_info: None,
             api_key_hashes: Vec::new(),
+            steering_api_key_hashes: Vec::new(),
             steering_module_names: RwLock::new(HashSet::new()),
             steering_mutation_lock: Mutex::new(()),
             server_load: AtomicU64::new(0),
             lora_manager: LoraManager::new(),
+            patch_sidecar: None,
         }
+    }
+
+    /// Configure the activation-patching sidecar reverse-proxy target.
+    ///
+    /// `base_url` is trimmed of a trailing `/` so path joining is exact. A
+    /// `None` (or empty) URL leaves the sweep routes returning HTTP 501.
+    pub fn with_patch_sidecar_url(mut self, base_url: Option<String>) -> Self {
+        self.patch_sidecar = base_url.filter(|url| !url.is_empty()).map(|url| PatchSidecar {
+            base_url: url.trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        });
+        self
+    }
+
+    /// The configured patch sidecar reverse-proxy target, if any.
+    pub(crate) fn patch_sidecar(&self) -> Option<&PatchSidecar> {
+        self.patch_sidecar.as_ref()
     }
 
     /// Set HTTP/API-server behavior switches.
@@ -121,6 +178,24 @@ impl AppState {
 
     pub(crate) fn api_key_hashes(&self) -> &[ApiKeyHash] {
         &self.api_key_hashes
+    }
+
+    /// Configure the steering API keys gating mutating steering endpoints.
+    pub fn with_steering_api_keys(mut self, keys: Vec<String>) -> Self {
+        self.steering_api_key_hashes = keys
+            .into_iter()
+            .filter(|key| !key.is_empty())
+            .map(|key| hash_api_key(&key))
+            .collect();
+        self
+    }
+
+    pub(crate) fn has_steering_api_keys(&self) -> bool {
+        !self.steering_api_key_hashes.is_empty()
+    }
+
+    pub(crate) fn steering_api_key_hashes(&self) -> &[ApiKeyHash] {
+        &self.steering_api_key_hashes
     }
 
     /// Seed the set of steering modules registered with the engine workers.

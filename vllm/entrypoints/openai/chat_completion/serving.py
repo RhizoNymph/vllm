@@ -4,7 +4,7 @@
 import asyncio
 import io
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -179,6 +179,24 @@ def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
         for modality, ranges in (mm_placeholders or {}).items()
         if ranges
     }
+
+
+def _messages_have_multimodal(messages) -> bool:
+    """True if any message carries a non-text content part (image/audio/...).
+
+    Used to reject patch+multimodal BEFORE chat rendering: rendering registers
+    each image in the frontend's multimodal sender cache, so rejecting after
+    it leaves the cache claiming the engine holds items it never received —
+    poisoning later requests that reuse the same image.
+    """
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") != "text":
+                return True
+    return False
 
 
 def _make_prompt_tokens_details(
@@ -367,6 +385,20 @@ class OpenAIServingChat(OpenAIServing):
                 request.tools,
                 chat_template_kwargs=chat_template_kwargs,
             )
+        # Patch + multimodal is rejected BEFORE rendering (see
+        # _messages_have_multimodal for why after is too late); the
+        # placeholder-count check in _admit_patch stays as a backstop.
+        if getattr(request, "patch", None) and _messages_have_multimodal(
+            request.messages
+        ):
+            return self.create_error_response(
+                "activation patching is not supported with multimodal "
+                "prompts (positions include image placeholder tokens); "
+                "use a text-only prompt",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="patch",
+            )
+
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -490,6 +522,35 @@ class OpenAIServingChat(OpenAIServing):
                 )
                 if error_response is not None:
                     return error_response
+
+            if isinstance(sampling_params, SamplingParams) and sampling_params.patch:
+                from vllm.v1.capture.patch_admission import (
+                    make_named_module_existence,
+                )
+
+                error_response = self._admit_patch(
+                    sampling_params=sampling_params,
+                    engine_input=engine_input,
+                    request_id=sub_request_id,
+                    named_module_exists=make_named_module_existence(raw_request),
+                )
+                if error_response is not None:
+                    return error_response
+                # Reject (HTTP 400) if a referenced patch source run/site does
+                # not exist, instead of silently completing unpatched.
+                from vllm.v1.capture.patch_admission import (
+                    PatchValidationError,
+                    validate_patch_sources,
+                )
+
+                try:
+                    await validate_patch_sources(self.engine_client, sampling_params)
+                except PatchValidationError as exc:
+                    return self.create_error_response(
+                        str(exc),
+                        status_code=HTTPStatus.BAD_REQUEST,
+                        param="patch",
+                    )
 
             self._log_inputs(
                 sub_request_id,
@@ -626,6 +687,61 @@ class OpenAIServingChat(OpenAIServing):
                 str(exc),
                 status_code=HTTPStatus.BAD_REQUEST,
                 param=getattr(exc, "capture_param", "capture"),
+            )
+        return None
+
+    def _admit_patch(
+        self,
+        *,
+        sampling_params: SamplingParams,
+        engine_input: EngineInput,
+        request_id: str,
+        named_module_exists: Callable[[str], bool] | None = None,
+    ) -> ErrorResponse | None:
+        """Validate the patch spec and stamp prefix-cache flags."""
+        from vllm.v1.capture.patch_admission import (
+            PatchValidationError,
+            resolve_patch_prefix_flags,
+        )
+
+        if not sampling_params.patch:
+            return None
+        # Multimodal prompts are unsupported: prompt positions include image
+        # placeholder tokens, so patch positions would target placeholder
+        # activations — semantically undefined and unvalidated. Fail loud.
+        if _get_mm_token_counts(engine_input):
+            return self.create_error_response(
+                "activation patching is not supported with multimodal "
+                "prompts (positions include image placeholder tokens); "
+                "use a text-only prompt",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="patch",
+            )
+        try:
+            num_prompt_tokens = self._extract_prompt_len(engine_input)
+            ctx = build_capture_context(
+                self.engine_client.vllm_config, num_prompt_tokens, request_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            return self.create_error_response(
+                f"patch: failed to read request shape: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="patch",
+            )
+        patch_config = getattr(self.engine_client.vllm_config, "patch_config", None)
+        max_patch_slots = (
+            getattr(patch_config, "max_patch_slots", 0) if patch_config else 0
+        )
+        try:
+            resolve_patch_prefix_flags(
+                sampling_params,
+                ctx,
+                max_patch_slots=max_patch_slots,
+                named_module_exists=named_module_exists,
+            )
+        except PatchValidationError as exc:
+            return self.create_error_response(
+                str(exc), status_code=HTTPStatus.BAD_REQUEST, param="patch"
             )
         return None
 

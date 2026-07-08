@@ -107,6 +107,8 @@ pub fn lower_sampling_params(
         decode_steering_vectors,
         steering_name,
         capture,
+        patch,
+        patch_vectors,
     } = sampling_params;
 
     validate_logprobs(
@@ -177,6 +179,8 @@ pub fn lower_sampling_params(
         // forwarded as `(name, 1.0)`; the worker applies the request scale.
         steering_module_ref: steering_name.map(|name| (name, 1.0)),
         capture,
+        patch,
+        patch_vectors,
     };
     validate_vocab_range(&params, &sampling_limits)?;
     Ok(params)
@@ -426,6 +430,8 @@ mod tests {
                 decode_steering_vectors: None,
                 steering_module_ref: None,
                 capture: None,
+                patch: None,
+                patch_vectors: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -478,6 +484,8 @@ mod tests {
                 decode_steering_vectors: None,
                 steering_module_ref: None,
                 capture: None,
+                patch: None,
+                patch_vectors: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -617,6 +625,8 @@ mod tests {
                 decode_steering_vectors: None,
                 steering_module_ref: None,
                 capture: None,
+                patch: None,
+                patch_vectors: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -687,6 +697,8 @@ mod tests {
                 decode_steering_vectors: None,
                 steering_module_ref: None,
                 capture: None,
+                patch: None,
+                patch_vectors: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -750,6 +762,8 @@ mod tests {
                 decode_steering_vectors: None,
                 steering_module_ref: None,
                 capture: None,
+                patch: None,
+                patch_vectors: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -987,6 +1001,8 @@ mod tests {
                 decode_steering_vectors: None,
                 steering_module_ref: None,
                 capture: None,
+                patch: None,
+                patch_vectors: None,
             }
         "#]]
         .assert_debug_eq(&params);
