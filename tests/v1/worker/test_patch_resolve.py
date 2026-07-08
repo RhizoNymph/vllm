@@ -68,6 +68,7 @@ class TestModuleSource:
                 }
             ],
             module_registry=reg,
+            hidden_size=3,
         )
         assert len(entries) == 1
         assert torch.allclose(entries[0].source, torch.tensor([1.0, 2.0, 3.0]))
@@ -87,8 +88,47 @@ class TestModuleSource:
                 }
             ],
             module_registry=reg,
+            hidden_size=2,
         )
         assert torch.allclose(entries[0].source, torch.tensor([3.0, 6.0]))
+
+    def test_wrong_width_module_row_records_failure_and_skips(self):
+        # Registration validates finiteness but not length, so a wrong-width
+        # row reaches resolution — it must loud-skip, not shape-crash staging.
+        reg = {"m": ({"post_block": {2: [1.0, 2.0, 3.0]}}, None, None)}
+        entries = _resolve(
+            [
+                {
+                    "layer": 2,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_module": "m",
+                }
+            ],
+            module_registry=reg,
+            hidden_size=8,
+        )
+        assert entries == []
+        failures = pop_resolution_failures()
+        assert failures and "width 3 != hook width 8" in failures["r0"][0]
+
+    def test_wrong_width_inline_table_records_failure_and_skips(self):
+        table = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
+        entries = _resolve(
+            [
+                {
+                    "layer": 2,
+                    "hook": "post_block",
+                    "dest_position": 0,
+                    "source_inline": 0,
+                }
+            ],
+            hidden_size=8,
+            patch_vectors=_pack(table, "float32"),
+        )
+        assert entries == []
+        failures = pop_resolution_failures()
+        assert failures and "width 3 != hook width 8" in failures["r0"][0]
 
     def test_unknown_module_records_failure_and_skips(self):
         entries = _resolve(
@@ -179,6 +219,7 @@ class TestMaskFolding:
                 }
             ],
             module_registry=reg,
+            hidden_size=4,
         )
         assert torch.allclose(entries[0].alpha_row, torch.tensor([1.0, 0.0, 1.0, 0.0]))
 
@@ -196,6 +237,7 @@ class TestMaskFolding:
                 }
             ],
             module_registry=reg,
+            hidden_size=3,
         )
         assert torch.allclose(entries[0].alpha_row, torch.tensor([0.0, 0.5, 0.0]))
 

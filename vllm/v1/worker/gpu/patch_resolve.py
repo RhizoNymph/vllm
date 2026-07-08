@@ -185,6 +185,15 @@ def _resolve_source_row(
                 f"source_module {name!r} has no vectors row at hook={hook} "
                 f"layer={layer} (unregistered or missing site)"
             )
+        # Registration validates finiteness/types but NOT length (steering
+        # tolerates per-hook widths under mHC), so a wrong-width row reaches
+        # this point — reject it here rather than shape-crashing the worker
+        # step at buffer staging.
+        if hidden_size is not None and int(row.shape[0]) != int(hidden_size):
+            return None, (
+                f"source_module {name!r} row at hook={hook} layer={layer} "
+                f"has width {int(row.shape[0])} != hook width {hidden_size}"
+            )
         return row, None
     if e.get("source_inline") is not None:
         if decoded is None:
@@ -194,6 +203,11 @@ def _resolve_source_row(
             return None, (
                 f"source_inline index {idx} out of range "
                 f"[0, {decoded.shape[0]})"
+            )
+        if hidden_size is not None and int(decoded.shape[1]) != int(hidden_size):
+            return None, (
+                f"patch_vectors width {int(decoded.shape[1])} != hook width "
+                f"{hidden_size}"
             )
         return decoded[idx].clone(), None
     return None, "entry has no source kind (need source_run/module/inline)"
