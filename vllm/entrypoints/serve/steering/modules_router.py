@@ -6,9 +6,11 @@ from http import HTTPStatus
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-import vllm.envs as envs
 from vllm.config.steering_types import coerce_steering_spec
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.serve.steering.api_router import (
+    _authorize_steering_mutation,
+)
 from vllm.entrypoints.serve.steering.modules_protocol import (
     RegisterSteeringModuleRequest,
     UnregisterSteeringModuleRequest,
@@ -104,6 +106,8 @@ async def register_steering_module(
     raw_request: Request,
 ) -> JSONResponse:
     """Register a named steering vector configuration."""
+    if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
+        return unauthorized
     registry = _get_registry(raw_request)
     if registry is None:
         return JSONResponse(
@@ -185,6 +189,8 @@ async def unregister_steering_module(
     raw_request: Request,
 ) -> JSONResponse:
     """Remove a named steering vector configuration."""
+    if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
+        return unauthorized
     registry = _get_registry(raw_request)
     if registry is None:
         return JSONResponse(
@@ -244,6 +250,4 @@ async def list_steering_modules(raw_request: Request) -> JSONResponse:
 
 
 def attach_router(app: FastAPI):
-    if not envs.VLLM_SERVER_DEV_MODE:
-        return
     app.include_router(router)

@@ -116,14 +116,18 @@ layer's forward path. Unused hook points are zero-valued no-ops.
 
 ## Global Steering API
 
-Global steering endpoints require `VLLM_SERVER_DEV_MODE=1`.
+Global steering endpoints are mounted whenever the server runs (they answer
+with a clear error when `--enable-steering` is not set). Mutation endpoints
+should be protected with a steering API key on any shared deployment.
 
 ### Gating Mutation Endpoints Behind a Steering API Key
 
-`POST /v1/steering/set` and `POST /v1/steering/clear` can optionally be
-gated behind a dedicated steering API key, separate from the server-wide
-`--api-key`.  This lets operators issue a narrower credential for
-mutating global steering state without handing out the main server key.
+Mutating steering endpoints (`POST /v1/steering/set`, `POST
+/v1/steering/clear`, `POST /v1/steering/modules/register`, `POST
+/v1/steering/modules/unregister`) can optionally be gated behind a
+dedicated steering API key, separate from the server-wide `--api-key`.
+This lets operators issue a narrower credential for mutating steering
+state without handing out the main server key.
 
 Configure it with either the CLI flag or the env var:
 
@@ -141,14 +145,14 @@ vllm serve google/gemma-3-4b-it \
   --steering-api-key primary-key --steering-api-key rotation-key
 ```
 
-When configured, requests to `/v1/steering/set` and `/v1/steering/clear`
-must include an `Authorization: Bearer <key>` header; anything else
-returns `401 Unauthorized` without dispatching the mutation.  This check
+When configured, requests to the mutation endpoints must include an
+`Authorization: Bearer <key>` header; anything else returns
+`401 Unauthorized` without dispatching the mutation.  This check
 is additive with the server-wide `--api-key` middleware: if both are
 set, requests must satisfy both.
 
-Read-only `GET /v1/steering` and the `/v1/steering/modules/*` endpoints
-are **not** gated by this key.
+Read-only endpoints (`GET /v1/steering`, `GET /v1/steering/layers`,
+`GET /v1/steering/modules`) are **not** gated by this key.
 
 ### Set Steering
 
@@ -370,7 +374,9 @@ startup cost:
 
 ### Registering at Runtime (API)
 
-Runtime management endpoints require `VLLM_SERVER_DEV_MODE=1`.
+Runtime registration is a steering *mutation*: when `--steering-api-key` /
+`VLLM_STEERING_API_KEY` is configured, these requests need the
+`Authorization: Bearer <key>` header.
 
 ```bash
 # Register a module (legacy JSON form)
@@ -513,9 +519,10 @@ as long as the model has been wired correctly.
 
 - See [Supported Scope](#supported-scope) for the list of wired decoder
   architectures
-- Global HTTP endpoints are gated behind `VLLM_SERVER_DEV_MODE=1`
-- `POST /v1/steering/set` and `POST /v1/steering/clear` can additionally
-  be gated behind `--steering-api-key` / `VLLM_STEERING_API_KEY`
+- Mutating HTTP endpoints (`/v1/steering/set`, `/v1/steering/clear`,
+  `/v1/steering/modules/register`, `/v1/steering/modules/unregister`) can
+  be gated behind `--steering-api-key` / `VLLM_STEERING_API_KEY`; protect
+  them on any shared deployment
 - Per-request steering requires `--enable-steering`
 - Distinct steering configs in flight are capped by `--max-steering-configs`
 
