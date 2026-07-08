@@ -40,7 +40,10 @@ fn requires_auth(path: &str) -> bool {
     GUARDED_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
 }
 
-fn verify_token(authorization: Option<&HeaderValue>, api_key_hashes: &[ApiKeyHash]) -> bool {
+pub(crate) fn verify_token(
+    authorization: Option<&HeaderValue>,
+    api_key_hashes: &[ApiKeyHash],
+) -> bool {
     let Some(authorization) = authorization else {
         return false;
     };

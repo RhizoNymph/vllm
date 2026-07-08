@@ -151,6 +151,11 @@ When configured, requests to the mutation endpoints must include an
 is additive with the server-wide `--api-key` middleware: if both are
 set, requests must satisfy both.
 
+The Rust frontend honors the same key for its steering-module routes
+(`POST /v1/steering/modules`, `DELETE /v1/steering/modules/{name}`) —
+`--steering-api-key` is forwarded to the Rust process, and
+`VLLM_STEERING_API_KEY` works there too.
+
 Read-only endpoints (`GET /v1/steering`, `GET /v1/steering/layers`,
 `GET /v1/steering/modules`) are **not** gated by this key.
 

@@ -10,12 +10,29 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use axum::http::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ApiError;
+use crate::middleware;
 use crate::state::AppState;
 use crate::steering_modules::{self, SteeringModuleBroadcast};
+
+/// Reject a mutation when steering API keys are configured and the request's
+/// bearer token doesn't match — mirroring the Python frontend's
+/// `--steering-api-key` gate. No keys configured means unauthenticated.
+fn authorize_steering_mutation(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if state.has_steering_api_keys()
+        && !middleware::verify_token(headers.get(AUTHORIZATION), state.steering_api_key_hashes())
+    {
+        return Err(ApiError::unauthorized(
+            "steering API key required".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Request body for `POST /v1/steering/modules`.
 #[derive(Debug, Deserialize)]
@@ -50,8 +67,10 @@ pub async fn list_steering_modules(
 /// re-broadcast the registry to the engine workers.
 pub async fn register_steering_modules(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<RegisterModulesRequest>, JsonRejection>,
 ) -> Result<Json<SteeringModulesResponse>, ApiError> {
+    authorize_steering_mutation(&state, &headers)?;
     let Json(body) = body.map_err(|error| ApiError::json_parse_error(error.body_text()))?;
     if body.modules.is_empty() {
         return Err(ApiError::invalid_request(
@@ -99,7 +118,9 @@ pub async fn register_steering_modules(
 pub async fn unregister_steering_module(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<SteeringModulesResponse>, ApiError> {
+    authorize_steering_mutation(&state, &headers)?;
     let _guard = state.lock_steering_mutations().await;
     if !state.is_steering_module_registered(&name) {
         return Err(ApiError::invalid_request(

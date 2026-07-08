@@ -155,6 +155,12 @@ pub struct Config {
     #[serde(skip_serializing)]
     #[educe(Debug(method(fmt_redacted_api_keys)))]
     pub api_keys: Vec<String>,
+    /// Steering API keys gating mutating steering endpoints (module
+    /// register/unregister). Empty means unauthenticated, mirroring the
+    /// Python frontend's `--steering-api-key`.
+    #[serde(default, skip_serializing)]
+    #[educe(Debug(method(fmt_redacted_api_keys)))]
+    pub steering_api_keys: Vec<String>,
     /// When `true`, suppress periodic stats logging (throughput, queue depth,
     /// cache usage).
     pub disable_log_stats: bool,

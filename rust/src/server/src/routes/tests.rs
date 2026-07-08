@@ -891,6 +891,16 @@ async fn test_admin_app_with_engine_script<F>(script: F) -> (axum::Router, MockE
 where
     F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
 {
+    test_admin_app_with_engine_script_and_steering_keys(script, Vec::new()).await
+}
+
+async fn test_admin_app_with_engine_script_and_steering_keys<F>(
+    script: F,
+    steering_api_keys: Vec<String>,
+) -> (axum::Router, MockEngineTask)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let engine_id = b"engine-openai-admin".to_vec();
@@ -915,10 +925,10 @@ where
     let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
     (
         build_router_with_dev_mode_and_lora(
-            Arc::new(AppState::new(
-                vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
-                chat,
-            )),
+            Arc::new(
+                AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat)
+                    .with_steering_api_keys(steering_api_keys),
+            ),
             true,
             true,
         ),
@@ -4763,6 +4773,131 @@ async fn steering_modules_delete_unknown_returns_bad_request() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn steering_modules_mutations_require_key_when_configured() {
+    // All requests here are rejected (or read-only) before any engine
+    // round-trip, so the mock engine script does nothing.
+    let (app, engine_task) = test_admin_app_with_engine_script_and_steering_keys(
+        |_dealer, _push| boxed_test_future(async move {}),
+        vec!["sekrit".to_string()],
+    )
+    .await;
+
+    let register_body = r#"{"modules":{"m":{"vectors":{"post_block":{"14":[0.1,0.2]}}}}}"#;
+
+    // Register without a key -> 401.
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/steering/modules")
+                .header("content-type", "application/json")
+                .body(Body::from(register_body))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // Register with the wrong bearer token -> 401.
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/steering/modules")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer wrong")
+                .body(Body::from(register_body))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // Unregister without a key -> 401 (auth precedes the unknown-name check).
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/steering/modules/anything")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // The read route stays open.
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/steering/modules")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn steering_modules_register_with_key_succeeds() {
+    let (app, engine_task) = test_admin_app_with_engine_script_and_steering_keys(
+        |dealer, push| {
+            boxed_test_future(async move {
+                // register_steering_modules broadcast.
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                let call_id = array[1].as_u64().expect("call id");
+                send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+
+                // pre_materialize_steering_module follow-up.
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                let call_id = array[1].as_u64().expect("call id");
+                send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+            })
+        },
+        vec!["sekrit".to_string()],
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/steering/modules")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sekrit")
+                .body(Body::from(
+                    r#"{"modules":{"m":{"vectors":{"post_block":{"14":[0.1,0.2]}}}}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({ "modules": ["m"] })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
