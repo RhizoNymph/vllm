@@ -120,7 +120,14 @@ def _load_entry_points() -> dict[str, type[CaptureConsumer]]:
 
 def _builtin_consumers() -> dict[str, type[CaptureConsumer]]:
     """vLLM's in-tree consumers, registered under reserved (leading-underscore)
-    names independent of the entry-point/dist-info state."""
+    names independent of the entry-point/dist-info state.
+
+    ``--enable-patching`` relies on the ``patch_source`` consumer being
+    resolvable at init. Under a Ray runtime_env (or any editable install
+    whose dist-info entry points predate the consumer) the entry-point
+    lookup can miss, raising ``UnknownCaptureConsumerError``. Registering
+    these here as built-in fallbacks makes them survive stale dist-info.
+    """
     from vllm.v1.capture.consumers.patch_source import PatchSourceConsumer
     from vllm.v1.capture.declarative import DeclarativeSteeringConsumer
 
