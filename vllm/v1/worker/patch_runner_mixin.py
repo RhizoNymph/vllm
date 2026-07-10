@@ -205,30 +205,44 @@ class PatchModelRunnerMixin:
             self._patch_max_slots = 0
             return
 
-        # Install the per-worker patch source store (clean-run activations).
-        # Lives wherever this rank's capture manager writes (TP rank 0 /
-        # each PP rank); resolution reads it, broadcasting to TP peers.
-        from vllm.model_executor.layers.patch import get_patch_source_cache_bytes
-        from vllm.v1.capture.source_store import (
-            PatchSourceStore,
-            get_active_patch_source_store,
-            set_active_patch_source_store,
-        )
-
-        source_budget = get_patch_source_cache_bytes(self.vllm_config)
-        if source_budget > 0 and get_active_patch_source_store() is None:
-            set_active_patch_source_store(PatchSourceStore(max_bytes=source_budget))
-            logger.info(
-                "Patch source store enabled: budget=%.3f GB",
-                source_budget / 1_000_000_000,
-            )
-
+        # Patch-table geometry (also feeds the source-store auto-sizing below).
         sample = next(iter(patchable.values()))
         a_table = getattr(sample, PATCH_TABLE_ATTR[SteeringHookPoint.POST_BLOCK])
         self._patch_max_slots = int(a_table.shape[0])
         table_device = a_table.device
         table_dtype = a_table.dtype
         hidden_size = int(a_table.shape[1])
+
+        # Install the per-worker patch source store (clean-run activations).
+        # Lives wherever this rank's capture manager writes (TP rank 0 /
+        # each PP rank); resolution reads it, broadcasting to TP peers. The
+        # budget auto-sizes from the model (``-1``, the default) so enabling
+        # patching provisions the store; ``0`` disables it.
+        from vllm.model_executor.layers.patch import (
+            get_patch_source_cache_bytes,
+            resolve_patch_source_cache_bytes,
+        )
+        from vllm.v1.capture.source_store import (
+            PatchSourceStore,
+            get_active_patch_source_store,
+            set_active_patch_source_store,
+        )
+
+        source_budget = resolve_patch_source_cache_bytes(
+            self.vllm_config,
+            hidden_size=hidden_size,
+            num_patch_layers=len(patchable),
+            num_hooks=len(PATCH_TABLE_ATTR),
+            dtype=table_dtype,
+        )
+        if source_budget > 0 and get_active_patch_source_store() is None:
+            set_active_patch_source_store(PatchSourceStore(max_bytes=source_budget))
+            auto = get_patch_source_cache_bytes(self.vllm_config) < 0
+            logger.info(
+                "Patch source store enabled: budget=%.3f GB%s",
+                source_budget / 1_000_000_000,
+                " (auto-sized from model)" if auto else "",
+            )
 
         if table_device.type == "cuda":
             from vllm.model_executor.layers.patch_kernel import (

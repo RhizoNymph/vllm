@@ -18,10 +18,13 @@ class PatchConfig:
     the scheduler reserves capacity and a breach is a loud error, never a silent
     drop. Slot 0 is the passthrough sentinel, so the usable count is one less."""
 
-    patch_source_cache_bytes: int = Field(default=0, ge=0)
-    """Byte budget for the clean-run source store (CPU). ``0`` disables it.
-    Sources are referenced by run handle across a sweep, so size this to hold at
-    least one full clean run's captured activations. Evicted whole-run (LRU)."""
+    patch_source_cache_bytes: int = Field(default=-1, ge=-1)
+    """Byte budget for the clean-run source store (CPU). ``-1`` (the default)
+    auto-sizes the store to hold ~one full clean run's captured activations —
+    derived from the model's hidden size, patched layers, injectable hooks, and
+    prompt length — so enabling patching provisions the store automatically.
+    ``0`` disables it. A positive value sets an explicit budget. Sources are
+    referenced by run handle across a sweep; evicted whole-run (LRU)."""
 
     @property
     def usable_slots(self) -> int:
