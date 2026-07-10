@@ -252,6 +252,7 @@ async def _generate_pane(
     thinking_enabled = "chat_template_kwargs" not in payload
     channel = "think" if thinking_enabled else "answer"
     carry = ""
+    parser_active = False  # server-side reasoning parser detected
     try:
         async with httpx.AsyncClient(timeout=900) as client:
             async with client.stream(
@@ -273,11 +274,20 @@ async def _generate_pane(
                     data = line[6:]
                     if data.strip() == "[DONE]":
                         break
-                    delta = (
-                        json.loads(data)["choices"][0].get("delta", {}).get("content")
-                    )
+                    d = json.loads(data)["choices"][0].get("delta", {})
+                    rc = d.get("reasoning_content")
+                    if rc:
+                        # server-side reasoning parser (--reasoning-parser):
+                        # thinking arrives pre-segmented; content = answer
+                        parser_active = True
+                        await put({"type": "token", "pane": pane,
+                                   "channel": "think", "text": rc})
+                        continue
+                    delta = d.get("content")
                     if not delta:
                         continue
+                    if parser_active:
+                        channel = "answer"
                     buf = carry + delta
                     carry = ""
                     while buf:

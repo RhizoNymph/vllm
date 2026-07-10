@@ -32,6 +32,8 @@ VENV_DIR="${VENV_DIR:-/mnt/data/artifacts/jlens/vllm-env}"
 PORT="${PORT:-8000}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 QUANTIZATION="${QUANTIZATION:-fp8}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+REASONING_PARSER="${REASONING_PARSER:-glm45}"
 CAPTURE_ROOT="${CAPTURE_ROOT:-/mnt/data/artifacts/jlens/vllm_capture}"
 # lens capture layers: stride-4 depth sweep + final (must match the jlens
 # consumer and the sidecar's JLENS_CAPTURE_LAYERS)
@@ -81,6 +83,8 @@ exec vllm serve "${MODEL}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --port "${PORT}" \
   --enable-steering \
+  --kv-cache-dtype "${KV_CACHE_DTYPE}" \
+  --reasoning-parser "${REASONING_PARSER}" \
   --capture-consumers "filesystem:root=${CAPTURE_ROOT}" \
   --capture-consumers "jlens:lens=${JLENS_LENS:-/mnt/data/artifacts/jlens/glm52_fit_1k/lens_glm52_1k.pt},unembed=${JLENS_UNEMBED:-/mnt/data/artifacts/jlens/glm52_unembed.pt},layers=${JLENS_LAYERS},topk=8,out=${JLENS_READOUT:-/mnt/data/artifacts/jlens/readout},device=cuda:0" \
   "${GRAPHSAFE_ARGS[@]}" \
