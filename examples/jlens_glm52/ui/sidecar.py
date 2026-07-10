@@ -1,0 +1,241 @@
+"""Web UI sidecar for the live Jacobian-lens demo.
+
+Serves a single-page interface (static/index.html) and one SSE endpoint that,
+per generation request:
+
+  1. optionally derives a steering direction for an arbitrary word from the
+     lens (J^T readout direction, residual-norm scaled) and packs it into the
+     fork's wire format;
+  2. proxies the chat request to the vllm server with the jlens capture
+     consumer armed (and the steering vectors attached);
+  3. tails the consumer's JSONL readout stream and relays token + readout
+     events over one SSE stream. With steering set, a baseline pass runs
+     first for side-by-side comparison.
+
+Run (in the serving venv, anywhere that sees /mnt/data):
+    python sidecar.py --port 7860
+Then expose:  tunnel-url 7860 -t 24
+
+Single-demo-user assumptions (documented, not enforced): readout files are
+matched by creation time, so concurrent generations may cross streams.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import glob
+import json
+import os
+import time
+
+import httpx
+import numpy as np
+import torch
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, StreamingResponse
+
+RUN_INFO = os.environ.get("JLENS_RUN_INFO", "/mnt/data/artifacts/jlens/serve/current.json")
+READOUT_DIR = os.environ.get("JLENS_READOUT_DIR", "/mnt/data/artifacts/jlens/readout")
+LENS_PATH = os.environ.get("JLENS_LENS", "/mnt/data/artifacts/jlens/glm52_fit_1k/lens_glm52_1k.pt")
+UNEMBED_PATH = os.environ.get("JLENS_UNEMBED", "/mnt/data/artifacts/jlens/glm52_unembed.pt")
+NORMS_PATH = os.environ.get("JLENS_NORMS", "/mnt/data/artifacts/jlens/glm52_norms/residual_norms.pt")
+BAND = [30, 40, 50]
+
+app = FastAPI(title="jlens live demo")
+_static = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+class Lens:
+    """Band J + unembed + norms; steering-direction derivation."""
+
+    def __init__(self) -> None:
+        bundle = torch.load(LENS_PATH, map_location="cpu", weights_only=True)
+        self.J = {l: bundle["J"][l].float() for l in BAND}
+        del bundle
+        u = torch.load(UNEMBED_PATH, map_location="cpu", weights_only=True)
+        self.norm_w = u["norm_weight"].float()
+        self.lm_head = u["lm_head_weight"].float()
+        del u
+        self.norms = torch.load(NORMS_PATH, map_location="cpu", weights_only=True)[
+            "mean_residual_norm"
+        ]
+        from transformers import AutoTokenizer
+
+        self.tok = AutoTokenizer.from_pretrained(
+            "/mnt/data/artifacts/GLM-5.2", trust_remote_code=True
+        )
+
+    def steering_spec(self, word: str, strength: float, layers: list[int]) -> dict:
+        token_id = self.tok(word, add_special_tokens=False).input_ids[0]
+        rows, scales = [], []
+        for layer in layers:
+            w = self.norm_w * self.lm_head[token_id]
+            d = w @ self.J[layer]
+            d = d / d.norm() * self.norms[layer]
+            rows.append(d.numpy().astype("<f4"))
+            scales.append(strength)
+        mat = np.ascontiguousarray(np.stack(rows))
+        return {
+            "post_block": {
+                "dtype": "float32",
+                "shape": list(mat.shape),
+                "layer_indices": layers,
+                "data": base64.b64encode(mat.tobytes()).decode(),
+                "scales": scales,
+            }
+        }
+
+
+LENS = Lens()
+
+
+def _server_base() -> str:
+    info = json.load(open(RUN_INFO))
+    return f"http://{info['host']}:{info['port']}"
+
+
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+async def _tail_readout(started: float, queue: asyncio.Queue, stop: asyncio.Event) -> None:
+    """Find the readout JSONL created after `started` and stream its lines."""
+    # Keep looking for a short grace period after the pane finishes: on NFS
+    # the file may become visible to other nodes late (run the sidecar on the
+    # same node as the vllm server to avoid the lag entirely).
+    path = None
+    while path is None:
+        candidates = [
+            f for f in glob.glob(os.path.join(READOUT_DIR, "*.jsonl"))
+            if os.path.getmtime(f) >= started - 0.5
+        ]
+        if candidates:
+            path = max(candidates, key=os.path.getmtime)
+        elif stop.is_set() and time.time() - started > 15:
+            return
+        else:
+            await asyncio.sleep(0.15)
+    pos = 0
+    idle = 0.0
+    while idle < 10.0:
+        with open(path, encoding="utf-8") as f:
+            f.seek(pos)
+            new = f.read()
+            pos = f.tell()
+        if new:
+            idle = 0.0
+            for line in new.splitlines():
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("event") == "done":
+                    return
+                await queue.put({"type": "readout", **rec})
+        else:
+            if stop.is_set():
+                idle += 0.25
+            await asyncio.sleep(0.25)
+
+
+async def _generate_pane(
+    pane: str, payload: dict, queue: asyncio.Queue, with_readout: bool
+) -> None:
+    started = time.time()
+    stop = asyncio.Event()
+    tail = asyncio.create_task(_tail_readout(started, queue, stop)) if with_readout else None
+    try:
+        async with httpx.AsyncClient(timeout=900) as client:
+            async with client.stream(
+                "POST", f"{_server_base()}/v1/chat/completions", json=payload
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data.strip() == "[DONE]":
+                        break
+                    delta = (
+                        json.loads(data)["choices"][0].get("delta", {}).get("content")
+                    )
+                    if delta:
+                        await queue.put({"type": "token", "pane": pane, "text": delta})
+    finally:
+        stop.set()
+        if tail:
+            await tail
+        await queue.put({"type": "pane_done", "pane": pane})
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    return FileResponse(os.path.join(_static, "index.html"))
+
+
+@app.get("/api/info")
+async def info() -> dict:
+    return {"band": BAND, "server": _server_base(), "model": "GLM-5.2 (fp8, TP8)",
+            "lens": os.path.basename(LENS_PATH)}
+
+
+@app.post("/api/generate")
+async def generate(body: dict) -> StreamingResponse:
+    prompt = body.get("prompt", "").strip() or "Tell me about your weekend plans."
+    max_tokens = min(int(body.get("max_tokens", 96)), 256)
+    steer = body.get("steer")  # {word, strength, layers} | None
+
+    def payload(steered: bool) -> dict:
+        p = {
+            "model": "glm-5.2",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "seed": 0,
+            "stream": True,
+            "capture": {
+                "jlens": {"hooks": {"post_block": BAND}, "positions": "all_generated"}
+            },
+        }
+        if steered and steer:
+            spec = LENS.steering_spec(
+                str(steer["word"]),
+                float(steer["strength"]),
+                [int(l) for l in steer.get("layers", [40])],
+            )
+            p["decode_steering_vectors"] = spec
+        return p
+
+    async def stream():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def run() -> None:
+            if steer:
+                # readout ticker follows the steered pane
+                await _generate_pane("baseline", payload(False), queue, with_readout=False)
+                await _generate_pane("steered", payload(True), queue, with_readout=True)
+            else:
+                await _generate_pane("baseline", payload(False), queue, with_readout=True)
+            await queue.put({"type": "done"})
+
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                event = await queue.get()
+                yield _sse(event)
+                if event["type"] == "done":
+                    break
+        finally:
+            task.cancel()
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--host", default="0.0.0.0")
+    args = parser.parse_args()
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

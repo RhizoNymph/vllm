@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GLM-5.2 · Jacobian lens console</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #121826; --panel-2: #0e131f;
+    --line: #232c40; --text: #e8eaf2; --muted: #8a93a8; --dim: #5a6378;
+    --amber: #f0a83c; --amber-dim: #7a5a28; --teal: #4fd1c5; --teal-dim: #2a5f5a;
+    --danger: #e0644f;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 var(--sans); min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 14px 22px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font: 600 16px/1 var(--sans); margin: 0; letter-spacing: 0.01em; }
+  header .sub { color: var(--muted); font: 12px var(--mono); }
+  header .dot { color: var(--teal); }
+  main {
+    display: grid; grid-template-columns: 330px 1fr; gap: 18px;
+    padding: 18px 22px; max-width: 1500px;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+  .panel h2 {
+    font: 600 11px var(--sans); text-transform: uppercase; letter-spacing: 0.09em;
+    color: var(--muted); margin: 0; padding: 10px 14px 0;
+  }
+  .panel .body { padding: 10px 14px 14px; display: flex; flex-direction: column; gap: 10px; }
+
+  textarea, input[type=text] {
+    width: 100%; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px;
+    font: 13px var(--mono); resize: vertical;
+  }
+  textarea:focus, input:focus { outline: 1px solid var(--teal-dim); }
+  label.row { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; }
+  .layers { display: flex; gap: 12px; }
+  .layers label { display: flex; gap: 5px; align-items: center; font: 12px var(--mono); color: var(--muted); }
+
+  .slider-row { display: grid; grid-template-columns: 1fr 52px; gap: 10px; align-items: center; }
+  input[type=range] { width: 100%; accent-color: var(--amber); }
+  #strengthVal { font: 13px var(--mono); color: var(--amber); text-align: right;
+                 font-variant-numeric: tabular-nums; }
+  .hint { font-size: 11.5px; color: var(--dim); }
+  .hint.warn { color: var(--danger); }
+
+  button#go {
+    background: var(--amber); color: #14100a; border: 0; border-radius: 4px;
+    padding: 9px 0; font: 600 13.5px var(--sans); cursor: pointer;
+  }
+  button#go:disabled { background: var(--amber-dim); color: #2b2417; cursor: wait; }
+  button#go:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+
+  .panes { display: grid; gap: 14px; }
+  .panes.two { grid-template-columns: 1fr 1fr; }
+  @media (max-width: 1200px) { .panes.two { grid-template-columns: 1fr; } }
+  .pane { min-height: 120px; }
+  .pane h2 .tag { font: 10px var(--mono); border: 1px solid var(--line);
+                  border-radius: 3px; padding: 1px 6px; margin-left: 8px; }
+  .pane.steered h2 { color: var(--amber); }
+  .pane.steered h2 .tag { border-color: var(--amber-dim); }
+  .out {
+    font: 13px/1.65 var(--mono); white-space: pre-wrap; word-break: break-word;
+    padding: 10px 14px 14px; color: var(--text); min-height: 80px;
+  }
+  .out .cursor { color: var(--teal); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .out .cursor { animation: none; } }
+
+  #tickerWrap { grid-column: 1 / -1; }
+  #tickerScroll { overflow-x: auto; }
+  table {
+    border-collapse: collapse; width: 100%; font: 12.5px var(--mono);
+    font-variant-numeric: tabular-nums;
+  }
+  th, td { text-align: left; padding: 3px 12px; border-bottom: 1px solid var(--panel-2); white-space: nowrap; }
+  th { color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+  td.tok { color: var(--text); }
+  td.rd { color: var(--muted); }
+  td.rd.hit { color: var(--teal); font-weight: 600; }
+  td.rd.steerhit { color: var(--amber); font-weight: 600; }
+  #tickerBody tr:last-child td { border-bottom: 0; }
+  .empty { color: var(--dim); padding: 12px 14px; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GLM-5.2 · Jacobian lens console</h1>
+  <span class="sub" id="info">connecting…</span>
+  <span class="sub"><span class="dot">●</span> readout band L30 · L40 · L50</span>
+</header>
+
+<main>
+  <section class="panel" id="controls">
+    <h2>Prompt</h2>
+    <div class="body">
+      <textarea id="prompt" rows="4">Tell me about your weekend plans.</textarea>
+      <label class="row">max tokens
+        <input type="text" id="maxTokens" value="96" style="width:64px">
+      </label>
+    </div>
+    <h2>Steering <span class="hint">(lens-derived direction)</span></h2>
+    <div class="body">
+      <label class="row"><input type="checkbox" id="steerOn"> inject a concept</label>
+      <input type="text" id="steerWord" value=" dog" placeholder=" word (leading space matters)">
+      <div class="slider-row">
+        <input type="range" id="strength" min="0.1" max="1.2" step="0.05" value="0.8">
+        <span id="strengthVal">0.80</span>
+      </div>
+      <div class="hint" id="strengthHint">0.3–0.8 = coherent drift · ≥1.0 = token takeover</div>
+      <div class="layers">
+        inject at:
+        <label><input type="checkbox" class="lyr" value="30"> L30</label>
+        <label><input type="checkbox" class="lyr" value="40" checked> L40</label>
+        <label><input type="checkbox" class="lyr" value="50"> L50</label>
+      </div>
+      <button id="go">Generate</button>
+      <div class="hint">Greedy, seed 0. With steering on, a baseline runs first
+        for comparison; the ticker follows the steered pass.</div>
+    </div>
+  </section>
+
+  <section class="panes" id="panes">
+    <div class="panel pane" id="paneBaseline">
+      <h2>Completion <span class="tag">baseline</span></h2>
+      <div class="out" id="outBaseline"><span class="empty">—</span></div>
+    </div>
+    <div class="panel pane steered" id="paneSteered" hidden>
+      <h2>Completion <span class="tag">steered</span></h2>
+      <div class="out" id="outSteered"><span class="empty">—</span></div>
+    </div>
+  </section>
+
+  <section class="panel" id="tickerWrap">
+    <h2>Live lens readout <span class="hint">top-1 per layer while generating · hover for top-5</span></h2>
+    <div id="tickerScroll">
+      <table>
+        <thead><tr><th>#</th><th>generated</th><th>L30</th><th>L40</th><th>L50</th></tr></thead>
+        <tbody id="tickerBody"><tr><td class="empty" colspan="5">run a generation to see the workspace stream</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const BAND = [30, 40, 50];
+
+fetch("/api/info").then(r => r.json()).then(i => {
+  $("info").textContent = `${i.model} · lens ${i.lens}`;
+}).catch(() => { $("info").textContent = "sidecar unreachable"; });
+
+$("strength").addEventListener("input", () => {
+  const v = parseFloat($("strength").value);
+  $("strengthVal").textContent = v.toFixed(2);
+  $("strengthHint").className = v >= 1.0 ? "hint warn" : "hint";
+  $("strengthHint").textContent = v >= 1.0
+    ? "≥1.0 saturates the stream — expect token takeover"
+    : "0.3–0.8 = coherent drift · ≥1.0 = token takeover";
+});
+
+let rows;      // pos -> {tr, cells: {layer: td}}
+let posOrder;  // sorted positions seen
+let tokens;    // steered/ticker pane token strings in arrival order
+
+function resetUI(steering) {
+  $("paneSteered").hidden = !steering;
+  $("panes").className = steering ? "panes two" : "panes";
+  $("outBaseline").innerHTML = "<span class='cursor'>▌</span>";
+  $("outSteered").innerHTML = steering ? "<span class='cursor'>▌</span>" : "";
+  $("tickerBody").innerHTML = "";
+  rows = new Map(); posOrder = []; tokens = [];
+}
+
+function appendToken(pane, text) {
+  const out = pane === "steered" ? $("outSteered") : $("outBaseline");
+  const cursor = out.querySelector(".cursor");
+  out.insertBefore(document.createTextNode(text), cursor);
+}
+
+function tickerToken(text) {
+  tokens.push(text);
+  renderAlignment();
+}
+
+function readoutEvent(rec) {
+  for (let i = 0; i < rec.pos.length; i++) {
+    const pos = rec.pos[i];
+    if (!rows.has(pos)) {
+      const tr = document.createElement("tr");
+      const idx = document.createElement("td"); idx.className = "rd";
+      const tok = document.createElement("td"); tok.className = "tok";
+      tr.append(idx, tok);
+      const cells = {};
+      for (const layer of BAND) {
+        const td = document.createElement("td"); td.className = "rd"; td.textContent = "·";
+        tr.append(td); cells[layer] = td;
+      }
+      rows.set(pos, { tr, cells, idx, tok });
+      posOrder.push(pos); posOrder.sort((a, b) => a - b);
+      const rank = posOrder.indexOf(pos);
+      const body = $("tickerBody");
+      body.insertBefore(tr, body.children[rank] ?? null);
+    }
+    const row = rows.get(pos);
+    const top = rec.top[i];
+    const td = row.cells[rec.layer];
+    if (td && top) {
+      td.textContent = JSON.stringify(top[0]).slice(1, -1);
+      td.title = top.map(t => JSON.stringify(t)).join("  ");
+      const steerWord = $("steerOn").checked ? $("steerWord").value.trim().toLowerCase() : null;
+      const t0 = top[0].trim().toLowerCase();
+      if (steerWord && t0 === steerWord) td.className = "rd steerhit";
+      else if (tokens.length && t0.length > 1) {
+        // teal when the readout token later appears in the generated text
+        td.className = tokens.join("").toLowerCase().includes(t0) ? "rd hit" : "rd";
+      }
+    }
+  }
+  renderAlignment();
+}
+
+function renderAlignment() {
+  // i-th generated token event aligns with i-th smallest readout position
+  posOrder.forEach((pos, i) => {
+    const row = rows.get(pos);
+    row.idx.textContent = i;
+    if (i < tokens.length) row.tok.textContent = JSON.stringify(tokens[i]).slice(1, -1);
+  });
+  const wrap = $("tickerScroll");
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+$("go").addEventListener("click", async () => {
+  const steering = $("steerOn").checked;
+  const layers = [...document.querySelectorAll(".lyr:checked")].map(c => +c.value);
+  if (steering && !layers.length) { alert("pick at least one injection layer"); return; }
+  resetUI(steering);
+  $("go").disabled = true;
+  try {
+    const resp = await fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt: $("prompt").value,
+        max_tokens: parseInt($("maxTokens").value) || 96,
+        steer: steering ? {
+          word: $("steerWord").value,
+          strength: parseFloat($("strength").value),
+          layers,
+        } : null,
+      }),
+    });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    const tickerPane = steering ? "steered" : "baseline";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split("\n\n"); buf = parts.pop();
+      for (const part of parts) {
+        if (!part.startsWith("data: ")) continue;
+        const ev = JSON.parse(part.slice(6));
+        if (ev.type === "token") {
+          appendToken(ev.pane, ev.text);
+          if (ev.pane === tickerPane) tickerToken(ev.text);
+        } else if (ev.type === "readout") {
+          readoutEvent(ev);
+        } else if (ev.type === "pane_done") {
+          const out = ev.pane === "steered" ? $("outSteered") : $("outBaseline");
+          out.querySelector(".cursor")?.remove();
+        }
+      }
+    }
+  } catch (err) {
+    $("outBaseline").textContent = `error: ${err}`;
+  } finally {
+    $("go").disabled = false;
+  }
+});
+</script>
+</body>
+</html>

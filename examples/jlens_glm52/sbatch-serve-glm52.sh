@@ -59,6 +59,17 @@ QUANT_ARGS=()
 
 export VLLM_SERVER_DEV_MODE=1  # mounts /v1/steering/* inspection endpoints
 source "${VENV_DIR}/bin/activate"
+
+# Optional lens-console UI sidecar (examples/jlens_glm52/ui/) on this node —
+# same node as the jlens consumer so its JSONL stream is visible without NFS
+# attribute-cache lag. Expose with: tunnel-url ${SIDECAR_PORT}
+if [[ "${SIDECAR:-1}" == "1" ]]; then
+  SIDECAR_PORT="${SIDECAR_PORT:-7860}"
+  python "${FORK_DIR}/examples/jlens_glm52/ui/sidecar.py" --port "${SIDECAR_PORT}" \
+    > "$(dirname "${RUN_INFO}")/sidecar-${SLURM_JOB_ID}.log" 2>&1 &
+  echo "[serve] jlens console sidecar on :${SIDECAR_PORT} (pid $!)"
+fi
+
 exec vllm serve "${MODEL}" \
   --served-model-name glm-5.2 \
   --tensor-parallel-size 8 \
