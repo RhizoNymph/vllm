@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-jlens-readout"
+version = "0.1.0"
+description = "Live Jacobian-lens readout capture consumer: streams per-token unembed(J_l @ h) top-k during decode"
+dependencies = ["vllm"]
+
+[project.entry-points."vllm.capture_consumers"]
+jlens = "jlens_readout:JLensReadoutConsumer"
