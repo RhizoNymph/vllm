@@ -68,7 +68,8 @@ source "${VENV_DIR}/bin/activate"
 # attribute-cache lag. Expose with: tunnel-url ${SIDECAR_PORT}
 if [[ "${SIDECAR:-1}" == "1" ]]; then
   SIDECAR_PORT="${SIDECAR_PORT:-7860}"
-  python "${FORK_DIR}/examples/jlens_glm52/ui/sidecar.py" --port "${SIDECAR_PORT}" \
+  JLENS_RUN_INFO="${RUN_INFO}" JLENS_CAPTURE_LAYERS="${JLENS_LAYERS}" \
+    python "${FORK_DIR}/examples/jlens_glm52/ui/sidecar.py" --port "${SIDECAR_PORT}" \
     > "$(dirname "${RUN_INFO}")/sidecar-${SLURM_JOB_ID}.log" 2>&1 &
   echo "[serve] jlens console sidecar on :${SIDECAR_PORT} (pid $!)"
 fi
