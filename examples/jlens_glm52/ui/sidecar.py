@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import base64
 import glob
 import json
@@ -209,11 +210,19 @@ async def _generate_pane(
                 if carry:
                     await queue.put({"type": "token", "pane": pane,
                                      "channel": channel, "text": carry})
+    except asyncio.CancelledError:
+        # client hit Stop / disconnected: closing the httpx stream makes
+        # vllm abort the request server-side; tear the tailer down fast.
+        if tail:
+            tail.cancel()
+        raise
     finally:
         stop.set()
         if tail:
-            await tail
-        await queue.put({"type": "pane_done", "pane": pane})
+            with contextlib.suppress(asyncio.CancelledError):
+                await tail
+        with contextlib.suppress(Exception):
+            await queue.put({"type": "pane_done", "pane": pane})
 
 
 @app.get("/")

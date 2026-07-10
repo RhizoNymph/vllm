@@ -59,7 +59,8 @@
     background: var(--amber); color: #14100a; border: 0; border-radius: 4px;
     padding: 9px 0; font: 600 13.5px var(--sans); cursor: pointer;
   }
-  button#go:disabled { background: var(--amber-dim); color: #2b2417; cursor: wait; }
+  button#go.stop { background: transparent; color: var(--danger);
+                   border: 1px solid var(--danger); }
   button#go:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
 
   .panes { display: grid; gap: 14px; }
@@ -126,15 +127,15 @@
       <label class="row"><input type="checkbox" id="steerOn"> inject a concept</label>
       <input type="text" id="steerWord" value=" dog" placeholder=" word (leading space matters)">
       <div class="slider-row">
-        <input type="range" id="strength" min="0.1" max="1.2" step="0.05" value="0.8">
-        <span id="strengthVal">0.80</span>
+        <input type="range" id="strength" min="0.1" max="1.2" step="0.05" value="0.3">
+        <span id="strengthVal">0.30</span>
       </div>
       <div class="hint" id="strengthHint">0.3–0.8 = coherent drift · ≥1.0 = token takeover</div>
       <div class="layers">
         inject at:
         <label><input type="checkbox" class="lyr" value="30"> L30</label>
         <label><input type="checkbox" class="lyr" value="40" checked> L40</label>
-        <label><input type="checkbox" class="lyr" value="50"> L50</label>
+        <label><input type="checkbox" class="lyr" value="50" checked> L50</label>
       </div>
       <button id="go">Generate</button>
       <div class="hint">Greedy, seed 0. With steering on, a baseline runs first
@@ -181,9 +182,14 @@ $("strength").addEventListener("input", () => {
     : "0.3–0.8 = coherent drift · ≥1.0 = token takeover";
 });
 
-let rows;      // pos -> {tr, cells: {layer: td}}
-let posOrder;  // sorted positions seen
-let tokens;    // steered/ticker pane token strings in arrival order
+// ---- run state (rebuilt per generation; all updates incremental) ----
+let rows;        // pos -> {tr, cells, tok}
+let rowRefs;     // rows in insertion(≈position) order; rowRefs[i] pairs with token i
+let lastPos;     // largest position seen (rows arrive ~ordered)
+let tokenCount;  // generated tokens seen on the ticker pane
+let genTokens;   // Set of trimmed-lowercase generated token strings
+let steerWord;   // cached lowercase steer word for the run ('' = off)
+let scrollQueued;
 
 function resetUI(steering) {
   $("paneSteered").hidden = !steering;
@@ -191,7 +197,16 @@ function resetUI(steering) {
   $("outBaseline").innerHTML = "<span class='cursor'>▌</span>";
   $("outSteered").innerHTML = steering ? "<span class='cursor'>▌</span>" : "";
   $("tickerBody").innerHTML = "";
-  rows = new Map(); posOrder = []; tokens = [];
+  rows = new Map(); rowRefs = []; lastPos = -Infinity;
+  tokenCount = 0; genTokens = new Set(); scrollQueued = false;
+  steerWord = steering ? $("steerWord").value.trim().toLowerCase() : "";
+}
+
+// Append to a single text node per region instead of one node per token.
+function appendText(container, refNode, text) {
+  const prev = refNode ? refNode.previousSibling : container.lastChild;
+  if (prev && prev.nodeType === Node.TEXT_NODE) prev.data += text;
+  else container.insertBefore(document.createTextNode(text), refNode ?? null);
 }
 
 function appendToken(pane, channel, text) {
@@ -206,74 +221,95 @@ function appendToken(pane, channel, text) {
       out.insertBefore(d, cursor);
       think = d.querySelector(".tcontent");
     }
-    think.append(document.createTextNode(text));
+    appendText(think, null, text);
   } else {
-    out.insertBefore(document.createTextNode(text), cursor);
+    appendText(out, cursor, text);
   }
 }
 
+function queueScroll() {
+  if (scrollQueued) return;
+  scrollQueued = true;
+  requestAnimationFrame(() => {
+    scrollQueued = false;
+    const wrap = $("tickerScroll");
+    // don't fight the user if they scrolled up to read
+    if (wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 160) {
+      wrap.scrollTop = wrap.scrollHeight;
+    }
+  });
+}
+
 function tickerToken(text) {
-  tokens.push(text);
-  renderAlignment();
+  genTokens.add(text.trim().toLowerCase());
+  const row = rowRefs[tokenCount];
+  if (row) row.tok.textContent = JSON.stringify(text).slice(1, -1);
+  tokenCount++;
+}
+
+function makeRow(pos) {
+  const tr = document.createElement("tr");
+  const idx = document.createElement("td"); idx.className = "rd";
+  const tok = document.createElement("td"); tok.className = "tok";
+  tr.append(idx, tok);
+  const cells = {};
+  for (const layer of BAND) {
+    const td = document.createElement("td"); td.className = "rd"; td.textContent = "·";
+    tr.append(td); cells[layer] = td;
+  }
+  const row = { tr, cells, tok, pos };
+  rows.set(pos, row);
+  const body = $("tickerBody");
+  if (pos > lastPos) {           // common case: append
+    body.append(tr);
+    rowRefs.push(row);
+    lastPos = pos;
+  } else {                       // rare: out-of-order insert
+    let i = rowRefs.length;
+    while (i > 0 && rowRefs[i - 1].pos > pos) i--;
+    body.insertBefore(tr, rowRefs[i] ? rowRefs[i].tr : null);
+    rowRefs.splice(i, 0, row);
+  }
+  const i = rowRefs.indexOf(row);
+  idx.textContent = i;
+  // token may have already streamed for this slot
+  return row;
 }
 
 function readoutEvent(rec) {
   for (let i = 0; i < rec.pos.length; i++) {
     const pos = rec.pos[i];
-    if (!rows.has(pos)) {
-      const tr = document.createElement("tr");
-      const idx = document.createElement("td"); idx.className = "rd";
-      const tok = document.createElement("td"); tok.className = "tok";
-      tr.append(idx, tok);
-      const cells = {};
-      for (const layer of BAND) {
-        const td = document.createElement("td"); td.className = "rd"; td.textContent = "·";
-        tr.append(td); cells[layer] = td;
-      }
-      rows.set(pos, { tr, cells, idx, tok });
-      posOrder.push(pos); posOrder.sort((a, b) => a - b);
-      const rank = posOrder.indexOf(pos);
-      const body = $("tickerBody");
-      body.insertBefore(tr, body.children[rank] ?? null);
-    }
-    const row = rows.get(pos);
+    const row = rows.get(pos) ?? makeRow(pos);
     const top = rec.top[i];
     const td = row.cells[rec.layer];
     if (td && top) {
-      td.textContent = JSON.stringify(top[0]).slice(1, -1);
+      const t0 = top[0];
+      td.textContent = JSON.stringify(t0).slice(1, -1);
       td.title = top.map(t => JSON.stringify(t)).join("  ");
-      const steerWord = $("steerOn").checked ? $("steerWord").value.trim().toLowerCase() : null;
-      const t0 = top[0].trim().toLowerCase();
-      if (steerWord && t0 === steerWord) td.className = "rd steerhit";
-      else if (tokens.length && t0.length > 1) {
-        // teal when the readout token later appears in the generated text
-        td.className = tokens.join("").toLowerCase().includes(t0) ? "rd hit" : "rd";
-      }
+      const t0n = t0.trim().toLowerCase();
+      if (steerWord && t0n === steerWord) td.className = "rd steerhit";
+      else if (t0n.length > 1 && genTokens.has(t0n)) td.className = "rd hit";
+      else td.className = "rd";
     }
   }
-  renderAlignment();
+  queueScroll();
 }
 
-function renderAlignment() {
-  // i-th generated token event aligns with i-th smallest readout position
-  posOrder.forEach((pos, i) => {
-    const row = rows.get(pos);
-    row.idx.textContent = i;
-    if (i < tokens.length) row.tok.textContent = JSON.stringify(tokens[i]).slice(1, -1);
-  });
-  const wrap = $("tickerScroll");
-  wrap.scrollTop = wrap.scrollHeight;
-}
+let controller = null;
 
 $("go").addEventListener("click", async () => {
+  if (controller) { controller.abort(); return; }
   const steering = $("steerOn").checked;
   const layers = [...document.querySelectorAll(".lyr:checked")].map(c => +c.value);
   if (steering && !layers.length) { alert("pick at least one injection layer"); return; }
   resetUI(steering);
-  $("go").disabled = true;
+  controller = new AbortController();
+  $("go").textContent = "Stop";
+  $("go").classList.add("stop");
   try {
     const resp = await fetch("/api/generate", {
       method: "POST",
+      signal: controller.signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         prompt: $("prompt").value,
@@ -310,9 +346,14 @@ $("go").addEventListener("click", async () => {
       }
     }
   } catch (err) {
-    $("outBaseline").textContent = `error: ${err}`;
+    if (err.name !== "AbortError") {
+      $("outBaseline").textContent = `error: ${err}`;
+    }
   } finally {
-    $("go").disabled = false;
+    controller = null;
+    $("go").textContent = "Generate";
+    $("go").classList.remove("stop");
+    document.querySelectorAll(".out .cursor").forEach(c => c.remove());
   }
 });
 </script>
