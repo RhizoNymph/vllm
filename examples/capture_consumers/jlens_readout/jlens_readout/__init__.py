@@ -72,7 +72,7 @@ class JLensReadoutConsumer:
         self._unembed_path = str(params["unembed"])
         raw_layers = str(params.get("layers", "30;40;50")).replace("|", ";")
         self._layers = sorted({int(x) for x in raw_layers.split(";") if x.strip()})
-        self._topk = int(params.get("topk", 5))
+        self._topk = int(params.get("topk", 8))
         self._out = str(params.get("out", "/tmp/jlens_readout"))
         self._device = str(params.get("device", "cpu"))
         self._tokenizer_path = str(
@@ -135,19 +135,32 @@ class JLensReadoutConsumer:
         )
         self._loaded = True
 
-    def _readout_top(self, h: torch.Tensor, layer: int) -> list[list[str]]:
-        """h: [rows, d] -> per-row top-k decoded tokens."""
-        x = h.to(self._device, dtype=torch.float16)
-        if layer in self._J:
-            x = x @ self._J[layer].T
+    def _unembed_top(self, x: torch.Tensor) -> tuple[list[list[str]], list[list[float]]]:
+        """x: [rows, d] residual-basis vectors -> per-row top-k (tokens, probs)."""
         xf = x.float()
         xf = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self._eps)
-        logits = (xf * self._norm_w).to(torch.float16) @ self._lm_head.T
-        top = logits.float().topk(self._topk, dim=-1).indices.cpu()
-        return [
-            [self._tok.decode([int(t)]) for t in row]
-            for row in top
-        ]
+        logits = ((xf * self._norm_w).to(torch.float16) @ self._lm_head.T).float()
+        probs = logits.softmax(dim=-1)
+        top_p, top_i = probs.topk(self._topk, dim=-1)
+        top_i, top_p = top_i.cpu(), top_p.cpu()
+        toks = [[self._tok.decode([int(t)]) for t in row] for row in top_i]
+        return toks, [[round(float(p), 5) for p in row] for row in top_p]
+
+    def _readout(self, h: torch.Tensor, layer: int) -> dict:
+        """Both lens readouts for one layer's rows.
+
+        JACOBIAN_LENS transports by J_l first; layers without a fitted J
+        (e.g. the final layer) fall back to identity, matching the reference
+        convention that the final row is the model's own output. LOGIT_LENS
+        is the bare unembed of the raw residual.
+        """
+        x = h.to(self._device, dtype=torch.float16)
+        ll_t, ll_p = self._unembed_top(x)
+        if layer in self._J:
+            jl_t, jl_p = self._unembed_top(x @ self._J[layer].T)
+        else:
+            jl_t, jl_p = ll_t, ll_p
+        return {"top": jl_t, "jl": {"t": jl_t, "p": jl_p}, "ll": {"t": ll_t, "p": ll_p}}
 
     # ------------------------------------------------------------------
     # CaptureSink protocol
@@ -161,10 +174,10 @@ class JLensReadoutConsumer:
                 int(chunk.key[1]),
                 str(chunk.key[2]),
             )
-            tops = self._readout_top(chunk.tensor, layer_idx)
+            readout = self._readout(chunk.tensor, layer_idx)
             positions = list(chunk.metadata.get("positions", []))
             line = json.dumps(
-                {"pos": positions, "layer": layer_idx, "hook": hook, "top": tops},
+                {"pos": positions, "layer": layer_idx, "hook": hook, **readout},
                 ensure_ascii=False,
             )
             with self._lock:

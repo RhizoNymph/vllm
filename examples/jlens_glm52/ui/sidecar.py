@@ -48,6 +48,11 @@ BAND = [30, 40, 50]
 
 app = FastAPI(title="jlens live demo")
 _static = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+# capture layers configured on the serving side (must match the jlens
+# consumer's layers= param); stride-4 sweep + final by default
+CAPTURE_LAYERS = [int(x) for x in os.environ.get(
+    "JLENS_CAPTURE_LAYERS", ";".join(str(l) for l in range(0, 77, 4))
+).replace("|", ";").split(";")]
 
 
 class Lens:
@@ -55,7 +60,8 @@ class Lens:
 
     def __init__(self) -> None:
         bundle = torch.load(LENS_PATH, map_location="cpu", weights_only=True)
-        self.J = {l: bundle["J"][l].float() for l in BAND}
+        wanted = set(BAND) | set(CAPTURE_LAYERS)
+        self.J = {l: bundle["J"][l].float() for l in wanted if l in bundle["J"]}
         del bundle
         u = torch.load(UNEMBED_PATH, map_location="cpu", weights_only=True)
         self.norm_w = u["norm_weight"].float()
@@ -92,6 +98,25 @@ class Lens:
 
 
 LENS = Lens()
+
+from lens_api import LensAPI  # noqa: E402  (needs Lens defined)
+
+LENS_API = LensAPI(LENS, lambda: _server_base(), READOUT_DIR, CAPTURE_LAYERS)
+
+
+@app.post("/api/lens/prompt")
+async def lens_prompt(body: dict) -> StreamingResponse:
+    """Neuronpedia jlens UI contract (NDJSON). See lens_api.py."""
+    return StreamingResponse(
+        LENS_API.stream(body), media_type="application/x-ndjson"
+    )
+
+
+_np_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui-np-dist")
+if os.path.isdir(_np_dist):
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/np", StaticFiles(directory=_np_dist, html=True), name="np")
 
 
 def _server_base() -> str:

@@ -30,10 +30,13 @@ set -euo pipefail
 MODEL="${MODEL:-/mnt/data/artifacts/GLM-5.2}"
 VENV_DIR="${VENV_DIR:-/mnt/data/artifacts/jlens/vllm-env}"
 PORT="${PORT:-8000}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 QUANTIZATION="${QUANTIZATION:-fp8}"
 CAPTURE_ROOT="${CAPTURE_ROOT:-/mnt/data/artifacts/jlens/vllm_capture}"
-GRAPHSAFE_KEYS="${GRAPHSAFE_KEYS:-30:post_block 40:post_block 50:post_block}"
+# lens capture layers: stride-4 depth sweep + final (must match the jlens
+# consumer and the sidecar's JLENS_CAPTURE_LAYERS)
+JLENS_LAYERS="${JLENS_LAYERS:-$(seq -s';' 0 4 76);77}"
+GRAPHSAFE_KEYS="${GRAPHSAFE_KEYS:-$(echo "${JLENS_LAYERS}" | tr ';' '\n' | sed 's/$/:post_block/' | tr '\n' ' ')}"
 RUN_INFO="${RUN_INFO:-/mnt/data/artifacts/jlens/serve/current.json}"
 
 FORK_DIR="${SLURM_SUBMIT_DIR:?submit from the fork repo root}"
@@ -78,6 +81,7 @@ exec vllm serve "${MODEL}" \
   --port "${PORT}" \
   --enable-steering \
   --capture-consumers "filesystem:root=${CAPTURE_ROOT}" \
+  --capture-consumers "jlens:lens=${JLENS_LENS:-/mnt/data/artifacts/jlens/glm52_fit_1k/lens_glm52_1k.pt},unembed=${JLENS_UNEMBED:-/mnt/data/artifacts/jlens/glm52_unembed.pt},layers=${JLENS_LAYERS},topk=8,out=${JLENS_READOUT:-/mnt/data/artifacts/jlens/readout},device=cuda:0" \
   "${GRAPHSAFE_ARGS[@]}" \
   --trust-remote-code \
   ${EXTRA_ARGS:-}
