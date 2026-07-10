@@ -195,6 +195,7 @@ let scrollQueued;
 function resetUI(steering) {
   $("paneSteered").hidden = !steering;
   $("panes").className = steering ? "panes two" : "panes";
+  document.querySelectorAll(".cachedtag").forEach(t => t.remove());
   $("outBaseline").innerHTML = "<span class='cursor'>▌</span>";
   $("outSteered").innerHTML = steering ? "<span class='cursor'>▌</span>" : "";
   $("tickerBody").innerHTML = "";
@@ -347,6 +348,14 @@ $("go").addEventListener("click", async () => {
           if (ev.pane === tickerPane) tickerToken(ev.text);
         } else if (ev.type === "readout") {
           readoutEvent(ev);
+        } else if (ev.type === "cached") {
+          const h = (ev.pane === "steered" ? $("paneSteered") : $("paneBaseline"))
+            .querySelector("h2");
+          if (!h.querySelector(".cachedtag")) {
+            const t = document.createElement("span");
+            t.className = "tag cachedtag"; t.textContent = "cached";
+            h.append(t);
+          }
         } else if (ev.type === "pane_done") {
           const out = ev.pane === "steered" ? $("outSteered") : $("outBaseline");
           out.querySelector(".cursor")?.remove();

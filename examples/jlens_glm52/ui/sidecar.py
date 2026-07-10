@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
+import hashlib
 import base64
 import glob
 import json
@@ -128,6 +130,56 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+# ---------------------------------------------------------------------------
+# Completion cache: per PANE, keyed on everything that affects that pane's
+# output (the baseline pane's key excludes steering entirely, so iterating on
+# steering strength replays the baseline instantly). Values are the pane's
+# full ordered event list (tokens + readouts), so a hit reproduces completion
+# AND ticker. Memory LRU + disk (survives sidecar restarts); CACHE_V salts
+# away stale formats when the readout schema or server config changes.
+# ---------------------------------------------------------------------------
+CACHE_V = 2
+CACHE_DIR = os.environ.get(
+    "JLENS_CACHE_DIR", os.path.join(os.path.dirname(RUN_INFO), "cache")
+)
+os.makedirs(CACHE_DIR, exist_ok=True)
+_cache_mem: collections.OrderedDict[str, list] = collections.OrderedDict()
+_CACHE_MEM_MAX = 32
+
+
+def _cache_key(desc: dict) -> str:
+    blob = json.dumps({"v": CACHE_V, **desc}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode()).hexdigest()[:32]
+
+
+def _cache_get(key: str) -> list | None:
+    if key in _cache_mem:
+        _cache_mem.move_to_end(key)
+        return _cache_mem[key]
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    if os.path.exists(path):
+        try:
+            events = json.load(open(path, encoding="utf-8"))
+        except Exception:
+            return None
+        _cache_mem[key] = events
+        while len(_cache_mem) > _CACHE_MEM_MAX:
+            _cache_mem.popitem(last=False)
+        return events
+    return None
+
+
+def _cache_put(key: str, events: list) -> None:
+    _cache_mem[key] = events
+    while len(_cache_mem) > _CACHE_MEM_MAX:
+        _cache_mem.popitem(last=False)
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(events, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 async def _tail_readout(req_prefix: str, started: float, queue: asyncio.Queue,
                         stop: asyncio.Event) -> None:
     """Find this request's readout JSONL (filename embeds the client request
@@ -165,13 +217,30 @@ async def _tail_readout(req_prefix: str, started: float, queue: asyncio.Queue,
 
 
 async def _generate_pane(
-    pane: str, payload: dict, queue: asyncio.Queue, with_readout: bool
+    pane: str, payload: dict, queue: asyncio.Queue, with_readout: bool,
+    cache_key: str | None = None,
 ) -> None:
+    if cache_key:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            await queue.put({"type": "cached", "pane": pane})
+            for event in cached:
+                await queue.put(event)
+            await queue.put({"type": "pane_done", "pane": pane})
+            return
+    recorded: list = []
+
+    async def put(event: dict) -> None:
+        recorded.append(event)
+        await queue.put(event)
+
     started = time.time()
     stop = asyncio.Event()
+    import types as _types
+    _rec_queue = _types.SimpleNamespace(put=put)
     tail = (
         asyncio.create_task(
-            _tail_readout(payload["request_id"], started, queue, stop)
+            _tail_readout(payload["request_id"], started, _rec_queue, stop)
         )
         if with_readout
         else None
@@ -216,8 +285,8 @@ async def _generate_pane(
                             pre, buf = buf.split("</think>", 1)
                             pre = pre.replace("<think>", "")
                             if pre:
-                                await queue.put({"type": "token", "pane": pane,
-                                                 "channel": "think", "text": pre})
+                                await put({"type": "token", "pane": pane,
+                                           "channel": "think", "text": pre})
                             channel = "answer"
                             continue
                         # hold back a suffix that could be a split tag
@@ -229,23 +298,29 @@ async def _generate_pane(
                         emit, carry = (buf[:-hold], buf[-hold:]) if hold else (buf, "")
                         emit = emit.replace("<think>", "")
                         if emit:
-                            await queue.put({"type": "token", "pane": pane,
-                                             "channel": channel, "text": emit})
+                            await put({"type": "token", "pane": pane,
+                                       "channel": channel, "text": emit})
                         buf = ""
                 if carry:
-                    await queue.put({"type": "token", "pane": pane,
-                                     "channel": channel, "text": carry})
+                    await put({"type": "token", "pane": pane,
+                               "channel": channel, "text": carry})
     except asyncio.CancelledError:
         # client hit Stop / disconnected: closing the httpx stream makes
         # vllm abort the request server-side; tear the tailer down fast.
         if tail:
             tail.cancel()
+        cache_key = None  # never cache a partial pane
         raise
     finally:
         stop.set()
         if tail:
             with contextlib.suppress(asyncio.CancelledError):
                 await tail
+        if cache_key and any(
+            e["type"] == "token" and not e["text"].startswith("[server error]")
+            for e in recorded
+        ):
+            _cache_put(cache_key, recorded)
         with contextlib.suppress(Exception):
             await queue.put({"type": "pane_done", "pane": pane})
 
@@ -301,13 +376,34 @@ async def generate(body: dict) -> StreamingResponse:
     async def stream():
         queue: asyncio.Queue = asyncio.Queue()
 
+        base_desc = {"prompt": prompt, "max_tokens": max_tokens,
+                     "thinking": thinking}
+        steer_desc = None
+        if steer:
+            steer_desc = {
+                "word": str(steer["word"]),
+                "strength": float(steer["strength"]),
+                "layers": sorted(int(l) for l in steer.get("layers", [40])),
+            }
+
         async def run() -> None:
             if steer:
                 # readout ticker follows the steered pane
-                await _generate_pane("baseline", payload(False), queue, with_readout=False)
-                await _generate_pane("steered", payload(True), queue, with_readout=True)
+                await _generate_pane(
+                    "baseline", payload(False), queue, with_readout=False,
+                    cache_key=_cache_key({**base_desc, "readout": False}),
+                )
+                await _generate_pane(
+                    "steered", payload(True), queue, with_readout=True,
+                    cache_key=_cache_key(
+                        {**base_desc, "readout": True, "steer": steer_desc}
+                    ),
+                )
             else:
-                await _generate_pane("baseline", payload(False), queue, with_readout=True)
+                await _generate_pane(
+                    "baseline", payload(False), queue, with_readout=True,
+                    cache_key=_cache_key({**base_desc, "readout": True}),
+                )
             await queue.put({"type": "done"})
 
         task = asyncio.create_task(run())
