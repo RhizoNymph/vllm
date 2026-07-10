@@ -46,7 +46,7 @@ READOUT_DIR = os.environ.get("JLENS_READOUT_DIR", "/mnt/data/artifacts/jlens/rea
 LENS_PATH = os.environ.get("JLENS_LENS", "/mnt/data/artifacts/jlens/glm52_fit_1k/lens_glm52_1k.pt")
 UNEMBED_PATH = os.environ.get("JLENS_UNEMBED", "/mnt/data/artifacts/jlens/glm52_unembed.pt")
 NORMS_PATH = os.environ.get("JLENS_NORMS", "/mnt/data/artifacts/jlens/glm52_norms/residual_norms.pt")
-BAND = [30, 40, 50]
+BAND = [28, 40, 52]  # must lie on the consumer's capture grid
 
 app = FastAPI(title="jlens live demo")
 _static = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -62,8 +62,9 @@ class Lens:
 
     def __init__(self) -> None:
         bundle = torch.load(LENS_PATH, map_location="cpu", weights_only=True)
-        wanted = set(BAND) | set(CAPTURE_LAYERS)
-        self.J = {l: bundle["J"][l].float() for l in wanted if l in bundle["J"]}
+        # keep every fitted layer resident (~12GB RAM): steering directions
+        # can then target any depth regardless of the capture grid
+        self.J = {l: t.float() for l, t in bundle["J"].items()}
         del bundle
         u = torch.load(UNEMBED_PATH, map_location="cpu", weights_only=True)
         self.norm_w = u["norm_weight"].float()

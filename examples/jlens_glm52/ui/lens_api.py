@@ -66,7 +66,15 @@ class LensAPI:
                 continue_final_message=prefill,
                 enable_thinking=bool(body.get("enableThinking", False)),
             )
-            return list(ids), n_gen
+            # transformers returns list[int], BatchEncoding/dict, or [[ids]]
+            # depending on version/kwargs — normalize
+            if hasattr(ids, "input_ids"):
+                ids = ids.input_ids
+            elif isinstance(ids, dict):
+                ids = ids["input_ids"]
+            if ids and isinstance(ids[0], (list, tuple)):
+                ids = ids[0]
+            return [int(t) for t in ids], n_gen
         text = body.get("prompt") or ""
         return list(tok(text).input_ids), n_gen
 
@@ -156,6 +164,13 @@ class LensAPI:
 
     async def stream(self, body: dict):
         """Async generator yielding NDJSON lines (str, newline-terminated)."""
+        try:
+            async for line in self._stream(body):
+                yield line
+        except Exception as exc:  # noqa: BLE001 — surface as in-stream error
+            yield json.dumps({"kind": "error", "error": f"{type(exc).__name__}: {exc}"}) + "\n"
+
+    async def _stream(self, body: dict):
         types = body.get("type") or ["JACOBIAN_LENS", "LOGIT_LENS"]
         top_n = min(int(body.get("topN", 8)), 8)
         temperature = float(body.get("temperature", 0))

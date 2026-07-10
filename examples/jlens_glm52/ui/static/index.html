@@ -112,7 +112,7 @@
 <header>
   <h1>GLM-5.2 · Jacobian lens console</h1>
   <span class="sub" id="info">connecting…</span>
-  <span class="sub"><span class="dot">●</span> readout band L30 · L40 · L50</span>
+  <span class="sub"><span class="dot">●</span> readout band L28 · L40 · L52</span>
 </header>
 
 <main>
@@ -137,9 +137,9 @@
       <div class="hint" id="strengthHint">0.3–0.8 = coherent drift · ≥1.0 = token takeover</div>
       <div class="layers">
         inject at:
-        <label><input type="checkbox" class="lyr" value="30"> L30</label>
+        <label><input type="checkbox" class="lyr" value="28"> L28</label>
         <label><input type="checkbox" class="lyr" value="40" checked> L40</label>
-        <label><input type="checkbox" class="lyr" value="50" checked> L50</label>
+        <label><input type="checkbox" class="lyr" value="52" checked> L52</label>
       </div>
       <label class="row"><input type="checkbox" id="compareLL">
         compare: logit-lens direction (3rd pane)</label>
@@ -173,7 +173,7 @@
     <h2>Live lens readout <span class="hint">top-1 per layer while generating · hover for top-5</span></h2>
     <div id="tickerScroll">
       <table>
-        <thead><tr><th>#</th><th>generated</th><th>L30</th><th>L40</th><th>L50</th></tr></thead>
+        <thead><tr><th>#</th><th>generated</th><th>L28</th><th>L40</th><th>L52</th></tr></thead>
         <tbody id="tickerBody"><tr><td class="empty" colspan="5">run a generation to see the workspace stream</td></tr></tbody>
       </table>
     </div>
@@ -182,7 +182,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const BAND = [30, 40, 50];
+const BAND = [28, 40, 52];
 
 fetch("/api/info").then(r => r.json()).then(i => {
   $("info").textContent = `${i.model} · lens ${i.lens}`;
