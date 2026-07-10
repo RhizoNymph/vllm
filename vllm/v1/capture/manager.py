@@ -303,8 +303,23 @@ class CaptureManager:
         spill_dir: str | None = None,
         spill_max_bytes: int = 4 << 30,
         local_layer_range: tuple[int, int] | None = None,
+        extra_global_specs: tuple[CaptureSpec | None, ...] = (),
+        slim: bool = False,
         graphsafe_keys: Sequence[tuple[int, str]] | None = None,
     ) -> None:
+        """See class docstring. Two additions for sync consumers:
+
+        ``extra_global_specs`` contributes ``(layer, hook)`` keys to the
+        persistent global-buffer set WITHOUT a corresponding sink slot —
+        used for sync-execution consumers, which read the buffers
+        directly on the step thread and never receive dispatched chunks.
+
+        ``slim=True`` builds a buffers-only manager: ``on_hook``'s
+        graph-safe ``copy_`` path works, but no dispatch/finalize
+        threads, queues, pinned pools, or spill state exist. Used on
+        non-zero TP ranks where only sync consumers run; the dispatch
+        pipeline entry points raise if reached.
+        """
         if len(consumers) != len(consumer_specs):
             msg = (
                 f"consumers length ({len(consumers)}) must match "
@@ -380,7 +395,7 @@ class CaptureManager:
         # layers like the global candidate keys.
         start, end = self._local_layer_range
         candidate_keys: set[tuple[int, str]] = set()
-        for spec in self._consumer_specs:
+        for spec in (*self._consumer_specs, *extra_global_specs):
             if spec is None:
                 continue
             for hook_name, layers in spec.hooks.items():
@@ -442,6 +457,21 @@ class CaptureManager:
         # compiled forward graph.  Cleared by ``consume_step_plan`` once
         # the runner's finalize path has copied the scratch tensors out.
         self._step_plan: StepCapturePlan | None = None
+
+        # Slim mode: persistent buffers only — no dispatch pipeline.
+        # ``_step_plan`` stays None forever, so ``on_hook`` only ever
+        # runs its global ``copy_`` branch.
+        self._slim = slim
+        if slim:
+            self._dispatch_queue = None  # type: ignore[assignment]
+            self._finalize_queue = None  # type: ignore[assignment]
+            self._dispatch_thread = None  # type: ignore[assignment]
+            self._finalize_thread = None  # type: ignore[assignment]
+            self._overload_policy = overload_policy
+            self._spill_dir = None
+            self._dropped_packets = 0
+            self._spilled_packets = 0
+            return
 
         # Async dispatch path.  ``dispatch_step_captures`` issues H2D
         # copies into pinned host buffers, records a CUDA event, and
@@ -523,6 +553,27 @@ class CaptureManager:
 
     # ------------------------------------------------------------------ props
 
+    def global_buffer(self, key: tuple[int, str]) -> torch.Tensor | None:
+        """Return the persistent global-capture buffer for ``key``.
+
+        The buffer holds the most recent forward's full residual for the
+        ``(layer, hook)`` key in its leading rows (input-batch token
+        order); contents are overwritten in place by the next forward.
+        Returns ``None`` when the key has no buffer (not a global key,
+        or ``max_num_tokens`` was unset).
+        """
+        return self._global_buffers.get(key)
+
+    def _require_pipeline(self, op: str) -> None:
+        """Raise if the dispatch pipeline is unavailable (slim mode)."""
+        if self._slim:
+            raise RuntimeError(
+                f"CaptureManager.{op} is unavailable on a slim manager: "
+                f"slim mode exists only to feed persistent global "
+                f"buffers to sync consumers (non-zero TP ranks) and has "
+                f"no dispatch/finalize pipeline."
+            )
+
     @property
     def num_consumers(self) -> int:
         return len(self._consumers)
@@ -561,6 +612,7 @@ class CaptureManager:
         ``hash_block_size`` (their granularity) enable activation-store
         write-through for this request; omitting them disables it.
         """
+        self._require_pipeline("register_request")
         if req_id in self._requests:
             msg = f"capture request {req_id!r} is already registered"
             raise ValueError(msg)
@@ -936,6 +988,7 @@ class CaptureManager:
         dispatch loop, so a failure in one sink never blocks delivery
         to the others.
         """
+        self._require_pipeline("dispatch_step_captures")
         # Pull global-spec rows out of the persistent buffers into
         # ``scratch_gpu`` first, so the rest of this method treats global
         # and client keys uniformly. No-op when no global key captured.
@@ -1449,6 +1502,8 @@ class CaptureManager:
         a destructor because ``__del__`` ordering during interpreter
         shutdown is not reliable for thread joins.
         """
+        if self._slim or self._dispatch_thread is None:
+            return
         if not self._dispatch_thread.is_alive():
             return
         # Stop the finalize thread first: pending finalize jobs drain the
@@ -1487,6 +1542,7 @@ class CaptureManager:
         thread.  Returns a dict mapping consumer index to ``CaptureResult``
         (empty if the request was never registered).
         """
+        self._require_pipeline("finalize_request")
         self._drain_dispatch_queue()
         state = self._requests.pop(req_id, None)
         if state is None:
@@ -1514,6 +1570,7 @@ class CaptureManager:
         so the result may attach to a later step's output or not reach the
         client at all.  The captured activations on disk are unaffected.
         """
+        self._require_pipeline("finalize_request_async")
         state = self._requests.pop(req_id, None)
         if state is None:
             return False

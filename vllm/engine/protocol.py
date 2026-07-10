@@ -20,6 +20,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.request_metadata import RequestMetadata
 
 if TYPE_CHECKING:
     from vllm.v1.engine import PauseMode
@@ -79,6 +80,7 @@ class EngineClient(ABC):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        request_metadata: RequestMetadata | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request."""
         ...

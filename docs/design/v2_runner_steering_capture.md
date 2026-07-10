@@ -103,21 +103,114 @@ only rank-identical inputs.
 ## Workstreams
 
 1. **Capture control plane** — DONE (CPU-tested, GPU pending).
-   `gpu/capture_runner_mixin.py` (`CaptureRunnerMixin`): init, gate,
-   force-eager seam, `_build_capture_{gate,batch}_view`,
-   `_register_capture_request`, `_finalize_capture_step`,
-   `_finalize_capture_for_request_async`, output drain, activation store.
-   Tests: `tests/v1/worker/test_gpu_v2_capture_glue.py`.
+   The runner-agnostic control plane is shared with the v1 runner in
+   `vllm/v1/worker/capture_runner_mixin.py` (`CaptureRunnerMixin`):
+   `_init_capture_state`, `_register_capture_request`, `_capture_add_request`,
+   `_capture_finish_request`, `_finalize_capture_step`,
+   `_finalize_capture_for_request_async`, the sync-consumer step loop
+   (`_build_step_capture_view` / `_run_sync_consumers` / `_warmup_sync_consumers`),
+   and the result drains. Both runners implement two hooks the shared step-view
+   builder calls: `_iter_step_capture_rows` (v1 walks `input_batch` accumulating
+   offsets; v2 reads `query_start_loc_np` + `req_states`) and
+   `_step_view_token_ids` (v1 copies the CPU token window; v2 returns empty).
+   `gpu/capture_runner_mixin.py` (`CaptureRunnerMixin`) subclasses the shared
+   mixin and keeps only the genuinely-v2 pieces: the force-eager gate view and
+   gather-plan view (`_build_capture_{gate,batch}_view`, `_capture_gate_decision`,
+   `_capture_build_plan`), which must be built before v2's `InputBatch` exists,
+   plus the two hooks above. Tests: `tests/v1/worker/test_gpu_v2_capture_glue.py`,
+   `tests/v1/worker/test_sync_steering_integration.py`.
 2. **Steering control plane** — DONE (CPU-tested, GPU pending).
-   `gpu/steering_runner_mixin.py` (`SteeringRunnerMixin`, a subclass of
-   `SteeringModelRunnerMixin` that reuses init / discovery / validation / the
-   public RPC API / `_resolve_request_steering` and overrides only the three
-   v1-state-coupled paths). Keeps its own `_steering_reqs` per-request state;
-   `_steering_add_request` (register + streaming re-add), `_steering_finish_requests`
-   (release on finish/preempt), `_update_steering_buffers_v2` (transition +
-   per-token index). No force-eager seam (persistent buffers). `gpu_worker.py`
-   already forwards the RPCs to `self.model_runner.*`.
+   Fully shared on `SteeringModelRunnerMixin` (de-fork complete, step H): the
+   v2 runner mixes it in directly
+   (`GPUModelRunner(..., CaptureRunnerMixin, SteeringModelRunnerMixin)`) and the
+   per-runner steering surface is just two batch-state accessor overrides —
+   `_steering_batch_view` (the per-step hot path's view) and
+   `_steering_req_position` (the override-apply decode-only phase guard) — which
+   read v2's `req_states` + `input_batch` instead of v1's batch-ordered columns.
+   They live on `gpu/capture_runner_mixin.py`, colocated with the capture glue
+   that already owns those same v2 arrays; the former
+   `gpu/steering_runner_mixin.py` (`SteeringRunnerMixin`) is deleted. No
+   force-eager seam (persistent buffers). `gpu_worker.py` already forwards the
+   RPCs to `self.model_runner.*`.
    Tests: `tests/v1/worker/test_gpu_v2_steering_glue.py`.
+
+   **Canonical per-request steering state (de-fork step C).** The per-request
+   steering identity + phase now lives in one shared store,
+   `SteeringModelRunnerMixin._steering_reqs: dict[str, _SteeringReqState]`,
+   populated identically on both runners from the broadcast `NewRequestData`.
+   The whole lifecycle is shared and runner-agnostic:
+   `_steering_add_request` (admission + streaming re-add),
+   `_steering_register_request` (the register-fresh core, also used by resume),
+   `_steering_finish_requests` (release on finish/preempt),
+   `_steering_release_state`, `_steering_transition` (prefill→decode), and
+   `_reset_steering_for_resumption` (v1 resume re-register). v1 drives them from
+   `_update_states` / `_update_streaming_request`; v2 from `add_requests` /
+   `finish_requests`. v1's former `_register_initial_steering_config` /
+   `_refresh_streaming_steering` / `_release_finished_steering_configs` /
+   `_req_steering_phase` and v2's private `_SteeringReqState` copy are gone.
+   The per-step hot path is unified too (de-fork step E, below): both runners
+   run one shared `_update_steering_buffers` that reads per-request steering
+   identity from `_steering_reqs` only. v1's former `_handle_steering_transition`
+   shim (a bridge from the batch hash columns to `_steering_transition`) and the
+   v1 input-batch hash columns themselves are gone. The cross-runner conformance
+   harness (`tests/v1/worker/test_steering_conformance.py`) asserts both runners
+   drive the manager identically across the whole lifecycle *and* write
+   byte-identical device buffers.
+
+   **Preemption unified on release-at-preemption (de-fork step D).** Both
+   runners now RELEASE a preempted request's config rows *and* any per-request
+   dynamic override at preemption time (the finish site unions
+   `finished_req_ids` with `scheduler_output.preempted_req_ids`), then
+   re-register a fresh prefill config on resume — v1 via
+   `_reset_steering_for_resumption`, v2 via the `add_requests` new-request path.
+   Previously v1 HELD its rows across preemption (releasing only at resume);
+   that pinned pool rows for the duration of the preemption. The scheduler
+   already agrees: `_preempt_request` (`scheduler.py:1256`) resets
+   `num_computed_tokens = 0` and drops the decode-signature tracking, and the
+   waiting-queue admission loop (`scheduler.py:705–718`, `:762–790`) reserves the
+   resumed request's prefill + decode steering rows before re-admitting it, so
+   the re-registration's `register_config` cannot overflow (the same guarantee
+   v2 already relied on). A request both preempted and finished in one step
+   releases exactly once (the union is a set; `_steering_finish_requests` pops
+   the canonical state idempotently).
+
+   **Unified per-step hot path (de-fork step E).** Both runners run one shared
+   `SteeringModelRunnerMixin._update_steering_buffers`. The only runner-specific
+   input — batch order + per-request token counts — is read through a
+   `SteeringBatchView` (`vllm/v1/worker/steering_batch_view.py`), a reusable
+   holder each runner mutates in place once per step (zero per-step allocation).
+   `_steering_batch_view` is the seam: v1 builds it from its batch-ordered
+   `input_batch` columns (identity slot→row map); the v2 runner overrides it
+   (on `gpu/capture_runner_mixin.py`) to read `input_batch.idx_mapping_np` +
+   `req_states` (`num_computed_tokens_np` / `prompt_len.np`). Steering identity (hashes + phase) comes from `_steering_reqs`
+   only, which retired v1's input-batch hash columns
+   (`request_prefill_steering_hash` / `request_decode_steering_hash` and the
+   `steering_hash_to_request_ids` index — the hot path was their only reader).
+   The shared body, beyond the per-token `steering_index`, every step:
+   - **§5.4 dynamic tier** — `steering_token_scales` (gain for decode tokens of a
+     tier-active state, `0` for prefill = §7 cache safety) via the same
+     per-request → `np.repeat` → pinned-H2D pattern as the index.
+   - **Phase 2 row gating** — resets `steering_row_gate` to `1.0` each step and
+     writes `steering_decode_mask` (`1.0` decode / `0.0` prefill) so an in-graph
+     monitor only gates decode rows.
+   - **Dynamic override pool** — a live `_req_dynamic_decode[req_id]` routes that
+     request's decode tokens to its pool row (`get_dynamic_row`) instead of the
+     admitted decode row; overrides drop on finish / preempt / streaming re-add.
+     The shared `_apply_request_override` reads the decode-only phase guard
+     through `_steering_req_position`, which the v2 runner overrides (on
+     `gpu/capture_runner_mixin.py`) to read v2's `req_states` (`req_id_to_index`
+     + `num_computed_tokens_np` / `prompt_len.np`).
+   - **Async transport** — drains the in-process `SteeringActionQueue` at the top
+     (before the nothing-active short-circuit, so a drained update can activate
+     steering) via the shared `_apply_steering_actions`.
+   - **APC notification** — the shared `_compute_decode_signature_deltas` folds
+     admitted decode config + override / tier / monitor into an effective
+     signature and reports only changed signatures; the runner attaches them on
+     `ModelRunnerOutput.steering_decode_signatures`.
+   - **Short-circuit predicates** — extended to `has_dynamic` / `has_dynamic_tier`
+     / `has_monitor` (the tier-only latent bug fix) and the active→inactive
+     transition resets `token_scales` / `row_gate` / `decode_mask` / monitor-active
+     flags. The cheap `_scales_dirty` populate path (§5.3) is wired too.
 
 ### Validation
 

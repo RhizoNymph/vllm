@@ -927,6 +927,16 @@ def supports_xpu_graph() -> bool:
 # create a library to hold the custom op
 vllm_lib = Library("vllm", "FRAGMENT")  # noqa
 
+# Qualified names (``ns::op``) already registered via
+# ``direct_register_custom_op`` in this process. Guards against a second
+# ``Library.define`` for the same op — which torch rejects with a hard
+# "registered ... multiple times" RuntimeError. This happens when a custom
+# op's defining module is imported more than once in a process (observed
+# with externally-plugged quant ops, e.g. the GGUF ``_fused_mul_mat_gguf``,
+# re-resolved on a cold torch.compile). Re-registering the same op is a
+# no-op, so skipping the duplicate is safe.
+_direct_registered_ops: set[str] = set()
+
 
 def direct_register_custom_op(
     op_name: str,
@@ -960,10 +970,17 @@ def direct_register_custom_op(
 
         dispatch_key = current_platform.dispatch_key
 
-    schema_str = infer_schema(op_func, mutates_args=mutates_args)
-
     my_lib = target_lib or vllm_lib
+    qualified = f"{getattr(my_lib, 'ns', 'vllm')}::{op_name}"
+    if qualified in _direct_registered_ops:
+        # Already registered in this process (idempotent): skip the second
+        # ``define`` so a re-imported op module doesn't hit torch's hard
+        # duplicate-registration error.
+        return
+
+    schema_str = infer_schema(op_func, mutates_args=mutates_args)
     my_lib.define(op_name + schema_str, tags=tags)
     my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
     if fake_impl is not None:
         my_lib._register_fake(op_name, fake_impl)
+    _direct_registered_ops.add(qualified)

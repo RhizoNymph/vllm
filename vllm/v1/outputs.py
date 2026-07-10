@@ -288,6 +288,15 @@ class ModelRunnerOutput:
     # which surfaces it on ``RequestOutput.capture_results``.
     capture_results: dict[str, dict[str, CaptureResult]] = field(default_factory=dict)
 
+    # req_id -> effective decode steering signature, for requests whose
+    # signature CHANGED this step (a delta, not the full set). The scheduler
+    # keys those requests' future decode KV blocks by this value so blocks
+    # produced under dynamic steering (override / tier / monitor) are not
+    # falsely reused by requests under different steering. Rank 0's value is
+    # canonical (rank-identical). See
+    # docs/design/dynamic_steering_apc_notification.md.
+    steering_decode_signatures: dict[str, int] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

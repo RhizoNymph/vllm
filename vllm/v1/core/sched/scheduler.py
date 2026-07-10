@@ -180,6 +180,13 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # Dynamic steering APC: req_id -> current effective decode steering
+        # signature reported by the worker (overrides / tier / monitor). A
+        # request present here has its decode block-hash key driven
+        # forward-only by ``_apply_steering_decode_signatures``; absent ⇒ the
+        # admitted decode hash applies. See
+        # docs/design/dynamic_steering_apc_notification.md.
+        self._req_decode_signature: dict[str, int] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -399,6 +406,27 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
 
+    def _apply_steering_decode_signatures(self, sigs: dict[str, int]) -> None:
+        """Apply worker-reported effective-decode-signature deltas.
+
+        For each reported request: a signature equal to its admitted decode
+        hash means it reverted to admitted steering (drop tracking); any
+        other value means dynamic steering (override / tier / monitor) is
+        shaping its decode KV, so its future decode blocks must be keyed by
+        that signature. Applied forward-only (no retroactive rekey) so the
+        clean pre-dynamic prefix stays shareable. See
+        docs/design/dynamic_steering_apc_notification.md.
+        """
+        for req_id, sig in sigs.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            if sig == request.decode_steering_config_hash:
+                self._req_decode_signature.pop(req_id, None)
+            else:
+                self._req_decode_signature[req_id] = sig
+            request.update_decode_steering_signature(sig)
+
     def _set_request_block_hash_steering_overrides(
         self,
         request: Request,
@@ -411,6 +439,12 @@ class Scheduler(SchedulerInterface):
         when the pool is full.  So its prefix-cache keys always reflect its real
         steering config hashes; there is no capacity-driven fallback to row 0.
         """
+        if request.request_id in self._req_decode_signature:
+            # Decode-phase request under dynamic steering: its decode key is
+            # driven forward-only by ``_apply_steering_decode_signatures``
+            # (re-running this here would retroactively rekey its clean
+            # prefix). Leave as-is.
+            return
         request.set_block_hash_steering_overrides(
             prefill_hash=request.prefill_steering_config_hash,
             decode_hash=request.decode_steering_config_hash,
@@ -1276,6 +1310,11 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        # Preemption re-runs prefill and drops any worker-side dynamic
+        # override; clear the decode-signature tracking so the resumed
+        # request gets normal (admitted) APC keys until the worker
+        # re-reports a dynamic signature in decode.
+        self._req_decode_signature.pop(request.request_id, None)
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1694,6 +1733,16 @@ class Scheduler(SchedulerInterface):
             for rid in model_runner_output.req_ids:
                 routing_offsets[rid] = offset
                 offset += num_scheduled_tokens[rid]
+
+        # Dynamic steering APC (docs/design/dynamic_steering_apc_notification.md):
+        # apply the worker's effective-decode-signature deltas BEFORE the
+        # per-request loop below appends this step's token (which hashes any
+        # newly-full decode block). Forward-only — already-hashed blocks keep
+        # their key; only blocks produced under the dynamic steering get the
+        # new key, so steered decode KV is never falsely reused.
+        steering_sigs = model_runner_output.steering_decode_signatures
+        if steering_sigs:
+            self._apply_steering_decode_signatures(steering_sigs)
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -2267,6 +2316,8 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        # Drop any dynamic-steering decode-signature tracking (bounded memory).
+        self._req_decode_signature.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

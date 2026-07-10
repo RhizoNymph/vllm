@@ -50,6 +50,7 @@ from vllm.sampling_params import (
     ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
+from vllm.v1.request_metadata import RequestMetadata
 
 logger = init_logger(__name__)
 
@@ -544,6 +545,35 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
+    conversation_id: str | None = Field(
+        default=None,
+        description="Opaque client conversation/session id. Carried as "
+        "request metadata (not a sampling parameter) and surfaced to "
+        "worker-side capture consumers via StepRequestView.conversation_id so a "
+        "dynamic-steering consumer can apply per-conversation (e.g. latched) "
+        "steering across the requests of one conversation. It is an "
+        "unauthenticated global namespace: in a multi-client deployment the "
+        "operator or gateway must namespace ids per client (e.g. a "
+        "per-tenant prefix) so one client cannot inherit or pre-latch "
+        "another's steering.",
+    )
+
+    steering: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Declarative per-request steering gates: a list of "
+        "{when, scope, apply}. `when` is {kind:'always'} or "
+        "{kind:'probe', probe:<vec>, threshold, sharpness?}; `scope` is "
+        "this_token|next_step|rest_of_request|rest_of_conversation; `apply` is "
+        "{kind:'add', steer:<vec>, strength?} or {kind:'attenuate', strength}. "
+        "A <vec> is {kind:'name', name:<registered>} (register via "
+        "/v1/steering/vectors/register) or {kind:'inline', "
+        "packed:{hook: SteeringHookPacked}} (base64). scope=rest_of_conversation "
+        "with apply=add persists server-side and requires a named steer vector "
+        "(inline is rejected); ephemeral scopes accept inline. Applied by the "
+        "built-in declarative consumer with no server-registered consumer; "
+        "requires the server to be started with --enable-steering.",
+    )
+
     steering_name: str | None = Field(
         default=None,
         description="Name of a pre-registered steering module. "
@@ -796,6 +826,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.patch_vectors is not None:
             sampling_params.patch_vectors = dict(self.patch_vectors)
         return sampling_params
+
+    def to_request_metadata(self, vector_registry=None) -> RequestMetadata:
+        """Build the request-level metadata channel for this request.
+
+        Holds host-side per-request fields that are not sampling parameters
+        (the conversation id and declarative steering gates); threaded to the
+        worker alongside the client request id rather than on
+        ``SamplingParams``. Named vector sources in ``steering`` are resolved
+        to inline packed bytes here via *vector_registry*; raises
+        ``ValueError`` on a malformed gate spec or unknown name (surfaced by
+        the caller as HTTP 400).
+        """
+        from vllm.v1.steering_schema import build_steering_gates
+
+        return RequestMetadata(
+            conversation_id=self.conversation_id,
+            steering=build_steering_gates(self.steering, vector_registry),
+        )
 
     @model_validator(mode="before")
     @classmethod

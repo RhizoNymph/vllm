@@ -112,16 +112,19 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
-from vllm.v1.worker.gpu.steering_runner_mixin import SteeringRunnerMixin
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer
 
 logger = init_logger(__name__)
 
 
 class GPUModelRunner(
-    LoRAModelRunnerMixin, CaptureRunnerMixin, SteeringRunnerMixin, PatchRunnerMixin
+    LoRAModelRunnerMixin,
+    CaptureRunnerMixin,
+    SteeringModelRunnerMixin,
+    PatchRunnerMixin,
 ):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -746,6 +749,12 @@ class GPUModelRunner(
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+
+        # Warm sync-consumer device compute now (full CUDA context) so the first
+        # served step doesn't pay the one-time GEMV init cost on the hot path.
+        if self._sync_consumers:
+            self._warmup_sync_consumers()
+
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
@@ -1238,9 +1247,12 @@ class GPUModelRunner(
 
             # Populate steering tables + per-token index before the forward.
             # The buffers are persistent, so a FULL cudagraph replay reads this
-            # step's values — no force-eager needed.
+            # step's values — no force-eager needed. The shared hot path reads
+            # the batch through ``self.input_batch`` (set here; v2 keeps no
+            # persistent input batch) + the v2 ``_steering_batch_view`` override.
             if self._steering_manager is not None:
-                self._update_steering_buffers_v2(scheduler_output, input_batch)
+                self.input_batch = input_batch
+                self._update_steering_buffers(scheduler_output)
             # Write per-(layer, hook) patch buffers from per-request specs.
             # Persistent buffers => FULL cudagraph replay reads this step's
             # values; no force-eager seam (unlike capture's dynamic gather).
@@ -1383,6 +1395,19 @@ class GPUModelRunner(
         if self._capture_manager is not None:
             self._finalize_capture_step()
 
+        # Sync-execution consumers: run on EVERY rank (outside the rank-0-only
+        # manager guard above), post-forward, so returned steering actions are
+        # applied before the next step's ``_update_steering_buffers``. The
+        # global capture buffers are still valid here (the next forward
+        # overwrites them); ``num_computed_tokens`` has not yet advanced, so the
+        # view reads start-of-step state matching the forward layout. Skipped on
+        # dummy/cudagraph-capture runs (``dummy_run``) and the v2-only
+        # ``warmup_kernels`` JIT pass (``_in_kernel_warmup``) so consumer policy
+        # never sees dummy/warmup activations — matches v1, whose warmup uses
+        # ``_dummy_run`` and so never reaches this call.
+        if self._sync_consumers and not dummy_run and not self._in_kernel_warmup:
+            self._run_sync_consumers(scheduler_output, input_batch)
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -1482,6 +1507,12 @@ class GPUModelRunner(
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             # Capture results finalized (off-thread) since the last step.
             capture_results=self._drain_capture_results(),
+            # Dynamic-steering APC: effective-decode-signature deltas computed
+            # in ``_update_steering_buffers`` this step (None when steering
+            # is inactive).
+            steering_decode_signatures=(
+                getattr(self, "_pending_decode_sigs", None) or None
+            ),
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(

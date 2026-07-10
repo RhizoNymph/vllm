@@ -408,6 +408,16 @@ async def init_app_state(
                     "pre_materialize_steering_module",
                     kwargs=dict(name=module_name),
                 )
+
+        # Frontend-only registry of named probe/steer vectors for declarative
+        # per-request steering gates. Resolved to inline packed bytes at
+        # request admission, so — unlike the module registry above — it is
+        # never broadcast to workers.
+        from vllm.entrypoints.openai.steering.vector_registry import (
+            SteeringVectorRegistry,
+        )
+
+        state.steering_vector_registry = SteeringVectorRegistry()
     elif hasattr(state, "steering_module_registry"):
         delattr(state, "steering_module_registry")
 

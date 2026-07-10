@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI
 
 from vllm.entrypoints.serve.steering._merge import (
+    check_action_determinism,
     deep_merge_status,
     normalize_worker_err,
 )
@@ -201,6 +202,77 @@ class TestDeepMergeStatus:
         assert deep_merge_status([]) == {}
         assert deep_merge_status([{}, {}]) == {}
         assert deep_merge_status([None, {}]) == {}
+
+
+# --- Applied-action determinism check ---
+
+
+def _wstat(tp, pp, checksum, count):
+    return {
+        "tp_rank": tp,
+        "pp_rank": pp,
+        "action_checksum": checksum,
+        "action_count": count,
+    }
+
+
+class TestCheckActionDeterminism:
+    def test_matching_tp_ranks_consistent(self):
+        result = check_action_determinism(
+            [_wstat(0, 0, "00ff", 3), _wstat(1, 0, "00ff", 3)]
+        )
+        assert result == {"consistent": True, "action_count": 3}
+
+    def test_diverging_tp_ranks_flagged(self):
+        result = check_action_determinism(
+            [_wstat(0, 0, "00ff", 3), _wstat(1, 0, "beef", 3)]
+        )
+        assert result["consistent"] is False
+        assert result["checksums"] == {"tp0/pp0": "00ff", "tp1/pp0": "beef"}
+
+    def test_disjoint_pp_stages_not_cross_compared(self):
+        """Distinct PP stages own disjoint layers; different checksums
+        across stages are not a divergence as long as each stage is
+        internally consistent."""
+        result = check_action_determinism(
+            [
+                _wstat(0, 0, "aaaa", 2),
+                _wstat(1, 0, "aaaa", 2),
+                _wstat(0, 1, "bbbb", 2),
+                _wstat(1, 1, "bbbb", 2),
+            ]
+        )
+        assert result["consistent"] is True
+
+    def test_within_stage_divergence_flagged_under_pp(self):
+        result = check_action_determinism(
+            [
+                _wstat(0, 0, "aaaa", 2),
+                _wstat(1, 0, "aaaa", 2),
+                _wstat(0, 1, "bbbb", 2),
+                _wstat(1, 1, "cccc", 2),  # TP-diverges within stage 1
+            ]
+        )
+        assert result["consistent"] is False
+        assert result["checksums"]["tp0/pp1"] == "bbbb"
+        assert result["checksums"]["tp1/pp1"] == "cccc"
+
+    def test_ignores_workers_without_checksum(self):
+        # Uninitialized worker (steering disabled) reports None; skipped.
+        result = check_action_determinism(
+            [
+                {"tp_rank": 0, "pp_rank": 0, "action_checksum": None},
+                None,
+                _wstat(1, 0, "00ff", 5),
+            ]
+        )
+        assert result == {"consistent": True, "action_count": 5}
+
+    def test_empty_input(self):
+        assert check_action_determinism([]) == {
+            "consistent": True,
+            "action_count": 0,
+        }
 
 
 class TestGetSteeringDivergence:

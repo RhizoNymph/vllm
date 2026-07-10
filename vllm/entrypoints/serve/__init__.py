@@ -43,6 +43,12 @@ def register_vllm_serve_api_routers(app: FastAPI):
 
     attach_steering_modules_router(app)
 
+    from vllm.entrypoints.serve.steering.vectors_router import (
+        attach_router as attach_steering_vectors_router,
+    )
+
+    attach_steering_vectors_router(app)
+
     from vllm.entrypoints.serve.patch.api_router import (
         attach_router as attach_patch_sweep_router,
     )

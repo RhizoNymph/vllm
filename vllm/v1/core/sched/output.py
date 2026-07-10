@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
+    from vllm.v1.request_metadata import RequestMetadata
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
@@ -25,6 +26,7 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    RequestMetadata = object
 
 
 @dataclass
@@ -44,6 +46,12 @@ class NewRequestData:
     # ``req_id`` is the vLLM-internal id; this carries the client id so the
     # worker (e.g. capture) can surface it for attribution. Optional/None-safe.
     client_request_id: str | None = None
+
+    # Request-level host-side metadata (conversation id, future steering
+    # specs). Carried in full so new sibling fields reach the worker without
+    # extra plumbing; the runner reads ``conversation_id`` off it for the
+    # per-step ``StepRequestView``. ``None`` when the request set none.
+    request_metadata: "RequestMetadata | None" = None
 
     # Per-request steering config hashes (0 = no per-request steering)
     prefill_steering_config_hash: int = 0
@@ -84,6 +92,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             client_request_id=request.external_req_id,
+            request_metadata=request.request_metadata,
             prefill_steering_config_hash=request.prefill_steering_config_hash,
             decode_steering_config_hash=request.decode_steering_config_hash,
             prefill_token_ids=prefill_token_ids,

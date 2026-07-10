@@ -98,6 +98,10 @@ def warmup_kernels(
 
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
+    # These forwards go through the real execute_model (needed for PP
+    # coordination), unlike v1's _dummy_run. Flag them so sync capture
+    # consumers skip these synthetic startup steps.
+    model_runner._in_kernel_warmup = True
     worker_execute_model(prefill_output)
 
     if not model_runner.is_pooling_model:
@@ -150,5 +154,6 @@ def warmup_kernels(
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
+    model_runner._in_kernel_warmup = False
     model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()

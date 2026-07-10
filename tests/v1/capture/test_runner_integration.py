@@ -468,7 +468,7 @@ def test_filesystem_consumer_byte_for_byte_matches_writer(
 
 
 # ---------------------------------------------------------------------------
-# 4. ``build_consumers`` returns a three-tuple matching the expected
+# 4. ``build_consumers`` returns a four-tuple matching the expected
 #    shape the runner consumes.
 # ---------------------------------------------------------------------------
 
@@ -477,7 +477,7 @@ def test_build_consumers_returns_sinks_validators_and_name_index(
     tmp_path: pathlib.Path,
 ) -> None:
     """``vllm.v1.capture.registry.build_consumers`` fans out the config
-    into a (sinks, validators, name_to_index) three-tuple.
+    into a (sinks, validators, name_to_index, sync_consumers) four-tuple.
     """
     from unittest.mock import MagicMock, patch
 
@@ -520,11 +520,15 @@ def test_build_consumers_returns_sinks_validators_and_name_index(
         vllm_config = MagicMock()
         vllm_config.capture_consumers_config = config
 
-        sinks, validators, name_to_index = _registry.build_consumers(vllm_config)
+        sinks, validators, name_to_index, sync_consumers = (
+            _registry.build_consumers(vllm_config)
+        )
 
     try:
         assert len(sinks) == 2
         assert len(validators) == 2
+        # No sync-execution consumers configured.
+        assert sync_consumers == []
         # First entry has no instance_name → keyed by entry-point name.
         # Second entry has instance_name="mirror" → keyed by that.
         assert name_to_index["filesystem"] == 0

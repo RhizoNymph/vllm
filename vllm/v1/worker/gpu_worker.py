@@ -1062,6 +1062,9 @@ class Worker(WorkerBase):
     def get_steering_status(self) -> dict:
         return self.model_runner.get_steering_status()
 
+    def get_dynamic_steering_status(self) -> dict:
+        return self.model_runner.get_dynamic_steering_status()
+
     def register_steering_modules(
         self,
         modules: dict[str, dict],
@@ -1077,6 +1080,20 @@ class Worker(WorkerBase):
 
     def release_pre_materialized_steering_module(self, name: str) -> None:
         return self.model_runner.release_pre_materialized_steering_module(name)
+
+    def register_steering_vector_name(
+        self,
+        name: str,
+        kind: str,
+        packed: dict,
+        digest: str | None = None,
+    ) -> None:
+        return self.model_runner.register_steering_vector_name(
+            name, kind, packed, digest
+        )
+
+    def unregister_steering_vector_name(self, name: str, kind: str) -> bool:
+        return self.model_runner.unregister_steering_vector_name(name, kind)
 
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.

@@ -94,12 +94,18 @@ def _load_entry_points() -> dict[str, type[CaptureConsumer]]:
                 hasattr(cls, attr)
                 for attr in ("submit_chunk", "submit_finalize", "get_result")
             )
-            if not (is_consumer_subclass or is_direct_sink):
+            # Sync-execution consumers (``execution = "sync"``) never
+            # receive dispatched chunks, so they need not implement the
+            # sink trio nor subclass ``CaptureConsumer`` — ``on_step``
+            # is their entire data surface.
+            is_sync = _is_sync_consumer(cls) and hasattr(cls, "on_step")
+            if not (is_consumer_subclass or is_direct_sink or is_sync):
                 raise TypeError(
                     f"Entry point {ep.name!r} in group "
                     f"{ENTRY_POINT_GROUP!r} resolved to {cls!r}, which is "
-                    f"neither a CaptureConsumer subclass nor a direct "
-                    f"CaptureSink implementation."
+                    f"neither a CaptureConsumer subclass, a direct "
+                    f"CaptureSink implementation, nor a sync-execution "
+                    f"consumer (execution='sync' with on_step)."
                 )
             resolved[ep.name] = cls
 
@@ -113,18 +119,20 @@ def _load_entry_points() -> dict[str, type[CaptureConsumer]]:
 
 
 def _builtin_consumers() -> dict[str, type[CaptureConsumer]]:
-    """vLLM's in-tree consumers, registered independent of the
-    entry-point/dist-info state.
+    """vLLM's in-tree consumers, registered under reserved (leading-underscore)
+    names independent of the entry-point/dist-info state.
 
     ``--enable-patching`` relies on the ``patch_source`` consumer being
     resolvable at init. Under a Ray runtime_env (or any editable install
     whose dist-info entry points predate the consumer) the entry-point
     lookup can miss, raising ``UnknownCaptureConsumerError``. Registering
-    it here as a built-in fallback makes patching survive stale dist-info.
+    these here as built-in fallbacks makes them survive stale dist-info.
     """
     from vllm.v1.capture.consumers.patch_source import PatchSourceConsumer
+    from vllm.v1.capture.declarative import DeclarativeSteeringConsumer
 
     return {
+        "_declarative_steering": DeclarativeSteeringConsumer,
         "patch_source": PatchSourceConsumer,
     }
 
@@ -161,6 +169,115 @@ def build_consumer(
     return cls(vllm_config, params)
 
 
+def _is_sync_consumer(obj: Any) -> bool:
+    """True if a consumer class or instance declares sync execution."""
+    return getattr(obj, "execution", "async") == "sync"
+
+
+def _validate_sync_consumer(
+    name: str,
+    instance: Any,
+    vllm_config: VllmConfig,
+) -> None:
+    """Enforce the sync-execution constraints at build time.
+
+    Sync consumers run on the model-runner step thread on every TP
+    rank, reading the persistent global capture buffers. That rules
+    out: driver location (cross-process round-trip on the step
+    thread), client specs (variable per-request keys ride the
+    eager-forcing gather path, not the persistent buffers), a missing
+    global spec (nothing to monitor), and pipeline parallelism (a
+    stage only sees its own layers; cross-stage decisions need a
+    sideband — unsupported in Phase 1a; see
+    docs/design/dynamic_steering.md §6).
+    """
+    if getattr(instance, "location", "worker") != "worker":
+        raise ValueError(
+            f"Sync capture consumer {name!r} must have location='worker' "
+            f"(got {getattr(instance, 'location', None)!r}): sync "
+            f"consumers run on the model-runner step thread."
+        )
+    if getattr(instance, "reads_client_spec", False):
+        raise ValueError(
+            f"Sync capture consumer {name!r} must not set "
+            f"reads_client_spec: sync execution reads only the "
+            f"persistent global-spec buffers."
+        )
+    spec = None
+    if hasattr(instance, "global_capture_spec"):
+        spec = instance.global_capture_spec()
+    if spec is None:
+        raise ValueError(
+            f"Sync capture consumer {name!r} must return a non-None "
+            f"global_capture_spec(): it defines the monitored "
+            f"(layer, hook) keys."
+        )
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    pp_size = int(getattr(parallel_config, "pipeline_parallel_size", 1))
+    if pp_size != 1:
+        raise ValueError(
+            f"Sync capture consumer {name!r} requires "
+            f"pipeline_parallel_size=1 (got {pp_size}); see "
+            f"docs/design/dynamic_steering.md §6."
+        )
+
+
+def _iter_config_entries(vllm_config: VllmConfig) -> list[tuple[str, str | None, dict]]:
+    """Normalize config-driven consumer entries to (name, instance_name,
+    params) tuples, accepting both the ``CaptureConsumersConfig``
+    dataclass shape and the legacy list-of-dicts shape."""
+    config = getattr(vllm_config, "capture_consumers_config", None)
+    config_entries: list[Any]
+    if config is None:
+        config_entries = []
+    elif hasattr(config, "consumers"):
+        config_entries = list(config.consumers)
+    else:
+        config_entries = list(config)
+
+    normalized: list[tuple[str, str | None, dict]] = []
+    for entry in config_entries:
+        if hasattr(entry, "name"):
+            # ``CaptureConsumerSpec`` dataclass (Phase E).
+            entry_name: str = entry.name
+            instance_name: str | None = getattr(entry, "instance_name", None)
+            params: dict[str, Any] = getattr(entry, "params", {}) or {}
+        else:
+            # Legacy dict form.
+            entry_name = entry["name"]
+            instance_name = entry.get("instance_name")
+            params = entry.get("params", {}) or {}
+        normalized.append((entry_name, instance_name, params))
+    return normalized
+
+
+def build_sync_consumers(
+    vllm_config: VllmConfig,
+) -> list[tuple[str, Any]]:
+    """Construct ONLY the sync-execution consumers from config.
+
+    Used on non-zero TP ranks, where async consumers must not be
+    instantiated (their constructors have side effects — writer
+    threads, open files) but sync consumers must exist on every rank
+    for rank-replicated execution. Returns ``(instance_key, instance)``
+    pairs in config order.
+    """
+    sync_consumers: list[tuple[str, Any]] = []
+    seen: dict[str, int] = {}
+    for entry_name, instance_name, params in _iter_config_entries(vllm_config):
+        cls = load_consumer_class(entry_name)
+        if not _is_sync_consumer(cls):
+            continue
+        instance = cls(vllm_config, params)
+        _validate_sync_consumer(entry_name, instance, vllm_config)
+        key = instance_name or entry_name
+        _insert_unique(seen, key, len(sync_consumers))
+        # _insert_unique may have suffixed the key; recover it.
+        key = next(k for k, v in seen.items() if v == len(sync_consumers))
+        sync_consumers.append((key, instance))
+    return sync_consumers
+
+
 def build_consumers(
     vllm_config: VllmConfig,
     consumer_instances: list[CaptureConsumer] | None = None,
@@ -168,6 +285,7 @@ def build_consumers(
     tuple[CaptureSink, ...],
     tuple[Any, ...],
     dict[str, int],
+    list[tuple[str, Any]],
 ]:
     """Build the consumer sinks, validators, and name-to-index map.
 
@@ -193,8 +311,15 @@ def build_consumers(
     - ``location = "driver"`` → install a driver bridge via
       ``install_driver_consumer``, which returns a worker-side shim.
 
+    Sync-execution consumers (``execution = "sync"``) are constructed
+    and validated here but kept OUT of ``sinks``/``validators``/
+    ``name_to_index`` — they never receive dispatched chunks, and
+    excluding them keeps ``CaptureManager``'s per-sink consumer-index
+    bitmask dense. They are returned separately.
+
     Returns:
-        A three-tuple ``(sinks, validators, name_to_index)``:
+        A four-tuple ``(sinks, validators, name_to_index,
+        sync_consumers)``:
 
         - ``sinks`` — tuple of ``CaptureSink`` objects in the same order
           as the config entries followed by the instance list.
@@ -208,36 +333,29 @@ def build_consumers(
           for config entries and ``type(instance).__name__`` (with a
           collision suffix) for pre-constructed instances onto the
           consumer index used by ``CaptureManager.register_request``.
+        - ``sync_consumers`` — ``(instance_key, instance)`` pairs for
+          sync-execution consumers, in config order (same set
+          ``build_sync_consumers`` constructs on non-zero TP ranks).
     """
     sinks: list[CaptureSink] = []
     validators: list[Any] = []
     name_to_index: dict[str, int] = {}
+    sync_consumers: list[tuple[str, Any]] = []
+    sync_seen: dict[str, int] = {}
 
     # --- config-driven consumers (entry-point registry) ---
-    config = getattr(vllm_config, "capture_consumers_config", None)
-    # Support two shapes:
-    # 1. Phase E ``CaptureConsumersConfig`` dataclass with
-    #    ``.consumers: list[CaptureConsumerSpec]``.
-    # 2. Plain ``list[dict]`` (test + legacy convenience).
-    config_entries: list[Any]
-    if config is None:
-        config_entries = []
-    elif hasattr(config, "consumers"):
-        config_entries = list(config.consumers)
-    else:
-        config_entries = list(config)
-
-    for entry in config_entries:
-        if hasattr(entry, "name"):
-            # ``CaptureConsumerSpec`` dataclass (Phase E).
-            entry_name: str = entry.name
-            instance_name: str | None = getattr(entry, "instance_name", None)
-            params: dict[str, Any] = getattr(entry, "params", {}) or {}
-        else:
-            # Legacy dict form.
-            entry_name = entry["name"]
-            instance_name = entry.get("instance_name")
-            params = entry.get("params", {}) or {}
+    for entry_name, instance_name, params in _iter_config_entries(vllm_config):
+        cls = load_consumer_class(entry_name)
+        if _is_sync_consumer(cls):
+            instance = cls(vllm_config, params)
+            _validate_sync_consumer(entry_name, instance, vllm_config)
+            key = instance_name or entry_name
+            _insert_unique(sync_seen, key, len(sync_consumers))
+            key = next(
+                k for k, v in sync_seen.items() if v == len(sync_consumers)
+            )
+            sync_consumers.append((key, instance))
+            continue
 
         consumer = build_consumer(entry_name, vllm_config, params)
         sink = _wrap_consumer(consumer)
@@ -249,6 +367,13 @@ def build_consumers(
 
     # --- pre-constructed instances ---
     for instance in consumer_instances or []:
+        if _is_sync_consumer(instance):
+            raise ValueError(
+                f"Pre-constructed consumer {type(instance).__name__} "
+                f"declares execution='sync'; sync consumers must be "
+                f"config-driven (they are constructed inside every "
+                f"worker), not passed as driver-side instances."
+            )
         if instance.location != "driver":
             raise ValueError(
                 f"Pre-constructed CaptureConsumer instances passed to "
@@ -261,7 +386,7 @@ def build_consumers(
         validators.append(_select_validator(sink, instance))
         _insert_unique(name_to_index, type(instance).__name__, len(sinks) - 1)
 
-    return tuple(sinks), tuple(validators), name_to_index
+    return tuple(sinks), tuple(validators), name_to_index, sync_consumers
 
 
 def build_admission_validators(vllm_config: VllmConfig) -> dict[str, Any]:

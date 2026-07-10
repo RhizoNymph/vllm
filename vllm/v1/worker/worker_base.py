@@ -193,6 +193,9 @@ class WorkerBase:
     def get_steering_status(self) -> dict:
         raise NotImplementedError
 
+    def get_dynamic_steering_status(self) -> dict:
+        raise NotImplementedError
+
     def register_steering_modules(
         self,
         modules: dict[str, dict],
@@ -207,6 +210,18 @@ class WorkerBase:
         raise NotImplementedError
 
     def release_pre_materialized_steering_module(self, name: str) -> None:
+        raise NotImplementedError
+
+    def register_steering_vector_name(
+        self,
+        name: str,
+        kind: str,
+        packed: dict,
+        digest: str | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def unregister_steering_vector_name(self, name: str, kind: str) -> bool:
         raise NotImplementedError
 
     @property

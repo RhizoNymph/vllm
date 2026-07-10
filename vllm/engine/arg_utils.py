@@ -597,6 +597,13 @@ class EngineArgs:
     # Steering fields
     enable_steering: bool = False
     max_steering_configs: int = SteeringConfig.max_steering_configs
+    max_dynamic_steering_configs: int = SteeringConfig.max_dynamic_steering_configs
+    enable_cross_layer_monitor: bool = SteeringConfig.enable_cross_layer_monitor
+    enable_row_monitor: bool = SteeringConfig.enable_row_monitor
+    enable_declarative_gates: bool = SteeringConfig.enable_declarative_gates
+    declarative_probe_sites: list[str] = get_field(
+        SteeringConfig, "declarative_probe_sites"
+    )
     # Patching fields
     enable_patching: bool = False
     max_patch_slots: int = PatchConfig.max_patch_slots
@@ -1463,6 +1470,26 @@ class EngineArgs:
             "--max-steering-configs",
             **steering_kwargs["max_steering_configs"],
         )
+        steering_group.add_argument(
+            "--max-dynamic-steering-configs",
+            **steering_kwargs["max_dynamic_steering_configs"],
+        )
+        steering_group.add_argument(
+            "--enable-cross-layer-monitor",
+            **steering_kwargs["enable_cross_layer_monitor"],
+        )
+        steering_group.add_argument(
+            "--enable-row-monitor",
+            **steering_kwargs["enable_row_monitor"],
+        )
+        steering_group.add_argument(
+            "--enable-declarative-gates",
+            **steering_kwargs["enable_declarative_gates"],
+        )
+        steering_group.add_argument(
+            "--declarative-probe-sites",
+            **steering_kwargs["declarative_probe_sites"],
+        )
 
         # Patching related configs
         patch_kwargs = get_kwargs(PatchConfig)
@@ -2213,6 +2240,11 @@ class EngineArgs:
         steering_config = (
             SteeringConfig(
                 max_steering_configs=self.max_steering_configs,
+                max_dynamic_steering_configs=self.max_dynamic_steering_configs,
+                enable_cross_layer_monitor=self.enable_cross_layer_monitor,
+                enable_row_monitor=self.enable_row_monitor,
+                enable_declarative_gates=self.enable_declarative_gates,
+                declarative_probe_sites=self.declarative_probe_sites,
             )
             if self.enable_steering
             else None

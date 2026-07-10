@@ -16,6 +16,10 @@ import numpy as np
 
 from vllm.v1.worker.gpu.capture_runner_mixin import CaptureRunnerMixin
 
+# Sentinel distinguishing "request_metadata not supplied" (build a default
+# namespace) from an explicit ``request_metadata=None`` (offline path).
+_UNSET = object()
+
 
 class _Glue(CaptureRunnerMixin):
     """Minimal host exposing only what the view builders / drain read."""
@@ -200,6 +204,9 @@ class _AddGlue(CaptureRunnerMixin):
         self._capture_feature_enabled = True
         self._capture_step_gate = gate
         self._capture_manager = mgr
+        self._sync_conversation_ids = {}
+        # Mirrors capture_runner_mixin.py:113 self._sync_steering_gates = {}
+        self._sync_steering_gates = {}
         self.registered_calls = []
 
     # Stub the full registration machinery; only the branching is under test.
@@ -209,10 +216,19 @@ class _AddGlue(CaptureRunnerMixin):
             self._capture_manager._reqs.add(new_req_data.req_id)
 
 
-def _new_req(req_id, capture):
+def _new_req(req_id, capture, conversation_id=None, request_metadata=_UNSET):
+    # conversation_id now travels on request_metadata, not sampling_params.
+    # Pass ``request_metadata=None`` to exercise the no-metadata (offline) path.
+    if request_metadata is _UNSET:
+        # steering mirrors RequestMetadata.steering (request_metadata.py:56),
+        # read by _capture_add_request as rmeta.steering.
+        request_metadata = SimpleNamespace(
+            conversation_id=conversation_id, steering=None
+        )
     return SimpleNamespace(
         req_id=req_id,
         sampling_params=SimpleNamespace(capture=capture),
+        request_metadata=request_metadata,
     )
 
 
@@ -286,3 +302,251 @@ def test_capture_add_disabled_is_noop():
 
     assert gate.registered == {} and gate.dropped == []
     assert glue.registered_calls == []
+
+
+# ---- sync-execution consumers ---------------------------------------------
+
+
+class _FakeSyncBuffers:
+    """Stand-in for the (slim or full) CaptureManager owning global buffers."""
+
+    def __init__(self, buffers):
+        self._buffers = buffers
+
+    def global_buffer(self, key):
+        return self._buffers.get(key)
+
+
+class _RecordingConsumer:
+    """Sync consumer that records the views it sees and returns canned actions."""
+
+    def __init__(self, actions=None, raises=False):
+        self._actions = actions
+        self._raises = raises
+        self.seen = []
+
+    def on_step(self, view):
+        self.seen.append(view)
+        if self._raises:
+            raise RuntimeError("boom")
+        return self._actions
+
+
+class _SyncGlue(CaptureRunnerMixin):
+    """Host exposing only the sync-consumer surface + a stubbed steering apply."""
+
+    def __init__(self, req_states, consumers, buffers, monitor_keys):
+        self.req_states = req_states
+        self._sync_consumers = consumers
+        self._sync_capture_buffers = _FakeSyncBuffers(buffers)
+        self._sync_monitor_keys = monitor_keys
+        self._sync_consumer_stats = {}
+        self._sync_step_counter = 0
+        self._sync_timing_events = None  # CPU: wall-time accounting path
+        self._sync_conversation_ids = {}
+        # Mirrors capture_runner_mixin.py:113 self._sync_steering_gates = {}
+        self._sync_steering_gates = {}
+        self.applied = []
+
+    # The steering mixin provides this on the real runner (resolved via MRO).
+    def _apply_steering_actions(self, actions, source):
+        self.applied.append((source, actions))
+
+
+def _sync_input_batch():
+    # Batch is decode-first: d (1 decode token) then p (3 prefill tokens).
+    return SimpleNamespace(
+        num_tokens=4,
+        num_reqs=2,
+        req_ids=["d", "p"],
+        idx_mapping_np=np.asarray([0, 1], dtype=np.int32),
+        query_start_loc_np=np.asarray([0, 1, 4], dtype=np.int32),
+    )
+
+
+def test_step_capture_view_slices_buffers_and_spans():
+    rs = _req_states(
+        prompt_len=[5, 10],
+        num_computed=[5, 0],
+        req_id_to_index={"d": 0, "p": 1},
+    )
+    key = (3, "post_block")
+    buf = np.arange(8 * 2, dtype=np.float32).reshape(8, 2)
+    glue = _SyncGlue(rs, [], {key: buf}, [key])
+    sched = SimpleNamespace(
+        num_scheduled_tokens={"d": 1, "p": 3}, total_num_scheduled_tokens=4
+    )
+
+    view = glue._build_step_capture_view(sched, _sync_input_batch())
+
+    # Tensor sliced to the unpadded forward token count.
+    assert view.tensors[key].shape[0] == 4
+    # Per-request spans from query_start_loc_np; phase from req_states.
+    assert [(r.req_id, r.start, r.end, r.phase) for r in view.requests] == [
+        ("d", 0, 1, "decode"),  # num_computed 5 >= prompt 5
+        ("p", 1, 4, "prefill"),  # num_computed 0 < prompt 10
+    ]
+    # v2 exposes no input-token window (GPU-resident); token_ids is empty.
+    assert all(r.token_ids.size == 0 for r in view.requests)
+
+
+def test_run_sync_consumers_applies_actions_and_counts_steps():
+    rs = _req_states([5], [5], {"d": 0})
+    actions = [object()]
+    consumer = _RecordingConsumer(actions=actions)
+    glue = _SyncGlue(rs, [("probe", consumer)], {}, [])
+    sched = SimpleNamespace(num_scheduled_tokens={"d": 1}, total_num_scheduled_tokens=1)
+    ib = SimpleNamespace(
+        num_tokens=1,
+        num_reqs=1,
+        req_ids=["d"],
+        idx_mapping_np=np.asarray([0], dtype=np.int32),
+        query_start_loc_np=np.asarray([0, 1], dtype=np.int32),
+    )
+
+    glue._run_sync_consumers(sched, ib)
+
+    assert glue._sync_step_counter == 1
+    assert len(consumer.seen) == 1
+    # Returned actions routed through the steering apply with the consumer name.
+    assert glue.applied == [("probe", actions)]
+    assert glue._sync_consumer_stats["probe"]["steps"] == 1
+
+
+def test_run_sync_consumers_isolates_exceptions():
+    rs = _req_states([5], [5], {"d": 0})
+    consumer = _RecordingConsumer(raises=True)
+    glue = _SyncGlue(rs, [("probe", consumer)], {}, [])
+    sched = SimpleNamespace(num_scheduled_tokens={"d": 1}, total_num_scheduled_tokens=1)
+    ib = SimpleNamespace(
+        num_tokens=1,
+        num_reqs=1,
+        req_ids=["d"],
+        idx_mapping_np=np.asarray([0], dtype=np.int32),
+        query_start_loc_np=np.asarray([0, 1], dtype=np.int32),
+    )
+
+    # A raising consumer must not abort the step nor apply any actions.
+    glue._run_sync_consumers(sched, ib)
+
+    assert glue.applied == []
+    assert glue._sync_consumer_stats["probe"]["steps"] == 1
+
+
+def test_in_kernel_warmup_flag_defaults_false():
+    # The runner gate (``not self._in_kernel_warmup``) relies on this default so
+    # real serving steps always run sync consumers.
+    assert CaptureRunnerMixin._in_kernel_warmup is False
+
+
+def test_warmup_kernels_flags_execute_model_as_warmup(monkeypatch):
+    # ``warmup_kernels`` drives synthetic forwards through the *real*
+    # execute_model (v2-only), so it must mark them as warmup the whole time and
+    # clear the flag afterward — that is exactly what the runner's sync-consumer
+    # gate keys off. Stub the request builders/synchronize so this stays CPU-only.
+    import torch
+
+    from vllm.v1.worker.gpu import warmup as warmup_mod
+
+    monkeypatch.setattr(warmup_mod, "Request", lambda *a, **k: object())
+    monkeypatch.setattr(
+        warmup_mod.NewRequestData,
+        "from_request",
+        staticmethod(lambda *a, **k: object()),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *a, **k: None)
+
+    model_runner = SimpleNamespace(
+        num_speculative_steps=0,
+        decode_query_len=1,
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
+            ],
+            num_blocks=100,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=8),
+        is_pooling_model=True,  # skips sampler/decode/grammar branches
+        is_last_pp_rank=True,
+        kv_connector=SimpleNamespace(set_disabled=lambda _disabled: None),
+        _in_kernel_warmup=False,
+    )
+
+    # Record the flag value seen during each real forward.
+    seen_flags: list[bool] = []
+    warmup_mod.warmup_kernels(
+        model_runner,
+        worker_execute_model=lambda _out: seen_flags.append(
+            model_runner._in_kernel_warmup
+        ),
+        worker_sample_tokens=lambda _g: None,
+    )
+
+    # Flag was set for every warmup forward (prefill + cleanup) and cleared after.
+    assert seen_flags and all(seen_flags)
+    assert model_runner._in_kernel_warmup is False
+
+
+# ---- conversation id plumbing ---------------------------------------------
+
+
+def test_capture_add_stashes_conversation_id():
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _AddGlue(gate, mgr)
+
+    glue._capture_add_request(
+        _new_req("a", {"c": {}}, conversation_id="conv-9"), was_present=False
+    )
+
+    assert glue._sync_conversation_ids == {"a": "conv-9"}
+
+
+def test_capture_add_missing_conversation_id_is_none():
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _AddGlue(gate, mgr)
+
+    glue._capture_add_request(_new_req("a", {"c": {}}), was_present=False)
+
+    assert glue._sync_conversation_ids == {"a": None}
+
+
+def test_capture_add_no_request_metadata_is_none():
+    # Offline / non-OpenAI path: request_metadata is None entirely.
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _AddGlue(gate, mgr)
+
+    glue._capture_add_request(
+        _new_req("a", {"c": {}}, request_metadata=None), was_present=False
+    )
+
+    assert glue._sync_conversation_ids == {"a": None}
+
+
+def test_capture_finish_drops_conversation_id():
+    glue = _AddGlue(_FakeGate(), None)
+    glue._sync_conversation_ids["a"] = "conv-1"
+
+    glue._capture_finish_request("a")
+
+    assert "a" not in glue._sync_conversation_ids
+
+
+def test_step_capture_view_carries_conversation_id():
+    rs = _req_states(
+        prompt_len=[5, 10],
+        num_computed=[5, 0],
+        req_id_to_index={"d": 0, "p": 1},
+    )
+    key = (3, "post_block")
+    buf = np.arange(8 * 2, dtype=np.float32).reshape(8, 2)
+    glue = _SyncGlue(rs, [], {key: buf}, [key])
+    # Only "d" is tagged; "p" has no conversation id (defaults to None).
+    glue._sync_conversation_ids = {"d": "conv-1"}
+    sched = SimpleNamespace(
+        num_scheduled_tokens={"d": 1, "p": 3}, total_num_scheduled_tokens=4
+    )
+
+    view = glue._build_step_capture_view(sched, _sync_input_batch())
+
+    convs = {r.req_id: r.conversation_id for r in view.requests}
+    assert convs == {"d": "conv-1", "p": None}
