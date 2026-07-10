@@ -65,7 +65,11 @@
 
   .panes { display: grid; gap: 14px; }
   .panes.two { grid-template-columns: 1fr 1fr; }
+  .panes.three { grid-template-columns: 1fr 1fr 1fr; }
+  @media (max-width: 1400px) { .panes.three { grid-template-columns: 1fr; } }
   @media (max-width: 1200px) { .panes.two { grid-template-columns: 1fr; } }
+  .pane.steeredll h2 { color: var(--teal); }
+  .pane.steeredll h2 .tag { border-color: var(--teal-dim); }
   .pane { min-height: 120px; }
   .pane h2 .tag { font: 10px var(--mono); border: 1px solid var(--line);
                   border-radius: 3px; padding: 1px 6px; margin-left: 8px; }
@@ -137,6 +141,8 @@
         <label><input type="checkbox" class="lyr" value="40" checked> L40</label>
         <label><input type="checkbox" class="lyr" value="50" checked> L50</label>
       </div>
+      <label class="row"><input type="checkbox" id="compareLL">
+        compare: logit-lens direction (3rd pane)</label>
       <button id="go">Generate</button>
       <div class="hint">Greedy, seed 0. With steering on, a baseline runs first
         for comparison; the ticker follows the steered pass.</div>
@@ -149,8 +155,12 @@
       <div class="out" id="outBaseline"><span class="empty">—</span></div>
     </div>
     <div class="panel pane steered" id="paneSteered" hidden>
-      <h2>Completion <span class="tag">steered</span></h2>
+      <h2>Completion <span class="tag">steered · jacobian</span></h2>
       <div class="out" id="outSteered"><span class="empty">—</span></div>
+    </div>
+    <div class="panel pane steeredll" id="paneSteeredLL" hidden>
+      <h2>Completion <span class="tag">steered · logit-lens</span></h2>
+      <div class="out" id="outSteeredLL"><span class="empty">—</span></div>
     </div>
   </section>
 
@@ -211,8 +221,11 @@ function appendText(container, refNode, text) {
   else container.insertBefore(document.createTextNode(text), refNode ?? null);
 }
 
+const OUT_FOR_PANE = { baseline: "outBaseline", steered: "outSteered", steered_ll: "outSteeredLL" };
+const PANE_EL = { baseline: "paneBaseline", steered: "paneSteered", steered_ll: "paneSteeredLL" };
+
 function appendToken(pane, channel, text) {
-  const out = pane === "steered" ? $("outSteered") : $("outBaseline");
+  const out = $(OUT_FOR_PANE[pane] ?? "outBaseline");
   const cursor = out.querySelector(".cursor");
   if (channel === "think") {
     let think = out.querySelector("details.think .tcontent");
@@ -311,7 +324,7 @@ $("go").addEventListener("click", async () => {
   const steering = $("steerOn").checked;
   const layers = [...document.querySelectorAll(".lyr:checked")].map(c => +c.value);
   if (steering && !layers.length) { alert("pick at least one injection layer"); return; }
-  resetUI(steering);
+  resetUI(steering, steering && $("compareLL").checked);
   controller = new AbortController();
   $("go").textContent = "Stop";
   $("go").classList.add("stop");
@@ -328,6 +341,7 @@ $("go").addEventListener("click", async () => {
           word: $("steerWord").value,
           strength: parseFloat($("strength").value),
           layers,
+          compare_logit: $("compareLL").checked,
         } : null,
       }),
     });
@@ -349,16 +363,14 @@ $("go").addEventListener("click", async () => {
         } else if (ev.type === "readout") {
           readoutEvent(ev);
         } else if (ev.type === "cached") {
-          const h = (ev.pane === "steered" ? $("paneSteered") : $("paneBaseline"))
-            .querySelector("h2");
+          const h = $(PANE_EL[ev.pane] ?? "paneBaseline").querySelector("h2");
           if (!h.querySelector(".cachedtag")) {
             const t = document.createElement("span");
             t.className = "tag cachedtag"; t.textContent = "cached";
             h.append(t);
           }
         } else if (ev.type === "pane_done") {
-          const out = ev.pane === "steered" ? $("outSteered") : $("outBaseline");
-          out.querySelector(".cursor")?.remove();
+          $(OUT_FOR_PANE[ev.pane] ?? "outBaseline").querySelector(".cursor")?.remove();
         }
       }
     }

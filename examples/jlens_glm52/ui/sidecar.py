@@ -78,12 +78,16 @@ class Lens:
             "/mnt/data/artifacts/GLM-5.2", trust_remote_code=True
         )
 
-    def steering_spec(self, word: str, strength: float, layers: list[int]) -> dict:
+    def steering_spec(self, word: str, strength: float, layers: list[int],
+                      lens_type: str = "JACOBIAN_LENS") -> dict:
         token_id = self.tok(word, add_special_tokens=False).input_ids[0]
         rows, scales = [], []
         for layer in layers:
             w = self.norm_w * self.lm_head[token_id]
-            d = w @ self.J[layer]
+            if lens_type == "LOGIT_LENS" or layer not in self.J:
+                d = w.clone()  # raw unembed direction, no transport
+            else:
+                d = w @ self.J[layer]
             d = d / d.norm() * self.norms[layer]
             rows.append(d.numpy().astype("<f4"))
             scales.append(strength)
@@ -356,7 +360,7 @@ async def generate(body: dict) -> StreamingResponse:
     steer = body.get("steer")  # {word, strength, layers} | None
     rid = f"jlens-{uuid.uuid4().hex[:12]}"
 
-    def payload(steered: bool) -> dict:
+    def payload(steered: bool, lens_type: str = "JACOBIAN_LENS") -> dict:
         p = {
             "model": "glm-5.2",
             "messages": [{"role": "user", "content": prompt}],
@@ -379,6 +383,7 @@ async def generate(body: dict) -> StreamingResponse:
                 str(steer["word"]),
                 float(steer["strength"]),
                 [int(l) for l in steer.get("layers", [40])],
+                lens_type=lens_type,
             )
             p["decode_steering_vectors"] = spec
         return p
@@ -396,9 +401,11 @@ async def generate(body: dict) -> StreamingResponse:
                 "layers": sorted(int(l) for l in steer.get("layers", [40])),
             }
 
+        compare_ll = bool(steer and steer.get("compare_logit"))
+
         async def run() -> None:
             if steer:
-                # readout ticker follows the steered pane
+                # readout ticker follows the (jacobian-)steered pane
                 await _generate_pane(
                     "baseline", payload(False), queue, with_readout=False,
                     cache_key=_cache_key({**base_desc, "readout": False}),
@@ -409,6 +416,15 @@ async def generate(body: dict) -> StreamingResponse:
                         {**base_desc, "readout": True, "steer": steer_desc}
                     ),
                 )
+                if compare_ll:
+                    await _generate_pane(
+                        "steered_ll", payload(True, "LOGIT_LENS"), queue,
+                        with_readout=False,
+                        cache_key=_cache_key({
+                            **base_desc, "readout": False,
+                            "steer": {**steer_desc, "lens": "LOGIT_LENS"},
+                        }),
+                    )
             else:
                 await _generate_pane(
                     "baseline", payload(False), queue, with_readout=True,
