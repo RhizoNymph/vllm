@@ -29,6 +29,7 @@ import glob
 import json
 import os
 import time
+import uuid
 
 import httpx
 import numpy as np
@@ -101,17 +102,13 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-async def _tail_readout(started: float, queue: asyncio.Queue, stop: asyncio.Event) -> None:
-    """Find the readout JSONL created after `started` and stream its lines."""
-    # Keep looking for a short grace period after the pane finishes: on NFS
-    # the file may become visible to other nodes late (run the sidecar on the
-    # same node as the vllm server to avoid the lag entirely).
+async def _tail_readout(req_prefix: str, started: float, queue: asyncio.Queue,
+                        stop: asyncio.Event) -> None:
+    """Find this request's readout JSONL (filename embeds the client request
+    id — exact handshake, no timing race) and stream its lines."""
     path = None
     while path is None:
-        candidates = [
-            f for f in glob.glob(os.path.join(READOUT_DIR, "*.jsonl"))
-            if os.path.getmtime(f) >= started - 0.5
-        ]
+        candidates = glob.glob(os.path.join(READOUT_DIR, f"*{req_prefix}*.jsonl"))
         if candidates:
             path = max(candidates, key=os.path.getmtime)
         elif stop.is_set() and time.time() - started > 15:
@@ -146,7 +143,20 @@ async def _generate_pane(
 ) -> None:
     started = time.time()
     stop = asyncio.Event()
-    tail = asyncio.create_task(_tail_readout(started, queue, stop)) if with_readout else None
+    tail = (
+        asyncio.create_task(
+            _tail_readout(payload["request_id"], started, queue, stop)
+        )
+        if with_readout
+        else None
+    )
+    # GLM-5.2's chat template pre-opens a <think> block: streamed content is
+    # reasoning until the closing tag. Label channels so the UI can render
+    # thinking distinctly; strip the tags themselves. Tags may split across
+    # deltas, so hold back a partial-tag suffix.
+    thinking_enabled = "chat_template_kwargs" not in payload
+    channel = "think" if thinking_enabled else "answer"
+    carry = ""
     try:
         async with httpx.AsyncClient(timeout=900) as client:
             async with client.stream(
@@ -161,8 +171,34 @@ async def _generate_pane(
                     delta = (
                         json.loads(data)["choices"][0].get("delta", {}).get("content")
                     )
-                    if delta:
-                        await queue.put({"type": "token", "pane": pane, "text": delta})
+                    if not delta:
+                        continue
+                    buf = carry + delta
+                    carry = ""
+                    while buf:
+                        if channel == "think" and "</think>" in buf:
+                            pre, buf = buf.split("</think>", 1)
+                            pre = pre.replace("<think>", "")
+                            if pre:
+                                await queue.put({"type": "token", "pane": pane,
+                                                 "channel": "think", "text": pre})
+                            channel = "answer"
+                            continue
+                        # hold back a suffix that could be a split tag
+                        hold = 0
+                        for k in range(min(8, len(buf)), 0, -1):
+                            if "</think>"[:k] == buf[-k:] or "<think>"[:k] == buf[-k:]:
+                                hold = k
+                                break
+                        emit, carry = (buf[:-hold], buf[-hold:]) if hold else (buf, "")
+                        emit = emit.replace("<think>", "")
+                        if emit:
+                            await queue.put({"type": "token", "pane": pane,
+                                             "channel": channel, "text": emit})
+                        buf = ""
+                if carry:
+                    await queue.put({"type": "token", "pane": pane,
+                                     "channel": channel, "text": carry})
     finally:
         stop.set()
         if tail:
@@ -184,8 +220,10 @@ async def info() -> dict:
 @app.post("/api/generate")
 async def generate(body: dict) -> StreamingResponse:
     prompt = body.get("prompt", "").strip() or "Tell me about your weekend plans."
-    max_tokens = min(int(body.get("max_tokens", 96)), 256)
+    max_tokens = min(int(body.get("max_tokens", 96)), 2048)
+    thinking = bool(body.get("thinking", True))
     steer = body.get("steer")  # {word, strength, layers} | None
+    rid = f"jlens-{uuid.uuid4().hex[:12]}"
 
     def payload(steered: bool) -> dict:
         p = {
@@ -195,10 +233,16 @@ async def generate(body: dict) -> StreamingResponse:
             "temperature": 0,
             "seed": 0,
             "stream": True,
+            # handshake: the consumer names its readout file by the internal
+            # request id, which embeds this client-supplied id — the tailer
+            # matches by prefix instead of racing on mtimes (multi-user safe)
+            "request_id": f"{rid}-{'s' if steered else 'b'}",
             "capture": {
                 "jlens": {"hooks": {"post_block": BAND}, "positions": "all_generated"}
             },
         }
+        if not thinking:
+            p["chat_template_kwargs"] = {"enable_thinking": False}
         if steered and steer:
             spec = LENS.steering_spec(
                 str(steer["word"]),

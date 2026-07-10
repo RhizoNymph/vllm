@@ -75,6 +75,15 @@
     padding: 10px 14px 14px; color: var(--text); min-height: 80px;
   }
   .out .cursor { color: var(--teal); animation: blink 1s steps(1) infinite; }
+  details.think {
+    border-left: 2px solid var(--line); margin: 0 0 10px; padding: 0 0 0 10px;
+    color: var(--dim); font-size: 12px;
+  }
+  details.think summary {
+    cursor: pointer; color: var(--dim); font: 600 10.5px var(--sans);
+    text-transform: uppercase; letter-spacing: 0.08em; user-select: none;
+  }
+  details.think .tcontent { white-space: pre-wrap; word-break: break-word; }
   @keyframes blink { 50% { opacity: 0; } }
   @media (prefers-reduced-motion: reduce) { .out .cursor { animation: none; } }
 
@@ -109,6 +118,8 @@
       <label class="row">max tokens
         <input type="text" id="maxTokens" value="96" style="width:64px">
       </label>
+      <label class="row"><input type="checkbox" id="thinkOn" checked>
+        thinking (labeled separately in output)</label>
     </div>
     <h2>Steering <span class="hint">(lens-derived direction)</span></h2>
     <div class="body">
@@ -183,10 +194,22 @@ function resetUI(steering) {
   rows = new Map(); posOrder = []; tokens = [];
 }
 
-function appendToken(pane, text) {
+function appendToken(pane, channel, text) {
   const out = pane === "steered" ? $("outSteered") : $("outBaseline");
   const cursor = out.querySelector(".cursor");
-  out.insertBefore(document.createTextNode(text), cursor);
+  if (channel === "think") {
+    let think = out.querySelector("details.think .tcontent");
+    if (!think) {
+      const d = document.createElement("details");
+      d.className = "think"; d.open = true;
+      d.innerHTML = "<summary>thinking</summary><div class='tcontent'></div>";
+      out.insertBefore(d, cursor);
+      think = d.querySelector(".tcontent");
+    }
+    think.append(document.createTextNode(text));
+  } else {
+    out.insertBefore(document.createTextNode(text), cursor);
+  }
 }
 
 function tickerToken(text) {
@@ -255,6 +278,7 @@ $("go").addEventListener("click", async () => {
       body: JSON.stringify({
         prompt: $("prompt").value,
         max_tokens: parseInt($("maxTokens").value) || 96,
+        thinking: $("thinkOn").checked,
         steer: steering ? {
           word: $("steerWord").value,
           strength: parseFloat($("strength").value),
@@ -275,7 +299,7 @@ $("go").addEventListener("click", async () => {
         if (!part.startsWith("data: ")) continue;
         const ev = JSON.parse(part.slice(6));
         if (ev.type === "token") {
-          appendToken(ev.pane, ev.text);
+          appendToken(ev.pane, ev.channel, ev.text);
           if (ev.pane === tickerPane) tickerToken(ev.text);
         } else if (ev.type === "readout") {
           readoutEvent(ev);
