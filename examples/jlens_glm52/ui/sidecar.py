@@ -360,7 +360,8 @@ async def generate(body: dict) -> StreamingResponse:
     steer = body.get("steer")  # {word, strength, layers} | None
     rid = f"jlens-{uuid.uuid4().hex[:12]}"
 
-    def payload(steered: bool, lens_type: str = "JACOBIAN_LENS") -> dict:
+    def payload(steered: bool, lens_type: str = "JACOBIAN_LENS",
+                strength_scale: float = 1.0) -> dict:
         p = {
             "model": "glm-5.2",
             "messages": [{"role": "user", "content": prompt}],
@@ -381,7 +382,7 @@ async def generate(body: dict) -> StreamingResponse:
         if steered and steer:
             spec = LENS.steering_spec(
                 str(steer["word"]),
-                float(steer["strength"]),
+                float(steer["strength"]) * strength_scale,
                 [int(l) for l in steer.get("layers", [40])],
                 lens_type=lens_type,
             )
@@ -417,12 +418,16 @@ async def generate(body: dict) -> StreamingResponse:
                     ),
                 )
                 if compare_ll:
+                    ll_coef = float(steer.get("ll_coef", 1.0))
                     await _generate_pane(
-                        "steered_ll", payload(True, "LOGIT_LENS"), queue,
+                        "steered_ll",
+                        payload(True, "LOGIT_LENS", strength_scale=ll_coef),
+                        queue,
                         with_readout=False,
                         cache_key=_cache_key({
                             **base_desc, "readout": False,
-                            "steer": {**steer_desc, "lens": "LOGIT_LENS"},
+                            "steer": {**steer_desc, "lens": "LOGIT_LENS",
+                                      "ll_coef": ll_coef},
                         }),
                     )
             else:

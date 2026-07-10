@@ -143,6 +143,11 @@
       </div>
       <label class="row"><input type="checkbox" id="compareLL">
         compare: logit-lens direction (3rd pane)</label>
+      <div class="slider-row">
+        <input type="range" id="llCoef" min="0.25" max="4" step="0.05" value="1">
+        <span id="llCoefVal" style="font: 13px var(--mono); color: var(--teal); text-align: right;">×1.00</span>
+      </div>
+      <div class="hint">logit-lens strength multiplier (relative to jacobian pane)</div>
       <button id="go">Generate</button>
       <div class="hint">Greedy, seed 0. With steering on, a baseline runs first
         for comparison; the ticker follows the steered pass.</div>
@@ -182,6 +187,10 @@ const BAND = [30, 40, 50];
 fetch("/api/info").then(r => r.json()).then(i => {
   $("info").textContent = `${i.model} · lens ${i.lens}`;
 }).catch(() => { $("info").textContent = "sidecar unreachable"; });
+
+$("llCoef").addEventListener("input", () => {
+  $("llCoefVal").textContent = "\u00d7" + parseFloat($("llCoef").value).toFixed(2);
+});
 
 $("strength").addEventListener("input", () => {
   const v = parseFloat($("strength").value);
@@ -344,6 +353,7 @@ $("go").addEventListener("click", async () => {
           strength: parseFloat($("strength").value),
           layers,
           compare_logit: $("compareLL").checked,
+          ll_coef: parseFloat($("llCoef").value),
         } : null,
       }),
     });
