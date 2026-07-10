@@ -202,12 +202,14 @@ let genTokens;   // Set of trimmed-lowercase generated token strings
 let steerWord;   // cached lowercase steer word for the run ('' = off)
 let scrollQueued;
 
-function resetUI(steering) {
+function resetUI(steering, compareLL) {
   $("paneSteered").hidden = !steering;
-  $("panes").className = steering ? "panes two" : "panes";
+  $("paneSteeredLL").hidden = !(steering && compareLL);
+  $("panes").className = steering ? (compareLL ? "panes three" : "panes two") : "panes";
   document.querySelectorAll(".cachedtag").forEach(t => t.remove());
   $("outBaseline").innerHTML = "<span class='cursor'>▌</span>";
   $("outSteered").innerHTML = steering ? "<span class='cursor'>▌</span>" : "";
+  $("outSteeredLL").innerHTML = (steering && compareLL) ? "<span class='cursor'>▌</span>" : "";
   $("tickerBody").innerHTML = "";
   rows = new Map(); rowRefs = []; lastPos = -Infinity;
   tokenCount = 0; tokenStrs = []; genTokens = new Set(); scrollQueued = false;
