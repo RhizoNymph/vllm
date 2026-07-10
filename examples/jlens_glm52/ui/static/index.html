@@ -117,7 +117,7 @@
     <div class="body">
       <textarea id="prompt" rows="4">Tell me about your weekend plans.</textarea>
       <label class="row">max tokens
-        <input type="text" id="maxTokens" value="96" style="width:64px">
+        <input type="text" id="maxTokens" value="4096" style="width:64px">
       </label>
       <label class="row"><input type="checkbox" id="thinkOn" checked>
         thinking (labeled separately in output)</label>
@@ -313,7 +313,7 @@ $("go").addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         prompt: $("prompt").value,
-        max_tokens: parseInt($("maxTokens").value) || 96,
+        max_tokens: parseInt($("maxTokens").value) || 4096,
         thinking: $("thinkOn").checked,
         steer: steering ? {
           word: $("steerWord").value,
