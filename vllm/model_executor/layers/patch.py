@@ -97,11 +97,57 @@ def get_patch_buffer_config(vllm_config: VllmConfig) -> int:
 
 
 def get_patch_source_cache_bytes(vllm_config: VllmConfig) -> int:
-    """Return the patch source-store byte budget, or 0 when disabled."""
+    """Return the raw patch source-store budget setting.
+
+    ``-1`` means auto-size (see :func:`resolve_patch_source_cache_bytes`), ``0``
+    disables the store, a positive value is an explicit byte budget. ``0`` is
+    also returned when patching is not configured.
+    """
     patch_config = getattr(vllm_config, "patch_config", None)
     if patch_config is None:
         return 0
     return int(getattr(patch_config, "patch_source_cache_bytes", 0))
+
+
+# Auto-size policy for the source store (the ``-1`` sentinel). The store must
+# hold ~one full clean run's captured activations; that size is deterministic
+# from the model, so patching provisions it without a manual byte budget.
+_PATCH_SOURCE_AUTO_POS_CAP = 4096  # size for clean prompts up to this length
+_PATCH_SOURCE_AUTO_HEADROOM = 2  # keep ~2 clean runs (whole-run LRU eviction)
+_PATCH_SOURCE_AUTO_FLOOR = 256 * 1024 * 1024  # >= 256 MiB
+_PATCH_SOURCE_AUTO_CEIL = 8 * 1000 * 1000 * 1000  # <= 8 GB by default
+
+
+def resolve_patch_source_cache_bytes(
+    vllm_config: VllmConfig,
+    *,
+    hidden_size: int,
+    num_patch_layers: int,
+    num_hooks: int,
+    dtype: torch.dtype,
+) -> int:
+    """Resolve the source-store byte budget, expanding the ``-1`` auto sentinel.
+
+    Auto (``-1``, the default) sizes the store to hold ~one full clean run's
+    captured activations (``hidden x layers x hooks x positions x dtype``) with
+    headroom, clamped to a sane [floor, ceiling]. ``0`` (disabled) and positive
+    (explicit) settings pass through unchanged.
+    """
+    raw = get_patch_source_cache_bytes(vllm_config)
+    if raw >= 0:
+        return raw
+    dtype_bytes = torch.empty(0, dtype=dtype).element_size()
+    max_len = int(getattr(vllm_config.model_config, "max_model_len", 0) or 0)
+    positions = (
+        min(max_len, _PATCH_SOURCE_AUTO_POS_CAP)
+        if max_len > 0
+        else _PATCH_SOURCE_AUTO_POS_CAP
+    )
+    one_run = (
+        hidden_size * num_patch_layers * max(1, num_hooks) * positions * dtype_bytes
+    )
+    budget = one_run * _PATCH_SOURCE_AUTO_HEADROOM
+    return max(_PATCH_SOURCE_AUTO_FLOOR, min(budget, _PATCH_SOURCE_AUTO_CEIL))
 
 
 def register_patch_buffers(
