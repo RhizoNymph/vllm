@@ -12,9 +12,23 @@ set -euo pipefail
 VENV_DIR="${1:-/mnt/data/artifacts/jlens/vllm-env}"
 FORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-if [[ -x "${VENV_DIR}/bin/python" ]] && "${VENV_DIR}/bin/python" -c "import vllm" 2>/dev/null; then
-  echo "[build-env] existing env at ${VENV_DIR} imports vllm; nothing to do"
+# Readiness = the compiled ops import, not just the pure-python package (a
+# botched precompiled fetch leaves vllm importable but vllm._C missing).
+if [[ -x "${VENV_DIR}/bin/python" ]] && "${VENV_DIR}/bin/python" -c "import vllm._C" 2>/dev/null; then
+  echo "[build-env] existing env at ${VENV_DIR} imports vllm._C; nothing to do"
   exit 0
+fi
+if [[ -d "${VENV_DIR}" ]]; then
+  echo "[build-env] existing env is broken (vllm._C missing); rebuilding"
+  rm -rf "${VENV_DIR}"
+fi
+# setup.py resolves the precompiled-wheel commit with `git merge-base` against
+# upstream main: it needs full history (no shallow clone) or the fetch guard
+# below fails the build early instead of producing a wheel-less install.
+if [[ -f "${FORK_DIR}/.git/shallow" ]]; then
+  echo "[build-env] ERROR: ${FORK_DIR} is a shallow clone; run" >&2
+  echo "  git -C ${FORK_DIR} fetch --unshallow origin" >&2
+  exit 43
 fi
 
 echo "[build-env] creating venv at ${VENV_DIR} (python 3.12)"
