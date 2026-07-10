@@ -162,6 +162,16 @@ async def _generate_pane(
             async with client.stream(
                 "POST", f"{_server_base()}/v1/chat/completions", json=payload
             ) as resp:
+                if resp.status_code != 200:
+                    body_text = (await resp.aread()).decode(errors="replace")
+                    try:
+                        body_text = json.loads(body_text)["error"]["message"]
+                    except Exception:
+                        pass
+                    await queue.put({"type": "token", "pane": pane,
+                                     "channel": "answer",
+                                     "text": f"[server error] {body_text}"})
+                    return
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -220,7 +230,9 @@ async def info() -> dict:
 @app.post("/api/generate")
 async def generate(body: dict) -> StreamingResponse:
     prompt = body.get("prompt", "").strip() or "Tell me about your weekend plans."
-    max_tokens = min(int(body.get("max_tokens", 96)), 2048)
+    # No sidecar-side cap: the server enforces its own context budget
+    # (--max-model-len minus prompt) and errors informatively past it.
+    max_tokens = max(1, int(body.get("max_tokens", 96)))
     thinking = bool(body.get("thinking", True))
     steer = body.get("steer")  # {word, strength, layers} | None
     rid = f"jlens-{uuid.uuid4().hex[:12]}"
