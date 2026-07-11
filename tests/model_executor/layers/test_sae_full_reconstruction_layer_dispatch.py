@@ -11,9 +11,9 @@ The shim:
 * Pulls every per-(layer, hook) buffer plus the shared
   ``sae_recon_index`` and gathers per-token clamp tensors from the
   row tables.
-* Derives ``recon_mask = (recon_index != 0)`` so row 0 is the
-  no-reconstruction sentinel — a token whose ``sae_recon_index`` is
-  0 passes through bit-identically.
+* Derives ``recon_mask`` from this site's active-row table so row 0
+  (never marked active) is the no-reconstruction sentinel and rows
+  owned by other modules' sites pass through bit-identically.
 * Dispatches via ``torch.ops.vllm.apply_sae_full_reconstruction``
   (the registered custom op) so :mod:`torch.compile` treats the
   call as an opaque splitting point.
@@ -32,6 +32,7 @@ from vllm.model_executor.layers.sae_full_reconstruction import (
     HOOK_POINT_FR_DECODER_BIAS_ATTR,
     HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
     HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
+    HOOK_POINT_FR_ROW_ACTIVE_ATTR,
     apply_layer_sae_full_reconstruction,
     register_sae_full_recon_buffers,
     register_sae_recon_index_buffer,
@@ -184,6 +185,11 @@ class TestReconIndexRouting:
         layer.sae_recon_index[:3].copy_(  # type: ignore[union-attr]
             torch.tensor([0, 1, 0], dtype=torch.long)
         )
+        # Row 1 belongs to this site — mark it in the active-row table
+        # (the populator does this in production).
+        getattr(layer, HOOK_POINT_FR_ROW_ACTIVE_ATTR[SteeringHookPoint.POST_MLP])[
+            1
+        ] = True
         out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_MLP)
         # Row 0 (no-op) → out[0] == h[0].
         assert torch.allclose(out[0], h[0])
@@ -216,9 +222,12 @@ class TestReconIndexRouting:
         getattr(layer, HOOK_POINT_FR_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])[
             1, 0
         ] = 7.0
-        # Token 0 → row 1.
+        # Token 0 → row 1, marked active for this site.
         h = torch.tensor([[1.0, -1.0, 2.0]])
         layer.sae_recon_index[:1].copy_(torch.tensor([1], dtype=torch.long))  # type: ignore[union-attr]
+        getattr(layer, HOOK_POINT_FR_ROW_ACTIVE_ATTR[SteeringHookPoint.POST_MLP])[
+            1
+        ] = True
         out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_MLP)
         # f = ReLU([1, -1, 2]) = [1, 0, 2]; absolute clamp on feat 0 →
         # [7, 0, 2]; identity decoder → [7, 0, 2].
