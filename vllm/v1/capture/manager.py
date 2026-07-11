@@ -476,6 +476,13 @@ class CaptureManager:
             dict[tuple[int, str], "torch.Tensor"],
             dict[tuple[int, str], "torch.Tensor"],
         ] | None = None
+        # Metadata fast-path row accumulator: req_id -> {(consumer, layer, hook)
+        # -> total rows}. The per-step fan-out just increments counts (no chunk
+        # objects, no submit); one meta chunk per key is flushed at finalize on
+        # the finalize thread. Written on the step thread, popped on the finalize
+        # thread — guarded by the lock.
+        self._meta_accum: dict[str, dict[tuple[int, int, str], int]] = {}
+        self._meta_accum_lock = threading.Lock()
 
         # Slim mode: persistent buffers only — no dispatch pipeline.
         # ``_step_plan`` stays None forever, so ``on_hook`` only ever
@@ -1015,50 +1022,61 @@ class CaptureManager:
         """Deliver a step's captures to metadata-only consumers.
 
         Every active consumer declared ``needs_payload = False``, so it reads
-        only key / shape / dtype. Nothing is gathered or copied off the GPU: for
-        each ``(consumer, request, layer, hook)`` group we build a zero-cost
-        ``meta`` chunk of shape ``(rows, hidden)`` straight from the plan's entry
-        count and the capture dtype, and submit it through the normal sink so
-        ``on_capture`` still fires once per key at finalize with the correct
-        shape and dtype. Runs inline on the step thread — no ``_materialize``,
-        no gather, no dispatch queue, no spill.
+        only key / shape / dtype. The per-step work is reduced to incrementing a
+        row counter per ``(consumer, request, layer, hook)`` — no ``meta`` tensor,
+        no ``CaptureChunk``, no ``submit_chunk`` — and one meta chunk per key is
+        flushed at finalize (see :meth:`_flush_metadata_accum`). This keeps the
+        step thread O(entries) with only dict increments instead of O(entries)
+        tensor allocations and sink calls.
         """
-        for consumer_idx, sink in enumerate(self._consumers):
-            bit = 1 << consumer_idx
-            grouped: dict[tuple[str, int, str], list[CapturePositionEntry]] = (
-                defaultdict(list)
-            )
+        with self._meta_accum_lock:
             for entry in plan.entries:
-                if entry.consumer_mask & bit:
-                    grouped[(entry.request_id, entry.layer, entry.hook)].append(entry)
-            if not grouped:
-                continue
-            chunks: list[CaptureChunk] = []
-            for (req_id, layer, hook), chunk_entries in grouped.items():
-                key = (layer, hook)
-                buf = self._global_buffers.get(key)
-                if buf is not None:
-                    hidden, dtype = buf.shape[1], buf.dtype
-                else:
-                    ref = plan.scratch_gpu.get(key)
-                    hidden = ref.shape[1] if ref is not None else 1
-                    dtype = plan.scratch_dtype.get(key, torch.float32)
-                meta = torch.empty(
-                    (len(chunk_entries), hidden), dtype=dtype, device="meta"
+                mask = entry.consumer_mask
+                if not mask:
+                    continue
+                req_acc = self._meta_accum.setdefault(entry.request_id, {})
+                layer, hook = entry.layer, entry.hook
+                consumer_idx = 0
+                while mask:
+                    if mask & 1:
+                        k = (consumer_idx, layer, hook)
+                        req_acc[k] = req_acc.get(k, 0) + 1
+                    mask >>= 1
+                    consumer_idx += 1
+
+    def _flush_metadata_accum(self, req_id: str) -> None:
+        """Submit one meta chunk per accumulated key for *req_id* at finalize.
+
+        Runs on the finalize thread (off the step critical path). Builds a
+        single ``meta`` chunk of shape ``(total_rows, hidden)`` per
+        ``(consumer, layer, hook)`` from the accumulated row count, so the sink's
+        ``submit_finalize`` cats one chunk and ``on_capture`` fires once per key
+        with the correct shape and dtype.
+        """
+        with self._meta_accum_lock:
+            acc = self._meta_accum.pop(req_id, None)
+        if not acc:
+            return
+        per_consumer: dict[int, list[CaptureChunk]] = defaultdict(list)
+        for (consumer_idx, layer, hook), rows in acc.items():
+            buf = self._global_buffers.get((layer, hook))
+            if buf is not None:
+                hidden, dtype = buf.shape[1], buf.dtype
+            else:
+                hidden, dtype = 1, self._model_dtype
+            meta = torch.empty((rows, hidden), dtype=dtype, device="meta")
+            per_consumer[consumer_idx].append(
+                CaptureChunk(
+                    key=(VllmInternalRequestId(req_id), layer, hook),
+                    tensor=meta,
+                    dtype=meta.dtype,
+                    row_offset=0,
+                    step_index=0,
+                    metadata={"consumer_index": consumer_idx},
                 )
-                chunks.append(
-                    CaptureChunk(
-                        key=(VllmInternalRequestId(req_id), layer, hook),
-                        tensor=meta,
-                        dtype=meta.dtype,
-                        row_offset=0,
-                        step_index=chunk_entries[0].step_index,
-                        metadata={
-                            "consumer_index": consumer_idx,
-                            "positions": [e.logical_pos for e in chunk_entries],
-                        },
-                    )
-                )
+            )
+        for consumer_idx, chunks in per_consumer.items():
+            sink = self._consumers[consumer_idx]
             try:
                 batch_submit = getattr(sink, "submit_chunk_batch", None)
                 if batch_submit is not None:
@@ -1068,7 +1086,7 @@ class CaptureManager:
                         sink.submit_chunk(chunk)
             except Exception:
                 logger.exception(
-                    "metadata fan-out: consumer %d raised; others unaffected.",
+                    "metadata flush: consumer %d raised; others unaffected.",
                     consumer_idx,
                 )
 
@@ -1723,6 +1741,10 @@ class CaptureManager:
         and no ``_requests`` access — so it runs identically on the calling
         thread (sync path) or the finalize thread (async path).
         """
+        # Metadata fast path: turn accumulated per-key row counts into one meta
+        # chunk each before submit_finalize cats them (no-op otherwise).
+        self._flush_metadata_accum(req_id)
+
         results: dict[int, CaptureResult] = {}
 
         for consumer_idx, spec in state.consumer_specs.items():
