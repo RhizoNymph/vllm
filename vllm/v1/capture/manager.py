@@ -332,6 +332,16 @@ class CaptureManager:
                 f"got {overload_policy!r}"
             )
         self._consumers = consumers
+        # A consumer that reads only capture metadata (``needs_payload=False``)
+        # never touches the tensor payload. When *every* active consumer is
+        # metadata-only, the device->host copy and the whole dispatch/spill
+        # pipeline are pure waste — deliver zero-cost ``meta`` views synchronously
+        # instead (see ``_fan_out_metadata``). Gated at dispatch time on
+        # there being no active activation store, which does need real payloads.
+        self._metadata_only_consumers = bool(consumers) and all(
+            not getattr(getattr(s, "_consumer", s), "needs_payload", True)
+            for s in consumers
+        )
         self._consumer_specs = consumer_specs
         # ``num_hidden_layers`` is the GLOBAL layer count (across all
         # pipeline stages); client/global specs reference global layer
@@ -1001,6 +1011,67 @@ class CaptureManager:
                 continue
             plan.scratch_gpu[key] = buf.index_select(0, idx)
 
+    def _fan_out_metadata(self, plan: StepCapturePlan) -> None:
+        """Deliver a step's captures to metadata-only consumers.
+
+        Every active consumer declared ``needs_payload = False``, so it reads
+        only key / shape / dtype. Nothing is gathered or copied off the GPU: for
+        each ``(consumer, request, layer, hook)`` group we build a zero-cost
+        ``meta`` chunk of shape ``(rows, hidden)`` straight from the plan's entry
+        count and the capture dtype, and submit it through the normal sink so
+        ``on_capture`` still fires once per key at finalize with the correct
+        shape and dtype. Runs inline on the step thread — no ``_materialize``,
+        no gather, no dispatch queue, no spill.
+        """
+        for consumer_idx, sink in enumerate(self._consumers):
+            bit = 1 << consumer_idx
+            grouped: dict[tuple[str, int, str], list[CapturePositionEntry]] = (
+                defaultdict(list)
+            )
+            for entry in plan.entries:
+                if entry.consumer_mask & bit:
+                    grouped[(entry.request_id, entry.layer, entry.hook)].append(entry)
+            if not grouped:
+                continue
+            chunks: list[CaptureChunk] = []
+            for (req_id, layer, hook), chunk_entries in grouped.items():
+                key = (layer, hook)
+                buf = self._global_buffers.get(key)
+                if buf is not None:
+                    hidden, dtype = buf.shape[1], buf.dtype
+                else:
+                    ref = plan.scratch_gpu.get(key)
+                    hidden = ref.shape[1] if ref is not None else 1
+                    dtype = plan.scratch_dtype.get(key, torch.float32)
+                meta = torch.empty(
+                    (len(chunk_entries), hidden), dtype=dtype, device="meta"
+                )
+                chunks.append(
+                    CaptureChunk(
+                        key=(VllmInternalRequestId(req_id), layer, hook),
+                        tensor=meta,
+                        dtype=meta.dtype,
+                        row_offset=0,
+                        step_index=chunk_entries[0].step_index,
+                        metadata={
+                            "consumer_index": consumer_idx,
+                            "positions": [e.logical_pos for e in chunk_entries],
+                        },
+                    )
+                )
+            try:
+                batch_submit = getattr(sink, "submit_chunk_batch", None)
+                if batch_submit is not None:
+                    batch_submit(chunks)
+                else:
+                    for chunk in chunks:
+                        sink.submit_chunk(chunk)
+            except Exception:
+                logger.exception(
+                    "metadata fan-out: consumer %d raised; others unaffected.",
+                    consumer_idx,
+                )
+
     def dispatch_step_captures(self, plan: StepCapturePlan) -> None:
         """Hand a finished step's scratch tensors to the dispatch thread.
 
@@ -1020,13 +1091,22 @@ class CaptureManager:
         to the others.
         """
         self._require_pipeline("dispatch_step_captures")
+
+        if not plan.entries:
+            return
+
+        # Metadata-only fast path: no consumer needs the payload and no store is
+        # active, so nothing has to leave the GPU. Skip the global-key gather,
+        # the D2H copy, the dispatch queue, and the spill — deliver zero-cost
+        # ``meta`` chunks straight from the plan's per-key row counts.
+        if self._metadata_only_consumers and get_active_activation_store() is None:
+            self._fan_out_metadata(plan)
+            return
+
         # Pull global-spec rows out of the persistent buffers into
         # ``scratch_gpu`` first, so the rest of this method treats global
         # and client keys uniformly. No-op when no global key captured.
         self._materialize_global_keys(plan)
-
-        if not plan.entries:
-            return
 
         scratch_pinned: dict[
             tuple[int, str], tuple[torch.Tensor | None, torch.Tensor]
