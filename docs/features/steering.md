@@ -77,6 +77,61 @@ Each vector entry can be written either as:
 
 Scaled entries are multiplied before addition.
 
+## Directional Clamps
+
+In addition to additive vectors, steering supports **directional
+projection clamps**: constrain the hidden state's scalar coordinate along
+a direction to an interval, per token, at any hook point:
+
+```text
+p  = h · v̂                      # current expression of the feature
+h' = h + strength · (clip(p, min, max) − p) · v̂
+```
+
+A token whose projection is already inside `[min, max]` is untouched, and
+everything orthogonal to the direction is always preserved — unlike an
+additive vector, which shifts every token by the same amount.
+
+Clamp entries live in `steering_clamps` / `prefill_steering_clamps` /
+`decode_steering_clamps` (per-request), the same tier names on
+`/v1/steering/set` (`clamps` / `prefill_clamps` / `decode_clamps`,
+global), and an optional clamps tier on named modules:
+
+```json
+"steering_clamps": {
+  "post_block": {
+    "20": [
+      {"vector": [/* hidden_size floats */], "max": 4.0},
+      {"vector": [/* ... */], "value": 8.0, "strength": 0.5}
+    ]
+  }
+}
+```
+
+Entry semantics:
+
+- `{"vector": v, "min": lo, "max": hi}` — clamp the projection to
+  `[lo, hi]`; either bound may be omitted (one-sided).
+- `{"vector": v, "value": c}` — sugar for `min = max = c` (pin the
+  feature to a constant expression; `c = 0` is directional ablation).
+- `strength` in `[0, 1]` applies a partial correction (default 1.0).
+- Directions are **unit-normalized server-side**, so bounds are in
+  unit-projection space and portable across vectors. Zero vectors are
+  rejected.
+- Unlike vectors, tiers merge by **concatenation** (base entries first,
+  then phase entries) — each direction is an independent constraint. Up
+  to `--steering-config.max_clamp_directions` (default 4) directions per
+  (hook, layer) site after composing global + per-request tiers.
+
+Clamps run **after** additive steering at each hook, so the bound holds on
+whatever leaves the site. They participate in the steering config hash,
+so prefix caching stays correct, and clamp-only requests are admitted
+exactly like vector requests.
+
+Picking bounds: capture activations at the target site (the capture
+feature), compute `h · v̂` over representative traffic to see the
+projection's natural range, then set `min`/`max` relative to it.
+
 ## Enabling Steering
 
 Global steering is always available for steerable models. Per-request
