@@ -457,6 +457,15 @@ class CaptureManager:
         # compiled forward graph.  Cleared by ``consume_step_plan`` once
         # the runner's finalize path has copied the scratch tensors out.
         self._step_plan: StepCapturePlan | None = None
+        # Cache of the last step's gather-index tensors, keyed by the per-key
+        # row signature. During steady-state decode the signature repeats every
+        # step (each request captures its one new token at a fixed buffer row),
+        # so we reuse the device tensors and skip the per-step H2D entirely.
+        self._gather_cache: tuple[
+            tuple[tuple[tuple[int, str], tuple[int, ...]], ...],
+            dict[tuple[int, str], "torch.Tensor"],
+            dict[tuple[int, str], "torch.Tensor"],
+        ] | None = None
 
         # Slim mode: persistent buffers only — no dispatch pipeline.
         # ``_step_plan`` stays None forever, so ``on_hook`` only ever
@@ -832,17 +841,39 @@ class CaptureManager:
         # global path — the buffer holds the full residual, so any
         # consumer's rows can be sliced from it, and the per-entry
         # ``consumer_mask`` still fans the rows out to both.
-        gather_indices: dict[tuple[int, str], torch.Tensor] = {}
-        global_gather_indices: dict[tuple[int, str], torch.Tensor] = {}
         scratch_gpu: dict[tuple[int, str], torch.Tensor] = {}
-        scratch_dtype: dict[tuple[int, str], torch.dtype] = {}
-        for key, rows in gather_rows.items():
-            idx = torch.tensor(rows, dtype=torch.int64, device=self._device)
-            scratch_dtype[key] = self._model_dtype
-            if key in self._global_keys:
-                global_gather_indices[key] = idx
-            else:
-                gather_indices[key] = idx
+        scratch_dtype: dict[tuple[int, str], torch.dtype] = {
+            key: self._model_dtype for key in gather_rows
+        }
+        # Reuse cached device index tensors when this step's per-key row pattern
+        # is identical to the last (the common case in steady-state decode),
+        # else materialize them in a single batched H2D instead of one per key.
+        signature = tuple(
+            (key, tuple(rows)) for key, rows in sorted(gather_rows.items())
+        )
+        cached = self._gather_cache
+        if cached is not None and cached[0] == signature:
+            gather_indices, global_gather_indices = cached[1], cached[2]
+        else:
+            gather_indices = {}
+            global_gather_indices = {}
+            keys = list(gather_rows.keys())
+            if keys:
+                flat: list[int] = []
+                bounds: list[int] = []
+                for key in keys:
+                    bounds.append(len(flat))
+                    flat.extend(gather_rows[key])
+                bounds.append(len(flat))
+                # One H2D for the whole step; each key's index tensor is a view.
+                big = torch.tensor(flat, dtype=torch.int64, device=self._device)
+                for i, key in enumerate(keys):
+                    idx = big[bounds[i] : bounds[i + 1]]
+                    if key in self._global_keys:
+                        global_gather_indices[key] = idx
+                    else:
+                        gather_indices[key] = idx
+            self._gather_cache = (signature, gather_indices, global_gather_indices)
 
         plan = StepCapturePlan(
             gather_indices=gather_indices,
