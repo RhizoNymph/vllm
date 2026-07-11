@@ -25,6 +25,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelL
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -195,7 +196,7 @@ class ArceeDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -321,18 +322,6 @@ class ArceeModel(nn.Module, EagleModelMixin):
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
                 continue
 
             if "scale" in name or "zero_point" in name:

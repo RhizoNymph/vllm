@@ -63,6 +63,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -526,10 +527,6 @@ class OpenPanguEmbeddedAttention(nn.Module):
         quant_config: QuantizationConfig | None,
     ) -> None:
         is_neox_style = True
-        is_gguf = quant_config and quant_config.get_name() == "gguf"
-        if is_gguf and config.model_type == "PanguEmbedded":
-            is_neox_style = False
-
         rope_parameters = config.rope_parameters or {}
         if rope_parameters is not None and rope_parameters.get(
             "mrope_interleaved", False
@@ -724,20 +721,6 @@ class OpenPanguSinkAttention(nn.Module):
         # bitsandbytes loads the weights of the specific portion
         # no need to narrow
         is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
-
-        # Special case for GGUF
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type:
-            param.weight_type = loaded_weight.item()
-
-        # Materialize GGUF UninitializedParameter
-        if is_gguf_weight and isinstance(param, nn.UninitializedParameter):
-            final_shape = list(loaded_weight.shape)
-            if output_dim is not None:
-                assert final_shape[output_dim] % self.tp_size == 0
-                final_shape[output_dim] = final_shape[output_dim] // self.tp_size
-            param.materialize(final_shape, dtype=loaded_weight.dtype)
 
         param_data = param.data
         if output_dim is not None and not is_sharded_weight:
@@ -1016,7 +999,7 @@ class OpenPanguDecoderLayer(nn.Module):
 
         if self.sandwich_norm:
             hidden_states = self.post_mlp_layernorm(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 
         return hidden_states, residual
 

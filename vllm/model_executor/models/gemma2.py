@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -268,8 +269,11 @@ class Gemma2DecoderLayer(nn.Module):
             hidden_states, residual
         )
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        # post_block must observe the true block output: residual + the *normed*
+        # MLP branch (= hidden_states[L+1]). Apply the post-FFN norm before the
+        # hook. Steering still rides ``residual`` so generation is unchanged.
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -361,16 +365,6 @@ class Gemma2Model(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue

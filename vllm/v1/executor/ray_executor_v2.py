@@ -253,12 +253,23 @@ class RayExecutorV2(MultiprocExecutor):
         self.failure_callback = None
         self.shutting_down = False
         self.shutdown_lock = threading.Lock()
+        # Job that owns the worker actor handles; set once actors are created
+        # in Step 1. Used to guard actor teardown against stale Ray sessions.
+        self._ray_job_id: str | None = None
 
         # Step 1: Initialize Ray cluster and retrieve placement group
         if ray is None:
             raise ImportError("Using Ray backend requires installation of ray.")
         initialize_ray_cluster(self.parallel_config, require_gpu_on_driver=False)
         placement_group = self.parallel_config.placement_group
+
+        # Record the Ray job that owns the worker actor handles. Handles are
+        # only valid within the session/job that created them; ray.kill() on a
+        # handle from a stale job raises ActorHandleNotFoundError. shutdown()
+        # uses this to skip actor teardown when Ray has been re-initialized
+        # under a different job (e.g. after an init failure or interpreter
+        # teardown re-runs ray.init()).
+        self._ray_job_id = ray.get_runtime_context().get_job_id()
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -495,6 +506,33 @@ class RayExecutorV2(MultiprocExecutor):
         ):
             monitor.join(timeout=10)
 
+    def _worker_actors_killable(self) -> bool:
+        """Whether worker actor handles can be killed in the current session.
+
+        Returns False when Ray is not initialized, or when the current Ray
+        job differs from the job that created the handles — in which case
+        ray.kill() would raise ActorHandleNotFoundError.
+        """
+        if ray is None or not ray.is_initialized():
+            return False
+        if getattr(self, "_ray_job_id", None) is None:
+            # Actors were never created (init failed before Step 1) — nothing
+            # to kill.
+            return False
+        try:
+            current_job_id = ray.get_runtime_context().get_job_id()
+        except Exception:
+            return False
+        if current_job_id != self._ray_job_id:
+            logger.debug(
+                "Skipping worker actor teardown: handles belong to Ray job "
+                "%s but current job is %s (session changed).",
+                self._ray_job_id,
+                current_job_id,
+            )
+            return False
+        return True
+
     def shutdown(self) -> None:
         """Properly shut down the executor and its workers."""
         lock = getattr(self, "shutdown_lock", None)
@@ -508,12 +546,19 @@ class RayExecutorV2(MultiprocExecutor):
 
         self._join_monitor_thread()
 
-        for handle in getattr(self, "ray_worker_handles", []):
-            try:
-                ray.kill(handle.actor)
-                logger.debug("Killed actor rank=%d", handle.rank)
-            except Exception:
-                logger.exception("Failed to kill actor rank=%d", handle.rank)
+        # Worker actor handles are only valid within the Ray session/job that
+        # created them. If Ray has been torn down, or re-initialized under a
+        # different job (which happens when an init failure or interpreter
+        # teardown re-runs ray.init()), ray.kill() on those handles raises
+        # ActorHandleNotFoundError. In both cases the original actors are gone
+        # with their session, so skip the kill rather than fail teardown.
+        if self._worker_actors_killable():
+            for handle in getattr(self, "ray_worker_handles", []):
+                try:
+                    ray.kill(handle.actor)
+                    logger.debug("Killed actor rank=%d", handle.rank)
+                except Exception:
+                    logger.exception("Failed to kill actor rank=%d", handle.rank)
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()

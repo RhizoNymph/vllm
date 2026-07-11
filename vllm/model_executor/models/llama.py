@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -71,6 +72,7 @@ from vllm.v1.attention.backend import AttentionType
 from .adapters import as_embedding_model, as_seq_cls_model
 from .interfaces import (
     EagleModelMixin,
+    LocalArgmaxMixin,
     SupportsEagle,
     SupportsEagle3,
     SupportsLoRA,
@@ -247,9 +249,6 @@ class LlamaAttention(nn.Module):
         quant_config: QuantizationConfig | None,
     ) -> None:
         is_neox_style = True
-        is_gguf = quant_config and quant_config.get_name() == "gguf"
-        if is_gguf and config.model_type == "llama":
-            is_neox_style = False
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -287,7 +286,6 @@ class LlamaDecoderLayer(nn.Module):
         )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support abacusai/Smaug-72B-v0.1 with attention_bias
-        # Support internlm/internlm-7b with bias
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False
         )
@@ -352,7 +350,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
@@ -475,18 +473,6 @@ class LlamaModel(nn.Module, EagleModelMixin):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
             if "scale" in name or "zero_point" in name:
                 # Remapping the name of FP8 kv-scale or zero point.
                 name = maybe_remap_kv_scale_name(name, params_dict)
@@ -523,7 +509,7 @@ class LlamaModel(nn.Module, EagleModelMixin):
 
 
 class LlamaForCausalLM(
-    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
+    LocalArgmaxMixin, nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
 ):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],

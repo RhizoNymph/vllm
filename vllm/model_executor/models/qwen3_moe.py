@@ -55,11 +55,13 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -454,8 +456,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        # mlp_in/mlp_out bracket the MLP/MoE sublayer for transcoder training:
+        # mlp_in is the normed MLP input; mlp_out is the branch added to the
+        # residual stream, so post_block == post_attn + mlp_out.
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_in")
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_out")
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -576,19 +583,6 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         for name, loaded_weight in weights:
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                assert loaded_weight.numel() == 1, (
-                    f"KV scale numel {loaded_weight.numel()} != 1"
-                )
-                loaded_weight = loaded_weight.squeeze()
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
             if "scale" in name or "zero_point" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:

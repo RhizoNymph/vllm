@@ -4,18 +4,20 @@
 import asyncio
 import hashlib
 import secrets
+import time
 from http import HTTPStatus
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-import vllm.envs as envs
 from vllm.config.steering_types import (
     SteeringVectorSpec,
+    coerce_steering_spec,
     normalize_layer_entry,
 )
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.steering._merge import (
+    check_action_determinism,
     deep_merge_status,
     normalize_worker_err,
 )
@@ -32,6 +34,27 @@ router = APIRouter()
 # validate-then-apply flow in /set cannot be interleaved with
 # another /set or /clear request.
 _steering_lock = asyncio.Lock()
+
+# Rate limit (seconds) for the applied-action determinism-divergence ERROR
+# log, so a client polling the status endpoint cannot flood the log.
+_DETERMINISM_LOG_INTERVAL_S = 60.0
+_last_determinism_log_s = 0.0
+
+
+def _log_determinism_divergence(checksums: dict) -> None:
+    """Log a cross-rank action-checksum divergence at ERROR (rate-limited)."""
+    global _last_determinism_log_s
+    now = time.monotonic()
+    if now - _last_determinism_log_s < _DETERMINISM_LOG_INTERVAL_S:
+        return
+    _last_determinism_log_s = now
+    logger.error(
+        "dynamic steering determinism violation: applied-action checksums "
+        "diverge across ranks (worker=checksum: %s). One rank's steering "
+        "tables have silently desynced from its siblings; outputs may be "
+        "corrupted. See docs/design/dynamic_steering.md §6.",
+        checksums,
+    )
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -138,14 +161,23 @@ async def set_steering(
 
     engine = engine_client(raw_request)
 
-    # Collect all tiers that have data.
+    # Collect all tiers that have data.  Each tier may arrive as either the
+    # legacy SteeringVectorSpec or the binary-wire SteeringVectorSpecPacked
+    # shape; ``coerce_steering_spec`` decodes the latter to ndarray entries
+    # that the downstream resolver/normalizer accepts transparently.
     tiers: dict[str, SteeringVectorSpec] = {}
-    if request.vectors:
-        tiers["vectors"] = request.vectors
-    if request.prefill_vectors:
-        tiers["prefill_vectors"] = request.prefill_vectors
-    if request.decode_vectors:
-        tiers["decode_vectors"] = request.decode_vectors
+    try:
+        if (v := coerce_steering_spec(request.vectors)) is not None:
+            tiers["vectors"] = v
+        if (v := coerce_steering_spec(request.prefill_vectors)) is not None:
+            tiers["prefill_vectors"] = v
+        if (v := coerce_steering_spec(request.decode_vectors)) is not None:
+            tiers["decode_vectors"] = v
+    except (KeyError, ValueError, TypeError) as err:
+        return JSONResponse(
+            content={"error": f"Malformed steering payload: {err}"},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
 
     if not tiers:
         return JSONResponse(
@@ -471,7 +503,35 @@ async def get_steering_layers(raw_request: Request) -> JSONResponse:
         )
 
 
+@router.get("/v1/steering/dynamic")
+async def get_dynamic_steering(raw_request: Request) -> JSONResponse:
+    """Return dynamic-steering state from every worker.
+
+    Per-worker dicts are returned unaggregated (keyed into a list in
+    worker order): sync consumer decisions are supposed to be identical
+    across TP ranks within a stage, so surfacing each rank's recent
+    ring of (step, on_step_ms, n_actions) tuples and apply counters
+    side by side doubles as the cheap rank-divergence audit. See
+    docs/design/dynamic_steering.md §5.5.
+    """
+    engine = engine_client(raw_request)
+
+    try:
+        results = await engine.collective_rpc("get_dynamic_steering_status")
+        workers = list(results)
+        determinism = check_action_determinism(workers)
+        if not determinism["consistent"]:
+            _log_determinism_divergence(determinism["checksums"])
+        return JSONResponse(
+            content={"workers": workers, "determinism": determinism}
+        )
+    except Exception as err:
+        logger.exception("Failed to get dynamic steering status")
+        return JSONResponse(
+            content={"error": f"Failed to get dynamic steering status: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
 def attach_router(app: FastAPI):
-    if not envs.VLLM_SERVER_DEV_MODE:
-        return
     app.include_router(router)

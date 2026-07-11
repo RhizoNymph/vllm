@@ -20,7 +20,7 @@ from vllm.v1.capture import (
 )
 
 
-def _key(req_id: str = "req-1", layer: int = 3, hook: str = "post_mlp") -> CaptureKey:
+def _key(req_id: str = "req-1", layer: int = 3, hook: str = "post_block") -> CaptureKey:
     return (VllmInternalRequestId(req_id), layer, hook)
 
 
@@ -31,15 +31,15 @@ def test_capture_key_is_a_three_tuple():
     req_id, layer, hook = key
     assert req_id == "req-1"
     assert layer == 3
-    assert hook == "post_mlp"
+    assert hook == "post_block"
 
 
 def test_capture_spec_is_frozen():
     spec = CaptureSpec(
-        hooks={"post_mlp": [1, 2, 3]},
+        hooks={"post_block": [1, 2, 3]},
         positions="last_prompt",
     )
-    assert spec.hooks == {"post_mlp": [1, 2, 3]}
+    assert spec.hooks == {"post_block": [1, 2, 3]}
     assert spec.positions == "last_prompt"
 
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -140,3 +140,25 @@ def test_capture_context_round_trip():
     assert ctx.element_size_bytes == 2
     assert ctx.tensor_parallel_size == 1
     assert ctx.pipeline_parallel_size == 1
+    # EP/DP sizes default to 1 (single-rank) when omitted.
+    assert ctx.expert_parallel_size == 1
+    assert ctx.data_parallel_size == 1
+
+
+def test_capture_context_parallel_sizes():
+    ctx = CaptureContext(
+        vllm_internal_request_id=VllmInternalRequestId("req-2"),
+        num_prompt_tokens=8,
+        num_computed_tokens=0,
+        num_hidden_layers=64,
+        hidden_size=4096,
+        element_size_bytes=2,
+        tensor_parallel_size=4,
+        pipeline_parallel_size=2,
+        expert_parallel_size=8,
+        data_parallel_size=2,
+    )
+    assert ctx.tensor_parallel_size == 4
+    assert ctx.pipeline_parallel_size == 2
+    assert ctx.expert_parallel_size == 8
+    assert ctx.data_parallel_size == 2

@@ -28,6 +28,15 @@ def mock_model_runner_with_input_batch():
     runner.requests = {}
     runner.max_num_reqs = 10
     runner.max_model_len = 1024
+    # Mirrors gpu_model_runner.py:825 self.late_interaction_runner =
+    # LateInteractionRunner(); an instance attr the spec-based Mock lacks.
+    runner.late_interaction_runner = Mock()
+    # Sync-consumer metadata stashes the runner inherits from
+    # CaptureRunnerMixin.__init__ (capture_runner_mixin.py:109 and :113);
+    # _update_streaming_request refreshes them, but Mock(spec=...) never runs
+    # __init__ so the instance attrs are absent.
+    runner._sync_conversation_ids = {}
+    runner._sync_steering_gates = {}
 
     # Create a real InputBatch for e2e testing
     runner.input_batch = InputBatch(
@@ -42,7 +51,6 @@ def mock_model_runner_with_input_batch():
         logitsprocs=None,
         is_pooling_model=False,
     )
-    runner.late_interaction_runner = Mock()
     return runner
 
 
@@ -210,19 +218,23 @@ def test_e2e_streaming_with_multimodal_features(mock_model_runner_with_input_bat
     assert req_id not in runner.input_batch.req_id_to_index
 
 
-# ---------------------------------------------------------------------------
-# Helpers for steering tests
-# ---------------------------------------------------------------------------
+def test_streaming_re_add_refreshes_sync_metadata_stashes():
+    """A streaming re-add must refresh the sync-consumer metadata stashes.
 
+    Regression for the v1/v2 drift where ``_update_streaming_request`` never
+    refreshed ``_sync_conversation_ids`` / ``_sync_steering_gates``, so a
+    streaming continuation that changed the conversation id or declarative
+    gates kept serving the prior chunk's stale values (v2 already refreshes
+    them unconditionally in ``_capture_add_request``).
+    """
+    from vllm.v1.request_metadata import RequestMetadata
+    from vllm.v1.steering_schema import build_steering_gates, resolve_gates_safe
 
-def _make_steering_runner():
-    """Create a mock GPUModelRunner with steering infrastructure."""
+    req_id = "streaming_meta_req"
+
     runner = Mock(spec=GPUModelRunner)
     runner.uses_mrope = False
-    runner.requests = {}
-    runner.max_num_reqs = 10
-    runner.max_model_len = 1024
-
+    runner.late_interaction_runner = Mock()
     runner.input_batch = InputBatch(
         max_num_reqs=10,
         max_model_len=1024,
@@ -235,471 +247,55 @@ def _make_steering_runner():
         logitsprocs=None,
         is_pooling_model=False,
     )
+    # Stale stashes left over from the prior chunk's registration.
+    runner._sync_conversation_ids = {req_id: "conv-old"}
+    runner._sync_steering_gates = {req_id: ["STALE"]}
 
-    runner.late_interaction_runner = Mock()
-
-    runner._steering_manager = Mock()
-    runner._steering_manager.register_config = Mock()
-    runner._steering_manager.release_config = Mock()
-    runner._req_steering_phase = {}
-    runner._sae_clamp_manager = None
-    runner._req_sae_phase = {}
-    runner._locally_owned_layers = {0}
-    runner._refresh_streaming_steering = (
-        GPUModelRunner._refresh_streaming_steering.__get__(runner, GPUModelRunner)
-    )
-    runner._resolve_request_steering = GPUModelRunner._resolve_request_steering.__get__(
-        runner, GPUModelRunner
-    )
-    return runner
-
-
-def _make_req_state(
-    req_id,
-    prefill_hash=0,
-    decode_hash=0,
-):
-    """Create a minimal CachedRequestState for steering tests."""
-    return CachedRequestState(
+    req_state = CachedRequestState(
         req_id=req_id,
         prompt_token_ids=[1, 2, 3],
         mm_features=[],
-        sampling_params=SamplingParams(temperature=0.5),
+        sampling_params=SamplingParams(),
         pooling_params=None,
         generator=None,
         block_ids=([0],),
         num_computed_tokens=3,
-        output_token_ids=[10, 11],
-        prefill_steering_config_hash=prefill_hash,
-        decode_steering_config_hash=decode_hash,
+        output_token_ids=[9],
+    )
+    runner.requests = {req_id: req_state}
+    runner.input_batch.add_request(req_state)
+
+    gates = build_steering_gates(
+        [
+            {
+                "when": {"kind": "always"},
+                "scope": "rest_of_request",
+                "apply": {"kind": "attenuate", "strength": 0.25},
+            }
+        ],
+        None,
     )
 
-
-def _make_new_req_data(
-    req_id,
-    prefill_hash=0,
-    decode_hash=0,
-    effective_prefill=None,
-    effective_decode=None,
-):
-    """Create a mock NewRequestData with steering hashes."""
     new_req_data = Mock()
-    new_req_data.req_id = req_id
-    new_req_data.prompt_token_ids = [1, 2, 3, 10, 4, 5]
+    new_req_data.prompt_token_ids = [1, 2, 3, 9, 4]
     new_req_data.mm_features = []
     new_req_data.prompt_embeds = None
+    new_req_data.sampling_params = SamplingParams(max_tokens=8)
     new_req_data.pooling_params = None
     new_req_data.block_ids = ([0, 1],)
     new_req_data.num_computed_tokens = 4
-    new_req_data.prefill_steering_config_hash = prefill_hash
-    new_req_data.decode_steering_config_hash = decode_hash
-
-    sp = Mock()
-    sp.effective_prefill_steering = effective_prefill
-    sp.effective_decode_steering = effective_decode
-    sp.prefill_additive_steering_config_hash = prefill_hash
-    sp.decode_additive_steering_config_hash = decode_hash
-    sp.steering_module_ref = None
-    sp.sae_clamp_specs = None
-    new_req_data.sampling_params = sp
-    return new_req_data
-
-
-# ---------------------------------------------------------------------------
-# Steering refresh tests
-# ---------------------------------------------------------------------------
-
-
-def test_streaming_update_refreshes_steering_hashes():
-    """Changing steering between turns updates hashes, releases old config,
-    and registers the new prefill config."""
-    runner = _make_steering_runner()
-    req_id = "steer_req_0"
-
-    req_state = _make_req_state(req_id, prefill_hash=111, decode_hash=222)
-    runner.requests[req_id] = req_state
-    runner.input_batch.add_request(req_state)
-    runner._req_steering_phase[req_id] = "decode"
-
-    prefill_vectors = {"layer.0": {0: [0.1, 0.2]}}
-    new_req_data = _make_new_req_data(
-        req_id,
-        prefill_hash=333,
-        decode_hash=444,
-        effective_prefill=prefill_vectors,
-    )
-
-    updated = GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
-
-    # Hashes must be refreshed on the state.
-    assert updated.prefill_steering_config_hash == 333
-    assert updated.decode_steering_config_hash == 444
-
-    # Old decode config released (was in decode phase with hash 222).
-    runner._steering_manager.release_config.assert_called_once_with(222, "decode")
-
-    # New prefill config registered.
-    runner._steering_manager.register_config.assert_called_once_with(
-        333,
-        prefill_vectors,
-        phase="prefill",
-        content_hash=333,
-        locally_owned_layers={0},
-    )
-
-    # Phase tracking reset to prefill.
-    assert runner._req_steering_phase[req_id] == "prefill"
-
-
-def test_streaming_update_no_steering_to_steering():
-    """A request that previously had no steering gains steering on re-add."""
-    runner = _make_steering_runner()
-    req_id = "steer_req_1"
-
-    req_state = _make_req_state(req_id, prefill_hash=0, decode_hash=0)
-    runner.requests[req_id] = req_state
-    runner.input_batch.add_request(req_state)
-    # No phase entry for a request without steering.
-
-    prefill_vectors = {"layer.0": {0: [0.5]}}
-    new_req_data = _make_new_req_data(
-        req_id,
-        prefill_hash=111,
-        decode_hash=222,
-        effective_prefill=prefill_vectors,
-    )
-
-    updated = GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
-
-    assert updated.prefill_steering_config_hash == 111
-    assert updated.decode_steering_config_hash == 222
-
-    # No old config to release (hashes were 0).
-    runner._steering_manager.release_config.assert_not_called()
-
-    # New prefill config registered.
-    runner._steering_manager.register_config.assert_called_once_with(
-        111,
-        prefill_vectors,
-        phase="prefill",
-        content_hash=111,
-        locally_owned_layers={0},
-    )
-
-    assert runner._req_steering_phase[req_id] == "prefill"
-
-
-def test_streaming_update_steering_to_no_steering():
-    """A request that had steering clears it on re-add."""
-    runner = _make_steering_runner()
-    req_id = "steer_req_2"
-
-    req_state = _make_req_state(req_id, prefill_hash=111, decode_hash=0)
-    runner.requests[req_id] = req_state
-    runner.input_batch.add_request(req_state)
-    runner._req_steering_phase[req_id] = "prefill"
-
-    new_req_data = _make_new_req_data(
-        req_id,
-        prefill_hash=0,
-        decode_hash=0,
-    )
-
-    updated = GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
-
-    assert updated.prefill_steering_config_hash == 0
-    assert updated.decode_steering_config_hash == 0
-
-    # Old prefill config released.
-    runner._steering_manager.release_config.assert_called_once_with(111, "prefill")
-
-    # No new config registered.
-    runner._steering_manager.register_config.assert_not_called()
-
-    # Phase tracking cleared.
-    assert req_id not in runner._req_steering_phase
-
-
-def test_streaming_update_steering_hashes_unchanged():
-    """Same non-zero hashes: old released, new registered (net refcount
-    neutral)."""
-    runner = _make_steering_runner()
-    req_id = "steer_req_3"
-
-    req_state = _make_req_state(req_id, prefill_hash=111, decode_hash=222)
-    runner.requests[req_id] = req_state
-    runner.input_batch.add_request(req_state)
-    runner._req_steering_phase[req_id] = "prefill"
-
-    prefill_vectors = {"layer.0": {0: [0.3]}}
-    new_req_data = _make_new_req_data(
-        req_id,
-        prefill_hash=111,
-        decode_hash=222,
-        effective_prefill=prefill_vectors,
+    new_req_data.prefill_steering_config_hash = 0
+    new_req_data.decode_steering_config_hash = 0
+    new_req_data.request_metadata = RequestMetadata(
+        conversation_id="conv-new", steering=gates
     )
 
     GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
 
-    # Old prefill config released (was in prefill phase).
-    runner._steering_manager.release_config.assert_called_once_with(111, "prefill")
-
-    # New prefill config registered (re-entering prefill).
-    runner._steering_manager.register_config.assert_called_once_with(
-        111,
-        prefill_vectors,
-        phase="prefill",
-        content_hash=111,
-        locally_owned_layers={0},
-    )
-
-
-def test_streaming_update_no_steering_manager():
-    """Without a steering manager, hashes are still updated on state and no
-    errors occur."""
-    runner = _make_steering_runner()
-    req_id = "steer_req_4"
-
-    req_state = _make_req_state(req_id, prefill_hash=111, decode_hash=222)
-    runner.requests[req_id] = req_state
-    runner.input_batch.add_request(req_state)
-
-    # Remove the steering manager to simulate no-steering setup.
-    runner._steering_manager = None
-
-    new_req_data = _make_new_req_data(
-        req_id,
-        prefill_hash=333,
-        decode_hash=444,
-    )
-
-    updated = GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
-
-    # Hashes still updated on the state even without a manager.
-    assert updated.prefill_steering_config_hash == 333
-    assert updated.decode_steering_config_hash == 444
-
-
-def test_streaming_update_capacity_error_propagates():
-    """When register_config raises RuntimeError under the strict-capacity
-    contract, the streaming refresh path must propagate the exception
-    rather than silently deferring it."""
-    runner = _make_steering_runner()
-    req_id = "steer_req_5"
-
-    req_state = _make_req_state(req_id, prefill_hash=0, decode_hash=0)
-    runner.requests[req_id] = req_state
-    runner.input_batch.add_request(req_state)
-
-    # Make register_config fail with RuntimeError (capacity full).
-    runner._steering_manager.register_config.side_effect = RuntimeError("capacity full")
-
-    prefill_vectors = {"layer.0": {0: [0.1]}}
-    new_req_data = _make_new_req_data(
-        req_id,
-        prefill_hash=555,
-        decode_hash=666,
-        effective_prefill=prefill_vectors,
-    )
-
-    with pytest.raises(RuntimeError, match="capacity full"):
-        GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
-
-    # Registration was attempted exactly once before the raise.
-    runner._steering_manager.register_config.assert_called_once()
-
-
-def test_streaming_update_failure_restores_old_vectors_not_new_params():
-    """Rollback must snapshot old sampling params before request mutation."""
-    runner = _make_steering_runner()
-    req_id = "steer_req_restore"
-
-    old_decode_vectors = {"layer.0": {0: [0.1, 0.2]}}
-    old_sp = SamplingParams(temperature=0.5)
-    old_sp.__dict__["effective_prefill_steering"] = None
-    old_sp.__dict__["effective_decode_steering"] = old_decode_vectors
-    old_sp.__dict__["prefill_additive_steering_config_hash"] = 111
-    old_sp.__dict__["decode_additive_steering_config_hash"] = 222
-
-    req_state = _make_req_state(req_id, prefill_hash=111, decode_hash=222)
-    req_state.sampling_params = old_sp
-    runner.requests[req_id] = req_state
-    runner.input_batch.add_request(req_state)
-    runner._req_steering_phase[req_id] = "decode"
-
-    new_prefill_vectors = {"layer.0": {0: [9.0, 9.0]}}
-    new_decode_vectors = {"layer.0": {0: [8.0, 8.0]}}
-    new_req_data = _make_new_req_data(
-        req_id,
-        prefill_hash=333,
-        decode_hash=444,
-        effective_prefill=new_prefill_vectors,
-        effective_decode=new_decode_vectors,
-    )
-    runner._steering_manager.register_config.side_effect = [
-        RuntimeError("capacity full"),
-        None,
-    ]
-
-    with pytest.raises(RuntimeError, match="capacity full"):
-        GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
-
-    restore_call = runner._steering_manager.register_config.call_args_list[1]
-    assert restore_call.args[:2] == (222, old_decode_vectors)
-    assert restore_call.kwargs["phase"] == "decode"
-    assert restore_call.kwargs["content_hash"] == 222
-    assert restore_call.args[1] is not new_decode_vectors
-
-
-def test_streaming_update_decode_phase_no_hash_vector_mismatch():
-    """Verify no hash/vector mismatch when a decode-phase request gets a
-    streaming update with new steering vectors.
-
-    Regression test: previously ``_reset_steering_for_resumption`` was called
-    *after* ``req_state.sampling_params`` was updated to the NEW params but
-    *before* the steering config hashes were updated.  Inside ``_reset``,
-    it would read ``req_state.sampling_params`` (NEW) paired with
-    ``req_state.prefill_steering_config_hash`` (still OLD), leading to a
-    mismatch where the old hash was registered with the new vectors.
-
-    With the fix the explicit block handles the streaming path correctly:
-    it saves old hashes before mutation, releases the old decode config,
-    then registers the new prefill config using data from ``new_req_data``.
-
-    This test uses a *real* SteeringManager to assert that the final
-    registration state is internally consistent (correct hash -> correct
-    vectors, correct refcount).
-    """
-    from vllm.v1.worker.steering_manager import SteeringManager
-
-    runner = Mock(spec=GPUModelRunner)
-    runner.uses_mrope = False
-    runner.requests = {}
-    runner.max_num_reqs = 10
-    runner.max_model_len = 1024
-
-    runner.input_batch = InputBatch(
-        max_num_reqs=10,
-        max_model_len=1024,
-        max_num_batched_tokens=1024,
-        device="cpu",
-        pin_memory=False,
-        vocab_size=32000,
-        block_sizes=[16],
-        kernel_block_sizes=[16],
-        logitsprocs=None,
-        is_pooling_model=False,
-    )
-    runner.late_interaction_runner = Mock()
-
-    # Use a real SteeringManager so we can inspect actual state.
-    mgr = SteeringManager(max_steering_configs=4)
-    runner._steering_manager = mgr
-    runner._req_steering_phase = {}
-    runner._sae_clamp_manager = None
-    runner._req_sae_phase = {}
-    runner._locally_owned_layers = {0}
-    runner._refresh_streaming_steering = (
-        GPUModelRunner._refresh_streaming_steering.__get__(runner, GPUModelRunner)
-    )
-    runner._resolve_request_steering = GPUModelRunner._resolve_request_steering.__get__(
-        runner, GPUModelRunner
-    )
-
-    req_id = "hash_mismatch_req"
-
-    # --- Set up OLD state: request in decode phase with old hashes ---
-    old_prefill_hash = 1000
-    old_decode_hash = 2000
-    old_prefill_vectors = {"layer.0": {0: [0.1, 0.2, 0.3, 0.4]}}
-    old_decode_vectors = {"layer.0": {0: [0.5, 0.6, 0.7, 0.8]}}
-
-    # Register old configs in the manager as if they were added during
-    # the request's initial prefill and prefill->decode transition.
-    mgr.register_config(old_prefill_hash, old_prefill_vectors, phase="prefill")
-    mgr.register_config(old_decode_hash, old_decode_vectors, phase="decode")
-    # Release old prefill (transition to decode would have released it).
-    mgr.release_config(old_prefill_hash, "prefill")
-
-    req_state = CachedRequestState(
-        req_id=req_id,
-        prompt_token_ids=[1, 2, 3, 4, 5],
-        mm_features=[],
-        sampling_params=SamplingParams(temperature=0.5),
-        pooling_params=None,
-        generator=None,
-        block_ids=([0],),
-        num_computed_tokens=5,
-        output_token_ids=[10, 11, 12],
-        prefill_steering_config_hash=old_prefill_hash,
-        decode_steering_config_hash=old_decode_hash,
-    )
-    runner.requests[req_id] = req_state
-    runner.input_batch.add_request(req_state)
-    runner._req_steering_phase[req_id] = "decode"
-
-    # Verify old decode config is registered before the update.
-    assert (old_decode_hash, "decode") in mgr.config_to_row
-    assert mgr.config_refcounts[(old_decode_hash, "decode")] == 1
-
-    # --- Build NEW request data with different steering vectors ---
-    new_prefill_hash = 3000
-    new_decode_hash = 4000
-    new_prefill_vectors = {"layer.0": {0: [1.0, 2.0, 3.0, 4.0]}}
-
-    new_req_data = Mock()
-    new_req_data.req_id = req_id
-    new_req_data.prompt_token_ids = [1, 2, 3, 4, 5, 10, 11, 12, 6, 7]
-    new_req_data.mm_features = []
-    new_req_data.prompt_embeds = None
-    new_req_data.pooling_params = None
-    new_req_data.block_ids = ([0, 1],)
-    new_req_data.num_computed_tokens = 8  # re-entering prefill
-
-    new_req_data.prefill_steering_config_hash = new_prefill_hash
-    new_req_data.decode_steering_config_hash = new_decode_hash
-
-    sp = Mock()
-    sp.effective_prefill_steering = new_prefill_vectors
-    sp.effective_decode_steering = {"layer.0": {0: [5.0, 6.0, 7.0, 8.0]}}
-    sp.prefill_additive_steering_config_hash = new_prefill_hash
-    sp.decode_additive_steering_config_hash = new_decode_hash
-    sp.steering_module_ref = None
-    sp.sae_clamp_specs = None
-    new_req_data.sampling_params = sp
-
-    # --- Execute the streaming update ---
-    updated = GPUModelRunner._update_streaming_request(runner, req_id, new_req_data)
-
-    # --- Assertions ---
-
-    # 1. Hashes on the state must be the NEW ones.
-    assert updated.prefill_steering_config_hash == new_prefill_hash
-    assert updated.decode_steering_config_hash == new_decode_hash
-
-    # 2. Old decode config must have been released (refcount -> 0, freed).
-    assert (old_decode_hash, "decode") not in mgr.config_to_row
-    assert (old_decode_hash, "decode") not in mgr.config_refcounts
-
-    # 3. Old prefill config must still be absent (was released earlier).
-    assert (old_prefill_hash, "prefill") not in mgr.config_to_row
-
-    # 4. The NEW prefill config must be registered with refcount 1.
-    assert (new_prefill_hash, "prefill") in mgr.config_to_row
-    assert mgr.config_refcounts[(new_prefill_hash, "prefill")] == 1
-
-    # 5. The registered vectors must be the NEW prefill vectors (not old).
-    stored = mgr.config_vectors[(new_prefill_hash, "prefill")]
-    assert "layer.0" in stored
-    assert 0 in stored["layer.0"]
-    import torch
-
-    expected = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
-    assert torch.allclose(stored["layer.0"][0].squeeze(), expected)
-
-    # 6. The NEW decode config must NOT be registered yet (it will be
-    #    registered when the request transitions from prefill to decode).
-    assert (new_decode_hash, "decode") not in mgr.config_to_row
-
-    # 7. Phase must be "prefill" (streaming re-adds start in prefill).
-    assert runner._req_steering_phase[req_id] == "prefill"
+    # Conversation id refreshed to the continuation's value (not stale).
+    assert runner._sync_conversation_ids[req_id] == "conv-new"
+    # Declarative gates refreshed to the resolved continuation gates.
+    refreshed = runner._sync_steering_gates[req_id]
+    assert refreshed != ["STALE"]
+    assert refreshed is not None
+    assert len(refreshed) == len(resolve_gates_safe(gates, req_id))

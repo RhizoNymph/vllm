@@ -51,6 +51,7 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.request_metadata import RequestMetadata
 
 logger = init_logger(__name__)
 
@@ -81,7 +82,7 @@ class AsyncLLM(EngineClient):
         start_engine_loop: bool = True,
         stat_loggers: list[StatLoggerFactory] | None = None,
         aggregate_engine_logging: bool = False,
-        client_addresses: dict[str, str] | None = None,
+        client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
     ) -> None:
@@ -110,13 +111,6 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
-
-        # Per-engine LRU mapping (prefill_hash, decode_hash) -> auto-named
-        # steering module name. See LLM._maybe_auto_promote_steering for
-        # the synchronous path's matching contract.
-        from vllm.config.steering_types import SteeringAutoPromoteLRU
-
-        self._steering_auto_promote_lru = SteeringAutoPromoteLRU(capacity=512)
 
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
@@ -216,7 +210,7 @@ class AsyncLLM(EngineClient):
         enable_log_requests: bool = False,
         aggregate_engine_logging: bool = False,
         disable_log_stats: bool = False,
-        client_addresses: dict[str, str] | None = None,
+        client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
     ) -> "AsyncLLM":
@@ -301,6 +295,7 @@ class AsyncLLM(EngineClient):
         prompt_text: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        request_metadata: RequestMetadata | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
@@ -309,19 +304,12 @@ class AsyncLLM(EngineClient):
 
         is_pooling = isinstance(params, PoolingParams)
 
-        if (
-            not is_pooling
-            and getattr(self.vllm_config, "steering_config", None) is not None
-        ):
+        # Steering preprocessing: pack inline vectors in the model dtype
+        # so the worker side doesn't have to recompute resolved values
+        # per forward pass.  No-op when the request has no inline steering.
+        if not is_pooling:
             from vllm.config.steering_types import (
-                maybe_auto_promote_steering_modules_async,
                 maybe_pack_inline_steering_for_request,
-            )
-
-            await maybe_auto_promote_steering_modules_async(
-                params,
-                rpc_fn=self.collective_rpc,
-                registry_lru=self._steering_auto_promote_lru,
             )
 
             try:
@@ -329,7 +317,15 @@ class AsyncLLM(EngineClient):
             except AttributeError:
                 torch_dtype = None
             if torch_dtype is not None:
-                maybe_pack_inline_steering_for_request(params, torch_dtype)
+                try:
+                    expected_row_width = (
+                        self.vllm_config.model_config.get_hidden_size()
+                    )
+                except AttributeError:
+                    expected_row_width = None
+                maybe_pack_inline_steering_for_request(
+                    params, torch_dtype, expected_row_width=expected_row_width
+                )
 
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill
@@ -386,6 +382,7 @@ class AsyncLLM(EngineClient):
                 trace_headers=trace_headers,
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
+                request_metadata=request_metadata,
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
@@ -567,6 +564,7 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        request_metadata: RequestMetadata | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -597,6 +595,7 @@ class AsyncLLM(EngineClient):
                 prompt_text=prompt_text,
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                request_metadata=request_metadata,
             )
 
             # The output_handler task pushes items into the queue.
@@ -693,6 +692,21 @@ class AsyncLLM(EngineClient):
                         IterationStats() if (log_stats and num_outputs) else None
                     )
 
+                    # Late capture results may arrive on a bare
+                    # EngineCoreOutputs with NO per-request outputs (emitted
+                    # by the engine core's idle loop after the owning request
+                    # finished), so deliver them outside the slicing loop --
+                    # zero outputs means zero slices.
+                    if late_capture := getattr(
+                        outputs, "late_capture_results", None
+                    ):
+                        output_processor.process_outputs(
+                            [],
+                            outputs.timestamp,
+                            None,
+                            late_capture_results=late_capture,
+                        )
+
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
                     # event loop for too long.
@@ -735,6 +749,29 @@ class AsyncLLM(EngineClient):
 
         self.output_handler = asyncio.create_task(output_handler())
 
+    async def wait_for_capture_results(
+        self, request_id: str, timeout: float = 300.0
+    ) -> dict | None:
+        """Await capture results that finalize after ``request_id`` finished.
+
+        Used by ``capture_wait`` API requests: capture files are written
+        asynchronously, so a request's results may arrive (via the
+        scheduler's ``late_capture_results``) seconds after its final
+        token. Returns ``None`` on timeout.
+        """
+        op = self.output_processor
+        results = op.pop_late_capture_results(request_id)
+        if results is not None:
+            return results
+        event = op.register_late_capture_event(request_id)
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            op._late_capture_events.pop(request_id, None)
+        return op.pop_late_capture_results(request_id)
+
     async def abort(
         self, request_id: str | Iterable[str], internal: bool = False
     ) -> None:
@@ -748,6 +785,33 @@ class AsyncLLM(EngineClient):
 
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
+
+    async def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> None:
+        """Submit a pre-aborted request so the connector's request_finished
+        hook runs to free any pre-admission KV-transfer resources (e.g. NIXL
+        prefill blocks pinned on the P node)."""
+        request = EngineCoreRequest(
+            request_id=request_id,
+            prompt_token_ids=[0],
+            mm_features=None,
+            sampling_params=SamplingParams(
+                max_tokens=1,
+                extra_args={"kv_transfer_params": dict(kv_transfer_params)},
+            ),
+            pooling_params=None,
+            arrival_time=time.time(),
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=data_parallel_rank,
+            abort_immediately=True,
+        )
+        await self.engine_core.add_request_async(request)
 
     async def pause_generation(
         self,
@@ -783,6 +847,8 @@ class AsyncLLM(EngineClient):
                 stacklevel=2,
             )
             mode = "wait"
+        if clear_cache:
+            await self.renderer.clear_mm_cache_async()
         await self.engine_core.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
         # Small sleep to help ensure that final outputs from any in-flight requests are
         # returned prior to this method returning. These outputs come out of the engine
@@ -929,6 +995,8 @@ class AsyncLLM(EngineClient):
         await self.engine_core.reset_encoder_cache_async()
 
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        if level >= 1:
+            await self.renderer.clear_mm_cache_async()
         await self.engine_core.sleep_async(level, mode)
 
         if self.logger_manager is not None:
@@ -1078,6 +1146,13 @@ class AsyncLLM(EngineClient):
             "init_weight_transfer_engine", kwargs={"init_info": init_info_dict}
         )
 
+    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+        """Start a new weight update."""
+        await self.collective_rpc(
+            "start_weight_update",
+            kwargs={"is_checkpoint_format": is_checkpoint_format},
+        )
+
     async def update_weights(self, request: WeightTransferUpdateRequest) -> None:
         """
         Batched weight update for RL training.
@@ -1096,3 +1171,7 @@ class AsyncLLM(EngineClient):
         await self.collective_rpc(
             "update_weights", kwargs={"update_info": update_info_dict}
         )
+
+    async def finish_weight_update(self) -> None:
+        """Finish the current weight update."""
+        await self.collective_rpc("finish_weight_update")

@@ -29,6 +29,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.request_metadata import RequestMetadata
 
 logger = init_logger(__name__)
 
@@ -50,6 +51,7 @@ class InputProcessor:
         self.structured_outputs_config = vllm_config.structured_outputs_config
         self.observability_config = vllm_config.observability_config
         self.steering_config = vllm_config.steering_config
+        self.use_v2_model_runner = vllm_config.use_v2_model_runner
 
         self.generation_config_fields = model_config.try_get_generation_config()
 
@@ -71,6 +73,14 @@ class InputProcessor:
             renderer=renderer,
             mm_registry=mm_registry,
         )
+
+        # Config-driven capture-consumer validators, used only to resolve
+        # per-request capture specs into prefix-cache flags before the
+        # request reaches the scheduler (the offline analogue of the OpenAI
+        # serving layer's ``_admit_capture``). Built lazily on the first
+        # capture request; stays ``None`` for non-capture workloads so they
+        # pay nothing. See ``vllm/v1/capture/admission.py``.
+        self._capture_consumers: dict[str, Any] | None = None
 
     @property
     def tokenizer(self) -> TokenizerLike | None:
@@ -99,15 +109,22 @@ class InputProcessor:
                 self.tokenizer,
             )
 
-            if params.thinking_token_budget is not None and (
-                self.vllm_config.reasoning_config is None
-                or not self.vllm_config.reasoning_config.enabled
-            ):
-                raise ValueError(
-                    "thinking_token_budget is set but reasoning_config is "
-                    "not configured. Please set --reasoning-config to use "
-                    "thinking_token_budget."
-                )
+            if params.thinking_token_budget is not None:
+                if (
+                    self.vllm_config.reasoning_config is None
+                    or not self.vllm_config.reasoning_config.enabled
+                ):
+                    raise ValueError(
+                        "thinking_token_budget is set but reasoning_config is "
+                        "not configured. Please set --reasoning-parser "
+                        "and/or --reasoning-config to use thinking_token_budget."
+                    )
+                if self.use_v2_model_runner:
+                    raise ValueError(
+                        "thinking_token_budget is not yet supported by the V2 "
+                        "model runner. Run vLLM with VLLM_USE_V2_MODEL_RUNNER=0 "
+                        "to use thinking_token_budget."
+                    )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS
@@ -164,16 +181,32 @@ class InputProcessor:
             or params.decode_steering_vectors is not None
             or params.steering_module_ref is not None
             or params.sae_clamp_specs is not None
+            or params.sae_full_reconstruction_specs is not None
             or params._effective_prefill_steering_packed is not None
             or params._effective_decode_steering_packed is not None
         )
-        if has_steering and not self.steering_config:
+        if not has_steering:
+            return
+        if not self.steering_config:
             raise ValueError(
                 "Per-request steering vectors, named-module references, "
                 "or SAE clamp specs were provided but steering is not "
                 "enabled. Start the server with --enable-steering to use "
                 "per-request steering."
             )
+        # Width gate: SamplingParams validation is model-blind, and a
+        # wrong-width row shape-crashes the worker's steering table
+        # population — reject here (frontend process, request-level error)
+        # on every path: online HTTP, offline LLM(), and the Rust frontend.
+        from vllm.config.steering_types import validate_spec_row_widths
+
+        expected = self.model_config.get_hidden_size()
+        for field_name, spec in (
+            ("steering_vectors", params.steering_vectors),
+            ("prefill_steering_vectors", params.prefill_steering_vectors),
+            ("decode_steering_vectors", params.decode_steering_vectors),
+        ):
+            validate_spec_row_widths(spec, expected, field_name=field_name)
 
     def _get_mm_identifier(
         self,
@@ -265,6 +298,7 @@ class InputProcessor:
         priority: int = 0,
         data_parallel_rank: int | None = None,
         resumable: bool = False,
+        request_metadata: RequestMetadata | None = None,
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
@@ -343,6 +377,43 @@ class InputProcessor:
         else:
             pooling_params = params.clone()
 
+        # Offline capture admission: resolve the per-request capture spec into
+        # prefix-cache reuse flags (the OpenAI path does this in
+        # ``_admit_capture``). Idempotent — served requests arrive with the
+        # flag already set, so this only fires for offline / direct ``LLM``
+        # requests, which never pass through the serving-layer admission step.
+        if (
+            sampling_params is not None
+            and sampling_params.capture is not None
+            and sampling_params.capture_touches_prompt is None
+        ):
+            self._resolve_capture_prefix_flags(
+                request_id,
+                sampling_params,
+                prompt_token_ids,
+                prompt_embeds,
+            )
+
+        # Offline patch admission: resolve the per-request patch spec into
+        # prefix-cache reuse flags (the OpenAI path does this in
+        # ``_admit_patch``). Idempotent — served requests arrive already
+        # stamped and skip this; it only fires for offline / direct ``LLM``
+        # requests. Unlike capture's best-effort resolution, an invalid offline
+        # patch spec raises ``ValueError`` (rejecting the request): patch
+        # entries carry explicit positions validated against the model's real
+        # shape, so a bad spec is a hard client error.
+        if (
+            sampling_params is not None
+            and sampling_params.patch
+            and sampling_params.patch_touches_prompt is None
+        ):
+            self._resolve_patch_prefix_flags(
+                request_id,
+                sampling_params,
+                prompt_token_ids,
+                prompt_embeds,
+            )
+
         # Multimodal related.
         mm_features: list[MultiModalFeatureSpec] | None = None
 
@@ -396,7 +467,116 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            request_metadata=request_metadata,
         )
+
+    def _resolve_capture_prefix_flags(
+        self,
+        request_id: str,
+        sampling_params: SamplingParams,
+        prompt_token_ids: list[int] | None,
+        prompt_embeds: Any,
+    ) -> None:
+        """Offline analogue of the serving layer's ``_admit_capture``.
+
+        Resolves ``sampling_params.capture`` into the prefix-cache reuse flags
+        so offline (and any non-OpenAI) requests get the same prefix-cache
+        treatment as served ones. Best-effort: an invalid spec leaves the flags
+        unset so the request stays conservatively correct (prefix caching
+        disabled for the capture) and the worker re-validates the raw spec at
+        registration.
+
+        Both spec/dict-form and pre-built instance-form consumers
+        (``LLM(capture_consumers=[obj])``) resolve here:
+        ``build_admission_validators`` keys them exactly as the runner does.
+        """
+        if getattr(self.vllm_config, "capture_consumers_config", None) is None:
+            return
+
+        from vllm.v1.capture.admission import (
+            build_capture_context,
+            resolve_capture_prefix_flags,
+        )
+        from vllm.v1.capture.errors import (
+            CaptureValidationError,
+            UnknownCaptureConsumerError,
+        )
+        from vllm.v1.capture.registry import build_admission_validators
+
+        if self._capture_consumers is None:
+            self._capture_consumers = build_admission_validators(self.vllm_config)
+        if not self._capture_consumers:
+            return
+
+        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+            prompt_token_ids, prompt_embeds
+        )
+        try:
+            ctx = build_capture_context(self.vllm_config, num_prompt_tokens, request_id)
+            resolve_capture_prefix_flags(self._capture_consumers, sampling_params, ctx)
+        except (UnknownCaptureConsumerError, CaptureValidationError) as exc:
+            logger.debug(
+                "capture: offline prefix-flag resolution skipped for request %s: %s",
+                request_id,
+                exc,
+            )
+
+    def _resolve_patch_prefix_flags(
+        self,
+        request_id: str,
+        sampling_params: SamplingParams,
+        prompt_token_ids: list[int] | None,
+        prompt_embeds: Any,
+    ) -> None:
+        """Offline analogue of the serving layer's ``_admit_patch``.
+
+        Resolves ``sampling_params.patch`` into the prefix-cache reuse flags
+        (``patch_touches_prompt`` / ``patch_min_prompt_position``) so offline
+        (and any non-OpenAI) requests get the same precise APC windowing served
+        requests get. Unlike the best-effort capture path, an invalid patch
+        spec raises ``ValueError`` — patch entries carry explicit
+        ``dest_position`` ints validated against the model's real shape, so a
+        bad spec is a hard client error that must fail loud (the engine rejects
+        the request, mirroring the serving layer's 400).
+
+        Deliberately narrower than the serving layer's ``_admit_patch``: it does
+        NOT run the source-manifest existence pre-check or the multimodal guard.
+        Those are frontend concerns — engine-side, a missing source is caught
+        (loudly) by the worker resolution-failure registry as a backstop, and
+        the offline/multimodal combination is out of scope.
+
+        The new client-provided source kinds are structurally validated here
+        (exactly-one-of source, mask shape, packed ``patch_vectors``, inline
+        index-in-range/width). Offline has no frontend steering registry, so
+        ``source_module`` names (other than the reserved ``zeros``) CANNOT be
+        existence-checked here — a bad name surfaces loudly via the worker
+        resolution-failure registry (``named_module_exists`` is left ``None``).
+        """
+        from vllm.v1.capture.admission import build_capture_context
+        from vllm.v1.capture.patch_admission import (
+            PatchValidationError,
+            resolve_patch_prefix_flags,
+        )
+
+        patch_config = getattr(self.vllm_config, "patch_config", None)
+        if patch_config is None:
+            raise ValueError(
+                "A patch spec was provided but patching is not enabled. Start "
+                "vLLM with --enable-patching to use per-request activation "
+                "patching."
+            )
+
+        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+            prompt_token_ids, prompt_embeds
+        )
+        ctx = build_capture_context(self.vllm_config, num_prompt_tokens, request_id)
+        max_patch_slots = getattr(patch_config, "max_patch_slots", 0)
+        try:
+            resolve_patch_prefix_flags(
+                sampling_params, ctx, max_patch_slots=max_patch_slots
+            )
+        except PatchValidationError as exc:
+            raise ValueError(str(exc)) from exc
 
     def _validate_prompt_len(
         self,

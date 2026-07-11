@@ -22,6 +22,7 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.metrics.stats import PrefillStats
+from vllm.v1.request_metadata import RequestMetadata
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
@@ -77,8 +78,22 @@ class Request:
         resumable: bool = False,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        abort_immediately: bool = False,
+        external_req_id: str | None = None,
+        request_metadata: RequestMetadata | None = None,
     ) -> None:
         self.request_id = request_id
+        # The original client-supplied request id (the id the API returned).
+        # ``request_id`` above is the vLLM-internal id, which adds a random
+        # suffix unless randomization is disabled. ``external_req_id`` lets
+        # downstream consumers (e.g. capture) correlate back to the client.
+        # Optional/None-safe: equals the internal id when randomization is
+        # off, and is unset for synthetically constructed requests.
+        self.external_req_id = external_req_id
+        # Request-level host-side metadata (conversation id, future steering
+        # specs). Carries the full struct so new sibling fields flow to the
+        # worker without further plumbing. ``None`` when the request set none.
+        self.request_metadata = request_metadata
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -139,8 +154,15 @@ class Request:
 
         # Used in async scheduling.
         self.num_output_placeholders = 0
-        # Used in forced preemption (reset_prefix_cache) with async scheduling.
-        self.discard_latest_async_tokens = False
+        self.async_tokens_to_discard = 0
+
+        # V2+PP+async: Enforces `pp_size` cadence between same-request decode steps
+        # so the worker's broadcast slot ring stays consistent.
+        self.next_decode_eligible_step = 0
+
+        # Seq of the most recent step this request was scheduled in; fences
+        # deferred block freeing (see Scheduler._free_request_blocks).
+        self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
@@ -185,6 +207,10 @@ class Request:
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
+        # If True, request should be aborted immediately after being added to
+        # the scheduler so the connector's request_finished hook runs.
+        self.abort_immediately = abort_immediately
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -193,6 +219,8 @@ class Request:
     ) -> "Request":
         return cls(
             request_id=request.request_id,
+            external_req_id=request.external_req_id,
+            request_metadata=request.request_metadata,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
@@ -209,6 +237,7 @@ class Request:
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
+            abort_immediately=request.abort_immediately,
         )
 
     def append_output_token_ids(
@@ -259,6 +288,20 @@ class Request:
         self.block_hashes.clear()
         self.update_block_hashes()
 
+    def update_decode_steering_signature(self, decode_hash: int) -> None:
+        """Forward-only update of the decode steering key for block hashing.
+
+        Unlike :meth:`set_block_hash_steering_overrides`, this does NOT
+        clear already-computed ``block_hashes``: blocks produced under the
+        previous signature keep their key (they *were* produced under that
+        steering), and only blocks hashed from now on pick up
+        ``decode_hash``. This is the per-block keying the dynamic-steering
+        path needs for mid-stream steering changes (overrides / tier /
+        monitor engaging during decode). Prefill keys are untouched. See
+        docs/design/dynamic_steering_apc_notification.md.
+        """
+        self.block_hash_decode_steering_config_hash = decode_hash
+
     @property
     def use_structured_output(self) -> bool:
         return self.structured_output_request is not None
@@ -304,14 +347,56 @@ class Request:
             return 0
         return self.sampling_params.decode_steering_config_hash
 
+    @cached_property
+    def patch_site_demand(self) -> dict[tuple[int, str], int]:
+        """Per-``(layer, hook)`` patch-slot demand. Delegates to
+        ``SamplingParams.patch_site_demand`` (itself cached). Empty when no
+        patching. Used by the scheduler for per-site capacity backpressure."""
+        if self.sampling_params is None:
+            return {}
+        return self.sampling_params.patch_site_demand
+
     def invalidate_steering_hashes(self) -> None:
         """Clear cached steering hashes so they recompute from current
         sampling_params.  Must be called whenever sampling_params is
         replaced (e.g. streaming session updates)."""
         self.__dict__.pop("prefill_steering_config_hash", None)
         self.__dict__.pop("decode_steering_config_hash", None)
+        self.__dict__.pop("patch_site_demand", None)
 
     def get_skip_reading_prefix_cache(self) -> bool:
+        # A capture-bearing request whose classification is unknown skips
+        # prefix-cache reuse entirely. A cache hit serves cached blocks
+        # without re-running the forward pass, so the hook taps that produce
+        # captured residuals never fire on the cached prefix. ``None`` means
+        # the capture could not be classified at admission (e.g. the offline
+        # ``LLM`` path does not resolve specs there), so we cannot know which
+        # positions are tapped and must conservatively skip reuse.
+        #
+        # Classified capture requests fall through to the normal resolution
+        # below: generated-only captures (``capture_touches_prompt`` False)
+        # keep full prefix caching, and prompt-touching captures
+        # (``capture_touches_prompt`` True) reuse the cache up to
+        # ``get_capture_prefix_cache_limit`` and re-forward the rest rather
+        # than skipping reuse wholesale. Checked before the explicit
+        # ``skip_reading_prefix_cache`` value because the latter is resolved
+        # during construction, before the entrypoint attaches ``capture``.
+        if (
+            self.sampling_params is not None
+            and self.sampling_params.capture
+            and self.sampling_params.capture_touches_prompt is None
+        ):
+            return True
+        # Same reasoning for activation patching: an unclassified patch request
+        # (offline path) might overwrite a prompt-range activation, which only
+        # fires when that position is re-forwarded — so skip reuse wholesale
+        # until classification (patch_touches_prompt) is known.
+        if (
+            self.sampling_params is not None
+            and self.sampling_params.patch
+            and self.sampling_params.patch_touches_prompt is None
+        ):
+            return True
         if (
             self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None
@@ -323,6 +408,35 @@ class Request:
         ):
             return self.pooling_params.skip_reading_prefix_cache
         return False
+
+    def get_capture_prefix_cache_limit(self) -> int | None:
+        """Upper bound on prefix-cache hit length imposed by capture/patching.
+
+        A prompt-touching capture must re-forward from its lowest captured
+        prompt position so that position's residual is produced; a prompt-range
+        patch must likewise re-forward from its lowest patched position so the
+        injection hook fires. Positions strictly below the floor may still be
+        served from cache. Returns the lower of the capture and patch floors,
+        or ``None`` when neither clamp applies (the unclassified case is
+        instead handled by :meth:`get_skip_reading_prefix_cache`).
+        """
+        sp = self.sampling_params
+        if sp is None:
+            return None
+        limits: list[int] = []
+        if (
+            sp.capture
+            and sp.capture_touches_prompt is True
+            and sp.capture_min_prompt_position is not None
+        ):
+            limits.append(sp.capture_min_prompt_position)
+        if (
+            sp.patch
+            and sp.patch_touches_prompt is True
+            and sp.patch_min_prompt_position is not None
+        ):
+            limits.append(sp.patch_min_prompt_position)
+        return min(limits) if limits else None
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)

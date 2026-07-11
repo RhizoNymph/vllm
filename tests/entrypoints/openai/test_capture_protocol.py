@@ -61,7 +61,7 @@ class TestChatProtocolRoundTrip:
                 "filesystem": {
                     "request_id": "r1",
                     "tag": "t1",
-                    "hooks": {"post_mlp": [0]},
+                    "hooks": {"post_block": [0]},
                     "positions": "last_prompt",
                 },
             },
@@ -226,13 +226,13 @@ class TestBuildCaptureResultsResponse:
         final = _FakeFinal(
             capture_results={
                 "fs": CaptureResult(
-                    key=("r1", 0, "post_mlp"),
+                    key=("r1", 0, "post_block"),
                     status="ok",
                     error=None,
                     payload=["/tmp/a.bin", "/tmp/a.json"],
                 ),
                 "log": CaptureResult(
-                    key=("r1", 0, "post_mlp"),
+                    key=("r1", 0, "post_block"),
                     status="partial_error",
                     error="dropped",
                     payload=None,
@@ -269,6 +269,88 @@ class TestPayloadCoercion:
     def test_fallback_to_value_key(self) -> None:
         assert _capture_result_to_response_payload(42) == {"value": 42}
 
+    def test_bytes_decoded_to_str(self) -> None:
+        # Results crossing the engine-IPC boundary (``capture_wait`` late
+        # finalize) arrive msgspec round-tripped: ``Path`` payloads come
+        # back as ``bytes``/``str``. Bytes are decoded so the response is
+        # JSON-safe.
+        assert _capture_result_to_response_payload([b"/tmp/a.bin"]) == {
+            "items": ["/tmp/a.bin"]
+        }
+
+    def test_dict_values_coerced(self) -> None:
+        # Non-primitive dict values are stringified rather than left as
+        # opaque objects that fail JSON serialization.
+        from pathlib import Path
+
+        out = _capture_result_to_response_payload({"p": Path("/tmp/x")})
+        assert out == {"p": "/tmp/x"}
+
+
+# ---------------------------------------------------------------------------
+# capture_wait protocol field
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureWaitField:
+    """``capture_wait`` opt-in on both request shapes."""
+
+    def test_chat_default_false(self) -> None:
+        req = ChatCompletionRequest.model_validate(
+            {"model": "m", "messages": [{"role": "user", "content": "x"}]}
+        )
+        assert req.capture_wait is False
+
+    def test_chat_accepts_true(self) -> None:
+        req = ChatCompletionRequest.model_validate(
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "x"}],
+                "capture_wait": True,
+            }
+        )
+        assert req.capture_wait is True
+
+    def test_completion_default_false(self) -> None:
+        req = CompletionRequest.model_validate({"model": "m", "prompt": "x"})
+        assert req.capture_wait is False
+
+    def test_completion_accepts_true(self) -> None:
+        req = CompletionRequest.model_validate(
+            {"model": "m", "prompt": "x", "capture_wait": True}
+        )
+        assert req.capture_wait is True
+
+
+class TestPendingCaptureResults:
+    """When ``capture`` is requested but results have not finalized, the
+    response surfaces a ``pending`` entry per consumer rather than omitting
+    the field, so clients distinguish "capture pending" from "no capture".
+    """
+
+    def test_pending_emitted_when_capture_requested_no_results(self) -> None:
+        req = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "x"}],
+            capture={"fs": {"hooks": {"post_block": [0]}}},
+        )
+        result = _build_capture_results_response(
+            req, _FakeFinal(capture_results={})  # type: ignore[arg-type]
+        )
+        assert result is not None
+        assert set(result) == {"fs"}
+        assert result["fs"].status == "pending"
+        assert "detail" in result["fs"].payload
+
+    def test_none_when_no_capture_requested(self) -> None:
+        req = ChatCompletionRequest(
+            model="m", messages=[{"role": "user", "content": "x"}]
+        )
+        result = _build_capture_results_response(
+            req, _FakeFinal(capture_results={})  # type: ignore[arg-type]
+        )
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # _admit_capture: unknown name + validator error paths
@@ -280,7 +362,7 @@ class _FakeConsumerAccepts(CaptureConsumer):
 
     def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
         # Returns a valid CaptureSpec derived from the raw payload.
-        return CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        return CaptureSpec(hooks={"post_block": [0]}, positions="last_prompt")
 
     def on_capture(self, key, tensor, sidecar):  # pragma: no cover - unused
         pass
@@ -314,6 +396,7 @@ def _build_admit_ctx_factories(monkeypatch):
             class _ParallelConfig:
                 tensor_parallel_size = 1
                 pipeline_parallel_size = 1
+                data_parallel_size = 1
 
             class _ModelConfig:
                 @staticmethod
@@ -405,7 +488,7 @@ class TestAdmitCaptureValidation:
         assert result["param"] == "capture.filesystem"
         assert "layer out of range" in result["message"]
 
-    def test_happy_path_mutates_sampling_params_to_spec(self, monkeypatch) -> None:
+    def test_happy_path_leaves_capture_raw(self, monkeypatch) -> None:
         from vllm.sampling_params import SamplingParams
 
         stub_cls, admit = _build_admit_ctx_factories(monkeypatch)
@@ -413,9 +496,8 @@ class TestAdmitCaptureValidation:
         consumer = _FakeConsumerAccepts.__new__(_FakeConsumerAccepts)
         stub._capture_consumers = {"filesystem": consumer}
 
-        sp = SamplingParams(
-            capture={"filesystem": {"tag": "t", "hooks": {"post_mlp": [0]}}}
-        )
+        raw = {"tag": "t", "hooks": {"post_block": [0]}}
+        sp = SamplingParams(capture={"filesystem": raw})
 
         result = admit(
             stub,
@@ -425,8 +507,11 @@ class TestAdmitCaptureValidation:
         )
 
         assert result is None
-        # The validator's CaptureSpec replaces the raw payload in place.
-        assert isinstance(sp.capture["filesystem"], CaptureSpec)
+        # _admit_capture deliberately does NOT overwrite the raw payload:
+        # CaptureSpec is not serializable across the engine IPC boundary, so
+        # the worker re-validates from the original dict. The entry must
+        # survive admission untouched.
+        assert sp.capture["filesystem"] is raw
 
     def test_noop_when_capture_is_none(self, monkeypatch) -> None:
         from vllm.sampling_params import SamplingParams
@@ -460,7 +545,7 @@ class TestAdmitCaptureValidation:
 
             def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
                 received.append(ctx)
-                return CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+                return CaptureSpec(hooks={"post_block": [0]}, positions="last_prompt")
 
             def on_capture(self, key, tensor, sidecar):  # pragma: no cover
                 pass
@@ -485,3 +570,60 @@ class TestAdmitCaptureValidation:
         assert ctx.element_size_bytes == 2
         assert ctx.tensor_parallel_size == 1
         assert ctx.pipeline_parallel_size == 1
+
+    def test_sets_capture_floor_for_prompt_spec(self, monkeypatch) -> None:
+        """A prompt-tapping spec records the re-forward floor.
+
+        ``_FakeConsumerAccepts`` resolves to ``positions="last_prompt"``
+        and the stub prompt length is 8, so the lowest captured prompt
+        position is 7. Admission classifies the request as prompt-touching
+        and records that floor to clamp prefix-cache reuse.
+        """
+        from vllm.sampling_params import SamplingParams
+
+        stub_cls, admit = _build_admit_ctx_factories(monkeypatch)
+        stub = stub_cls()
+        stub._capture_consumers = {
+            "fs": _FakeConsumerAccepts.__new__(_FakeConsumerAccepts)
+        }
+        sp = SamplingParams(capture={"fs": {"hooks": {"post_block": [0]}}})
+
+        result = admit(
+            stub,
+            sampling_params=sp,
+            engine_input=object(),
+            request_id="req-1",
+        )
+        assert result is None
+        assert sp.capture_touches_prompt is True
+        assert sp.capture_min_prompt_position == 7
+
+    def test_sets_capture_touches_prompt_false_for_generated_spec(
+        self, monkeypatch
+    ) -> None:
+        """A generated-only spec leaves prefix caching enabled."""
+        from vllm.sampling_params import SamplingParams
+
+        class _GeneratedOnly(CaptureConsumer):
+            reads_client_spec = True
+
+            def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
+                return CaptureSpec(hooks={"post_block": [0]}, positions="all_generated")
+
+            def on_capture(self, key, tensor, sidecar):  # pragma: no cover
+                pass
+
+        stub_cls, admit = _build_admit_ctx_factories(monkeypatch)
+        stub = stub_cls()
+        stub._capture_consumers = {"fs": _GeneratedOnly.__new__(_GeneratedOnly)}
+        sp = SamplingParams(capture={"fs": {}})
+
+        result = admit(
+            stub,
+            sampling_params=sp,
+            engine_input=object(),
+            request_id="req-1",
+        )
+        assert result is None
+        assert sp.capture_touches_prompt is False
+        assert sp.capture_min_prompt_position is None

@@ -41,11 +41,13 @@ from vllm.model_executor.layers.attention.encoder_only_attention import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     register_steering_buffers,
 )
@@ -54,7 +56,13 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
 
-from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
+from .interfaces import (
+    LocalArgmaxMixin,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsPP,
+)
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
@@ -251,8 +259,13 @@ class Qwen3DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        # mlp_in/mlp_out bracket the MLP sublayer for transcoder training:
+        # mlp_in is the normed MLP input; mlp_out is the branch added to the
+        # residual stream, so post_block == post_attn + mlp_out.
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_in")
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_out")
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -279,7 +292,7 @@ class Qwen3Model(Qwen2Model):
 
 
 class Qwen3ForCausalLM(
-    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
+    LocalArgmaxMixin, nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
 ):
     packed_modules_mapping = {
         "qkv_proj": [

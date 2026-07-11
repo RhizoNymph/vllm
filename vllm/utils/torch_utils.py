@@ -3,6 +3,7 @@
 import contextlib
 import importlib.metadata
 import os
+import platform
 import random
 import threading
 from collections.abc import Callable, Collection
@@ -67,6 +68,11 @@ MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP = {
 T = TypeVar("T")
 
 
+# Pin memory in non-WSL case.
+# Logic duplicated here for now to avoid circular import.
+PIN_MEMORY = "microsoft" not in " ".join(platform.uname()).lower()
+
+
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
         kv_cache_dtype.startswith("fp8")
@@ -108,6 +114,32 @@ def is_strictly_contiguous(t: torch.Tensor) -> bool:
             return False
         expected_stride *= shape[i]
     return True
+
+
+def canonicalize_singleton_dim_strides(t: torch.Tensor) -> torch.Tensor:
+    """Fix degenerate strides on size=1 dimensions for CUDA TMA compatibility.
+
+    PyTorch allows any stride on a size=1 dim (is_contiguous() is always True
+    there), so a size=1 dim may have stride=1 (2 bytes for bf16) instead of
+    the canonical product(shape[i+1:]).  CUDA TMA on H100+ requires all
+    non-outermost strides to be ≥16-byte aligned; stride=1 triggers
+    cudaErrorIllegalInstruction.  Zero-copy: patches stride metadata only via
+    as_strided; returns t unchanged if all size=1 strides are already canonical.
+    """
+    if 1 not in t.shape:
+        return t
+    strides = list(t.stride())
+    shape = t.shape
+    prev_stride = 1
+    changed = False
+    for i in range(len(shape) - 1, -1, -1):
+        if shape[i] == 1 and strides[i] != prev_stride:
+            strides[i] = prev_stride
+            changed = True
+        prev_stride = strides[i] * shape[i]
+    if not changed:
+        return t
+    return t.as_strided(t.shape, strides)
 
 
 @contextlib.contextmanager
@@ -576,12 +608,12 @@ def create_kv_caches_with_random(
 def async_tensor_h2d(
     data: list,
     dtype: torch.dtype,
-    target_device: str | torch.device,
-    pin_memory: bool,
+    device: str | torch.device,
+    pin_memory: bool = PIN_MEMORY,
 ) -> torch.Tensor:
     """Asynchronously create a tensor and copy it from host to device."""
     t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
-    return t.to(device=target_device, non_blocking=True)
+    return t.to(device=device, non_blocking=True)
 
 
 def make_ndarray_with_pad(
@@ -895,6 +927,16 @@ def supports_xpu_graph() -> bool:
 # create a library to hold the custom op
 vllm_lib = Library("vllm", "FRAGMENT")  # noqa
 
+# Qualified names (``ns::op``) already registered via
+# ``direct_register_custom_op`` in this process. Guards against a second
+# ``Library.define`` for the same op — which torch rejects with a hard
+# "registered ... multiple times" RuntimeError. This happens when a custom
+# op's defining module is imported more than once in a process (observed
+# with externally-plugged quant ops, e.g. the GGUF ``_fused_mul_mat_gguf``,
+# re-resolved on a cold torch.compile). Re-registering the same op is a
+# no-op, so skipping the duplicate is safe.
+_direct_registered_ops: set[str] = set()
+
 
 def direct_register_custom_op(
     op_name: str,
@@ -928,10 +970,17 @@ def direct_register_custom_op(
 
         dispatch_key = current_platform.dispatch_key
 
-    schema_str = infer_schema(op_func, mutates_args=mutates_args)
-
     my_lib = target_lib or vllm_lib
+    qualified = f"{getattr(my_lib, 'ns', 'vllm')}::{op_name}"
+    if qualified in _direct_registered_ops:
+        # Already registered in this process (idempotent): skip the second
+        # ``define`` so a re-imported op module doesn't hit torch's hard
+        # duplicate-registration error.
+        return
+
+    schema_str = infer_schema(op_func, mutates_args=mutates_args)
     my_lib.define(op_name + schema_str, tags=tags)
     my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
     if fake_impl is not None:
         my_lib._register_fake(op_name, fake_impl)
+    _direct_registered_ops.add(qualified)

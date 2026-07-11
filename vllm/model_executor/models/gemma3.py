@@ -27,11 +27,12 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import GeluAndMul
+from vllm.model_executor.layers.activation import get_act_and_mul_fn
 from vllm.model_executor.layers.attention import (
     Attention,
     EncoderOnlyAttention,
 )
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -43,6 +44,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_dtype,
     register_steering_buffers,
@@ -96,13 +98,7 @@ class Gemma3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
-        if hidden_activation != "gelu_pytorch_tanh":
-            raise ValueError(
-                "Gemma3 uses `gelu_pytorch_tanh` as the hidden activation "
-                "function. Please set `hidden_act` and `hidden_activation` to "
-                "`gelu_pytorch_tanh`."
-            )
-        self.act_fn = GeluAndMul(approximate="tanh")
+        self.act_fn = get_act_and_mul_fn(hidden_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
@@ -334,11 +330,18 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
         )
+        # mlp_in is the normed MLP input (transcoder training tap).
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_in")
         hidden_states = self.mlp(hidden_states)
-
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
-
+        # post_block must observe the true block output: residual + the *normed*
+        # MLP branch (= hidden_states[L+1]). Apply the post-FFN norm before the
+        # hook. Steering still rides ``residual`` so generation is unchanged.
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        # mlp_out is the normed MLP branch added to the residual stream, so
+        # post_block == post_attn + mlp_out.
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_out")
+
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 
         return hidden_states, residual
 
@@ -356,8 +359,16 @@ class Gemma3Model(nn.Module):
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
         steering_config = getattr(vllm_config, "steering_config", None)
+        # Buffer rows must cover the static config pool AND the dynamic-override
+        # pool (rows allocated at runtime by RequestSteeringOverride); mirror
+        # get_steering_buffer_config / the runner's warmup table_rows. Omitting
+        # max_dynamic_steering_configs undersizes the table and the override
+        # path writes past it (device-side assert in populate_steering_tables).
         max_steering_configs = (
-            steering_config.max_steering_configs if steering_config else 0
+            steering_config.max_steering_configs
+            + getattr(steering_config, "max_dynamic_steering_configs", 0)
+            if steering_config
+            else 0
         )
         steering_dtype = get_steering_buffer_dtype(vllm_config)
 
@@ -448,26 +459,6 @@ class Gemma3Model(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            # Revert +1 during llama.cpp conversion
-            # see: https://github.com/ggml-org/llama.cpp/blob/be7c3034108473beda214fd1d7c98fd6a7a3bdf5/convert_hf_to_gguf.py#L3397-L3400
-            if (
-                self.quant_config
-                and self.quant_config.get_name() == "gguf"
-                and name.endswith("norm.weight")
-            ):
-                loaded_weight -= 1
-
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
-
             # Check if this is a scale parameter that needs remapping first
             if name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
                 # Try to remap the scale name first

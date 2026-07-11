@@ -578,7 +578,7 @@ class Gemma3nDecoderLayer(nn.Module):
         attn_ffw_norm = self.post_feedforward_layernorm(attn_ffw)
         attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
         attn_ffw_laurel_gated = apply_layer_steering(
-            self, attn_ffw_laurel_gated, SteeringHookPoint.POST_MLP
+            self, attn_ffw_laurel_gated, SteeringHookPoint.POST_BLOCK
         )
 
         # ActUp (connect).
@@ -1098,16 +1098,6 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
             ):
                 name = f"self_decoder.{name}"
 
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue

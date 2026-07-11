@@ -48,6 +48,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -287,7 +288,7 @@ class OlmoeDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -303,6 +304,7 @@ class OlmoeModel(nn.Module):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
         max_steering_tokens, max_steering_configs = get_steering_buffer_config(
             vllm_config
         )
@@ -312,6 +314,7 @@ class OlmoeModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,

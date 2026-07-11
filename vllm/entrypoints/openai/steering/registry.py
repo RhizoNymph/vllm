@@ -23,13 +23,15 @@ from vllm.config.sae_steering_types import (
     coerce_sae_clamp_specs,
 )
 from vllm.config.steering_types import (
-    ResolvedSteeringVectorSpec,
     SteeringVectorSpec,
+    _looks_packed,
+    coerce_steering_spec,
     hash_steering_config,
     merge_steering_specs,
     normalize_layer_entry,
     resolve_effective_vectors,
     scale_steering_spec,
+    validate_spec_row_widths,
     validate_steering_index,
 )
 from vllm.logger import init_logger
@@ -90,17 +92,26 @@ class SteeringModule:
 class SteeringModuleRegistry:
     """Registry for named steering vector configurations."""
 
-    def __init__(self, valid_layer_indices: set[int] | None = None) -> None:
+    def __init__(
+        self,
+        valid_layer_indices: set[int] | None = None,
+        expected_row_width: int | None = None,
+    ) -> None:
         self._modules: dict[str, SteeringModule] = {}
         self._lock = asyncio.Lock()
         self._valid_layer_indices = valid_layer_indices
+        # Steering row width (== model hidden size). When set, registration
+        # rejects wrong-width vectors — such rows otherwise broadcast to
+        # workers, pre-materialize into the steering row table, and
+        # shape-crash the engine at the next table population.
+        self._expected_row_width = expected_row_width
 
     async def register(
         self,
         name: str,
-        vectors: SteeringVectorSpec | None = None,
-        prefill_vectors: SteeringVectorSpec | None = None,
-        decode_vectors: SteeringVectorSpec | None = None,
+        vectors: SteeringVectorSpec | dict | None = None,
+        prefill_vectors: SteeringVectorSpec | dict | None = None,
+        decode_vectors: SteeringVectorSpec | dict | None = None,
         *,
         kind: SteeringModuleKind = SteeringModuleKind.ADDITIVE,
         sae_manifest: SAEModuleManifest | None = None,
@@ -111,6 +122,13 @@ class SteeringModuleRegistry:
         validated as before; passing a non-empty ``sae_manifest`` is
         an error.  For ``kind=SAE_DELTA`` the manifest is required and
         all additive vector fields must be empty.
+
+        Each additive tier may be either the legacy ``SteeringVectorSpec``
+        shape or the binary-wire ``SteeringVectorSpecPacked`` shape; the
+        latter is normalized to the former via :func:`coerce_steering_spec`
+        so the stored ``SteeringModule`` always carries the legacy shape and
+        ``dump_for_broadcast`` continues to emit pickle-friendly plain
+        Python collections.
         """
         if kind is SteeringModuleKind.ADDITIVE:
             if sae_manifest is not None:
@@ -118,11 +136,23 @@ class SteeringModuleRegistry:
                     f"Steering module '{name}': sae_manifest is only valid "
                     "for kind=SAE_DELTA."
                 )
+            # Normalize packed-shape inputs to legacy shape so downstream
+            # validation (_validate_layer_entry) and the broadcast payload
+            # both see plain lists.
+            vectors = coerce_steering_spec(vectors)
+            prefill_vectors = coerce_steering_spec(prefill_vectors)
+            decode_vectors = coerce_steering_spec(decode_vectors)
+
+            # Validate that at least one tier has vectors
             if not vectors and not prefill_vectors and not decode_vectors:
                 raise ValueError(f"Steering module '{name}' has no vectors in any tier")
 
             # Validate hook point names and entry format
-            for spec in [vectors, prefill_vectors, decode_vectors]:
+            for tier_name, spec in [
+                ("vectors", vectors),
+                ("prefill_vectors", prefill_vectors),
+                ("decode_vectors", decode_vectors),
+            ]:
                 if spec:
                     invalid = set(spec.keys()) - VALID_HOOK_POINT_NAMES
                     if invalid:
@@ -141,6 +171,12 @@ class SteeringModuleRegistry:
                                 layer_idx=layer_idx,
                                 entry=entry,
                             )
+                    if self._expected_row_width is not None:
+                        validate_spec_row_widths(
+                            spec,
+                            self._expected_row_width,
+                            field_name=f"module {name!r} {tier_name}",
+                        )
 
             module = SteeringModule(
                 name=name,
@@ -504,9 +540,13 @@ class SteeringModuleRegistry:
                 "decode_vectors": null,
             }
 
-        JSON uses string keys for layer indices; they are converted to int.
-        SAE delta modules are loaded from a directory containing the
-        generic ``manifest.json`` + per-site safetensors layout accepted by
+        Each tier may instead be the binary-wire
+        ``SteeringVectorSpecPacked`` shape (base64-encoded ``data`` field
+        plus ``dtype``/``shape``/``layer_indices``), decoded via
+        :func:`coerce_steering_spec`.  JSON uses string keys for layer
+        indices; they are converted to int.  SAE delta modules are loaded
+        from a directory containing the generic ``manifest.json`` +
+        per-site safetensors layout accepted by
         :func:`vllm.entrypoints.openai.steering.sae_loader.load_sae_module_from_dir`.
         """
         file_path = Path(path)
@@ -538,12 +578,11 @@ class SteeringModuleRegistry:
                 f"got {type(data).__name__}"
             )
 
-        # Extract three tiers, converting string layer keys to int
-        vectors = _convert_layer_keys(data.get("vectors"), field_name="vectors")
-        prefill_vectors = _convert_layer_keys(
+        vectors = _load_tier_from_json(data.get("vectors"), field_name="vectors")
+        prefill_vectors = _load_tier_from_json(
             data.get("prefill_vectors"), field_name="prefill_vectors"
         )
-        decode_vectors = _convert_layer_keys(
+        decode_vectors = _load_tier_from_json(
             data.get("decode_vectors"), field_name="decode_vectors"
         )
 
@@ -561,9 +600,9 @@ class SteeringModuleRegistry:
         inline_prefill: SteeringVectorSpec | None,
         inline_decode: SteeringVectorSpec | None,
     ) -> tuple[
-        ResolvedSteeringVectorSpec | None,
-        ResolvedSteeringVectorSpec | None,
-        ResolvedSteeringVectorSpec | None,
+        SteeringVectorSpec | None,
+        SteeringVectorSpec | None,
+        SteeringVectorSpec | None,
         str | None,
     ]:
         """Resolve a named module and merge with inline vectors.
@@ -654,9 +693,7 @@ class SteeringModuleRegistry:
 
     def _validate_layer_index(self, name: str, layer_idx: int) -> None:
         """Validate layer indices against the loaded model when available."""
-        validate_steering_index(
-            layer_idx, f"Steering module {name!r} layer_idx"
-        )
+        validate_steering_index(layer_idx, f"Steering module {name!r} layer_idx")
         if self._valid_layer_indices is None:
             return
         if layer_idx not in self._valid_layer_indices:
@@ -872,6 +909,33 @@ def sae_manifest_from_dict(payload: dict[str, Any]) -> SAEModuleManifest:
         activation_params=dict(payload.get("activation_params") or {}),
         weights_uri=payload.get("weights_uri"),
     )
+
+
+def _load_tier_from_json(
+    tier: dict[str, Any] | None,
+    *,
+    field_name: str,
+) -> SteeringVectorSpec | None:
+    """Decode a single steering tier from a parsed JSON object.
+
+    Routes between the legacy and packed shapes: packed inputs go through
+    :func:`coerce_steering_spec` (which decodes the base64 blob and
+    returns int-keyed ``list[float]`` rows directly); legacy inputs go
+    through :func:`_convert_layer_keys` to coerce JSON string layer keys
+    into ints.
+    """
+    if tier is None:
+        return None
+    if not isinstance(tier, dict):
+        raise ValueError(
+            f"Steering module field {field_name!r} must be a JSON object, "
+            f"got {type(tier).__name__}"
+        )
+    if not tier:
+        return None
+    if _looks_packed(tier):
+        return coerce_steering_spec(tier)
+    return _convert_layer_keys(tier, field_name=field_name)
 
 
 def _convert_layer_keys(

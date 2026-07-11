@@ -296,7 +296,7 @@ class LoopCoderDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = hidden_states + residual
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
 
         return hidden_states
@@ -508,18 +508,6 @@ class IQuestLoopCoderModel(nn.Module):
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
-                continue
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "gate_projections" in name:

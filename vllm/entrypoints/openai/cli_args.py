@@ -20,13 +20,13 @@ from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     validate_chat_template,
 )
-from vllm.entrypoints.constants import (
-    H11_MAX_HEADER_COUNT_DEFAULT,
-    H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
-)
 from vllm.entrypoints.openai.models.protocol import (
     LoRAModulePath,
     SteeringModulePath,
+)
+from vllm.entrypoints.serve.utils.constants import (
+    H11_MAX_HEADER_COUNT_DEFAULT,
+    H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
 )
 from vllm.logger import init_logger
 from vllm.tool_parsers import ToolParserManager
@@ -279,6 +279,17 @@ class FrontendArgs(BaseFrontendArgs):
     """Host name."""
     port: int = 8000
     """Port number."""
+    data_parallel_supervisor_port: int = 9256
+    """HTTP port for aggregated health endpoints in multi-port external LB
+    mode."""
+    dp_supervisor_probe_interval_s: float = 5.0
+    """Seconds between aggregated health probes in multi-port external LB mode."""
+    dp_supervisor_probe_timeout_s: float = 5.0
+    """Seconds to wait between retries when a child health probe fails with a
+    connection error in multi-port external LB mode."""
+    dp_supervisor_probe_failure_threshold: int = 3
+    """Number of consecutive connection-error retries before a child health
+    probe is declared failed in multi-port external LB mode."""
     uds: str | None = None
     """Unix domain socket path. If set, host and port arguments are ignored."""
     uvicorn_log_level: Literal[
@@ -411,6 +422,15 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "Defaults to data_parallel_size if not specified.",
     )
     parser.add_argument(
+        "--patch-sidecar-port",
+        type=int,
+        default=0,
+        help="Loopback port for the internal activation-patching sidecar "
+        "api_server spawned when the Rust frontend is used with "
+        "--enable-patching. 0 (default) auto-picks a free port. Ignored "
+        "without the Rust frontend or when VLLM_RUST_PATCH_SIDECAR=0.",
+    )
+    parser.add_argument(
         "--config",
         help="Read CLI options from a config file. "
         "Must be a YAML with the following options: "
@@ -442,6 +462,13 @@ def validate_parsed_serve_args(args: argparse.Namespace):
         raise TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
     if args.enable_log_outputs and not args.enable_log_requests:
         raise TypeError("Error: --enable-log-outputs requires --enable-log-requests")
+
+    if args.data_parallel_multi_port_external_lb:
+        from vllm.entrypoints.openai.dp_supervisor import (
+            validate_multi_port_external_lb_args,
+        )
+
+        validate_multi_port_external_lb_args(args)
 
 
 def create_parser_for_docs() -> FlexibleArgumentParser:

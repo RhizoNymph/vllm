@@ -22,6 +22,12 @@ from vllm.v1.capture.consumers.filesystem.consumer import FilesystemConsumer
 from vllm.v1.capture.consumers.filesystem.types import (
     FilesystemCaptureRequest,
 )
+from vllm.v1.capture.consumers.filesystem.writer import (
+    ActivationWriter,
+    FinalizeTask,
+    WriteResult,
+    WriteTask,
+)
 from vllm.v1.capture.types import (
     CaptureChunk,
     CaptureContext,
@@ -30,12 +36,6 @@ from vllm.v1.capture.types import (
     CaptureResult,
     CaptureSpec,
     VllmInternalRequestId,
-)
-from vllm.v1.capture.consumers.filesystem.writer import (
-    ActivationWriter,
-    FinalizeTask,
-    WriteResult,
-    WriteTask,
 )
 
 # Validation tests require pydantic (pulled in by vllm.config). Skip
@@ -55,15 +55,20 @@ def _make_vllm_config(
     *,
     root_path: str | None = "/tmp/activations",
     max_bytes: int = 0,
+    num_hidden_layers: int = 32,
 ) -> MagicMock:
     """Build a minimal mock ``VllmConfig`` for the filesystem consumer.
 
     ``root_path`` / ``max_bytes`` are accepted for backwards compatibility
     with older call sites but are no longer consulted by the validator;
     the consumer receives its ``root`` via its constructor ``params``.
+    ``num_hidden_layers`` backs ``model_config.get_total_num_hidden_layers()``,
+    which the consumer reads to resolve ``global_hooks`` (e.g. ``"all"``).
     """
     del root_path, max_bytes
-    return MagicMock()
+    cfg = MagicMock()
+    cfg.model_config.get_total_num_hidden_layers.return_value = num_hidden_layers
+    return cfg
 
 
 def _make_context(
@@ -76,6 +81,8 @@ def _make_context(
     element_size_bytes: int = 2,
     tp: int = 1,
     pp: int = 1,
+    ep: int = 1,
+    dp: int = 1,
 ) -> CaptureContext:
     return CaptureContext(
         vllm_internal_request_id=VllmInternalRequestId(request_id),
@@ -86,6 +93,8 @@ def _make_context(
         element_size_bytes=element_size_bytes,
         tensor_parallel_size=tp,
         pipeline_parallel_size=pp,
+        expert_parallel_size=ep,
+        data_parallel_size=dp,
     )
 
 
@@ -100,6 +109,26 @@ def _make_consumer(
         vllm_config=_make_vllm_config(root_path=str(tmp_path)),
         params=params,
     )
+
+
+def test_root_expanduser(tmp_path, monkeypatch) -> None:
+    """A ``~`` in the configured root expands to ``$HOME``.
+
+    The shell does not expand ``~`` in
+    ``--capture-consumers filesystem:root=~/path`` (it is not at a word
+    boundary), so the consumer must ``expanduser`` it — otherwise captures
+    land in a literal ``~`` directory under the server's cwd.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    consumer = FilesystemConsumer(
+        vllm_config=_make_vllm_config(),
+        params={"root": "~/caps"},
+    )
+    try:
+        assert consumer._root == tmp_path / "caps"
+        assert "~" not in str(consumer._root)
+    finally:
+        consumer.shutdown(timeout=5.0)
 
 
 def _wait_for_result(
@@ -359,6 +388,128 @@ class TestValidateClientSpec:
         finally:
             consumer.shutdown(timeout=5.0)
 
+    @pytest.mark.parametrize(
+        "tp,pp,ep,dp",
+        [
+            (2, 1, 1, 1),  # tensor parallel
+            (1, 2, 1, 1),  # pipeline parallel
+            (1, 1, 4, 1),  # expert parallel
+            (1, 1, 1, 2),  # data parallel
+            (2, 2, 4, 2),  # all axes together
+        ],
+    )
+    def test_parallel_sizes_accepted_for_residual_hooks(
+        self, tp: int, pp: int, ep: int, dp: int
+    ) -> None:
+        # The replicated residual hooks are supported under every
+        # parallel axis — admission no longer rejects TP/PP/EP/DP > 1.
+        vllm_config = _make_vllm_config()
+        consumer = FilesystemConsumer(
+            vllm_config=vllm_config,
+            params={"root": "/tmp/test"},
+        )
+        try:
+            ctx = _make_context(tp=tp, pp=pp, ep=ep, dp=dp)
+            raw = FilesystemCaptureRequest(
+                request_id="par-req",
+                tag="par-tag",
+                hooks={"post_block": [0, 1, 2]},
+                positions="last_prompt",
+            )
+            spec = consumer.validate_client_spec(raw, ctx)
+            assert isinstance(spec, CaptureSpec)
+            assert spec.hooks["post_block"] == [0, 1, 2]
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    @pytest.mark.parametrize("layout", ["packed", "sharded", "per_file"])
+    def test_layouts_accepted_under_pipeline_parallelism(self, layout: str) -> None:
+        # packed/sharded now split their per-request/per-tag files by
+        # pipeline stage rank, so admission accepts them under PP rather
+        # than rejecting (see test_packed.py / test_sharded.py for the
+        # per-stage on-disk behavior).
+        consumer = FilesystemConsumer(
+            vllm_config=_make_vllm_config(),
+            params={"root": "/tmp/test"},
+        )
+        try:
+            ctx = _make_context(pp=2)
+            raw = FilesystemCaptureRequest(
+                request_id="pp-accepts",
+                tag="pp-accepts",
+                hooks={"post_block": [0, 1]},
+                positions="last_prompt",
+                layout=layout,
+            )
+            assert isinstance(consumer.validate_client_spec(raw, ctx), CaptureSpec)
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+
+@_skip_no_pydantic
+class TestPPGeometry:
+    """Validate ``_pp_geometry`` against the *real* ``ParallelConfig`` and
+    the real ``ModelConfig.get_layers_start_end_indices`` layer-split logic
+    — the production path the other PP tests stub with a fake config."""
+
+    @staticmethod
+    def _geom(pp: int, tp: int, rank: int, total_layers: int):
+        from types import SimpleNamespace
+
+        from vllm.config.model import ModelConfig
+        from vllm.config.parallel import ParallelConfig
+        from vllm.v1.capture.consumers.filesystem.consumer import _pp_geometry
+
+        # Bind the real (unbound) ModelConfig method to a stub carrying only
+        # the layer count it needs, so the real split arithmetic runs.
+        real_split = ModelConfig.get_layers_start_end_indices
+
+        class _ModelStub:
+            def get_total_num_hidden_layers(self) -> int:
+                return total_layers
+
+            def get_layers_start_end_indices(self, parallel_config: object):
+                return real_split(self, parallel_config)
+
+        # distributed_executor_backend="ray" skips ParallelConfig's
+        # single-node GPU-count validation, so the test runs on a box with
+        # fewer GPUs than world_size (e.g. CI / a 1-GPU node).
+        pc = ParallelConfig(
+            pipeline_parallel_size=pp,
+            tensor_parallel_size=tp,
+            distributed_executor_backend="ray",
+        )
+        pc.rank = rank
+        cfg = SimpleNamespace(parallel_config=pc, model_config=_ModelStub())
+        return _pp_geometry(cfg)
+
+    def test_pp_disabled_is_inert(self) -> None:
+        # pp_size == 1 → legacy filenames, no local-range filtering.
+        assert self._geom(pp=1, tp=1, rank=0, total_layers=4) == (1, 0, None)
+
+    def test_two_stage_tp1_splits_layers(self) -> None:
+        assert self._geom(pp=2, tp=1, rank=0, total_layers=4) == (2, 0, (0, 2))
+        assert self._geom(pp=2, tp=1, rank=1, total_layers=4) == (2, 1, (2, 4))
+
+    def test_tp_replicas_share_their_stage_slice(self) -> None:
+        # stage = (rank // tp) % pp: ranks 0,1 are stage 0; ranks 2,3 stage 1.
+        assert self._geom(pp=2, tp=2, rank=0, total_layers=4) == (2, 0, (0, 2))
+        assert self._geom(pp=2, tp=2, rank=1, total_layers=4) == (2, 0, (0, 2))
+        assert self._geom(pp=2, tp=2, rank=2, total_layers=4) == (2, 1, (2, 4))
+        assert self._geom(pp=2, tp=2, rank=3, total_layers=4) == (2, 1, (2, 4))
+
+    def test_four_stage_even_split(self) -> None:
+        for rank in range(4):
+            pp_size, pp_rank, rng = self._geom(pp=4, tp=1, rank=rank, total_layers=32)
+            assert (pp_size, pp_rank) == (4, rank)
+            assert rng == (rank * 8, rank * 8 + 8)
+
+    def test_non_config_falls_back_to_legacy(self) -> None:
+        from vllm.v1.capture.consumers.filesystem.consumer import _pp_geometry
+
+        # A MagicMock (its attrs don't coerce to int) → pp disabled.
+        assert _pp_geometry(MagicMock()) == (1, 0, None)
+
 
 class TestGetResultLifecycle:
     """Verify the result transitions: None -> pending -> ok."""
@@ -379,7 +530,7 @@ class TestGetResultLifecycle:
         consumer = _make_consumer(tmp_path)
         try:
             request_id = VllmInternalRequestId("result-test")
-            key: CaptureKey = (request_id, 1, "post_mlp")
+            key: CaptureKey = (request_id, 1, "post_block")
 
             tensor = torch.randn(1, 4, dtype=torch.float32)
             consumer.submit_chunk(
@@ -422,7 +573,7 @@ class TestWaitForResult:
         consumer = _make_consumer(tmp_path)
         try:
             request_id = VllmInternalRequestId("wait-ok")
-            key: CaptureKey = (request_id, 2, "post_mlp")
+            key: CaptureKey = (request_id, 2, "post_block")
 
             tensor = torch.randn(1, 4, dtype=torch.float32)
             consumer.submit_chunk(
@@ -518,6 +669,173 @@ class TestShutdown:
             assert consumer.global_capture_spec() is None
         finally:
             consumer.shutdown(timeout=5.0)
+
+
+class TestGlobalCaptureSpec:
+    """Consumer-level global capture spec (CUDA-graph-safe path)."""
+
+    def test_none_without_global_hooks(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path)
+        try:
+            assert consumer.global_capture_spec() is None
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_returns_configured_spec(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path,
+            global_hooks={"post_block": [0, 2]},
+            global_positions="all_generated",
+        )
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"post_block": [0, 2]}
+            assert spec.positions == "all_generated"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_default_positions_all_prompt(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path, global_hooks={"post_block": [1]})
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.positions == "all_prompt"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_explicit_positions_list(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path,
+            global_hooks={"pre_attn": [0]},
+            global_positions=[0, 1, 2],
+        )
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.positions == [0, 1, 2]
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_layers_sorted_deduped(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path, global_hooks={"post_attn": [3, 1, 1, 0]})
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"post_attn": [0, 1, 3]}
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_empty_global_hooks_disables(self, tmp_path: pathlib.Path) -> None:
+        # An empty dict is treated as "not configured" → no global spec.
+        consumer = _make_consumer(tmp_path, global_hooks={})
+        try:
+            assert consumer.global_capture_spec() is None
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_invalid_hook_name_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="not a valid hook point"):
+            _make_consumer(tmp_path, global_hooks={"bogus": [0]})
+
+    def test_renamed_hook_old_name_rejected(self, tmp_path: pathlib.Path) -> None:
+        # ``post_mlp`` was renamed to ``post_block``; the global validator
+        # must reject the old name (it previously accepted it, silently
+        # capturing nothing since no model fires ``post_mlp``).
+        with pytest.raises(ValueError, match="not a valid hook point"):
+            _make_consumer(tmp_path, global_hooks={"post_mlp": [0]})
+
+    def test_non_dict_global_hooks_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="must be a dict"):
+            _make_consumer(tmp_path, global_hooks=[0, 1])
+
+    def test_empty_layer_list_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="resolved to no layers"):
+            _make_consumer(tmp_path, global_hooks={"post_block": []})
+
+    def test_negative_layer_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            _make_consumer(tmp_path, global_hooks={"post_block": [-1]})
+
+    def test_non_int_layer_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="must be ints"):
+            _make_consumer(tmp_path, global_hooks={"post_block": ["x"]})
+
+    def test_default_tag_configurable(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path,
+            global_hooks={"post_block": [0]},
+            default_tag="run42",
+        )
+        try:
+            assert consumer._params.default_tag == "run42"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_default_tag_defaults_to_default(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path)
+        try:
+            assert consumer._params.default_tag == "default"
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    # ---- string DSL + range / all / dot-list (CLI-safe forms) ----
+
+    def test_string_dsl_multiple_hooks(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path, global_hooks="pre_attn:0-2;post_block:20"
+        )
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"pre_attn": [0, 1, 2], "post_block": [20]}
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_string_dsl_all(self, tmp_path: pathlib.Path) -> None:
+        # num_hidden_layers defaults to 32 in the fixture.
+        consumer = _make_consumer(tmp_path, global_hooks="post_block:all")
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"post_block": list(range(32))}
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_dict_value_range_string(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(tmp_path, global_hooks={"post_block": "0-3"})
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks == {"post_block": [0, 1, 2, 3]}
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_dict_value_dot_list_and_all(self, tmp_path: pathlib.Path) -> None:
+        consumer = _make_consumer(
+            tmp_path, global_hooks={"post_block": "1.5.9", "pre_attn": "all"}
+        )
+        try:
+            spec = consumer.global_capture_spec()
+            assert spec is not None
+            assert spec.hooks["post_block"] == [1, 5, 9]
+            assert spec.hooks["pre_attn"] == list(range(32))
+        finally:
+            consumer.shutdown(timeout=5.0)
+
+    def test_layer_out_of_range_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="out of range"):
+            _make_consumer(tmp_path, global_hooks={"post_block": [99]})
+
+    def test_string_dsl_missing_colon_rejected(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        with pytest.raises(ValueError, match="must be '<hook>:<layers>'"):
+            _make_consumer(tmp_path, global_hooks="post_block")
+
+    def test_bad_layer_spec_string_rejected(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(ValueError, match="layer spec"):
+            _make_consumer(tmp_path, global_hooks={"post_block": "1,2,3"})
 
 
 class TestClassVars:

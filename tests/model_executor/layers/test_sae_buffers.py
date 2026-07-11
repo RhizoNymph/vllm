@@ -162,7 +162,11 @@ class TestRegisterSaeBuffers:
         assert sae_act_params == {"threshold": 0.7}
 
     def test_supports_each_hook_point(self):
-        for hp in SteeringHookPoint:
+        # Iterate the SAE-supported hook points (the keys of the SAE
+        # buffer-attr maps), not the full SteeringHookPoint enum: the
+        # additive framework's POST_BLOCK hook is not an SAE surgery
+        # site, so ``register_sae_buffers`` has no buffer names for it.
+        for hp in HOOK_POINT_SAE_CLAMP_KIND_ATTR:
             m = _bare_module()
             register_sae_buffers(
                 m,

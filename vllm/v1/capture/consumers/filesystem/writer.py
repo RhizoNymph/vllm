@@ -168,6 +168,9 @@ class ActivationWriter:
         timeout_seconds: float = 180.0,
         on_collision: CollisionPolicy = "overwrite",
         fd_cache_size: int = 256,
+        fsync: bool = True,
+        atomic_publish: bool = True,
+        coalesce_max_bytes: int = 1 << 20,
     ) -> None:
         if num_threads <= 0:
             raise ValueError(f"num_threads must be >= 1, got {num_threads}")
@@ -182,6 +185,17 @@ class ActivationWriter:
                 f"on_collision must be one of 'overwrite' / 'error' / "
                 f"'suffix', got {on_collision!r}"
             )
+        if not atomic_publish and on_collision != "overwrite":
+            # Direct-write mode has no rename step to enforce a
+            # collision policy against, so it only supports overwrite.
+            raise ValueError(
+                "atomic_publish=False requires on_collision='overwrite', "
+                f"got {on_collision!r}"
+            )
+        if coalesce_max_bytes < 0:
+            raise ValueError(
+                f"coalesce_max_bytes must be >= 0, got {coalesce_max_bytes}"
+            )
 
         self.root = pathlib.Path(root)
         self.num_threads = num_threads
@@ -189,6 +203,30 @@ class ActivationWriter:
         self.timeout_seconds = timeout_seconds
         self.on_collision: CollisionPolicy = on_collision
         self.fd_cache_size = fd_cache_size
+        # When False, skip every ``os.fsync``. On network filesystems an
+        # fsync-per-file is the dominant finalize cost (a synchronous
+        # server round-trip each); skipping it trades crash-durability
+        # for throughput. The atomic ``os.replace`` still gives readers
+        # close-to-open visibility (NFS flushes dirty pages on close),
+        # so consumers see complete files either way — only durability
+        # across a server crash is relaxed.
+        self._fsync = fsync
+        # When True, writes land on ``<path>.tmp`` and an atomic
+        # ``os.replace`` publishes them. When False, write straight to
+        # the final path and skip the rename. On NFS each ``rename`` is
+        # a synchronous metadata RPC; dropping the two per capture
+        # (.bin + sidecar) is the main lever for small-capture
+        # throughput, at the cost of atomic visibility (a reader can
+        # observe a partially written file mid-capture).
+        self._atomic = atomic_publish
+        # Merge consecutive same-key ``WriteTask``s already queued on a
+        # worker into a single vectored ``os.writev``, up to this many
+        # bytes. With the ``packed`` layout a request's many small
+        # per-(step,layer,hook) appends all share one writer key, so
+        # coalescing turns hundreds of tiny ~16 KB writes into a few
+        # large ones — the throughput lever once per-file finalize is
+        # already amortized. 0 disables (one ``os.write`` per chunk).
+        self._coalesce_max_bytes = coalesce_max_bytes
 
         self._queues: list[queue.Queue[Any]] = [
             queue.Queue(maxsize=queue_size) for _ in range(num_threads)
@@ -393,13 +431,22 @@ class ActivationWriter:
         partition: _PartitionState,
     ) -> None:
         try:
+            # ``carry`` holds a task dequeued while coalescing that did
+            # not belong to the current batch; processed next iteration
+            # so it is never lost. Set before any I/O for that reason.
+            carry: Any = None
             while True:
-                task = q.get()
+                task = carry if carry is not None else q.get()
+                carry = None
                 if task is _SHUTDOWN:
                     break
                 try:
                     if isinstance(task, WriteTask):
-                        self._handle_write(partition, task)
+                        payloads = [task.payload]
+                        carry = self._coalesce_same_key(q, task, payloads)
+                        self._handle_write_batch(
+                            partition, task.key, task.path, task.append, payloads
+                        )
                     elif isinstance(task, FinalizeTask):
                         self._handle_finalize(partition, task)
                     else:  # pragma: no cover - defensive
@@ -428,18 +475,69 @@ class ActivationWriter:
     # ------------------------------------------------------------------
     # WriteTask handling
 
+    def _target_path(self, path: pathlib.Path) -> pathlib.Path:
+        """Where bytes are written: ``.tmp`` sibling if atomic, else final."""
+        return _tmp_path(path) if self._atomic else path
+
+    def _coalesce_same_key(
+        self,
+        q: queue.Queue[Any],
+        first: WriteTask,
+        payloads: list[bytes],
+    ) -> Any:
+        """Greedily drain queued same-key ``WriteTask``s into ``payloads``.
+
+        Pulls tasks already sitting in ``q`` (never blocks); while they
+        are ``WriteTask``s for ``first.key`` with ``append=True``,
+        appends their payloads until ``coalesce_max_bytes`` is reached or
+        the queue drains. The first non-matching task (different key, a
+        ``FinalizeTask``, or ``_SHUTDOWN``) is returned as the worker
+        loop's ``carry`` — it has been removed from the queue, so it must
+        not be dropped. Returns ``None`` if nothing non-matching popped.
+        """
+        limit = self._coalesce_max_bytes
+        if limit <= 0:
+            return None
+        total = len(first.payload)
+        while total < limit:
+            try:
+                nxt = q.get_nowait()
+            except queue.Empty:
+                return None
+            if isinstance(nxt, WriteTask) and nxt.key == first.key and nxt.append:
+                payloads.append(nxt.payload)
+                total += len(nxt.payload)
+            else:
+                return nxt
+        return None
+
     def _handle_write(self, partition: _PartitionState, task: WriteTask) -> None:
-        tmp_path = _tmp_path(task.path)
-        fd = self._acquire_fd(partition, task.key, tmp_path, task.append)
+        self._handle_write_batch(
+            partition, task.key, task.path, task.append, [task.payload]
+        )
+
+    def _handle_write_batch(
+        self,
+        partition: _PartitionState,
+        key: CaptureKey,
+        path: pathlib.Path,
+        append: bool,
+        payloads: list[bytes],
+    ) -> None:
+        target = self._target_path(path)
+        fd = self._acquire_fd(partition, key, target, append)
         try:
-            _full_write(fd, task.payload)
+            if len(payloads) == 1:
+                _full_write(fd, payloads[0])
+            else:
+                _full_writev(fd, payloads)
         except OSError as exc:
             # Evict the fd on I/O error so the next attempt reopens.
-            self._drop_fd(partition, task.key, fsync=False)
+            self._drop_fd(partition, key, fsync=False)
             raise WriteError(
-                f"write to {tmp_path} failed: {exc}",
-                path=tmp_path,
-                key=task.key,
+                f"write to {target} failed: {exc}",
+                path=target,
+                key=key,
                 errno_code=exc.errno,
             ) from exc
 
@@ -491,14 +589,15 @@ class ActivationWriter:
         cache = partition.fd_cache
         while len(cache) > partition.cache_capacity:
             evict_key, evict_fd = cache.popitem(last=False)
-            try:
-                os.fsync(evict_fd)
-            except OSError as exc:
-                logger.warning(
-                    "fsync on evicted fd for key=%s failed: %s",
-                    evict_key,
-                    exc,
-                )
+            if self._fsync:
+                try:
+                    os.fsync(evict_fd)
+                except OSError as exc:
+                    logger.warning(
+                        "fsync on evicted fd for key=%s failed: %s",
+                        evict_key,
+                        exc,
+                    )
             try:
                 os.close(evict_fd)
             except OSError as exc:  # pragma: no cover - best effort
@@ -518,7 +617,7 @@ class ActivationWriter:
         fd = partition.fd_cache.pop(key, None)
         if fd is None:
             return None
-        if fsync:
+        if fsync and self._fsync:
             try:
                 os.fsync(fd)
             except OSError as exc:
@@ -532,10 +631,13 @@ class ActivationWriter:
     def _close_all_fds(self, partition: _PartitionState) -> None:
         while partition.fd_cache:
             key, fd = partition.fd_cache.popitem(last=False)
-            try:
-                os.fsync(fd)
-            except OSError as exc:
-                logger.warning("fsync on shutdown fd for key=%s failed: %s", key, exc)
+            if self._fsync:
+                try:
+                    os.fsync(fd)
+                except OSError as exc:
+                    logger.warning(
+                        "fsync on shutdown fd for key=%s failed: %s", key, exc
+                    )
             try:
                 os.close(fd)
             except OSError as exc:  # pragma: no cover - best effort
@@ -556,8 +658,8 @@ class ActivationWriter:
                 self._drop_fd(partition, task.key, fsync=False)
                 return
 
-        bin_tmp = _tmp_path(task.bin_path)
-        sidecar_tmp = _tmp_path(task.sidecar_path)
+        bin_tmp = self._target_path(task.bin_path)
+        sidecar_tmp = self._target_path(task.sidecar_path)
 
         # Ensure the .bin.tmp exists. If no WriteTask was ever sent
         # for this key (zero-byte capture), touch the tmp file now so
@@ -581,19 +683,25 @@ class ActivationWriter:
                 ) from exc
 
         # Flush and close the .bin.tmp fd.
-        fd = partition.fd_cache.pop(task.key, None)
-        if fd is not None:
-            try:
-                os.fsync(fd)
-            except OSError as exc:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-                raise WriteError(
-                    f"fsync {bin_tmp} failed: {exc}",
-                    path=bin_tmp,
-                    key=task.key,
-                    errno_code=exc.errno,
-                ) from exc
+        cached_fd: int | None
+        try:
+            cached_fd = partition.fd_cache.pop(task.key)
+        except KeyError:
+            cached_fd = None
+        if cached_fd is not None:
+            fd = cached_fd
+            if self._fsync:
+                try:
+                    os.fsync(fd)
+                except OSError as exc:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                    raise WriteError(
+                        f"fsync {bin_tmp} failed: {exc}",
+                        path=bin_tmp,
+                        key=task.key,
+                        errno_code=exc.errno,
+                    ) from exc
             try:
                 os.close(fd)
             except OSError as exc:
@@ -605,11 +713,16 @@ class ActivationWriter:
                 ) from exc
 
         # Promote .bin.tmp -> task.bin_path under the collision policy.
-        final_bin = self._promote(
-            tmp_path=bin_tmp,
-            target=task.bin_path,
-            key=task.key,
-        )
+        # In direct-write mode the bytes are already at the final path,
+        # so there is no rename RPC to issue.
+        if self._atomic:
+            final_bin = self._promote(
+                tmp_path=bin_tmp,
+                target=task.bin_path,
+                key=task.key,
+            )
+        else:
+            final_bin = task.bin_path
 
         # Write the sidecar: json -> .json.tmp -> fsync -> promote.
         try:
@@ -646,15 +759,16 @@ class ActivationWriter:
             ) from exc
         try:
             _full_write(sidecar_fd, payload)
-            try:
-                os.fsync(sidecar_fd)
-            except OSError as exc:
-                raise WriteError(
-                    f"fsync {sidecar_tmp} failed: {exc}",
-                    path=sidecar_tmp,
-                    key=task.key,
-                    errno_code=exc.errno,
-                ) from exc
+            if self._fsync:
+                try:
+                    os.fsync(sidecar_fd)
+                except OSError as exc:
+                    raise WriteError(
+                        f"fsync {sidecar_tmp} failed: {exc}",
+                        path=sidecar_tmp,
+                        key=task.key,
+                        errno_code=exc.errno,
+                    ) from exc
         except OSError as exc:
             raise WriteError(
                 f"write {sidecar_tmp} failed: {exc}",
@@ -666,11 +780,14 @@ class ActivationWriter:
             with contextlib.suppress(OSError):
                 os.close(sidecar_fd)
 
-        final_sidecar = self._promote(
-            tmp_path=sidecar_tmp,
-            target=task.sidecar_path,
-            key=task.key,
-        )
+        if self._atomic:
+            final_sidecar = self._promote(
+                tmp_path=sidecar_tmp,
+                target=task.sidecar_path,
+                key=task.key,
+            )
+        else:
+            final_sidecar = task.sidecar_path
 
         self._record_ok(task.key, bin_path=final_bin, sidecar_path=final_sidecar)
 
@@ -815,3 +932,26 @@ def _full_write(fd: int, payload: bytes) -> None:
         if written <= 0:
             raise OSError(errno.EIO, "os.write returned 0 bytes")
         offset += written
+
+
+def _full_writev(fd: int, payloads: list[bytes]) -> None:
+    """Vectored ``os.writev`` that drains every buffer, retrying shorts.
+
+    Writes all of ``payloads`` to ``fd`` in order with one syscall per
+    pass, avoiding both per-buffer ``os.write`` overhead and a
+    concatenation copy. ``os.writev`` may accept fewer bytes than offered
+    (notably on NFS); we advance past fully written buffers, slice the
+    partially written one, and loop until drained.
+    """
+    views = [memoryview(b) for b in payloads]
+    idx = 0
+    n = len(views)
+    while idx < n:
+        written = os.writev(fd, views[idx:])
+        if written <= 0:
+            raise OSError(errno.EIO, "os.writev returned 0 bytes")
+        while idx < n and written >= len(views[idx]):
+            written -= len(views[idx])
+            idx += 1
+        if written > 0 and idx < n:
+            views[idx] = views[idx][written:]

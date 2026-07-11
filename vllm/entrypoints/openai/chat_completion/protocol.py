@@ -15,7 +15,10 @@ from pydantic import Field, PrivateAttr, model_serializer, model_validator
 
 from vllm.config import ModelConfig
 from vllm.config.sae_steering_types import coerce_sae_clamp_specs
-from vllm.config.steering_types import SteeringVectorSpec
+from vllm.config.steering_types import (
+    SteeringVectorSpecPacked,
+    unpack_steering_vectors,
+)
 from vllm.config.utils import replace
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -32,6 +35,8 @@ from vllm.entrypoints.openai.engine.protocol import (
     StructuralTagResponseFormat,
     ToolCall,
     UsageInfo,
+    validate_structural_tag_response_format,
+    validate_structured_outputs_structural_tag,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -43,8 +48,10 @@ from vllm.sampling_params import (
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
+    ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
+from vllm.v1.request_metadata import RequestMetadata
 
 logger = init_logger(__name__)
 
@@ -71,7 +78,7 @@ class CaptureResultResponse(OpenAIBaseModel):
     - ``error``: first error message, or ``None``.
     - ``payload``: consumer-specific opaque dict. The filesystem consumer
       writes ``{"paths": [...]}``; other consumers may expose their own
-      schema.
+      schemas.
     """
 
     status: Literal["pending", "ok", "partial_error", "error", "not_requested"]
@@ -120,6 +127,16 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: list[int] | None = None
+    # Per-token expert routing decisions, base64-encoded ``.npy`` bytes
+    # (numpy serialization). Shape after decode:
+    #   (num_tokens - 1, num_layers, num_experts_per_tok)  dtype uint8/uint16
+    # ``num_tokens - 1`` because the last sampled token has not been
+    # forwarded yet and therefore has no routing data.
+    # Decode:
+    #   np.load(io.BytesIO(base64.b64decode(s)))
+    # ``None`` if (a) the request was aborted before any forward pass,
+    # or (b) ``enable_return_routed_experts`` is off server-side.
+    routed_experts: str | None = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -135,6 +152,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None
+    # Rendered prompt text from chat templating (only set when
+    # ``return_prompt_text=True`` on the request).
+    prompt_text: str | None = None
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
@@ -171,6 +191,9 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     system_fingerprint: str | None = None
     # not part of the OpenAI spec but for tracing the tokens
     prompt_token_ids: list[int] | None = None
+    # Rendered prompt text from chat templating (only set when
+    # ``return_prompt_text=True`` on the request); only sent on the first chunk.
+    prompt_text: str | None = None
     capture_results: dict[str, CaptureResultResponse] | None = Field(
         default=None,
         description=(
@@ -256,7 +279,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "part of the standard OpenAI API specification."
         ),
     )
-    thinking_token_budget: int | None = None
+    thinking_token_budget: ThinkingTokenBudget = None
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -276,6 +299,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Annotated[int, Field(ge=-1, le=_INT64_MAX)] | None = None
+    truncation_side: Literal["left", "right"] | None = Field(
+        default=None,
+        description=(
+            "Which side to truncate from when truncate_prompt_tokens is active. "
+            "'right' keeps the first N tokens. "
+            "'left' keeps the last N tokens."
+        ),
+    )
     prompt_logprobs: int | None = None
     allowed_token_ids: list[int] | None = None
     bad_words: list[str] = Field(default_factory=list)
@@ -395,6 +426,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "need to map generated text back to input tokens."
         ),
     )
+    return_prompt_text: bool | None = Field(
+        default=None,
+        description=(
+            "If true, the response will include ``prompt_text`` containing the "
+            "prompt string produced by chat templating. In streaming mode it "
+            "is sent only on the first chunk. This is useful for inspecting "
+            "exactly what was fed into the model."
+        ),
+    )
 
     cache_salt: str | None = Field(
         default=None,
@@ -431,24 +471,108 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "can detect such behavior and terminate early, saving time and tokens.",
     )
 
-    steering_vectors: SteeringVectorSpec | None = Field(
+    capture: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Per-request opt-in for capture consumers, keyed by consumer "
+            "instance name. Each value is an opaque raw spec that the "
+            "corresponding consumer's ``validate_client_spec`` interprets "
+            "(the filesystem consumer expects a ``FilesystemCaptureRequest``-"
+            "shaped dict — ``request_id``, ``tag``, ``hooks``, ``positions``, "
+            'and an optional ``layout`` of ``"per_file"`` (default) or '
+            '``"packed"`` (one indexed file per request); other consumers '
+            "expose their own schema). The "
+            "response body returns a sibling ``capture_results`` dict with "
+            "per-consumer status/payload. Rejected with HTTP 400 when a "
+            "name does not match any registered consumer or when the raw "
+            "spec fails the consumer's admission validator."
+        ),
+    )
+    capture_wait: bool = Field(
+        default=False,
+        description=(
+            "When true (and `capture` is set), hold the response until this "
+            "request's capture results have finalized (files durable), then "
+            "report them in `capture_results`. Capture writes are otherwise "
+            "asynchronous and may land after the response."
+        ),
+    )
+    patch: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Activation-patching sites. Each entry: {layer, hook, "
+            "dest_position, source_run, source_position, alpha?} — overwrite "
+            "(alpha=1) or interpolate toward the destination activation at "
+            "(layer, hook, dest_position) with the clean run `source_run`'s "
+            "activation at `source_position`. Instead of source_run a client "
+            "may set source_module (named steering module or 'zeros') or "
+            "source_inline (a row of patch_vectors); an optional per-entry mask "
+            "restricts the patch to a subset of dims. Graded via normal "
+            "logprobs."
+        ),
+    )
+    patch_vectors: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Request-level packed table of client-provided patch vectors "
+            "referenced by a patch entry's source_inline / mask.inline row "
+            "index. Binary wire form: {dtype, shape:[n_rows, width], data: "
+            "base64}."
+        ),
+    )
+
+    # Per-request inline steering vectors in binary wire format.  Each entry
+    # is ``{dtype, shape, layer_indices, data: base64, scales?}`` — see
+    # ``vllm.config.steering_types.SteeringHookPacked``.  The packed form
+    # avoids the JSON parse + ``np.asarray(list_of_floats)`` overhead that
+    # dominates inline-request preprocessing on the API-server thread.
+    steering_vectors: SteeringVectorSpecPacked | None = Field(
         default=None,
         description="Per-request activation steering vectors keyed by hook "
-        "point name (pre_attn, post_attn, post_mlp), then layer index. "
-        "Values are either bare "
-        'list[float] (scale=1.0) or {"vector": [...], "scale": float}.',
+        "point name (pre_attn, post_attn, post_block). Each hook carries one "
+        "base64-encoded (num_layers, hidden_size) blob plus a sibling "
+        "layer_indices list (and optional per-row scales).",
     )
 
-    prefill_steering_vectors: SteeringVectorSpec | None = Field(
+    prefill_steering_vectors: SteeringVectorSpecPacked | None = Field(
         default=None,
         description="Phase-specific steering vectors added to base during "
-        "prefill only. Same format as steering_vectors.",
+        "prefill only. Same packed format as steering_vectors.",
     )
 
-    decode_steering_vectors: SteeringVectorSpec | None = Field(
+    decode_steering_vectors: SteeringVectorSpecPacked | None = Field(
         default=None,
         description="Phase-specific steering vectors added to base during "
-        "decode only. Same format as steering_vectors.",
+        "decode only. Same packed format as steering_vectors.",
+    )
+
+    conversation_id: str | None = Field(
+        default=None,
+        description="Opaque client conversation/session id. Carried as "
+        "request metadata (not a sampling parameter) and surfaced to "
+        "worker-side capture consumers via StepRequestView.conversation_id so a "
+        "dynamic-steering consumer can apply per-conversation (e.g. latched) "
+        "steering across the requests of one conversation. It is an "
+        "unauthenticated global namespace: in a multi-client deployment the "
+        "operator or gateway must namespace ids per client (e.g. a "
+        "per-tenant prefix) so one client cannot inherit or pre-latch "
+        "another's steering.",
+    )
+
+    steering: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Declarative per-request steering gates: a list of "
+        "{when, scope, apply}. `when` is {kind:'always'} or "
+        "{kind:'probe', probe:<vec>, threshold, sharpness?}; `scope` is "
+        "this_token|next_step|rest_of_request|rest_of_conversation; `apply` is "
+        "{kind:'add', steer:<vec>, strength?} or {kind:'attenuate', strength}. "
+        "A <vec> is {kind:'name', name:<registered>} (register via "
+        "/v1/steering/vectors/register) or {kind:'inline', "
+        "packed:{hook: SteeringHookPacked}} (base64). scope=rest_of_conversation "
+        "with apply=add persists server-side and requires a named steer vector "
+        "(inline is rejected); ephemeral scopes accept inline. Applied by the "
+        "built-in declarative consumer with no server-registered consumer; "
+        "requires the server to be started with --enable-steering.",
     )
 
     steering_name: str | None = Field(
@@ -470,32 +594,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
-    capture: dict[str, Any] | None = Field(
-        default=None,
-        description=(
-            "Per-request opt-in for capture consumers, keyed by consumer "
-            "instance name. Each value is an opaque raw spec that the "
-            "corresponding consumer's ``validate_client_spec`` interprets "
-            "(the filesystem consumer expects a ``FilesystemCaptureRequest``-"
-            "shaped dict; other consumers expose their own schema). The "
-            "response body returns a sibling ``capture_results`` dict with "
-            "per-consumer status/payload. Rejected with HTTP 400 when a "
-            "name does not match any registered consumer or when the raw "
-            "spec fails the consumer's admission validator."
-        ),
-    )
-
     # --8<-- [end:chat-completion-extra-params]
 
     @model_validator(mode="before")
     @classmethod
-    def _materialize_tool_calls_before(cls, data: Any) -> Any:
-        """Eagerly convert tool_calls generators/iterators to lists.
+    def _normalize_messages_before(cls, data: Any) -> Any:
+        """Pre-process message dicts before Pydantic field validation.
 
-        Must run before Pydantic field validation so that one-shot
-        generators are not consumed during union type matching of
-        ChatCompletionAssistantMessageParam (which types tool_calls
-        as Iterable[...]).
+        Performs two normalizations in a single pass:
+        - Converts tool_calls generators/iterators to lists so one-shot
+          generators are not consumed during union type matching.
+        - Renames the deprecated ``reasoning_content`` field to
+          ``reasoning`` so downstream code only needs to check one field.
         """
         if not isinstance(data, dict):
             return data
@@ -508,6 +618,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             tool_calls = msg.get("tool_calls")
             if tool_calls is not None and not isinstance(tool_calls, list):
                 msg["tool_calls"] = list(tool_calls)
+            reasoning_content = msg.pop("reasoning_content", None)
+            if reasoning_content is not None and msg.get("reasoning") is None:
+                msg["reasoning"] = reasoning_content
         return data
 
     @model_validator(mode="after")
@@ -536,17 +649,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_template: str | None,
         default_template_content_format: ChatTemplateContentFormatOption,
     ) -> ChatParams:
+        extra_kwargs: dict[str, Any] = dict(
+            add_generation_prompt=self.add_generation_prompt,
+            continue_final_message=self.continue_final_message,
+            documents=self.documents,
+            reasoning_effort=self.reasoning_effort,
+        )
+
+        # When reasoning is requested, activate thinking for models whose
+        # chat templates require explicit opt-in (e.g., Gemma4 defaults
+        # enable_thinking to false). For templates that don't declare the
+        # variable, resolve_chat_template_kwargs filters it out harmlessly.
+        user_kwargs = self.chat_template_kwargs or {}
+        if self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
+            extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
+
         return ChatParams(
             chat_template=self.chat_template or default_template,
             chat_template_content_format=default_template_content_format,
             chat_template_kwargs=merge_kwargs(
                 self.chat_template_kwargs,
-                dict(
-                    add_generation_prompt=self.add_generation_prompt,
-                    continue_final_message=self.continue_final_message,
-                    documents=self.documents,
-                    reasoning_effort=self.reasoning_effort,
-                ),
+                extra_kwargs,
             ),
             media_io_kwargs=self.media_io_kwargs,
         )
@@ -563,6 +686,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             max_total_tokens=model_config.max_model_len,
             max_output_tokens=max_output_tokens or 0,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
+            truncation_side=self.truncation_side,
             add_special_tokens=self.add_special_tokens,
             needs_detokenization=bool(self.echo and not self.return_token_ids),
             max_total_tokens_param="max_model_len",
@@ -695,9 +819,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
-            steering_vectors=self.steering_vectors,
-            prefill_steering_vectors=self.prefill_steering_vectors,
-            decode_steering_vectors=self.decode_steering_vectors,
+            steering_vectors=unpack_steering_vectors(self.steering_vectors),
+            prefill_steering_vectors=unpack_steering_vectors(
+                self.prefill_steering_vectors
+            ),
+            decode_steering_vectors=unpack_steering_vectors(
+                self.decode_steering_vectors
+            ),
             sae_clamp_specs=coerce_sae_clamp_specs(self.sae_clamp_specs),
         )
         # Attach the capture dict (keyed by consumer name). The
@@ -707,7 +835,29 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # internal reference across requests.
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)
+        if self.patch is not None:
+            sampling_params.patch = [dict(e) for e in self.patch]
+        if self.patch_vectors is not None:
+            sampling_params.patch_vectors = dict(self.patch_vectors)
         return sampling_params
+
+    def to_request_metadata(self, vector_registry=None) -> RequestMetadata:
+        """Build the request-level metadata channel for this request.
+
+        Holds host-side per-request fields that are not sampling parameters
+        (the conversation id and declarative steering gates); threaded to the
+        worker alongside the client request id rather than on
+        ``SamplingParams``. Named vector sources in ``steering`` are resolved
+        to inline packed bytes here via *vector_registry*; raises
+        ``ValueError`` on a malformed gate spec or unknown name (surfaced by
+        the caller as HTTP 400).
+        """
+        from vllm.v1.steering_schema import build_steering_gates
+
+        return RequestMetadata(
+            conversation_id=self.conversation_id,
+            steering=build_steering_gates(self.steering, vector_registry),
+        )
 
     @model_validator(mode="before")
     @classmethod
@@ -734,6 +884,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "'json_schema' field must be provided.",
                     parameter="response_format",
                 )
+
+        if rf_type == "structural_tag":
+            validate_structural_tag_response_format(response_format)
 
         return data
 
@@ -804,20 +957,21 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
         # you can only use one kind of constraints for structured outputs
         if count > 1:
-            raise ValueError(
+            raise VLLMValidationError(
                 "You can only use one kind of constraints for structured "
-                "outputs ('json', 'regex' or 'choice')."
+                "outputs ('json', 'regex' or 'choice').",
             )
         # you can only either use structured outputs or tools, not both
-        if count > 1 and data.get("tool_choice", "none") not in (
+        if count > 0 and data.get("tool_choice", "none") not in (
             "none",
             "auto",
             "required",
         ):
-            raise ValueError(
+            raise VLLMValidationError(
                 "You can only either use constraints for structured outputs "
-                "or tools, not both."
+                "or tools, not both.",
             )
+        validate_structured_outputs_structural_tag(structured_outputs_kwargs)
         return data
 
     @model_validator(mode="before")
@@ -848,17 +1002,21 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if "tool_choice" in data and data["tool_choice"] is not None:
             # ensure that if "tool choice" is specified, tools are present
             if "tools" not in data or data["tools"] is None:
-                raise ValueError("When using `tool_choice`, `tools` must be set.")
+                raise VLLMValidationError(
+                    "When using `tool_choice`, `tools` must be set.",
+                    parameter="tool_choice",
+                )
 
             # make sure that tool choice is either a named tool
             # OR that it's set to "auto" or "required"
             if data["tool_choice"] not in ["auto", "required"] and not isinstance(
                 data["tool_choice"], dict
             ):
-                raise ValueError(
+                raise VLLMValidationError(
                     f"Invalid value for `tool_choice`: {data['tool_choice']}! "
                     'Only named tools, "none", "auto" or "required" '
-                    "are supported."
+                    "are supported.",
+                    parameter="tool_choice",
                 )
 
             # ensure that if "tool_choice" is specified as an object,
@@ -871,29 +1029,33 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 valid_tool = False
                 function = data["tool_choice"].get("function")
                 if not isinstance(function, dict):
-                    raise ValueError(
+                    raise VLLMValidationError(
                         f"Invalid value for `function`: `{function}` in "
-                        f"`tool_choice`! {correct_usage_message}"
+                        f"`tool_choice`! {correct_usage_message}",
+                        parameter="tool_choice.function",
                     )
                 if "name" not in function:
-                    raise ValueError(
+                    raise VLLMValidationError(
                         f"Expected field `name` in `function` in "
-                        f"`tool_choice`! {correct_usage_message}"
+                        f"`tool_choice`! {correct_usage_message}",
+                        parameter="tool_choice.function.name",
                     )
                 function_name = function["name"]
                 if not isinstance(function_name, str) or len(function_name) == 0:
-                    raise ValueError(
+                    raise VLLMValidationError(
                         f"Invalid `name` in `function`: `{function_name}`"
-                        f" in `tool_choice`! {correct_usage_message}"
+                        f" in `tool_choice`! {correct_usage_message}",
+                        parameter="tool_choice.function.name",
                     )
                 for tool in data["tools"]:
                     if tool["function"]["name"] == function_name:
                         valid_tool = True
                         break
                 if not valid_tool:
-                    raise ValueError(
+                    raise VLLMValidationError(
                         "The tool specified in `tool_choice` does not match any"
-                        " of the specified `tools`"
+                        " of the specified `tools`",
+                        parameter="tool_choice",
                     )
         return data
 
@@ -901,9 +1063,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @classmethod
     def check_generation_prompt(cls, data):
         if data.get("continue_final_message") and data.get("add_generation_prompt"):
-            raise ValueError(
+            raise VLLMValidationError(
                 "Cannot set both `continue_final_message` and "
-                "`add_generation_prompt` to True."
+                "`add_generation_prompt` to True.",
             )
         return data
 
@@ -913,8 +1075,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("cache_salt") is not None and (
             not isinstance(data["cache_salt"], str) or not data["cache_salt"]
         ):
-            raise ValueError(
-                "Parameter 'cache_salt' must be a non-empty string if provided."
+            raise VLLMValidationError(
+                "Parameter 'cache_salt' must be a non-empty string if provided.",
+                parameter="cache_salt",
             )
         return data
 
@@ -984,7 +1147,9 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
     - The ``n`` parameter must be 1 (or omitted).
     """
 
-    messages: list[list[ChatCompletionMessageParam]] = Field(..., min_length=1)
+    messages: list[Annotated[list[ChatCompletionMessageParam], Field(min_length=1)]] = (
+        Field(..., min_length=1)
+    )
     model: str | None = None
 
     # Shared sampling / generation fields — mirror ChatCompletionRequest.
@@ -1002,6 +1167,8 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
     temperature: float | None = 0.7
     top_p: float | None = 1.0
     user: str | None = None
+    tool_choice: Literal["none"] | None = "none"
+    include_reasoning: bool = True
 
     # vLLM extensions
     best_of: int | None = None
@@ -1021,9 +1188,9 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
     guided_decoding_backend: str | None = None
     echo: bool = False
     return_token_ids: bool = False
-    steering_vectors: SteeringVectorSpec | None = None
-    prefill_steering_vectors: SteeringVectorSpec | None = None
-    decode_steering_vectors: SteeringVectorSpec | None = None
+    steering_vectors: SteeringVectorSpecPacked | None = None
+    prefill_steering_vectors: SteeringVectorSpecPacked | None = None
+    decode_steering_vectors: SteeringVectorSpecPacked | None = None
     steering_name: str | None = None
     sae_clamp_specs: list[dict[str, Any]] | None = None
 
@@ -1037,6 +1204,16 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
                 "Batch chat completions do not support beam search. "
                 "Please set `use_beam_search` to False."
             )
+        response_format = data.get("response_format")
+        rf_type = (
+            response_format.get("type")
+            if isinstance(response_format, dict)
+            else getattr(response_format, "type", None)
+        )
+        if rf_type == "structural_tag":
+            validate_structural_tag_response_format(response_format)
+        if (structured_outputs := data.get("structured_outputs")) is not None:
+            validate_structured_outputs_structural_tag(structured_outputs)
         n = data.get("n", 1)
         if n is not None and n != 1:
             raise ValueError(

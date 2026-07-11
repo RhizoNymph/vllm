@@ -77,6 +77,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
 )
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -113,6 +114,7 @@ from .interfaces import (
 )
 from .utils import (
     PPMissingLayer,
+    get_pp_missing_layer_names,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -308,6 +310,13 @@ class DeepseekV2MoE(nn.Module):
         self.is_fusion_moe_shared_experts_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         )
+        if (
+            self.is_rocm_aiter_moe_enabled
+            and self.gate.e_score_correction_bias is not None
+        ):
+            # Accumulates in fp32; avoids bf16->fp32 cast.
+            self.gate.set_out_dtype(self.gate.weight.dtype)
+
         if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
             self.shared_experts = None
         else:
@@ -618,6 +627,7 @@ class Indexer(nn.Module):
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
         prefix: str = "",
+        is_inplace_rope: bool = False,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -679,15 +689,21 @@ class Indexer(nn.Module):
             self.topk_indices_buffer,
         )
 
+        self.is_inplace_rope = is_inplace_rope
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
-        if current_platform.is_rocm():
+        if current_platform.is_rocm() and self.is_inplace_rope:
             # This path should works on all platform, will remove extra
             # branches in the future
+            # This fast path relies on rotary_emb mutating q and k inplace.
+            # On ROCm, this is only valid for kernels used as custom ops.
+            # In pytorch-native rope for inductor fusion, rotated q/k tensors
+            # are not mutated inplace but returned as new tensors.
             # Fused wk + weights_proj: one GEMM, then split
             kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
@@ -743,7 +759,9 @@ class Indexer(nn.Module):
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
-def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+def _try_load_fp8_indexer_wk(
+    name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names
+):
     """
     We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
     in FP8 with a separate weight_scale_inv, while weights_proj is stored in BF16.
@@ -759,6 +777,12 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
         return False  # WK is not in FP8 format, ignore.
     # Buffer this tensor (weight or scale) until both have arrived.
     layer_prefix = name.rsplit(".wk.", 1)[0]  # e.g. "model.layers.0.self_attn.indexer"
+    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+    if any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in pp_missing_layer_names
+    ):
+        return True
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -776,7 +800,6 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     )
 
     # Load the dequantized weight into shard 0 of the fused buffer.
-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
     param = params_dict[fused_name]
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
@@ -1008,21 +1031,23 @@ class DeepseekV2MLAAttention(nn.Module):
                 cache_config,
                 topk_indices_buffer,
                 f"{prefix}.indexer",
+                is_inplace_rope=self.indexer_rope_emb.enabled(),
             )
 
-            # Enable IndexCache for DeepSeek models to reduce redundant top-k
-            # token selection computations in sparse attention.
-            use_index_cache = getattr(config, "use_index_cache", False)
-            if use_index_cache:
-                # IndexCache config
-                # Refer: https://arxiv.org/abs/2603.12201 for more details.
-                _index_topk_freq = getattr(config, "index_topk_freq", 1)
-                _index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                layer_id = extract_layer_index(prefix)
-                if _index_topk_pattern is None:
-                    _skip_topk = max(layer_id - 1, 0) % _index_topk_freq != 0
-                elif 0 <= layer_id < len(_index_topk_pattern):
-                    _skip_topk = _index_topk_pattern[layer_id] == "S"
+            # IndexCache config
+            # Refer: https://arxiv.org/abs/2603.12201 for more details.
+            _index_topk_freq = getattr(config, "index_topk_freq", 1)
+            _index_topk_pattern = getattr(config, "index_topk_pattern", None)
+            _index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+            layer_id = extract_layer_index(prefix)
+
+            if _index_topk_pattern is None:
+                _skip_topk = (
+                    max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq
+                    != 0
+                )
+            elif 0 <= layer_id < len(_index_topk_pattern):
+                _skip_topk = _index_topk_pattern[layer_id] == "S"
 
         else:
             self.indexer_rope_emb = None
@@ -1214,7 +1239,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             # The scaling of DeepseekV2MOE output would be done in the forward
             # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 
         return hidden_states, residual
 
@@ -1259,8 +1284,8 @@ class DeepseekV2Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
-                vllm_config,
-                prefix,
+                vllm_config=vllm_config,
+                prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
                 max_steering_tokens=max_steering_tokens,
                 max_steering_configs=max_steering_configs,
@@ -1559,6 +1584,7 @@ class DeepseekV2ForCausalLM(
             num_redundant_experts=self.num_redundant_experts,
         )
 
+        pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
@@ -1574,7 +1600,12 @@ class DeepseekV2ForCausalLM(
             )
 
             if _try_load_fp8_indexer_wk(
-                name, loaded_weight, _pending_wk_fp8, params_dict, loaded_params
+                name,
+                loaded_weight,
+                _pending_wk_fp8,
+                params_dict,
+                loaded_params,
+                pp_missing_layer_names,
             ):
                 continue
 

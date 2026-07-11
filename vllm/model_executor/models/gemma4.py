@@ -26,7 +26,6 @@ import regex as re
 import torch
 from torch import nn
 
-import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -36,11 +35,13 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import GeluAndMul
+from vllm.model_executor.layers.activation import get_act_and_mul_fn
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
+    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -247,13 +248,7 @@ class Gemma4MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
-        if hidden_activation != "gelu_pytorch_tanh":
-            raise ValueError(
-                "Gemma4 uses `gelu_pytorch_tanh` as the hidden activation "
-                "function. Please set `hidden_act` and `hidden_activation` to "
-                "`gelu_pytorch_tanh`."
-            )
-        self.act_fn = GeluAndMul(approximate="tanh")
+        self.act_fn = get_act_and_mul_fn(hidden_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
@@ -340,8 +335,9 @@ class Gemma4MoE(nn.Module):
         # Gemma4 routing: softmax over ALL experts → top-k → renormalize.
         # FusedMoE's built-in fused_topk scopes softmax differently, so
         # a custom routing function is needed for numerical correctness.
-        per_expert_scale = self.per_expert_scale
-
+        # NOTE: self.per_expert_scale is read at call time (not captured into
+        # a local) so that torch.func.functional_call parameter substitution
+        # reaches the routing function correctly.
         def routing_function(
             hidden_states: torch.Tensor,
             gating_output: torch.Tensor,
@@ -350,10 +346,12 @@ class Gemma4MoE(nn.Module):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             if current_platform.is_cuda_alike() or current_platform.is_xpu():
                 return gemma4_fused_routing_kernel_triton(
-                    gating_output, topk, per_expert_scale
+                    gating_output, topk, self.per_expert_scale
                 )
 
-            return gemma4_routing_function_torch(gating_output, topk, per_expert_scale)
+            return gemma4_routing_function_torch(
+                gating_output, topk, self.per_expert_scale
+            )
 
         # FusedMoE experts with custom Gemma4 routing
         self.experts = FusedMoE(
@@ -369,7 +367,7 @@ class Gemma4MoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             custom_routing_function=routing_function,
-            activation="gelu",
+            activation="gelu_tanh",
         )
 
     def forward(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
@@ -557,7 +555,9 @@ class Gemma4DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        vllm_config: VllmConfig | None = None,
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
+        steering_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -567,15 +567,13 @@ class Gemma4DecoderLayer(nn.Module):
 
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
-        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
-            vllm_config
-        )
+
         register_steering_buffers(
             self,
             config.hidden_size,
             max_steering_tokens=max_steering_tokens,
             max_steering_configs=max_steering_configs,
-            dtype=get_steering_buffer_dtype(vllm_config),
+            dtype=steering_dtype,
         )
 
         # Gemma4 uses different head dimensions for sliding vs full attention
@@ -726,10 +724,13 @@ class Gemma4DecoderLayer(nn.Module):
         # Gemma4 residual pattern:
         # 1. input_norm(x) → attn → post_attn_norm → ADD residual
         # 2. pre_ff_norm → mlp → post_ff_norm → ADD residual
-        hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.PRE_ATTN
-        )
         residual = hidden_states
+        # Activation-capture taps (no-op unless a capture manager is active).
+        # Read the pristine residual stream at each hook point, before any
+        # steering is applied, so captures record the model's natural
+        # activations; mirrors apply_layer_steering's hook placement.
+        maybe_capture_residual(residual, self.layer_idx, "pre_attn")
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         hidden_states = self.input_layernorm(residual)
 
@@ -741,6 +742,9 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        maybe_capture_residual(hidden_states, self.layer_idx, "post_attn")
+        # POST_ATTN steers the combined tensor before it is split into the
+        # MLP-input path and the residual carried to the final add.
         hidden_states = apply_layer_steering(
             self, hidden_states, SteeringHookPoint.POST_ATTN
         )
@@ -748,15 +752,17 @@ class Gemma4DecoderLayer(nn.Module):
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        # mlp_in is the normed dense-MLP input (transcoder training tap). On MoE
+        # layers the parallel MoE branch is normed separately, so mlp_in covers
+        # only the dense path; mlp_out still captures the combined branch.
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_in")
         hidden_states = self.mlp(hidden_states)
 
         if self.enable_moe_block:
             hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
 
-            # Router and MoE experts see the residual (pre-MLP state),
-            # matching the HF transformers forward path
-            router_logits = self.router(residual)
             hidden_states_2 = self.pre_feedforward_layernorm_2(residual)
+            router_logits = self.router(residual)
             hidden_states_2 = self.moe(hidden_states_2, router_logits)
             hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
 
@@ -764,9 +770,13 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states = hidden_states_1 + hidden_states_2
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        # mlp_out is the normed MLP branch added to the residual stream, so
+        # post_block == post_attn + mlp_out.
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_out")
         hidden_states = hidden_states + residual
+        maybe_capture_residual(hidden_states, self.layer_idx, "post_block")
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
 
         # Apply PLE (Per-Layer Embedding) if configured
@@ -1069,6 +1079,10 @@ class Gemma4Model(nn.Module, EagleModelMixin):
             self.per_layer_input_scale = None
             self.per_layer_projection_scale = None
 
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        steering_dtype = get_steering_buffer_dtype(vllm_config)
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Gemma4DecoderLayer(
@@ -1076,7 +1090,9 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
-                vllm_config=vllm_config,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
+                steering_dtype=steering_dtype,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1084,11 +1100,14 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         # Final norm: output = norm(x) * weight
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Embedding scale = sqrt(hidden_size)
-        # Downcast to model dtype (bfloat16 etc.) for numerical parity
+        # Embedding scale = sqrt(hidden_size), cast to model dtype to avoid
+        # mixed-precision drift from bf16 * fp32 across deep stacks.
         self.register_buffer(
             "normalizer",
-            torch.tensor(config.hidden_size**0.5),
+            torch.tensor(
+                config.hidden_size**0.5,
+                dtype=vllm_config.model_config.dtype,
+            ),
             persistent=False,
         )
 
@@ -1141,7 +1160,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
             )
             self.hidden_states = torch.zeros(
                 (max_num_tokens, config.hidden_size),
-                dtype=self.embed_tokens.weight.dtype,
+                dtype=vllm_config.model_config.dtype,
                 device=device,
             )
             if (
@@ -1154,7 +1173,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                         config.num_hidden_layers,
                         self.hidden_size_per_layer_input,
                     ),
-                    dtype=self.embed_tokens.weight.dtype,
+                    dtype=vllm_config.model_config.dtype,
                     device=device,
                 )
             else:
@@ -1405,45 +1424,40 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         #   moe.experts.{id}.gate_proj → FusedMoE w1 (shard of w13)
         #   moe.experts.{id}.up_proj   → FusedMoE w3 (shard of w13)
         #   moe.experts.{id}.down_proj → FusedMoE w2
-        #
-        # Use prefix matching to handle both weights and
-        # quantization scale parameters. The param_name is a prefix ending
-        # in underscore, and weight_name ends with a dot, so that:
-        #   "experts.0.gate_proj.weight_scale" -> "experts.w13_weight_scale"
-        #   "experts.0.gate_proj.weight" -> "experts.w13_weight"
         num_experts = getattr(self.config, "num_experts", None) or 0
-        expert_params_mapping = [
-            # (param_name, weight_name, expert_id, shard_id)
+        # Strategy A: dot-separated suffix
+        # (standard AWQ/GPTQ e.g. .qweight, .scales, .weight)
+        dot_suffix_expert_params_mapping = fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+        )
+        # Strategy B: underscore-separated suffix
+        # (CompressedTensors-format AWQ/W4A16 _packed, _scale)
+        underscore_suffix_expert_params_mapping = [
             (
-                "experts.w13_"
-                if proj_name in ["gate_proj", "up_proj"]
-                else "experts.w2_",
-                f"experts.{expert_id}.{proj_name}.",
+                f"{param_name}weight_",
+                f"{weight_name.rstrip('.')}_",
                 expert_id,
                 shard_id,
             )
-            for expert_id in range(num_experts)
-            for shard_id, proj_name in [
-                ("w1", "gate_proj"),
-                ("w2", "down_proj"),
-                ("w3", "up_proj"),
-            ]
+            for (
+                param_name,
+                weight_name,
+                expert_id,
+                shard_id,
+            ) in dot_suffix_expert_params_mapping
         ]
+        expert_params_mapping = (
+            dot_suffix_expert_params_mapping + underscore_suffix_expert_params_mapping
+        )
         params_dict = dict(self.named_parameters())
         # Include buffers (e.g. layer_scalar) so they can be loaded too
         params_dict.update(dict(self.named_buffers()))
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
-
             if name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
                 remapped_name = maybe_remap_kv_scale_name(name, params_dict)
                 if remapped_name is not None and remapped_name in params_dict:
@@ -1520,6 +1534,10 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                     if name is None:
                         continue
                     if is_pp_missing_parameter(name, self):
+                        continue
+                    # Skip if name doesn't exist in params_dict (e.g., individual
+                    # expert weights that should have been handled above)
+                    if name not in params_dict:
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(

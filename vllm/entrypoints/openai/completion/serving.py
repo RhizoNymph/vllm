@@ -2,16 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import io
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
+import numpy as np
+import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.chat_completion.protocol import (
     CaptureResultResponse,
 )
@@ -36,9 +38,11 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
     clamp_prompt_logprobs,
+    format_token_id_placeholder,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
@@ -48,13 +52,16 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
-from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.capture import (
     CaptureConsumer,
-    CaptureContext,
     CaptureValidationError,
+    UnknownCaptureConsumerError,
 )
 from vllm.v1.capture import registry as capture_registry
+from vllm.v1.capture.admission import (
+    build_capture_context,
+    resolve_capture_prefix_flags,
+)
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -106,20 +113,11 @@ class OpenAIServingCompletion(OpenAIServing):
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
 
-        # Capture-consumer instance cache — mirrors
+        # Capture-consumer validator cache — mirrors
         # ``OpenAIServingChat.__init__``.
-        self._capture_consumers: dict[str, CaptureConsumer] = {}
-        capture_config = getattr(
-            self.engine_client.vllm_config, "capture_consumers_config", None
+        self._capture_consumers: dict[str, CaptureConsumer] = (
+            capture_registry.build_admission_validators(self.engine_client.vllm_config)
         )
-        if capture_config is not None:
-            for spec in capture_config.consumers:
-                key = spec.instance_name or spec.name
-                self._capture_consumers[key] = capture_registry.build_consumer(
-                    spec.name,
-                    self.engine_client.vllm_config,
-                    spec.params,
-                )
 
     def _admit_capture(
         self,
@@ -135,10 +133,6 @@ class OpenAIServingCompletion(OpenAIServing):
         if sampling_params.capture is None:
             return None
 
-        vllm_config = self.engine_client.vllm_config
-        parallel_config = vllm_config.parallel_config
-        model_config = vllm_config.model_config
-
         try:
             num_prompt_tokens = self._extract_prompt_len(engine_input)
         except Exception as exc:
@@ -149,12 +143,9 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
         try:
-            num_hidden_layers = model_config.get_total_num_hidden_layers()
-            hidden_size = model_config.get_hidden_size()
-            dt = model_config.dtype
-            element_size_bytes = getattr(dt, "itemsize", None)
-            if element_size_bytes is None:
-                element_size_bytes = get_dtype_size(cast(Any, dt))
+            ctx = build_capture_context(
+                self.engine_client.vllm_config, num_prompt_tokens, request_id
+            )
         except Exception as exc:
             return self.create_error_response(
                 f"capture: failed to read model shape: {exc}",
@@ -162,40 +153,63 @@ class OpenAIServingCompletion(OpenAIServing):
                 param="capture",
             )
 
-        ctx = CaptureContext(
-            vllm_internal_request_id=request_id,  # type: ignore[arg-type]
-            num_prompt_tokens=num_prompt_tokens,
-            num_computed_tokens=0,
-            num_hidden_layers=num_hidden_layers,
-            hidden_size=hidden_size,
-            element_size_bytes=int(element_size_bytes),
-            tensor_parallel_size=parallel_config.tensor_parallel_size,
-            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+        # Resolve every per-request spec and stamp the prefix-cache reuse
+        # flags onto ``sampling_params`` (shared with the offline
+        # ``InputProcessor`` path). The raw ``capture`` dict is left in place:
+        # ``CaptureSpec`` is not IPC-serializable, so the worker re-validates
+        # from the original dict after scheduling.
+        try:
+            resolve_capture_prefix_flags(self._capture_consumers, sampling_params, ctx)
+        except (UnknownCaptureConsumerError, CaptureValidationError) as exc:
+            return self.create_error_response(
+                str(exc),
+                status_code=HTTPStatus.BAD_REQUEST,
+                param=getattr(exc, "capture_param", "capture"),
+            )
+        return None
+
+    def _admit_patch(
+        self,
+        *,
+        sampling_params: SamplingParams,
+        engine_input: EngineInput,
+        request_id: str,
+        named_module_exists: Callable[[str], bool] | None = None,
+    ) -> ErrorResponse | None:
+        """Validate the patch spec and stamp prefix-cache flags."""
+        from vllm.v1.capture.patch_admission import (
+            PatchValidationError,
+            resolve_patch_prefix_flags,
         )
 
-        validated: dict[str, Any] = {}
-        for name, raw_spec in sampling_params.capture.items():
-            consumer = self._capture_consumers.get(name)
-            if consumer is None:
-                available = sorted(self._capture_consumers.keys())
-                return self.create_error_response(
-                    (
-                        f"capture: no consumer named {name!r} is registered. "
-                        f"Available consumers: {available}."
-                    ),
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    param=f"capture.{name}",
-                )
-            try:
-                validated[name] = consumer.validate_client_spec(raw_spec, ctx)
-            except CaptureValidationError as exc:
-                return self.create_error_response(
-                    str(exc),
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    param=f"capture.{name}",
-                )
-
-        sampling_params.capture = validated
+        if not sampling_params.patch:
+            return None
+        try:
+            num_prompt_tokens = self._extract_prompt_len(engine_input)
+            ctx = build_capture_context(
+                self.engine_client.vllm_config, num_prompt_tokens, request_id
+            )
+        except Exception as exc:
+            return self.create_error_response(
+                f"patch: failed to read request shape: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="patch",
+            )
+        patch_config = getattr(self.engine_client.vllm_config, "patch_config", None)
+        max_patch_slots = (
+            getattr(patch_config, "max_patch_slots", 0) if patch_config else 0
+        )
+        try:
+            resolve_patch_prefix_flags(
+                sampling_params,
+                ctx,
+                max_patch_slots=max_patch_slots,
+                named_module_exists=named_module_exists,
+            )
+        except PatchValidationError as exc:
+            return self.create_error_response(
+                str(exc), status_code=HTTPStatus.BAD_REQUEST, param="patch"
+            )
         return None
 
     async def render_completion_request(
@@ -237,6 +251,15 @@ class OpenAIServingCompletion(OpenAIServing):
             - suffix (the language models we currently support do not support
             suffix)
         """
+        return await self._with_kv_transfer_rejection_cleanup(
+            self._create_completion(request, raw_request), request, raw_request
+        )
+
+    async def _create_completion(
+        self,
+        request: CompletionRequest,
+        raw_request: Request | None = None,
+    ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
         if request.stream and request.use_beam_search:
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
@@ -322,6 +345,24 @@ class OpenAIServingCompletion(OpenAIServing):
                     err, status_code=HTTPStatus.BAD_REQUEST
                 )
 
+        # Build the request-metadata channel once (declarative steering gate
+        # names are resolved against the vector registry here; a malformed
+        # gate spec or unknown name raises ValueError → HTTP 400).
+        steering_vector_registry = (
+            None
+            if raw_request is None
+            else getattr(raw_request.app.state, "steering_vector_registry", None)
+        )
+        try:
+            req_metadata_channel = request.to_request_metadata(
+                vector_registry=steering_vector_registry
+            )
+        except ValueError as exc:
+            return self.create_error_response(
+                f"Invalid steering gate spec: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
@@ -335,6 +376,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 self._extract_prompt_len(engine_input),
                 self.default_sampling_params,
                 self.override_max_tokens,
+                truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
 
             sampling_params: SamplingParams | BeamSearchParams
@@ -380,6 +422,35 @@ class OpenAIServingCompletion(OpenAIServing):
                 if error_response is not None:
                     return error_response
 
+            if isinstance(sampling_params, SamplingParams) and sampling_params.patch:
+                from vllm.v1.capture.patch_admission import (
+                    make_named_module_existence,
+                )
+
+                error_response = self._admit_patch(
+                    sampling_params=sampling_params,
+                    engine_input=engine_input,
+                    request_id=request_id_item,
+                    named_module_exists=make_named_module_existence(raw_request),
+                )
+                if error_response is not None:
+                    return error_response
+                # Reject (HTTP 400) if a referenced patch source run/site does
+                # not exist, instead of silently completing unpatched.
+                from vllm.v1.capture.patch_admission import (
+                    PatchValidationError,
+                    validate_patch_sources,
+                )
+
+                try:
+                    await validate_patch_sources(self.engine_client, sampling_params)
+                except PatchValidationError as exc:
+                    return self.create_error_response(
+                        str(exc),
+                        status_code=HTTPStatus.BAD_REQUEST,
+                        param="patch",
+                    )
+
             self._log_inputs(
                 request_id_item,
                 engine_input,
@@ -410,6 +481,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     trace_headers=trace_headers,
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
+                    request_metadata=req_metadata_channel,
                 )
 
             generators.append(generator)
@@ -451,6 +523,21 @@ class OpenAIServingCompletion(OpenAIServing):
                     final_res.prompt = self._extract_prompt_text(engine_inputs[i])
 
             final_res_batch_checked = cast(list[RequestOutput], final_res_batch)
+
+            if (
+                request.capture
+                and getattr(request, "capture_wait", False)
+                and final_res_batch_checked
+                and not final_res_batch_checked[0].capture_results
+                and hasattr(self.engine_client, "wait_for_capture_results")
+            ):
+                # Capture writes are asynchronous; hold the response until
+                # this request's results finalize (files durable).
+                late = await self.engine_client.wait_for_capture_results(
+                    final_res_batch_checked[0].request_id
+                )
+                if late:
+                    final_res_batch_checked[0].capture_results = late
 
             response = self.request_output_to_completion_response(
                 final_res_batch_checked,
@@ -644,7 +731,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 total_tokens=total_prompt_tokens + total_completion_tokens,
             )
 
-            if self.enable_prompt_tokens_details and num_cached_tokens:
+            if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
                     cached_tokens=num_cached_tokens
                 )
@@ -742,6 +829,18 @@ class OpenAIServingCompletion(OpenAIServing):
                 else:
                     logprobs = None
 
+                # Encode routed_experts for transport. JSON can't carry raw
+                # bytes, so we write the ndarray as a ``.npy`` byte stream
+                # and base64-encode it. ``pybase64`` is ~3x faster than the
+                # stdlib ``base64`` on large payloads thanks to SIMD.
+                routed_experts_b64 = None
+                if output.routed_experts is not None:
+                    buf = io.BytesIO()
+                    np.save(buf, output.routed_experts)
+                    routed_experts_b64 = base64.b64encode(buf.getvalue()).decode(
+                        "ascii"
+                    )
+
                 choice_data = CompletionResponseChoice(
                     index=len(choices),
                     text=output_text,
@@ -755,6 +854,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
+                    routed_experts=routed_experts_b64,
                 )
                 choices.append(choice_data)
 
@@ -771,7 +871,7 @@ class OpenAIServingCompletion(OpenAIServing):
         if (
             self.enable_prompt_tokens_details
             and last_final_res
-            and last_final_res.num_cached_tokens
+            and last_final_res.num_cached_tokens is not None
         ):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=last_final_res.num_cached_tokens
@@ -821,7 +921,7 @@ class OpenAIServingCompletion(OpenAIServing):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None:
                 if should_return_as_token_id:
-                    token = f"token_id:{token_id}"
+                    token = format_token_id_placeholder(token_id)
                 else:
                     if tokenizer is None:
                         raise VLLMValidationError(

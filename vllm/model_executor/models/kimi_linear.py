@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -18,7 +18,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
-from vllm.model_executor.layers.kda import KimiDeltaAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -27,6 +26,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+    KimiGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -35,6 +37,15 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    get_steering_buffer_dtype,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -286,26 +297,33 @@ class KimiDecoderLayer(nn.Module):
     def __init__(
         self,
         config: KimiLinearConfig,
-        layer_idx: int,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
-        parallel_config: ParallelConfig | None = None,
-        model_config: ModelConfig | None = None,
+        vllm_config: VllmConfig,
         prefix: str = "",
-        **kwargs,
+        max_steering_tokens: int = 1,
+        max_steering_configs: int = 0,
+        steering_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
 
         self.is_moe = config.is_moe
+        layer_idx = int(prefix.rsplit(".", 1)[1])
+        self.layer_idx = layer_idx
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+            dtype=steering_dtype,
+        )
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
 
         if config.is_kda_layer(layer_idx):
-            self.self_attn = KimiDeltaAttention(
-                layer_idx=layer_idx,
-                hidden_size=config.hidden_size,
-                quant_config=quant_config,
-                cache_config=cache_config,
-                model_config=config,
+            self.self_attn = KimiGatedDeltaNetAttention(
+                config,
+                vllm_config,
                 prefix=f"{prefix}.self_attn",
             )
         else:
@@ -365,6 +383,8 @@ class KimiDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
+
         attn_output = torch.empty_like(hidden_states)
         self.self_attn(
             hidden_states=hidden_states,
@@ -373,9 +393,13 @@ class KimiDecoderLayer(nn.Module):
         )
         hidden_states = attn_output
 
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -385,10 +409,6 @@ class KimiLinearModel(nn.Module):
         super().__init__()
 
         config = vllm_config.model_config.hf_text_config
-        model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-        parallel_config = vllm_config.parallel_config
         self.config = config
 
         self.vocab_size = config.vocab_size
@@ -402,19 +422,19 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        extra_kwargs = {}
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        steering_dtype = get_steering_buffer_dtype(vllm_config)
 
         def get_layer(prefix: str):
-            layer_idx = int(prefix.rsplit(".", 1)[1])
             return KimiDecoderLayer(
                 config,
-                layer_idx,
-                cache_config,
-                quant_config,
-                parallel_config,
-                model_config,
+                vllm_config,
                 prefix,
-                **extra_kwargs,
+                max_steering_tokens=max_steering_tokens,
+                max_steering_configs=max_steering_configs,
+                steering_dtype=steering_dtype,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -422,6 +442,7 @@ class KimiLinearModel(nn.Module):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -614,7 +635,7 @@ class KimiLinearForCausalLM(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: "VllmConfig",
-    ) -> tuple[torch.dtype, torch.dtype, torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.kda_state_dtype(
             vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
         )
@@ -622,7 +643,7 @@ class KimiLinearForCausalLM(
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: "VllmConfig"
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_config
         tp_size = parallel_config.tensor_parallel_size
@@ -642,9 +663,7 @@ class KimiLinearForCausalLM(
     @classmethod
     def get_mamba_state_copy_func(
         cls,
-    ) -> tuple[
-        MambaStateCopyFunc, MambaStateCopyFunc, MambaStateCopyFunc, MambaStateCopyFunc
-    ]:
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
 
     def compute_logits(

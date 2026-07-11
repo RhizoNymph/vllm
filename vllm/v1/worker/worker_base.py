@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 import torch
 import torch.nn as nn
 
+import vllm.ir
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -86,6 +87,13 @@ class WorkerBase:
         # Device and model state
         self.device: torch.device | None = None
         self.model_runner: nn.Module | None = None
+
+        # IR op priority and torch-wrap state are constant for the worker's
+        # lifetime.
+        vllm_config.kernel_config.ir_op_priority.set_default()
+        vllm.ir.set_default_torch_wrap(
+            vllm_config.compilation_config.ir_enable_torch_wrap
+        )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
@@ -185,6 +193,9 @@ class WorkerBase:
     def get_steering_status(self) -> dict:
         raise NotImplementedError
 
+    def get_dynamic_steering_status(self) -> dict:
+        raise NotImplementedError
+
     def register_steering_modules(
         self,
         modules: dict[str, dict],
@@ -200,6 +211,24 @@ class WorkerBase:
         module_name: str,
         weights: dict[tuple[int, str], dict[str, torch.Tensor]],
     ) -> None:
+        raise NotImplementedError
+
+    def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
+        raise NotImplementedError
+
+    def release_pre_materialized_steering_module(self, name: str) -> None:
+        raise NotImplementedError
+
+    def register_steering_vector_name(
+        self,
+        name: str,
+        kind: str,
+        packed: dict,
+        digest: str | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def unregister_steering_vector_name(self, name: str, kind: str) -> bool:
         raise NotImplementedError
 
     @property

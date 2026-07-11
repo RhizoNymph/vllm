@@ -31,6 +31,30 @@ The two modes compose: a single request can trigger a global consumer
 *and* a per-request consumer, and `RequestOutput.capture_results`
 returns a per-consumer result dict.
 
+### Hook points
+
+A `(layer, hook)` names where in the decoder layer an activation is read.
+The available hooks are:
+
+| Hook | Tensor captured |
+| --- | --- |
+| `pre_attn` | Residual stream entering the layer (before the attention sublayer). |
+| `post_attn` | Residual stream after the attention sublayer's contribution. |
+| `post_block` | Residual stream leaving the layer (`= post_attn + mlp_out`), i.e. HF's `hidden_states[L+1]`. |
+| `mlp_in` | Normalized activation fed **into** the MLP/MoE sublayer (output of the pre-MLP norm). |
+| `mlp_out` | The MLP/MoE branch the sublayer writes back to the residual stream (after any post-MLP norm / layer-scale). |
+
+`pre_attn`/`post_attn`/`post_block` are wired on every model. `mlp_in`
+and `mlp_out` are the paired taps needed to **train transcoders** (a
+transcoder learns `mlp_in → mlp_out` for one layer; cross-layer
+transcoders consume them across layers, aligned per token). They are
+wired on **gemma3, gemma4, and the qwen3 family** (`qwen3`, `qwen3_moe`,
+`qwen3_next`/Qwen3.5); request them explicitly by name (e.g.
+`{"mlp_in": [12], "mlp_out": [12]}`). They are deliberately excluded from
+the `:all` fan-out so `:all` stays model-agnostic. On gemma MoE layers
+`mlp_in` covers only the dense path (the parallel MoE branch is normed
+separately); `mlp_out` always captures the combined branch.
+
 ## Built-in Consumers
 
 vLLM ships two consumers, registered in its own `pyproject.toml` via
@@ -53,13 +77,19 @@ Implemented at `vllm.v1.capture.consumers.filesystem.FilesystemConsumer`.
 Python API):
 
 | Field | Type | Default | Purpose |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `root` | `str` | required | Root directory for all captures. |
 | `writer_threads` | `int` | `4` | Writer thread pool size. |
 | `queue_size` | `int` | `1024` | Per-thread bounded queue capacity. |
 | `timeout_seconds` | `float` | `180.0` | Per-write timeout; failures become `partial_error`. |
 | `on_collision` | `"overwrite" \| "error" \| "suffix"` | `"overwrite"` | What to do when the target `.bin` already exists. |
 | `fd_cache_size` | `int` | `256` | Per-thread LRU file-descriptor cache. |
+| `fsync` | `bool` | `True` | `fsync` each file before publish. `False` trades crash-durability for throughput; the impact is storage-dependent — redundant on a Linux `sync` export, free on Linux `async` (both no-ops in our A/B), but a real per-file `COMMIT` cost on a NAS that buffers writes and honors `COMMIT` (the writer holds files open, so the publish-time `fsync` is the operative commit). File count is the universal lever; see [Durability vs. response timing](#durability-vs-response-timing). |
+| `atomic_publish` | `bool` | `True` | Publish via `.tmp` + atomic rename. `False` writes straight to the final path (drops two rename RPCs/file, loses atomic visibility; requires `on_collision="overwrite"`). |
+| `default_layout` | `"per_file" \| "packed" \| "sharded"` | `"per_file"` | Layout for requests that don't set their own `layout`. |
+| `coalesce_max_bytes` | `int` | `1<<20` | Merge consecutive same-key queued writes into one `writev` up to this size (`0` disables). Most effective for `packed`/`sharded`. |
+| `num_shards` | `int` | `8` | `sharded` layout: shard files per tag (request → `hash(id) % num_shards`). |
+| `shard_max_bytes` | `int` | `256<<20` | `sharded` layout: size at which an open shard is sealed and a new one started. |
 
 **Per-request client spec** (`FilesystemCaptureRequest`):
 
@@ -70,6 +100,7 @@ class FilesystemCaptureRequest:
     tag: str                             # grouping label, slugged
     hooks: dict[str, Any]                # hook name -> layer selector
     positions: str | list[int]           # position selector
+    layout: str | None = None     # "per_file" | "packed" | "sharded" (else default)
 ```
 
 Client `hooks` values may be a list of ints, the literal string
@@ -77,11 +108,50 @@ Client `hooks` values may be a list of ints, the literal string
 `positions` accepts `"last_prompt"`, `"all_prompt"`,
 `"all_generated"`, `"all"`, or an explicit `list[int]`.
 
+**Layout** (`layout`, else the consumer's `default_layout`):
+
+- **`per_file`** (default) — one `.bin` + `.json` per
+  `(layer, hook)`. Lowest latency; a reader can tail a `.bin` as
+  decode steps append (mid-request streaming). File count scales with
+  `layers × hooks` per request.
+- **`packed`** — one `packed.bin` + one `packed.json` index per
+  *request*, with all `(layer, hook)` tensors concatenated. Cuts the
+  file count by `layers × hooks` — a large throughput win on network
+  mounts (one set of metadata RPCs per request instead of per
+  `(layer, hook)`; ~4.5× on NFS in benchmarks). A capture is readable
+  once its request finalizes (no mid-request streaming). Choose this
+  for offline/bulk analysis of multi-layer captures.
+- **`sharded`** — many requests' captures share a small set of large
+  shard files **per tag** (a request is assigned to shard
+  `hash(request_id) % num_shards`). Shards are sealed (published) when
+  they cross `shard_max_bytes` or at shutdown, then a new one starts.
+  Fewest files for the **many-tiny-requests** case (e.g. thousands of
+  `last_prompt` single-row captures), where even `packed` makes one
+  tiny file per request. Tradeoff: a capture is readable only **after
+  its shard seals** (end-of-run/bulk model), and a request's result is
+  `ok` ("captured into shard, durable after seal") rather than a
+  ready-to-read file.
+
 **On-disk layout**:
 
-```
+```text
+# per_file
 {root}/{tag_slug}/{request_id_slug}/{layer_idx}_{hook_name}.bin
 {root}/{tag_slug}/{request_id_slug}/{layer_idx}_{hook_name}.json
+
+# packed
+{root}/{tag_slug}/{request_id_slug}/packed.bin
+{root}/{tag_slug}/{request_id_slug}/packed.json   # index over the .bin
+
+# sharded (per tag; many requests share each shard)
+{root}/{tag_slug}/shard-{NNN}-{SEQ}.bin
+{root}/{tag_slug}/shard-{NNN}-{SEQ}.json   # index: per-chunk entries with request_id
+
+# packed / sharded under pipeline parallelism (pp_size > 1): each stage
+# writes its own file for the layers it owns, keyed by stage rank. The
+# reader merges the per-stage files back into one request.
+{root}/{tag_slug}/{request_id_slug}/packed-pp{RR}.bin   # + .json
+{root}/{tag_slug}/shard-pp{RR}-{NNN}-{SEQ}.bin          # + .json
 ```
 
 `tag_slug` and `request_id_slug` are produced by the admission
@@ -92,9 +162,120 @@ validator — characters outside `[a-zA-Z0-9._-]` are replaced with
 is stored as raw uint16 bytes; readers should round-trip through
 `torch.uint16.view(torch.bfloat16)`.
 
-**Sidecar JSON**: written atomically alongside the `.bin` file on
-finalize. Contains `request_id`, `layer`, `hook`, plus any fields
-the framework propagates via the per-finalize `sidecar` dict.
+**Sidecar JSON**: written atomically alongside the `.bin` on finalize.
+`per_file` sidecars carry `request_id`, `layer`, `hook`, `shape`,
+`dtype`, plus framework-propagated fields. `packed` sidecars carry
+`request_id`, `layout: "packed"`, `dtype`, and an `entries` list of
+`{layer, hook, offset, nbytes, shape}` indexing the `packed.bin`.
+`sharded` shard indexes carry `layout: "sharded"`, `shard_idx`, `seq`,
+`dtype`, and per-chunk `entries` that additionally include `request_id`
+(shards interleave many requests).
+
+**Reading**: `vllm.v1.capture.consumers.filesystem.reader` (NumPy-only)
+provides `read_per_file`, `read_packed`, `read_request` (auto-detects
+per_file/packed), and `read_sharded(tag_dir)` → `{request_id:
+{(layer, hook): array}}` (scans a tag's sealed shard indexes). Under
+pipeline parallelism, pointing `read_packed`/`read_request` at a request
+directory merges all per-stage `packed-pp{RR}` files, and `read_sharded`
+merges per-stage `shard-pp{RR}` files by request — callers get the full
+layer set transparently regardless of how many stages wrote it.
+
+#### Throughput tuning
+
+**First, find your bottleneck** — `dd if=/dev/zero of=<target>/probe bs=1M
+count=1024 oflag=direct conv=fsync` measures your capture target's raw write
+ceiling. The right lever depends on whether you're disk-bound or code-bound:
+
+- **Disk-bound** (slow/network storage — e.g. NFS over a single connection,
+  spinning disk, a SATA SSD): the capture *code* can't push past the disk.
+  Reach for storage-side levers: faster storage; `nconnect=N` on the NFS
+  mount to use parallel bandwidth; the **`packed`** layout (one file per
+  request, far fewer metadata round-trips than `per_file`); or **`sharded`**
+  for the many-small-requests case (collapses commit count to ~`num_shards`).
+  `coalesce_max_bytes` (default 1 MiB) merges per-step appends; larger rarely
+  helps. The `fsync` toggle only helps on storage that buffers writes and honors
+  `COMMIT` (e.g. a NAS); it's a no-op on Linux sync/async exports. File count is
+  the lever under every regime (see [Durability vs. response
+  timing](#durability-vs-response-timing)).
+- **Code-bound** (fast local NVMe / tmpfs, where the disk isn't the wall):
+  the single dispatch/submit thread is the limit. Use `packed` (one
+  `WriteTask` + one lock per request per step via the batched submit path)
+  and a handful of `writer_threads`. On fast storage this reaches multiple
+  hundreds of MB/s to ~1 GB/s; on a network mount it makes no difference,
+  because the disk caps you first.
+
+For online capture during serving, none of this is on the critical path —
+residual-stream volume at token-generation rate is far below these ceilings.
+
+#### Durability vs. response timing
+
+A request's HTTP response is generated when **text generation** finishes; its
+capture files are written **asynchronously** by the consumer's writer threads
+and may land seconds later. When the files haven't been published by the time
+the response is built, its `capture_results` field reports `status: "pending"`.
+Clients that must read the files should wait for the **expected file set** per
+request (`layers × hooks` files in `per_file` layout, one `packed.*` pair in
+`packed`) rather than sleeping a fixed interval — a fixed sleep races the flush
+and is indistinguishable from data loss. (Servers can instead have the request
+block until capture finalizes; see the `capture_wait` request flag.)
+
+On a **network filesystem the flush tail can dominate** this delay, and the
+underlying cost is **synchronous `COMMIT` round-trips to the file server**.
+Whether the `fsync` toggle is what *triggers* those commits depends on the
+server's write/`COMMIT` semantics interacting with the writer's FD cache: the
+writer keeps each request's `.bin.tmp` **open across decode steps** (a per-thread
+LRU FD cache), so the per-file `close` is deferred to finalize, where an `fsync`
+(if enabled) precedes the rename. Three regimes:
+
+- **Linux `sync` export** — the server commits each write before replying, so by
+  finalize the data is already durable and the `fsync` is **redundant**. A/B
+  (120 KB files, 8 threads, 20 GbE bond): ~28 MB/s with fsync vs ~26 without.
+- **Linux `async` export** — the server acks `COMMIT` without flushing, so
+  `fsync` is **free** (durability deferred to lazy server writeback). Same A/B:
+  ~204 vs ~198 MB/s. The ~7× jump over the `sync` export is the **server-side
+  commit mode**, not anything the client does.
+- **A NAS that buffers writes but honors `COMMIT`** — the held-open fd means the
+  publish-time `fsync` is the *operative* commit: a real synchronous per-file
+  round-trip (measured ~90 `per_file` captures/s on one deployment — a 100-request
+  × 36-layer run ~40 s to flush). Here `fsync=False` is a genuine throughput
+  lever, traded against crash-durability.
+
+So the **`fsync` impact is storage-dependent**, but the **file-count ceiling is
+universal**: each `per_file` capture costs create/open/close/rename RPCs whatever
+the commit policy, and that per-small-file rate dominates. Tiny files run at the
+same rate over 1 GbE and the bond (metadata-RPC *latency*-bound, not bandwidth),
+while 64 MB contiguous writes reach ~93% of the raw disk bound once the per-file
+overhead amortizes. The lever you control is **file count**: `per_file` ~26 MB/s
+→ `packed` (one file per request) ~120 MB/s → `sharded` (many requests per file)
+near the disk bound — and fewer files cut the `COMMIT` count under *every* regime
+above. A post-batch reader should size its wait to the file count, not the byte
+volume.
+
+#### Backpressure & overload
+
+When capture volume *does* outrun consumer throughput (heavy capture — many
+layers × hooks × all positions, or a prefill burst), the **dispatch queue**
+is the single backpressure point. It is bounded by
+`--capture-dispatch-queue-size` (default 256; `<=0` is unbounded/legacy,
+where overload grows memory without limit). When it fills,
+`--capture-overload-policy` decides what happens:
+
+| policy | behaviour | trade-off |
+|---|---|---|
+| `block` | stall the forward pass until the queue drains | no loss, bounded memory, serving slows |
+| `drop` | discard the step's captures (counted via `dropped_packets`) | serving never stalls; lossy |
+| `spill` *(default)* | serialize overflow to a local scratch dir and replay it, in order, when the queue drains | no loss, no stall, bounded RAM; uses local disk |
+
+`spill` parks overflow under `--capture-spill-dir` (default
+`$TMPDIR/vllm-capture-spill`; use fast local storage). It preserves strict
+per-key ordering — once spilling starts, every packet routes through the
+spill FIFO until it drains, so replayed data never races live data. The
+dispatch thread replays spilled packets when the in-memory queue is idle, and
+`finalize` waits for spilled data to reach consumers (no loss). If the spill
+area hits `--capture-spill-max-bytes` (default 4 GiB), `spill` degrades to
+`block` rather than dropping. The filesystem writer's own submit timeout is
+`timeout_seconds` (default 30 s), after which a wedged writer surfaces a
+`WriteError` instead of stalling indefinitely.
 
 ### `logging`
 
@@ -108,7 +289,7 @@ Implemented at `vllm.v1.capture.consumers.logging.LoggingConsumer`.
 **Parameters**:
 
 | Field | Type | Default | Purpose |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `hooks` | `dict[str, list[int]]` | required | Hook name to layer indices. |
 | `positions` | position selector | `"last_prompt"` | Which positions to capture. |
 | `level` | `str` | `"INFO"` | Python logging level. |
@@ -180,7 +361,7 @@ llm = LLM(
     model="meta-llama/Llama-3-8B",
     capture_consumers=[
         {"name": "filesystem", "params": {"root": "/tmp/captures"}},
-        {"name": "logging", "params": {"hooks": {"post_mlp": [0]}}},
+        {"name": "logging", "params": {"hooks": {"post_block": [0]}}},
     ],
 )
 ```
@@ -213,7 +394,7 @@ sampling_params = SamplingParams(
         "filesystem": FilesystemCaptureRequest(
             request_id="probe_0001",
             tag="mnist-probe-v1",
-            hooks={"post_mlp": [12]},
+            hooks={"post_block": [12]},
             positions="last_prompt",
         ),
     },
@@ -245,8 +426,9 @@ response = httpx.post(
                 "filesystem": {
                     "request_id": "probe_train_0001",
                     "tag": "capital-probe",
-                    "hooks": {"post_mlp": [12, 16, 20, 24]},
+                    "hooks": {"post_block": [12, 16, 20, 24]},
                     "positions": "last_prompt",
+                    "layout": "packed",
                 },
             },
         },
@@ -255,8 +437,11 @@ response = httpx.post(
 ).json()
 ```
 
-Validation happens at admission time; an invalid spec returns HTTP
-400 with a descriptive error.
+`layout` is optional (`"per_file"` default, `"packed"` for one indexed
+file per request — see the `filesystem` consumer section). Validation
+happens at admission time; an invalid spec (unknown consumer, bad
+layout, out-of-range layer, …) returns HTTP 400 with a descriptive
+error.
 
 ## Reading Results
 
@@ -278,7 +463,7 @@ sampling_params = SamplingParams(
         "filesystem": FilesystemCaptureRequest(
             request_id="req1",
             tag="demo",
-            hooks={"post_mlp": [0]},
+            hooks={"post_block": [0]},
             positions="last_prompt",
         ),
     },
@@ -302,18 +487,148 @@ if result is not None and result.status == "ok":
 On the OpenAI-compatible HTTP path, results are attached to the
 response body as `capture_results`, mirroring the structure above.
 
+> **Best-effort result delivery.** Finalize (flushing a request's captured
+> activations to the consumer and collecting the per-key result) runs on a
+> background thread so it never blocks the model-runner step — see
+> [Performance](#performance). The `capture_results` field is attached to
+> the response only if finalize completes before the request's output is
+> emitted; otherwise it may be absent even though the captured data was
+> written successfully. **The activations on disk are the source of truth**;
+> treat `capture_results` as an optional, best-effort acknowledgement.
+
+## Parallelism
+
+Capturing the residual-stream hooks (`pre_attn`, `post_attn`,
+`post_block`) and the MLP-sublayer hooks (`mlp_in`, `mlp_out`) is
+supported under **tensor, pipeline, expert, and data parallelism** for
+worker-location consumers — including the built-in `filesystem`
+consumer. How it works:
+
+- The tensors these hooks read are **replicated** across the tensor- and
+  expert-parallel ranks within each pipeline stage. `mlp_in` is the
+  replicated normed input; `mlp_out` is read after the MLP/MoE down-proj
+  all-reduce / combine — so, like the residual-stream hooks, exactly one
+  rank — TP rank 0 of each stage — captures them and the other ranks add
+  no overhead.
+- Under **pipeline parallelism**, each stage's TP rank 0 captures the
+  (global-indexed) layers that stage owns and writes them to the capture
+  target; the engine merges the per-stage results into one
+  `RequestOutput.capture_results`. Layer indices in a client spec are
+  always **global** (`0..num_hidden_layers-1`).
+- Under **data parallelism**, each replica is an independent engine core
+  over disjoint requests; captures partition naturally with no merge.
+
+**Requirement — shared storage:** under pipeline parallelism the capture
+target (`filesystem` `root`) must be a **shared mount** (e.g. an NFS
+volume) reachable by every pipeline node, because different stages write
+different layers of the same request.
+
+**All layouts work under PP.** `per_file` is keyed by global layer index,
+so stages never collide. `packed` and `sharded` would otherwise write a
+single file per request (or per tag) and have every stage race for the
+same path — so under `pipeline_parallel_size > 1` each stage instead
+writes its **own** file for the layers it owns, keyed by stage rank
+(`packed-pp{RR}.{bin,json}`, `shard-pp{RR}-{NNN}-{SEQ}.{bin,json}`). The
+reference reader merges the per-stage files back into one request, so
+`read_packed` / `read_request` / `read_sharded` return the full layer set
+transparently. Completion is tracked per stage against only the layers
+that stage captures.
+
+**Not yet supported:** (1) `location="driver"` consumers that need a
+request's *full* layer stack assembled in one process across pipeline
+stages (worker-location consumers are unaffected); (2) capturing
+genuinely *sharded* activations (MLP intermediate / per-expert outputs).
+See [Capture Consumers under Parallelism](../design/capture_parallelism.md).
+
+## Performance
+
+Capture is designed to stay off the critical path except on the steps that
+genuinely capture.
+
+- **Per-step eager only for client-spec captures.** The per-request
+  *client*-spec gather selects a variable number of rows and allocates a
+  fresh output each step, which cannot execute inside a replayed CUDA
+  graph — so a step that gathers for a client spec must run eager. Rather
+  than forcing eager on *every* step while capture is configured, a
+  rank-replicated `CaptureStepGate` decides per step whether any scheduled
+  request actually captures a client-spec position in that step's window.
+  Plain requests on a capture-enabled server, and the decode steps of a
+  `last_prompt` capture (which only fires during prefill), keep full
+  cudagraph speed. The gate is evaluated identically on every TP/PP rank
+  from the broadcast `scheduler_output` — no per-step collective — so all
+  ranks agree on eager-vs-cudagraph and stay in lockstep on
+  `num_tokens_padded`. It is a strict superset of what the capturer
+  actually gathers, so it never runs a client-capturing step in cudagraph
+  mode.
+- **Global specs keep full cudagraph speed.** A consumer with a *global*
+  spec (captures for every request, e.g. `logging`) captures the same
+  fixed `(layer, hook)` set on every request, so it does **not** force
+  eager. Its `(layer, hook)` set is known at startup, so the capturer
+  records a fixed-shape full-residual `copy_` of each global hook's
+  `[num_tokens, hidden]` tensor into a persistent buffer; that copy is
+  baked into every CUDA graph at warmup and replays against the persistent
+  address. After the forward the host slices the wanted rows out of the
+  buffer (off-graph) and dispatches them. The copy is collective-free, so
+  it is safe to record on only the capturer rank's graphs. The buffers
+  cost `max_num_tokens × hidden × dtype` bytes per global `(layer, hook)`
+  — negligible for a single-layer `logging`-style probe, but proportional
+  to the layer count for an all-layers global spec.
+- **Graph-safe keys for per-request captures.** The same persistent-buffer
+  path can serve *per-request* captures: pre-declare an allowlist of
+  `(layer, hook)` keys at startup with the repeatable
+  `--capture-graphsafe-key LAYER:HOOK` flag (`capture_graphsafe_keys` in
+  YAML/Python), and a client spec that taps **only** allowlisted keys keeps
+  full cudagraph speed instead of forcing the step eager. `LAYER` and/or
+  `HOOK` may be `all`, so the accepted shorthands are `L:hook`, `L:all`
+  (every standard hook at layer `L`), `all:hook` (one hook on every layer),
+  and `all:all`. A request whose spec taps **any** key outside the allowlist
+  gracefully falls back to the eager path — correctness is never affected,
+  only speed. The trade-off mirrors a global spec: each covered key reserves
+  one `max_num_tokens × hidden × dtype` persistent buffer and pays a
+  full-residual `copy_` at that layer on **every** forward step, whether or
+  not an in-flight request currently taps it (the copy must be static to stay
+  in the graph). Size the allowlist to the keys you actually probe; left empty
+  (the default), per-request captures stay on the eager path gated per-step by
+  the `CaptureStepGate` above.
+
+  ```bash
+  vllm serve meta-llama/Llama-3-8B \
+      --capture-consumers filesystem:root=/mnt/nas/activations \
+      --capture-graphsafe-key 12:post_block \
+      --capture-graphsafe-key all:pre_attn
+  ```
+- **Non-blocking finalize.** Finalizing a request flushes its captured
+  activations and waits for each `(layer, hook)` result — under the
+  `filesystem` consumer, roughly one small-file write per captured layer.
+  These waits run on a dedicated background finalize thread, not the
+  model-runner step thread, so a finishing capture request does not stall
+  the batch. The result is surfaced best-effort (see
+  [Reading Results](#reading-results)).
+
+Tail latency under capture is dominated by the consumer's own write path;
+for the `filesystem` consumer see [Throughput tuning](#throughput-tuning)
+and [Backpressure & overload](#backpressure--overload).
+
 ## Limits
 
-- **Tensor/pipeline parallelism**: the filesystem consumer rejects
-  any request under `tensor_parallel_size > 1` or
-  `pipeline_parallel_size > 1`. Third-party consumers that collect
-  residuals should do the same — multi-rank collection is out of
-  scope for the current framework.
 - **Prefix-cache hits**: positions below
   `CaptureContext.num_computed_tokens` were served from the prefix
-  cache and never forwarded through the model. Consumers reject such
-  positions at admission; enforcement is the consumer's
-  responsibility.
+  cache and never forwarded through the model, so their residuals
+  cannot be captured. To guarantee captured positions are forwarded, a
+  request whose capture taps a **prompt-range** position reuses the
+  prefix cache only up to its lowest captured prompt position and
+  re-forwards from there (`last_prompt` keeps almost the whole prompt
+  cached; `all_prompt` reuses nothing); a capture of **generated-only**
+  positions keeps full prefix caching. Other requests are never
+  affected. The clamp uses the resolved capture positions, computed by a
+  shared admission step on **both** paths: the served (OpenAI API) path
+  resolves in `_admit_capture`, and the offline `LLM` path resolves in the
+  `InputProcessor` before the request reaches the scheduler. Both dict/spec
+  form and pre-built instance-form consumers
+  (`LLM(capture_consumers=[obj])`) resolve, keyed identically to the
+  worker. Consumers also reject cached positions at admission as a
+  backstop. See "Prefix-Cache Interaction" in
+  `docs/design/capture_consumers.md`.
 - **Hook coverage**: only the decoder architectures that wire the
   `apply_layer_steering` / `maybe_capture_residual` pair fire hooks.
   See [Activation Steering](steering.md) for the list of covered

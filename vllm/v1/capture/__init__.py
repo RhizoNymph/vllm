@@ -8,7 +8,8 @@ See ``docs/design/capture_consumers.md`` for the design spec and
 
 from __future__ import annotations
 
-from vllm.v1.capture.consumer import CaptureConsumer
+from vllm.v1.capture.consumer import CaptureConsumer, SyncCaptureConsumer
+from vllm.v1.capture.controller import SteeringController
 from vllm.v1.capture.errors import (
     CaptureValidationError,
     UnknownCaptureConsumerError,
@@ -25,6 +26,10 @@ from vllm.v1.capture.types import (
     HookName,
     PositionSelector,
     VllmInternalRequestId,
+    capture_expert_parallel_size,
+    captured_prompt_positions,
+    min_captured_prompt_position,
+    spec_touches_prompt,
 )
 
 __all__ = [
@@ -40,6 +45,12 @@ __all__ = [
     "CaptureValidationError",
     "HookName",
     "PositionSelector",
+    "SteeringController",
+    "SyncCaptureConsumer",
     "UnknownCaptureConsumerError",
     "VllmInternalRequestId",
+    "capture_expert_parallel_size",
+    "captured_prompt_positions",
+    "min_captured_prompt_position",
+    "spec_touches_prompt",
 ]

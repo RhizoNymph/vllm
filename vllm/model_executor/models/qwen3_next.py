@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
 )
@@ -36,8 +37,11 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -48,6 +52,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -64,6 +69,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 
@@ -72,6 +78,7 @@ from .interfaces import (
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
 )
@@ -282,13 +289,50 @@ class Qwen3NextAttention(nn.Module):
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def forward(
+        # Fuse the gated split + QK-RMSNorm + (partial) NeoX RoPE + gate copy.
+        # TODO: support MRoPE
+        mm_config = model_config.multimodal_config if model_config else None
+        text_only = mm_config is None or mm_config.language_model_only
+        self.use_fused_qk_norm_rope_gate = (
+            self.attn_output_gate
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and current_platform.is_cuda()
+            and text_only
+        )
+
+    def _project_qkv_gate(
         self,
+        qkv: torch.Tensor,
         positions: torch.Tensor,
-        output: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ):
-        qkv, _ = self.qkv_proj(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Return post-norm, post-RoPE (q, k, v) and the pre-sigmoid gate.
+
+        Dispatches between the fused Triton kernel and the eager
+        split + QK-RMSNorm + RoPE path. ``gate`` is ``None`` when output
+        gating is disabled.
+        """
+        if self.use_fused_qk_norm_rope_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            # mRoPE passes positions as (3, n_tokens) for T/H/W. Fusion is only
+            # enabled text-only, where the three rows are identical, so taking
+            # the T row is exact. (1D positions pass through.)
+            pos = positions[0] if positions.ndim == 2 else positions
+            q, k, gate = fused_qk_rmsnorm_rope_gate(
+                q_gate,
+                k,
+                self.q_norm.weight.float() + 1.0,
+                self.k_norm.weight.float() + 1.0,
+                self.rotary_emb.cos_sin_cache,
+                pos,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+            )
+            return q, k, v, gate
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -301,6 +345,7 @@ class Qwen3NextAttention(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
 
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
@@ -308,15 +353,20 @@ class Qwen3NextAttention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
             -1, self.num_kv_heads * self.head_dim
         )
-
         q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
 
+    def forward(
+        self,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v, gate = self._project_qkv_gate(qkv, positions)
         attn_output = self.attn(q, k, v)
-
-        if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
-
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
         output[:], _ = self.o_proj(attn_output)
 
 
@@ -348,7 +398,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         )
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNetAttention(
+            self.linear_attn = QwenGatedDeltaNetAttention(
                 config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
@@ -452,6 +502,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        # mlp_in is the normed MLP/MoE input (transcoder training tap).
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_in")
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
@@ -468,7 +520,10 @@ class Qwen3NextDecoderLayer(nn.Module):
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
 
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        # mlp_out is the branch added to the residual stream (after the optional
+        # ffn layer-scale), so post_block == post_attn + mlp_out.
+        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_out")
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -712,6 +767,7 @@ class Qwen3NextForCausalLM(
     SupportsPP,
     QwenNextMixtureOfExperts,
     IsHybrid,
+    SupportsEagle3,
 ):
     packed_modules_mapping = {
         "qkv_proj": [

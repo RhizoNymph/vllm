@@ -43,6 +43,7 @@ from vllm.utils.flashinfer import (
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import (
+    canonicalize_singleton_dim_strides,
     is_quantized_kv_cache,
     is_strictly_contiguous,
     nvfp4_kv_cache_full_dim,
@@ -222,9 +223,7 @@ class BatchDCPPrefillWrapper:
         self._context = BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, get_kv_cache_layout()
         )
-        self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(
-            workspace_buffer, get_kv_cache_layout()
-        )
+        self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer)
 
     def plan(
         self,
@@ -337,9 +336,24 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # Note: Not sure for all platforms, but on Blackwell,
-        # only support a page size of 16, 32, 64.
-        return [16, 32, 64]
+        # Page sizes >= 128 only run on the trtllm-gen dynamic kernel (GQA/MQA
+        # on Blackwell); advertise them only when usable so selection never
+        # picks a large kernel block we cannot serve.
+        use_large_pages = False
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None and vllm_config.model_config is not None:
+            pc = vllm_config.parallel_config
+            mc = vllm_config.model_config
+            num_qo_heads = mc.get_num_attention_heads(pc)
+            num_kv_heads = mc.get_num_kv_heads(pc)
+            use_large_pages = (
+                num_kv_heads > 0
+                and num_qo_heads // num_kv_heads > 1
+                and can_use_trtllm_attention(num_qo_heads, num_kv_heads)
+            )
+        if not use_large_pages:
+            return [16, 32, 64]
+        return [16, 32, 64, 128, 256, 512, 1024]
 
     @staticmethod
     def get_name() -> str:
@@ -402,7 +416,7 @@ class FlashInferBackend(AttentionBackend):
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         # https://github.com/flashinfer-ai/flashinfer/blob/3d55c71a62052c590c130897d3a3db49b14fcc34/include/flashinfer/utils.cuh#L157
-        return [64, 128, 256]
+        return [64, 128, 256, 512]
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -622,6 +636,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
             if self.is_kvcache_nvfp4:
+                # trtllm-gen FP4 FMHA kernels only exist for sm100f (sm_100/sm_103).
+                # Fail fast at init rather than crashing on the first request.
+                if not current_platform.is_device_capability_family(100):
+                    raise ValueError(
+                        "--kv-cache-dtype nvfp4 requires sm100f, "
+                        "please try a different dtype or remove"
+                    )
                 # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
                 # which is passed to FlashInferImpl
                 self.kv_cache_dtype = self.cache_dtype
@@ -640,6 +661,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # try to use fp8 q if kv cache is fp8, and will fall back to model dtype
         # if TRTLLM attention kernel is not used when building attn metadata
         can_use_trtllm = can_use_trtllm_attention(self.num_qo_heads, self.num_kv_heads)
+
+        # Page sizes >= 128 require the trtllm-gen GQA/MQA path (guaranteed by
+        # get_supported_kernel_block_sizes).
+        assert self.page_size <= 64 or (
+            can_use_trtllm and self.num_qo_heads // self.num_kv_heads > 1
+        ), f"Unexpected FlashInfer page size {self.page_size} without trtllm-gen GQA"
 
         if (
             can_use_trtllm
@@ -682,7 +709,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # reused CPU buffers to avoid a race condition between step N async copies to
         # GPU and step N+1 buffer updates.
         self.pin_memory = (
-            not envs.VLLM_USE_V2_MODEL_RUNNER and is_pin_memory_available()
+            not vllm_config.use_v2_model_runner and is_pin_memory_available()
         )
         self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
         self.paged_kv_indptr_cpu_buffer = torch.zeros_like(
@@ -911,6 +938,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Decode (FI native or TRTLLM)
         use_cascade = common_prefix_len > 0
         uses_spec_reorder = self.reorder_batch_threshold > 1
+        # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
+        prefill_force_trtllm = (
+            True if page_size >= 128 else self.attention_config.use_trtllm_attention
+        )
         prefill_use_trtllm = use_trtllm_attention(
             self.num_qo_heads,
             self.num_kv_heads,
@@ -920,7 +951,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.cache_dtype,
             self.q_data_type,
             is_prefill=True,
-            force_use_trtllm=self.attention_config.use_trtllm_attention,
+            force_use_trtllm=prefill_force_trtllm,
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
@@ -1104,7 +1135,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_indptr_prefill_gpu = self.paged_kv_indptr.gpu[
                     prefill_start : num_reqs + 1
                 ]
-                paged_kv_indptr_prefill_gpu[0] = 0
+                # Assign to slice to avoid cpu sync.
+                paged_kv_indptr_prefill_gpu[:1] = 0
                 torch.cumsum(
                     num_blocks_per_req,
                     dim=0,
@@ -1449,15 +1481,16 @@ class FlashInferImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # The FlashInfer api requires data to be in fp8_e4m3 or fp8_e5m2
-        # to process the cache when the kv_cache_dtype is fp8
-        if self.kv_sharing_target_layer_name is None and is_quantized_kv_cache(
-            self.kv_cache_dtype
-        ):
-            torch_dtype = FlashInferBackend.get_dtype_for_flashinfer(
-                self.kv_cache_dtype
-            )
-            kv_cache = kv_cache.view(torch_dtype)
+        # FlashInfer treats uint8 KV cache as NVFP4. vLLM stores FP8 KV cache
+        # as uint8 bytes, so pass FP8 caches with their logical dtype.
+        if not self.is_kvcache_nvfp4 and kv_cache.dtype == torch.uint8:
+            fp8_view_dtype = None
+            if self.kv_cache_dtype in ("fp8", "fp8_e4m3", torch.float8_e4m3fn):
+                fp8_view_dtype = torch.float8_e4m3fn
+            elif self.kv_cache_dtype in ("fp8_e5m2", torch.float8_e5m2):
+                fp8_view_dtype = torch.float8_e5m2
+            if fp8_view_dtype is not None:
+                kv_cache = kv_cache.view(fp8_view_dtype)
 
         # Inputs and outputs may be padded for CUDA graphs
         query = query[:num_actual_tokens]
@@ -1479,6 +1512,21 @@ class FlashInferImpl(AttentionImpl):
 
         stride_order = FlashInferBackend.get_kv_cache_stride_order()
         kv_cache_permute = kv_cache.permute(*stride_order)  # HND and contiguous
+        # Fix degenerate strides on any size-1 dimension (e.g. num_kv_heads=1
+        # with TP=8).  PyTorch permits non-canonical strides on size-1 dims;
+        # CUDA TMA requires ≥16-byte alignment on all non-outermost strides.
+        # canonicalize_singleton_dim_strides patches metadata via as_strided —
+        # zero-copy.  See vllm.utils.torch_utils.
+        fixed = canonicalize_singleton_dim_strides(kv_cache_permute)
+        if fixed is not kv_cache_permute:
+            logger.debug(
+                "Canonicalized degenerate KV cache strides (FlashInfer): "
+                "shape=%s, strides before=%s, strides after=%s",
+                kv_cache_permute.shape,
+                kv_cache_permute.stride(),
+                fixed.stride(),
+            )
+        kv_cache_permute = fixed
 
         # For NVFP4, the kv_cache last dim is full_dim (data + scale packed).
         # Split into correctly-strided data and scale views.
@@ -1568,10 +1616,11 @@ class FlashInferImpl(AttentionImpl):
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
                 # prefill_query may be non-contiguous or have degenerate strides
-                # First ensure memory contiguity, then fix degenerate strides
-                # with reshape. contiguous() alone doesn't fix degenerate
-                # strides when a dimension has size 1.
-                prefill_query = prefill_query.contiguous().reshape(prefill_query.shape)
+                # on size=1 dims. contiguous() ensures memory layout; then
+                # canonicalize_singleton_dim_strides fixes any remaining
+                # degenerate strides on size=1 dims for TMA alignment.
+                prefill_query = prefill_query.contiguous()
+                prefill_query = canonicalize_singleton_dim_strides(prefill_query)
                 workspace_buffer = _get_trtllm_gen_workspace_buffer()
                 block_tables_prefill = attn_metadata.prefill.block_tables
                 seq_lens_prefill = attn_metadata.prefill.seq_lens
@@ -1621,11 +1670,9 @@ class FlashInferImpl(AttentionImpl):
                     # with fp8 kv cache, we can construct a mock block
                     # and mock kv cache with BF16 KV involved in the prefill
                     #
-                    # The inner (block_size, head_size) dims must be
-                    # contiguous; outer dims may have non-canonical strides
-                    # (e.g. cross-layer unified allocation).
-                    # Degenerate strides on outer dims break TMA descriptors
-                    # (see flashinfer-ai/flashinfer#2232).
+                    kv_cache_permute = canonicalize_singleton_dim_strides(
+                        kv_cache_permute
+                    )
                     kv_strides = kv_cache_permute.stride()
                     assert (
                         kv_strides[-1] == 1
@@ -1732,12 +1779,13 @@ class FlashInferImpl(AttentionImpl):
                 if needs_fp8_out:
                     output[:num_decode_tokens].copy_(out_decode.to(output.dtype))
             else:
-                # decode_query may be non-contiguous or have degenerate strides
                 assert isinstance(attn_metadata.decode, TRTLLMDecode)
-                # First ensure memory contiguity, then fix degenerate strides
-                # with reshape. contiguous() alone doesn't fix degenerate
-                # strides when a dimension has size 1.
-                decode_query = decode_query.contiguous().reshape(decode_query.shape)
+                # decode_query may be non-contiguous or have degenerate strides
+                # on size=1 dims. contiguous() ensures memory layout; then
+                # canonicalize_singleton_dim_strides fixes any remaining
+                # degenerate strides on size=1 dims for TMA alignment.
+                decode_query = decode_query.contiguous()
+                decode_query = canonicalize_singleton_dim_strides(decode_query)
                 workspace_buffer = _get_trtllm_gen_workspace_buffer()
                 block_tables_decode = attn_metadata.decode.block_tables
                 seq_lens_decode = attn_metadata.decode.seq_lens
@@ -1748,11 +1796,7 @@ class FlashInferImpl(AttentionImpl):
                 assert is_strictly_contiguous(workspace_buffer)
                 assert is_strictly_contiguous(block_tables_decode)
                 assert is_strictly_contiguous(seq_lens_decode)
-                # kv_cache outer dims may be non-contiguous (e.g.
-                # cross-layer unified allocation), but inner dims
-                # (block_size, head_size) must be contiguous and
-                # strides must be canonical to avoid TMA descriptor
-                # failures (see flashinfer-ai/flashinfer#2232).
+                kv_cache_permute = canonicalize_singleton_dim_strides(kv_cache_permute)
                 kv_strides = kv_cache_permute.stride()
                 assert (
                     kv_strides[-1] == 1 and kv_strides[-2] == kv_cache_permute.shape[-1]

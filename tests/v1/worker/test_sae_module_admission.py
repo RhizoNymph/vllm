@@ -35,6 +35,7 @@ class _MixinHarness(SteeringModelRunnerMixin):
     def __init__(self):
         self._steering_module_registry = {}
         self._steering_module_resolved_cache = {}
+        self._steering_module_pinned_rows = {}
         self._sae_module_registry = {}
         self._sae_steerable_sites = {}
         self._req_sae_phase = {}

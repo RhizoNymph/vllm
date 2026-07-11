@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
+    from vllm.v1.request_metadata import RequestMetadata
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
@@ -25,6 +26,7 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    RequestMetadata = object
 
 
 @dataclass
@@ -40,6 +42,17 @@ class NewRequestData:
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
 
+    # The original client-supplied request id (the id the API returned).
+    # ``req_id`` is the vLLM-internal id; this carries the client id so the
+    # worker (e.g. capture) can surface it for attribution. Optional/None-safe.
+    client_request_id: str | None = None
+
+    # Request-level host-side metadata (conversation id, future steering
+    # specs). Carried in full so new sibling fields reach the worker without
+    # extra plumbing; the runner reads ``conversation_id`` off it for the
+    # per-step ``StepRequestView``. ``None`` when the request set none.
+    request_metadata: "RequestMetadata | None" = None
+
     # Per-request steering config hashes (0 = no per-request steering)
     prefill_steering_config_hash: int = 0
     decode_steering_config_hash: int = 0
@@ -47,13 +60,26 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Capture activation-store write-through (None unless the request
+    # carries a capture spec): the request's prompt block hashes and the
+    # granularity they were computed at. Lets the worker content-address
+    # captured prompt residuals into the activation store. The hash block
+    # size travels with the hashes because it can differ from the
+    # scheduler's KV block size (hybrid / context-parallel configs).
+    capture_block_hashes: list[bytes] | None = None
+    capture_hash_block_size: int = 0
+
     @classmethod
     def from_request(
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
+        hash_block_size: int = 0,
     ) -> "NewRequestData":
+        has_capture = request.sampling_params is not None and bool(
+            request.sampling_params.capture
+        )
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -65,9 +91,13 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
+            client_request_id=request.external_req_id,
+            request_metadata=request.request_metadata,
             prefill_steering_config_hash=request.prefill_steering_config_hash,
             decode_steering_config_hash=request.decode_steering_config_hash,
             prefill_token_ids=prefill_token_ids,
+            capture_block_hashes=(list(request.block_hashes) if has_capture else None),
+            capture_hash_block_size=hash_block_size if has_capture else 0,
         )
 
     def __repr__(self) -> str:
@@ -245,6 +275,10 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # Dynamic speculative decoding: optimal K chosen by scheduler.
+    # Number of spec tokens to schedule for the next step.
+    num_spec_tokens_to_schedule: int = 0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

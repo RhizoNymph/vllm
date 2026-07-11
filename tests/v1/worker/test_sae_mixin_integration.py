@@ -115,10 +115,12 @@ class _RichHarness(SteeringModelRunnerMixin):
         }
         self._locally_owned_layers = frozenset(layer_indices)
         self._steering_module_registry: dict = {}
+        self._steering_module_resolved_cache: dict = {}
+        self._steering_module_pinned_rows: dict = {}
         self._sae_module_registry: dict = {}
         self._sae_steerable_sites: dict = {}
         self._req_sae_phase: dict = {}
-        self._req_steering_phase: dict = {}
+        self._steering_reqs: dict = {}
         self._req_transition_scan_candidates: set[str] = set()
         self._steering_index_dirty = False
         self._sae_clamp_manager = SAEClampManager(max_sae_configs)
@@ -949,7 +951,7 @@ class TestReleaseSaeForRequest:
             decode_steering_config_hash=222,
         )
 
-        h._release_finished_steering_configs({"req-1"})
+        h._steering_finish_requests({"req-1"})
 
         assert "req-1" not in h._req_sae_phase
         assert h._sae_clamp_manager.config_to_row == {}

@@ -6,8 +6,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from vllm.config.steering_types import SteeringVectorSpec
-
 
 class SAEModuleManifestRequest(BaseModel):
     """Wire-format manifest for a kind=``sae_delta`` module."""
@@ -86,18 +84,25 @@ class RegisterSteeringModuleRequest(BaseModel):
             "``sae_manifest`` and rejects the additive fields."
         ),
     )
-    vectors: SteeringVectorSpec | None = Field(
+    # Each additive tier accepts either the legacy ``SteeringVectorSpec``
+    # shape or the binary-wire ``SteeringVectorSpecPacked`` shape; see
+    # ``SetSteeringRequest`` in ``protocol.py`` for the discrimination
+    # rationale.  The handler calls ``coerce_steering_spec`` to normalize.
+    vectors: dict[str, Any] | None = Field(
         default=None,
-        description="Base steering vectors (both phases). Same format as "
-        "the /v1/steering/set endpoint.  Additive-kind only.",
+        description="Base steering vectors (both phases). Same accepted "
+        "shapes as the /v1/steering/set endpoint (legacy SteeringVectorSpec "
+        "or binary-wire SteeringHookPacked per hook).  Additive-kind only.",
     )
-    prefill_vectors: SteeringVectorSpec | None = Field(
+    prefill_vectors: dict[str, Any] | None = Field(
         default=None,
-        description="Prefill-phase steering vectors.  Additive-kind only.",
+        description="Prefill-phase steering vectors. Same accepted shapes "
+        "as vectors.  Additive-kind only.",
     )
-    decode_vectors: SteeringVectorSpec | None = Field(
+    decode_vectors: dict[str, Any] | None = Field(
         default=None,
-        description="Decode-phase steering vectors.  Additive-kind only.",
+        description="Decode-phase steering vectors. Same accepted shapes "
+        "as vectors.  Additive-kind only.",
     )
     sae_manifest: SAEModuleManifestRequest | None = Field(
         default=None,

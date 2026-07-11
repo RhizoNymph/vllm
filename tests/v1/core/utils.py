@@ -12,6 +12,7 @@ from vllm.config import (
     ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
+    SteeringConfig,
     VllmConfig,
 )
 from vllm.multimodal.inputs import (
@@ -24,6 +25,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -57,6 +59,7 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    max_steering_configs: int | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -89,6 +92,8 @@ def create_scheduler(
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
+        # Ensure admission/preemption mechanics are deterministic
+        watermark=0.0,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
@@ -135,6 +140,12 @@ def create_scheduler(
         else None
     )
 
+    steering_config = (
+        SteeringConfig(max_steering_configs=max_steering_configs)
+        if max_steering_configs is not None
+        else None
+    )
+
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
@@ -143,6 +154,7 @@ def create_scheduler(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
+        steering_config=steering_config,
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
@@ -160,6 +172,7 @@ def create_scheduler(
         ],
     )
     cache_config.num_gpu_blocks = num_blocks
+    register_all_kvcache_specs(vllm_config)
     scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
     return scheduler_cls(
         vllm_config=vllm_config,

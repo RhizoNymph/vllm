@@ -56,7 +56,10 @@ from vllm.v1.worker.sae_full_reconstruction_manager import (
     SAEFullReconstructionManager,
 )
 from vllm.v1.worker.steering_manager import SteeringManager
-from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
+from vllm.v1.worker.steering_model_runner_mixin import (
+    SteeringModelRunnerMixin,
+    _SteeringReqState,
+)
 
 
 @dataclass
@@ -100,6 +103,21 @@ def _make_decoder_layer(layer_idx: int, hidden_size: int = 4) -> nn.Module:
     m.register_buffer(
         "steering_index", torch.zeros(16, dtype=torch.long), persistent=False
     )
+    # Per-token gate / row-gate / decode-mask buffers the rebuilt per-step
+    # main path writes alongside the index.
+    m.register_buffer(
+        "steering_token_scales",
+        torch.zeros(16, dtype=torch.float32),
+        persistent=False,
+    )
+    m.register_buffer(
+        "steering_row_gate", torch.ones(7, dtype=torch.float32), persistent=False
+    )
+    m.register_buffer(
+        "steering_decode_mask",
+        torch.zeros(16, dtype=torch.float32),
+        persistent=False,
+    )
     return m
 
 
@@ -127,10 +145,15 @@ class _Harness(SteeringModelRunnerMixin):
         self._locally_owned_layers = frozenset(layer_indices)
         # Both delta and full-reconstruction surfaces present.
         self._steering_module_registry: dict = {}
+        self._steering_module_resolved_cache: dict = {}
+        self._steering_module_pinned_rows: dict = {}
         self._sae_module_registry: dict = {}
         self._sae_steerable_sites: dict = {}
         self._req_sae_phase: dict = {}
-        self._req_steering_phase: dict = {}
+        self._steering_reqs: dict = {}
+        self._req_dynamic_decode: dict = {}
+        self._req_override_source: dict = {}
+        self._req_decode_sig_reported: dict = {}
         self._steering_index_dirty = False
         self._sae_clamp_manager = SAEClampManager(max_sae_configs)
         self._steering_manager = None
@@ -479,7 +502,15 @@ class TestAdmissionAndRelease:
             decode_hash=decode_hash,
             is_prefilling=False,
         )
-        h._req_steering_phase["req-1"] = "decode"
+        # The request was previously admitted straight into decode; the
+        # canonical per-request store tracks that phase now.
+        h._steering_reqs["req-1"] = _SteeringReqState(
+            sampling_params=sp,
+            prefill_hash=prefill_hash,
+            decode_hash=decode_hash,
+            num_prompt_tokens=10,
+            phase="decode",
+        )
         req_state = SimpleNamespace(
             sampling_params=sp,
             num_prompt_tokens=10,
@@ -506,14 +537,22 @@ class TestPerStepFullReconIndex:
         h._steering_n_tokens_scratch = np.zeros(8, dtype=np.int64)
         h._sae_fr_rows_scratch = np.zeros(8, dtype=np.int64)
         h._sae_fr_index_pinned = torch.zeros(16, dtype=torch.long)
+        # An SAE-only request carries a nonzero combined hash, which defeats
+        # the additive nothing-active shortcut by design in the rebuilt
+        # framework — the main per-step path runs, so its scratch surface
+        # must be present too.
+        h._steering_rows_scratch = np.zeros(8, dtype=np.int64)
+        h._steering_tier_gain_scratch = np.zeros(8, dtype=np.float32)
+        h._steering_decode_mask_scratch = np.zeros(8, dtype=np.float32)
+        h._steering_index_pinned = torch.zeros(16, dtype=torch.long)
+        h._steering_token_scales_pinned = torch.zeros(16, dtype=torch.float32)
+        h._steering_decode_mask_pinned = torch.zeros(16, dtype=torch.float32)
         h.input_batch = SimpleNamespace(
             num_reqs=1,
             req_ids=["req-1"],
             req_id_to_index={"req-1": 0},
             num_computed_tokens_cpu=np.array([0], dtype=np.int64),
             num_prompt_tokens=np.array([4], dtype=np.int64),
-            request_prefill_steering_hash=np.array([0xCAFE], dtype=np.int64),
-            request_decode_steering_hash=np.array([0], dtype=np.int64),
         )
         h.requests = {}
         h.register_steering_modules(modules={"g": _payload()})
@@ -526,13 +565,31 @@ class TestPerStepFullReconIndex:
             decode_hash=0,
             is_prefilling=True,
         )
+        # Per-request combined steering hashes live on the canonical
+        # ``_steering_reqs`` store (theirs moved them off the InputBatch
+        # columns).
+        h._steering_reqs["req-1"] = _SteeringReqState(
+            sampling_params=sp,
+            prefill_hash=0xCAFE,
+            decode_hash=0,
+            num_prompt_tokens=4,
+            phase="prefill",
+        )
 
         h._update_steering_buffers(
             SimpleNamespace(num_scheduled_tokens={"req-1": 1})
         )
 
         site = h._steerable_layers_cache[20]
-        assert int(site.steering_index[0].item()) == 0
+        # The rebuilt main path routes an additive-hash-0 prefill token to
+        # row 1 (the global prefill effective row) rather than the row-0
+        # sentinel; with no global vectors set that row is all zeros, so the
+        # additive contribution is still nil for this SAE-only request.
+        additive_row = int(site.steering_index[0].item())
+        assert additive_row in (0, 1)
+        if additive_row == 1:
+            table = getattr(site, HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_MLP])
+            assert torch.all(table[1] == 0)
         assert int(site.sae_recon_index[0].item()) == 1
 
 
@@ -571,14 +628,17 @@ class TestStreamingFullReconRefresh:
             },
         )
         new_sp = SamplingParams(sae_full_reconstruction_specs=[new_spec])
-        h._refresh_streaming_steering(
+        # Streaming re-adds route through the canonical registration path
+        # (the rebuilt framework replaced ``_refresh_streaming_steering``):
+        # any state held for the id is released before the fresh prefill
+        # config is registered.
+        h._steering_register_request(
             "req-1",
-            SimpleNamespace(sampling_params=new_sp),
-            old_prefill_hash=old_prefill_hash,
-            old_decode_hash=old_decode_hash,
-            new_prefill_hash=new_sp.prefill_steering_config_hash,
-            new_decode_hash=new_sp.decode_steering_config_hash,
-            old_sampling_params=old_sp,
+            sampling_params=new_sp,
+            prefill_hash=new_sp.prefill_steering_config_hash,
+            decode_hash=new_sp.decode_steering_config_hash,
+            num_prompt_tokens=10,
+            num_computed_tokens=0,
         )
 
         old_fr_hash = old_sp.prefill_sae_full_recon_config_hash
@@ -588,71 +648,6 @@ class TestStreamingFullReconRefresh:
         assert (new_fr_hash, "prefill") in mgr.config_to_row
         assert h._req_sae_fr_phase == {"req-1": "prefill"}
         assert h._req_sae_fr_hash == {"req-1": new_fr_hash}
-
-    def test_streaming_refresh_failure_restores_old_full_recon_row(
-        self, monkeypatch
-    ):
-        h = _Harness(max_sae_configs=4)
-        h._steering_manager = SteeringManager(max_steering_configs=4)
-        h.register_steering_modules(modules={"g": _payload(clampable=(0, 1))})
-
-        old_spec = SAEFullReconstructionSpec(
-            module_name="g",
-            clamps={
-                "post_mlp": {
-                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
-                }
-            },
-        )
-        old_sp = SamplingParams(sae_full_reconstruction_specs=[old_spec])
-        old_prefill_hash = old_sp.prefill_steering_config_hash
-        old_decode_hash = old_sp.decode_steering_config_hash
-        h._register_initial_sae_full_recon(
-            "req-1",
-            old_sp,
-            prefill_hash=old_prefill_hash,
-            decode_hash=old_decode_hash,
-            is_prefilling=True,
-        )
-        h.requests = {"req-1": SimpleNamespace(sampling_params=old_sp)}
-
-        new_spec = SAEFullReconstructionSpec(
-            module_name="g",
-            clamps={
-                "post_mlp": {
-                    20: (SAEClampEntry(feature_idx=1, kind="absolute", value=7.0),)
-                }
-            },
-        )
-        new_sp = SamplingParams(sae_full_reconstruction_specs=[new_spec])
-        new_fr_hash = new_sp.prefill_sae_full_recon_config_hash
-        mgr = h._sae_fr_clamp_manager
-        original_register = mgr.register_recon_spec
-
-        def fail_new_full_recon_register(config_hash, *_args, **_kwargs):
-            if config_hash == new_fr_hash:
-                raise RuntimeError("new full recon row rejected")
-            return original_register(config_hash, *_args, **_kwargs)
-
-        monkeypatch.setattr(
-            mgr, "register_recon_spec", fail_new_full_recon_register
-        )
-
-        with pytest.raises(RuntimeError, match="new full recon row rejected"):
-            h._refresh_streaming_steering(
-                "req-1",
-                SimpleNamespace(sampling_params=new_sp),
-                old_prefill_hash=old_prefill_hash,
-                old_decode_hash=old_decode_hash,
-                new_prefill_hash=new_sp.prefill_steering_config_hash,
-                new_decode_hash=new_sp.decode_steering_config_hash,
-                old_sampling_params=old_sp,
-            )
-
-        old_fr_hash = old_sp.prefill_sae_full_recon_config_hash
-        assert mgr.config_to_row == {(old_fr_hash, "prefill"): 1}
-        assert h._req_sae_fr_phase == {"req-1": "prefill"}
-        assert h._req_sae_fr_hash == {"req-1": old_fr_hash}
 
 
 class TestAssertSpecsCanBeApplied:

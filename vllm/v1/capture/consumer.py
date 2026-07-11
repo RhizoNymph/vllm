@@ -27,7 +27,9 @@ from vllm.v1.capture.types import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.capture.step_view import StepCaptureView
     from vllm.v1.capture.types import CaptureContext
+    from vllm.v1.worker.steering_action_queue import SteeringAction
 
 
 class CaptureConsumer(ABC):
@@ -50,11 +52,24 @@ class CaptureConsumer(ABC):
       with shared-memory tensor handoff.
     - ``required_sidecar_fields``: optional sidecar field names the
       framework must populate for this consumer.
-      ``vllm_internal_request_id`` is always present.
+      ``vllm_internal_request_id`` and ``client_request_id`` are always
+      present (the latter is the original client-supplied request id, for
+      universal attribution; it falls back to the internal id when request
+      id randomization is disabled).
     - ``reads_client_spec``: whether the consumer accepts per-request
       opt-in via ``SamplingParams.capture[consumer_name]``. Default
       ``False`` — most consumers have a global spec set at
       registration time.
+    - ``execution``: ``"async"`` (default) delivers data through the
+      dispatch/finalize pipeline off the critical path. ``"sync"``
+      consumers instead implement ``on_step`` and run **on the
+      model-runner step thread** immediately after each forward —
+      they never receive chunks or finalize calls. Sync consumers
+      must have ``location = "worker"``, must not read client specs,
+      must return a non-``None`` ``global_capture_spec()``, and are
+      constructed on every tensor-parallel rank (see the determinism
+      contract on ``on_step``). See
+      ``docs/design/dynamic_steering.md`` §5.1.
 
     Override points, in order of necessity:
 
@@ -73,9 +88,14 @@ class CaptureConsumer(ABC):
       ``pass``.
     """
 
-    location: ClassVar[Literal["worker", "driver"]] = "worker"
+    location: Literal["worker", "driver"] = "worker"
     required_sidecar_fields: ClassVar[frozenset[str]] = frozenset()
     reads_client_spec: ClassVar[bool] = False
+    # When False, the consumer reads only capture metadata (key / shape /
+    # dtype) and never the tensor payload, so the manager may skip the
+    # device->host copy and dispatch/spill pipeline for it.
+    needs_payload: ClassVar[bool] = True
+    execution: ClassVar[Literal["async", "sync"]] = "async"
 
     def __init__(  # noqa: B027 — intentional no-op default.
         self,
@@ -86,6 +106,20 @@ class CaptureConsumer(ABC):
 
     def global_capture_spec(self) -> CaptureSpec | None:
         return None
+
+    @classmethod
+    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
+        """Graph-safe ``layer:hook`` keys this consumer wants pre-buffered for
+        per-request capture, derived from its ``params``.
+
+        Shorthands are allowed (``"N:hook"``, ``"N:all"``, ``"all:hook"``,
+        ``"all:all"``). The union across all registered consumers forms the
+        DEFAULT graph-safe allowlist; an explicit ``--capture-graphsafe-key`` /
+        ``capture_graphsafe_keys`` overrides it. Resolved at config-build time
+        from the class + params (no instance is constructed), so this must not
+        depend on runtime state. Default: none.
+        """
+        return []
 
     def validate_client_spec(
         self,
@@ -107,8 +141,9 @@ class CaptureConsumer(ABC):
         """Called once per finalized capture key.
 
         ``tensor`` has shape ``(num_rows, hidden_size)`` in the dtype
-        captured. ``sidecar`` is filtered to the consumer's
-        ``required_sidecar_fields`` plus ``vllm_internal_request_id``.
+        captured. ``sidecar`` carries the consumer's
+        ``required_sidecar_fields`` plus the always-present
+        ``vllm_internal_request_id`` and ``client_request_id``.
         """
 
     def on_error(  # noqa: B027 — intentional no-op default.
@@ -117,6 +152,114 @@ class CaptureConsumer(ABC):
         error: str,
     ) -> None:
         pass
+
+    def on_step(self, view: StepCaptureView) -> list[Any] | None:
+        """Sync-execution hook: called once per forward step on the
+        model-runner step thread (``execution = "sync"`` only).
+
+        ``view.tensors`` are zero-copy GPU views of the persistent
+        capture buffers — **valid only until the next forward pass
+        begins**; finish all reads (probe GEMMs, D2H) before
+        returning. The return value is a list of steering actions
+        (e.g. ``SteeringVectorUpdate`` from
+        ``vllm.v1.worker.steering_action_queue``) applied inline
+        before the next step builds its steering tables, or ``None``.
+
+        Determinism contract: this method runs on **every**
+        tensor-parallel rank with a byte-identical ``view``. It must
+        be a pure function of the view and the consumer's own state,
+        and that state must evolve identically on every rank — no
+        RNG, no wall-clock reads, no iteration over unordered
+        collections, no I/O-dependent decisions. Divergent actions
+        silently desynchronize the ranks' steering tables.
+
+        This method is on the critical path: its wall time adds
+        directly to step latency and is tracked per consumer.
+        """
+        return None
+
+    def shutdown(self, timeout: float = 30.0) -> None:  # noqa: B027
+        pass
+
+
+class SyncCaptureConsumer(ABC):
+    """Base class for **sync-execution** capture consumers (dynamic steering).
+
+    A sync consumer runs on the model-runner step thread immediately after
+    each forward pass: the engine hands it a
+    :class:`~vllm.v1.capture.step_view.StepCaptureView` of the monitored
+    residual and applies the steering actions it returns before the next step
+    builds its steering tables. Unlike :class:`CaptureConsumer` (the async
+    dispatch/finalize path), a sync consumer never receives capture chunks and
+    never implements ``on_capture`` — ``on_step`` is its entire data surface.
+
+    Subclasses MUST implement :meth:`on_step` and :meth:`global_capture_spec`
+    (the latter naming the ``(layer, hook)`` sites whose residual the view
+    exposes). The fixed class metadata encodes the sync-execution constraints
+    the registry enforces at build time (worker location, no client specs; see
+    :func:`vllm.v1.capture.registry._validate_sync_consumer`).
+
+    Why an ABC: the capture registry calls ``declared_graphsafe_keys`` on the
+    *class* at config-build time. A sync consumer that forgot it used to fail
+    there with a cryptic ``AttributeError`` deep in the build, never in a unit
+    test that instantiates the class directly. The ``[]`` default here removes
+    that footgun, and the abstract :meth:`on_step` / :meth:`global_capture_spec`
+    turn any remaining contract gap into a clear
+    ``TypeError: Can't instantiate abstract class`` at construction.
+    """
+
+    location: ClassVar[Literal["worker"]] = "worker"
+    execution: ClassVar[Literal["sync"]] = "sync"
+    reads_client_spec: ClassVar[bool] = False
+
+    def __init__(  # noqa: B027 — intentional no-op default.
+        self,
+        vllm_config: VllmConfig,
+        params: dict[str, Any],
+    ) -> None:
+        pass
+
+    @classmethod
+    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
+        """Graph-safe ``layer:hook`` keys to pre-buffer for per-request capture.
+
+        Sync consumers read the :class:`StepCaptureView` directly and need no
+        per-request graph-safe pre-buffering, so the default is empty. Resolved
+        on the class at config-build time (no instance is constructed), so an
+        override must not depend on runtime state. Default: none.
+        """
+        return []
+
+    @abstractmethod
+    def global_capture_spec(self) -> CaptureSpec:
+        """The (non-``None``) global capture spec.
+
+        Names the ``(layer, hook)`` sites whose residual is exposed on each
+        :class:`StepCaptureView`. Required: a sync consumer with no monitored
+        site has nothing to observe and is rejected at build time.
+        """
+
+    @abstractmethod
+    def on_step(self, view: StepCaptureView) -> list[SteeringAction] | None:
+        """Sync-execution hook: called once per forward step on the
+        model-runner step thread immediately after the forward pass.
+
+        ``view.tensors`` are zero-copy GPU views of the persistent capture
+        buffers — **valid only until the next forward pass begins**; finish all
+        reads (probe GEMMs, D2H) before returning. The return value is a list
+        of steering actions applied inline before the next step builds its
+        steering tables, or ``None``.
+
+        Determinism contract: this method runs on **every** tensor-parallel
+        rank with a byte-identical ``view``. It must be a pure function of the
+        view and the consumer's own state, and that state must evolve
+        identically on every rank — no RNG, no wall-clock reads, no iteration
+        over unordered collections, no I/O-dependent decisions. Divergent
+        actions silently desynchronize the ranks' steering tables.
+
+        This method is on the critical path: its wall time adds directly to
+        step latency and is tracked per consumer.
+        """
 
     def shutdown(self, timeout: float = 30.0) -> None:  # noqa: B027
         pass

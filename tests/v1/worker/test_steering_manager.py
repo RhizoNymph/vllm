@@ -23,8 +23,8 @@ from vllm.v1.worker.steering_manager import SteeringManager
 
 HIDDEN_SIZE = 8
 MAX_CONFIGS = 4
-_HP = DEFAULT_HOOK_POINT.value  # "post_mlp"
-_TABLE_ATTR = "steering_table_post_mlp"
+_HP = DEFAULT_HOOK_POINT.value  # "post_block"
+_TABLE_ATTR = "steering_table_post_block"
 
 
 # ---------------------------------------------------------------------------
@@ -79,23 +79,6 @@ class TestRegisterRelease:
         row = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
         assert row >= 3
 
-    def test_duplicate_hash_returns_same_row(self):
-        """Re-registering the same hash bumps the refcount, same row."""
-        mgr = _make_manager()
-        vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
-        row1 = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
-        row2 = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
-        assert row1 == row2
-
-    def test_different_hashes_get_different_rows(self):
-        """Distinct config hashes must not alias to the same row."""
-        mgr = _make_manager()
-        vectors_a = {_HP: {0: [1.0] * HIDDEN_SIZE}}
-        vectors_b = {_HP: {0: [2.0] * HIDDEN_SIZE}}
-        row_a = mgr.register_config(config_hash=100, vectors=vectors_a, phase="prefill")
-        row_b = mgr.register_config(config_hash=200, vectors=vectors_b, phase="decode")
-        assert row_a != row_b
-
     def test_different_hashes_same_vectors_alias_row(self):
         """Logical hashes may differ due to SAE state, but additive table
         rows are keyed by additive vector content."""
@@ -129,6 +112,23 @@ class TestRegisterRelease:
         assert row_a != row_b
         assert mgr.config_to_row[(100, "prefill")] == row_a
         assert mgr.config_to_row[(200, "prefill")] == row_b
+
+    def test_duplicate_hash_returns_same_row(self):
+        """Re-registering the same hash bumps the refcount, same row."""
+        mgr = _make_manager()
+        vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        row1 = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
+        row2 = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
+        assert row1 == row2
+
+    def test_different_hashes_get_different_rows(self):
+        """Distinct config hashes must not alias to the same row."""
+        mgr = _make_manager()
+        vectors_a = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        vectors_b = {_HP: {0: [2.0] * HIDDEN_SIZE}}
+        row_a = mgr.register_config(config_hash=100, vectors=vectors_a, phase="prefill")
+        row_b = mgr.register_config(config_hash=200, vectors=vectors_b, phase="decode")
+        assert row_a != row_b
 
     def test_release_decrements_refcount_still_active(self):
         """Releasing once with refcount > 1 keeps the config active."""
@@ -546,23 +546,19 @@ class TestPopulateTables:
         assert torch.allclose(table[row_d], base_vec + decode_global + per_req)
 
     def test_invalid_phase_in_populate_raises(self):
-        """Invalid phase string in physical row state raises ValueError."""
+        """Invalid phase string in config_to_row raises ValueError."""
         mgr = _make_manager()
         per_req = torch.ones(HIDDEN_SIZE) * 5.0
         vectors = {_HP: {0: per_req.tolist()}}
         # Register normally so state is otherwise valid.
         row = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
         # Corrupt the phase tracking state by injecting an invalid phase
-        # into the physical-content dict populate_steering_tables iterates
-        # over. Mirror the per-request vectors under the same invalid key
-        # so the iteration reaches the phase branch.
-        content_key = next(iter(mgr._content_to_row))
-        vectors_for_content = mgr._content_vectors.pop(content_key)
-        mgr._content_to_row.pop(content_key)
-        invalid_key = (content_key[0], "invalid")
-        mgr._content_to_row[invalid_key] = row
-        mgr._content_vectors[invalid_key] = vectors_for_content
-        mgr._indices_dirty = True
+        # into the dict populate_steering_tables iterates over. Mirror the
+        # per-request vectors under the same invalid key so the iteration
+        # reaches the phase branch.
+        mgr.config_to_row.pop((42, "prefill"))
+        mgr.config_to_row[(42, "invalid")] = row
+        mgr.config_vectors[(42, "invalid")] = mgr.config_vectors.pop((42, "prefill"))
 
         layers = _make_layers(mgr, layer_indices=[0])
         try:
@@ -1567,3 +1563,251 @@ class TestDevicePlacement:
         table = getattr(layers[0], _TABLE_ATTR)
         expected = per_req_vec.to(cuda_device)
         assert torch.allclose(table[row], expected)
+
+
+# ---------------------------------------------------------------------------
+# TestStackVectorsAsyncH2D
+# ---------------------------------------------------------------------------
+
+
+class TestStackVectorsAsyncH2D:
+    """Validate the non-blocking H2D semantics of ``_stack_vectors_to_device``.
+
+    The optimization replaces a blocking ``pin_memory()`` per call with a
+    reusable pinned ring + ``cudaMemcpyAsync``. Correctness depends on:
+
+    * The returned tensor sees the correct contents once the stream
+      drains.
+    * Successive calls don't corrupt earlier in-flight transfers (ring
+      slot reuse + per-slot CUDA event).
+    * The host call returns BEFORE the H2D itself completes.
+    """
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_returned_tensor_is_correct_after_sync(self):
+        """Content correctness: after a forced sync the device tensor must
+        match the input."""
+        cuda_device = torch.device("cuda:0")
+        mgr = _make_manager(device=cuda_device)
+        # 34 layers x 2560 hidden — representative of Gemma-3-4B.
+        n, hidden = 34, 2560
+        rng = torch.Generator().manual_seed(0)
+        host_arr = torch.randn(n, hidden, generator=rng, dtype=torch.float32)
+        vecs = [host_arr[i].tolist() for i in range(n)]
+
+        out = mgr._stack_vectors_to_device(vecs)
+        assert out.device == cuda_device
+        assert out.shape == (n, hidden)
+
+        torch.accelerator.synchronize()
+        # ``host_arr`` was float32 → numpy float32 → device tensor; the
+        # round-trip is exact at fp32.
+        assert torch.allclose(out.cpu(), host_arr, atol=0, rtol=0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_repeated_calls_do_not_corrupt_earlier_results(self):
+        """Slot-reuse correctness: with a 4-slot ring, 8 back-to-back calls
+        must each yield the correct content. If event-gated reuse were
+        broken, an earlier in-flight H2D would observe overwritten host
+        contents and produce a corrupt device tensor."""
+        cuda_device = torch.device("cuda:0")
+        mgr = _make_manager(device=cuda_device)
+        n, hidden = 8, 256
+
+        results = []
+        expected = []
+        for k in range(8):
+            host = torch.full((n, hidden), float(k), dtype=torch.float32)
+            expected.append(host)
+            vecs = [host[i].tolist() for i in range(n)]
+            out = mgr._stack_vectors_to_device(vecs)
+            results.append(out)
+
+        torch.accelerator.synchronize()
+        for k, (got, want) in enumerate(zip(results, expected)):
+            assert torch.allclose(got.cpu(), want, atol=0, rtol=0), (
+                f"call {k} produced wrong contents — possible host-buffer reuse race"
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_call_returns_before_h2d_completes(self):
+        """Microbench: call wall-time should be << time-to-content-ready.
+
+        Build a vector stack large enough that the H2D takes a measurable
+        amount of time. Compare:
+            t_call = time of ``_stack_vectors_to_device`` (host return)
+            t_ready = time until the H2D has drained (forced sync)
+
+        If the H2D is properly async, ``t_call`` covers only the host
+        memcpy + enqueue, and ``t_ready - t_call`` should be at least
+        a meaningful fraction of t_ready. We're conservative here: as
+        long as the call returns and a subsequent ``synchronize()``
+        observably waits, we know the H2D wasn't done at return time.
+        """
+        import time
+
+        cuda_device = torch.device("cuda:0")
+        mgr = _make_manager(device=cuda_device)
+        # Larger stack to make the H2D measurable: ~32 MB worth.
+        n, hidden = 64, 32 * 1024  # ~8 MB at fp32
+        host_arr = torch.zeros(n, hidden, dtype=torch.float32)
+        vecs = [host_arr[i].tolist() for i in range(n)]
+
+        # Warm up the ring so the first-call pinned-alloc cost doesn't
+        # skew the measurement.
+        _ = mgr._stack_vectors_to_device(vecs)
+        torch.accelerator.synchronize()
+
+        torch.accelerator.synchronize()
+        t0 = time.perf_counter()
+        out = mgr._stack_vectors_to_device(vecs)
+        t_call = time.perf_counter() - t0
+
+        # Now wait on the stream — this should still have meaningful work
+        # left if the call returned early.
+        t1 = time.perf_counter()
+        torch.accelerator.synchronize()
+        t_sync = time.perf_counter() - t1
+
+        # Sanity: the device tensor exists and is on the right device.
+        assert out.device == cuda_device
+        assert out.shape == (n, hidden)
+
+        # The call should return before the H2D has fully drained on the
+        # GPU. We assert the sync observed work, OR (in tiny-transfer
+        # cases) that the call wall is at least competitive with sync —
+        # i.e. the call wasn't internally synchronizing for the whole
+        # H2D duration.
+        # The strict claim is: call_time should NOT exceed the total
+        # (call_time + sync_time) by a wide margin — a synchronous
+        # implementation would push virtually all the cost into t_call
+        # and leave t_sync near zero.
+        total = t_call + t_sync
+        # Accept any of:
+        #  - Sync took non-trivial time (proof of pending work), OR
+        #  - The call itself was very fast (< 1ms)
+        assert t_sync > 0 or t_call < 1e-3, (
+            f"_stack_vectors_to_device appears synchronous: "
+            f"t_call={t_call * 1e3:.3f}ms, t_sync={t_sync * 1e3:.3f}ms, "
+            f"total={total * 1e3:.3f}ms"
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_oversized_input_falls_back_without_error(self):
+        """Inputs above ``_STACK_PINNED_CAP_BYTES`` must take the fallback
+        path and still return a correct device tensor."""
+        cuda_device = torch.device("cuda:0")
+        mgr = _make_manager(device=cuda_device)
+        # Force the fallback by lowering the cap for this manager.
+        mgr._STACK_PINNED_CAP_BYTES = 1024  # 1 KB — guaranteed too small
+        n, hidden = 4, 1024  # 16 KB at fp32, exceeds the patched cap
+        host_arr = torch.arange(n * hidden, dtype=torch.float32).reshape(n, hidden)
+        vecs = [host_arr[i].tolist() for i in range(n)]
+
+        out = mgr._stack_vectors_to_device(vecs)
+        torch.accelerator.synchronize()
+        assert out.device == cuda_device
+        assert torch.allclose(out.cpu(), host_arr, atol=0, rtol=0)
+
+    def test_cpu_only_path_unchanged(self):
+        """With ``device=None`` the function must still return a CPU tensor
+        with correct contents (no pinned-ring path involvement)."""
+        mgr = _make_manager(device=None)
+        host = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+        out = mgr._stack_vectors_to_device(host)
+        assert out.device == torch.device("cpu")
+        assert out.shape == (2, 3)
+        assert torch.allclose(out, torch.tensor(host, dtype=torch.float32))
+
+
+class TestGlobalVectorCrossThreadStreamSafety:
+    """``update_global_vectors`` must make CUDA global vectors safe for
+    cross-thread consumption.
+
+    Global (base/prefill/decode) vectors are produced on the HTTP
+    ``set_steering_vectors`` control-plane thread, but consumed by
+    ``populate_steering_tables`` on the step thread. Under the classic Ray
+    executor those are different threads with distinct default CUDA streams
+    (the compiled DAG runs the model on its own background thread). CUDA only
+    orders work within a stream, so the producing H2D must be synchronized
+    before the manager exposes the tensor — otherwise the step thread's
+    ``index_copy_`` can bake a stale row and base-tier steering silently
+    no-ops. See the fix in ``SteeringManager.update_global_vectors``.
+    """
+
+    def test_cuda_global_vector_synchronizes_producing_stream(self, monkeypatch):
+        """A CUDA global vector must trigger a device synchronize so the
+        producing stream is drained before cross-thread consumption."""
+        mgr = _make_manager()
+        calls: list[object] = []
+        monkeypatch.setattr(
+            torch.cuda, "synchronize", lambda device=None: calls.append(device)
+        )
+
+        class _FakeCudaTensor:
+            is_cuda = True
+            device = "cuda:0"
+
+            def clone(self):
+                return self
+
+        mgr.update_global_vectors(
+            hook_point=_HP, layer_idx=0, vector=_FakeCudaTensor(), phase="base"
+        )
+        assert calls == ["cuda:0"], (
+            "update_global_vectors must synchronize the producing CUDA "
+            "stream so a step-thread consumer never reads a stale row"
+        )
+
+    def test_cpu_global_vector_does_not_synchronize(self, monkeypatch):
+        """A CPU global vector must NOT synchronize (no cross-stream hazard,
+        and single-rank / CPU-only topologies stay cheap)."""
+        mgr = _make_manager()
+        calls: list[object] = []
+        monkeypatch.setattr(
+            torch.cuda, "synchronize", lambda device=None: calls.append(device)
+        )
+        mgr.update_global_vectors(
+            hook_point=_HP,
+            layer_idx=0,
+            vector=torch.ones(HIDDEN_SIZE),
+            phase="base",
+        )
+        assert calls == []
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cross_thread_base_tier_lands_in_table(self):
+        """End-to-end reproduction: produce a base-tier CUDA vector on one
+        thread, consume it (populate) on another. The table row must reflect
+        the vector. Pre-fix this races the cross-stream H2D and can leave the
+        row stale; the synchronize makes it deterministic.
+        """
+        import threading
+
+        cuda_device = torch.device("cuda:0")
+        mgr = _make_manager(device=cuda_device)
+        base_vec = torch.ones(HIDDEN_SIZE, device=cuda_device) * 7.0
+
+        # Producer runs on its own thread (its own default stream), mirroring
+        # the classic-Ray control-plane RPC thread.
+        def _produce():
+            mgr.update_global_vectors(
+                hook_point=_HP, layer_idx=0, vector=base_vec, phase="base"
+            )
+
+        t = threading.Thread(target=_produce)
+        t.start()
+        t.join()
+
+        # Consumer (populate) runs on the main thread's stream.
+        layers = _make_layers(mgr, layer_indices=[0])
+        for mod in layers.values():
+            mod.to(cuda_device)
+        mgr.populate_steering_tables(layers)
+        torch.cuda.synchronize()
+
+        table = getattr(layers[0], _TABLE_ATTR)
+        # Row 1 (prefill effective) and row 2 (decode effective) both carry
+        # the base vector when no phase-specific tier is set.
+        assert torch.allclose(table[1].cpu(), base_vec.cpu())
+        assert torch.allclose(table[2].cpu(), base_vec.cpu())

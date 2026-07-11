@@ -186,3 +186,35 @@ class TestCaptureConsumersConfigHash:
         h = cfg.compute_hash()
         assert isinstance(h, str)
         assert len(h) == 16
+
+    def test_changes_when_piecewise_fallback_toggled(self) -> None:
+        # The fallback changes splitting_ops (the compiled graph), so it must
+        # participate in the compile-cache key.
+        cfg_a = CaptureConsumersConfig(
+            consumers=[CaptureConsumerSpec(name="fs")],
+            piecewise_capture_fallback=False,
+        )
+        cfg_b = CaptureConsumersConfig(
+            consumers=[CaptureConsumerSpec(name="fs")],
+            piecewise_capture_fallback=True,
+        )
+        assert cfg_a.compute_hash() != cfg_b.compute_hash()
+
+
+class TestActivationCacheBudget:
+    def test_defaults_to_disabled(self) -> None:
+        assert CaptureConsumersConfig(consumers=[]).activation_cache_bytes == 0
+
+    def test_settable(self) -> None:
+        cfg = CaptureConsumersConfig(consumers=[], activation_cache_bytes=2048)
+        assert cfg.activation_cache_bytes == 2048
+
+    def test_runtime_only_not_in_hash(self) -> None:
+        # The budget is a runtime knob; changing it must not bust the
+        # compile cache, so it stays out of compute_hash.
+        a = CaptureConsumersConfig(consumers=[CaptureConsumerSpec(name="fs")])
+        b = CaptureConsumersConfig(
+            consumers=[CaptureConsumerSpec(name="fs")],
+            activation_cache_bytes=1_000_000,
+        )
+        assert a.compute_hash() == b.compute_hash()

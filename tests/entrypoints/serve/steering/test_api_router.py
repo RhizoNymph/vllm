@@ -6,13 +6,12 @@ Tests cover three-tier steering (base, prefill, decode) with co-located
 scale format support.
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-import vllm.envs as envs
 from vllm.entrypoints.serve.steering.api_router import (
     _normalize_spec,
     attach_router,
@@ -477,7 +476,7 @@ class TestNormalizeSpec:
     def test_normalize_spec_drops_empty_hook(self):
         """Hooks whose layer dict is empty are dropped from the result.
 
-        An input like ``{"post_mlp": {}}`` is functionally
+        An input like ``{"post_block": {}}`` is functionally
         equivalent to omitting the hook entirely: no layers and no
         vectors would be applied. Keeping the empty hook in the
         normalized spec would produce a truthy-but-empty entry that
@@ -507,21 +506,15 @@ class TestNormalizeSpec:
 
 
 class TestAttachRouter:
-    def test_attached_in_dev_mode(self):
+    def test_attached_unconditionally(self):
+        # Steering routes are not dev-mode endpoints: mutation routes carry
+        # their own auth (--steering-api-key) and reads are harmless.
         app = FastAPI()
-        with patch.object(envs, "VLLM_SERVER_DEV_MODE", True):
-            attach_router(app)
+        attach_router(app)
         paths = {r.path for r in app.routes}
         assert "/v1/steering/set" in paths
         assert "/v1/steering/clear" in paths
         assert "/v1/steering" in paths
-
-    def test_not_attached_without_dev_mode(self):
-        app = FastAPI()
-        with patch.object(envs, "VLLM_SERVER_DEV_MODE", False):
-            attach_router(app)
-        paths = {r.path for r in app.routes}
-        assert "/v1/steering/set" not in paths
 
 
 # --- steering API key auth ---
@@ -626,3 +619,122 @@ class TestSteeringAPIKeyAuth:
         client = _SyncASGIClient(_make_app_with_tokens(engine, ["secret"]))
         resp = client.get("/v1/steering")
         assert resp.status_code == 200
+
+
+# --- POST /v1/steering/set: binary-wire packed input ---
+
+
+class TestSetSteeringPacked:
+    """``/v1/steering/set`` accepts the same SteeringHookPacked shape that
+    per-request steering already uses, in addition to the legacy JSON
+    list-of-floats form.  Coverage targets the coercion seam introduced by
+    ``coerce_steering_spec``; the rest of the pipeline (validation, RPC
+    fan-out, cache invalidation) is shared with the legacy-form tests."""
+
+    def test_set_packed_base_vectors(self, client, engine):
+        """Single hook, two layers, default scales — round-trips to RPC."""
+        from tests.entrypoints.serve.steering._packed_helpers import pack_hook
+
+        engine.collective_rpc.side_effect = [
+            [(0, 0, [0, 3])],
+            [(0, 0, [0, 3])],
+        ]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "vectors": {
+                    _HP: pack_hook({0: [1.0, 2.0], 3: [4.0, 5.0]}),
+                }
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        assert resp.json()["layers_updated"] == [0, 3]
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", {})
+        vectors = kwargs.get("vectors", {})
+        # Exact equality is fine here: 1.0, 2.0, 4.0, 5.0 are all
+        # bit-exact in fp32.
+        assert list(vectors[_HP][0]) == [1.0, 2.0]
+        assert list(vectors[_HP][3]) == [4.0, 5.0]
+
+    def test_set_packed_with_scales(self, client, engine):
+        """Per-row ``scales`` field is honored at unpack time."""
+        from tests.entrypoints.serve.steering._packed_helpers import pack_hook
+
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "vectors": {
+                    _HP: pack_hook({0: [1.0, 2.0]}, scales=[3.0]),
+                }
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", {})
+        vectors = kwargs.get("vectors", {})
+        # fp32 round-trip: 1.0 * 3.0 == 3.0, 2.0 * 3.0 == 6.0
+        assert list(vectors[_HP][0]) == pytest.approx([3.0, 6.0], rel=1e-6)
+
+    def test_set_packed_mixed_tiers(self, client, engine):
+        """Base tier packed + prefill tier legacy in the same request."""
+        from tests.entrypoints.serve.steering._packed_helpers import pack_hook
+
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "vectors": {_HP: pack_hook({0: [1.0, 2.0]})},
+                "prefill_vectors": {_HP: {"0": [0.1, 0.2]}},
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", {})
+        # Packed values: bit-exact in fp32.  Legacy list values: pass
+        # through unchanged so exact compare also works.
+        assert list(kwargs["vectors"][_HP][0]) == [1.0, 2.0]
+        assert kwargs["prefill_vectors"][_HP][0] == [0.1, 0.2]
+
+    def test_set_packed_malformed_data_length(self, client, engine):
+        """A packed blob whose ``data`` byte length disagrees with
+        ``shape``/``dtype`` returns 400 (caught at the coercion seam)."""
+        import pybase64 as base64
+
+        # shape says 1×4 fp32 (=16 bytes), but we send 8 bytes
+        bad = {
+            "dtype": "float32",
+            "shape": [1, 4],
+            "layer_indices": [0],
+            "data": base64.b64encode(b"\x00" * 8).decode("ascii"),
+        }
+        resp = client.post(
+            "/v1/steering/set",
+            json={"vectors": {_HP: bad}},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "Malformed steering payload" in body["error"]
+        engine.collective_rpc.assert_not_called()
+
+    def test_set_packed_decode_only_tier(self, client, engine):
+        """Packed input works on the decode-only tier as well."""
+        from tests.entrypoints.serve.steering._packed_helpers import pack_hook
+
+        engine.collective_rpc.side_effect = [[(0, 0, [0])], [(0, 0, [0])]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={
+                "decode_vectors": {_HP: pack_hook({0: [0.5, 0.6]})},
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        validate_call = engine.collective_rpc.call_args_list[0]
+        kwargs = validate_call.kwargs.get("kwargs", {})
+        # 0.5 is bit-exact in fp32; 0.6 round-trips with fp32 epsilon.
+        assert list(kwargs["decode_vectors"][_HP][0]) == pytest.approx(
+            [0.5, 0.6], rel=1e-6
+        )
+        assert kwargs.get("vectors") is None
+        assert kwargs.get("prefill_vectors") is None

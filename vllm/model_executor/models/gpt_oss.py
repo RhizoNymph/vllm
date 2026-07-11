@@ -35,6 +35,15 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import OCP_MX_BLOCK_SIZE
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    get_steering_buffer_dtype,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.utils import rocm_unquantized_gemm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -43,6 +52,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    remap_moe_expert_weights,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
@@ -243,6 +253,17 @@ class TransformerBlock(torch.nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
 
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.hidden_size,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+            dtype=get_steering_buffer_dtype(vllm_config),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -255,11 +276,14 @@ class TransformerBlock(torch.nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.attn(hidden_states, positions)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         output = self.mlp(hidden_states)
+        output, residual = apply_block_steering(self, output, residual)
         return output, residual
 
 
@@ -288,6 +312,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.norm = RMSNorm(self.config.hidden_size, eps=1e-5)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
@@ -379,7 +404,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
         tp_rank_start = tp_rank * per_rank_intermediate_size
         tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
-        for name, weight in weights:
+        # Use centralized weight remapping for MoE expert parameters
+        for name, weight in remap_moe_expert_weights(weights, params_dict):
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
                 continue
@@ -580,8 +606,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
             Returns:
                 Weight dtype string (e.g., "mxfp4", "fp8") or None if not available
             """
-            if hasattr(self.layers[layer_id].mlp.experts.quant_method, "weight_dtype"):
-                return self.layers[layer_id].mlp.experts.quant_method.weight_dtype
+            if hasattr(self.layers[layer_id].mlp.experts._quant_method, "weight_dtype"):
+                return self.layers[layer_id].mlp.experts._quant_method.weight_dtype
             return None
 
         intermediate_size = self.config.intermediate_size
@@ -633,53 +659,14 @@ class GptOssModel(nn.Module, EagleModelMixin):
                         "an unexpected condition. Please open an issue if encountered."
                     )
 
+                # The MoE refactor (#41184) moved expert params under
+                # `mlp.experts.routed_experts.*`; remap the legacy checkpoint
+                # name so keys like w2_bias resolve against params_dict.
+                fused_name = fused_name.replace(
+                    ".mlp.experts.", ".mlp.experts.routed_experts."
+                )
+
                 moe_quant_method = _get_moe_weight_dtype(layer_id=layer_id)
-
-            def kv_cache_scale_loader(
-                quant_config: QuantizationConfig,
-                name: str,
-                params_dict: dict[str, typing.Any],
-                weight: torch.Tensor,
-                default_weight_loader: Callable[..., None],
-                loaded_params: set[str],
-            ) -> tuple[bool, set[str]]:
-                """
-                Load KV cache output scales.
-                Returns:
-                    Tuple of (bool, set):
-                    - bool: True if KV-cache scale was loaded into loaded_params
-                    - set: Updated set of loaded_params if True else the original set
-                """
-                # load explicit cached KV output scale from quant_config
-                if quant_config is not None and (
-                    scale_name := quant_config.get_cache_scale(name)
-                ):
-                    param = params_dict[scale_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    if weight.numel() != 1:
-                        raise ValueError(
-                            f"KV cache scale '{scale_name}' is expected to be a "
-                            f"scalar, but got a tensor of shape {weight.shape}."
-                        )
-                    # Ensure weight is a scalar before passing to loader.
-                    weight_loader(param, weight.flatten()[0])
-                    loaded_params.add(scale_name)
-                    return True, loaded_params
-
-                return False, loaded_params
-
-            load_kv_cache_scale_completed, loaded_params = kv_cache_scale_loader(
-                self.quant_config,
-                name,
-                params_dict,
-                loaded_weight,
-                default_weight_loader,
-                loaded_params,
-            )
-            if load_kv_cache_scale_completed:
-                continue
 
             if (
                 all(key in name for key in ["input_scale", "mlp.experts"])

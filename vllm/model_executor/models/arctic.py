@@ -222,7 +222,6 @@ class ArcticMoE(nn.Module):
             self.w2s,
             topk_weights,
             topk_ids,
-            inplace=True,
         )
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -401,7 +400,7 @@ class ArcticDecoderLayer(nn.Module):
             hidden_states = self.block_sparse_moe(hidden_states)
             hidden_states = residual_attn + hidden_states
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
         return hidden_states
 

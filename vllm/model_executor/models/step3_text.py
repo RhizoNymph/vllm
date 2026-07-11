@@ -34,6 +34,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -328,7 +329,7 @@ class Step3TextDecoderLayer(nn.Module):
             hidden_states = share_output + moe_output
         else:
             hidden_states = self.mlp(hidden_states)
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 
         return hidden_states, residual
 
@@ -376,7 +377,7 @@ class Step3TextModel(nn.Module):
             self.norm = PPMissingLayer()
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], config.hidden_size
+            ["hidden_states", "residual"], config.hidden_size
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -453,9 +454,21 @@ class Step3TextModel(nn.Module):
         )
 
         expert_params_mapping = [
-            (f".moe.experts.{base_layer}w13_weight", ".moe.gate_proj.weight", "w1"),
-            (f".moe.experts.{base_layer}w13_weight", ".moe.up_proj.weight", "w3"),
-            (f".moe.experts.{base_layer}w2_weight", ".moe.down_proj.weight", "w2"),
+            (
+                f".moe.experts.routed_experts.{base_layer}w13_weight",
+                ".moe.gate_proj.weight",
+                "w1",
+            ),
+            (
+                f".moe.experts.routed_experts.{base_layer}w13_weight",
+                ".moe.up_proj.weight",
+                "w3",
+            ),
+            (
+                f".moe.experts.routed_experts.{base_layer}w2_weight",
+                ".moe.down_proj.weight",
+                "w2",
+            ),
         ]
 
         disable_moe_stacked_params = [data[1] for data in expert_params_mapping]

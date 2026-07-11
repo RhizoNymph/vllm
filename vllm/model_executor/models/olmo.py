@@ -261,7 +261,7 @@ class OlmoDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
         return hidden_states
 
@@ -315,7 +315,8 @@ class OlmoModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         """
-        :param input_ids: A tensor of shape `(batch_size, seq_len)`.
+        Args:
+            input_ids: A tensor of shape `(batch_size, seq_len)`.
         """
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:

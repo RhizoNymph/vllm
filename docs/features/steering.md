@@ -50,7 +50,7 @@ Also supported:
 - Global steering through HTTP endpoints
 - Per-request steering through `SamplingParams`
 - Three additive tiers (base / prefill-specific / decode-specific)
-- Three hook points: `pre_attn`, `post_attn`, `post_mlp`
+- Three hook points: `pre_attn`, `post_attn`, `post_block`
 - Phase-aware scheduler admission for per-request steering
 - Prefix-cache separation for different prefill steering configs
 - Continuous batching
@@ -109,21 +109,25 @@ activation that is discarded immediately afterward.
 | --- | --- |
 | `pre_attn` | Residual stream before attention |
 | `post_attn` | Residual stream after attention |
-| `post_mlp` | Residual stream after MLP |
+| `post_block` | Residual stream after MLP |
 
 For supported models, these hooks are wired directly into each decoder
 layer's forward path. Unused hook points are zero-valued no-ops.
 
 ## Global Steering API
 
-Global steering endpoints require `VLLM_SERVER_DEV_MODE=1`.
+Global steering endpoints are mounted whenever the server runs (they answer
+with a clear error when `--enable-steering` is not set). Mutation endpoints
+should be protected with a steering API key on any shared deployment.
 
 ### Gating Mutation Endpoints Behind a Steering API Key
 
-`POST /v1/steering/set` and `POST /v1/steering/clear` can optionally be
-gated behind a dedicated steering API key, separate from the server-wide
-`--api-key`.  This lets operators issue a narrower credential for
-mutating global steering state without handing out the main server key.
+Mutating steering endpoints (`POST /v1/steering/set`, `POST
+/v1/steering/clear`, `POST /v1/steering/modules/register`, `POST
+/v1/steering/modules/unregister`) can optionally be gated behind a
+dedicated steering API key, separate from the server-wide `--api-key`.
+This lets operators issue a narrower credential for mutating steering
+state without handing out the main server key.
 
 Configure it with either the CLI flag or the env var:
 
@@ -141,14 +145,19 @@ vllm serve google/gemma-3-4b-it \
   --steering-api-key primary-key --steering-api-key rotation-key
 ```
 
-When configured, requests to `/v1/steering/set` and `/v1/steering/clear`
-must include an `Authorization: Bearer <key>` header; anything else
-returns `401 Unauthorized` without dispatching the mutation.  This check
+When configured, requests to the mutation endpoints must include an
+`Authorization: Bearer <key>` header; anything else returns
+`401 Unauthorized` without dispatching the mutation.  This check
 is additive with the server-wide `--api-key` middleware: if both are
 set, requests must satisfy both.
 
-Read-only `GET /v1/steering` and the `/v1/steering/modules/*` endpoints
-are **not** gated by this key.
+The Rust frontend honors the same key for its steering-module routes
+(`POST /v1/steering/modules`, `DELETE /v1/steering/modules/{name}`) —
+`--steering-api-key` is forwarded to the Rust process, and
+`VLLM_STEERING_API_KEY` works there too.
+
+Read-only endpoints (`GET /v1/steering`, `GET /v1/steering/layers`,
+`GET /v1/steering/modules`) are **not** gated by this key.
 
 ### Set Steering
 
@@ -157,7 +166,7 @@ curl -X POST http://localhost:8000/v1/steering/set \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
-      "post_mlp": {
+      "post_block": {
         "15": {"vector": [0.1, 0.2], "scale": 2.0}
       }
     },
@@ -182,6 +191,39 @@ Important behavior:
 - `decode_vectors` is additive during decode only
 - `replace=true` clears all current steering before applying the new state
 - changing global base or prefill steering invalidates prefix-cache reuse
+
+Each tier in `/v1/steering/set` also accepts the binary wire shape used by
+per-request steering (`SteeringHookPacked`: base64-encoded
+`(num_layers, hidden_size)` blob + `layer_indices` + `dtype`/`shape`,
+optional per-row `scales`). The server detects the shape per hook and
+decodes via `np.frombuffer`, so a single client-side packing helper works
+across global and per-request paths:
+
+```python
+import base64
+
+import numpy as np
+import requests
+
+vec = np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
+stacked = np.stack([vec], axis=0)  # (num_layers, hidden_size)
+
+packed_hook = {
+    "dtype": str(stacked.dtype),
+    "shape": list(stacked.shape),
+    "layer_indices": [15],
+    "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+    "scales": [2.0],  # optional per-row scales
+}
+
+requests.post(
+    "http://localhost:8000/v1/steering/set",
+    json={"vectors": {"post_block": packed_hook}},
+)
+```
+
+Legacy and packed shapes can be mixed across tiers in the same request —
+e.g. `vectors` packed, `prefill_vectors` legacy.
 
 ### Clear Steering
 
@@ -215,7 +257,7 @@ params = SamplingParams(
     max_tokens=64,
     temperature=0.0,
     steering_vectors={
-        "post_mlp": {
+        "post_block": {
             15: {"vector": [0.1, 0.2], "scale": 2.0},
         },
     },
@@ -234,30 +276,52 @@ params = SamplingParams(
 outputs = llm.generate(["Hello"], params)
 ```
 
+### OpenAI-Compatible Server
+
 Per-request steering is also available through the OpenAI-compatible server
-using `extra_body`:
+using `extra_body`. The HTTP fields use a binary wire format: each hook
+carries one base64-encoded `(num_layers, hidden_size)` blob plus a sibling
+`layer_indices` list. The server decodes via `np.frombuffer` (zero-copy
+view) — microseconds vs. the ~10–15 ms per request a JSON `list[float]`
+payload would cost on the API-server event loop.
 
 ```python
+import base64
+
+import numpy as np
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
+vec = np.random.standard_normal(2560).astype(np.float16)
+stacked = np.stack([vec], axis=0)  # (num_layers, hidden_size)
+
+base = {
+    "post_block": {
+        "dtype": str(stacked.dtype),  # "float16" | "float32" | "float64"
+        "shape": list(stacked.shape),
+        "layer_indices": [15],
+        "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+        # Optional: per-row scales, matched 1:1 with layer_indices.
+        # Mirrors the {"vector": [...], "scale": float} form available
+        # to the in-process SamplingParams API without baking the
+        # multiplier into the bytes.
+        "scales": [2.0],
+    }
+}
+
 response = client.chat.completions.create(
     model="google/gemma-3-4b-it",
     messages=[{"role": "user", "content": "Hello"}],
-    extra_body={
-        "steering_vectors": {
-            "post_mlp": {15: [0.1, 0.2]},
-        },
-        "prefill_steering_vectors": {
-            "pre_attn": {15: [0.3, 0.4]},
-        },
-        "decode_steering_vectors": {
-            "pre_attn": {15: [0.5, 0.6]},
-        },
-    },
+    extra_body={"steering_vectors": base},
 )
 ```
+
+`prefill_steering_vectors` and `decode_steering_vectors` accept the same
+packed shape for phase-specific additions.
+
+See [`examples/online_serving/openai_steering_client.py`](../../examples/online_serving/openai_steering_client.py)
+for a runnable end-to-end client.
 
 ## Named Steering Modules
 
@@ -280,7 +344,7 @@ The JSON file uses the same three-tier format as the global steering API:
 ```json
 {
   "vectors": {
-    "post_mlp": {
+    "post_block": {
       "15": [0.1, 0.2, 0.3],
       "20": {"vector": [0.4, 0.5, 0.6], "scale": 2.0}
     }
@@ -294,18 +358,39 @@ The JSON file uses the same three-tier format as the global steering API:
 }
 ```
 
+Any tier in the file may instead use the binary-wire `SteeringHookPacked`
+shape — the loader detects the shape per hook. Useful when steering banks
+are large enough that the JSON list-of-floats parse becomes the dominant
+startup cost:
+
+```json
+{
+  "vectors": {
+    "post_block": {
+      "dtype": "float32",
+      "shape": [2, 2560],
+      "layer_indices": [15, 20],
+      "data": "<base64 of the (2, 2560) buffer>",
+      "scales": [1.0, 2.0]
+    }
+  }
+}
+```
+
 ### Registering at Runtime (API)
 
-Runtime management endpoints require `VLLM_SERVER_DEV_MODE=1`.
+Runtime registration is a steering *mutation*: when `--steering-api-key` /
+`VLLM_STEERING_API_KEY` is configured, these requests need the
+`Authorization: Bearer <key>` header.
 
 ```bash
-# Register a module
+# Register a module (legacy JSON form)
 curl -X POST http://localhost:8000/v1/steering/modules/register \
   -H "Content-Type: application/json" \
   -d '{
     "name": "creativity",
     "vectors": {
-      "post_mlp": {"15": [0.1, 0.2, 0.3]}
+      "post_block": {"15": [0.1, 0.2, 0.3]}
     }
   }'
 
@@ -316,6 +401,37 @@ curl http://localhost:8000/v1/steering/modules
 curl -X POST http://localhost:8000/v1/steering/modules/unregister \
   -H "Content-Type: application/json" \
   -d '{"name": "creativity"}'
+```
+
+`/v1/steering/modules/register` accepts the same binary-wire shape as
+`/v1/steering/set` and the per-request paths. The example below
+registers a module whose `vectors` tier is packed; the registry
+normalizes back to the legacy shape before storing so worker broadcast
+and per-request resolution stay unchanged:
+
+```python
+import base64
+
+import numpy as np
+import requests
+
+vec = np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
+stacked = np.stack([vec], axis=0)
+
+requests.post(
+    "http://localhost:8000/v1/steering/modules/register",
+    json={
+        "name": "creativity",
+        "vectors": {
+            "post_block": {
+                "dtype": str(stacked.dtype),
+                "shape": list(stacked.shape),
+                "layer_indices": [15],
+                "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+            }
+        },
+    },
+)
 ```
 
 ### Using Named Modules in Requests
@@ -349,7 +465,7 @@ response = client.chat.completions.create(
     extra_body={
         "steering_name": "creativity",
         "steering_vectors": {
-            "post_mlp": {15: [0.05, 0.1, 0.15]},
+            "post_block": {15: [0.05, 0.1, 0.15]},
         },
     },
 )
@@ -408,9 +524,10 @@ as long as the model has been wired correctly.
 
 - See [Supported Scope](#supported-scope) for the list of wired decoder
   architectures
-- Global HTTP endpoints are gated behind `VLLM_SERVER_DEV_MODE=1`
-- `POST /v1/steering/set` and `POST /v1/steering/clear` can additionally
-  be gated behind `--steering-api-key` / `VLLM_STEERING_API_KEY`
+- Mutating HTTP endpoints (`/v1/steering/set`, `/v1/steering/clear`,
+  `/v1/steering/modules/register`, `/v1/steering/modules/unregister`) can
+  be gated behind `--steering-api-key` / `VLLM_STEERING_API_KEY`; protect
+  them on any shared deployment
 - Per-request steering requires `--enable-steering`
 - Distinct steering configs in flight are capped by `--max-steering-configs`
 
@@ -441,7 +558,7 @@ Returns per-layer hook-point availability aggregated across TP × PP ranks:
 
 ```bash
 curl http://localhost:8000/v1/steering/layers
-# {"layers": {"0": {"hook_points": ["post_mlp"]}, "1": {"hook_points": ["post_mlp", "pre_attn"]}, ...}}
+# {"layers": {"0": {"hook_points": ["post_block"]}, "1": {"hook_points": ["post_block", "pre_attn"]}, ...}}
 ```
 
 Useful to confirm which layers of the loaded model are steerable before

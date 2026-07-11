@@ -17,17 +17,24 @@ from __future__ import annotations
 import logging
 import pathlib
 import threading
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from vllm.v1.capture.consumers.filesystem.types import (
+    VALID_LAYOUTS,
     FilesystemCaptureRequest,
     FilesystemConsumerParams,
+    packed_bin_name,
+    packed_index_name,
+    shard_bin_name,
+    shard_index_name,
 )
 from vllm.v1.capture.consumers.filesystem.writer import (
     ActivationWriter,
     FinalizeTask,
     WriteTask,
 )
+from vllm.v1.capture.errors import CaptureValidationError
 from vllm.v1.capture.types import (
     CaptureChunk,
     CaptureFinalize,
@@ -38,7 +45,7 @@ from vllm.v1.capture.types import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.capture.types import CaptureContext
+    from vllm.v1.capture.types import CaptureContext, HookName, PositionSelector
 
 logger = logging.getLogger(__name__)
 
@@ -54,14 +61,272 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
             "FilesystemConsumer requires a 'root' parameter pointing "
             "to the output directory."
         )
+    default_layout = str(params.get("default_layout", "per_file"))
+    if default_layout not in VALID_LAYOUTS:
+        raise ValueError(
+            f"default_layout must be one of {sorted(VALID_LAYOUTS)}, "
+            f"got {default_layout!r}"
+        )
     return FilesystemConsumerParams(
         root=str(params["root"]),
         writer_threads=int(params.get("writer_threads", 4)),
         queue_size=int(params.get("queue_size", 1024)),
-        timeout_seconds=float(params.get("timeout_seconds", 180.0)),
+        timeout_seconds=float(params.get("timeout_seconds", 30.0)),
         on_collision=str(params.get("on_collision", "overwrite")),
         fd_cache_size=int(params.get("fd_cache_size", 256)),
+        fsync=bool(params.get("fsync", True)),
+        atomic_publish=bool(params.get("atomic_publish", True)),
+        default_layout=str(params.get("default_layout", "per_file")),
+        coalesce_max_bytes=int(params.get("coalesce_max_bytes", 1 << 20)),
+        num_shards=int(params.get("num_shards", 8)),
+        shard_max_bytes=int(params.get("shard_max_bytes", 256 << 20)),
+        # Kept raw (dict or string DSL); resolved against the model's layer
+        # count in ``FilesystemConsumer.__init__`` (where ``all`` needs it).
+        global_hooks=params.get("global_hooks"),
+        global_positions=params.get("global_positions", "all_prompt"),
+        default_tag=str(params.get("default_tag", "default")),
     )
+
+
+# Hook points that have a real model forward tap; mirrors
+# ``filesystem.validation._VALID_HOOK_NAMES``. Redeclared here (not
+# imported) to keep ``_parse_params`` torch/pydantic-free. Keep this set in
+# sync with ``_VALID_HOOK_NAMES`` -- they must list the same hook points.
+_VALID_GLOBAL_HOOK_NAMES: frozenset[str] = frozenset(
+    ("pre_attn", "post_attn", "post_block")
+)
+
+
+def _resolve_layer_spec(spec: Any, num_layers: int, hook_name: str) -> list[int]:
+    """Resolve one hook's layer spec into a sorted, de-duped index list.
+
+    ``spec`` is either an explicit list/tuple of ints, or a string:
+    ``"all"`` | ``"<a>-<b>"`` (inclusive range) | ``"<i>.<j>.<k>"``
+    (dot-separated list) | ``"<i>"`` (single). The dot/range/``all`` forms
+    keep the value comma-free so it survives the ``--capture-consumers
+    name:k=v,k=v`` CLI shorthand.
+    """
+    if isinstance(spec, str):
+        s = spec.strip()
+        if not s:
+            raise ValueError(f"global_hooks[{hook_name!r}] has an empty layer spec")
+        if s == "all":
+            layers = list(range(num_layers))
+        elif "-" in s:
+            lo_s, _, hi_s = s.partition("-")
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] range {s!r} must be '<int>-<int>'"
+                ) from None
+            layers = list(range(lo, hi + 1))
+        else:
+            try:
+                layers = [int(x) for x in s.split(".")]
+            except ValueError:
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] layer spec {s!r} must be 'all', "
+                    f"'<a>-<b>', or dot-separated ints (e.g. '1.5.9')"
+                ) from None
+    elif isinstance(spec, (list, tuple)):
+        layers = []
+        for x in spec:
+            if isinstance(x, bool) or not isinstance(x, int):
+                raise ValueError(
+                    f"global_hooks[{hook_name!r}] entries must be ints, "
+                    f"got {type(x).__name__}"
+                )
+            layers.append(x)
+    else:
+        raise ValueError(
+            f"global_hooks[{hook_name!r}] must be a list of ints or a layer-spec "
+            f"string, got {type(spec).__name__}"
+        )
+    if not layers:
+        raise ValueError(f"global_hooks[{hook_name!r}] resolved to no layers")
+    for layer in layers:
+        if layer < 0:
+            raise ValueError(
+                f"global_hooks[{hook_name!r}] layer {layer} must be non-negative"
+            )
+        if layer >= num_layers:
+            raise ValueError(
+                f"global_hooks[{hook_name!r}] layer {layer} is out of range for a "
+                f"model with {num_layers} layers"
+            )
+    return sorted(set(layers))
+
+
+def _resolve_global_hooks(
+    raw: Any, num_layers: int
+) -> dict[str, list[int]] | None:
+    """Resolve the ``global_hooks`` param into ``{hook: [layers]}`` or None.
+
+    Accepts either form:
+
+    - a **dict** ``{hook: layers}`` where ``layers`` is a list of ints or a
+      layer-spec string (``"all"`` / ``"0-17"`` / ``"1.5.9"``); or
+    - a **string** in the CLI-safe DSL ``"<hook>:<layers>[;<hook>:<layers>]"``
+      (e.g. ``"post_block:all"`` or ``"pre_attn:0-17;post_block:20"``).
+
+    ``None``/empty disables the global spec (legacy per-request-only
+    behavior). ``num_layers`` is the model's total decoder-layer count, used
+    to expand ``all``.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        items: list[tuple[str, Any]] = []
+        for part in text.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            hook, sep, layerspec = part.partition(":")
+            if not sep or not layerspec.strip():
+                raise ValueError(
+                    f"global_hooks entry {part!r} must be '<hook>:<layers>'"
+                )
+            items.append((hook.strip(), layerspec.strip()))
+    elif isinstance(raw, dict):
+        if not raw:
+            return None
+        items = list(raw.items())
+    else:
+        raise ValueError(
+            f"global_hooks must be a dict or a '<hook>:<layers>' string, "
+            f"got {type(raw).__name__}"
+        )
+    parsed: dict[str, list[int]] = {}
+    for hook_name, layerspec in items:
+        if hook_name not in _VALID_GLOBAL_HOOK_NAMES:
+            raise ValueError(
+                f"global_hooks key {hook_name!r} is not a valid hook point; "
+                f"valid names: {sorted(_VALID_GLOBAL_HOOK_NAMES)}"
+            )
+        parsed[hook_name] = _resolve_layer_spec(layerspec, num_layers, hook_name)
+    return parsed or None
+
+
+def _pp_geometry(
+    vllm_config: Any,
+) -> tuple[int, int, tuple[int, int] | None]:
+    """Resolve ``(pp_size, pp_rank, local_layer_range)`` for this worker.
+
+    Under pipeline parallelism each stage's consumer runs in its own
+    process, owns a disjoint slice of the model's layers, and must (a)
+    write packed/sharded files under per-stage names so stages don't race
+    for the same path on the shared mount, and (b) track completion against
+    only the layers this stage actually captures. Both need the stage's
+    pp rank and its ``[start, end)`` global layer slice — derived here
+    exactly as :meth:`ModelConfig.get_layers_start_end_indices` /
+    ``CaptureManager`` derive them, so the consumer and manager agree on
+    the slice.
+
+    Returns ``(1, 0, None)`` when pipeline parallelism is disabled or the
+    config does not expose usable parallel/model info (e.g. a test
+    ``MagicMock``, whose attributes don't coerce to ``int``). In that case
+    packed/sharded use the legacy pp-agnostic filenames and track every
+    requested layer.
+    """
+    try:
+        parallel_config = vllm_config.parallel_config
+        pp_size = int(parallel_config.pipeline_parallel_size)
+    except (AttributeError, TypeError, ValueError):
+        return 1, 0, None
+    if pp_size <= 1:
+        return 1, 0, None
+    # PP is genuinely enabled: a failure to resolve the layer slice here is
+    # a real misconfiguration, so let it surface rather than silently
+    # falling back to colliding pp-agnostic filenames.
+    tp_size = int(parallel_config.tensor_parallel_size)
+    pp_rank = (int(parallel_config.rank) // tp_size) % pp_size
+    start, end = vllm_config.model_config.get_layers_start_end_indices(parallel_config)
+    return pp_size, pp_rank, (int(start), int(end))
+
+
+# Sentinel writer-key components for a request's single packed file.
+# layer=-1 / hook="__packed__" never collide with real (layer>=0, hook)
+# keys, so all of a request's captures funnel to one writer fd + result.
+_PACKED_LAYER = -1
+_PACKED_HOOK = "__packed__"
+
+
+@dataclass
+class _PackedState:
+    """Per-request accumulation state for the ``packed`` layout.
+
+    Mutated on the dispatch thread (``submit_chunk``) and the finalize
+    thread (``submit_finalize``) for *different* requests concurrently,
+    so all access is guarded by ``FilesystemConsumer._lock``. Within a
+    single request, chunks (dispatch thread) all precede finalizes
+    (finalize thread) thanks to the manager's dispatch-drain barrier, so
+    byte offsets recorded here match submission/append order exactly.
+    """
+
+    tag_slug: str
+    request_id_slug: str
+    expected_keys: set[tuple[int, str]]
+    dtype: str | None = None
+    running_offset: int = 0
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    finalized: set[tuple[int, str]] = field(default_factory=set)
+    sidecar_fields: dict[str, Any] = field(default_factory=dict)
+    # Cached on first chunk so the (slow) pathlib construction runs once
+    # per request instead of once per submitted batch.
+    bin_path: pathlib.Path | None = None
+
+
+# Sentinel hook for shard writer keys (see _ShardState). The shard
+# writer key is ``(f"{tag_slug}#{shard_idx}", seq, _SHARD_HOOK)``: a
+# stable key[0] keeps a shard pinned to one writer thread (ordered
+# appends), and ``seq`` in the layer slot rotates the fd on each seal.
+_SHARD_HOOK = "__shard__"
+
+
+@dataclass
+class _ShardState:
+    """Accumulation state for one shard file (``sharded`` layout).
+
+    Keyed by ``(tag_slug, shard_idx)`` in the consumer. Holds the current
+    rotation ``seq``, byte offset, and the per-chunk index entries (each
+    carrying ``request_id``, since a shard interleaves many requests).
+    Sealed when ``running_offset`` crosses ``shard_max_bytes`` or at
+    shutdown; sealing publishes the index + renames the .bin and bumps
+    ``seq`` to start a fresh shard. Guarded by ``FilesystemConsumer._lock``.
+    """
+
+    tag_slug: str
+    shard_idx: int
+    seq: int = 0
+    running_offset: int = 0
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    dtype: str | None = None
+
+
+@dataclass
+class _ShardedRequestState:
+    """Per-request completion tracking for the ``sharded`` layout.
+
+    A request's chunks all go to one shard (``hash(request_id) %
+    num_shards`` within its tag). Unlike per_file/packed, the request's
+    result is *not* a writer ``WriteResult`` (the shard file is shared and
+    seals asynchronously): the request is reported ``ok`` once all its
+    expected keys finalize, with payload = the shard file(s) it landed in.
+    A capture becomes *readable* only after its shard seals (size or
+    shutdown) — an end-of-run/bulk model.
+    """
+
+    tag_slug: str
+    request_id_slug: str
+    shard_idx: int
+    expected_keys: set[tuple[int, str]]
+    finalized: set[tuple[int, str]] = field(default_factory=set)
+    shard_bins: set[str] = field(default_factory=set)
+    done: bool = False
 
 
 class FilesystemConsumer:
@@ -73,7 +338,7 @@ class FilesystemConsumer:
     Path layout: ``{root}/{tag_slug}/{request_id_slug}/{layer}_{hook}.bin``
     """
 
-    location: ClassVar[Literal["worker"]] = "worker"
+    location: Literal["worker", "driver"] = "worker"
     reads_client_spec: ClassVar[bool] = True
 
     def __init__(
@@ -83,7 +348,43 @@ class FilesystemConsumer:
     ) -> None:
         self._vllm_config = vllm_config
         self._params = _parse_params(params)
-        self._root = pathlib.Path(self._params.root)
+        # Consumer-level global capture spec (CUDA-graph-safe path). Built
+        # once at construction from ``global_hooks``/``global_positions``;
+        # ``None`` keeps the legacy per-request-only behavior. When set, the
+        # manager captures every request uniformly via the persistent-buffer
+        # path and files are named by the engine request id under
+        # ``default_tag`` (see :meth:`_resolve_chunk_slugs`).
+        self._global_spec: CaptureSpec | None = None
+        if self._params.global_hooks:
+            num_layers = (
+                self._vllm_config.model_config.get_total_num_hidden_layers()
+            )
+            resolved = _resolve_global_hooks(self._params.global_hooks, num_layers)
+            if resolved is not None:
+                self._global_spec = CaptureSpec(
+                    hooks=cast("dict[HookName, list[int]]", resolved),
+                    positions=cast(
+                        "PositionSelector", self._params.global_positions
+                    ),
+                )
+        # ``expanduser`` so ``root=~/path`` works: a shell does not expand the
+        # ``~`` in ``--capture-consumers filesystem:root=~/path`` (it is not at
+        # a word boundary), so the literal ``~`` would otherwise become a
+        # directory under the server's cwd.
+        self._root = pathlib.Path(self._params.root).expanduser()
+        # Pipeline-parallel geometry. Under PP each stage owns a disjoint
+        # global layer slice and writes its own packed/sharded files keyed
+        # by stage rank (``_file_pp_rank``); completion is tracked against
+        # only this stage's layers (``_local_layer_range``). With PP off
+        # both are inert (legacy filenames, all layers expected).
+        self._pp_size, self._pp_rank, self._local_layer_range = _pp_geometry(
+            vllm_config
+        )
+        # ``None`` selects the legacy pp-agnostic filenames; an int embeds
+        # the stage rank so per-stage files never collide on the mount.
+        self._file_pp_rank: int | None = None if self._pp_size <= 1 else self._pp_rank
+        self._packed_bin_name = packed_bin_name(self._file_pp_rank)
+        self._packed_index_name = packed_index_name(self._file_pp_rank)
         self._writer = ActivationWriter(
             root=self._root,
             num_threads=self._params.writer_threads,
@@ -91,11 +392,45 @@ class FilesystemConsumer:
             timeout_seconds=self._params.timeout_seconds,
             on_collision=self._params.on_collision,  # type: ignore[arg-type]
             fd_cache_size=self._params.fd_cache_size,
+            fsync=self._params.fsync,
+            atomic_publish=self._params.atomic_publish,
+            coalesce_max_bytes=self._params.coalesce_max_bytes,
         )
         # Lock protecting _key_paths which tracks the slug-based path
         # components per CaptureKey for use at finalize time.
         self._lock = threading.Lock()
         self._key_paths: dict[CaptureKey, tuple[str, str]] = {}
+        # Slug components recorded at admission time, keyed by
+        # ``vllm_internal_request_id``. The framework's ``CaptureSpec``
+        # only carries ``(hooks, positions)``, so the per-request
+        # ``tag`` and ``request_id`` from the client's
+        # ``FilesystemCaptureRequest`` would otherwise be lost between
+        # ``validate_client_spec`` and ``submit_chunk``/``submit_finalize``.
+        # Looked up by ``str(_request_id)`` because ``CaptureKey``'s
+        # request-id component carries that string form.
+        self._request_slugs: dict[str, tuple[str, str]] = {}
+        # Per-request resolved layout ("per_file" | "packed"), recorded
+        # at admission. Requests not seen at admission default to the
+        # consumer-level ``default_layout``.
+        self._request_layout: dict[str, str] = {}
+        # Per-request packed accumulation state, created lazily on first
+        # chunk/finalize for a packed request. Guarded by self._lock.
+        self._packed_states: dict[str, _PackedState] = {}
+        # "sharded" layout state. Open shards keyed by (tag_slug,
+        # shard_idx); per-request completion tracking keyed by req_str;
+        # per-request completion events for wait_for_result. All guarded
+        # by self._lock / self._wait_lock.
+        self._shard_states: dict[tuple[str, int], _ShardState] = {}
+        self._sharded_requests: dict[str, _ShardedRequestState] = {}
+        self._sharded_events: dict[str, threading.Event] = {}
+        # Logical dtype string per key (per_file), captured from the
+        # first chunk so the finalize sidecar is self-describing.
+        self._key_dtype: dict[CaptureKey, str] = {}
+        # Total captured rows per key, accumulated across chunks. Used
+        # to write ``shape`` into the sidecar JSON at finalize time so
+        # readers can ``np.frombuffer`` the .bin without recomputing
+        # from filesize / hidden_size externally.
+        self._key_shapes: dict[CaptureKey, list[int]] = {}
         # Per writer-key events set by _on_write_result when a result
         # goes terminal. Keyed by writer-side (str, int, str) tuples.
         self._wait_lock = threading.Lock()
@@ -106,9 +441,33 @@ class FilesystemConsumer:
     # CaptureSink protocol
     # ------------------------------------------------------------------
 
-    def global_capture_spec(self) -> None:
-        """Filesystem consumer has no global spec — capture is per-request."""
-        return None
+    def global_capture_spec(self) -> CaptureSpec | None:
+        """Return the consumer-level global capture spec, if configured.
+
+        When ``global_hooks`` is set the consumer advertises a uniform
+        ``CaptureSpec`` so every request is captured via the manager's
+        CUDA-graph-safe persistent-buffer path (no force-eager). Returns
+        ``None`` otherwise, preserving the legacy per-request behavior where
+        capture is driven only by ``SamplingParams.capture``.
+        """
+        return self._global_spec
+
+    @classmethod
+    def declared_graphsafe_keys(cls, params: dict[str, Any]) -> list[str]:
+        """Graph-safe keys declared via the ``graphsafe_keys`` param.
+
+        Accepts a list of ``layer:hook`` shorthands or a single
+        ``';'``-separated string (``,`` already separates CLI params), e.g.
+        ``filesystem:root=/x,graphsafe_keys=12:post_block;20:post_block`` or
+        ``{"graphsafe_keys": ["all:post_block"]}``. These per-request taps then
+        run graph-safe without a separate ``--capture-graphsafe-key`` flag.
+        """
+        raw = params.get("graphsafe_keys")
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            return [part.strip() for part in raw.split(";") if part.strip()]
+        return [str(part).strip() for part in raw if str(part).strip()]
 
     def validate_client_spec(
         self,
@@ -131,63 +490,486 @@ class FilesystemConsumer:
         # module load time — keeps the consumer importable in lightweight
         # test environments.
         from vllm.v1.capture.consumers.filesystem.validation import (
+            slug_path_components,
             validate_filesystem_request,
         )
 
-        return validate_filesystem_request(raw_spec, self._vllm_config, ctx)
+        spec = validate_filesystem_request(raw_spec, self._vllm_config, ctx)
+        # Record the slugs keyed by vllm_internal_request_id. The
+        # ``CaptureSpec`` we return only carries hooks+positions; we
+        # need the tag/request_id again at submit time to build the
+        # correct on-disk path. Slugging happens here (admission) so
+        # invalid slugs surface as a HTTP 400 rather than silently
+        # falling through to ``"default"``.
+        tag_slug, request_id_slug = slug_path_components(raw_spec)
+
+        # Resolve the on-disk layout for this request: explicit
+        # per-request ``layout`` wins, else the consumer default.
+        layout = raw_spec.layout or self._params.default_layout
+        if layout not in VALID_LAYOUTS:
+            raise CaptureValidationError(
+                f"capture.layout must be one of {sorted(VALID_LAYOUTS)}, got {layout!r}"
+            )
+        # ``packed``/``sharded`` write one file per request (per tag). Under
+        # pipeline parallelism each stage owns a disjoint global layer slice
+        # and writes its own ``packed-pp{rank}``/``shard-pp{rank}`` files
+        # (see ``_file_pp_rank``), so stages never race for the same path on
+        # the shared mount. The pp-agnostic ``per_file`` layout is keyed by
+        # global layer index and is collision-free regardless.
+
+        req_str = str(ctx.vllm_internal_request_id)
+        # The (layer, hook) set this stage must see finalized before its
+        # share of the request is complete (used by packed + sharded). The
+        # client spec carries *global* layers (validated against the global
+        # layer space); under PP the manager only ever captures and
+        # finalizes the layers this stage owns, so completion must be
+        # tracked against the local slice — otherwise the packed index
+        # (sharded ``done`` flag) would wait forever on layers another
+        # stage holds. With PP off ``_local_layer_range`` is ``None`` and
+        # every requested layer is expected.
+        expected = {
+            (layer_idx, hook_name)
+            for hook_name, layers in spec.hooks.items()
+            for layer_idx in layers
+        }
+        if self._local_layer_range is not None:
+            start, end = self._local_layer_range
+            expected = {
+                (layer_idx, hook_name)
+                for (layer_idx, hook_name) in expected
+                if start <= layer_idx < end
+            }
+
+        with self._lock:
+            self._request_slugs[req_str] = (tag_slug, request_id_slug)
+            self._request_layout[req_str] = layout
+            # When this stage owns none of the request's layers, the manager
+            # drops the consumer for the request — no chunks/finalizes will
+            # arrive — so don't create accumulation state that would never
+            # complete (and would leak).
+            if expected:
+                if layout == "packed":
+                    self._packed_states[req_str] = _PackedState(
+                        tag_slug=tag_slug,
+                        request_id_slug=request_id_slug,
+                        expected_keys=expected,
+                    )
+                elif layout == "sharded":
+                    shard_idx = hash(req_str) % max(1, self._params.num_shards)
+                    self._sharded_requests[req_str] = _ShardedRequestState(
+                        tag_slug=tag_slug,
+                        request_id_slug=request_id_slug,
+                        shard_idx=shard_idx,
+                        expected_keys=expected,
+                    )
+        return spec
+
+    # ------------------------------------------------------------------
+    # Layout / key helpers
+    # ------------------------------------------------------------------
+
+    def _layout_for(self, req_str: str) -> str:
+        """Resolved layout for a request ("per_file" | "packed")."""
+        with self._lock:
+            return self._request_layout.get(req_str, self._params.default_layout)
+
+    def _writer_key_for(self, key: CaptureKey) -> tuple[str, int, str]:
+        """Underlying ActivationWriter key for a capture key.
+
+        ``per_file`` → one writer key per ``(layer, hook)``. ``packed`` →
+        a single sentinel key per request, so all of a request's captures
+        share one file, one fd, and one ``WriteResult``.
+        """
+        request_id, layer_idx, hook_name = key
+        req_str = str(request_id)
+        if self._layout_for(req_str) == "packed":
+            return (req_str, _PACKED_LAYER, _PACKED_HOOK)
+        return (req_str, layer_idx, hook_name)
+
+    def _resolve_chunk_slugs(
+        self, req_str: str, chunk: CaptureChunk
+    ) -> tuple[str, str]:
+        """Slug priority: chunk.metadata override → admission record →
+        ``(default_tag, req)`` fallback.
+
+        The fallback path is what global-driven (non-validated) requests
+        take: no ``FilesystemCaptureRequest`` was admitted, so the consumer
+        names files by the engine request id under the consumer's
+        ``default_tag``."""
+        with self._lock:
+            recorded = self._request_slugs.get(req_str)
+        fallback_tag, fallback_req = recorded or (self._params.default_tag, req_str)
+        return (
+            chunk.metadata.get("tag_slug", fallback_tag),
+            chunk.metadata.get("request_id_slug", fallback_req),
+        )
+
+    @staticmethod
+    def _tensor_to_bytes(tensor: Any) -> tuple[bytes, int, int, str]:
+        """Return ``(raw_bytes, rows, hidden, logical_dtype_str)``.
+
+        bf16 is viewed as uint16 before numpy (numpy has no native bf16),
+        matching the on-disk spec; the *logical* dtype string ("bfloat16")
+        is still reported so the sidecar stays self-describing.
+        """
+        import torch as _torch
+
+        dtype_str = str(tensor.dtype).removeprefix("torch.")
+        view = tensor.view(_torch.uint16) if tensor.dtype == _torch.bfloat16 else tensor
+        rows, hidden = int(tensor.shape[0]), int(tensor.shape[1])
+        return view.numpy().tobytes(), rows, hidden, dtype_str
+
+    # ------------------------------------------------------------------
+    # submit_chunk
+    # ------------------------------------------------------------------
 
     def submit_chunk(self, chunk: CaptureChunk) -> None:
         """Convert a ``CaptureChunk`` to bytes and submit a ``WriteTask``."""
+        req_str = str(chunk.key[0])
+        layout = self._layout_for(req_str)
+        if layout == "packed":
+            self._submit_chunk_packed(chunk, req_str)
+        elif layout == "sharded":
+            self._submit_chunk_sharded(chunk, req_str)
+        else:
+            self._submit_chunk_per_file(chunk, req_str)
+
+    def submit_chunk_batch(self, chunks: list[CaptureChunk]) -> None:
+        """Submit one dispatch step's chunks, amortizing per-chunk overhead.
+
+        For the ``packed`` layout every chunk of a request in this step
+        targets the same file (one writer key), so they are concatenated
+        into a single ``WriteTask`` and their index entries recorded under a
+        single lock acquisition — collapsing ~num_layers tasks/locks per
+        request per step into one. ``per_file``/``sharded`` chunks fall
+        through to the per-chunk path (each targets its own key/shard, so
+        there is no same-key batching win there).
+        """
+        # Group by request in one pass, then resolve the layout once per
+        # request (not once per chunk — the layout is fixed per request).
+        by_req: dict[str, list[CaptureChunk]] = {}
+        for chunk in chunks:
+            by_req.setdefault(str(chunk.key[0]), []).append(chunk)
+
+        for req_str, group in by_req.items():
+            layout = self._layout_for(req_str)
+            if layout == "packed":
+                self._submit_chunk_packed_batch(group, req_str)
+            elif layout == "sharded":
+                for chunk in group:
+                    self._submit_chunk_sharded(chunk, req_str)
+            else:
+                for chunk in group:
+                    self._submit_chunk_per_file(chunk, req_str)
+
+    def _submit_chunk_per_file(self, chunk: CaptureChunk, req_str: str) -> None:
         key = chunk.key
         _request_id, layer_idx, hook_name = key
+        tag_slug, request_id_slug = self._resolve_chunk_slugs(req_str, chunk)
+        tensor_bytes, rows, hidden, dtype_str = self._tensor_to_bytes(chunk.tensor)
 
-        # Compute path: {root}/{tag}/{request_id}/{layer}_{hook}.bin
-        # We need tag and request_id slugs. The CaptureKey only has the
-        # vllm_internal_request_id. For the filesystem layout we use
-        # the key components directly — the request_id in the key IS the
-        # vllm internal id, and we use it as the directory name.
-        # The tag comes from the metadata on the first chunk, or we
-        # fall back to "default".
-        tag_slug = chunk.metadata.get("tag_slug", "default")
-        request_id_slug = chunk.metadata.get("request_id_slug", str(_request_id))
-
-        # Cache the slug paths for use at finalize time.
+        # Cache slug paths and accumulate the row count / dtype so the
+        # finalize sidecar carries an accurate, self-describing layout.
         with self._lock:
             if key not in self._key_paths:
                 self._key_paths[key] = (tag_slug, request_id_slug)
+            self._key_dtype.setdefault(key, dtype_str)
+            existing = self._key_shapes.get(key)
+            if existing is None:
+                self._key_shapes[key] = [rows, hidden]
+            else:
+                existing[0] += rows
+                if hidden != existing[1]:
+                    logger.warning(
+                        "hidden-size mismatch across chunks for key=%s: "
+                        "expected %d, got %d",
+                        key,
+                        existing[1],
+                        hidden,
+                    )
 
         bin_path = (
             self._root / tag_slug / request_id_slug / f"{layer_idx}_{hook_name}.bin"
         )
-
-        # Convert tensor to bytes (tensor is already on CPU).
-        tensor_bytes = chunk.tensor.numpy().tobytes()
-
-        writer_key = (str(_request_id), layer_idx, hook_name)
         self._writer.submit(
             WriteTask(
                 path=bin_path,
                 payload=tensor_bytes,
                 append=True,
-                key=writer_key,
+                key=(req_str, layer_idx, hook_name),
             )
         )
 
+    def _submit_chunk_packed(self, chunk: CaptureChunk, req_str: str) -> None:
+        _request_id, layer_idx, hook_name = chunk.key
+        tag_slug, request_id_slug = self._resolve_chunk_slugs(req_str, chunk)
+        tensor_bytes, rows, hidden, dtype_str = self._tensor_to_bytes(chunk.tensor)
+        nbytes = len(tensor_bytes)
+
+        # Reserve a byte range and record the index entry under the lock,
+        # then submit outside it. submit_chunk for a single request runs
+        # on one (dispatch) thread, so offset-assignment order == append
+        # order even with the lock released before submit; cross-request
+        # writes target different files, so interleaving is harmless.
+        with self._lock:
+            state = self._packed_states.get(req_str)
+            if state is None:
+                # No admission record (e.g. a non-validated path). Create
+                # lazily; expected_keys empty → publishes on first
+                # finalize. The normal per-request path always records
+                # expected_keys in validate_client_spec.
+                state = _PackedState(
+                    tag_slug=tag_slug,
+                    request_id_slug=request_id_slug,
+                    expected_keys=set(),
+                )
+                self._packed_states[req_str] = state
+            if state.dtype is None:
+                state.dtype = dtype_str
+            elif state.dtype != dtype_str:
+                logger.warning(
+                    "dtype mismatch in packed request %s: %s vs %s",
+                    req_str,
+                    state.dtype,
+                    dtype_str,
+                )
+            state.entries.append(
+                {
+                    "layer": layer_idx,
+                    "hook": hook_name,
+                    "offset": state.running_offset,
+                    "nbytes": nbytes,
+                    "shape": [rows, hidden],
+                }
+            )
+            state.running_offset += nbytes
+            # Use the state's slugs (recorded at admission) so chunk
+            # writes and the finalize index land in the same directory.
+            bin_tag, bin_req = state.tag_slug, state.request_id_slug
+
+        bin_path = self._root / bin_tag / bin_req / self._packed_bin_name
+        self._writer.submit(
+            WriteTask(
+                path=bin_path,
+                payload=tensor_bytes,
+                append=True,
+                key=(req_str, _PACKED_LAYER, _PACKED_HOOK),
+            )
+        )
+
+    def _submit_chunk_packed_batch(
+        self, chunks: list[CaptureChunk], req_str: str
+    ) -> None:
+        """Batched packed submit: one WriteTask + one lock for the group.
+
+        All chunks belong to ``req_str`` (same packed file / writer key).
+        Serialize outside the lock, reserve all byte ranges and record all
+        index entries in one lock acquisition (preserving append order, so
+        offsets match the concatenated payload), then submit a single
+        ``WriteTask`` with the concatenated bytes.
+        """
+        if not chunks:
+            return
+        # Serialize every chunk outside the lock (cheap; not the bottleneck).
+        serialized: list[tuple[int, str, bytes, int, int, str]] = []
+        for chunk in chunks:
+            _request_id, layer_idx, hook_name = chunk.key
+            payload, rows, hidden, dtype_str = self._tensor_to_bytes(chunk.tensor)
+            serialized.append((layer_idx, hook_name, payload, rows, hidden, dtype_str))
+
+        payloads: list[bytes] = []
+        with self._lock:
+            state = self._packed_states.get(req_str)
+            if state is None:
+                # Resolve slugs only on first sight of the request (under the
+                # lock we already hold); they're fixed for the request, so
+                # this avoids a per-batch _resolve_chunk_slugs lock round-trip.
+                recorded = self._request_slugs.get(req_str)
+                fallback_tag, fallback_req = recorded or (
+                    self._params.default_tag,
+                    req_str,
+                )
+                meta = chunks[0].metadata
+                state = _PackedState(
+                    tag_slug=meta.get("tag_slug", fallback_tag),
+                    request_id_slug=meta.get("request_id_slug", fallback_req),
+                    expected_keys=set(),
+                )
+                self._packed_states[req_str] = state
+            for layer_idx, hook_name, payload, rows, hidden, dtype_str in serialized:
+                if state.dtype is None:
+                    state.dtype = dtype_str
+                elif state.dtype != dtype_str:
+                    logger.warning(
+                        "dtype mismatch in packed request %s: %s vs %s",
+                        req_str,
+                        state.dtype,
+                        dtype_str,
+                    )
+                state.entries.append(
+                    {
+                        "layer": layer_idx,
+                        "hook": hook_name,
+                        "offset": state.running_offset,
+                        "nbytes": len(payload),
+                        "shape": [rows, hidden],
+                    }
+                )
+                state.running_offset += len(payload)
+                payloads.append(payload)
+            if state.bin_path is None:
+                state.bin_path = (
+                    self._root
+                    / state.tag_slug
+                    / state.request_id_slug
+                    / self._packed_bin_name
+                )
+            bin_path = state.bin_path
+
+        combined = payloads[0] if len(payloads) == 1 else b"".join(payloads)
+        self._writer.submit(
+            WriteTask(
+                path=bin_path,
+                payload=combined,
+                append=True,
+                key=(req_str, _PACKED_LAYER, _PACKED_HOOK),
+            )
+        )
+
+    def _submit_chunk_sharded(self, chunk: CaptureChunk, req_str: str) -> None:
+        _request_id, layer_idx, hook_name = chunk.key
+        tensor_bytes, rows, hidden, dtype_str = self._tensor_to_bytes(chunk.tensor)
+        nbytes = len(tensor_bytes)
+
+        # Route to the request's shard (assigned at admission). Append the
+        # bytes to the shard's open .bin and record a per-chunk index
+        # entry (carrying request_id, since shards interleave requests).
+        # Seal + rotate the shard if it crosses the size threshold. All
+        # state mutation is under the lock; the WriteTask submit (and any
+        # seal task) is issued after releasing it.
+        seal_task: FinalizeTask | None = None
+        with self._lock:
+            req = self._sharded_requests.get(req_str)
+            if req is None:
+                # No admission record (non-validated path) — create lazily
+                # with the default shard assignment and empty expected set.
+                shard_idx = hash(req_str) % max(1, self._params.num_shards)
+                tag_slug, request_id_slug = self._resolve_chunk_slugs(req_str, chunk)
+                req = _ShardedRequestState(
+                    tag_slug=tag_slug,
+                    request_id_slug=request_id_slug,
+                    shard_idx=shard_idx,
+                    expected_keys=set(),
+                )
+                self._sharded_requests[req_str] = req
+
+            shard_key = (req.tag_slug, req.shard_idx)
+            shard = self._shard_states.get(shard_key)
+            if shard is None:
+                shard = _ShardState(tag_slug=req.tag_slug, shard_idx=req.shard_idx)
+                self._shard_states[shard_key] = shard
+            if shard.dtype is None:
+                shard.dtype = dtype_str
+
+            shard.entries.append(
+                {
+                    "request_id": req_str,
+                    "layer": layer_idx,
+                    "hook": hook_name,
+                    "offset": shard.running_offset,
+                    "nbytes": nbytes,
+                    "shape": [rows, hidden],
+                }
+            )
+            shard.running_offset += nbytes
+            bin_name = shard_bin_name(shard.shard_idx, shard.seq, self._file_pp_rank)
+            bin_path = self._root / req.tag_slug / bin_name
+            req.shard_bins.add(str(bin_path))
+            writer_key = (f"{req.tag_slug}#{shard.shard_idx}", shard.seq, _SHARD_HOOK)
+            # Seal when the shard crosses the size threshold.
+            if shard.running_offset >= self._params.shard_max_bytes:
+                seal_task = self._build_shard_seal_locked(shard)
+
+        self._writer.submit(
+            WriteTask(path=bin_path, payload=tensor_bytes, append=True, key=writer_key)
+        )
+        if seal_task is not None:
+            self._writer.submit(seal_task)
+
+    def _build_shard_seal_locked(self, shard: _ShardState) -> FinalizeTask:
+        """Build the seal ``FinalizeTask`` for ``shard`` and rotate it.
+
+        Must be called with ``self._lock`` held. Snapshots the current
+        entries into an index payload, returns the FinalizeTask (publishes
+        ``shard-k-seq.bin`` + ``.json``), then bumps ``seq`` and resets the
+        shard's running state so subsequent chunks open a fresh file.
+        """
+        tag_dir = self._root / shard.tag_slug
+        bin_path = tag_dir / shard_bin_name(
+            shard.shard_idx, shard.seq, self._file_pp_rank
+        )
+        sidecar_path = tag_dir / shard_index_name(
+            shard.shard_idx, shard.seq, self._file_pp_rank
+        )
+        index_payload: dict[str, Any] = {
+            "layout": "sharded",
+            "shard_idx": shard.shard_idx,
+            "seq": shard.seq,
+            "dtype": shard.dtype or "float32",
+            "entries": shard.entries,
+        }
+        # Under PP each stage seals its own shard files; record the stage.
+        if self._file_pp_rank is not None:
+            index_payload["pp_rank"] = self._file_pp_rank
+            index_payload["pp_size"] = self._pp_size
+        writer_key = (f"{shard.tag_slug}#{shard.shard_idx}", shard.seq, _SHARD_HOOK)
+        task = FinalizeTask(
+            bin_path=bin_path,
+            sidecar_path=sidecar_path,
+            sidecar_payload=index_payload,
+            key=writer_key,
+        )
+        # Rotate: next chunks for this shard start a fresh file.
+        shard.seq += 1
+        shard.running_offset = 0
+        shard.entries = []
+        return task
+
+    # ------------------------------------------------------------------
+    # submit_finalize
+    # ------------------------------------------------------------------
+
     def submit_finalize(self, finalize: CaptureFinalize) -> None:
-        """Build and submit a ``FinalizeTask`` for this key."""
+        """Finalize one capture key (per_file) or accumulate toward the
+        single packed-file finalize (packed)."""
+        req_str = str(finalize.key[0])
+        layout = self._layout_for(req_str)
+        if layout == "packed":
+            self._submit_finalize_packed(finalize, req_str)
+        elif layout == "sharded":
+            self._submit_finalize_sharded(finalize, req_str)
+        else:
+            self._submit_finalize_per_file(finalize, req_str)
+
+    def _submit_finalize_per_file(
+        self, finalize: CaptureFinalize, req_str: str
+    ) -> None:
         key = finalize.key
         _request_id, layer_idx, hook_name = key
 
-        # Retrieve cached path slugs.
         with self._lock:
             path_info = self._key_paths.pop(key, None)
+            shape_info = self._key_shapes.pop(key, None)
+            dtype_str = self._key_dtype.pop(key, None)
+            recorded = self._request_slugs.get(req_str)
 
-        tag_slug = "default"
-        request_id_slug = str(_request_id)
         if path_info is not None:
             tag_slug, request_id_slug = path_info
+        elif recorded is not None:
+            tag_slug, request_id_slug = recorded
+        else:
+            tag_slug, request_id_slug = self._params.default_tag, req_str
 
-        # Also check the finalize sidecar for slug overrides.
         tag_slug = finalize.sidecar.get("tag_slug", tag_slug)
         request_id_slug = finalize.sidecar.get("request_id_slug", request_id_slug)
 
@@ -196,28 +978,119 @@ class FilesystemConsumer:
         )
         sidecar_path = bin_path.with_suffix(".json")
 
-        # Build sidecar payload from the finalize sidecar.
         sidecar_payload: dict[str, Any] = {
-            "request_id": str(_request_id),
+            "request_id": req_str,
+            # Client-supplied request id (always present in the sidecar):
+            # makes every written file mappable to the client's request even
+            # when no custom per-request request_id slug was set. Falls back
+            # to the internal id if unavailable.
+            "client_request_id": finalize.sidecar.get("client_request_id", req_str),
             "layer": layer_idx,
             "hook": hook_name,
         }
         sidecar_payload.update(finalize.sidecar)
+        if shape_info is not None:
+            sidecar_payload["shape"] = list(shape_info)
+        if dtype_str is not None:
+            sidecar_payload["dtype"] = dtype_str
 
-        writer_key = (str(_request_id), layer_idx, hook_name)
         self._writer.submit(
             FinalizeTask(
                 bin_path=bin_path,
                 sidecar_path=sidecar_path,
                 sidecar_payload=sidecar_payload,
-                key=writer_key,
+                key=(req_str, layer_idx, hook_name),
             )
         )
 
+    def _submit_finalize_packed(self, finalize: CaptureFinalize, req_str: str) -> None:
+        _request_id, layer_idx, hook_name = finalize.key
+
+        # Per-key finalizes arrive in one synchronous burst (post drain
+        # barrier). Publish the single packed file only once every
+        # expected (layer, hook) has been finalized.
+        task: FinalizeTask | None = None
+        with self._lock:
+            state = self._packed_states.get(req_str)
+            if state is None:
+                return
+            state.finalized.add((layer_idx, hook_name))
+            state.sidecar_fields.update(finalize.sidecar)
+            state.tag_slug = finalize.sidecar.get("tag_slug", state.tag_slug)
+            state.request_id_slug = finalize.sidecar.get(
+                "request_id_slug", state.request_id_slug
+            )
+            if not state.expected_keys.issubset(state.finalized):
+                return
+            # Last expected finalize — build the index and publish.
+            self._packed_states.pop(req_str, None)
+            index_payload: dict[str, Any] = dict(state.sidecar_fields)
+            index_payload.update(
+                {
+                    "request_id": req_str,
+                    "layout": "packed",
+                    "dtype": state.dtype or "float32",
+                    "entries": state.entries,
+                }
+            )
+            # Under PP this index covers only this stage's layers; record
+            # the stage so readers/operators can attribute the file.
+            if self._file_pp_rank is not None:
+                index_payload["pp_rank"] = self._file_pp_rank
+                index_payload["pp_size"] = self._pp_size
+            req_dir = self._root / state.tag_slug / state.request_id_slug
+            task = FinalizeTask(
+                bin_path=req_dir / self._packed_bin_name,
+                sidecar_path=req_dir / self._packed_index_name,
+                sidecar_payload=index_payload,
+                key=(req_str, _PACKED_LAYER, _PACKED_HOOK),
+            )
+
+        if task is not None:
+            self._writer.submit(task)
+
+    def _submit_finalize_sharded(self, finalize: CaptureFinalize, req_str: str) -> None:
+        _request_id, layer_idx, hook_name = finalize.key
+        # The request's bytes are already in its shard (written during
+        # submit_chunk). Finalize just tracks completion: once every
+        # expected (layer, hook) has finalized, the request is "ok" — its
+        # data lives in shard_bins and becomes readable when those shards
+        # seal (size threshold or shutdown). No per-request file to write.
+        completed = False
+        with self._lock:
+            req = self._sharded_requests.get(req_str)
+            if req is None:
+                return
+            req.finalized.add((layer_idx, hook_name))
+            if req.expected_keys.issubset(req.finalized) and not req.done:
+                req.done = True
+                completed = True
+        if completed:
+            with self._wait_lock:
+                event = self._sharded_events.get(req_str)
+            if event is not None:
+                event.set()
+
     def get_result(self, key: CaptureKey) -> CaptureResult | None:
-        """Map the writer's ``WriteResult`` to a ``CaptureResult``."""
-        _request_id, layer_idx, hook_name = key
-        writer_key = (str(_request_id), layer_idx, hook_name)
+        """Map the writer's ``WriteResult`` to a ``CaptureResult``.
+
+        For ``packed`` requests every ``(layer, hook)`` key maps to the
+        request's single packed ``WriteResult``, so each key reports the
+        packed file's status/paths. For ``sharded`` requests the result is
+        consumer-tracked (the shard file is shared and seals async): every
+        key reports ``ok`` once the request's keys have all finalized, with
+        payload = the shard file(s) it landed in (readable after seal).
+        """
+        req_str = str(key[0])
+        if self._layout_for(req_str) == "sharded":
+            with self._lock:
+                req = self._sharded_requests.get(req_str)
+                if req is None or not req.done:
+                    return None
+                payload = sorted(req.shard_bins)
+            return CaptureResult(key=key, status="ok", error=None, payload=payload)
+
+        writer_key = self._writer_key_for(key)
         write_result = self._writer.get_result(writer_key)
         if write_result is None:
             return None
@@ -253,8 +1126,21 @@ class FilesystemConsumer:
         status.  If the result is already terminal on entry the method
         returns immediately without waiting.
         """
-        _request_id, layer_idx, hook_name = key
-        writer_key = (str(_request_id), layer_idx, hook_name)
+        req_str = str(key[0])
+        if self._layout_for(req_str) == "sharded":
+            # Sharded completion is consumer-tracked (set when the
+            # request's last expected key finalizes), not a WriteResult.
+            with self._wait_lock:
+                with self._lock:
+                    req = self._sharded_requests.get(req_str)
+                    already_done = req is not None and req.done
+                if already_done:
+                    return self.get_result(key)
+                event = self._sharded_events.setdefault(req_str, threading.Event())
+            event.wait(timeout=timeout)
+            return self.get_result(key)
+
+        writer_key = self._writer_key_for(key)
 
         with self._wait_lock:
             wr = self._writer.get_result(writer_key)
@@ -280,5 +1166,20 @@ class FilesystemConsumer:
                 event.set()
 
     def shutdown(self, timeout: float = 30.0) -> None:
-        """Forward shutdown to the underlying ``ActivationWriter``."""
+        """Seal any open shards, then drain the underlying writer.
+
+        Open ``sharded`` shards holding unsealed data are published now so
+        their captures become readable; otherwise a partial final shard
+        would never get an index. per_file/packed have nothing to seal.
+        """
+        seal_tasks: list[FinalizeTask] = []
+        with self._lock:
+            for shard in self._shard_states.values():
+                if shard.entries:
+                    seal_tasks.append(self._build_shard_seal_locked(shard))
+        for task in seal_tasks:
+            try:
+                self._writer.submit(task)
+            except Exception:
+                logger.exception("failed to submit shard seal at shutdown")
         self._writer.shutdown(timeout=timeout)

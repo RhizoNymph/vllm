@@ -14,15 +14,17 @@ The checks performed here are the ones that can't be done at
 ``SamplingParams`` construction time because they need a
 ``VllmConfig`` or request context:
 
-1. ``tensor_parallel_size == 1`` and ``pipeline_parallel_size == 1``.
-   Multi-rank residual collection is out of scope for v1.
-2. Every layer referenced by every hook is in
-   ``[0, num_hidden_layers)``.
-3. Tag and request_id slug cleanly (reject ``..``, leading ``/``,
+1. Every layer referenced by every hook is in
+   ``[0, num_hidden_layers)`` (the *global* layer count under PP).
+2. Tag and request_id slug cleanly (reject ``..``, leading ``/``,
    > 256 chars, empty).
-4. Explicit position indices are valid and not below
+3. Explicit position indices are valid and not below
    ``num_computed_tokens`` (prefix-cache hits that were never
    forwarded).
+
+Tensor / pipeline / expert / data parallelism are all supported for
+the replicated residual hooks; see the parallelism note at the
+rejection site (now removed) and ``docs/design/capture_parallelism.md``.
 
 Runtime concerns (writer pool, plan building, finalization) are not
 this module's job.
@@ -30,11 +32,17 @@ this module's job.
 
 from __future__ import annotations
 
-import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
+
+import regex as re
 
 from vllm.v1.capture.errors import CaptureValidationError
-from vllm.v1.capture.types import CaptureContext, CaptureSpec, HookName
+from vllm.v1.capture.types import (
+    CaptureContext,
+    CaptureSpec,
+    HookName,
+    PositionSelector,
+)
 
 from .types import FilesystemCaptureRequest
 
@@ -50,8 +58,15 @@ if TYPE_CHECKING:
 # here (rather than imported) to keep this module torch-free. Whenever
 # steering grows a new hook point, this tuple must be updated in
 # lockstep.
+#
+# ``mlp_in`` / ``mlp_out`` are reserved in the hook-id table
+# (``activation_capture.py``) and ``HookName`` but are not yet wired into
+# any model forward, so a request for them would pass validation and then
+# produce an empty, zero-byte capture. Keep them out of the accepted set
+# so admission rejects them until they are wired; re-add here once
+# implemented.
 _VALID_HOOK_NAMES: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out")
+    ("pre_attn", "post_attn", "post_block")
 )
 
 _VALID_POSITION_KINDS: frozenset[str] = frozenset(
@@ -81,17 +96,12 @@ def _slug(name: str, *, field: str) -> str:
         raise CaptureValidationError(f"{field} must be non-empty")
     if len(name) > _SLUG_MAX_LEN:
         raise CaptureValidationError(
-            f"{field} must be at most {_SLUG_MAX_LEN} characters, "
-            f"got {len(name)}"
+            f"{field} must be at most {_SLUG_MAX_LEN} characters, got {len(name)}"
         )
     if ".." in name:
-        raise CaptureValidationError(
-            f"{field} must not contain '..': {name!r}"
-        )
+        raise CaptureValidationError(f"{field} must not contain '..': {name!r}")
     if name.startswith("/"):
-        raise CaptureValidationError(
-            f"{field} must not start with '/': {name!r}"
-        )
+        raise CaptureValidationError(f"{field} must not start with '/': {name!r}")
     return _SLUG_REGEX.sub("_", name)
 
 
@@ -118,15 +128,12 @@ def _expand_layer_list(
     return result
 
 
-def _expand_ranges(
-    raw: list[Any], *, num_hidden_layers: int, where: str
-) -> list[int]:
+def _expand_ranges(raw: list[Any], *, num_hidden_layers: int, where: str) -> list[int]:
     result: list[int] = []
     for i, pair in enumerate(raw):
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             raise CaptureValidationError(
-                f"{where}[{i}] must be a 2-element [start, end] pair, "
-                f"got {pair!r}"
+                f"{where}[{i}] must be a 2-element [start, end] pair, got {pair!r}"
             )
         start, end = pair
         if (
@@ -302,8 +309,7 @@ def _structural_validate(raw: FilesystemCaptureRequest) -> None:
     """Structural validation of the raw request before resolving."""
     if not isinstance(raw.request_id, str) or not raw.request_id:
         raise CaptureValidationError(
-            f"capture.request_id must be a non-empty string, "
-            f"got {raw.request_id!r}"
+            f"capture.request_id must be a non-empty string, got {raw.request_id!r}"
         )
     if not isinstance(raw.tag, str) or not raw.tag:
         raise CaptureValidationError(
@@ -317,8 +323,7 @@ def _structural_validate(raw: FilesystemCaptureRequest) -> None:
     for hook_name in raw.hooks:
         if not isinstance(hook_name, str):
             raise CaptureValidationError(
-                f"capture.hooks key must be a string, "
-                f"got {type(hook_name).__name__}"
+                f"capture.hooks key must be a string, got {type(hook_name).__name__}"
             )
         if hook_name not in _VALID_HOOK_NAMES:
             raise CaptureValidationError(
@@ -339,8 +344,7 @@ def _structural_validate(raw: FilesystemCaptureRequest) -> None:
         for i, value in enumerate(raw.positions):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise CaptureValidationError(
-                    f"capture.positions[{i}] must be an int, "
-                    f"got {type(value).__name__}"
+                    f"capture.positions[{i}] must be an int, got {type(value).__name__}"
                 )
             if value < 0:
                 raise CaptureValidationError(
@@ -370,19 +374,20 @@ def validate_filesystem_request(
     # 1. Structural validation.
     _structural_validate(raw)
 
-    # 2. TP/PP > 1 rejected.
-    if ctx.tensor_parallel_size != 1:
-        raise CaptureValidationError(
-            f"filesystem capture is only supported with "
-            f"tensor_parallel_size=1; got {ctx.tensor_parallel_size}. "
-            "Multi-rank residual collection is out of scope for v1."
-        )
-    if ctx.pipeline_parallel_size != 1:
-        raise CaptureValidationError(
-            f"filesystem capture is only supported with "
-            f"pipeline_parallel_size=1; got {ctx.pipeline_parallel_size}. "
-            "Multi-rank residual collection is out of scope for v1."
-        )
+    # 2. Parallelism. The residual hooks captured today (pre_attn /
+    # post_attn / post_block) read the residual stream after the
+    # tensor-parallel all-reduce / MoE combine, so it is replicated and
+    # full-width across the TP and EP planes; data parallelism partitions
+    # requests across independent engine cores. All four axes are
+    # therefore supported: TP rank 0 of each pipeline stage captures that
+    # stage's (global-indexed) layers to the shared mount, and the engine
+    # merges the per-stage results. No accept/reject branch on TP / PP /
+    # EP / DP size is needed here.
+    #
+    # Phase 4 (sharded-activation capture: MLP intermediate / per-expert
+    # outputs) will reintroduce a rejection *for sharded hooks only*,
+    # since those tensors are partitioned across the TP / EP plane and
+    # need a gather. The residual hooks above remain unconditional.
 
     # 3. Slug tag + request_id so we surface a clean error (rather
     # than failing much later on a filesystem write).
@@ -404,18 +409,17 @@ def validate_filesystem_request(
         )
         if not resolved:
             raise CaptureValidationError(
-                f"capture.hooks[{hook_name!r}] expanded to an empty "
-                "layer list"
+                f"capture.hooks[{hook_name!r}] expanded to an empty layer list"
             )
         # hook_name already validated as one of _VALID_HOOK_NAMES.
-        resolved_hooks[hook_name] = resolved  # type: ignore[literal-required]
+        resolved_hooks[cast(HookName, hook_name)] = resolved
 
     # 5. Resolve positions.
     # "last_prompt", "all_prompt", and explicit lists resolve at
     # admission time. "all_generated" and "all" stay symbolic — the
     # runner materializes them per-step once the generated token
     # count is known.
-    resolved_positions: list[int] | str
+    resolved_positions: PositionSelector
     if isinstance(raw.positions, str):
         if raw.positions in ("last_prompt", "all_prompt"):
             resolved_positions = _resolve_positions(
@@ -425,8 +429,9 @@ def validate_filesystem_request(
                 where="capture.positions",
             )
         else:
-            # "all_generated" / "all" — defer to the runner.
-            resolved_positions = raw.positions
+            # "all_generated" / "all" — defer to the runner. Already
+            # validated against _VALID_POSITION_KINDS above.
+            resolved_positions = cast(PositionSelector, raw.positions)
     elif isinstance(raw.positions, list):
         resolved_positions = _resolve_positions(
             raw.positions,
@@ -455,4 +460,18 @@ def validate_filesystem_request(
     return CaptureSpec(hooks=resolved_hooks, positions=resolved_positions)
 
 
-__all__: list[str] = ["validate_filesystem_request"]
+def slug_path_components(raw: FilesystemCaptureRequest) -> tuple[str, str]:
+    """Slug ``tag`` and ``request_id`` for filesystem path use.
+
+    Exposed alongside ``validate_filesystem_request`` so the consumer can
+    record the slugs at admission time (when the raw ``FilesystemCaptureRequest``
+    is still in hand) for later use at submit/finalize time, since the
+    framework's :class:`CaptureSpec` only carries ``hooks`` and ``positions``.
+    Raises :class:`CaptureValidationError` on invalid slugs.
+    """
+    tag_slug = _slug(raw.tag, field="capture.tag")
+    request_id_slug = _slug(raw.request_id, field="capture.request_id")
+    return tag_slug, request_id_slug
+
+
+__all__: list[str] = ["validate_filesystem_request", "slug_path_components"]

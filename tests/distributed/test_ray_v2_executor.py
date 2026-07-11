@@ -83,7 +83,7 @@ def assert_executor(executor, tp_size, pp_size):
     assert executor._get_output_rank() == expected_output_rank
 
     if pp_size > 1:
-        assert executor.max_concurrent_batches == pp_size
+        assert executor.vllm_config.max_concurrent_batches == pp_size
 
     executor.check_health()
     assert not executor.is_failed
@@ -343,3 +343,72 @@ def test_ray_v2_single_node_generation_with_pg(tp_size, pp_size):
         llm.llm_engine.model_executor.shutdown()
         del llm
         gc.collect()
+
+
+def _bare_executor(job_id: str | None) -> RayExecutorV2:
+    """Construct an executor shell without running __init__ or touching Ray."""
+    executor = object.__new__(RayExecutorV2)
+    executor._ray_job_id = job_id
+    return executor
+
+
+def test_worker_actors_killable_same_job():
+    """Handles from the current job are killable."""
+    executor = _bare_executor(job_id="01000000")
+    with (
+        patch.object(ray, "is_initialized", return_value=True),
+        patch("vllm.v1.executor.ray_executor_v2.ray.get_runtime_context") as mock_ctx,
+    ):
+        mock_ctx.return_value.get_job_id.return_value = "01000000"
+        assert executor._worker_actors_killable() is True
+
+
+def test_worker_actors_not_killable_stale_job():
+    """Handles from a different job are not killable (would raise
+    ActorHandleNotFoundError)."""
+    executor = _bare_executor(job_id="01000000")
+    with (
+        patch.object(ray, "is_initialized", return_value=True),
+        patch("vllm.v1.executor.ray_executor_v2.ray.get_runtime_context") as mock_ctx,
+    ):
+        mock_ctx.return_value.get_job_id.return_value = "02000000"
+        assert executor._worker_actors_killable() is False
+
+
+def test_worker_actors_not_killable_ray_down():
+    """When Ray is not initialized, actors are not killable."""
+    executor = _bare_executor(job_id="01000000")
+    with patch.object(ray, "is_initialized", return_value=False):
+        assert executor._worker_actors_killable() is False
+
+
+def test_worker_actors_not_killable_never_created():
+    """When actors were never created (init failed early), nothing to kill."""
+    executor = _bare_executor(job_id=None)
+    with patch.object(ray, "is_initialized", return_value=True):
+        assert executor._worker_actors_killable() is False
+
+
+def test_shutdown_skips_kill_on_stale_job():
+    """shutdown() must not call ray.kill() when the job changed."""
+    from vllm.v1.executor.ray_executor_v2 import RayWorkerHandle
+
+    executor = _bare_executor(job_id="01000000")
+    executor.shutdown_lock = threading.Lock()
+    executor.shutting_down = False
+    executor._monitor_thread = None
+    executor.ray_worker_handles = [
+        RayWorkerHandle(actor=object(), rank=0, local_rank=0, node_id="n0")
+    ]
+    executor.rpc_broadcast_mq = None
+    executor.response_mqs = []
+
+    with (
+        patch.object(ray, "is_initialized", return_value=True),
+        patch("vllm.v1.executor.ray_executor_v2.ray.get_runtime_context") as mock_ctx,
+        patch("vllm.v1.executor.ray_executor_v2.ray.kill") as mock_kill,
+    ):
+        mock_ctx.return_value.get_job_id.return_value = "02000000"
+        executor.shutdown()
+
+    mock_kill.assert_not_called()

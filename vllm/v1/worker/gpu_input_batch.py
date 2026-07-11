@@ -49,6 +49,8 @@ class CachedRequestState:
 
     lora_request: LoRARequest | None = None
     prompt_embeds: torch.Tensor | None = None
+    # To accumulate prompt logprobs tensor chunks across prefill steps.
+    in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None
 
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
@@ -248,16 +250,6 @@ class InputBatch:
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
 
-        # Steering config tracking (separate arrays for prefill and decode)
-        self.request_prefill_steering_hash = np.zeros(
-            (self.max_num_reqs,), dtype=np.int64
-        )
-        self.request_decode_steering_hash = np.zeros(
-            (self.max_num_reqs,), dtype=np.int64
-        )
-        # Tracks the union of both hashes (any non-zero hash gets tracked)
-        self.steering_hash_to_request_ids: dict[int, set[str]] = {}
-
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
         # generator should not be included in the dictionary.
@@ -268,9 +260,6 @@ class InputBatch:
         # req_id -> list of specific token IDs to compute logprobs for
         # More efficient than num_logprobs=-1 when only a few tokens are needed
         self.logprob_token_ids: dict[str, list[int]] = {}
-
-        # To accumulate prompt logprobs tensor chunks across prefill steps.
-        self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
 
         # Internal representation of per-step batch state changes, used for
         # reordering persistent batch and generating logitsprocs batch state
@@ -493,17 +482,6 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
-        # Steering config tracking (prefill and decode)
-        prefill_hash = request.prefill_steering_config_hash
-        decode_hash = request.decode_steering_config_hash
-        self.request_prefill_steering_hash[req_index] = prefill_hash
-        self.request_decode_steering_hash[req_index] = decode_hash
-        for h in (prefill_hash, decode_hash):
-            if h != 0:
-                if h not in self.steering_hash_to_request_ids:
-                    self.steering_hash_to_request_ids[h] = set()
-                self.steering_hash_to_request_ids[h].add(request.req_id)
-
         return req_index
 
     def update_req_spec_token_ids(
@@ -530,6 +508,7 @@ class InputBatch:
         start_index = self.num_tokens_no_spec[req_index]
         end_token_index = start_index + num_spec_tokens
         self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
+        self.is_token_ids[req_index, start_index:end_token_index] = True
         cur_spec_token_ids.extend(spec_token_ids)
 
     def remove_request(self, req_id: str) -> int | None:
@@ -562,20 +541,6 @@ class InputBatch:
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
 
-        # Steering cleanup (both prefill and decode hashes)
-        for arr in (
-            self.request_prefill_steering_hash,
-            self.request_decode_steering_hash,
-        ):
-            steering_hash = int(arr[req_index])
-            if steering_hash != 0:
-                hash_req_ids = self.steering_hash_to_request_ids.get(steering_hash)
-                if hash_req_ids:
-                    hash_req_ids.discard(req_id)
-                    if not hash_req_ids:
-                        del self.steering_hash_to_request_ids[steering_hash]
-                arr[req_index] = 0
-
         if self.is_pooling_model:
             self.pooling_params.pop(req_id, None)
             self.pooling_states.pop(req_id, None)
@@ -591,7 +556,6 @@ class InputBatch:
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
         self.logprob_token_ids.pop(req_id, None)
-        self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
         if self.prev_req_id_to_index is not None:
             self.prev_req_id_to_index.pop(req_id, None)
 
@@ -670,18 +634,6 @@ class InputBatch:
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] = (
             self.request_lora_mapping[i2],
             self.request_lora_mapping[i1],
-        )
-
-        (
-            self.request_prefill_steering_hash[i1],
-            self.request_prefill_steering_hash[i2],
-        ) = (
-            self.request_prefill_steering_hash[i2],
-            self.request_prefill_steering_hash[i1],
-        )
-        self.request_decode_steering_hash[i1], self.request_decode_steering_hash[i2] = (
-            self.request_decode_steering_hash[i2],
-            self.request_decode_steering_hash[i1],
         )
 
         if self.is_pooling_model:
@@ -812,13 +764,6 @@ class InputBatch:
                 last_req_index
             ]
 
-            self.request_prefill_steering_hash[empty_index] = (
-                self.request_prefill_steering_hash[last_req_index]
-            )
-            self.request_decode_steering_hash[empty_index] = (
-                self.request_decode_steering_hash[last_req_index]
-            )
-
             if self.is_pooling_model:
                 last_req_index -= 1
                 # Sampling state not used by pooling models.
@@ -943,7 +888,7 @@ class InputBatch:
             not self.no_penalties
             or bool(self.bad_words_token_ids)
             or self.logitsprocs_need_output_token_ids
-            or not thinking_budget_tracks_reqs
+            or thinking_budget_tracks_reqs
         )
         output_token_ids = (
             cast(list[list[int]], self.req_output_token_ids)
@@ -1109,7 +1054,12 @@ class InputBatch:
             # output placeholders (tokens can be discarded after kv-load
             # failure) or a larger number (async spec decode adds optimistic
             # placeholders that may exceed the actual acceptance count).
-            first_placeholder = req_output_token_ids.index(-1)
+            first_placeholder = len(req_output_token_ids)
+            while (
+                first_placeholder > 0
+                and req_output_token_ids[first_placeholder - 1] == -1
+            ):
+                first_placeholder -= 1
             num_placeholders = len(req_output_token_ids) - first_placeholder
             num_to_replace = min(num_sampled_ids, num_placeholders)
             del new_ids[num_to_replace:]

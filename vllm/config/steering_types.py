@@ -19,47 +19,212 @@ Where ``scale(entry)`` means: if entry is a bare list, scale=1.0; if entry is
 from __future__ import annotations
 
 import hashlib
-from collections import OrderedDict
-from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
+from typing_extensions import NotRequired
 
 if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
 
 # Per-layer entry: bare list (scale=1.0) or {"vector": [...], "scale": float}.
-# This is the public, user-facing shape. Internally, merge helpers may
-# produce np.ndarray entries that are fed back through downstream resolvers;
-# normalize_layer_entry handles those without widening the public alias.
+# This is the public, user-facing shape — the type alias is exposed as a
+# pydantic field type by request/response models in ``vllm.entrypoints``,
+# so it must remain a narrow, schema-generable union.  Internally,
+# :func:`merge_steering_specs` produces ``np.ndarray`` entries that are
+# re-fed into resolvers; :func:`normalize_layer_entry` handles that
+# transparently without widening this alias.
 SteeringLayerEntry = list[float] | dict[str, Any]
-SteeringLayerEntryInternal = SteeringLayerEntry | np.ndarray
 
 # Full spec: {hook_point_name: {layer_idx: SteeringLayerEntry}}
 SteeringVectorSpec = dict[str, dict[int, SteeringLayerEntry]]
-SteeringVectorSpecInternal = dict[str, dict[int, SteeringLayerEntryInternal]]
-SteeringVectorSpecLike = Mapping[str, Mapping[int, SteeringLayerEntryInternal]]
-ResolvedSteeringVectorSpec = dict[str, dict[int, np.ndarray]]
+
+
+# Binary wire format: one packed blob per hook.  ``data`` is a base64-encoded
+# contiguous byte string of length ``prod(shape) * dtype.itemsize``.  The
+# matching ``layer_indices`` lists the layer each row of the stacked array
+# corresponds to.  Allows clients to skip JSON parse + ``np.asarray(list)``
+# conversion of the ~350 KB per-layer-floats payload that dominates inline
+# request preprocessing — typically ~10-15 ms saved per request on
+# gemma-3-4b.
+class SteeringHookPacked(TypedDict):
+    dtype: str  # "float32" | "float16" | "bfloat16"
+    shape: list[int]  # [num_layers_in_blob, hidden_size]
+    layer_indices: list[int]  # which layer each row corresponds to
+    data: str  # base64-encoded contiguous bytes
+    # Optional per-row scales matching ``layer_indices``.  When set,
+    # each row is multiplied by its scale at decode.  Mirrors the
+    # ``{"vector": [...], "scale": float}`` form of the legacy
+    # ``SteeringLayerEntry`` so binary-wire clients can express the
+    # same per-layer scale knob without baking the multiplier into
+    # the bytes (useful when the same vector is reused at different
+    # scales across requests or when scales are runtime knobs the
+    # client doesn't want to re-encode each time).
+    scales: NotRequired[list[float]]
+
+
+# Packed full spec: {hook_point_name: SteeringHookPacked}
+SteeringVectorSpecPacked = dict[str, SteeringHookPacked]
 
 STEERING_INDEX_MAX = 2**31 - 1
 
 
 def validate_steering_index(value: object, label: str) -> int:
-    """Validate an index that is serialized as signed int32."""
+    """Validate an index that is serialized as signed int32.
+
+    Shared by the SAE steering types (layer indices, feature indices)
+    which are hashed via ``int.to_bytes(4, ..., signed=True)`` and must
+    therefore fit in a non-negative signed int32.
+    """
     if type(value) is not int:
         raise ValueError(f"{label} must be a non-negative integer, got {value!r}.")
     if value < 0:
         raise ValueError(f"{label} must be non-negative, got {value!r}.")
     if value > STEERING_INDEX_MAX:
-        raise ValueError(
-            f"{label} must be <= {STEERING_INDEX_MAX}, got {value!r}."
-        )
+        raise ValueError(f"{label} must be <= {STEERING_INDEX_MAX}, got {value!r}.")
     return value
 
 
-def _steering_index_bytes(value: object, label: str) -> bytes:
-    idx = validate_steering_index(value, label)
-    return idx.to_bytes(4, "little", signed=True)
+def _looks_packed(tier: dict) -> bool:
+    """Detect whether *tier* is the binary ``SteeringVectorSpecPacked`` shape.
+
+    Both the legacy and packed shapes are ``dict[str, dict[...]]`` at the
+    top level; the discriminator lives in the inner dict.  ``SteeringHookPacked``
+    carries marker keys ``dtype`` and ``data``; the legacy form maps stringified
+    layer indices to lists or ``{"vector", "scale"}`` dicts.
+    """
+    first = next(iter(tier.values()), None)
+    return isinstance(first, dict) and "data" in first and "dtype" in first
+
+
+def coerce_steering_spec(
+    tier: dict | None,
+) -> dict[str, dict[int, list[float] | dict]] | None:
+    """Return *tier* as a ``SteeringVectorSpec``-shaped dict, unpacking the
+    binary wire form if present.
+
+    Packed tiers are detected via :func:`_looks_packed`, decoded with
+    :func:`unpack_steering_vectors`, then the resulting ``np.ndarray``
+    rows are flattened back to ``list[float]`` so the output is uniformly
+    legacy-shaped regardless of input.  The list conversion makes the
+    helper a single normalization seam for every steering ingestion site
+    (global set, module register, JSON file loader) — downstream
+    validators that strictly require ``list`` (see
+    ``SteeringModuleRegistry._validate_layer_entry``) keep working
+    unchanged.  Per-row ``scales`` are pre-applied during unpack.
+
+    For both shapes the inner layer-index keys are normalized to ``int``.
+    Pydantic v2 used to coerce JSON ``"0"`` → ``0`` when the protocol
+    field was typed ``dict[int, ...]``; the global-set and module-register
+    handlers now widen those fields to ``dict[str, Any]`` (to admit the
+    packed shape), so this helper takes over the int-key coercion that
+    callers downstream rely on (e.g. ``set`` math against worker-reported
+    ``validated_layers``, registry lookups keyed by ``int``).
+
+    Returns ``None`` if *tier* is ``None`` or empty.  Raises ``ValueError``
+    on malformed packed payloads (length / shape mismatch) or on a legacy
+    inner key that cannot be converted to ``int``.
+    """
+    if not tier:
+        return None
+    if _looks_packed(tier):
+        unpacked = unpack_steering_vectors(tier)
+        if unpacked is None:
+            return None
+        return {
+            hook: {layer_idx: arr.tolist() for layer_idx, arr in layer_dict.items()}
+            for hook, layer_dict in unpacked.items()
+        }
+    # Legacy shape: ensure inner layer keys are ints, regardless of whether
+    # they arrived as ints (in-process callers) or strings (JSON over HTTP).
+    result: dict[str, dict[int, list[float] | dict]] = {}
+    for hook, layer_vecs in tier.items():
+        if not isinstance(layer_vecs, dict):
+            raise ValueError(
+                f"Steering tier {hook!r} must map layer indices to entries, "
+                f"got {type(layer_vecs).__name__}"
+            )
+        coerced_layers: dict[int, list[float] | dict] = {}
+        for layer_key, entry in layer_vecs.items():
+            if isinstance(layer_key, int):
+                coerced_layers[layer_key] = entry
+                continue
+            try:
+                coerced_layers[int(layer_key)] = entry
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Steering tier {hook!r} has invalid layer index "
+                    f"{layer_key!r}; expected an integer"
+                ) from exc
+        result[hook] = coerced_layers
+    return result
+
+
+def unpack_steering_vectors(
+    packed: SteeringVectorSpecPacked | None,
+) -> dict[str, dict[int, np.ndarray]] | None:
+    """Decode a binary-wire packed steering spec to the legacy ndarray dict.
+
+    Each hook's bytes blob is base64-decoded then wrapped via
+    ``np.frombuffer`` (zero-copy view) and reshaped to ``(num_layers,
+    hidden_size)``.  Rows are split into a ``{layer_idx: ndarray}`` map
+    keyed by ``layer_indices``.
+
+    When the optional ``scales`` field is present, each row is multiplied
+    by its matching scale before being placed in the result.  Rows with
+    scale ``1.0`` keep the zero-copy view; other rows pay one
+    ``ndarray * scalar`` (microseconds, dtype-preserving).
+
+    Returns ``None`` if *packed* is ``None`` or empty.
+    """
+    if not packed:
+        return None
+    import pybase64 as base64
+
+    result: dict[str, dict[int, np.ndarray]] = {}
+    for hook, blob in packed.items():
+        dtype = np.dtype(blob["dtype"])
+        shape = tuple(blob["shape"])
+        layer_indices = blob["layer_indices"]
+        if len(shape) != 2:
+            raise ValueError(
+                f"SteeringHookPacked.shape must be 2-D [num_layers, hidden_size]; "
+                f"got {shape}"
+            )
+        if shape[0] != len(layer_indices):
+            raise ValueError(
+                f"SteeringHookPacked.layer_indices length ({len(layer_indices)}) "
+                f"must equal shape[0] ({shape[0]})"
+            )
+        raw = base64.b64decode(blob["data"])
+        expected = int(np.prod(shape)) * dtype.itemsize
+        if len(raw) != expected:
+            raise ValueError(
+                f"SteeringHookPacked.data length {len(raw)} != expected "
+                f"{expected} (shape={shape}, dtype={dtype})"
+            )
+        stacked = np.frombuffer(raw, dtype=dtype).reshape(shape)
+        scales = blob.get("scales")
+        if scales is None:
+            result[hook] = {int(idx): stacked[i] for i, idx in enumerate(layer_indices)}
+            continue
+        if len(scales) != len(layer_indices):
+            raise ValueError(
+                f"SteeringHookPacked.scales length ({len(scales)}) must equal "
+                f"layer_indices length ({len(layer_indices)})"
+            )
+        rows: dict[int, np.ndarray] = {}
+        for i, idx in enumerate(layer_indices):
+            s = float(scales[i])
+            if s == 1.0:
+                rows[int(idx)] = stacked[i]
+            else:
+                # ``stacked[i] * dtype.type(s)`` keeps the result in
+                # the source dtype (Python float scalar would promote
+                # to float64).
+                rows[int(idx)] = stacked[i] * dtype.type(s)
+        result[hook] = rows
+    return result
 
 
 def normalize_layer_entry(
@@ -68,8 +233,12 @@ def normalize_layer_entry(
     """Return ``(vector, scale)`` from a steering layer entry.
 
     If *entry* is a bare ``list[float]`` or ``np.ndarray``, returns
-    ``(entry, 1.0)``. If *entry* is ``{"vector": [...], "scale": float}``,
+    ``(entry, 1.0)``.  If *entry* is ``{"vector": [...], "scale": float}``,
     returns ``(entry["vector"], entry["scale"])``.
+
+    The ndarray case supports re-feeding the output of
+    :func:`merge_steering_specs` (which produces pre-scaled ``np.float64``
+    arrays) through downstream resolvers without converting back to lists.
     """
     if isinstance(entry, np.ndarray):
         return entry, 1.0
@@ -96,6 +265,62 @@ def normalize_layer_entry(
     )
 
 
+def steering_vector_content_digest(packed: SteeringVectorSpecPacked) -> str:
+    """Return a stable sha256 hex digest of a packed steering vector's content.
+
+    Canonical serialization: the packed ``{hook: SteeringHookPacked}`` dict
+    JSON-encoded with sorted keys and no whitespace. ``data`` is already a
+    base64 string and every other field is a plain scalar/list, so the encoding
+    is deterministic and identical wherever it is computed (frontend registry
+    and worker registry), giving both sides a matching content address.
+
+    Used to guard latch-by-reference: a ``rest_of_conversation`` latch stores
+    the registered name plus this digest, and a later turn is only bridged if
+    the name still resolves to the *same* content — a name re-registered with
+    different vectors mid-conversation is detected as a digest mismatch and the
+    latch disengages rather than silently steering with changed content.
+
+    Args:
+        packed: The ``{hook: SteeringHookPacked}`` packed spec.
+
+    Returns:
+        The lowercase hex sha256 digest of the canonical serialization.
+    """
+    import json
+
+    canonical = json.dumps(packed, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def validate_spec_row_widths(
+    spec: dict | None,
+    expected_width: int,
+    *,
+    field_name: str,
+) -> None:
+    """Raise ``ValueError`` when any vector in *spec* is not
+    ``expected_width`` wide.
+
+    Wrong-width rows pass structural validation (finite floats) but
+    shape-crash the worker's steering table population
+    (``populate_steering_tables`` stacks all active rows), killing the
+    engine — so every seam that accepts client vectors must width-check
+    before anything is broadcast or admitted. Entries may be bare lists,
+    ``{"vector", "scale"}`` dicts, or ndarrays (packed-form decode).
+    """
+    if not spec:
+        return
+    for hook_name, layers in spec.items():
+        for layer_idx, entry in layers.items():
+            vector, _ = normalize_layer_entry(entry)
+            if len(vector) != expected_width:
+                raise ValueError(
+                    f"{field_name}[{hook_name!r}][{layer_idx}]: vector width "
+                    f"{len(vector)} != expected steering row width "
+                    f"{expected_width} (model hidden size)"
+                )
+
+
 def _scale_vector(vec: list[float] | np.ndarray, scale: float) -> np.ndarray:
     """Multiply *vec* by *scale*, returning a float64 numpy array.
 
@@ -117,9 +342,9 @@ def _add_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def resolve_effective_vectors(
-    base: SteeringVectorSpecLike | None,
-    phase_specific: SteeringVectorSpecLike | None,
-) -> ResolvedSteeringVectorSpec | None:
+    base: SteeringVectorSpec | None,
+    phase_specific: SteeringVectorSpec | None,
+) -> dict[str, dict[int, np.ndarray]] | None:
     """Merge *base* and *phase_specific* steering specs additively.
 
     For each ``(hook, layer)`` pair, both the base and phase-specific entries
@@ -184,7 +409,14 @@ def resolve_effective_vectors(
 
 
 def _torch_dtype_to_pack_dtype(torch_dtype: object) -> np.dtype:
-    """Pick the numpy dtype to pack steering vectors as for *torch_dtype*."""
+    """Pick the numpy dtype to pack steering vectors as for *torch_dtype*.
+
+    Maps the model's compute dtype to a numpy dtype for the wire-format
+    packing path.  Numpy lacks a native ``bfloat16`` (without the
+    optional ``ml_dtypes`` package), so bf16 models fall back to
+    ``float32`` — still a ~2.25× IPC reduction over msgpack-encoded
+    Python float lists.
+    """
     name = getattr(torch_dtype, "__str__", lambda: "")().rsplit(".", 1)[-1]
     if name == "float16":
         return np.dtype(np.float16)
@@ -200,7 +432,17 @@ def pack_effective_steering(
     spec_phase: SteeringVectorSpec | None,
     dtype: np.dtype | str,
 ) -> dict[str, dict[int, np.ndarray]] | None:
-    """Resolve and pack inline steering specs in one shot."""
+    """Resolve and pack inline steering specs in one shot.
+
+    Equivalent to ``resolve_effective_vectors(spec_base, spec_phase)``
+    cast to *dtype*, but does the cast inline so we never allocate the
+    intermediate float64 arrays purely for the cast-then-discard.
+    Used by the LLM client (and HTTP server) to build the
+    ``effective_*_steering_packed`` fields on :class:`SamplingParams`
+    before request submission.
+
+    Returns ``None`` when both inputs are ``None`` / empty.
+    """
     if not spec_base and not spec_phase:
         return None
     np_dtype = np.dtype(dtype)
@@ -220,7 +462,25 @@ def pack_steering_for_dtype(
     spec: SteeringVectorSpec | None,
     dtype: np.dtype | str,
 ) -> dict[str, dict[int, np.ndarray]] | None:
-    """Pre-bake a :class:`SteeringVectorSpec` into dtype-specific arrays."""
+    """Pre-bake a :class:`SteeringVectorSpec` into model-dtype ``ndarray`` form.
+
+    Converts every per-layer entry — bare-list or ``{"vector", "scale"}``
+    dict — into a 1-D ``np.ndarray`` in *dtype* with the inner ``scale``
+    already applied.  Returned shape:
+    ``{hook: {layer_idx: ndarray[dtype]}}``.
+
+    Used by the inline-vectors fast path: the LLM client (or HTTP server)
+    converts user-supplied list-of-floats into this packed form before
+    serializing into the request body, so the wire payload carries
+    ``len(vec) * dtype.itemsize`` bytes per layer instead of
+    ``len(vec) * 9`` bytes (msgpack-encoded floats).  The downstream
+    resolver (:func:`resolve_effective_vectors` and
+    :func:`merge_steering_specs`) already accepts ``ndarray`` entries
+    transparently, so packed inputs flow through without further
+    conversion.
+
+    Returns ``None`` if *spec* is ``None`` or empty.
+    """
     if not spec:
         return None
     np_dtype = np.dtype(dtype)
@@ -233,7 +493,12 @@ def pack_steering_for_dtype(
             vec, scale = normalize_layer_entry(entry)
             arr = np.asarray(vec, dtype=np_dtype)
             if scale != 1.0:
+                # Cast the scale to the target dtype so the multiply
+                # stays in-place (avoiding an fp32 promotion that the
+                # caller would only have to cast back).
                 arr = arr * np_dtype.type(scale)
+                # ``arr * scalar`` on a non-fp32 ndarray sometimes
+                # returns a higher-precision result; force it back.
                 if arr.dtype != np_dtype:
                     arr = arr.astype(np_dtype, copy=False)
             packed[layer_idx] = arr
@@ -243,9 +508,9 @@ def pack_steering_for_dtype(
 
 
 def scale_steering_spec(
-    spec: SteeringVectorSpecLike | None,
+    spec: SteeringVectorSpec | None,
     scale: float,
-) -> SteeringVectorSpecInternal | None:
+) -> SteeringVectorSpec | None:
     """Apply a uniform multiplier to every entry in *spec*.
 
     Returns a new spec where each layer entry's effective magnitude has
@@ -261,12 +526,12 @@ def scale_steering_spec(
     if not spec:
         return None
     if scale == 1.0:
-        return cast(SteeringVectorSpecInternal, spec)
-    result: SteeringVectorSpecInternal = {}
+        return spec
+    result: SteeringVectorSpec = {}
     for hook, layer_dict in spec.items():
         if not layer_dict:
             continue
-        scaled_layers: dict[int, SteeringLayerEntryInternal] = {}
+        scaled_layers: dict[int, SteeringLayerEntry] = {}
         for layer_idx, entry in layer_dict.items():
             vec, sc = normalize_layer_entry(entry)
             scaled_layers[layer_idx] = {"vector": vec, "scale": sc * scale}
@@ -276,9 +541,9 @@ def scale_steering_spec(
 
 
 def merge_steering_specs(
-    a: SteeringVectorSpecLike | None,
-    b: SteeringVectorSpecLike | None,
-) -> ResolvedSteeringVectorSpec | None:
+    a: SteeringVectorSpec | None,
+    b: SteeringVectorSpec | None,
+) -> SteeringVectorSpec | None:
     """Additively merge two :class:`SteeringVectorSpec` dicts.
 
     For overlapping ``(hook, layer)`` entries both sides are pre-scaled
@@ -293,7 +558,7 @@ def merge_steering_specs(
     if a_empty and b_empty:
         return None
 
-    result: ResolvedSteeringVectorSpec = {}
+    result: SteeringVectorSpec = {}
 
     all_hooks: set[str] = set()
     if not a_empty:
@@ -314,7 +579,7 @@ def merge_steering_specs(
         if not all_layer_idxs:
             continue
 
-        hook_result: dict[int, np.ndarray] = {}
+        hook_result: dict[int, SteeringLayerEntry] = {}
         for layer_idx in all_layer_idxs:
             a_entry = a_layers.get(layer_idx)
             b_entry = b_layers.get(layer_idx)
@@ -340,16 +605,16 @@ def merge_steering_specs(
 
 
 def hash_steering_config(
-    effective_vectors: SteeringVectorSpecLike | None,
+    effective_vectors: dict[str, dict[int, list[float] | np.ndarray]] | None,
     module_ref: tuple[str, float] | None = None,
     sae_clamp_specs: tuple[Any, ...] | None = None,
     sae_full_reconstruction_specs: tuple[Any, ...] | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 
-    Returns 0 if *effective_vectors*, *module_ref*, and
-    *sae_clamp_specs* are all ``None`` or empty.  The hash is masked
-    to fit in ``np.int64``.
+    Returns 0 if *effective_vectors*, *module_ref*, *sae_clamp_specs*,
+    and *sae_full_reconstruction_specs* are all ``None`` or empty.  The
+    hash is masked to fit in ``np.int64``.
 
     *module_ref* is an optional ``(name, scale)`` reference to a
     worker-side named steering module.  When set, the reference is
@@ -360,18 +625,20 @@ def hash_steering_config(
     function reduces to the original "hash inline-only vectors" behavior
     bit-for-bit, preserving prefix-cache reuse for existing requests.
 
-    *sae_clamp_specs* is an optional tuple of
-    :class:`vllm.config.sae_steering_types.SAEClampSpec` describing
-    SAE feature-surgery clamps.  When ``None`` or empty the SAE block
-    is omitted from the digest, so requests that don't use SAE
-    steering hash bit-for-bit identically to before this argument
-    existed.  This is required for prefix-cache reuse.
-
     Accepts entries as either ``list[float]`` (legacy callers) or
     ``np.ndarray`` (the float64 arrays produced by
     :func:`resolve_effective_vectors`).  In both cases the float→float32
     cast happens exactly once at the ``tobytes`` boundary, so hashes are
     bit-for-bit identical regardless of the input container.
+
+    *sae_clamp_specs* is an optional tuple of
+    :class:`vllm.config.sae_steering_types.SAEClampSpec` describing SAE
+    feature-surgery clamps, and *sae_full_reconstruction_specs* an
+    optional tuple of
+    :class:`vllm.config.sae_steering_types.SAEFullReconstructionSpec`.
+    When ``None`` or empty each SAE block is omitted from the digest, so
+    requests that don't use SAE steering hash bit-for-bit identically to
+    before these arguments existed — required for prefix-cache reuse.
     """
     if (
         not effective_vectors
@@ -398,7 +665,7 @@ def hash_steering_config(
                     vec = entry
                     scale = 1.0
                 arr = np.asarray(vec, dtype=np.float32)
-                h.update(_steering_index_bytes(layer_idx, "layer_idx"))
+                h.update(layer_idx.to_bytes(4, "little", signed=True))
                 h.update(arr.tobytes())
                 if scale != 1.0:
                     h.update(np.float64(scale).tobytes())
@@ -413,24 +680,22 @@ def hash_steering_config(
         h.update(name.encode("utf-8"))
         h.update(np.float64(scale).tobytes())
     if sae_clamp_specs:
-        # Defer the import to avoid a circular dependency: sae_steering_types
-        # imports VALID_HOOK_POINT_NAMES from model_executor.layers.steering,
-        # which transitively does not depend on this module — but the cycle
-        # is fragile, and a function-local import keeps this file's import
-        # graph minimal.  ``hash_sae_clamp_specs`` writes its own domain
-        # separator into the digest it computes; we incorporate that result
-        # via ``int.to_bytes`` to keep the composition associative.
+        # Defer the import to avoid a circular dependency:
+        # sae_steering_types imports ``validate_steering_index`` from this
+        # module.  ``hash_sae_clamp_specs`` writes its own domain
+        # separator into the digest it computes; we incorporate that
+        # result via ``int.to_bytes`` to keep the composition associative.
         from vllm.config.sae_steering_types import hash_sae_clamp_specs
 
         sae_hash = hash_sae_clamp_specs(sae_clamp_specs)
         h.update(b"\x00sae_block\x00")
         h.update(sae_hash.to_bytes(8, "little", signed=False))
     if sae_full_reconstruction_specs:
-        # Distinct domain separator from the delta block above so a
-        # delta and a full-reconstruction request with identical clamp
-        # content can never collide on prefix-cache keys: the two paths
-        # produce different residual streams (perturbation vs
-        # replacement) and must not share prefill cache.
+        # Distinct domain separator from the delta block above so a delta
+        # and a full-reconstruction request with identical clamp content
+        # can never collide on prefix-cache keys: the two paths produce
+        # different residual streams (perturbation vs replacement) and
+        # must not share prefill cache.
         from vllm.config.sae_steering_types import (
             hash_sae_full_reconstruction_specs,
         )
@@ -444,15 +709,35 @@ def hash_steering_config(
 def maybe_pack_inline_steering_for_request(
     sp: SamplingParams,
     torch_dtype: object,
+    expected_row_width: int | None = None,
 ) -> None:
-    """Pre-resolve and pack inline steering vectors on *sp* in-place."""
-    if sp.steering_module_ref is not None:
-        # Named-module requests may still carry inline base / phase
-        # overrides.  Those raw tiers are needed on the worker so
-        # ``_resolve_request_steering`` can merge them with the named
-        # module's tiers.  The packed effective inline form is only
-        # valid for inline-only requests.
-        return
+    """Pre-resolve + pack inline steering vectors on *sp* in-place.
+
+    Shared between :class:`vllm.entrypoints.LLM` (sync path) and
+    :class:`vllm.v1.engine.async_llm.AsyncLLM` (HTTP path), called just
+    before the request crosses the multiprocessing boundary.  See
+    :meth:`SamplingParams._effective_prefill_steering_packed` for the
+    contract.
+
+    No-ops when:
+
+    - all inline tier fields are ``None`` (named-only or no-steering);
+    - packed fields are already set (idempotency for callers that
+      pre-packed).
+
+    Mutates *sp* by:
+    1. Reading ``prefill_steering_config_hash`` and
+       ``decode_steering_config_hash`` to fix the hash against the
+       original fp64-resolved values (preserves prefix-cache reuse).
+    2. Setting ``effective_*_steering_packed`` to the model-dtype
+       ``ndarray`` form of the resolved per-phase specs.
+    3. Clearing ``steering_vectors`` / ``prefill_steering_vectors`` /
+       ``decode_steering_vectors`` so the wire payload doesn't carry
+       both forms.
+    4. Stashing the packed dicts as the cached values for the
+       ``effective_*_steering`` cached_properties so worker-side reads
+       return them directly without re-resolving.
+    """
     if (
         sp.steering_vectors is None
         and sp.prefill_steering_vectors is None
@@ -465,20 +750,28 @@ def maybe_pack_inline_steering_for_request(
     ):
         return
 
+    # Width gate. This runs before the inline fields are cleared (step 3),
+    # making it the one seam every inline-steering request crosses — the
+    # engine-side validator never sees the raw specs after packing. A
+    # wrong-width row would otherwise shape-crash the worker's steering
+    # table population and kill the engine.
+    if expected_row_width is not None:
+        for field_name, spec in (
+            ("steering_vectors", sp.steering_vectors),
+            ("prefill_steering_vectors", sp.prefill_steering_vectors),
+            ("decode_steering_vectors", sp.decode_steering_vectors),
+        ):
+            validate_spec_row_widths(
+                spec, expected_row_width, field_name=field_name
+            )
+
     np_dtype = _torch_dtype_to_pack_dtype(torch_dtype)
 
-    # Prime hashes before mutating inline fields. This preserves
-    # prefix-cache parity between packed and unpacked submissions,
-    # including the SAE hash contribution when present.  The additive-only
-    # row keys must also be fixed here so the first unpromoted request and
-    # later auto-promoted siblings use the same physical-row identity even
-    # when packing casts vectors to fp16/bf16-compatible payloads.
+    # Prime the hash cached_properties against the original fp64 path
+    # so a packed and an unpacked submission of the same logical request
+    # share a prefix-cache hash.
     _ = sp.prefill_steering_config_hash
     _ = sp.decode_steering_config_hash
-    _ = sp.prefill_additive_steering_config_hash
-    _ = sp.decode_additive_steering_config_hash
-    _ = sp.prefill_sae_clamp_config_hash
-    _ = sp.decode_sae_clamp_config_hash
 
     sp._effective_prefill_steering_packed = pack_effective_steering(
         sp.steering_vectors, sp.prefill_steering_vectors, np_dtype
@@ -491,250 +784,3 @@ def maybe_pack_inline_steering_for_request(
     sp.decode_steering_vectors = None
     sp.__dict__["effective_prefill_steering"] = sp._effective_prefill_steering_packed
     sp.__dict__["effective_decode_steering"] = sp._effective_decode_steering_packed
-
-
-class SteeringAutoPromoteLRU:
-    """Per-engine LRU tracking which inline specs have been seen."""
-
-    def __init__(self, capacity: int = 512) -> None:
-        if capacity < 1:
-            raise ValueError(f"LRU capacity must be >= 1, got {capacity}")
-        self._capacity = capacity
-        self._items: OrderedDict[tuple[int, int], str | None] = OrderedDict()
-
-    def observe(
-        self, key: tuple[int, int]
-    ) -> tuple[str, str | None, tuple[tuple[int, int], str | None] | None]:
-        existing = self._items.get(key, ...)
-        if existing is ...:
-            evicted = self._put_new(key, None)
-            return "first", None, evicted
-        self._items.move_to_end(key)
-        if existing is None:
-            return "second", None, None
-        return "registered", existing, None
-
-    def mark_registered(self, key: tuple[int, int], name: str) -> None:
-        if key not in self._items:
-            raise KeyError(key)
-        self._items[key] = name
-        self._items.move_to_end(key)
-
-    def _put_new(
-        self, key: tuple[int, int], name: str | None
-    ) -> tuple[tuple[int, int], str | None] | None:
-        evicted: tuple[tuple[int, int], str | None] | None = None
-        if len(self._items) >= self._capacity:
-            for evicted_key, evicted_name in self._items.items():
-                if evicted_name is None:
-                    del self._items[evicted_key]
-                    evicted = (evicted_key, evicted_name)
-                    break
-            else:
-                return None
-        self._items[key] = name
-        return evicted
-
-    def get(self, key: tuple[int, int]) -> str | None:
-        existing = self._items.get(key)
-        if existing is None:
-            return None
-        self._items.move_to_end(key)
-        return existing
-
-    def __contains__(self, key: tuple[int, int]) -> bool:
-        return key in self._items
-
-    def __len__(self) -> int:
-        return len(self._items)
-
-
-def _build_named_payload_from_resolved(
-    sp: SamplingParams,
-) -> dict[str, dict[str, dict[int, list[float]]]]:
-    """Build a worker broadcast payload from a request's resolved vectors."""
-    payload: dict[str, dict[str, dict[int, list[float]]]] = {}
-
-    prefill = sp.effective_prefill_steering
-    decode = sp.effective_decode_steering
-
-    def _to_list_dict(
-        spec: dict[str, dict[int, np.ndarray]] | None,
-    ) -> dict[str, dict[int, list[float]]] | None:
-        if not spec:
-            return None
-        return {
-            hook: {
-                layer: arr.astype(np.float32, copy=False).tolist()
-                for layer, arr in layer_dict.items()
-            }
-            for hook, layer_dict in spec.items()
-        }
-
-    prefill_payload = _to_list_dict(prefill)
-    decode_payload = _to_list_dict(decode)
-
-    if prefill_payload == decode_payload:
-        if prefill_payload is not None:
-            payload["vectors"] = prefill_payload
-    else:
-        if prefill_payload is not None:
-            payload["prefill_vectors"] = prefill_payload
-        if decode_payload is not None:
-            payload["decode_vectors"] = decode_payload
-    return payload
-
-
-def _auto_promote_prep(
-    sp: SamplingParams,
-    registry_lru: SteeringAutoPromoteLRU,
-) -> (
-    tuple[
-        tuple[int, int] | None,
-        tuple[int, int] | None,
-        str | None,
-        dict[str, dict[str, dict[int, list[float]]]] | None,
-        tuple[tuple[int, int], str | None] | None,
-    ]
-    | None
-):
-    if sp.steering_module_ref is not None:
-        return None
-    has_inline = (
-        sp.steering_vectors is not None
-        or sp.prefill_steering_vectors is not None
-        or sp.decode_steering_vectors is not None
-    )
-    has_packed = (
-        sp._effective_prefill_steering_packed is not None
-        or sp._effective_decode_steering_packed is not None
-    )
-    if not has_inline and not has_packed:
-        return None
-
-    original_hashes = (
-        sp.prefill_steering_config_hash,
-        sp.decode_steering_config_hash,
-    )
-    # Scheduler admission may need SAE-only row hashes after the inline
-    # fields are rewritten to a generated module reference.  Prime them now
-    # so promotion does not defer SAE hashing into the scheduler hot path.
-    _ = sp.prefill_sae_clamp_config_hash
-    _ = sp.decode_sae_clamp_config_hash
-    # Auto-promotion only registers the additive inline payload.  SAE clamps
-    # stay on the request, but including them in the LRU key would duplicate
-    # identical additive modules for each SAE clamp variant.
-    #
-    # Use the cached additive identity rather than re-hashing
-    # ``effective_*_steering`` directly.  Offline LLM.add_request may reuse the
-    # same SamplingParams object for multiple prompts; the first prompt can pack
-    # inline vectors to fp16/bf16 before the second prompt reaches this path.
-    # The cached additive hashes are primed before packing, so the second
-    # observation still hits the same LRU key instead of looking like a new
-    # rounded payload.
-    h_prefill = sp.prefill_additive_steering_config_hash
-    h_decode = sp.decode_additive_steering_config_hash
-    key = (h_prefill, h_decode)
-    status, name, evicted = registry_lru.observe(key)
-
-    if status == "first":
-        if evicted is not None and evicted[1] is not None:
-            return None, None, None, None, evicted
-        return None
-    if status == "registered":
-        assert name is not None
-        return key, original_hashes, name, None, None
-
-    name = f"_auto_{h_prefill:016x}_{h_decode:016x}"
-    payload = _build_named_payload_from_resolved(sp)
-    if not payload:
-        return None
-    return key, original_hashes, name, payload, evicted
-
-
-def _auto_promote_apply(
-    sp: SamplingParams,
-    name: str,
-    original_hashes: tuple[int, int],
-    additive_hashes: tuple[int, int],
-) -> None:
-    sp.steering_module_ref = (name, 1.0)
-    sp.steering_vectors = None
-    sp.prefill_steering_vectors = None
-    sp.decode_steering_vectors = None
-    sp._effective_prefill_steering_packed = None
-    sp._effective_decode_steering_packed = None
-    sp._auto_promote_original_hashes = original_hashes
-    sp.__dict__.pop("effective_prefill_steering", None)
-    sp.__dict__.pop("effective_decode_steering", None)
-    # Auto-promotion is a transport optimization: the worker reads the
-    # vectors through a generated module name, but the logical request
-    # identity remains the pre-promotion inline payload plus any SAE
-    # clamps.  Keep these cached hashes stable so prefix-cache keys and
-    # row-capacity accounting match an unpromoted request.
-    sp.__dict__["prefill_steering_config_hash"] = original_hashes[0]
-    sp.__dict__["decode_steering_config_hash"] = original_hashes[1]
-    sp.__dict__["prefill_additive_steering_config_hash"] = additive_hashes[0]
-    sp.__dict__["decode_additive_steering_config_hash"] = additive_hashes[1]
-
-
-def maybe_auto_promote_steering_modules(
-    sp: SamplingParams,
-    rpc_fn: Callable[..., Any],
-    registry_lru: SteeringAutoPromoteLRU,
-) -> None:
-    """Promote repeated inline steering specs to named modules."""
-    prep = _auto_promote_prep(sp, registry_lru)
-    if prep is None:
-        return
-    key, original_hashes, name, payload, evicted = prep
-    if payload is not None:
-        assert key is not None
-        assert name is not None
-        rpc_fn(
-            "register_steering_modules",
-            kwargs={"modules": {name: payload}, "replace": False},
-        )
-        registry_lru.mark_registered(key, name)
-    if evicted is not None:
-        _, evicted_name = evicted
-        if evicted_name is not None:
-            rpc_fn(
-                "unregister_steering_modules",
-                kwargs={"names": [evicted_name]},
-            )
-    if name is not None:
-        assert key is not None
-        assert original_hashes is not None
-        _auto_promote_apply(sp, name, original_hashes, key)
-
-
-async def maybe_auto_promote_steering_modules_async(
-    sp: SamplingParams,
-    rpc_fn: Callable[..., Any],
-    registry_lru: SteeringAutoPromoteLRU,
-) -> None:
-    """Async variant for ``AsyncLLM.add_request``."""
-    prep = _auto_promote_prep(sp, registry_lru)
-    if prep is None:
-        return
-    key, original_hashes, name, payload, evicted = prep
-    if payload is not None:
-        assert key is not None
-        assert name is not None
-        await rpc_fn(
-            "register_steering_modules",
-            kwargs={"modules": {name: payload}, "replace": False},
-        )
-        registry_lru.mark_registered(key, name)
-    if evicted is not None:
-        _, evicted_name = evicted
-        if evicted_name is not None:
-            await rpc_fn(
-                "unregister_steering_modules",
-                kwargs={"names": [evicted_name]},
-            )
-    if name is not None:
-        assert key is not None
-        assert original_hashes is not None
-        _auto_promote_apply(sp, name, original_hashes, key)

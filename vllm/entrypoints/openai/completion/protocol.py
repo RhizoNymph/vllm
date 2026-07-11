@@ -11,7 +11,10 @@ from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
 from vllm.config.sae_steering_types import coerce_sae_clamp_specs
-from vllm.config.steering_types import SteeringVectorSpec
+from vllm.config.steering_types import (
+    SteeringVectorSpecPacked,
+    unpack_steering_vectors,
+)
 from vllm.config.utils import replace
 from vllm.entrypoints.openai.chat_completion.protocol import (
     CaptureResultResponse,
@@ -23,6 +26,8 @@ from vllm.entrypoints.openai.engine.protocol import (
     StreamOptions,
     StructuralTagResponseFormat,
     UsageInfo,
+    validate_structural_tag_response_format,
+    validate_structured_outputs_structural_tag,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -34,8 +39,10 @@ from vllm.sampling_params import (
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
+    ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
+from vllm.v1.request_metadata import RequestMetadata
 
 logger = init_logger(__name__)
 
@@ -84,8 +91,24 @@ class CompletionRequest(OpenAIBaseModel):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Annotated[int, Field(ge=-1, le=_INT64_MAX)] | None = None
+    truncation_side: Literal["left", "right"] | None = Field(
+        default=None,
+        description=(
+            "Which side to truncate from when truncate_prompt_tokens is active. "
+            "'right' keeps the first N tokens. "
+            "'left' keeps the last N tokens."
+        ),
+    )
     allowed_token_ids: list[int] | None = None
     prompt_logprobs: int | None = None
+    logprob_token_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "Specific token IDs to return logprobs for on each generated "
+            "token, regardless of whether they fall in the top-`logprobs`. "
+            "Exact scoring for label/answer tokens (e.g. logit-diff metrics)."
+        ),
+    )
     # --8<-- [end:completion-sampling-params]
 
     # --8<-- [start:completion-extra-params]
@@ -182,31 +205,13 @@ class CompletionRequest(OpenAIBaseModel):
         "can detect such behavior and terminate early, saving time and tokens.",
     )
 
-    steering_vectors: SteeringVectorSpec | None = Field(
+    thinking_token_budget: ThinkingTokenBudget = Field(
         default=None,
-        description="Per-request activation steering vectors keyed by hook "
-        "point name (pre_attn, post_attn, post_mlp), then layer index. "
-        "Values are either bare "
-        'list[float] (scale=1.0) or {"vector": [...], "scale": float}.',
-    )
-
-    prefill_steering_vectors: SteeringVectorSpec | None = Field(
-        default=None,
-        description="Phase-specific steering vectors added to base during "
-        "prefill only. Same format as steering_vectors.",
-    )
-
-    decode_steering_vectors: SteeringVectorSpec | None = Field(
-        default=None,
-        description="Phase-specific steering vectors added to base during "
-        "decode only. Same format as steering_vectors.",
-    )
-
-    steering_name: str | None = Field(
-        default=None,
-        description="Name of a pre-registered steering module. "
-        "When set, the named vectors are resolved and additively "
-        "composed with any inline steering vector fields.",
+        description=(
+            "Maximum number of tokens allowed for thinking operations "
+            "(reasoning models). Non-negative integer sets the limit; "
+            "-1 means unlimited (treated as unset)."
+        ),
     )
 
     sae_clamp_specs: list[dict[str, Any]] | None = Field(
@@ -229,6 +234,94 @@ class CompletionRequest(OpenAIBaseModel):
             "``ChatCompletionRequest.capture`` for the full schema."
         ),
     )
+    capture_wait: bool = Field(
+        default=False,
+        description=(
+            "When true (and `capture` is set), hold the response until this "
+            "request's capture results have finalized (files durable), then "
+            "report them in `capture_results`. Capture writes are otherwise "
+            "asynchronous and may land after the response."
+        ),
+    )
+    patch: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Activation-patching sites. Each entry: {layer, hook, "
+            "dest_position, source_run, source_position, alpha?} — overwrite "
+            "(alpha=1) or interpolate toward the destination activation at "
+            "(layer, hook, dest_position) with the clean run `source_run`'s "
+            "activation at `source_position`. Instead of source_run a client "
+            "may set source_module (named steering module or 'zeros') or "
+            "source_inline (a row of patch_vectors); an optional per-entry mask "
+            "restricts the patch to a subset of dims. The result is graded via "
+            "normal logprobs; no extra response field."
+        ),
+    )
+    patch_vectors: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Request-level packed table of client-provided patch vectors "
+            "referenced by a patch entry's source_inline / mask.inline row "
+            "index. Binary wire form: {dtype, shape:[n_rows, width], data: "
+            "base64}."
+        ),
+    )
+
+    # Per-request inline steering vectors in binary wire format.  Each entry
+    # is ``{dtype, shape, layer_indices, data: base64, scales?}`` — see
+    # ``vllm.config.steering_types.SteeringHookPacked``.  The packed form
+    # avoids the JSON parse + ``np.asarray(list_of_floats)`` overhead that
+    # dominates inline-request preprocessing on the API-server thread.
+    steering_vectors: SteeringVectorSpecPacked | None = Field(
+        default=None,
+        description="Per-request activation steering vectors keyed by hook "
+        "point name (pre_attn, post_attn, post_block). Each hook carries one "
+        "base64-encoded (num_layers, hidden_size) blob plus a sibling "
+        "layer_indices list (and optional per-row scales).",
+    )
+
+    prefill_steering_vectors: SteeringVectorSpecPacked | None = Field(
+        default=None,
+        description="Phase-specific steering vectors added to base during "
+        "prefill only. Same packed format as steering_vectors.",
+    )
+
+    decode_steering_vectors: SteeringVectorSpecPacked | None = Field(
+        default=None,
+        description="Phase-specific steering vectors added to base during "
+        "decode only. Same packed format as steering_vectors.",
+    )
+
+    conversation_id: str | None = Field(
+        default=None,
+        description="Opaque client conversation/session id. Carried as "
+        "request metadata (not a sampling parameter) and surfaced to "
+        "worker-side capture consumers via StepRequestView.conversation_id so a "
+        "dynamic-steering consumer can apply per-conversation (e.g. latched) "
+        "steering across the requests of one conversation. It is an "
+        "unauthenticated global namespace: in a multi-client deployment the "
+        "operator or gateway must namespace ids per client (e.g. a "
+        "per-tenant prefix) so one client cannot inherit or pre-latch "
+        "another's steering.",
+    )
+
+    steering_name: str | None = Field(
+        default=None,
+        description="Name of a pre-registered steering module. "
+        "When set, the named vectors are resolved and additively "
+        "composed with any inline steering vector fields.",
+    )
+
+    steering: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Declarative per-request steering gates: a list of "
+        "{when, scope, apply}. See the chat completion `steering` field for "
+        "the gate schema. A vector source may be {kind:'name', name:...} "
+        "(registered via /v1/steering/vectors/register) or {kind:'inline', "
+        "packed:...}; scope=rest_of_conversation with apply=add requires a "
+        "named steer vector. Applied by the built-in declarative consumer; "
+        "requires --enable-steering.",
+    )
 
     # --8<-- [end:completion-extra-params]
 
@@ -237,6 +330,7 @@ class CompletionRequest(OpenAIBaseModel):
             max_total_tokens=model_config.max_model_len,
             max_output_tokens=self.max_tokens or 0,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
+            truncation_side=self.truncation_side,
             add_special_tokens=self.add_special_tokens,
             needs_detokenization=bool(self.echo and not self.return_token_ids),
             max_total_tokens_param="max_model_len",
@@ -359,6 +453,7 @@ class CompletionRequest(OpenAIBaseModel):
             stop=self.stop,
             stop_token_ids=self.stop_token_ids,
             logprobs=self.logprobs,
+            logprob_token_ids=self.logprob_token_ids,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,
@@ -375,14 +470,48 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
-            steering_vectors=self.steering_vectors,
-            prefill_steering_vectors=self.prefill_steering_vectors,
-            decode_steering_vectors=self.decode_steering_vectors,
+            thinking_token_budget=self.thinking_token_budget,
+            steering_vectors=unpack_steering_vectors(self.steering_vectors),
+            prefill_steering_vectors=unpack_steering_vectors(
+                self.prefill_steering_vectors
+            ),
+            decode_steering_vectors=unpack_steering_vectors(
+                self.decode_steering_vectors
+            ),
             sae_clamp_specs=coerce_sae_clamp_specs(self.sae_clamp_specs),
         )
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)
+        if self.patch is not None:
+            sampling_params.patch = [dict(e) for e in self.patch]
+        if self.patch_vectors is not None:
+            sampling_params.patch_vectors = dict(self.patch_vectors)
         return sampling_params
+
+    def to_request_metadata(self, vector_registry=None) -> RequestMetadata:
+        """Build the request-level metadata channel for this request.
+
+        Holds host-side per-request fields that are not sampling parameters
+        (the conversation id and declarative steering gates); threaded to the
+        worker alongside the client request id rather than on
+        ``SamplingParams``. Named vector sources in ``steering`` are resolved
+        via *vector_registry*; raises ``ValueError`` on a malformed spec or
+        unknown name (surfaced by the caller as HTTP 400).
+        """
+        from vllm.v1.steering_schema import build_steering_gates
+
+        return RequestMetadata(
+            conversation_id=self.conversation_id,
+            steering=build_steering_gates(self.steering, vector_registry),
+        )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_null_max_tokens(cls, data):
+        if isinstance(data, dict) and data.get("max_tokens") is None:
+            data = data.copy()
+            data["max_tokens"] = cls.model_fields["max_tokens"].default
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -409,6 +538,9 @@ class CompletionRequest(OpenAIBaseModel):
                     "'json_schema' field must be provided.",
                     parameter="response_format",
                 )
+
+        if rf_type == "structural_tag":
+            validate_structural_tag_response_format(response_format)
 
         return data
 
@@ -437,6 +569,7 @@ class CompletionRequest(OpenAIBaseModel):
                 "outputs ('json', 'regex' or 'choice').",
                 parameter="structured_outputs",
             )
+        validate_structured_outputs_structural_tag(structured_outputs_kwargs)
         return data
 
     @model_validator(mode="before")
@@ -487,8 +620,9 @@ class CompletionRequest(OpenAIBaseModel):
         )
 
         if prompt_is_empty and embeds_is_empty:
-            raise ValueError(
-                "Either prompt or prompt_embeds must be provided and non-empty."
+            raise VLLMValidationError(
+                "Either prompt or prompt_embeds must be provided and non-empty.",
+                parameter="prompt",
             )
 
         return data
@@ -499,8 +633,9 @@ class CompletionRequest(OpenAIBaseModel):
         if data.get("cache_salt") is not None and (
             not isinstance(data["cache_salt"], str) or not data["cache_salt"]
         ):
-            raise ValueError(
-                "Parameter 'cache_salt' must be a non-empty string if provided."
+            raise VLLMValidationError(
+                "Parameter 'cache_salt' must be a non-empty string if provided.",
+                parameter="cache_salt",
             )
         return data
 
@@ -528,6 +663,16 @@ class CompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None  # For response
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
+    # Per-token expert routing decisions, base64-encoded ``.npy`` bytes
+    # (numpy serialization). Shape after decode:
+    #   (num_tokens - 1, num_layers, num_experts_per_tok)  dtype uint8/uint16
+    # ``num_tokens - 1`` because the last sampled token has not been
+    # forwarded yet and therefore has no routing data.
+    # Decode:
+    #   np.load(io.BytesIO(base64.b64decode(s)))
+    # ``None`` if (a) the request was aborted before any forward pass,
+    # or (b) ``enable_return_routed_experts`` is off server-side.
+    routed_experts: str | None = None
 
 
 class CompletionResponse(OpenAIBaseModel):

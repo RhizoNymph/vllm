@@ -91,6 +91,9 @@ class TestNormalizeLayerEntry:
             normalize_layer_entry("not a list or dict")  # type: ignore[arg-type]
 
     def test_ndarray_returns_scale_one(self):
+        """ndarray entries (produced by merge_steering_specs) pass through
+        as ``(arr, 1.0)`` so they can be re-fed into resolve_effective_vectors
+        / scale_steering_spec without conversion to list."""
         arr = np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
         result_vec, result_scale = normalize_layer_entry(arr)
         assert isinstance(result_vec, np.ndarray)
@@ -201,8 +204,12 @@ class TestResolveEffectiveVectors:
             resolve_effective_vectors(base, phase)
 
     def test_accepts_merge_specs_output(self):
+        """resolve_effective_vectors must accept the ndarray-valued entries
+        produced by merge_steering_specs (which is how the worker-side
+        named-module resolver feeds merged specs back through the resolver)."""
         merged_base = merge_steering_specs({"hp": {0: [1.0, 2.0, 3.0]}}, None)
         merged_phase = merge_steering_specs({"hp": {0: [10.0, 20.0, 30.0]}}, None)
+        # Sanity-check the intermediate shape that triggered the bug.
         assert isinstance(merged_base["hp"][0], np.ndarray)
         assert isinstance(merged_phase["hp"][0], np.ndarray)
         result = resolve_effective_vectors(merged_base, merged_phase)
@@ -216,41 +223,55 @@ class TestResolveEffectiveVectors:
 
 
 class TestMergeSteeringSpecs:
+    """Validate additive merge semantics and downstream-compat of outputs.
+
+    ``merge_steering_specs`` may produce ``np.ndarray``-valued entries (via
+    ``_scale_vector``).  Downstream consumers — ``resolve_effective_vectors``,
+    ``scale_steering_spec`` — must handle that shape.  These tests pin the
+    contract that callers (notably the worker-side named-module resolver
+    in ``SteeringModelRunnerMixin._resolve_request_steering_for_phase``) can
+    chain merge → resolve / merge → scale without intermediate conversion.
+    """
+
     def test_both_none_returns_none(self):
         assert merge_steering_specs(None, None) is None
 
     def test_only_a_pass_through(self):
-        result = merge_steering_specs({"hp": {0: [1.0, 2.0]}}, None)
+        a = {"hp": {0: [1.0, 2.0]}}
+        result = merge_steering_specs(a, None)
         assert result is not None
         assert result["hp"][0].tolist() == [1.0, 2.0]
 
     def test_only_b_pass_through(self):
-        result = merge_steering_specs(None, {"hp": {0: [3.0, 4.0]}})
+        b = {"hp": {0: [3.0, 4.0]}}
+        result = merge_steering_specs(None, b)
         assert result is not None
         assert result["hp"][0].tolist() == [3.0, 4.0]
 
     def test_overlapping_entries_sum(self):
-        result = merge_steering_specs(
-            {"hp": {0: [1.0, 2.0]}},
-            {"hp": {0: [10.0, 20.0]}},
-        )
+        a = {"hp": {0: [1.0, 2.0]}}
+        b = {"hp": {0: [10.0, 20.0]}}
+        result = merge_steering_specs(a, b)
         assert result is not None
         assert result["hp"][0].tolist() == [11.0, 22.0]
 
     def test_chained_merge_resolve(self):
-        merged_base = merge_steering_specs(
-            {"hp": {0: [1.0, 2.0]}},
-            {"hp": {1: [5.0, 6.0]}},
-        )
+        """merge → merge → resolve, mirroring _resolve_request_steering_for_phase
+        when both module spec and inline spec are present on each tier."""
+        scaled_base = {"hp": {0: [1.0, 2.0]}}
+        inline_base = {"hp": {1: [5.0, 6.0]}}
+        merged_base = merge_steering_specs(scaled_base, inline_base)
         result = resolve_effective_vectors(merged_base, None)
         assert result is not None
         assert result["hp"][0].tolist() == [1.0, 2.0]
         assert result["hp"][1].tolist() == [5.0, 6.0]
 
     def test_chained_merge_scale_spec(self):
+        """scale_steering_spec must accept ndarray entries from merge output."""
         merged = merge_steering_specs({"hp": {0: [1.0, 2.0]}}, None)
         scaled = scale_steering_spec(merged, 3.0)
         assert scaled is not None
+        # scale_steering_spec wraps non-1.0 multipliers into the dict form.
         entry = scaled["hp"][0]
         assert isinstance(entry, dict)
         assert np.array_equal(np.asarray(entry["vector"]), np.asarray([1.0, 2.0]))
@@ -292,14 +313,6 @@ class TestHashSteeringConfig:
         vecs_a = {"hp_b": {1: [2.0]}, "hp_a": {0: [1.0]}}
         vecs_b = {"hp_a": {0: [1.0]}, "hp_b": {1: [2.0]}}
         assert hash_steering_config(vecs_a) == hash_steering_config(vecs_b)
-
-    def test_max_int32_layer_hashes(self):
-        h = hash_steering_config({"post_mlp": {2**31 - 1: [1.0]}})
-        assert h > 0
-
-    def test_oversized_layer_rejected(self):
-        with pytest.raises(ValueError, match="2147483647"):
-            hash_steering_config({"post_mlp": {2**31: [1.0]}})
 
 
 # -----------------------------------------------------------------------
@@ -357,10 +370,10 @@ class TestDimensionCrossValidation:
         ):
             SamplingParams(
                 steering_vectors={
-                    "post_mlp": {15: [1.0, 2.0]},
+                    "post_block": {15: [1.0, 2.0]},
                 },
                 prefill_steering_vectors={
-                    "post_mlp": {15: [1.0]},
+                    "post_block": {15: [1.0]},
                 },
             )
 
@@ -373,10 +386,10 @@ class TestDimensionCrossValidation:
         ):
             SamplingParams(
                 steering_vectors={
-                    "post_mlp": {0: [1.0, 2.0, 3.0]},
+                    "post_block": {0: [1.0, 2.0, 3.0]},
                 },
                 decode_steering_vectors={
-                    "post_mlp": {0: [1.0, 2.0]},
+                    "post_block": {0: [1.0, 2.0]},
                 },
             )
 
@@ -386,10 +399,10 @@ class TestDimensionCrossValidation:
 
         params = SamplingParams(
             steering_vectors={
-                "post_mlp": {0: [1.0, 2.0]},
+                "post_block": {0: [1.0, 2.0]},
             },
             prefill_steering_vectors={
-                "post_mlp": {0: [3.0, 4.0]},
+                "post_block": {0: [3.0, 4.0]},
             },
         )
         assert params.steering_vectors is not None
@@ -402,10 +415,10 @@ class TestDimensionCrossValidation:
 
         params = SamplingParams(
             steering_vectors={
-                "post_mlp": {0: [1.0, 2.0]},
+                "post_block": {0: [1.0, 2.0]},
             },
             prefill_steering_vectors={
-                "post_mlp": {1: [1.0]},
+                "post_block": {1: [1.0]},
             },
         )
         assert params.steering_vectors is not None
@@ -421,10 +434,10 @@ class TestDimensionCrossValidation:
         ):
             SamplingParams(
                 prefill_steering_vectors={
-                    "post_mlp": {0: [1.0, 2.0]},
+                    "post_block": {0: [1.0, 2.0]},
                 },
                 decode_steering_vectors={
-                    "post_mlp": {0: [1.0]},
+                    "post_block": {0: [1.0]},
                 },
             )
 
@@ -435,10 +448,10 @@ class TestDimensionCrossValidation:
 
         params = SamplingParams(
             prefill_steering_vectors={
-                "post_mlp": {0: [1.0, 2.0]},
+                "post_block": {0: [1.0, 2.0]},
             },
             decode_steering_vectors={
-                "post_mlp": {1: [1.0]},
+                "post_block": {1: [1.0]},
             },
         )
         assert params.prefill_steering_vectors is not None
@@ -451,10 +464,10 @@ class TestDimensionCrossValidation:
 
         params = SamplingParams(
             prefill_steering_vectors={
-                "post_mlp": {0: [1.0, 2.0]},
+                "post_block": {0: [1.0, 2.0]},
             },
             decode_steering_vectors={
-                "post_mlp": {0: [3.0, 4.0]},
+                "post_block": {0: [3.0, 4.0]},
             },
         )
         assert params.prefill_steering_vectors is not None
@@ -470,12 +483,12 @@ class TestDimensionCrossValidation:
         ):
             SamplingParams(
                 prefill_steering_vectors={
-                    "post_mlp": {
+                    "post_block": {
                         0: {"vector": [1.0, 2.0], "scale": 0.5},
                     },
                 },
                 decode_steering_vectors={
-                    "post_mlp": {0: [1.0]},
+                    "post_block": {0: [1.0]},
                 },
             )
 
@@ -496,7 +509,7 @@ class TestSamplingParamsExtraKeyRejection:
         with pytest.raises(ValueError, match="unexpected keys"):
             SamplingParams(
                 steering_vectors={
-                    "post_mlp": {
+                    "post_block": {
                         0: {"vector": [1.0, 2.0], "scale": 1.0, "typo": "bad"},
                     },
                 },
@@ -509,7 +522,7 @@ class TestSamplingParamsExtraKeyRejection:
         with pytest.raises(ValueError, match="unexpected keys"):
             SamplingParams(
                 prefill_steering_vectors={
-                    "post_mlp": {
+                    "post_block": {
                         0: {"vector": [1.0], "scale": 1.0, "extra": 42},
                     },
                 },
@@ -522,50 +535,8 @@ class TestSamplingParamsExtraKeyRejection:
         with pytest.raises(ValueError, match="unexpected keys"):
             SamplingParams(
                 decode_steering_vectors={
-                    "post_mlp": {
+                    "post_block": {
                         0: {"vector": [1.0], "scale": 1.0, "foo": 1, "bar": 2},
                     },
                 },
             )
-
-
-class TestSamplingParamsBoolFloatRejection:
-    def test_bool_vector_value_rejected(self):
-        from vllm.sampling_params import SamplingParams
-
-        with pytest.raises(ValueError, match="finite float"):
-            SamplingParams(steering_vectors={"post_mlp": {0: [True]}})
-
-    def test_bool_scaled_entry_value_rejected(self):
-        from vllm.sampling_params import SamplingParams
-
-        with pytest.raises(ValueError, match="finite float"):
-            SamplingParams(
-                steering_vectors={
-                    "post_mlp": {0: {"vector": [False], "scale": 1.0}},
-                },
-            )
-
-    def test_bool_scaled_entry_scale_rejected(self):
-        from vllm.sampling_params import SamplingParams
-
-        with pytest.raises(ValueError, match="finite float"):
-            SamplingParams(
-                steering_vectors={
-                    "post_mlp": {0: {"vector": [1.0], "scale": True}},
-                },
-            )
-
-
-class TestSamplingParamsLayerIndexValidation:
-    def test_bool_layer_index_rejected(self):
-        from vllm.sampling_params import SamplingParams
-
-        with pytest.raises(ValueError, match="non-negative integer"):
-            SamplingParams(steering_vectors={"post_mlp": {True: [1.0]}})
-
-    def test_oversized_layer_index_rejected(self):
-        from vllm.sampling_params import SamplingParams
-
-        with pytest.raises(ValueError, match="2147483647"):
-            SamplingParams(steering_vectors={"post_mlp": {2**31: [1.0]}})

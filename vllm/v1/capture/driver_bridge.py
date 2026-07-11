@@ -29,7 +29,7 @@ import logging
 import queue
 import threading
 import time
-from typing import ClassVar, Literal
+from typing import Literal
 
 import torch.multiprocessing as mp
 
@@ -56,7 +56,7 @@ class _DriverQueueShim:
     treat it identically to an in-process ``_BatchedAdapter``.
     """
 
-    location: ClassVar[Literal["worker"]] = "worker"
+    location: Literal["worker", "driver"] = "worker"
 
     def __init__(
         self,

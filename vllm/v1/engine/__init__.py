@@ -18,6 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.capture.types import CaptureResult
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.request_metadata import RequestMetadata
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -75,7 +76,13 @@ class EngineCoreReadyResponse:
 
     max_model_len: int
     num_gpu_blocks: int
+    block_size: int
     dp_stats_address: str | None
+    dtype: str
+    vllm_version: str
+    # KV cache capacity (None for encoder-only/attention-free models).
+    kv_cache_size_tokens: int | None = None
+    kv_cache_max_concurrency: float | None = None
 
 
 class EngineCoreRequest(
@@ -120,8 +127,20 @@ class EngineCoreRequest(
     # Used in outputs and to support abort(req_id, internal=False).
     external_req_id: str | None = None
 
+    # Request-level host-side metadata (conversation id, and future
+    # declarative steering specs). Distinct from sampling parameters: it does
+    # not influence sampling, so it rides here alongside ``external_req_id``
+    # rather than on ``SamplingParams``. ``None`` when the request set none.
+    request_metadata: RequestMetadata | None = None
+
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
+
+    # If True, the request should be added to the scheduler's waiting queue
+    # and immediately aborted, so connector-side cleanup runs via the standard
+    # request_finished hook. Used to free P-side prefill blocks when a
+    # KV-transfer request is rejected on the D node before engine admission.
+    abort_immediately: bool = False
 
     @property
     def params(self) -> SamplingParams | PoolingParams:
@@ -227,6 +246,12 @@ class EngineCoreOutputs(
     timestamp: float = 0.0
 
     utility_output: UtilityOutput | None = None
+    # Capture results that finalized AFTER their request finished (writes are
+    # asynchronous). Keyed by request_id; routed by the output processor to
+    # ``capture_wait`` waiters since the per-request output stream is closed.
+    late_capture_results: dict[str, dict[str, CaptureResult]] = msgspec.field(
+        default_factory=dict
+    )
     finished_requests: set[str] | None = None
 
     # In DP case, used to signal that the current wave of requests

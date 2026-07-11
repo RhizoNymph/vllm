@@ -1,153 +1,164 @@
-# Repository Overview
+# Overview
 
-This repository is a fork of [vllm-project/vllm](https://github.com/vllm-project/vllm)
-that adds **activation steering** as a first-class runtime feature.
-This overview is scoped to fork-specific work; for general vLLM
-internals, refer to the upstream documentation under `docs/design/`,
-`docs/features/`, and `docs/serving/`.
+This document indexes the interpretability-infrastructure features built on this
+vLLM fork. They share one data plane — the residual-stream hook points
+(`pre_attn`, `post_attn`, `post_block`) and the persistent-buffer + opaque-op
+discipline that keeps interventions CUDA-graph-safe — and layer on each other:
+capture taps the residual, steering adds to it, patching overwrites it, the
+patch source store reuses the capture pipeline, and the dynamic-steering
+control plane closes the capture → steering feedback loop in-process.
 
-## Description
+```yaml
+Overview:
+  description: >
+    Residual-stream interpretability primitives for vLLM — capture, steering,
+    and activation patching — sharing one graph-safe data plane and reusing
+    each other's machinery, plus a dynamic-steering control plane that closes
+    the activation -> steering feedback loop (monitor a residual, decide a
+    policy, actuate steering) at the engine step granularity.
+  subsystems:
+    data_plane: >
+      Per-(layer, hook) residual-stream hook points folded into
+      apply_layer_steering / apply_block_steering. Persistent buffers + opaque
+      ops (mutates_args=[]) so a FULL cudagraph replay reads each step's values.
+      Buffers attach at model build via register_steering_buffers; disabled mode
+      constant-folds out of the forward.
+    control_plane: >
+      Per-request specs on SamplingParams / RequestMetadata, resolved
+      rank-locally in the model runner (v1 and v2), with scheduler
+      admission/backpressure and prefix-cache floors. Runner-agnostic mixins
+      hold the shared logic; thin per-runner accessors project the batch.
+    stores: >
+      Capture consumers (entry-point plugins) sink tapped activations; the
+      run-id-keyed PatchSourceStore holds clean-run activations for patching.
+    dynamic_steering: >
+      The loop joining capture and steering: an action vocabulary
+      (SteeringVectorUpdate / RequestSteeringOverride / SteeringScaleUpdate /
+      SteeringMonitorUpdate) carried from consumers to the runner via a sync
+      on_step return or an async action queue, applied before the next step.
+      Steering state lives in per-layer persistent GPU tables (global
+      prefill/decode rows, per-request rows, a dynamic additive tier, per-row
+      scales, in-graph monitor gates) mutated between steps and visible to
+      CUDA-graph replay.
+  data_flow: >
+    Steering loop: forward pass -> capture hook writes residual to persistent
+    buffers -> (sync) StepCaptureView handed to each sync consumer's on_step on
+    the step thread -> consumer returns steering actions -> runner applies them
+    to the steering tables before the next step builds its steering_index; OR
+    (async) chunks dispatched -> consumer.on_capture -> action queue -> drained
+    at the top of the next step.
+    Patching: a clean prompt is captured once (patch_source consumer ->
+    PatchSourceStore); destination requests carry patch specs; the runner
+    resolves source vectors and writes per-(layer, hook) buffers before the
+    forward; the apply path overwrites/interpolates the residual, then steering
+    adds on top. The /v1/patch_sweep endpoint fans a (hooks x layers x
+    positions) grid through continuous batching for one-call causal-tracing
+    sweeps; when the referenced source run is missing and clean_prompt is given
+    it auto-captures the clean run first. Large grids can stream per-cell
+    results over SSE (stream: true / client on_cell).
 
-Goal: serve large language models with the standard vLLM stack
-(continuous batching, prefix caching, `torch.compile`, CUDA graphs,
-TP/PP) **and** allow injection of activation steering — both
-precomputed additive vectors (today) and SAE-based feature surgery
-(see [`features/sae_steering.md`](features/sae_steering.md))
-— into the residual stream of decoder layers, with phase-aware
-per-request and global tiers.
-
-## Subsystems
-
-The fork-specific runtime spans four cooperating subsystems:
-
-1. **Hook-point library**
-   `vllm/model_executor/layers/steering.py` plus
-   `vllm/model_executor/layers/steering_kernel.py`. Defines the
-   per-(hook, layer) buffer layout, the `apply_steering` custom op,
-   and the Triton fast-path. Decoder-layer modules call
-   `apply_layer_steering(...)` at three positions in the residual
-   stream: `pre_attn`, `post_attn`, `post_mlp`.
-
-2. **Per-worker steering manager**
-   `vllm/v1/worker/steering_manager.py`. Owns the row allocator and
-   ref-counter for per-request configs, plus the global-tier vector
-   cache. Materializes the per-layer table buffers each step from
-   the (small) cached state. Shared-nothing across ranks; row IDs
-   stay synchronized via deterministic replay rather than any
-   cross-rank collective.
-
-3. **Model-runner integration**
-   `vllm/v1/worker/steering_model_runner_mixin.py`. Threads steering
-   through admission, phase transitions (prefill→decode), capture
-   consumers, and resumption. Drives `populate_steering_tables`
-   exactly when the manager is dirty.
-
-4. **API surface**
-   - Global steering: `vllm/entrypoints/serve/steering/api_router.py`
-     (`POST /v1/steering/{set,clear}`, `GET /v1/steering`,
-     `GET /v1/steering/layers`).
-   - Named modules: `vllm/entrypoints/openai/steering/registry.py`
-     and `vllm/entrypoints/serve/steering/modules_router.py`.
-   - Per-request steering: fields on `SamplingParams`, surfaced
-     through the OpenAI-compatible server's `extra_body`.
-   - CLI: `--enable-steering`, `--max-steering-configs`,
-     `--steering-modules`, `--steering-api-key`.
-
-## Data Flow
-
-Across one inference step:
-
+Features Index:
+  activation_capture:
+    description: >
+      Tap residual-stream activations during inference and content-address them
+      into a CPU store via pluggable capture consumers (async chunks off the
+      critical path, or sync consumers reading zero-copy GPU views on the step
+      thread immediately post-forward).
+    entry_points:
+      - vllm.capture_consumers (entry-point group)
+      - "SamplingParams.capture"
+      - vllm/v1/capture/consumer.py (CaptureConsumer, SyncCaptureConsumer)
+      - vllm/v1/capture/registry.py (entry-point load, build, sync validation)
+      - vllm/v1/capture/config.py (graphsafe-key resolution at config build)
+    depends_on: []
+    doc: docs/features/capture_consumers.md
+  activation_steering:
+    description: >
+      Per-request, per-token, CUDA-graph-safe additive intervention on the
+      residual stream (three tiers, three hook points).
+    entry_points: ["SamplingParams.steering_vectors", "--enable-steering"]
+    depends_on: [activation_capture]
+    doc: docs/features/steering.md
+  activation_patching:
+    description: >
+      Overwrite/interpolate residual activations at (layer, hook, position)
+      sites with a source vector — a prior clean run's captured activations
+      (causal tracing), a named steering module / reserved "zeros", or a
+      client-provided packed patch_vectors row — optionally through a per-dim
+      mask (alpha·mask folded into a per-dim alpha table). Includes a
+      server-side (hooks × layers × positions) sweep endpoint (capture- or
+      vector-sourced) with SSE streaming and source-run lifecycle.
+    entry_points:
+      ["SamplingParams.patch", "SamplingParams.patch_vectors", "--enable-patching", "POST /v1/patch_sweep"]
+    depends_on: [activation_capture, activation_steering]
+    doc: docs/features/activation_patching.md
+  dynamic_steering:
+    description: >
+      Monitor -> policy -> actuate control plane; sync/async consumers emit
+      steering actions applied with 1 (sync) or 1-3 (async) step latency.
+    entry_points:
+      - vllm/v1/capture/step_view.py (StepCaptureView / StepRequestView)
+      - vllm/v1/worker/steering_action_queue.py (action vocabulary + queue)
+    depends_on: [activation_capture, activation_steering]
+    doc: docs/design/dynamic_steering.md
+  consumer_controller_base:
+    description: >
+      The SyncCaptureConsumer contract ABC and the SteeringController base.
+      SyncCaptureConsumer encodes the sync contract (on_step +
+      global_capture_spec abstract; declared_graphsafe_keys defaulted to [])
+      so an incomplete consumer fails clearly at construction instead of deep
+      in config-build. SteeringController sits on top and owns per-request
+      lifecycle, conversation scoping (bounded FIFO), and the
+      trigger->latch->bridge pattern; subclasses implement only decide().
+    entry_points:
+      - vllm/v1/capture/consumer.py (SyncCaptureConsumer)
+      - vllm/v1/capture/controller.py (SteeringController)
+      - examples/.../minimal_examples.py (_SyncBase, ConversationLatchExample)
+    depends_on: [activation_capture, dynamic_steering]
+    doc: docs/design/dynamic_steering.md  # §5.6
+  declarative_per_request_steering:
+    description: >
+      A client attaches its own conditional steering to a request (a nested list
+      of when x scope x apply gates in RequestMetadata.steering) with NO
+      server-registered consumer. A built-in auto-registered consumer maps gates
+      to the steering substrate: probe x this_token gates run in-graph via the
+      per-row monitor; other scopes are host-latched (reusing SteeringController).
+      Vector sources are name-first (a probe/steer registry mirrored to every
+      worker) with an inline base64 packed escape hatch; a NamedVec rides the wire
+      un-inflated and resolves worker-side at admission. rest_of_conversation add
+      persists server-side by reference to a registered name (inline refused) and
+      bridges later turns by re-resolving the name with a digest guard; operator
+      consumers win over client gates.
+    entry_points:
+      - vllm/v1/steering_schema.py (gate schema + resolve/build)
+      - vllm/v1/capture/declarative.py (DeclarativeSteeringConsumer)
+      - vllm/v1/capture/controller.py (ByRefLatch + latch/bridge)
+      - vllm/v1/worker/steering_vector_registry.py (worker named-vector registry)
+      - vllm/entrypoints/openai/steering/vector_registry.py (frontend mirror)
+      - vllm/entrypoints/serve/steering/vectors_router.py (admin endpoints)
+    depends_on: [dynamic_steering, consumer_controller_base]
+    doc: docs/design/dynamic_steering.md  # §8.2
+  sae_steering:
+    description: >
+      Per-(layer, hook) SAE feature surgery in two variants. Delta: encode the
+      live residual, replace a small set of feature activations with
+      caller-supplied clamp values, add the resulting decoder-direction delta
+      back into the residual. Full reconstruction: replace the residual with
+      decode(activate(encode(h))) + b_dec, optionally with the same clamps
+      applied to the activation before decode (Scaling Monosemanticity /
+      Golden Gate semantics). Clamp tables use row 0 as no-op sentinel, rows
+      1/2 as global prefill/decode tiers, rows 3+ per-request; full-recon rows
+      are gated per-site by an active-row table and keyed by FR-only phase
+      hashes. Both variants compose with the additive tier and reuse its
+      admission, scheduler-capacity, TP/PP, and prefix-cache machinery, with
+      independent capacity pools per manager.
+    entry_points:
+      - vllm/model_executor/layers/sae_steering.py (apply_layer_sae_delta)
+      - vllm/model_executor/layers/sae_full_reconstruction.py (apply_layer_sae_full_reconstruction)
+      - vllm/v1/worker/sae_clamp_manager.py (SAEClampManager)
+      - vllm/v1/worker/sae_full_reconstruction_manager.py (SAEFullReconstructionManager)
+      - "SamplingParams.sae_clamp_specs / SamplingParams.sae_full_reconstruction_specs"
+      - "POST /v1/steering/modules/register with kind: sae_delta | sae_full_reconstruction"
+    depends_on: [activation_steering]
+    doc: docs/features/sae_steering.md
 ```
-Engine receives request
-   ├── SamplingParams.steering_* validated and hashed
-   │     -> prefill_steering_config_hash, decode_steering_config_hash
-   └── Scheduler reserves additive and/or SAE steering row capacity
-       before dispatch
-
-Worker receives SchedulerOutput
-   ├── Mixin: register/release rows for new+finished requests
-   ├── Mixin: phase-transition handler (prefill -> decode) re-binds row
-   ├── Mixin: populate_steering_tables(...) if manager dirty
-   │     -> writes per-layer steering_table_{pre_attn,post_attn,post_mlp}
-   └── Mixin: writes steering_index[t] for each token slot
-
-Model forward (under torch.compile / CUDA graph):
-   for each decoder layer:
-       residual = apply_layer_steering(residual, PRE_ATTN)
-       ... attention ...
-       residual = apply_layer_steering(residual, POST_ATTN)
-       ... mlp ...
-       residual = apply_layer_steering(residual, POST_MLP)
-   # apply_layer_steering composition order (each stage is independently
-   # gated by a static hasattr check on its per-layer buffer):
-   #   1. additive gather/add by steering_index
-   #   2. SAE delta when SAE delta buffers are attached
-   #   3. SAE full reconstruction when full-recon buffers are attached
-
-Engine collects outputs
-   └── On request finish: SteeringManager.release_config drops refcounts
-```
-
-Global API mutations are broadcast to every worker via
-`collective_rpc`. Prefix-cache keying for prefill-affecting tiers is
-folded into the standard cache hash.
-
-## Features Index
-
-### Activation Steering (additive vectors)
-
-- description: Precomputed direction vectors added into the residual
-  stream at one of three hook points per layer. Three-tier additive
-  composition (base / prefill / decode), phase-aware admission,
-  named-module registry, distributed under TP/PP.
-- entry_points:
-    - `vllm.model_executor.layers.steering.apply_layer_steering`
-    - `vllm.v1.worker.steering_manager.SteeringManager`
-    - `POST /v1/steering/set`, `POST /v1/steering/modules/register`
-    - `SamplingParams.steering_vectors` (and `prefill_*`, `decode_*`,
-      `steering_module_ref`)
-- depends_on: vLLM scheduler, prefix cache, custom-op machinery, TP/PP
-  comms, `torch.compile`/CUDA graph integration.
-- doc: [`features/steering.md`](features/steering.md)
-- design: [`design/steering_runtime.md`](design/steering_runtime.md)
-
-### SAE-Based Steering (delta + full reconstruction)
-
-- description: Per-(layer, hook) SAE feature surgery in two variants.
-  **Delta**: encode the live residual, replace a small set of
-  feature activations with caller-supplied clamp values, add the
-  resulting decoder-direction delta back into the residual.  **Full
-  reconstruction**: replace the residual entirely with the SAE's
-  `decode(activate(encode(h))) + b_dec`, optionally with the same
-  per-(layer, hook) clamps applied to the activation before decode
-  (Anthropic Scaling Monosemanticity / Golden Gate Claude
-  semantics).  Both variants compose additively with the existing
-  additive tier and use the same admission, TP/PP, and prefix-cache
-  machinery.
-- entry_points:
-    - `vllm.model_executor.layers.sae_steering.apply_layer_sae_delta`
-    - `vllm.model_executor.layers.sae_full_reconstruction.apply_layer_sae_full_reconstruction`
-    - `vllm.v1.worker.sae_clamp_manager.SAEClampManager`
-    - `vllm.v1.worker.sae_full_reconstruction_manager.SAEFullReconstructionManager`
-    - `POST /v1/steering/modules/register` with
-      `kind: "sae_delta"` or `kind: "sae_full_reconstruction"`
-    - `SamplingParams.sae_clamp_specs` (delta) and
-      `SamplingParams.sae_full_reconstruction_specs` (replacement)
-- depends_on: Activation Steering runtime patterns (runner mixin,
-  named-module registry, custom-op shim, scheduler admission, and
-  prefix-cache key folding). SAE rows are owned by parallel
-  `SAEClampManager` and `SAEFullReconstructionManager`s, each with
-  its own row table per (layer, hook) site.
-- doc: [`features/sae_steering.md`](features/sae_steering.md)
-
-## Where to Read Next
-
-- New to the steering runtime? Start with
-  [`features/steering.md`](features/steering.md) for the user-facing
-  surface, then [`design/steering_runtime.md`](design/steering_runtime.md)
-  for invariants and the distributed contract.
-- Working on the SAE path? Read
-  [`features/sae_steering.md`](features/sae_steering.md) and verify
-  the open design questions there before writing code.
-- Working on a non-fork part of vLLM? Use the upstream docs index at
-  [`README.md`](README.md).
