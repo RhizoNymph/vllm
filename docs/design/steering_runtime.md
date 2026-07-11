@@ -118,6 +118,64 @@ points reuse the same row mapping but look up different per-hook tables.
 That is why steering supports multiple hook points without multiplying the
 per-token bookkeeping cost.
 
+## Directional Clamps
+
+Clamping is a third intervention methodology (alongside additive steering
+and patch/replace) that constrains the hidden state's scalar projection
+along up to K unit directions per steering row:
+
+```text
+p     = h · v̂                       # fp32 accumulate
+delta = strength · (clip(p, lo, hi) − p)
+h'    = h + delta · v̂               # orthogonal complement untouched
+```
+
+`lo == hi` pins a feature, `lo == hi == 0` is directional ablation,
+one-sided bounds suppress only over/under-expression. It is the first
+*state-dependent* intervention: the delta depends on `h` itself, so a
+token already in bounds is untouched.
+
+Runtime design decisions:
+
+- **Clamps ride the steering row machinery.** They are part of a request's
+  steering config identity: folded into the prefill/decode config hashes
+  (behind a domain separator; vector-only hashes are bit-for-bit
+  unchanged), so scheduler admission, row allocation, refcounting, and
+  prefix-cache keys all work unchanged. A clamp-only request has a nonzero
+  hash and registers a (possibly vector-empty) manager row.
+- **Per-layer per-hook buffers**, row-congruent with the steering tables
+  and gathered via the shared `steering_index`:
+  `steering_clamp_dirs_{hook}` `(rows, K, hidden)` in model dtype (row 0 is
+  the all-zero no-op sentinel), `steering_clamp_bounds_{hook}`
+  `(rows, K, 2)` fp32 (default `[-inf, +inf]`),
+  `steering_clamp_strength_{hook}` `(rows, K)` fp32, plus a per-hook
+  `any_active` flag. `K = steering_config.max_clamp_directions` (part of
+  `compute_hash`; 0 disables clamping and no buffers attach).
+- **Row composition is concatenation, not addition** — clamps are
+  independent constraints. Row 1 = concat(global base, global prefill);
+  row 2 = concat(global base, global decode); config rows =
+  concat(global base, global phase, per-request), capped at K with a loud
+  error naming the site; dynamic-override rows inherit the global decode
+  composition (overrides carry no clamps).
+- **Two custom ops**, `apply_clamp` and `apply_clamp_block`
+  (non-mutating, fresh output — cudagraph-safe; Triton on CUDA, eager
+  reference on CPU). The `post_block` variant reconstructs the true block
+  output `residual + hidden` and folds the correction into `residual`,
+  because clamping (like replace) does not commute through the deferred
+  MLP add.
+- **Emission order** at every hook: capture → patch → steer (add) →
+  **clamp last**, so the additive term cannot push the projection back
+  out of bounds. Emission is a `hasattr` static branch — servers without
+  clamping trace no clamp ops.
+- **Directions are unit-normalized at ingestion**
+  (`SamplingParams.__post_init__`, which msgspec runs on decode, so one
+  seam covers the Python HTTP, offline LLM, and Rust msgpack paths).
+  Bounds live in unit-projection space.
+- Named modules may carry a clamps tier (concatenated before inline
+  entries at worker resolution; the module-level scale does NOT apply to
+  clamps). Global clamps ride `/v1/steering/set` (`clamps` /
+  `prefill_clamps` / `decode_clamps`) and share its prefix-cache reset.
+
 ## Phase Semantics
 
 The critical invariant is:
