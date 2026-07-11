@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import math
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
 
@@ -56,6 +56,7 @@ class SteeringModuleKind(str, Enum):
 
     ADDITIVE = "additive"
     SAE_DELTA = "sae_delta"
+    SAE_FULL_RECONSTRUCTION = "sae_full_reconstruction"
 
 
 class SAEActivation(str, Enum):
@@ -521,3 +522,287 @@ def _sae_spec_sort_key(
             layer_items.append((layer_idx, entries))
         hook_items.append((hook_name, tuple(layer_items)))
     return (spec.module_name, phase_override or spec.phase, tuple(hook_items))
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: full-reconstruction spec types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SAEFullReconstructionSpec:
+    """Per-request directive for the SAE full-reconstruction path.
+
+    Sibling of :class:`SAEClampSpec` for the *replacement* variant
+    (Anthropic Scaling Monosemanticity / Golden Gate Claude
+    semantics).  A request that carries a full-reconstruction spec
+    has its residual stream **replaced** by the SAE reconstruction
+    at every site declared by the named module's manifest, with
+    optional per-(hook, layer) clamps applied to the activations
+    before the decoder pass.
+
+    Differences from :class:`SAEClampSpec`:
+
+    * **``clamps`` may be empty.**  Pure reconstruction (no
+      activation modifications) is a meaningful op for this kind:
+      the residual is replaced by ``decode(activate(encode(h))) +
+      b_dec``, which is the SAE's reconstruction with its
+      (irreducible) error.  Callers wanting Golden-Gate-style
+      *amplification* set clamp entries; callers wanting the bare
+      replacement leave ``clamps`` empty.
+    * **Sites are implicit.**  Where :class:`SAEClampSpec` only
+      activates the (hook, layer) sites named in ``clamps``, a
+      full-reconstruction spec activates *every* site declared by
+      the named module's manifest.  ``clamps`` keys must therefore
+      be a subset of those manifest sites — validated at
+      admission time.
+
+    Hashing: see :func:`hash_sae_full_reconstruction_specs`; the
+    digest folds into :func:`hash_steering_config` so prefix-cache
+    keys reflect *whether* a request opted into a full-reconstruction
+    module — replacement and perturbation have different cache
+    invariants.
+    """
+
+    module_name: str
+    clamps: SAEClampHookMap = field(default_factory=dict)
+    phase: SAEClampPhase = "both"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.module_name, str) or not self.module_name:
+            raise ValueError(
+                "SAEFullReconstructionSpec.module_name must be a non-empty "
+                f"str, got {self.module_name!r}."
+            )
+        if self.phase not in ("both", "prefill", "decode"):
+            raise ValueError(
+                "SAEFullReconstructionSpec.phase must be 'both', 'prefill', "
+                f"or 'decode', got {self.phase!r}."
+            )
+        if not isinstance(self.clamps, dict):
+            raise ValueError(
+                "SAEFullReconstructionSpec.clamps must be a dict, got "
+                f"{type(self.clamps).__name__}."
+            )
+        coerced: SAEClampHookMap = {}
+        for hook_name, layer_map in self.clamps.items():
+            if hook_name not in VALID_HOOK_POINT_NAMES:
+                raise ValueError(
+                    f"SAEFullReconstructionSpec.clamps key {hook_name!r} is "
+                    f"not a valid hook point.  Valid: "
+                    f"{sorted(VALID_HOOK_POINT_NAMES)}."
+                )
+            if not isinstance(layer_map, dict) or not layer_map:
+                raise ValueError(
+                    f"SAEFullReconstructionSpec.clamps[{hook_name!r}] must "
+                    "be a non-empty dict mapping layer indices to clamp-"
+                    "entry tuples."
+                )
+            coerced_layer: SAEClampLayerMap = {}
+            for layer_idx, entries in layer_map.items():
+                if not isinstance(layer_idx, int) or layer_idx < 0:
+                    raise ValueError(
+                        f"SAEFullReconstructionSpec.clamps[{hook_name!r}] "
+                        f"keys must be non-negative integers, got "
+                        f"{layer_idx!r}."
+                    )
+                if not isinstance(entries, (list, tuple)) or not entries:
+                    raise ValueError(
+                        f"SAEFullReconstructionSpec.clamps[{hook_name!r}]"
+                        f"[{layer_idx}] must be a non-empty sequence of "
+                        f"SAEClampEntry, got {type(entries).__name__}."
+                    )
+                feature_seen: set[int] = set()
+                for entry in entries:
+                    if not isinstance(entry, SAEClampEntry):
+                        raise ValueError(
+                            f"SAEFullReconstructionSpec.clamps"
+                            f"[{hook_name!r}][{layer_idx}] entries must "
+                            f"all be SAEClampEntry, got "
+                            f"{type(entry).__name__}."
+                        )
+                    if entry.feature_idx in feature_seen:
+                        raise ValueError(
+                            f"SAEFullReconstructionSpec.clamps"
+                            f"[{hook_name!r}][{layer_idx}] contains "
+                            f"duplicate feature_idx={entry.feature_idx}; "
+                            "each feature may appear at most once per "
+                            "(hook, layer)."
+                        )
+                    feature_seen.add(entry.feature_idx)
+                coerced_layer[layer_idx] = tuple(entries)
+            coerced[hook_name] = coerced_layer
+        object.__setattr__(self, "clamps", coerced)
+
+
+def coerce_sae_full_reconstruction_specs(
+    raw: object,
+) -> tuple[SAEFullReconstructionSpec, ...] | None:
+    """Coerce a JSON payload into ``tuple[SAEFullReconstructionSpec, ...]``.
+
+    Mirrors :func:`coerce_sae_clamp_specs` for the full-reconstruction
+    spec type.  Returns ``None`` for empty input so downstream code
+    can short-circuit on ``is None``.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            "sae_full_reconstruction_specs must be a list of spec objects, "
+            f"got {type(raw).__name__}."
+        )
+    if not raw:
+        return None
+    out: list[SAEFullReconstructionSpec] = []
+    for i, item in enumerate(raw):
+        if isinstance(item, SAEFullReconstructionSpec):
+            out.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"sae_full_reconstruction_specs[{i}] must be a dict or "
+                f"SAEFullReconstructionSpec, got {type(item).__name__}."
+            )
+        module_name_raw = item.get("module_name")
+        if not isinstance(module_name_raw, str):
+            raise ValueError(
+                f"sae_full_reconstruction_specs[{i}]['module_name'] must be "
+                f"a str, got {type(module_name_raw).__name__}."
+            )
+        module_name: str = module_name_raw
+        phase = item.get("phase", "both")
+        clamps_raw = item.get("clamps") or {}
+        if not isinstance(clamps_raw, dict):
+            raise ValueError(
+                f"sae_full_reconstruction_specs[{i}]['clamps'] must be a "
+                f"dict, got {type(clamps_raw).__name__}."
+            )
+        clamps: SAEClampHookMap = {}
+        for hook_name, layer_map_raw in clamps_raw.items():
+            if not isinstance(layer_map_raw, dict):
+                raise ValueError(
+                    f"sae_full_reconstruction_specs[{i}]['clamps']"
+                    f"[{hook_name!r}] must be a dict mapping layer indices "
+                    f"to entry lists, got {type(layer_map_raw).__name__}."
+                )
+            layer_map: SAEClampLayerMap = {}
+            for layer_key, entries_raw in layer_map_raw.items():
+                layer_idx = int(layer_key)
+                if not isinstance(entries_raw, (list, tuple)):
+                    raise ValueError(
+                        f"sae_full_reconstruction_specs[{i}]['clamps']"
+                        f"[{hook_name!r}][{layer_key!r}] must be a list of "
+                        f"entries, got {type(entries_raw).__name__}."
+                    )
+                entries: list[SAEClampEntry] = []
+                for entry_raw in entries_raw:
+                    if isinstance(entry_raw, SAEClampEntry):
+                        entries.append(entry_raw)
+                        continue
+                    if not isinstance(entry_raw, dict):
+                        raise ValueError(
+                            f"sae_full_reconstruction_specs[{i}]['clamps']"
+                            f"[{hook_name!r}][{layer_key!r}] entries must "
+                            f"be dicts or SAEClampEntry."
+                        )
+                    entries.append(
+                        SAEClampEntry(
+                            feature_idx=int(entry_raw["feature_idx"]),
+                            kind=entry_raw["kind"],
+                            value=float(entry_raw["value"]),
+                            only_if_active=bool(entry_raw.get("only_if_active", False)),
+                        )
+                    )
+                layer_map[layer_idx] = tuple(entries)
+            clamps[hook_name] = layer_map
+        out.append(
+            SAEFullReconstructionSpec(
+                module_name=module_name,
+                clamps=clamps,
+                phase=phase,
+            )
+        )
+    return tuple(out)
+
+
+def hash_sae_full_reconstruction_specs(
+    specs: tuple[SAEFullReconstructionSpec, ...] | None,
+) -> int:
+    """Deterministic SHA-256 hash of full-reconstruction specs.
+
+    Mirrors :func:`hash_sae_clamp_specs`'s ordering and encoding rules
+    but writes a distinct domain separator (``b"\\x00sae_full_recon\\x00"``)
+    so a delta clamp tuple can never collide with a full-reconstruction
+    tuple even on identical clamp content — the two paths produce
+    different residual streams and must not share prefix-cache keys.
+
+    Returns 0 for ``None`` or empty input.  Composes with
+    :func:`hash_steering_config`.
+    """
+    if not specs:
+        return 0
+    return _hash_sae_full_reconstruction_specs_with_phase(specs)
+
+
+def _hash_sae_full_reconstruction_specs_with_phase(
+    specs: tuple[SAEFullReconstructionSpec, ...],
+    *,
+    phase_override: Literal["prefill", "decode"] | None = None,
+) -> int:
+    """Hash *specs*, optionally replacing each spec phase in the digest."""
+    h = hashlib.sha256()
+    h.update(b"\x00sae_full_recon\x00")
+    for spec in sorted(
+        specs, key=lambda s: (s.module_name, phase_override or s.phase)
+    ):
+        h.update(b"\x01module\x01")
+        h.update(spec.module_name.encode("utf-8"))
+        h.update((phase_override or spec.phase).encode("utf-8"))
+        for hook_name in sorted(spec.clamps.keys()):
+            h.update(b"\x02hook\x02")
+            h.update(hook_name.encode("utf-8"))
+            layer_map = spec.clamps[hook_name]
+            for layer_idx in sorted(layer_map.keys()):
+                h.update(b"\x03layer\x03")
+                h.update(
+                    validate_steering_index(
+                        layer_idx, "SAEFullReconstructionSpec layer_idx"
+                    ).to_bytes(4, "little", signed=True)
+                )
+                entries = sorted(layer_map[layer_idx], key=lambda e: e.feature_idx)
+                for entry in entries:
+                    h.update(b"\x04entry\x04")
+                    h.update(
+                        validate_steering_index(
+                            entry.feature_idx, "SAEClampEntry.feature_idx"
+                        ).to_bytes(4, "little", signed=True)
+                    )
+                    h.update(b"a" if entry.kind == "absolute" else b"r")
+                    h.update(struct.pack("<d", float(entry.value)))
+                    h.update(b"\x01" if entry.only_if_active else b"\x00")
+    return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+
+
+def hash_sae_full_reconstruction_specs_for_phase(
+    specs: tuple[SAEFullReconstructionSpec, ...] | None,
+    phase: Literal["prefill", "decode"],
+) -> int:
+    """Hash full-reconstruction table content for one worker phase.
+
+    Mirrors :func:`hash_sae_clamp_specs_for_phase`: drop specs that
+    don't apply to *phase*, then hash the remainder with each
+    surviving spec's phase canonicalised to *phase*.  Lets the SAE
+    full-reconstruction manager share rows by actual table content
+    across worker phases without weakening prefix-cache isolation
+    of the request-side hash.
+    """
+    if phase not in ("prefill", "decode"):
+        raise ValueError(f"phase must be 'prefill' or 'decode', got {phase!r}.")
+    if not specs:
+        return 0
+    phase_specs = tuple(spec for spec in specs if spec.phase in ("both", phase))
+    if not phase_specs:
+        return 0
+    return _hash_sae_full_reconstruction_specs_with_phase(
+        phase_specs, phase_override=phase
+    )
