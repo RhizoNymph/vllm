@@ -336,9 +336,7 @@ def normalize_clamp_entry(
     bounds, or ``strength`` outside ``[0, 1]``.
     """
     if not isinstance(entry, dict):
-        raise TypeError(
-            f"Clamp entry must be a dict, got {type(entry).__name__}"
-        )
+        raise TypeError(f"Clamp entry must be a dict, got {type(entry).__name__}")
     allowed = {"vector", "value", "min", "max", "strength"}
     extra = set(entry.keys()) - allowed
     if extra:
@@ -353,9 +351,7 @@ def normalize_clamp_entry(
     has_min = entry.get("min") is not None
     has_max = entry.get("max") is not None
     if has_value and (has_min or has_max):
-        raise ValueError(
-            "Clamp entry 'value' is mutually exclusive with 'min'/'max'"
-        )
+        raise ValueError("Clamp entry 'value' is mutually exclusive with 'min'/'max'")
     if has_value:
         val = float(entry["value"])
         if math.isnan(val) or math.isinf(val):
@@ -373,15 +369,11 @@ def normalize_clamp_entry(
                 f"Clamp entry bounds must not be NaN, got min={lo}, max={hi}"
             )
         if lo > hi:
-            raise ValueError(
-                f"Clamp entry min ({lo}) must be <= max ({hi})"
-            )
+            raise ValueError(f"Clamp entry min ({lo}) must be <= max ({hi})")
 
     strength = float(entry.get("strength", 1.0))
     if math.isnan(strength) or not (0.0 <= strength <= 1.0):
-        raise ValueError(
-            f"Clamp entry strength must be in [0, 1], got {strength}"
-        )
+        raise ValueError(f"Clamp entry strength must be in [0, 1], got {strength}")
 
     arr = np.asarray(entry["vector"], dtype=np.float64)
     if arr.ndim != 1 or arr.size == 0:
@@ -936,9 +928,7 @@ def maybe_pack_inline_steering_for_request(
             ("prefill_steering_vectors", sp.prefill_steering_vectors),
             ("decode_steering_vectors", sp.decode_steering_vectors),
         ):
-            validate_spec_row_widths(
-                spec, expected_row_width, field_name=field_name
-            )
+            validate_spec_row_widths(spec, expected_row_width, field_name=field_name)
 
     np_dtype = _torch_dtype_to_pack_dtype(torch_dtype)
 
