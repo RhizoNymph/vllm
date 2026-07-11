@@ -92,8 +92,10 @@ def _apply_clamp_kernel(
     hidden_row_ptr = hidden_ptr + pid_n * h_stride_n
     out_row_ptr = out_ptr + pid_n * o_stride_n
 
+    # ``steering_index`` is int64; the initializer must match its dtype or
+    # Triton rejects the branch redefinition (int32[] vs int64[]).
     active = tl.load(active_ptr)
-    row = 0
+    row = tl.full([], 0, tl.int64)
     if active != 0:
         row = tl.load(index_ptr + pid_n)
 
@@ -197,8 +199,10 @@ def _apply_clamp_block_kernel(
     residual_row_ptr = residual_ptr + pid_n * r_stride_n
     out_row_ptr = out_ptr + pid_n * o_stride_n
 
+    # ``steering_index`` is int64; the initializer must match its dtype or
+    # Triton rejects the branch redefinition (int32[] vs int64[]).
     active = tl.load(active_ptr)
-    row = 0
+    row = tl.full([], 0, tl.int64)
     if active != 0:
         row = tl.load(index_ptr + pid_n)
 
