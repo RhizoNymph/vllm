@@ -2,7 +2,7 @@
 #SBATCH --job-name=jlens-serve-glm52
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
-#SBATCH --time=12:00:00
+#SBATCH --time=72:00:00  # long-lived demo server; override with sbatch --time=
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 #
