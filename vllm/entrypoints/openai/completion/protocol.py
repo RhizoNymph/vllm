@@ -12,6 +12,7 @@ from pydantic import Field, model_validator
 from vllm.config import ModelConfig
 from vllm.config.steering_types import (
     SteeringVectorSpecPacked,
+    coerce_clamp_spec,
     unpack_steering_vectors,
 )
 from vllm.config.utils import replace
@@ -279,6 +280,29 @@ class CompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
+    # Per-request directional clamps (legacy JSON form only; see the chat
+    # protocol's steering_clamps for the entry shape).
+    steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-request directional clamps applied to both "
+        "phases, keyed by hook point then layer index; each value is a "
+        "list of clamp entries ({'vector': [...], 'min': float?, 'max': "
+        "float?, 'strength': float=1.0} or {'vector': [...], 'value': c} "
+        "to pin).",
+    )
+
+    prefill_steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Phase-specific clamps concatenated after base during "
+        "prefill only. Same format as steering_clamps.",
+    )
+
+    decode_steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Phase-specific clamps concatenated after base during "
+        "decode only. Same format as steering_clamps.",
+    )
+
     conversation_id: str | None = Field(
         default=None,
         description="Opaque client conversation/session id. Carried as "
@@ -465,6 +489,9 @@ class CompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
+            steering_clamps=coerce_clamp_spec(self.steering_clamps),
+            prefill_steering_clamps=coerce_clamp_spec(self.prefill_steering_clamps),
+            decode_steering_clamps=coerce_clamp_spec(self.decode_steering_clamps),
         )
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)

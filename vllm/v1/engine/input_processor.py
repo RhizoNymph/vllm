@@ -180,19 +180,28 @@ class InputProcessor:
             or params.prefill_steering_vectors is not None
             or params.decode_steering_vectors is not None
         )
-        if not has_steering:
+        has_clamps = (
+            params.steering_clamps is not None
+            or params.prefill_steering_clamps is not None
+            or params.decode_steering_clamps is not None
+        )
+        if not has_steering and not has_clamps:
             return
         if not self.steering_config:
             raise ValueError(
-                "Per-request steering vectors were provided but steering "
-                "is not enabled. Start the server with --enable-steering "
-                "to use per-request steering vectors."
+                "Per-request steering vectors/clamps were provided but "
+                "steering is not enabled. Start the server with "
+                "--enable-steering to use per-request steering."
             )
         # Width gate: SamplingParams validation is model-blind, and a
         # wrong-width row shape-crashes the worker's steering table
         # population — reject here (frontend process, request-level error)
         # on every path: online HTTP, offline LLM(), and the Rust frontend.
-        from vllm.config.steering_types import validate_spec_row_widths
+        from vllm.config.steering_types import (
+            resolve_effective_clamps,
+            validate_clamp_row_widths,
+            validate_spec_row_widths,
+        )
 
         expected = self.model_config.get_hidden_size()
         for field_name, spec in (
@@ -201,6 +210,32 @@ class InputProcessor:
             ("decode_steering_vectors", params.decode_steering_vectors),
         ):
             validate_spec_row_widths(spec, expected, field_name=field_name)
+        if has_clamps:
+            max_dirs = int(getattr(self.steering_config, "max_clamp_directions", 0))
+            if max_dirs <= 0:
+                raise ValueError(
+                    "Per-request clamps were provided but clamping is "
+                    "disabled (steering_config.max_clamp_directions=0)."
+                )
+            for field_name, cspec in (
+                ("steering_clamps", params.steering_clamps),
+                ("prefill_steering_clamps", params.prefill_steering_clamps),
+                ("decode_steering_clamps", params.decode_steering_clamps),
+            ):
+                validate_clamp_row_widths(cspec, expected, field_name=field_name)
+            # Per-site K cap after the tier concat — reject over-budget
+            # requests here (request-level error) rather than crashing the
+            # step thread at manager materialization.
+            resolve_effective_clamps(
+                params.steering_clamps,
+                params.prefill_steering_clamps,
+                max_directions=max_dirs,
+            )
+            resolve_effective_clamps(
+                params.steering_clamps,
+                params.decode_steering_clamps,
+                max_directions=max_dirs,
+            )
 
     def _get_mm_identifier(
         self,
