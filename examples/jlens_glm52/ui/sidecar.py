@@ -250,15 +250,18 @@ async def _generate_pane(
         if with_readout
         else None
     )
-    # With the server-side reasoning parser (--reasoning-parser), thinking
-    # arrives as `reasoning_content` deltas and the answer as `content` with
-    # NO <think> tags. Route by field: reasoning_content -> think, content ->
-    # answer. Tag-splitting is kept only as a fallback for a server WITHOUT
-    # the parser (literal <think>...</think> inside content); it engages the
-    # first time a literal tag appears and defaults to answer otherwise.
-    channel = "answer"
+    # GLM-5.2 thinking (no reasoning parser): the chat template PRE-OPENS the
+    # think block in the prompt, so generation is reasoning text terminated by
+    # a bare "</think>" (there is no opening tag in the stream), then the
+    # answer. So start in the think channel when thinking is enabled and flip
+    # to answer at "</think>". When thinking is disabled there is no block and
+    # everything is the answer. (`reasoning_content` deltas, if a server-side
+    # parser is ever enabled, are still routed to think.)
+    thinking_enabled = payload.get("chat_template_kwargs", {}).get(
+        "enable_thinking", True
+    )
+    channel = "think" if thinking_enabled else "answer"
     carry = ""
-    tag_mode = False
     try:
         async with httpx.AsyncClient(timeout=900) as client:
             async with client.stream(
@@ -288,13 +291,6 @@ async def _generate_pane(
                         continue
                     delta = d.get("content")
                     if not delta:
-                        continue
-                    if not tag_mode and ("<think>" in delta or "</think>" in delta):
-                        tag_mode = True  # no-parser server: tags are inline
-                        channel = "think"
-                    if not tag_mode:
-                        await put({"type": "token", "pane": pane,
-                                   "channel": "answer", "text": delta})
                         continue
                     buf = carry + delta
                     carry = ""
