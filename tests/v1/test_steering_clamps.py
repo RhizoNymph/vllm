@@ -41,9 +41,7 @@ class TestNormalizeClampEntry:
         assert strength == 1.0
 
     def test_unit_normalization_float64(self):
-        vec, _, _, _ = normalize_clamp_entry(
-            {"vector": [1e-3, 0.0, 0.0], "max": 1.0}
-        )
+        vec, _, _, _ = normalize_clamp_entry({"vector": [1e-3, 0.0, 0.0], "max": 1.0})
         assert vec.dtype == np.float64
         assert math.isclose(float(np.linalg.norm(vec)), 1.0, rel_tol=1e-12)
         assert vec[0] == 1.0
@@ -208,9 +206,7 @@ class TestHashSteeringClamps:
         assert hash_steering_config(None, clamps={}) == 0
 
     def test_clamps_change_hash(self):
-        assert hash_steering_config(_VEC) != hash_steering_config(
-            _VEC, clamps=_CLAMP
-        )
+        assert hash_steering_config(_VEC) != hash_steering_config(_VEC, clamps=_CLAMP)
 
     def test_bounds_change_hash(self):
         a = {"post_block": {0: [_entry([1.0, 0.0, 0.0], 4.0)]}}
@@ -279,15 +275,11 @@ class TestSamplingParamsClamps:
 
     def test_invalid_hook_rejected(self):
         with pytest.raises(ValueError, match="hook"):
-            SamplingParams(
-                steering_clamps={"not_a_hook": {0: [_entry([1.0], 1.0)]}}
-            )
+            SamplingParams(steering_clamps={"not_a_hook": {0: [_entry([1.0], 1.0)]}})
 
     def test_negative_layer_rejected(self):
         with pytest.raises(ValueError, match="non-negative"):
-            SamplingParams(
-                steering_clamps={"post_block": {-1: [_entry([1.0], 1.0)]}}
-            )
+            SamplingParams(steering_clamps={"post_block": {-1: [_entry([1.0], 1.0)]}})
 
     def test_zero_vector_rejected(self):
         with pytest.raises(ValueError, match="zero"):
@@ -297,9 +289,7 @@ class TestSamplingParamsClamps:
 
     def test_entries_must_be_list(self):
         with pytest.raises(ValueError, match="list"):
-            SamplingParams(
-                steering_clamps={"post_block": {0: _entry([1.0], 1.0)}}
-            )
+            SamplingParams(steering_clamps={"post_block": {0: _entry([1.0], 1.0)}})
 
     def test_effective_prefill_clamps_concat(self):
         sp = SamplingParams(
@@ -376,9 +366,7 @@ class TestSamplingParamsClamps:
         sp = SamplingParams(
             steering_clamps={"post_block": {0: [_entry([1.0, 0.0], 1.0)]}}
         )
-        maybe_pack_inline_steering_for_request(
-            sp, torch.float32, expected_row_width=2
-        )
+        maybe_pack_inline_steering_for_request(sp, torch.float32, expected_row_width=2)
         assert sp.steering_clamps is not None
 
     def test_from_optional_threads_clamps(self):

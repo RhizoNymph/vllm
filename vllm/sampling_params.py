@@ -785,9 +785,7 @@ class SamplingParams(
             if not isinstance(entry["source_run"], str):
                 raise ValueError(f"patch[{i}]['source_run'] must be a str")
             if "source_position" not in entry:
-                raise ValueError(
-                    f"patch[{i}]: source_run requires source_position"
-                )
+                raise ValueError(f"patch[{i}]: source_run requires source_position")
             if not isinstance(entry["source_position"], int):
                 raise ValueError(f"patch[{i}]['source_position'] must be an int")
         elif has_module:
@@ -799,9 +797,7 @@ class SamplingParams(
                 raise ValueError(f"patch[{i}]['source_inline'] must be an int")
             self._require_patch_row(i, "source_inline", idx, n_rows)
 
-    def _validate_patch_mask(
-        self, i: int, mask: Any, n_rows: int | None
-    ) -> None:
+    def _validate_patch_mask(self, i: int, mask: Any, n_rows: int | None) -> None:
         """Structural check on an optional per-entry ``mask``."""
         if mask is None:
             return
@@ -811,8 +807,7 @@ class SamplingParams(
         has_inline = mask.get("inline") is not None
         if has_indices == has_inline:
             raise ValueError(
-                f"patch[{i}]['mask'] must set exactly one of "
-                f"'indices' | 'inline'"
+                f"patch[{i}]['mask'] must set exactly one of 'indices' | 'inline'"
             )
         if has_indices:
             indices = mask["indices"]
@@ -834,9 +829,7 @@ class SamplingParams(
     ) -> None:
         """A ``source_inline`` / mask inline index must reference a real row."""
         if n_rows is None:
-            raise ValueError(
-                f"patch[{i}]: {what} index {idx} requires patch_vectors"
-            )
+            raise ValueError(f"patch[{i}]: {what} index {idx} requires patch_vectors")
         if not (0 <= idx < n_rows):
             raise ValueError(
                 f"patch[{i}]: {what} index {idx} out of range [0, {n_rows})"
@@ -1400,11 +1393,7 @@ class SamplingParams(
                     else -1
                 ),
                 str(e.get("source_module") or ""),
-                (
-                    int(e["source_inline"])
-                    if e.get("source_inline") is not None
-                    else -1
-                ),
+                (int(e["source_inline"]) if e.get("source_inline") is not None else -1),
                 repr(e.get("mask")),
                 float(e.get("alpha", 1.0)),
             )

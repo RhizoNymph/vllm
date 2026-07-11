@@ -163,6 +163,19 @@ def register_steering_buffers(
     if max_steering_configs == 0:
         return
     table_dtype = dtype if dtype is not None else torch.float32
+    # Directional-clamp buffers ride the steering row space (row-congruent
+    # with the steering tables, gathered via the shared ``steering_index``),
+    # so unlike patch they are registered after the steering-disabled early
+    # return.  Lazy import: ``clamp`` imports hook-point constants from this
+    # module.  No-op unless ``max_clamp_directions > 0``.
+    from vllm.model_executor.layers.clamp import maybe_register_clamp_buffers
+
+    maybe_register_clamp_buffers(
+        module,
+        hidden_size,
+        num_rows=max_steering_configs + 3,
+        dtype=table_dtype,
+    )
     for hp in SteeringHookPoint:
         module.register_buffer(
             HOOK_POINT_TABLE_ATTR[hp],
@@ -584,6 +597,7 @@ def apply_layer_steering(
     of the layer's lifetime, so ``torch.compile`` traces it as a static
     branch and the disabled path emits no steering kernel at all.
     """
+    from vllm.model_executor.layers.clamp import maybe_apply_clamp
     from vllm.model_executor.layers.patch import maybe_apply_patch
 
     maybe_capture_residual(hidden_states, module.layer_idx, hook_point.value)
@@ -591,7 +605,11 @@ def apply_layer_steering(
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
     if not hasattr(module, table_attr):
         return hidden_states
-    return _emit_steering_op(module, hidden_states, hook_point)
+    hidden_states = _emit_steering_op(module, hidden_states, hook_point)
+    # Clamp runs LAST (capture -> patch -> steer -> clamp): it is a
+    # constraint on whatever leaves the site, so the additive term cannot
+    # push the projection back out of bounds.
+    return maybe_apply_clamp(module, hidden_states, hook_point)
 
 
 def apply_block_steering(
@@ -621,6 +639,7 @@ def apply_block_steering(
     from vllm.model_executor.layers.activation_capture import (
         get_active_capture_manager,
     )
+    from vllm.model_executor.layers.clamp import maybe_apply_clamp_block
     from vllm.model_executor.layers.patch import maybe_apply_patch_block
 
     if get_active_capture_manager() is not None:
@@ -640,6 +659,9 @@ def apply_block_steering(
     if not hasattr(module, table_attr):
         return hidden_states, residual
     residual = _emit_steering_op(module, residual, SteeringHookPoint.POST_BLOCK)
+    # Clamp runs LAST; the two-tensor variant constrains the true block
+    # output (residual + hidden) and folds the correction into residual.
+    residual = maybe_apply_clamp_block(module, hidden_states, residual)
     return hidden_states, residual
 
 
