@@ -333,7 +333,7 @@ def run_multi_api_server(args: argparse.Namespace):
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    listen_address, sock = setup_server(args)
+    listen_address, sock = setup_server(args, reuse_port=num_api_servers > 1)
 
     engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
 
@@ -417,7 +417,7 @@ def run_multi_api_server(args: argparse.Namespace):
             else:
                 expected_engine_start_index = 0
                 expected_engine_count = parallel_config.data_parallel_size
-            # Start rust front-end process on engine client index 0.
+            # Start rust front-end process.
             api_server_manager = RustFrontendProcessManager(
                 binary_path=rust_frontend_path,
                 sock=sock,

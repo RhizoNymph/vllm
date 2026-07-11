@@ -17,6 +17,7 @@ import ray
 from vllm import LLM
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.v1.executor import ray_executor_v2
 from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
 
 pytestmark = pytest.mark.usefixtures("enable_ray_v2_backend")
@@ -83,7 +84,13 @@ def assert_executor(executor, tp_size, pp_size):
     assert executor._get_output_rank() == expected_output_rank
 
     if pp_size > 1:
-        assert executor.vllm_config.max_concurrent_batches == pp_size
+        expected_concurrent_batches = pp_size + int(
+            executor.vllm_config.scheduler_config.async_scheduling
+            and executor.vllm_config.use_v2_model_runner
+        )
+        assert (
+            executor.vllm_config.max_concurrent_batches == expected_concurrent_batches
+        )
 
     executor.check_health()
     assert not executor.is_failed
@@ -93,6 +100,43 @@ def assert_executor(executor, tp_size, pp_size):
 
     for handle in executor.ray_worker_handles:
         assert handle.node_id is not None
+
+
+def test_select_tcpstore_port_seeds_disjoint_windows(monkeypatch):
+    """Co-located DP engines scan distinct, adjacent port windows, so two
+    engines on a node cannot pick the same TCPStore port."""
+    requested = []
+
+    def fake_get_open_port(start_port, max_attempts):
+        requested.append((start_port, max_attempts))
+        return start_port
+
+    monkeypatch.setattr(ray_executor_v2, "_get_open_port", fake_get_open_port)
+
+    ports = [
+        RayExecutorV2._select_tcpstore_port(rank, master_port=29500)
+        for rank in range(4)
+    ]
+
+    assert requested == [(29600, 32), (29632, 32), (29664, 32), (29696, 32)]
+    assert len(set(ports)) == 4
+
+
+def test_select_tcpstore_port_non_dp_uses_random(monkeypatch):
+    """A non-DP engine has no local rank and uses a random port."""
+    monkeypatch.setattr(ray_executor_v2, "get_open_port", lambda: 54321)
+    assert RayExecutorV2._select_tcpstore_port(None, master_port=29500) == 54321
+
+
+def test_select_tcpstore_port_full_window_uses_random(monkeypatch):
+    """A fully occupied window falls back to a random port."""
+
+    def raise_full(start_port, max_attempts):
+        raise RuntimeError("no open port")
+
+    monkeypatch.setattr(ray_executor_v2, "_get_open_port", raise_full)
+    monkeypatch.setattr(ray_executor_v2, "get_open_port", lambda: 54321)
+    assert RayExecutorV2._select_tcpstore_port(0, master_port=29500) == 54321
 
 
 @pytest.mark.parametrize("tp_size, pp_size", [(1, 1), (2, 1), (4, 1), (2, 2)])
@@ -343,72 +387,3 @@ def test_ray_v2_single_node_generation_with_pg(tp_size, pp_size):
         llm.llm_engine.model_executor.shutdown()
         del llm
         gc.collect()
-
-
-def _bare_executor(job_id: str | None) -> RayExecutorV2:
-    """Construct an executor shell without running __init__ or touching Ray."""
-    executor = object.__new__(RayExecutorV2)
-    executor._ray_job_id = job_id
-    return executor
-
-
-def test_worker_actors_killable_same_job():
-    """Handles from the current job are killable."""
-    executor = _bare_executor(job_id="01000000")
-    with (
-        patch.object(ray, "is_initialized", return_value=True),
-        patch("vllm.v1.executor.ray_executor_v2.ray.get_runtime_context") as mock_ctx,
-    ):
-        mock_ctx.return_value.get_job_id.return_value = "01000000"
-        assert executor._worker_actors_killable() is True
-
-
-def test_worker_actors_not_killable_stale_job():
-    """Handles from a different job are not killable (would raise
-    ActorHandleNotFoundError)."""
-    executor = _bare_executor(job_id="01000000")
-    with (
-        patch.object(ray, "is_initialized", return_value=True),
-        patch("vllm.v1.executor.ray_executor_v2.ray.get_runtime_context") as mock_ctx,
-    ):
-        mock_ctx.return_value.get_job_id.return_value = "02000000"
-        assert executor._worker_actors_killable() is False
-
-
-def test_worker_actors_not_killable_ray_down():
-    """When Ray is not initialized, actors are not killable."""
-    executor = _bare_executor(job_id="01000000")
-    with patch.object(ray, "is_initialized", return_value=False):
-        assert executor._worker_actors_killable() is False
-
-
-def test_worker_actors_not_killable_never_created():
-    """When actors were never created (init failed early), nothing to kill."""
-    executor = _bare_executor(job_id=None)
-    with patch.object(ray, "is_initialized", return_value=True):
-        assert executor._worker_actors_killable() is False
-
-
-def test_shutdown_skips_kill_on_stale_job():
-    """shutdown() must not call ray.kill() when the job changed."""
-    from vllm.v1.executor.ray_executor_v2 import RayWorkerHandle
-
-    executor = _bare_executor(job_id="01000000")
-    executor.shutdown_lock = threading.Lock()
-    executor.shutting_down = False
-    executor._monitor_thread = None
-    executor.ray_worker_handles = [
-        RayWorkerHandle(actor=object(), rank=0, local_rank=0, node_id="n0")
-    ]
-    executor.rpc_broadcast_mq = None
-    executor.response_mqs = []
-
-    with (
-        patch.object(ray, "is_initialized", return_value=True),
-        patch("vllm.v1.executor.ray_executor_v2.ray.get_runtime_context") as mock_ctx,
-        patch("vllm.v1.executor.ray_executor_v2.ray.kill") as mock_kill,
-    ):
-        mock_ctx.return_value.get_job_id.return_value = "02000000"
-        executor.shutdown()
-
-    mock_kill.assert_not_called()

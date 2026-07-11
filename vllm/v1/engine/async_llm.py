@@ -318,9 +318,7 @@ class AsyncLLM(EngineClient):
                 torch_dtype = None
             if torch_dtype is not None:
                 try:
-                    expected_row_width = (
-                        self.vllm_config.model_config.get_hidden_size()
-                    )
+                    expected_row_width = self.vllm_config.model_config.get_hidden_size()
                 except AttributeError:
                     expected_row_width = None
                 maybe_pack_inline_steering_for_request(
@@ -697,9 +695,7 @@ class AsyncLLM(EngineClient):
                     # by the engine core's idle loop after the owning request
                     # finished), so deliver them outside the slicing loop --
                     # zero outputs means zero slices.
-                    if late_capture := getattr(
-                        outputs, "late_capture_results", None
-                    ):
+                    if late_capture := getattr(outputs, "late_capture_results", None):
                         output_processor.process_outputs(
                             [],
                             outputs.timestamp,
@@ -1146,12 +1142,9 @@ class AsyncLLM(EngineClient):
             "init_weight_transfer_engine", kwargs={"init_info": init_info_dict}
         )
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+    async def start_weight_update(self) -> None:
         """Start a new weight update."""
-        await self.collective_rpc(
-            "start_weight_update",
-            kwargs={"is_checkpoint_format": is_checkpoint_format},
-        )
+        await self.collective_rpc("start_weight_update")
 
     async def update_weights(self, request: WeightTransferUpdateRequest) -> None:
         """
