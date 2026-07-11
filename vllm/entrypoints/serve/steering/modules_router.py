@@ -138,11 +138,17 @@ async def register_steering_module(
             vectors=vectors,
             prefill_vectors=prefill_vectors,
             decode_vectors=decode_vectors,
+            clamps=request.clamps,
+            prefill_clamps=request.prefill_clamps,
+            decode_clamps=request.decode_clamps,
         )
         # Push the freshly-registered module to every worker so requests
         # carrying ``SamplingParams.steering_module_ref`` resolve it
         # locally instead of forcing the API server to materialize the
-        # full vector spec into the multiprocessing payload.
+        # full vector spec into the multiprocessing payload. Clamp tiers
+        # are read back from the registry so the broadcast carries the
+        # coerced (int layer keys) form it validated.
+        registered = registry.get(request.name)
         engine = _engine_client(raw_request)
         await _broadcast_module_to_workers(
             engine,
@@ -151,6 +157,9 @@ async def register_steering_module(
                 "vectors": vectors,
                 "prefill_vectors": prefill_vectors,
                 "decode_vectors": decode_vectors,
+                "clamps": registered.clamps if registered else None,
+                "prefill_clamps": registered.prefill_clamps if registered else None,
+                "decode_clamps": registered.decode_clamps if registered else None,
             },
         )
         # Eagerly upload the module's vectors to the manager so the

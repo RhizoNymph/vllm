@@ -453,6 +453,39 @@ def resolve_effective_clamps(
     return result if result else None
 
 
+def coerce_clamp_spec(tier: dict | None) -> SteeringClampSpec | None:
+    """Return *tier* as a ``SteeringClampSpec``-shaped dict with int layer keys.
+
+    Clamp sibling of :func:`coerce_steering_spec` (no packed form to
+    detect): layer-index keys arriving as strings over JSON are coerced to
+    ``int``; entry lists pass through untouched (deep validation happens at
+    ``SamplingParams`` / worker ingestion via :func:`normalize_clamp_entry`).
+    Returns ``None`` if *tier* is ``None`` or empty; raises ``ValueError``
+    on a non-dict hook value or a non-integer layer key.
+    """
+    if not tier:
+        return None
+    result: SteeringClampSpec = {}
+    for hook, layer_entries in tier.items():
+        if not isinstance(layer_entries, dict):
+            raise ValueError(
+                f"Clamp tier {hook!r} must map layer indices to entry "
+                f"lists, got {type(layer_entries).__name__}"
+            )
+        coerced: dict[int, list[ClampEntry]] = {}
+        for layer_key, entries in layer_entries.items():
+            try:
+                coerced[int(layer_key)] = entries
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Clamp tier {hook!r} has invalid layer index "
+                    f"{layer_key!r}; expected an integer"
+                ) from exc
+        if coerced:
+            result[hook] = coerced
+    return result or None
+
+
 def validate_clamp_row_widths(
     spec: SteeringClampSpec | None,
     expected_width: int,

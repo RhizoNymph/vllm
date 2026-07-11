@@ -16,6 +16,7 @@ from pydantic import Field, PrivateAttr, model_serializer, model_validator
 from vllm.config import ModelConfig
 from vllm.config.steering_types import (
     SteeringVectorSpecPacked,
+    coerce_clamp_spec,
     unpack_steering_vectors,
 )
 from vllm.config.utils import replace
@@ -545,6 +546,34 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
+    # Per-request directional clamps. Legacy (unpacked) JSON form only —
+    # {hook: {layer: [ClampEntry, ...]}} with each entry {"vector": [...],
+    # "min": float?, "max": float?, "strength": float=1.0} or the sugar
+    # {"vector": [...], "value": c}. Layer keys arrive as strings over
+    # JSON and are int-coerced in to_sampling_params.
+    steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-request directional clamps applied to both "
+        "phases, keyed by hook point then layer index; each value is a "
+        "list of clamp entries ({'vector': [...], 'min': float?, 'max': "
+        "float?, 'strength': float=1.0} or {'vector': [...], 'value': c} "
+        "to pin). Each entry constrains the hidden state's projection "
+        "along its (unit-normalized) direction to [min, max]; unlike "
+        "steering_vectors, tiers merge by concatenation.",
+    )
+
+    prefill_steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Phase-specific clamps concatenated after base during "
+        "prefill only. Same format as steering_clamps.",
+    )
+
+    decode_steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Phase-specific clamps concatenated after base during "
+        "decode only. Same format as steering_clamps.",
+    )
+
     conversation_id: str | None = Field(
         default=None,
         description="Opaque client conversation/session id. Carried as "
@@ -813,6 +842,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
+            steering_clamps=coerce_clamp_spec(self.steering_clamps),
+            prefill_steering_clamps=coerce_clamp_spec(self.prefill_steering_clamps),
+            decode_steering_clamps=coerce_clamp_spec(self.decode_steering_clamps),
         )
         # Attach the capture dict (keyed by consumer name). The
         # entrypoint's ``_admit_capture`` mutates each value in place

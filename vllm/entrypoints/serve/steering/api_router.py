@@ -11,7 +11,9 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from vllm.config.steering_types import (
+    SteeringClampSpec,
     SteeringVectorSpec,
+    coerce_clamp_spec,
     coerce_steering_spec,
     normalize_layer_entry,
 )
@@ -166,6 +168,7 @@ async def set_steering(
     # shape; ``coerce_steering_spec`` decodes the latter to ndarray entries
     # that the downstream resolver/normalizer accepts transparently.
     tiers: dict[str, SteeringVectorSpec] = {}
+    clamp_tiers: dict[str, SteeringClampSpec] = {}
     try:
         if (v := coerce_steering_spec(request.vectors)) is not None:
             tiers["vectors"] = v
@@ -173,19 +176,26 @@ async def set_steering(
             tiers["prefill_vectors"] = v
         if (v := coerce_steering_spec(request.decode_vectors)) is not None:
             tiers["decode_vectors"] = v
+        if (c := coerce_clamp_spec(request.clamps)) is not None:
+            clamp_tiers["clamps"] = c
+        if (c := coerce_clamp_spec(request.prefill_clamps)) is not None:
+            clamp_tiers["prefill_clamps"] = c
+        if (c := coerce_clamp_spec(request.decode_clamps)) is not None:
+            clamp_tiers["decode_clamps"] = c
     except (KeyError, ValueError, TypeError) as err:
         return JSONResponse(
             content={"error": f"Malformed steering payload: {err}"},
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
 
-    if not tiers:
+    if not tiers and not clamp_tiers:
         return JSONResponse(
             content={
                 "error": (
-                    "No vectors provided. Include at least one of "
-                    "vectors, prefill_vectors, or decode_vectors "
-                    "with hook point/layer data."
+                    "No vectors or clamps provided. Include at least one "
+                    "of vectors, prefill_vectors, decode_vectors, clamps, "
+                    "prefill_clamps, or decode_clamps with hook "
+                    "point/layer data."
                 ),
             },
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -195,6 +205,10 @@ async def set_steering(
     all_invalid: set[str] = set()
     for spec in tiers.values():
         invalid = _validate_hook_points(spec)
+        if invalid:
+            all_invalid.update(invalid)
+    for cspec in clamp_tiers.values():
+        invalid = _validate_hook_points(cspec)
         if invalid:
             all_invalid.update(invalid)
     if all_invalid:
@@ -240,6 +254,9 @@ async def set_steering(
                     prefill_vectors=normalized_prefill,
                     decode_vectors=normalized_decode,
                     validate_only=True,
+                    clamps=clamp_tiers.get("clamps"),
+                    prefill_clamps=clamp_tiers.get("prefill_clamps"),
+                    decode_clamps=clamp_tiers.get("decode_clamps"),
                 ),
             )
             # Each worker now returns ``(tp_rank, pp_rank, valid_layers)``.
@@ -284,6 +301,9 @@ async def set_steering(
                 if tier:
                     for layer_vecs in tier.values():
                         requested_layers.update(layer_vecs.keys())
+            for ctier in clamp_tiers.values():
+                for layer_entries in ctier.values():
+                    requested_layers.update(layer_entries.keys())
 
             missing = requested_layers - validated_layers
             if missing:
@@ -320,6 +340,9 @@ async def set_steering(
                     decode_vectors=normalized_decode,
                     replace=request.replace,
                     validate_only=False,
+                    clamps=clamp_tiers.get("clamps"),
+                    prefill_clamps=clamp_tiers.get("prefill_clamps"),
+                    decode_clamps=clamp_tiers.get("decode_clamps"),
                 ),
             )
 
@@ -333,6 +356,9 @@ async def set_steering(
                 normalized_base is not None
                 or normalized_prefill is not None
                 or normalized_decode is not None
+                # Clamps alter hidden states (and thus KV) exactly like
+                # vectors do; any clamp tier change invalidates the cache.
+                or bool(clamp_tiers)
                 or request.replace  # replace clears all tiers
             )
             if affects_cache:
@@ -368,6 +394,8 @@ async def set_steering(
         for tier in (normalized_base, normalized_prefill, normalized_decode):
             if tier:
                 all_hooks.update(tier.keys())
+        for ctier in clamp_tiers.values():
+            all_hooks.update(ctier.keys())
 
         return JSONResponse(
             content={
@@ -522,9 +550,7 @@ async def get_dynamic_steering(raw_request: Request) -> JSONResponse:
         determinism = check_action_determinism(workers)
         if not determinism["consistent"]:
             _log_determinism_divergence(determinism["checksums"])
-        return JSONResponse(
-            content={"workers": workers, "determinism": determinism}
-        )
+        return JSONResponse(content={"workers": workers, "determinism": determinism})
     except Exception as err:
         logger.exception("Failed to get dynamic steering status")
         return JSONResponse(
