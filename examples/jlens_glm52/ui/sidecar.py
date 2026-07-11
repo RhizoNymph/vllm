@@ -250,14 +250,15 @@ async def _generate_pane(
         if with_readout
         else None
     )
-    # GLM-5.2's chat template pre-opens a <think> block: streamed content is
-    # reasoning until the closing tag. Label channels so the UI can render
-    # thinking distinctly; strip the tags themselves. Tags may split across
-    # deltas, so hold back a partial-tag suffix.
-    thinking_enabled = "chat_template_kwargs" not in payload
-    channel = "think" if thinking_enabled else "answer"
+    # With the server-side reasoning parser (--reasoning-parser), thinking
+    # arrives as `reasoning_content` deltas and the answer as `content` with
+    # NO <think> tags. Route by field: reasoning_content -> think, content ->
+    # answer. Tag-splitting is kept only as a fallback for a server WITHOUT
+    # the parser (literal <think>...</think> inside content); it engages the
+    # first time a literal tag appears and defaults to answer otherwise.
+    channel = "answer"
     carry = ""
-    parser_active = False  # server-side reasoning parser detected
+    tag_mode = False
     try:
         async with httpx.AsyncClient(timeout=900) as client:
             async with client.stream(
@@ -282,17 +283,19 @@ async def _generate_pane(
                     d = json.loads(data)["choices"][0].get("delta", {})
                     rc = d.get("reasoning_content")
                     if rc:
-                        # server-side reasoning parser (--reasoning-parser):
-                        # thinking arrives pre-segmented; content = answer
-                        parser_active = True
                         await put({"type": "token", "pane": pane,
                                    "channel": "think", "text": rc})
                         continue
                     delta = d.get("content")
                     if not delta:
                         continue
-                    if parser_active:
-                        channel = "answer"
+                    if not tag_mode and ("<think>" in delta or "</think>" in delta):
+                        tag_mode = True  # no-parser server: tags are inline
+                        channel = "think"
+                    if not tag_mode:
+                        await put({"type": "token", "pane": pane,
+                                   "channel": "answer", "text": delta})
+                        continue
                     buf = carry + delta
                     carry = ""
                     while buf:
@@ -378,8 +381,9 @@ async def generate(body: dict) -> StreamingResponse:
                 "jlens": {"hooks": {"post_block": BAND}, "positions": "all_generated"}
             },
         }
-        if not thinking:
-            p["chat_template_kwargs"] = {"enable_thinking": False}
+        # GLM-5.2's template defaults thinking OFF, so set it explicitly both
+        # ways — otherwise the "thinking" checkbox does nothing.
+        p["chat_template_kwargs"] = {"enable_thinking": thinking}
         if steered and steer:
             spec = LENS.steering_spec(
                 str(steer["word"]),
