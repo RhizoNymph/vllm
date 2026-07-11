@@ -321,7 +321,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, (spec,), "prefill")
+        row = manager.register_clamp_spec(123, (spec,), "prefill")
         # clampable_features=(2, 5) means feature_idx=5 maps to position 1.
         populate_sae_clamp_table(
             manager=manager,
@@ -334,11 +334,11 @@ class TestPopulateSaeClampTable:
         )
         kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
         value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
-        # Row 1, position 1 (feature_idx 5) gets the clamp.
-        assert kind[1, 1].item() == CLAMP_KIND_ABSOLUTE
-        assert value[1, 1].item() == 7.0
-        # Row 1, position 0 (feature_idx 2) stays NONE.
-        assert kind[1, 0].item() == CLAMP_KIND_NONE
+        # The per-request row, position 1 (feature_idx 5), gets the clamp.
+        assert kind[row, 1].item() == CLAMP_KIND_ABSOLUTE
+        assert value[row, 1].item() == 7.0
+        # Position 0 (feature_idx 2) stays NONE.
+        assert kind[row, 0].item() == CLAMP_KIND_NONE
         any_active = getattr(
             m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
         )
@@ -361,9 +361,9 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, (spec,), "prefill")
+        row = manager.register_clamp_spec(123, (spec,), "prefill")
         # This buffer site belongs to module 'other_module' — spec
-        # targets 'g'; row 1 must be zeroed at this site.
+        # targets 'g'; the per-request row must be zeroed at this site.
         populate_sae_clamp_table(
             manager=manager,
             module=m,
@@ -377,7 +377,7 @@ class TestPopulateSaeClampTable:
         any_active = getattr(
             m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
         )
-        assert torch.equal(kind[1], torch.zeros(2, dtype=torch.int8))
+        assert torch.equal(kind[row], torch.zeros(2, dtype=torch.int8))
         assert not any_active.item()
 
     def test_phase_filter_decode_only(self):
@@ -417,7 +417,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, (spec,), "decode")
+        row = manager.register_clamp_spec(123, (spec,), "decode")
         populate_sae_clamp_table(
             manager=manager,
             module=m,
@@ -429,8 +429,8 @@ class TestPopulateSaeClampTable:
         )
         kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
         value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
-        assert kind[1, 0].item() == CLAMP_KIND_ABSOLUTE
-        assert value[1, 0].item() == 9.0
+        assert kind[row, 0].item() == CLAMP_KIND_ABSOLUTE
+        assert value[row, 0].item() == 9.0
         any_active = getattr(
             m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
         )
@@ -454,7 +454,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, (decode_spec,), "decode")
+        row = manager.register_clamp_spec(123, (decode_spec,), "decode")
 
         populate_sae_clamp_table(
             manager=manager,
@@ -482,13 +482,13 @@ class TestPopulateSaeClampTable:
 
         kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
         value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
-        assert kind[1, 0].item() == CLAMP_KIND_ABSOLUTE
-        assert value[1, 0].item() == 9.0
+        assert kind[row, 0].item() == CLAMP_KIND_ABSOLUTE
+        assert value[row, 0].item() == 9.0
         assert any_active.item()
 
     def test_layer_with_no_clamps_in_spec_zeroed(self):
-        # Spec covers layer 20; site is layer 21 — row 1 must be zero
-        # at the layer-21 site.
+        # Spec covers layer 20; site is layer 21 — the per-request row
+        # must be zero at the layer-21 site.
         m = _layer_with_sae(
             hook=SteeringHookPoint.POST_MLP,
             n_clamp=1,
@@ -505,7 +505,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, (spec,), "prefill")
+        row = manager.register_clamp_spec(123, (spec,), "prefill")
         populate_sae_clamp_table(
             manager=manager,
             module=m,
@@ -516,7 +516,7 @@ class TestPopulateSaeClampTable:
             layer_idx=21,  # spec targets 20, this site is 21
         )
         kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
-        assert torch.equal(kind[1], torch.zeros(1, dtype=torch.int8))
+        assert torch.equal(kind[row], torch.zeros(1, dtype=torch.int8))
 
     def test_only_if_active_flag_propagates(self):
         m = _layer_with_sae(
@@ -542,7 +542,7 @@ class TestPopulateSaeClampTable:
                 }
             },
         )
-        manager.register_clamp_spec(123, (spec,), "prefill")
+        row = manager.register_clamp_spec(123, (spec,), "prefill")
         populate_sae_clamp_table(
             manager=manager,
             module=m,
@@ -555,12 +555,12 @@ class TestPopulateSaeClampTable:
         only = getattr(
             m, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
         )
-        assert bool(only[1, 0].item()) is True
+        assert bool(only[row, 0].item()) is True
 
-    def test_global_clamp_lands_on_row_zero(self):
+    def test_global_clamp_lands_on_phase_global_rows(self):
         # Global clamp at the manager level → populator writes it
-        # into row 0 so tokens with no per-request SAE clamps gather
-        # the global state from the no-op-or-global sentinel row.
+        # into rows 1/2 so tokens with no per-request SAE clamps gather
+        # phase-specific global state.
         m = _layer_with_sae(
             hook=SteeringHookPoint.POST_MLP,
             n_clamp=2,
@@ -596,10 +596,60 @@ class TestPopulateSaeClampTable:
             m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
         )
         # Position 1 corresponds to feature_idx=5 in clampable_features.
-        assert int(kind[0, 1].item()) == 1  # CLAMP_KIND_ABSOLUTE
-        assert float(value[0, 1].item()) == 3.5
-        assert int(kind[0, 0].item()) == 0  # other features untouched
+        assert int(kind[1, 1].item()) == 1  # prefill global row
+        assert float(value[1, 1].item()) == 3.5
+        assert int(kind[2, 1].item()) == 1  # decode global row
+        assert float(value[2, 1].item()) == 3.5
+        assert int(kind[0, 1].item()) == 0  # row 0 remains no-op
+        assert int(kind[1, 0].item()) == 0  # other features untouched
         assert bool(any_active.item()) is True
+
+    def test_phase_specific_globals_do_not_share_row(self):
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_MLP,
+            n_clamp=1,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="g",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        prefill_spec = SAEClampSpec(
+            module_name="g",
+            phase="prefill",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=5, kind="absolute", value=3.5),)
+                }
+            },
+        )
+        decode_spec = SAEClampSpec(
+            module_name="g",
+            phase="decode",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=5, kind="absolute", value=9.0),)
+                }
+            },
+        )
+        manager.set_global_clamps(
+            prefill_specs=(prefill_spec,),
+            decode_specs=(decode_spec,),
+        )
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="g",
+            clampable_features=(5,),
+            layer_idx=20,
+        )
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
+        assert int(kind[0, 0].item()) == CLAMP_KIND_NONE
+        assert int(kind[1, 0].item()) == CLAMP_KIND_ABSOLUTE
+        assert float(value[1, 0].item()) == 3.5
+        assert int(kind[2, 0].item()) == CLAMP_KIND_ABSOLUTE
+        assert float(value[2, 0].item()) == 9.0
 
     def test_global_clamp_merges_into_per_request_row(self):
         # A request with its own SAE clamp on a *different* feature
@@ -644,9 +694,10 @@ class TestPopulateSaeClampTable:
         )
         kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
         value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])
-        # Row 0 still carries the global clamp.
-        assert int(kind[0, 0].item()) == 1
-        assert float(value[0, 0].item()) == 1.0
+        # The prefill global row carries the global clamp.
+        assert int(kind[1, 0].item()) == 1
+        assert float(value[1, 0].item()) == 1.0
+        assert int(kind[0, 0].item()) == 0
         # Per-request row carries BOTH the global (position 0) AND the
         # request's own clamp (position 1).
         assert int(kind[row, 0].item()) == 1  # global applied here too
@@ -654,7 +705,7 @@ class TestPopulateSaeClampTable:
         assert int(kind[row, 1].item()) == 2  # CLAMP_KIND_ADDITIVE
         assert float(value[row, 1].item()) == 2.0
 
-    def test_clearing_globals_re_zeros_row_zero(self):
+    def test_clearing_globals_re_zeros_phase_global_rows(self):
         m = _layer_with_sae(
             hook=SteeringHookPoint.POST_MLP,
             n_clamp=2,
@@ -685,7 +736,8 @@ class TestPopulateSaeClampTable:
         )
         kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
         # Global active.
-        assert int(kind[0, 1].item()) == 1
+        assert int(kind[1, 1].item()) == 1
+        assert int(kind[2, 1].item()) == 1
         manager.clear_global_clamps()
         populate_sae_clamp_table(
             manager=manager,
@@ -695,7 +747,9 @@ class TestPopulateSaeClampTable:
             clampable_features=(2, 5),
             layer_idx=20,
         )
-        # Row 0 re-zeroed.
+        # Phase global rows re-zeroed; row 0 stays zero throughout.
+        assert int(kind[1, 1].item()) == 0
+        assert int(kind[2, 1].item()) == 0
         assert int(kind[0, 1].item()) == 0
 
     def test_unknown_feature_idx_in_spec_raises(self):

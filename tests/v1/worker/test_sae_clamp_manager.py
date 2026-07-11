@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for ``SAEClampManager``.
 
-The manager is a pure data structure that mirrors ``SteeringManager``
-but without the global-vector tier (SAE feature surgery has no
-"global" clamp): row 0 is the no-op sentinel and rows 1..max are
-per-(spec-hash, phase) configurations.
+The manager is a pure data structure that mirrors ``SteeringManager``:
+row 0 is the no-op sentinel, rows 1 and 2 are global prefill/decode
+tiers, and rows 3..max+2 are per-(spec-hash, phase) configurations.
 
 These tests exercise the manager in isolation — no GPU buffers, no
 worker mixin, no actual encoding/decoding.  Buffer materialization
@@ -53,31 +52,31 @@ def _make_spec(
 
 
 class TestRowAllocation:
-    """Row 0 is no-op; allocated rows start at 1, monotonically rising."""
+    """Rows 0..2 are reserved; allocated rows start at 3."""
 
     def test_initial_state_has_no_rows(self):
         m = SAEClampManager(max_sae_configs=4)
         assert m.config_to_row == {}
-        assert m.free_rows == [4, 3, 2, 1]
+        assert m.free_rows == [6, 5, 4, 3]
 
-    def test_register_returns_row_one_first(self):
+    def test_register_returns_row_three_first(self):
         m = SAEClampManager(max_sae_configs=4)
         row = m.register_clamp_spec(123, (_make_spec(),), "prefill")
-        assert row == 1
-        assert m.config_to_row == {(123, "prefill"): 1}
+        assert row == 3
+        assert m.config_to_row == {(123, "prefill"): 3}
 
     def test_register_consecutive_rows(self):
         m = SAEClampManager(max_sae_configs=4)
         r1 = m.register_clamp_spec(1, (_make_spec(value=1.0),), "prefill")
         r2 = m.register_clamp_spec(2, (_make_spec(value=2.0),), "prefill")
         r3 = m.register_clamp_spec(3, (_make_spec(value=3.0),), "prefill")
-        assert (r1, r2, r3) == (1, 2, 3)
+        assert (r1, r2, r3) == (3, 4, 5)
 
     def test_same_hash_same_phase_returns_existing_row_and_increments_refcount(self):
         m = SAEClampManager(max_sae_configs=4)
         r1 = m.register_clamp_spec(1, (_make_spec(),), "prefill")
         r2 = m.register_clamp_spec(1, (_make_spec(),), "prefill")
-        assert r1 == r2 == 1
+        assert r1 == r2 == 3
         assert m.config_refcounts[(1, "prefill")] == 2
 
     def test_same_sae_content_different_request_hash_aliases_row(self):
@@ -87,9 +86,9 @@ class TestRowAllocation:
         r1 = m.register_clamp_spec(1, (spec,), "prefill")
         r2 = m.register_clamp_spec(2, (spec,), "prefill")
 
-        assert r1 == r2 == 1
-        assert m.config_to_row[(1, "prefill")] == 1
-        assert m.config_to_row[(2, "prefill")] == 1
+        assert r1 == r2 == 3
+        assert m.config_to_row[(1, "prefill")] == 3
+        assert m.config_to_row[(2, "prefill")] == 3
         assert m.config_refcounts[(1, "prefill")] == 1
         assert m.config_refcounts[(2, "prefill")] == 1
         assert len(list(m.active_rows())) == 1
@@ -102,7 +101,7 @@ class TestRowAllocation:
         r1 = m.register_clamp_spec(1, (both,), "prefill")
         r2 = m.register_clamp_spec(2, (prefill,), "prefill")
 
-        assert r1 == r2 == 1
+        assert r1 == r2 == 3
         assert len(list(m.active_rows())) == 1
 
     def test_same_hash_different_phase_gets_new_row(self):
@@ -110,7 +109,7 @@ class TestRowAllocation:
         r_prefill = m.register_clamp_spec(1, (_make_spec(),), "prefill")
         r_decode = m.register_clamp_spec(1, (_make_spec(),), "decode")
         assert r_prefill != r_decode
-        assert {r_prefill, r_decode} == {1, 2}
+        assert {r_prefill, r_decode} == {3, 4}
 
 
 class TestCapacityContract:
@@ -160,16 +159,16 @@ class TestRefcounting:
         m = SAEClampManager(max_sae_configs=4)
         # Must not raise, must not alter free_rows.
         m.release_clamp_spec(999, "prefill")
-        assert m.free_rows == [4, 3, 2, 1]
+        assert m.free_rows == [6, 5, 4, 3]
 
 
 class TestGetRowForConfig:
-    """Lookup mirrors SteeringManager: hash 0 → no-op row, registered → assigned."""
+    """Lookup mirrors SteeringManager: hash 0 → global row."""
 
-    def test_hash_zero_returns_row_zero_for_both_phases(self):
+    def test_hash_zero_returns_phase_global_rows(self):
         m = SAEClampManager(max_sae_configs=4)
-        assert m.get_row_for_config(0, is_prefill=True) == 0
-        assert m.get_row_for_config(0, is_prefill=False) == 0
+        assert m.get_row_for_config(0, is_prefill=True) == 1
+        assert m.get_row_for_config(0, is_prefill=False) == 2
 
     def test_registered_hash_returns_assigned_row(self):
         m = SAEClampManager(max_sae_configs=4)
@@ -201,7 +200,7 @@ class TestActiveRowsEnumeration:
         m.register_clamp_spec(30, (_make_spec(module_name="c"),), "prefill")
         rows = list(m.active_rows())
         # (row, hash, phase, specs) tuples; sorted by row index.
-        assert [r[0] for r in rows] == [1, 2, 3]
+        assert [r[0] for r in rows] == [3, 4, 5]
         assert [r[2] for r in rows] == ["prefill", "decode", "prefill"]
         assert [r[3][0].module_name for r in rows] == ["a", "b", "c"]
 
@@ -241,7 +240,7 @@ class TestActiveRowsEnumeration:
         spec_a = _make_spec(phase="prefill", value=1.0)
         spec_b = _make_spec(phase="decode", value=2.0)
         row = m.register_clamp_spec(7, (spec_a, spec_b), "prefill")
-        assert row == 1
+        assert row == 3
 
     def test_specs_with_no_entries_for_phase_rejected(self):
         m = SAEClampManager(max_sae_configs=4)
@@ -301,13 +300,13 @@ class TestDirtyFlag:
 class TestGlobalClampTier:
     """Global SAE clamps stored on the manager apply to every token in a phase.
 
-    The dispatch shim doesn't know about the tier directly; the
-    populator merges global specs into row 0 (the shared sentinel-or-
-    global row) and into every per-request row so a request that opts
-    into per-request clamps still picks up the globals.  These tests
-    cover only the manager-side state machine (set/clear/query); the
-    populator-side merge contract is covered alongside the other
-    populator tests in ``test_sae_layer_dispatch.py``.
+    The dispatch shim doesn't know about the tier directly; hash-zero
+    lookups route to rows 1 and 2 for prefill/decode globals, while
+    the populator also merges global specs into every per-request row
+    so a request that opts into per-request clamps still picks up the
+    globals.  These tests cover only the manager-side state machine
+    (set/clear/query); the populator-side merge contract is covered
+    alongside the other populator tests in ``test_sae_layer_dispatch.py``.
     """
 
     def test_initial_state_has_no_globals(self):
@@ -355,6 +354,27 @@ class TestGlobalClampTier:
         # ``replace=True`` clears every phase before applying.
         assert m.global_decode_specs == ()
 
+    def test_global_replace_failure_preserves_existing_state(self):
+        m = SAEClampManager(max_sae_configs=4)
+        old_prefill = _make_spec(feature_idx=7)
+        old_decode = _make_spec(feature_idx=11)
+        m.set_global_clamps(prefill_specs=(old_prefill,), decode_specs=(old_decode,))
+        m.mark_tables_clean()
+
+        new_prefill = _make_spec(feature_idx=13)
+        bad_decode_a = _make_spec(feature_idx=17)
+        bad_decode_b = _make_spec(feature_idx=17)
+        with pytest.raises(ValueError, match="overlapping"):
+            m.set_global_clamps(
+                prefill_specs=(new_prefill,),
+                decode_specs=(bad_decode_a, bad_decode_b),
+                replace=True,
+            )
+
+        assert m.global_prefill_specs == (old_prefill,)
+        assert m.global_decode_specs == (old_decode,)
+        assert m._tables_dirty is False
+
     def test_global_append_validates_no_overlap(self):
         m = SAEClampManager(max_sae_configs=4)
         s1 = _make_spec(feature_idx=7)
@@ -363,6 +383,38 @@ class TestGlobalClampTier:
         # — must raise even though it's a separate set_global_clamps call.
         with pytest.raises(ValueError, match="overlapping"):
             m.set_global_clamps(prefill_specs=(_make_spec(feature_idx=7),))
+
+    def test_register_rejects_collision_with_existing_global(self):
+        m = SAEClampManager(max_sae_configs=4)
+        m.set_global_clamps(prefill_specs=(_make_spec(feature_idx=7),))
+
+        with pytest.raises(ValueError, match="overlapping"):
+            m.register_clamp_spec(
+                7,
+                (_make_spec(feature_idx=7),),
+                "prefill",
+            )
+
+    def test_set_global_rejects_collision_with_active_request(self):
+        m = SAEClampManager(max_sae_configs=4)
+        req_spec = _make_spec(feature_idx=7)
+        m.register_clamp_spec(7, (req_spec,), "prefill")
+        m.mark_tables_clean()
+
+        with pytest.raises(ValueError, match="overlapping"):
+            m.set_global_clamps(prefill_specs=(_make_spec(feature_idx=7),))
+
+        assert m.global_prefill_specs == ()
+        assert m._tables_dirty is False
+
+    def test_decode_global_does_not_collide_with_prefill_request(self):
+        m = SAEClampManager(max_sae_configs=4)
+        req_spec = _make_spec(feature_idx=7, phase="prefill")
+        m.register_clamp_spec(7, (req_spec,), "prefill")
+
+        global_decode = _make_spec(feature_idx=7, phase="decode")
+        m.set_global_clamps(decode_specs=(global_decode,))
+        assert m.global_decode_specs == (global_decode,)
 
     def test_clear_globals_zeros_both_tiers_and_marks_dirty(self):
         m = SAEClampManager(max_sae_configs=4)
@@ -390,11 +442,8 @@ class TestGlobalClampTier:
         with pytest.raises(ValueError, match="prefill"):
             m.global_specs_for_phase("base")
 
-    def test_get_row_for_hash_zero_returns_row_zero_even_with_globals(self):
-        # Row 0 is still the row for hash=0; the populator just writes
-        # the global content into row 0 instead of leaving it zeroed.
-        # The dispatch shim doesn't need to change.
+    def test_get_row_for_hash_zero_returns_phase_global_rows_with_globals(self):
         m = SAEClampManager(max_sae_configs=4)
         m.set_global_clamps(prefill_specs=(_make_spec(feature_idx=7),))
-        assert m.get_row_for_config(0, is_prefill=True) == 0
-        assert m.get_row_for_config(0, is_prefill=False) == 0
+        assert m.get_row_for_config(0, is_prefill=True) == 1
+        assert m.get_row_for_config(0, is_prefill=False) == 2

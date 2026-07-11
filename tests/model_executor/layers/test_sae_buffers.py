@@ -80,12 +80,12 @@ class TestRegisterSaeBuffers:
         kind_attr = HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
         value_attr = HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP]
         only_attr = HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
-        # Row 0 is the no-op sentinel; +1 covers it.
-        assert getattr(m, kind_attr).shape == (4, 4)
+        # Row 0 is the no-op sentinel, rows 1/2 are phase globals.
+        assert getattr(m, kind_attr).shape == (6, 4)
         assert getattr(m, kind_attr).dtype is torch.int8
-        assert getattr(m, value_attr).shape == (4, 4)
+        assert getattr(m, value_attr).shape == (6, 4)
         assert getattr(m, value_attr).dtype is torch.float32
-        assert getattr(m, only_attr).shape == (4, 4)
+        assert getattr(m, only_attr).shape == (6, 4)
         assert getattr(m, only_attr).dtype is torch.bool
 
     def test_row_zero_is_zero_initialized(self):
