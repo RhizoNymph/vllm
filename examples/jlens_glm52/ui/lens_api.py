@@ -36,6 +36,18 @@ VOCAB_SIZE = 154880
 FINAL_LAYER = 77
 
 
+def _finite(x):
+    """Replace non-finite floats (NaN/inf) with 0.0 so re-serialized JSON is
+    valid for the browser (Python json emits bare NaN otherwise)."""
+    if isinstance(x, float):
+        return x if x == x and x not in (float("inf"), float("-inf")) else 0.0
+    if isinstance(x, dict):
+        return {k: _finite(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_finite(v) for v in x]
+    return x
+
+
 class LensAPI:
     """Bound to the sidecar's Lens (weights + tokenizer) at startup."""
 
@@ -155,7 +167,7 @@ class LensAPI:
                         continue
                     if rec.get("event") == "done":
                         return
-                    await sink(rec)
+                    await sink(_finite(rec))
             else:
                 idle = idle + 0.2 if stop.is_set() else 0.0
                 await asyncio.sleep(0.2)

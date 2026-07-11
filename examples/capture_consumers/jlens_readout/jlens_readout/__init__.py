@@ -137,14 +137,21 @@ class JLensReadoutConsumer:
 
     def _unembed_top(self, x: torch.Tensor) -> tuple[list[list[str]], list[list[float]]]:
         """x: [rows, d] residual-basis vectors -> per-row top-k (tokens, probs)."""
-        xf = x.float()
+        # fp8 residuals can carry non-finite values; scrub before softmax so a
+        # single inf/nan position can't poison the row into all-NaN probs (and
+        # emit invalid `NaN` JSON tokens downstream).
+        xf = torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0)
         xf = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self._eps)
         logits = ((xf * self._norm_w).to(torch.float16) @ self._lm_head.T).float()
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
         probs = logits.softmax(dim=-1)
         top_p, top_i = probs.topk(self._topk, dim=-1)
         top_i, top_p = top_i.cpu(), top_p.cpu()
         toks = [[self._tok.decode([int(t)]) for t in row] for row in top_i]
-        return toks, [[round(float(p), 5) for p in row] for row in top_p]
+        def _f(p):
+            p = float(p)
+            return round(p, 5) if p == p else 0.0  # NaN != NaN
+        return toks, [[_f(p) for p in row] for row in top_p]
 
     def _readout(self, h: torch.Tensor, layer: int) -> dict:
         """Both lens readouts for one layer's rows.

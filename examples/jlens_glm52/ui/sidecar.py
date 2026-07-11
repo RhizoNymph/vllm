@@ -131,8 +131,20 @@ def _server_base() -> str:
     return f"http://{info['host']}:{info['port']}"
 
 
+def _finite(x):
+    """Recursively replace non-finite floats (NaN/inf) with 0.0 — Python's
+    json emits bare `NaN`/`Infinity`, which the browser's JSON.parse rejects."""
+    if isinstance(x, float):
+        return x if x == x and x not in (float("inf"), float("-inf")) else 0.0
+    if isinstance(x, dict):
+        return {k: _finite(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_finite(v) for v in x]
+    return x
+
+
 def _sse(obj: dict) -> str:
-    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+    return f"data: {json.dumps(_finite(obj), ensure_ascii=False)}\n\n"
 
 
 # ---------------------------------------------------------------------------
