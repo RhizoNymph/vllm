@@ -32,6 +32,8 @@ class LoggingConsumer(CaptureConsumer):
     """
 
     location: Literal["worker", "driver"] = "worker"
+    # Logs only the key + row count + dtype; never reads the tensor payload.
+    needs_payload = False
 
     def __init__(self, vllm_config: Any, params: dict[str, Any]) -> None:
         self._hooks: dict[HookName, list[int]] = params["hooks"]

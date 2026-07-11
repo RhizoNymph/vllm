@@ -332,6 +332,16 @@ class CaptureManager:
                 f"got {overload_policy!r}"
             )
         self._consumers = consumers
+        # A consumer that reads only capture metadata (``needs_payload=False``)
+        # never touches the tensor payload. When *every* active consumer is
+        # metadata-only, the device->host copy and the whole dispatch/spill
+        # pipeline are pure waste — deliver zero-cost ``meta`` views synchronously
+        # instead (see ``_dispatch_metadata_only``). Gated at dispatch time on
+        # there being no active activation store, which does need real payloads.
+        self._metadata_only_consumers = bool(consumers) and all(
+            not getattr(getattr(s, "_consumer", s), "needs_payload", True)
+            for s in consumers
+        )
         self._consumer_specs = consumer_specs
         # ``num_hidden_layers`` is the GLOBAL layer count (across all
         # pipeline stages); client/global specs reference global layer
@@ -970,6 +980,30 @@ class CaptureManager:
                 continue
             plan.scratch_gpu[key] = buf.index_select(0, idx)
 
+    def _dispatch_metadata_only(self, plan: StepCapturePlan) -> None:
+        """Deliver a step's captures to metadata-only consumers synchronously.
+
+        Every active consumer declared ``needs_payload = False``, so it reads
+        only key / shape / dtype. We build ``meta``-device views (correct shape
+        and dtype, zero allocation, no data) and fan them out inline — skipping
+        the device->host copy, the dispatch queue, and the spill path entirely.
+        ``index_select`` / ``torch.cat`` downstream stay on ``meta``, so no host
+        memory or PCIe traffic is spent. The store write-through is intentionally
+        omitted: the caller only takes this path when no store is active.
+        """
+        scratch_pinned: dict[
+            tuple[int, str], tuple[torch.Tensor | None, torch.Tensor]
+        ] = {
+            key: (None, torch.empty(t.shape, dtype=t.dtype, device="meta"))
+            for key, t in plan.scratch_gpu.items()
+        }
+        packet = _DispatchPacket(
+            entries=list(plan.entries),
+            scratch_pinned=scratch_pinned,
+            cuda_event=None,
+        )
+        self._fan_out_to_consumers(packet)
+
     def dispatch_step_captures(self, plan: StepCapturePlan) -> None:
         """Hand a finished step's scratch tensors to the dispatch thread.
 
@@ -995,6 +1029,12 @@ class CaptureManager:
         self._materialize_global_keys(plan)
 
         if not plan.entries:
+            return
+
+        # Metadata-only fast path: no consumer needs the payload and no store
+        # is active, so skip the D2H copy, dispatch queue, and spill entirely.
+        if self._metadata_only_consumers and get_active_activation_store() is None:
+            self._dispatch_metadata_only(plan)
             return
 
         scratch_pinned: dict[
