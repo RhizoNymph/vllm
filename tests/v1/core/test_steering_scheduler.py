@@ -16,7 +16,9 @@ from vllm import SamplingParams
 from vllm.config.sae_steering_types import (
     SAEClampEntry,
     SAEClampSpec,
+    SAEFullReconstructionSpec,
     hash_sae_clamp_specs_for_phase,
+    hash_sae_full_reconstruction_specs_for_phase,
 )
 from vllm.config.steering_types import hash_steering_config
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -31,6 +33,12 @@ def _sae_spec(phase: str = "both", value: float = 1.0) -> SAEClampSpec:
                 0: (SAEClampEntry(feature_idx=0, kind="absolute", value=value),)
             }
         },
+    )
+
+
+def _recon_spec(phase: str = "both") -> SAEFullReconstructionSpec:
+    return SAEFullReconstructionSpec(
+        module_name="r", phase=phase  # type: ignore[arg-type]
     )
 
 
@@ -147,6 +155,36 @@ class TestSeparateAdditiveAndSaeCapacity:
             sae_pairs, {(111, "prefill")}
         )
 
+    def test_full_reconstruction_uses_its_own_capacity_pool(self):
+        scheduler = self._scheduler(max_configs=1)
+        recon_spec = _recon_spec()
+        request = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_mlp": {0: [1.0]}},
+                sae_clamp_specs=(_sae_spec(),),
+                sae_full_reconstruction_specs=(recon_spec,),
+            ),
+            prefill_hash=222,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        recon_pairs = scheduler._request_sae_full_recon_config_pairs(
+            request, "prefill"
+        )
+
+        recon_hash = hash_sae_full_reconstruction_specs_for_phase(
+            (recon_spec,), "prefill"
+        )
+        assert additive_pairs
+        assert sae_pairs
+        assert recon_pairs == {(recon_hash, "prefill")}
+        assert not scheduler._steering_pool_would_overflow(recon_pairs, set())
+        assert scheduler._steering_pool_would_overflow(
+            recon_pairs, {(111, "prefill")}
+        )
+
     def test_sae_phase_filtering_affects_scheduler_pool(self):
         scheduler = self._scheduler(max_configs=1)
         spec = _sae_spec("decode")
@@ -168,6 +206,27 @@ class TestSeparateAdditiveAndSaeCapacity:
         assert decode_additive == set()
         assert decode_sae == {
             (hash_sae_clamp_specs_for_phase((spec,), "decode"), "decode")
+        }
+
+    def test_full_reconstruction_phase_filtering_affects_scheduler_pool(self):
+        scheduler = self._scheduler(max_configs=1)
+        spec = _recon_spec("decode")
+        request = self._request(
+            sampling_params=SamplingParams(sae_full_reconstruction_specs=(spec,)),
+            prefill_hash=0,
+            decode_hash=333,
+        )
+
+        prefill_recon = scheduler._request_sae_full_recon_config_pairs(
+            request, "prefill"
+        )
+        decode_recon = scheduler._request_sae_full_recon_config_pairs(
+            request, "decode"
+        )
+
+        assert prefill_recon == set()
+        assert decode_recon == {
+            (hash_sae_full_reconstruction_specs_for_phase((spec,), "decode"), "decode")
         }
 
     def test_sae_phase_hash_is_cached_for_scheduler(self, monkeypatch):

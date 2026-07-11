@@ -26,7 +26,9 @@ What this stage covers:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -53,6 +55,7 @@ from vllm.v1.worker.sae_clamp_manager import SAEClampManager
 from vllm.v1.worker.sae_full_reconstruction_manager import (
     SAEFullReconstructionManager,
 )
+from vllm.v1.worker.steering_manager import SteeringManager
 from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 
 
@@ -184,6 +187,22 @@ class TestRegisterAttachesFullReconBuffers:
             getattr(layer20, HOOK_POINT_FR_MODULE_NAME_ATTR[SteeringHookPoint.POST_MLP])
             == "g"
         )
+        assert layer20.sae_recon_index is layer21.sae_recon_index
+
+    def test_later_registration_shares_index_with_existing_sites(self):
+        h = _Harness()
+        h.register_steering_modules(
+            modules={"a": _payload(layers=((20, "post_mlp"),))}
+        )
+        layer20 = h._steerable_layers_cache[20]
+        original_index = layer20.sae_recon_index
+
+        h.register_steering_modules(
+            modules={"b": _payload(layers=((21, "post_attn"),))}
+        )
+        layer21 = h._steerable_layers_cache[21]
+        assert layer20.sae_recon_index is original_index
+        assert layer21.sae_recon_index is original_index
 
     def test_unregister_detaches(self):
         h = _Harness()
@@ -339,9 +358,10 @@ class TestAttachWeights:
 
 
 class TestAdmissionAndRelease:
-    def _spec(self) -> SAEFullReconstructionSpec:
+    def _spec(self, *, phase: str = "both") -> SAEFullReconstructionSpec:
         return SAEFullReconstructionSpec(
             module_name="g",
+            phase=phase,
             clamps={
                 "post_mlp": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
@@ -361,7 +381,10 @@ class TestAdmissionAndRelease:
             is_prefilling=True,
         )
         assert h._req_sae_fr_phase["req-1"] == "prefill"
-        assert (0xCAFE, "prefill") in h._sae_fr_clamp_manager.config_to_row
+        assert (
+            sp.prefill_sae_full_recon_config_hash,
+            "prefill",
+        ) in h._sae_fr_clamp_manager.config_to_row
 
     def test_register_initial_decode_only_when_not_prefilling(self):
         h = _Harness()
@@ -375,9 +398,28 @@ class TestAdmissionAndRelease:
             is_prefilling=False,
         )
         assert h._req_sae_fr_phase["req-1"] == "decode"
-        assert (0xDEAD, "decode") in h._sae_fr_clamp_manager.config_to_row
+        assert (
+            sp.decode_sae_full_recon_config_hash,
+            "decode",
+        ) in h._sae_fr_clamp_manager.config_to_row
         # Prefill row must not be allocated.
         assert (0xCAFE, "prefill") not in h._sae_fr_clamp_manager.config_to_row
+
+    def test_register_initial_prefill_ignores_decode_only_spec(self):
+        h = _Harness()
+        h.register_steering_modules(modules={"g": _payload()})
+        sp = SamplingParams(
+            sae_full_reconstruction_specs=[self._spec(phase="decode")]
+        )
+        h._register_initial_sae_full_recon(
+            "req-1",
+            sp,
+            prefill_hash=0xCAFE,
+            decode_hash=0xDEAD,
+            is_prefilling=True,
+        )
+        assert "req-1" not in h._req_sae_fr_phase
+        assert not h._sae_fr_clamp_manager.config_to_row
 
     def test_release_under_recorded_phase(self):
         h = _Harness()
@@ -392,7 +434,10 @@ class TestAdmissionAndRelease:
         )
         h._release_sae_full_recon_for_request("req-1", 0xCAFE, 0xDEAD)
         assert "req-1" not in h._req_sae_fr_phase
-        assert (0xCAFE, "prefill") not in h._sae_fr_clamp_manager.config_to_row
+        assert (
+            sp.prefill_sae_full_recon_config_hash,
+            "prefill",
+        ) not in h._sae_fr_clamp_manager.config_to_row
 
     def test_release_unknown_request_is_no_op(self):
         h = _Harness()
@@ -419,6 +464,195 @@ class TestAdmissionAndRelease:
         # Hash 0 is the no-reconstruction sentinel; admitting it would
         # be a manager-side violation, so the helper short-circuits.
         assert "req-1" not in h._req_sae_fr_phase
+
+    def test_resumption_resets_decode_full_recon_row_to_prefill(self):
+        h = _Harness()
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.register_steering_modules(modules={"g": _payload()})
+        sp = SamplingParams(sae_full_reconstruction_specs=[self._spec()])
+        prefill_hash = sp.prefill_steering_config_hash
+        decode_hash = sp.decode_steering_config_hash
+        h._register_initial_sae_full_recon(
+            "req-1",
+            sp,
+            prefill_hash=prefill_hash,
+            decode_hash=decode_hash,
+            is_prefilling=False,
+        )
+        h._req_steering_phase["req-1"] = "decode"
+        req_state = SimpleNamespace(
+            sampling_params=sp,
+            num_prompt_tokens=10,
+            prefill_steering_config_hash=prefill_hash,
+            decode_steering_config_hash=decode_hash,
+        )
+
+        h._reset_steering_for_resumption(
+            "req-1", req_state, new_num_computed_tokens=5
+        )
+
+        mgr = h._sae_fr_clamp_manager
+        decode_key = (sp.decode_sae_full_recon_config_hash, "decode")
+        prefill_key = (sp.prefill_sae_full_recon_config_hash, "prefill")
+        assert decode_key not in mgr.config_to_row
+        assert prefill_key in mgr.config_to_row
+        assert h._req_sae_fr_phase == {"req-1": "prefill"}
+
+
+class TestPerStepFullReconIndex:
+    def test_additive_no_active_shortcut_updates_full_recon_index(self):
+        h = _Harness()
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h._steering_n_tokens_scratch = np.zeros(8, dtype=np.int64)
+        h._sae_fr_rows_scratch = np.zeros(8, dtype=np.int64)
+        h._sae_fr_index_pinned = torch.zeros(16, dtype=torch.long)
+        h.input_batch = SimpleNamespace(
+            num_reqs=1,
+            req_ids=["req-1"],
+            req_id_to_index={"req-1": 0},
+            num_computed_tokens_cpu=np.array([0], dtype=np.int64),
+            num_prompt_tokens=np.array([4], dtype=np.int64),
+            request_prefill_steering_hash=np.array([0xCAFE], dtype=np.int64),
+            request_decode_steering_hash=np.array([0], dtype=np.int64),
+        )
+        h.requests = {}
+        h.register_steering_modules(modules={"g": _payload()})
+        spec = SAEFullReconstructionSpec(module_name="g")
+        sp = SamplingParams(sae_full_reconstruction_specs=[spec])
+        h._register_initial_sae_full_recon(
+            "req-1",
+            sp,
+            prefill_hash=0xCAFE,
+            decode_hash=0,
+            is_prefilling=True,
+        )
+
+        h._update_steering_buffers(
+            SimpleNamespace(num_scheduled_tokens={"req-1": 1})
+        )
+
+        site = h._steerable_layers_cache[20]
+        assert int(site.steering_index[0].item()) == 0
+        assert int(site.sae_recon_index[0].item()) == 1
+
+
+class TestStreamingFullReconRefresh:
+    def test_streaming_refresh_replaces_old_full_recon_prefill_row(self):
+        h = _Harness(max_sae_configs=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.register_steering_modules(modules={"g": _payload(clampable=(0, 1))})
+
+        old_spec = SAEFullReconstructionSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        old_sp = SamplingParams(sae_full_reconstruction_specs=[old_spec])
+        old_prefill_hash = old_sp.prefill_steering_config_hash
+        old_decode_hash = old_sp.decode_steering_config_hash
+        h._register_initial_sae_full_recon(
+            "req-1",
+            old_sp,
+            prefill_hash=old_prefill_hash,
+            decode_hash=old_decode_hash,
+            is_prefilling=True,
+        )
+        h.requests = {"req-1": SimpleNamespace(sampling_params=old_sp)}
+
+        new_spec = SAEFullReconstructionSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=1, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        new_sp = SamplingParams(sae_full_reconstruction_specs=[new_spec])
+        h._refresh_streaming_steering(
+            "req-1",
+            SimpleNamespace(sampling_params=new_sp),
+            old_prefill_hash=old_prefill_hash,
+            old_decode_hash=old_decode_hash,
+            new_prefill_hash=new_sp.prefill_steering_config_hash,
+            new_decode_hash=new_sp.decode_steering_config_hash,
+            old_sampling_params=old_sp,
+        )
+
+        old_fr_hash = old_sp.prefill_sae_full_recon_config_hash
+        new_fr_hash = new_sp.prefill_sae_full_recon_config_hash
+        mgr = h._sae_fr_clamp_manager
+        assert (old_fr_hash, "prefill") not in mgr.config_to_row
+        assert (new_fr_hash, "prefill") in mgr.config_to_row
+        assert h._req_sae_fr_phase == {"req-1": "prefill"}
+        assert h._req_sae_fr_hash == {"req-1": new_fr_hash}
+
+    def test_streaming_refresh_failure_restores_old_full_recon_row(
+        self, monkeypatch
+    ):
+        h = _Harness(max_sae_configs=4)
+        h._steering_manager = SteeringManager(max_steering_configs=4)
+        h.register_steering_modules(modules={"g": _payload(clampable=(0, 1))})
+
+        old_spec = SAEFullReconstructionSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        old_sp = SamplingParams(sae_full_reconstruction_specs=[old_spec])
+        old_prefill_hash = old_sp.prefill_steering_config_hash
+        old_decode_hash = old_sp.decode_steering_config_hash
+        h._register_initial_sae_full_recon(
+            "req-1",
+            old_sp,
+            prefill_hash=old_prefill_hash,
+            decode_hash=old_decode_hash,
+            is_prefilling=True,
+        )
+        h.requests = {"req-1": SimpleNamespace(sampling_params=old_sp)}
+
+        new_spec = SAEFullReconstructionSpec(
+            module_name="g",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=1, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        new_sp = SamplingParams(sae_full_reconstruction_specs=[new_spec])
+        new_fr_hash = new_sp.prefill_sae_full_recon_config_hash
+        mgr = h._sae_fr_clamp_manager
+        original_register = mgr.register_recon_spec
+
+        def fail_new_full_recon_register(config_hash, *_args, **_kwargs):
+            if config_hash == new_fr_hash:
+                raise RuntimeError("new full recon row rejected")
+            return original_register(config_hash, *_args, **_kwargs)
+
+        monkeypatch.setattr(
+            mgr, "register_recon_spec", fail_new_full_recon_register
+        )
+
+        with pytest.raises(RuntimeError, match="new full recon row rejected"):
+            h._refresh_streaming_steering(
+                "req-1",
+                SimpleNamespace(sampling_params=new_sp),
+                old_prefill_hash=old_prefill_hash,
+                old_decode_hash=old_decode_hash,
+                new_prefill_hash=new_sp.prefill_steering_config_hash,
+                new_decode_hash=new_sp.decode_steering_config_hash,
+                old_sampling_params=old_sp,
+            )
+
+        old_fr_hash = old_sp.prefill_sae_full_recon_config_hash
+        assert mgr.config_to_row == {(old_fr_hash, "prefill"): 1}
+        assert h._req_sae_fr_phase == {"req-1": "prefill"}
+        assert h._req_sae_fr_hash == {"req-1": old_fr_hash}
 
 
 class TestAssertSpecsCanBeApplied:

@@ -32,16 +32,25 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn as nn
 
-from vllm.config.sae_steering_types import SAEActivation
+from vllm.config.sae_steering_types import SAEActivation, SAEFullReconstructionSpec
 from vllm.model_executor.layers.sae_full_reconstruction import (
+    apply_layer_sae_full_reconstruction,
     apply_sae_full_reconstruction,
+    populate_sae_full_recon_clamp_table,
+    register_sae_full_recon_buffers,
+    register_sae_recon_index_buffer,
     sae_encode_full,
 )
 from vllm.model_executor.layers.sae_steering import (
     CLAMP_KIND_ABSOLUTE,
     CLAMP_KIND_ADDITIVE,
     CLAMP_KIND_NONE,
+)
+from vllm.model_executor.layers.steering import SteeringHookPoint
+from vllm.v1.worker.sae_full_reconstruction_manager import (
+    SAEFullReconstructionManager,
 )
 
 
@@ -310,6 +319,48 @@ class TestReconMaskGate:
             + inputs["decoder_bias"]
         )
         assert torch.allclose(out, expected, atol=1e-5, rtol=1e-5)
+
+
+class TestLayerRouting:
+    def test_row_for_other_module_does_not_reconstruct_this_site(self):
+        module = nn.Module()
+        register_sae_full_recon_buffers(
+            module,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="site_b",
+            activation=SAEActivation.RELU,
+            activation_params={},
+            d_sae=2,
+            n_clamp=0,
+            hidden_size=2,
+            max_recon_configs=2,
+            clampable_features=torch.zeros(0, dtype=torch.int64),
+            dtype=torch.float32,
+        )
+        register_sae_recon_index_buffer(module, max_tokens=1)
+        module.sae_recon_index[0] = 1
+
+        manager = SAEFullReconstructionManager(max_recon_configs=2)
+        manager.register_recon_spec(
+            123,
+            (SAEFullReconstructionSpec(module_name="site_a"),),
+            "prefill",
+        )
+        populate_sae_full_recon_clamp_table(
+            manager=manager,
+            module=module,
+            hook_point=SteeringHookPoint.POST_MLP,
+            module_name="site_b",
+            clampable_features=(),
+            layer_idx=0,
+        )
+
+        hidden = torch.tensor([[1.0, 2.0]])
+        out = apply_layer_sae_full_reconstruction(
+            module, hidden, SteeringHookPoint.POST_MLP
+        )
+
+        assert torch.equal(out, hidden)
 
 
 # ---------------------------------------------------------------------------

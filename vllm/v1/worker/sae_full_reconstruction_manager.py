@@ -14,7 +14,7 @@ Layout invariants:
 * Row 0 is the no-reconstruction sentinel.  A token whose
   ``sae_recon_index`` selects row 0 passes through unchanged because
   :func:`apply_layer_sae_full_reconstruction` derives
-  ``recon_mask = (recon_index != 0)``.
+  ``recon_mask`` from each site's active-row table.
 * Rows ``1..max_recon_configs`` are per-(spec_hash, phase) configurations.
 
 Determinism: every rank executes identical register / release calls
