@@ -593,6 +593,118 @@ class SteeringModelRunnerMixin:
         if mgr is not None:
             mgr.clear_global_vectors()
 
+    def set_sae_global_clamps(
+        self,
+        prefill_specs_raw: object = None,
+        decode_specs_raw: object = None,
+        *,
+        replace: bool = False,
+    ) -> tuple[int, int]:
+        """Install global SAE delta clamps applied to every token in a phase.
+
+        Mirrors :meth:`set_steering_vectors` for the SAE delta path:
+        the supplied specs are validated against the worker SAE
+        registry, then committed to :class:`SAEClampManager`'s global
+        tier.  Tokens whose request does not carry per-request SAE
+        clamps will gather row 0 on the next forward pass; the
+        populator has already written the global content into that
+        row, so the per-token dispatch picks them up without per-
+        request bookkeeping.
+
+        Args:
+            prefill_specs_raw: JSON-shape clamp specs (as accepted by
+                :func:`coerce_sae_clamp_specs`) for the prefill global
+                tier, or ``None`` to leave existing prefill globals
+                untouched.
+            decode_specs_raw: analogous for the decode global tier.
+            replace: when True, clear existing globals before applying
+                — used for atomic swap of the global configuration.
+
+        Returns:
+            ``(tp_rank, pp_rank)`` for router-side TP divergence checks.
+        """
+        tp_rank, pp_rank = _get_steering_ranks()
+        mgr = self._sae_clamp_manager
+        if mgr is None:
+            return (tp_rank, pp_rank)
+        from vllm.config.sae_steering_types import coerce_sae_clamp_specs
+
+        prefill_specs = coerce_sae_clamp_specs(prefill_specs_raw)
+        decode_specs = coerce_sae_clamp_specs(decode_specs_raw)
+        # Validate every spec's module name is registered and every
+        # referenced (layer, hook) site / feature is covered.  Reuses
+        # the per-request admission validator so the worker fails loud
+        # for the same problems regardless of whether clamps arrive
+        # per-request or globally.
+        for tier_specs in (prefill_specs, decode_specs):
+            if tier_specs is None:
+                continue
+            # Build a stand-in SamplingParams-like object so we can
+            # reuse :meth:`_assert_sae_clamps_can_be_applied` without
+            # duplicating its logic here.
+            class _Stub:
+                pass
+
+            stub = _Stub()
+            stub.sae_clamp_specs = tier_specs
+            self._assert_sae_clamps_can_be_applied(stub)  # type: ignore[arg-type]
+        mgr.set_global_clamps(
+            prefill_specs=prefill_specs,
+            decode_specs=decode_specs,
+            replace=replace,
+        )
+        return (tp_rank, pp_rank)
+
+    def clear_sae_global_clamps(self) -> None:
+        """Drop all configured global SAE delta clamps.
+
+        Symmetric to :meth:`clear_steering_vectors` for the SAE delta
+        path.  Row 0 will be re-zeroed on the next per-step populate,
+        restoring no-op semantics for tokens whose request does not
+        carry per-request SAE clamps.
+        """
+        mgr = self._sae_clamp_manager
+        if mgr is not None:
+            mgr.clear_global_clamps()
+
+    def get_sae_global_clamps_status(self) -> dict:
+        """Return a JSON-safe summary of the currently-configured globals.
+
+        Returns ``{"prefill": [...], "decode": [...]}`` where each
+        list entry is a JSON-encodable view of a
+        :class:`SAEClampSpec`.  Empty lists mean "no globals
+        configured for this phase".
+        """
+        mgr = self._sae_clamp_manager
+        if mgr is None:
+            return {"prefill": [], "decode": []}
+
+        def _spec_to_dict(spec) -> dict:
+            return {
+                "module_name": spec.module_name,
+                "phase": spec.phase,
+                "clamps": {
+                    hook_name: {
+                        str(layer_idx): [
+                            {
+                                "feature_idx": e.feature_idx,
+                                "kind": e.kind,
+                                "value": e.value,
+                                "only_if_active": e.only_if_active,
+                            }
+                            for e in entries
+                        ]
+                        for layer_idx, entries in layer_map.items()
+                    }
+                    for hook_name, layer_map in spec.clamps.items()
+                },
+            }
+
+        return {
+            "prefill": [_spec_to_dict(s) for s in mgr.global_prefill_specs],
+            "decode": [_spec_to_dict(s) for s in mgr.global_decode_specs],
+        }
+
     def get_steering_status(self) -> dict:
         """Return per-hook-point status for active layers.
 
@@ -2422,13 +2534,17 @@ class SteeringModelRunnerMixin:
                 if flag_buf is not None:
                     flag_buf.zero_()
 
-        # Fast no-active path: if every SAE row has been released, the
-        # only required work is clearing a previously nonzero shared
-        # index.  Stale nonzero table rows are harmless once no token
-        # points at them.  Clear each site's ``any_active`` flag on the
-        # active->inactive transition so layer hooks skip the SAE op
-        # entirely until a later row reuse repopulates tables.
-        if not sae_mgr.config_to_row:
+        # Fast no-active path: if every SAE row has been released *and*
+        # no global SAE clamps are configured, the only required work
+        # is clearing a previously nonzero shared index.  Stale nonzero
+        # table rows are harmless once no token points at them.  Clear
+        # each site's ``any_active`` flag on the active->inactive
+        # transition so layer hooks skip the SAE op entirely until a
+        # later row reuse repopulates tables.  Globals are checked
+        # alongside per-request rows because the global tier still
+        # writes content into row 0 that the dispatch shim has to see,
+        # even when no per-request rows are live.
+        if not sae_mgr.config_to_row and not sae_mgr.has_global_clamps():
             if sae_mgr._tables_dirty:
                 clear_sae_any_active_flags()
                 sae_mgr.mark_tables_clean()

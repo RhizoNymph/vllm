@@ -58,8 +58,22 @@ class SAEClampManager:
             registering past capacity raises ``RuntimeError``.
 
     Layout:
-        Row 0: no-op sentinel (filled with ``CLAMP_KIND_NONE``)
-        Rows 1..max_sae_configs: per-request configurations
+        Row 0: shared sentinel + global tier.  When no global clamps are
+            configured this row is all-zero (true no-op for tokens that
+            don't carry per-request clamps).  When
+            :meth:`set_global_clamps` is configured, this row holds the
+            effective global clamps for the active worker phase; tokens
+            with ``config_hash == 0`` route here and pick up the global
+            clamps for free.  Per-phase content is materialised at
+            populate time by ``populate_sae_clamp_table`` writing the
+            phase-appropriate global specs into the row.
+        Rows 1..max_sae_configs: per-request configurations.  The
+            populator merges global clamps into each per-request row
+            so a request that opts into per-request clamps still gets
+            the globals stacked on top (any feature_idx collision
+            between a global clamp and a per-request clamp is rejected
+            at admission time by
+            :func:`validate_sae_clamp_specs_no_overlap`).
     """
 
     def __init__(self, max_sae_configs: int) -> None:
@@ -88,10 +102,24 @@ class SAEClampManager:
         # deterministic across ranks.
         self.free_rows: list[int] = list(range(max_sae_configs, 0, -1))
 
+        # Global SAE clamp tier.  Per-phase tuples of
+        # :class:`SAEClampSpec`; the populator merges these into every
+        # row (including row 0 — the shared no-op-or-global sentinel)
+        # so a token whose request opted out of per-request clamps
+        # still picks them up through row 0, and per-request rows
+        # stack globals on top.
+        #
+        # Phase-keyed (rather than a single "base" tier) because a
+        # global clamp can legitimately want decode-only or prefill-
+        # only semantics — analogous to the additive path's
+        # ``global_prefill_vectors`` / ``global_decode_vectors``.
+        self.global_prefill_specs: tuple[SAEClampSpec, ...] = ()
+        self.global_decode_specs: tuple[SAEClampSpec, ...] = ()
+
         # Set by every state mutator that changes row content (register
-        # new-row path, release refcount->0 path); cleared by the
-        # populator via :meth:`mark_tables_clean`.  Initialized True so
-        # the first populate call always runs.
+        # new-row path, release refcount->0 path, global-clamp update);
+        # cleared by the populator via :meth:`mark_tables_clean`.
+        # Initialized True so the first populate call always runs.
         self._tables_dirty: bool = True
 
     def register_clamp_spec(
@@ -220,10 +248,18 @@ class SAEClampManager:
     def get_row_for_config(self, config_hash: int, is_prefill: bool) -> int:
         """Return the row index for a config in the given worker phase.
 
-        ``config_hash == 0`` always returns row 0 (the no-op sentinel).
-        Otherwise looks up by ``(hash, phase)``; raises
-        ``RuntimeError`` if the entry is missing — a scheduler-bug
-        signal, identical fail-loud behaviour to the additive manager.
+        ``config_hash == 0`` always returns row 0 (the shared
+        sentinel-or-global row).  When global clamps are configured,
+        the populator writes the phase-appropriate global clamps into
+        row 0 so tokens with no per-request SAE state still pick them
+        up; otherwise row 0 stays at zero and is a true no-op.
+
+        For registered per-request configs, returns the assigned row
+        (``1..max_sae_configs``), looked up by
+        ``(config_hash, "prefill"/"decode")``.  Raises
+        ``RuntimeError`` for unregistered nonzero hashes — a
+        scheduler-bug signal, identical fail-loud behaviour to the
+        additive manager.
         """
         if config_hash == 0:
             return 0
@@ -237,6 +273,82 @@ class SAEClampManager:
             "before dispatching a request that uses SAE clamps; "
             "reaching this branch is a scheduler bug."
         )
+
+    def set_global_clamps(
+        self,
+        prefill_specs: tuple[SAEClampSpec, ...] | None = None,
+        decode_specs: tuple[SAEClampSpec, ...] | None = None,
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Configure global SAE clamps applied to every token in a phase.
+
+        Mirrors :meth:`SteeringManager.update_global_vectors` for the
+        SAE delta path.  When ``replace`` is True, existing state is
+        cleared before applying — used by the API server's
+        ``POST /v1/steering/sae/set`` to atomically install a new
+        global configuration.  When False, the new specs are appended
+        to the existing tier (subject to the standard no-overlap
+        check on ``validate_sae_clamp_specs_no_overlap`` per phase).
+
+        Empty tuples are tolerated: passing both ``None`` and
+        ``replace=False`` is a no-op; passing an empty tuple with
+        ``replace=True`` clears that phase.  This lets the API surface
+        the natural "set decode-only globals, leave prefill globals
+        alone" pattern.
+
+        Args:
+            prefill_specs: tuple of :class:`SAEClampSpec` to apply to
+                row 1 (global prefill).  ``None`` leaves the existing
+                state untouched unless ``replace`` is True.
+            decode_specs: tuple of :class:`SAEClampSpec` to apply to
+                row 2 (global decode).  Same semantics as
+                ``prefill_specs``.
+            replace: when True, clear the existing global state before
+                applying.  Atomic with the new content — partial state
+                during the swap is never observable.
+        """
+        if replace:
+            self.global_prefill_specs = ()
+            self.global_decode_specs = ()
+        if prefill_specs is not None:
+            new_prefill = tuple(self.global_prefill_specs) + tuple(prefill_specs)
+            validate_sae_clamp_specs_no_overlap(new_prefill)
+            self.global_prefill_specs = new_prefill
+        if decode_specs is not None:
+            new_decode = tuple(self.global_decode_specs) + tuple(decode_specs)
+            validate_sae_clamp_specs_no_overlap(new_decode)
+            self.global_decode_specs = new_decode
+        self._tables_dirty = True
+
+    def clear_global_clamps(self) -> None:
+        """Drop all configured global SAE clamps.
+
+        Symmetric to :meth:`SteeringManager.clear_global_vectors`.
+        After this call, rows 1 and 2 will be re-zeroed on the next
+        populate, restoring no-op semantics for tokens whose request
+        does not carry per-request SAE clamps.
+        """
+        self.global_prefill_specs = ()
+        self.global_decode_specs = ()
+        self._tables_dirty = True
+
+    def has_global_clamps(self) -> bool:
+        """Return True iff any global SAE clamps are configured."""
+        return bool(self.global_prefill_specs) or bool(self.global_decode_specs)
+
+    def global_specs_for_phase(
+        self, phase: str
+    ) -> tuple[SAEClampSpec, ...]:
+        """Return the global spec tuple for ``phase``.
+
+        Used by the per-layer populator to materialise rows 1 and 2.
+        """
+        if phase == "prefill":
+            return self.global_prefill_specs
+        if phase == "decode":
+            return self.global_decode_specs
+        raise ValueError(f"phase must be 'prefill' or 'decode'; got {phase!r}.")
 
     def active_rows(
         self,
