@@ -141,6 +141,9 @@ pub(super) fn prepare_completion_request(
             capture: request.capture,
             patch: request.patch,
             patch_vectors: request.patch_vectors,
+            steering_clamps: request.steering_clamps,
+            prefill_steering_clamps: request.prefill_steering_clamps,
+            decode_steering_clamps: request.decode_steering_clamps,
         },
         decode_options: TextDecodeOptions {
             skip_special_tokens: request.skip_special_tokens,

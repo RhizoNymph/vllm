@@ -422,7 +422,6 @@ fn is_engine_core_dead(error: &Error) -> bool {
     }
 }
 
-
 fn is_unexpected_dispatcher_output(error: &Error) -> bool {
     match error {
         Error::UnexpectedDispatcherOutput { .. } => true,
@@ -465,10 +464,10 @@ fn multipart_logprob_output_frames(request_id: &str) -> Vec<bytes::Bytes> {
             Value::Nil,
             Value::from(EngineCoreFinishReason::Length as u8),
         ])]),
-        Value::Nil,             // scheduler_stats
-        Value::from(0.0),       // timestamp
-        Value::Nil,             // utility_output
-        Value::Map(vec![]),     // late_capture_results (empty map, real wire)
+        Value::Nil,                                  // scheduler_stats
+        Value::from(0.0),                            // timestamp
+        Value::Nil,                                  // utility_output
+        Value::Map(vec![]),                          // late_capture_results (empty map, real wire)
         Value::Array(vec![Value::from(request_id)]), // finished_requests
     ]);
 
@@ -2557,6 +2556,9 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             capture: None,
             patch: None,
             patch_vectors: None,
+            steering_clamps: None,
+            prefill_steering_clamps: None,
+            decode_steering_clamps: None,
         },
     );
 
