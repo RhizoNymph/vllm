@@ -263,6 +263,16 @@ pub struct ChatCompletionRequest {
     /// Request-level packed table of client-provided patch vectors referenced
     /// by a patch entry's `source_inline` / mask `inline`, forwarded verbatim
     pub patch_vectors: Option<Value>,
+
+    /// Per-request steering clamps applied to both prefill and decode phases,
+    /// forwarded verbatim to engine-core
+    pub steering_clamps: Option<Value>,
+
+    /// Steering clamps applied during prefill only, forwarded verbatim
+    pub prefill_steering_clamps: Option<Value>,
+
+    /// Steering clamps applied during decode only, forwarded verbatim
+    pub decode_steering_clamps: Option<Value>,
 }
 
 impl Default for ChatCompletionRequest {
@@ -333,6 +343,9 @@ impl Default for ChatCompletionRequest {
             capture: None,
             patch: None,
             patch_vectors: None,
+            steering_clamps: None,
+            prefill_steering_clamps: None,
+            decode_steering_clamps: None,
         }
     }
 }

@@ -124,6 +124,15 @@ pub struct SamplingParams {
     /// Request-level packed table of client-provided patch vectors referenced
     /// by a patch entry's `source_inline` / mask `inline`. Forwarded verbatim.
     pub patch_vectors: Option<Value>,
+    /// Per-request steering clamps applied to both prefill and decode phases.
+    /// Forwarded verbatim to engine-core; Python validates on decode.
+    pub steering_clamps: Option<Value>,
+    /// Phase-specific steering clamps applied during prefill only. Forwarded
+    /// verbatim.
+    pub prefill_steering_clamps: Option<Value>,
+    /// Phase-specific steering clamps applied during decode only. Forwarded
+    /// verbatim.
+    pub decode_steering_clamps: Option<Value>,
 }
 
 #[allow(clippy::derivable_impls)] // more explicit
@@ -158,6 +167,9 @@ impl Default for SamplingParams {
             capture: None,
             patch: None,
             patch_vectors: None,
+            steering_clamps: None,
+            prefill_steering_clamps: None,
+            decode_steering_clamps: None,
         }
     }
 }
