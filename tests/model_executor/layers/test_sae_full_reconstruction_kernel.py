@@ -190,6 +190,53 @@ class TestParityWithEager:
         assert torch.equal(out[1], inputs["hidden_states"][1])
         assert torch.equal(out[3], inputs["hidden_states"][3])
 
+    def test_topk_only_if_active_treats_selected_negative_feature_as_active(self):
+        hidden = torch.tensor([[-2.0, -1.0]])
+        inputs = {
+            "hidden_states": hidden,
+            "encoder_weight": torch.eye(2),
+            "encoder_bias": torch.zeros(2),
+            "decoder_weight": torch.eye(2),
+            "decoder_bias": torch.zeros(2),
+            "clampable_features": torch.tensor([0], dtype=torch.int64),
+        }
+        clamps = {
+            "clamp_kind": torch.tensor([[1]], dtype=torch.int8),
+            "clamp_value": torch.tensor([[4.0]], dtype=torch.float32),
+            "clamp_only_if_active": torch.tensor([[True]], dtype=torch.bool),
+        }
+
+        got = apply_sae_full_recon_triton(
+            **inputs,
+            **clamps,
+            recon_mask=torch.ones(1, dtype=torch.bool),
+            activation_code=ACTIVATION_CODE_TOPK,
+            activation_param=2.0,
+        )
+
+        assert torch.equal(got, torch.tensor([[4.0, -1.0]]))
+
+    def test_topk_ties_keep_lowest_feature_indices(self):
+        inputs = {
+            "hidden_states": torch.zeros(1, 4),
+            "encoder_weight": torch.zeros(4, 4),
+            "encoder_bias": torch.ones(4),
+            "decoder_weight": torch.eye(4),
+            "decoder_bias": torch.zeros(4),
+            "clampable_features": torch.zeros(0, dtype=torch.int64),
+        }
+        clamps = _zero_clamps(1, 0)
+
+        got = apply_sae_full_recon_triton(
+            **inputs,
+            **clamps,
+            recon_mask=torch.ones(1, dtype=torch.bool),
+            activation_code=ACTIVATION_CODE_TOPK,
+            activation_param=2.0,
+        )
+
+        assert torch.equal(got, torch.tensor([[1.0, 1.0, 0.0, 0.0]]))
+
     def test_dtype_preserved(self):
         # bfloat16/float16 input → output preserved.
         for dtype in (torch.float16, torch.bfloat16, torch.float32):

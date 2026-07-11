@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import torch
 
+from vllm.model_executor.layers.sae_steering import _topk_mask_lowest_indices
+
 
 def apply_sae_full_recon_triton(
     hidden_states: torch.Tensor,
@@ -101,9 +103,7 @@ def apply_sae_full_recon_triton(
         if k >= d_sae:
             f = pre_act
         else:
-            _, top_idx = torch.topk(pre_act, k=k, dim=1, largest=True)
-            mask = torch.zeros_like(pre_act, dtype=torch.bool)
-            mask.scatter_(1, top_idx, True)
+            mask = _topk_mask_lowest_indices(pre_act, k)
             f = torch.where(mask, pre_act, torch.zeros_like(pre_act))
     else:
         raise ValueError(f"Unsupported activation_code: {activation_code!r}")
@@ -119,7 +119,9 @@ def apply_sae_full_recon_triton(
 
         idx_2d = clampable_features.unsqueeze(0).expand(n_active, -1)
         f_subset = f.gather(1, idx_2d)
-        active_flag = f_subset > 0.0
+        active_flag = (
+            f_subset != 0.0 if activation_code == 2 else f_subset > 0.0
+        )
         new_f_absolute = value_active
         new_f_additive = f_subset + value_active
         new_f = torch.where(

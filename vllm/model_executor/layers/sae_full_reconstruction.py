@@ -112,7 +112,7 @@ HOOK_POINT_FR_DECODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
 # whose ``sae_recon_index`` selects ``r``.  Row 0 is reserved as the
 # "no reconstruction" sentinel — a token that maps to row 0 passes
 # through unchanged because :func:`apply_layer_sae_full_reconstruction`
-# derives ``recon_mask`` as ``recon_index != 0``.
+# derives ``recon_mask`` from this site's active-row table.
 HOOK_POINT_FR_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_kind_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_clamp_kind_post_attn",
@@ -127,6 +127,11 @@ HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_only_if_active_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_clamp_only_if_active_post_attn",
     SteeringHookPoint.POST_MLP: "sae_fr_clamp_only_if_active_post_mlp",
+}
+HOOK_POINT_FR_ROW_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_fr_row_active_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_fr_row_active_post_attn",
+    SteeringHookPoint.POST_MLP: "sae_fr_row_active_post_mlp",
 }
 # Clampable global feature indices for this site (constant per
 # manifest registration).
@@ -163,6 +168,7 @@ _FR_BUFFER_ATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
     HOOK_POINT_FR_CLAMP_KIND_ATTR,
     HOOK_POINT_FR_CLAMP_VALUE_ATTR,
     HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR,
+    HOOK_POINT_FR_ROW_ACTIVE_ATTR,
     HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR,
 )
 _FR_PYATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
@@ -185,6 +191,7 @@ def register_sae_full_recon_buffers(
     max_recon_configs: int,
     clampable_features: torch.Tensor,
     dtype: torch.dtype,
+    device: torch.device | None = None,
 ) -> None:
     """Attach full-reconstruction SAE buffers for one ``(layer, hook)`` site.
 
@@ -196,7 +203,7 @@ def register_sae_full_recon_buffers(
     The clamp tables are sized ``(max_recon_configs + 1, n_clamp)``
     where row 0 is the no-reconstruction sentinel — never written
     by the populator and gated out by the layer-hook dispatch shim
-    via the ``recon_index != 0`` derivation.
+    via the active-row table.
 
     Args:
         module: the decoder-layer module to attach buffers to.
@@ -216,6 +223,9 @@ def register_sae_full_recon_buffers(
         clampable_features: ``(n_clamp,)`` int64 tensor of *global*
             feature indices that may be clamped at this site.
         dtype: compute dtype for the encoder / decoder weight tensors.
+        device: device for runtime buffers. Runtime registrations happen
+            after layers may have moved to their worker device, so callers
+            should pass the device of an existing layer buffer.
     """
     if max_recon_configs == 0:
         return
@@ -246,42 +256,47 @@ def register_sae_full_recon_buffers(
     n_rows = max_recon_configs + 1
     module.register_buffer(
         enc_w_attr,
-        torch.zeros(d_sae, hidden_size, dtype=dtype),
+        torch.zeros(d_sae, hidden_size, dtype=dtype, device=device),
         persistent=False,
     )
     module.register_buffer(
         HOOK_POINT_FR_ENCODER_BIAS_ATTR[hook_point],
-        torch.zeros(d_sae, dtype=dtype),
+        torch.zeros(d_sae, dtype=dtype, device=device),
         persistent=False,
     )
     module.register_buffer(
         HOOK_POINT_FR_DECODER_WEIGHT_ATTR[hook_point],
-        torch.zeros(d_sae, hidden_size, dtype=dtype),
+        torch.zeros(d_sae, hidden_size, dtype=dtype, device=device),
         persistent=False,
     )
     module.register_buffer(
         HOOK_POINT_FR_DECODER_BIAS_ATTR[hook_point],
-        torch.zeros(hidden_size, dtype=dtype),
+        torch.zeros(hidden_size, dtype=dtype, device=device),
         persistent=False,
     )
     module.register_buffer(
         HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point],
-        torch.zeros(n_rows, n_clamp, dtype=torch.int8),
+        torch.zeros(n_rows, n_clamp, dtype=torch.int8, device=device),
         persistent=False,
     )
     module.register_buffer(
         HOOK_POINT_FR_CLAMP_VALUE_ATTR[hook_point],
-        torch.zeros(n_rows, n_clamp, dtype=torch.float32),
+        torch.zeros(n_rows, n_clamp, dtype=torch.float32, device=device),
         persistent=False,
     )
     module.register_buffer(
         HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point],
-        torch.zeros(n_rows, n_clamp, dtype=torch.bool),
+        torch.zeros(n_rows, n_clamp, dtype=torch.bool, device=device),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point],
+        torch.zeros(n_rows, dtype=torch.bool, device=device),
         persistent=False,
     )
     module.register_buffer(
         HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR[hook_point],
-        clampable_features.detach().to(torch.int64).clone(),
+        clampable_features.detach().to(dtype=torch.int64, device=device).clone(),
         persistent=False,
     )
     setattr(module, HOOK_POINT_FR_MODULE_NAME_ATTR[hook_point], module_name)
@@ -325,21 +340,25 @@ def sae_full_recon_buffers_attached(
     return hasattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
 
 
-def register_sae_recon_index_buffer(module: nn.Module, max_tokens: int) -> None:
+def register_sae_recon_index_buffer(
+    module: nn.Module, max_tokens: int, device: torch.device | None = None
+) -> None:
     """Attach the shared per-token ``sae_recon_index`` buffer to ``module``.
 
     Mirrors the additive ``steering_index`` and the delta path's
     ``sae_index``: a single ``(max_tokens,)`` int64 tensor, expected
     to be shared across all SAE-full-reconstruction-covered layers
     via :func:`share_sae_recon_index_across_layers`.  Row 0 is the
-    no-reconstruction sentinel; the layer-hook dispatch shim derives
-    ``recon_mask = (recon_index != 0)``.
+    no-reconstruction sentinel; each site gates the shared row through
+    its own active-row table.
     """
     if max_tokens == 0:
         return
+    if hasattr(module, "sae_recon_index"):
+        return
     module.register_buffer(
         "sae_recon_index",
-        torch.zeros(max_tokens, dtype=torch.long),
+        torch.zeros(max_tokens, dtype=torch.long, device=device),
         persistent=False,
     )
 
@@ -740,8 +759,8 @@ def apply_layer_sae_full_reconstruction(
 
     The shim performs a per-token gather from the row tables (keyed
     by the shared ``sae_recon_index`` buffer), derives
-    ``recon_mask = (recon_index != 0)`` so row 0 is the no-op
-    sentinel, and dispatches to
+    ``recon_mask`` from this site's active-row table so row 0 and
+    rows owned by other modules are no-op sentinels, and dispatches to
     ``torch.ops.vllm.apply_sae_full_reconstruction``.  The torch-op
     indirection is what makes :mod:`torch.compile` treat the call as
     an opaque splitting point.
@@ -753,7 +772,8 @@ def apply_layer_sae_full_reconstruction(
         return hidden_states
     recon_index_full: torch.Tensor = module.sae_recon_index  # type: ignore[assignment]
     recon_index = recon_index_full[:n_tokens]
-    recon_mask = recon_index != 0
+    active_table = getattr(module, HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point])
+    recon_mask = active_table[recon_index]
 
     enc_w = getattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
     enc_b = getattr(module, HOOK_POINT_FR_ENCODER_BIAS_ATTR[hook_point])
@@ -826,10 +846,8 @@ def populate_sae_full_recon_clamp_table(
     accidental routing to it is a true passthrough.
 
     Specs with empty ``clamps`` (pure reconstruction) are recorded by
-    *zeroing* the row at this site — the reconstruction still happens
-    via the dispatch shim's ``recon_mask = (recon_index != 0)`` because
-    the row index is non-zero.  The clamp tables only carry feature-
-    activation modifications.
+    *zeroing* the row at this site and marking the active-row table.
+    The clamp tables only carry feature-activation modifications.
 
     Args:
         manager: the :class:`SAEFullReconstructionManager` holding active rows.
@@ -856,6 +874,7 @@ def populate_sae_full_recon_clamp_table(
     kind_table = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
     value_table = getattr(module, HOOK_POINT_FR_CLAMP_VALUE_ATTR[hook_point])
     only_table = getattr(module, HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
+    active_table = getattr(module, HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point])
     n_clamp = kind_table.shape[1]
     if len(clampable_features) != n_clamp:
         raise ValueError(
@@ -868,6 +887,7 @@ def populate_sae_full_recon_clamp_table(
     kind_table[0].zero_()
     value_table[0].zero_()
     only_table[0].zero_()
+    active_table[0].zero_()
     hook_name = hook_point.value
     for row, _config_hash, row_phase, specs in manager.active_rows():
         if worker_phase is not None and row_phase != worker_phase:
@@ -875,16 +895,18 @@ def populate_sae_full_recon_clamp_table(
         kind_table[row].zero_()
         value_table[row].zero_()
         only_table[row].zero_()
+        active_table[row].zero_()
         for spec in specs:
             if spec.module_name != module_name:
                 continue
             if spec.phase != "both" and spec.phase != row_phase:
                 continue
+            active_table[row].fill_(True)
             layer_map = spec.clamps.get(hook_name)
             if layer_map is None:
                 # Empty clamps for this hook — row stays zeroed; the
-                # reconstruction still triggers because the row index
-                # is non-zero (recon_mask = recon_index != 0).
+                # reconstruction still triggers because this site's
+                # active table marks the row as enabled.
                 continue
             layer_entries: list = []
             if layer_idx is None:
@@ -937,6 +959,7 @@ __all__ = [
     "HOOK_POINT_FR_ENCODER_BIAS_ATTR",
     "HOOK_POINT_FR_ENCODER_WEIGHT_ATTR",
     "HOOK_POINT_FR_MODULE_NAME_ATTR",
+    "HOOK_POINT_FR_ROW_ACTIVE_ATTR",
     "SAEFullReconstructionManager",
     "apply_layer_sae_full_reconstruction",
     "apply_sae_full_reconstruction",

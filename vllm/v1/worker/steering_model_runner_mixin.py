@@ -1865,24 +1865,29 @@ class SteeringModelRunnerMixin:
     ) -> None:
         """Admit ``sp.sae_full_reconstruction_specs`` against the manager.
 
-        Uses the combined ``prefill_hash`` / ``decode_hash`` from the
-        scheduler so admission accounting and row addressing stay
-        aligned with the scheduler's capacity reservations.  The full
-        spec tuple is stored verbatim so the populator can re-derive
-        per-(layer, hook) clamp content at flush time.
+        Uses the scheduler's combined hashes only as phase-presence gates.
+        Rows are keyed by the full-reconstruction-only phase hashes so
+        additive and decode-only state cannot accidentally route tokens to
+        a reconstruction row in the wrong phase.
         """
         mgr = self._sae_fr_clamp_manager
         specs = getattr(sp, "sae_full_reconstruction_specs", None)
         if mgr is None or not specs:
             return
+        prefill_specs = sp._phase_filtered_sae_full_recon_specs("prefill")
+        decode_specs = sp._phase_filtered_sae_full_recon_specs("decode")
+        prefill_recon_hash = sp.prefill_sae_full_recon_config_hash
+        decode_recon_hash = sp.decode_sae_full_recon_config_hash
         if is_prefilling:
-            if prefill_hash != 0:
-                mgr.register_recon_spec(prefill_hash, specs, "prefill")
-                self._set_req_sae_fr_row(req_id, prefill_hash, "prefill")
+            if prefill_hash != 0 and prefill_recon_hash != 0 and prefill_specs:
+                mgr.register_recon_spec(
+                    prefill_recon_hash, prefill_specs, "prefill"
+                )
+                self._set_req_sae_fr_row(req_id, prefill_recon_hash, "prefill")
         else:
-            if decode_hash != 0:
-                mgr.register_recon_spec(decode_hash, specs, "decode")
-                self._set_req_sae_fr_row(req_id, decode_hash, "decode")
+            if decode_hash != 0 and decode_recon_hash != 0 and decode_specs:
+                mgr.register_recon_spec(decode_recon_hash, decode_specs, "decode")
+                self._set_req_sae_fr_row(req_id, decode_recon_hash, "decode")
 
     def _release_sae_full_recon_for_request(
         self,
@@ -1900,198 +1905,6 @@ class SteeringModelRunnerMixin:
         recon_hash, phase = row
         if recon_hash != 0:
             mgr.release_recon_spec(recon_hash, phase)
-    # -----------------------------------------------------------------------
-    # Phase-4: SAE full-reconstruction buffer / weight / admission lifecycle
-    # -----------------------------------------------------------------------
-
-    def _attach_sae_full_recon_buffers(
-        self,
-        module_name: str,
-        manifest: SAEModuleManifest,
-    ) -> None:
-        """Attach per-(layer, hook) full-reconstruction buffers.
-
-        Walks ``manifest.layers``, filters to layers this rank owns,
-        and attaches the full encoder / decoder weight buffers + per-
-        row clamp tables + the shared ``sae_recon_index`` to each
-        owning layer module.  Buffers default to zero; weights are
-        populated separately via :meth:`attach_sae_full_recon_weights`.
-        """
-        steerable = self._steerable_layers_cache or {}
-        vllm_config = getattr(self, "vllm_config", None)
-        steering_config = (
-            getattr(vllm_config, "steering_config", None)
-            if vllm_config is not None
-            else None
-        )
-        if steering_config is None or not steerable:
-            return
-        max_recon_configs = int(steering_config.max_steering_configs)
-        any_layer = next(iter(steerable.values()))
-        ref_dtype: torch.dtype | None = None
-        for attr in HOOK_POINT_TABLE_ATTR.values():
-            if hasattr(any_layer, attr):
-                ref_dtype = getattr(any_layer, attr).dtype
-                break
-        if ref_dtype is None:
-            ref_dtype = getattr(self.vllm_config.model_config, "dtype", torch.float32)
-        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
-        max_tokens = (
-            int(scheduler_config.max_num_batched_tokens)
-            if scheduler_config is not None
-            else 0
-        )
-        n_clamp = len(manifest.clampable_features)
-        clampable_features = torch.tensor(
-            list(manifest.clampable_features), dtype=torch.int64
-        )
-        attached_layers: list[nn.Module] = []
-        for layer_idx, hook_str in manifest.layers:
-            if layer_idx not in self._locally_owned_layers:
-                continue
-            layer = steerable.get(layer_idx)
-            if layer is None:
-                continue
-            try:
-                hook_point = SteeringHookPoint(hook_str)
-            except ValueError as exc:
-                raise SteeringVectorError(
-                    f"SAE full-reconstruction module {module_name!r} declares "
-                    f"unsupported hook point {hook_str!r}."
-                ) from exc
-            register_sae_full_recon_buffers(
-                layer,
-                hook_point=hook_point,
-                module_name=module_name,
-                activation=manifest.activation,
-                activation_params=manifest.activation_params,
-                d_sae=manifest.d_sae,
-                n_clamp=n_clamp,
-                hidden_size=manifest.d_model,
-                max_recon_configs=max_recon_configs,
-                clampable_features=clampable_features,
-                dtype=ref_dtype,
-            )
-            register_sae_recon_index_buffer(layer, max_tokens=max_tokens)
-            self._sae_fr_steerable_sites[(module_name, layer_idx, hook_str)] = layer
-            attached_layers.append(layer)
-        if attached_layers:
-            share_sae_recon_index_across_layers(attached_layers)
-            self._warmup_sae_full_recon_for_module(
-                manifest=manifest,
-                attached_layers=attached_layers,
-                ref_dtype=ref_dtype,
-            )
-
-    def _warmup_sae_full_recon_for_module(
-        self,
-        *,
-        manifest: SAEModuleManifest,
-        attached_layers: list[nn.Module],
-        ref_dtype: torch.dtype,
-    ) -> None:
-        """Pre-warm the full-reconstruction CUDA path for ``manifest``.
-
-        Mirrors :meth:`_warmup_sae_kernel_for_module` for the
-        full-reconstruction path.  No-op on CPU; under CUDA it pays
-        the first-call cuBLAS handle / autotune costs outside any
-        captured forward pass.
-        """
-        if not attached_layers:
-            return
-        device = attached_layers[0].sae_recon_index.device  # type: ignore[union-attr]
-        if device.type != "cuda":
-            return
-        from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
-            warmup_apply_sae_full_recon_kernel,
-        )
-        from vllm.model_executor.layers.sae_steering import (
-            _ACTIVATION_TO_CODE,
-            _activation_to_scalar,
-        )
-
-        compute_dtype = getattr(self.vllm_config.model_config, "dtype", ref_dtype)
-        warmup_apply_sae_full_recon_kernel(
-            hidden_size=manifest.d_model,
-            d_sae=manifest.d_sae,
-            n_clamp=len(manifest.clampable_features),
-            table_dtype=ref_dtype,
-            compute_dtype=compute_dtype,
-            device=device,
-            activation_code=_ACTIVATION_TO_CODE[manifest.activation],
-            activation_param=_activation_to_scalar(
-                manifest.activation, manifest.activation_params
-            ),
-        )
-
-    def _detach_sae_full_recon_buffers(self, module_name: str) -> None:
-        """Detach per-(layer, hook) full-reconstruction buffers for the module."""
-        sites = getattr(self, "_sae_fr_steerable_sites", None)
-        if sites is None:
-            return
-        keys = [k for k in sites if k[0] == module_name]
-        for key in keys:
-            _, _layer_idx, hook_str = key
-            layer = sites.pop(key)
-            try:
-                hook_point = SteeringHookPoint(hook_str)
-            except ValueError:
-                continue
-            unregister_sae_full_recon_buffers(layer, hook_point=hook_point)
-
-    def attach_sae_full_recon_weights(
-        self,
-        module_name: str,
-        weights: dict[tuple[int, str], dict[str, torch.Tensor]],
-    ) -> None:
-        """Inject encoder / decoder weight + bias tensors into full-recon buffers.
-
-        ``weights`` maps ``(layer_idx, hook_str)`` to a dict with keys
-        ``"encoder_weight"``, ``"encoder_bias"``,
-        ``"decoder_weight"``, and ``"decoder_bias"``.  Each tensor is
-        copied into the corresponding zero-initialised buffer in
-        place; shape and dtype must match what
-        :meth:`_attach_sae_full_recon_buffers` allocated.
-        """
-        if module_name not in self._sae_fr_module_registry:
-            raise SteeringVectorError(
-                f"attach_sae_full_recon_weights: SAE full-reconstruction "
-                f"module {module_name!r} is not registered."
-            )
-        for (layer_idx, hook_str), tensors in weights.items():
-            site = self._sae_fr_steerable_sites.get((module_name, layer_idx, hook_str))
-            if site is None:
-                continue
-            try:
-                hook_point = SteeringHookPoint(hook_str)
-            except ValueError as exc:
-                raise SteeringVectorError(
-                    f"attach_sae_full_recon_weights: unsupported hook point "
-                    f"{hook_str!r}."
-                ) from exc
-            for tensor_key, attr_table in (
-                ("encoder_weight", HOOK_POINT_FR_ENCODER_WEIGHT_ATTR),
-                ("encoder_bias", HOOK_POINT_FR_ENCODER_BIAS_ATTR),
-                ("decoder_weight", HOOK_POINT_FR_DECODER_WEIGHT_ATTR),
-                ("decoder_bias", HOOK_POINT_FR_DECODER_BIAS_ATTR),
-            ):
-                if tensor_key not in tensors:
-                    raise SteeringVectorError(
-                        f"attach_sae_full_recon_weights({module_name!r}): "
-                        f"missing {tensor_key!r} for site (layer="
-                        f"{layer_idx}, hook={hook_str!r})."
-                    )
-                buf = getattr(site, attr_table[hook_point])
-                src = tensors[tensor_key].to(dtype=buf.dtype, device=buf.device)
-                if src.shape != buf.shape:
-                    raise SteeringVectorError(
-                        f"attach_sae_full_recon_weights({module_name!r}): "
-                        f"{tensor_key} shape {tuple(src.shape)} does not "
-                        f"match buffer shape {tuple(buf.shape)} at site "
-                        f"(layer={layer_idx}, hook={hook_str!r})."
-                    )
-                buf.copy_(src)
-
     def _register_initial_sae_clamps(
         self,
         req_id: str,
@@ -2299,6 +2112,8 @@ class SteeringModelRunnerMixin:
             # current step's SAE index so the final prefill token still
             # sees the prefill row before it is released.
             self._update_sae_buffers(scheduler_output)
+            if getattr(self, "_sae_fr_clamp_manager", None) is not None:
+                self._update_sae_full_recon_buffers(scheduler_output)
             if self._may_need_prefill_completion_transition_scan():
                 self._handle_sae_transitions_for_scheduled_prefill_completions(
                     scheduler_output
@@ -2590,6 +2405,7 @@ class SteeringModelRunnerMixin:
                 prefill_hash == 0
                 and decode_hash == 0
                 and req_id not in self._req_sae_phase
+                and req_id not in self._req_sae_fr_phase_map()
                 and req_id not in self._transition_scan_candidates()
             ):
                 continue
@@ -2598,6 +2414,7 @@ class SteeringModelRunnerMixin:
             transitions.append((req_id, prefill_hash, decode_hash, sp))
         self._apply_batched_steering_transitions(transitions)
         self._apply_batched_sae_transitions(transitions)
+        self._apply_batched_sae_full_recon_transitions(transitions)
 
     def _may_need_prefill_completion_transition_scan(self) -> bool:
         """Return whether no-active shortcut must scan for phase transitions."""
@@ -2609,6 +2426,9 @@ class SteeringModelRunnerMixin:
         # no prefill row to keep the additive manager active.
         return (
             any(phase == "prefill" for phase in self._req_sae_phase.values())
+            or any(
+                phase == "prefill" for phase in self._req_sae_fr_phase_map().values()
+            )
             or bool(self._transition_scan_candidates())
         )
 
@@ -2662,16 +2482,26 @@ class SteeringModelRunnerMixin:
                 self._pop_req_sae_fr_row(req_id)
 
         for req_id, _prefill_hash, decode_hash, sp in transitions:
-            specs = (
-                getattr(sp, "sae_full_reconstruction_specs", None)
+            decode_specs = (
+                sp._phase_filtered_sae_full_recon_specs("decode")
                 if sp is not None
+                and getattr(sp, "sae_full_reconstruction_specs", None)
                 else None
             )
-            if decode_hash != 0 and specs:
-                fr_mgr.register_recon_spec(decode_hash, specs, "decode")
-                self._set_req_sae_fr_row(req_id, decode_hash, "decode")
+            decode_recon_hash = (
+                sp.decode_sae_full_recon_config_hash
+                if sp is not None
+                and getattr(sp, "sae_full_reconstruction_specs", None)
+                else 0
+            )
+            if decode_hash != 0 and decode_recon_hash != 0 and decode_specs:
+                fr_mgr.register_recon_spec(
+                    decode_recon_hash, decode_specs, "decode"
+                )
+                self._set_req_sae_fr_row(req_id, decode_recon_hash, "decode")
             else:
                 self._pop_req_sae_fr_row(req_id)
+            self._transition_scan_candidates().discard(req_id)
 
     def _update_sae_buffers(self, scheduler_output: "SchedulerOutput") -> None:
         """Populate SAE per-layer clamp tables and the shared ``sae_index``.
@@ -2862,8 +2692,8 @@ class SteeringModelRunnerMixin:
         non-blocking H2D copy into the shared ``sae_recon_index``
         tensor.  Tokens whose request has no active full-
         reconstruction row are routed to row 0 (the no-reconstruction
-        sentinel) so the dispatch shim's ``recon_mask =
-        (recon_index != 0)`` short-circuits them.
+        sentinel) so the dispatch shim's per-site active-row table
+        short-circuits them.
         """
         fr_mgr = self._sae_fr_clamp_manager
         if fr_mgr is None or not self._sae_fr_steerable_sites:
@@ -2933,25 +2763,40 @@ class SteeringModelRunnerMixin:
             num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
             num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
             is_prefilling = num_computed < num_prompt
+            tracked_recon_row = self._get_req_sae_fr_row(req_id)
 
             if is_prefilling:
                 combined_hash = int(
                     self.input_batch.request_prefill_steering_hash[req_index]
                 )
-                if (combined_hash, "prefill") in fr_mgr.config_to_row:
-                    hash_val = combined_hash
-                else:
-                    hash_val = 0
-                row = fr_mgr.get_row_for_config(hash_val, is_prefill=True)
+                recon_hash = (
+                    tracked_recon_row[0] if tracked_recon_row is not None else 0
+                )
+                if (
+                    combined_hash == 0
+                    or recon_hash == 0
+                    or tracked_recon_row is None
+                    or tracked_recon_row[1] != "prefill"
+                    or (recon_hash, "prefill") not in fr_mgr.config_to_row
+                ):
+                    recon_hash = 0
+                row = fr_mgr.get_row_for_config(recon_hash, is_prefill=True)
             else:
                 combined_hash = int(
                     self.input_batch.request_decode_steering_hash[req_index]
                 )
-                if (combined_hash, "decode") in fr_mgr.config_to_row:
-                    hash_val = combined_hash
-                else:
-                    hash_val = 0
-                row = fr_mgr.get_row_for_config(hash_val, is_prefill=False)
+                recon_hash = (
+                    tracked_recon_row[0] if tracked_recon_row is not None else 0
+                )
+                if (
+                    combined_hash == 0
+                    or recon_hash == 0
+                    or tracked_recon_row is None
+                    or tracked_recon_row[1] != "decode"
+                    or (recon_hash, "decode") not in fr_mgr.config_to_row
+                ):
+                    recon_hash = 0
+                row = fr_mgr.get_row_for_config(recon_hash, is_prefill=False)
             rows_scratch[active_count] = row
             n_tokens_scratch[active_count] = n_tokens
             active_count += 1
@@ -3082,6 +2927,8 @@ class SteeringModelRunnerMixin:
         # also needs its SAE row reset.  Release any decode-phase row
         # we admitted, then register the prefill row.
         sae_mgr = self._sae_clamp_manager
+        sae_registered: tuple[int, str] | None = None
+        fr_registered: tuple[int, str] | None = None
         if sae_mgr is not None and sp is not None and sp.sae_clamp_specs:
             try:
                 old_row = self._get_req_sae_row(req_id)
@@ -3099,13 +2946,61 @@ class SteeringModelRunnerMixin:
                         prefill_sae_hash, prefill_specs, "prefill"
                     )
                     self._set_req_sae_row(req_id, prefill_sae_hash, "prefill")
+                    sae_registered = (prefill_sae_hash, "prefill")
                 else:
                     self._pop_req_sae_row(req_id)
             except Exception:
+                if sae_registered is not None:
+                    sae_mgr.release_clamp_spec(*sae_registered)
                 if additive_registered is not None:
                     mgr.release_config(*additive_registered)
                 self._req_steering_phase.pop(req_id, None)
                 self._pop_req_sae_row(req_id)
+                self._pop_req_sae_fr_row(req_id)
+                self._transition_scan_candidates().discard(req_id)
+                raise
+
+        fr_mgr = getattr(self, "_sae_fr_clamp_manager", None)
+        if (
+            fr_mgr is not None
+            and sp is not None
+            and getattr(sp, "sae_full_reconstruction_specs", None)
+        ):
+            try:
+                old_row = self._get_req_sae_fr_row(req_id)
+                if (
+                    old_row is not None
+                    and old_row[1] == "decode"
+                    and old_row[0] != 0
+                ):
+                    fr_mgr.release_recon_spec(old_row[0], "decode")
+                    self._pop_req_sae_fr_row(req_id)
+                prefill_specs = sp._phase_filtered_sae_full_recon_specs("prefill")
+                prefill_recon_hash = sp.prefill_sae_full_recon_config_hash
+                if (
+                    prefill_hash != 0
+                    and prefill_recon_hash != 0
+                    and prefill_specs
+                ):
+                    fr_mgr.register_recon_spec(
+                        prefill_recon_hash, prefill_specs, "prefill"
+                    )
+                    self._set_req_sae_fr_row(
+                        req_id, prefill_recon_hash, "prefill"
+                    )
+                    fr_registered = (prefill_recon_hash, "prefill")
+                else:
+                    self._pop_req_sae_fr_row(req_id)
+            except Exception:
+                if fr_registered is not None:
+                    fr_mgr.release_recon_spec(*fr_registered)
+                if sae_registered is not None and sae_mgr is not None:
+                    sae_mgr.release_clamp_spec(*sae_registered)
+                if additive_registered is not None:
+                    mgr.release_config(*additive_registered)
+                self._req_steering_phase.pop(req_id, None)
+                self._pop_req_sae_row(req_id)
+                self._pop_req_sae_fr_row(req_id)
                 self._transition_scan_candidates().discard(req_id)
                 raise
 
@@ -3276,6 +3171,8 @@ class SteeringModelRunnerMixin:
         sp = new_req_data.sampling_params
         if sp is not None:
             self._assert_sae_clamps_can_be_applied(sp)
+            if getattr(self, "_sae_fr_module_registry", None) is not None:
+                self._assert_sae_full_recon_specs_can_be_applied(sp)
 
         old_phase = self._req_steering_phase.get(req_id)
         old_sp: SamplingParams | None
@@ -3316,6 +3213,15 @@ class SteeringModelRunnerMixin:
                 if old_sae_specs is not None:
                     old_sae_restore = (old_sae_row[0], old_sae_row[1], old_sae_specs)
 
+        fr_mgr = getattr(self, "_sae_fr_clamp_manager", None)
+        old_fr_restore: tuple[int, str, tuple] | None = None
+        if fr_mgr is not None:
+            old_fr_row = self._get_req_sae_fr_row(req_id)
+            if old_fr_row is not None and old_fr_row[0] != 0:
+                old_fr_specs = fr_mgr.config_specs.get(old_fr_row)
+                if old_fr_specs is not None:
+                    old_fr_restore = (old_fr_row[0], old_fr_row[1], old_fr_specs)
+
         transition_candidates = self.__dict__.get("_req_transition_scan_candidates")
         if not isinstance(transition_candidates, set):
             transition_candidates = set()
@@ -3346,6 +3252,12 @@ class SteeringModelRunnerMixin:
                 self._set_req_sae_row(req_id, old_sae_hash, old_sae_phase)
             elif sae_mgr is not None:
                 self._pop_req_sae_row(req_id)
+            if fr_mgr is not None and old_fr_restore is not None:
+                old_fr_hash, old_fr_phase, old_fr_specs = old_fr_restore
+                fr_mgr.register_recon_spec(old_fr_hash, old_fr_specs, old_fr_phase)
+                self._set_req_sae_fr_row(req_id, old_fr_hash, old_fr_phase)
+            elif fr_mgr is not None:
+                self._pop_req_sae_fr_row(req_id)
             if was_transition_candidate:
                 transition_candidates.add(req_id)
             else:
@@ -3416,10 +3328,41 @@ class SteeringModelRunnerMixin:
                     self._set_req_sae_row(req_id, prefill_sae_hash, "prefill")
                 else:
                     self._pop_req_sae_row(req_id)
+            if fr_mgr is not None:
+                old_row = self._get_req_sae_fr_row(req_id)
+                if old_row is not None and old_row[0] != 0:
+                    fr_mgr.release_recon_spec(old_row[0], old_row[1])
+                    self._pop_req_sae_fr_row(req_id)
+                prefill_specs = (
+                    sp._phase_filtered_sae_full_recon_specs("prefill")
+                    if sp is not None
+                    and getattr(sp, "sae_full_reconstruction_specs", None)
+                    else None
+                )
+                prefill_recon_hash = (
+                    sp.prefill_sae_full_recon_config_hash
+                    if sp is not None
+                    and getattr(sp, "sae_full_reconstruction_specs", None)
+                    else 0
+                )
+                if (
+                    new_prefill_hash != 0
+                    and prefill_recon_hash != 0
+                    and prefill_specs
+                ):
+                    fr_mgr.register_recon_spec(
+                        prefill_recon_hash, prefill_specs, "prefill"
+                    )
+                    self._set_req_sae_fr_row(
+                        req_id, prefill_recon_hash, "prefill"
+                    )
+                else:
+                    self._pop_req_sae_fr_row(req_id)
         except Exception:
             if additive_registered is not None:
                 mgr.release_config(*additive_registered)
             self._req_steering_phase.pop(req_id, None)
             self._pop_req_sae_row(req_id)
+            self._pop_req_sae_fr_row(req_id)
             restore_old_state()
             raise

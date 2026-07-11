@@ -355,8 +355,10 @@ class Scheduler(SchedulerInterface):
         request: Request,
         scheduled_additive_steering_configs: set[tuple[int, str]],
         scheduled_sae_steering_configs: set[tuple[int, str]],
+        scheduled_sae_full_recon_configs: set[tuple[int, str]],
         post_transition_additive_steering_configs: set[tuple[int, str]],
         post_transition_sae_steering_configs: set[tuple[int, str]],
+        post_transition_sae_full_recon_configs: set[tuple[int, str]],
     ) -> None:
         """Keep APC steering keys aligned with the effective steering rows."""
         prefill_hash = request.prefill_steering_config_hash
@@ -365,6 +367,9 @@ class Scheduler(SchedulerInterface):
         if self.steering_config:
             if request.num_computed_tokens < request.num_prompt_tokens:
                 additive_pairs, sae_pairs = self._request_steering_config_pairs(
+                    request, "prefill"
+                )
+                recon_pairs = self._request_sae_full_recon_config_pairs(
                     request, "prefill"
                 )
                 if (
@@ -378,11 +383,18 @@ class Scheduler(SchedulerInterface):
                             sae_pairs,
                             scheduled_sae_steering_configs,
                         )
+                        or self._steering_pool_would_overflow(
+                            recon_pairs,
+                            scheduled_sae_full_recon_configs,
+                        )
                     )
                 ):
                     prefill_hash = 0
             else:
                 additive_pairs, sae_pairs = self._request_steering_config_pairs(
+                    request, "decode"
+                )
+                recon_pairs = self._request_sae_full_recon_config_pairs(
                     request, "decode"
                 )
                 if (
@@ -403,6 +415,14 @@ class Scheduler(SchedulerInterface):
                         or self._steering_pool_would_overflow(
                             sae_pairs,
                             post_transition_sae_steering_configs,
+                        )
+                        or self._steering_pool_would_overflow(
+                            recon_pairs,
+                            scheduled_sae_full_recon_configs,
+                        )
+                        or self._steering_pool_would_overflow(
+                            recon_pairs,
+                            post_transition_sae_full_recon_configs,
                         )
                     )
                 ):
@@ -459,6 +479,27 @@ class Scheduler(SchedulerInterface):
         else:
             sae_pairs = set()
         return additive_pairs, sae_pairs
+
+    def _request_sae_full_recon_config_pairs(
+        self,
+        request: Request,
+        phase: str,
+    ) -> set[tuple[int, str]]:
+        if phase == "prefill":
+            config_hash = request.prefill_steering_config_hash
+        else:
+            config_hash = request.decode_steering_config_hash
+        if config_hash == 0:
+            return set()
+
+        sp = request.sampling_params
+        if sp is None or not getattr(sp, "sae_full_reconstruction_specs", None):
+            return set()
+        if phase == "prefill":
+            recon_hash = sp.prefill_sae_full_recon_config_hash
+        else:
+            recon_hash = sp.decode_sae_full_recon_config_hash
+        return {(recon_hash, phase)} if recon_hash != 0 else set()
 
     def _steering_pool_would_overflow(
         self,
@@ -701,8 +742,10 @@ class Scheduler(SchedulerInterface):
         # prefill forward uses the row-0 sentinel.
         scheduled_additive_steering_configs: set[tuple[int, str]] = set()
         scheduled_sae_steering_configs: set[tuple[int, str]] = set()
+        scheduled_sae_full_recon_configs: set[tuple[int, str]] = set()
         post_transition_additive_steering_configs: set[tuple[int, str]] = set()
         post_transition_sae_steering_configs: set[tuple[int, str]] = set()
+        post_transition_sae_full_recon_configs: set[tuple[int, str]] = set()
         if self.steering_config:
             for req in scheduled_running_reqs:
                 n_sched = num_scheduled_tokens.get(req.request_id, 0)
@@ -719,8 +762,12 @@ class Scheduler(SchedulerInterface):
                         additive_pairs, sae_pairs = self._request_steering_config_pairs(
                             req, "prefill"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            req, "prefill"
+                        )
                         scheduled_additive_steering_configs.update(additive_pairs)
                         scheduled_sae_steering_configs.update(sae_pairs)
+                        scheduled_sae_full_recon_configs.update(recon_pairs)
                     if (
                         needs_decode_reservation
                         and req.decode_steering_config_hash != 0
@@ -728,10 +775,14 @@ class Scheduler(SchedulerInterface):
                         additive_pairs, sae_pairs = self._request_steering_config_pairs(
                             req, "decode"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            req, "decode"
+                        )
                         post_transition_additive_steering_configs.update(
                             additive_pairs
                         )
                         post_transition_sae_steering_configs.update(sae_pairs)
+                        post_transition_sae_full_recon_configs.update(recon_pairs)
                     elif (
                         not needs_decode_reservation
                         and req.prefill_steering_config_hash != 0
@@ -739,18 +790,27 @@ class Scheduler(SchedulerInterface):
                         additive_pairs, sae_pairs = self._request_steering_config_pairs(
                             req, "prefill"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            req, "prefill"
+                        )
                         post_transition_additive_steering_configs.update(
                             additive_pairs
                         )
                         post_transition_sae_steering_configs.update(sae_pairs)
+                        post_transition_sae_full_recon_configs.update(recon_pairs)
                 else:
                     additive_pairs, sae_pairs = self._request_steering_config_pairs(
                         req, "decode"
                     )
+                    recon_pairs = self._request_sae_full_recon_config_pairs(
+                        req, "decode"
+                    )
                     scheduled_additive_steering_configs.update(additive_pairs)
                     scheduled_sae_steering_configs.update(sae_pairs)
+                    scheduled_sae_full_recon_configs.update(recon_pairs)
                     post_transition_additive_steering_configs.update(additive_pairs)
                     post_transition_sae_steering_configs.update(sae_pairs)
+                    post_transition_sae_full_recon_configs.update(recon_pairs)
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
@@ -798,8 +858,10 @@ class Scheduler(SchedulerInterface):
                     request,
                     scheduled_additive_steering_configs,
                     scheduled_sae_steering_configs,
+                    scheduled_sae_full_recon_configs,
                     post_transition_additive_steering_configs,
                     post_transition_sae_steering_configs,
+                    post_transition_sae_full_recon_configs,
                 )
 
                 # Check steering config capacity.  Within each row
@@ -821,8 +883,12 @@ class Scheduler(SchedulerInterface):
                         additive_pairs, sae_pairs = self._request_steering_config_pairs(
                             request, "prefill"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            request, "prefill"
+                        )
                     else:
                         additive_pairs, sae_pairs = set(), set()
+                        recon_pairs = set()
                     if (
                         self._steering_pool_would_overflow(
                             additive_pairs,
@@ -831,6 +897,10 @@ class Scheduler(SchedulerInterface):
                         or self._steering_pool_would_overflow(
                             sae_pairs,
                             scheduled_sae_steering_configs,
+                        )
+                        or self._steering_pool_would_overflow(
+                            recon_pairs,
+                            scheduled_sae_full_recon_configs,
                         )
                     ):
                         request.set_block_hash_steering_overrides(
@@ -909,6 +979,9 @@ class Scheduler(SchedulerInterface):
                     additive_pairs, sae_pairs = self._request_steering_config_pairs(
                         request, "decode"
                     )
+                    recon_pairs = self._request_sae_full_recon_config_pairs(
+                        request, "decode"
+                    )
                     if (
                         self._steering_pool_would_overflow(
                             additive_pairs,
@@ -925,6 +998,14 @@ class Scheduler(SchedulerInterface):
                         or self._steering_pool_would_overflow(
                             sae_pairs,
                             post_transition_sae_steering_configs,
+                        )
+                        or self._steering_pool_would_overflow(
+                            recon_pairs,
+                            scheduled_sae_full_recon_configs,
+                        )
+                        or self._steering_pool_would_overflow(
+                            recon_pairs,
+                            post_transition_sae_full_recon_configs,
                         )
                     ):
                         request.set_block_hash_steering_overrides(decode_hash=0)
@@ -1010,6 +1091,9 @@ class Scheduler(SchedulerInterface):
                         additive_pairs, sae_pairs = self._request_steering_config_pairs(
                             request, "decode"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            request, "decode"
+                        )
                     elif (
                         num_computed_tokens + num_new_tokens
                         < request.num_prompt_tokens
@@ -1018,12 +1102,19 @@ class Scheduler(SchedulerInterface):
                         additive_pairs, sae_pairs = self._request_steering_config_pairs(
                             request, "prefill"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            request, "prefill"
+                        )
                     elif request.decode_steering_config_hash != 0:
                         additive_pairs, sae_pairs = self._request_steering_config_pairs(
                             request, "decode"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            request, "decode"
+                        )
                     else:
                         additive_pairs, sae_pairs = set(), set()
+                        recon_pairs = set()
                     if (
                         self._steering_pool_would_overflow(
                             additive_pairs,
@@ -1032,6 +1123,10 @@ class Scheduler(SchedulerInterface):
                         or self._steering_pool_would_overflow(
                             sae_pairs,
                             post_transition_sae_steering_configs,
+                        )
+                        or self._steering_pool_would_overflow(
+                            recon_pairs,
+                            post_transition_sae_full_recon_configs,
                         )
                     ):
                         request.set_block_hash_steering_overrides(
@@ -1144,8 +1239,12 @@ class Scheduler(SchedulerInterface):
                         additive_pairs, sae_pairs = self._request_steering_config_pairs(
                             request, "prefill"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            request, "prefill"
+                        )
                         scheduled_additive_steering_configs.update(additive_pairs)
                         scheduled_sae_steering_configs.update(sae_pairs)
+                        scheduled_sae_full_recon_configs.update(recon_pairs)
                         will_complete = (
                             num_computed_tokens + num_new_tokens
                             >= request.num_prompt_tokens
@@ -1162,10 +1261,14 @@ class Scheduler(SchedulerInterface):
                                     request, "decode"
                                 )
                             )
+                            recon_pairs = self._request_sae_full_recon_config_pairs(
+                                request, "decode"
+                            )
                             post_transition_additive_steering_configs.update(
                                 additive_pairs
                             )
                             post_transition_sae_steering_configs.update(sae_pairs)
+                            post_transition_sae_full_recon_configs.update(recon_pairs)
                         elif (
                             not needs_decode_reservation
                             and request.prefill_steering_config_hash != 0
@@ -1174,17 +1277,23 @@ class Scheduler(SchedulerInterface):
                                 additive_pairs
                             )
                             post_transition_sae_steering_configs.update(sae_pairs)
+                            post_transition_sae_full_recon_configs.update(recon_pairs)
                     else:
                         # Full prefix-cache hit — starting in decode.
                         additive_pairs, sae_pairs = self._request_steering_config_pairs(
                             request, "decode"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            request, "decode"
+                        )
                         scheduled_additive_steering_configs.update(additive_pairs)
                         scheduled_sae_steering_configs.update(sae_pairs)
+                        scheduled_sae_full_recon_configs.update(recon_pairs)
                         post_transition_additive_steering_configs.update(
                             additive_pairs
                         )
                         post_transition_sae_steering_configs.update(sae_pairs)
+                        post_transition_sae_full_recon_configs.update(recon_pairs)
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
