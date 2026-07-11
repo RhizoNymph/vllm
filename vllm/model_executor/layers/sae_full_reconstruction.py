@@ -91,22 +91,22 @@ from vllm.utils.torch_utils import direct_register_custom_op
 HOOK_POINT_FR_ENCODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_encoder_weight_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_encoder_weight_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_encoder_weight_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_encoder_weight_post_block",
 }
 HOOK_POINT_FR_ENCODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_encoder_bias_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_encoder_bias_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_encoder_bias_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_encoder_bias_post_block",
 }
 HOOK_POINT_FR_DECODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_decoder_weight_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_decoder_weight_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_decoder_weight_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_decoder_weight_post_block",
 }
 HOOK_POINT_FR_DECODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_decoder_bias_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_decoder_bias_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_decoder_bias_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_decoder_bias_post_block",
 }
 # Per-row clamp tables: row ``r`` carries the clamp state for tokens
 # whose ``sae_recon_index`` selects ``r``.  Row 0 is reserved as the
@@ -116,46 +116,46 @@ HOOK_POINT_FR_DECODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
 HOOK_POINT_FR_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_kind_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_clamp_kind_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_clamp_kind_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_clamp_kind_post_block",
 }
 HOOK_POINT_FR_CLAMP_VALUE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_value_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_clamp_value_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_clamp_value_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_clamp_value_post_block",
 }
 HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_only_if_active_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_clamp_only_if_active_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_clamp_only_if_active_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_clamp_only_if_active_post_block",
 }
 HOOK_POINT_FR_ROW_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_row_active_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_row_active_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_row_active_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_row_active_post_block",
 }
 # Clampable global feature indices for this site (constant per
 # manifest registration).
 HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_clampable_features_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_clampable_features_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_clampable_features_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_clampable_features_post_block",
 }
 # Module name + activation are Python attributes — read as per-site
 # constants by the kernel.
 HOOK_POINT_FR_MODULE_NAME_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_module_name_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_module_name_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_module_name_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_module_name_post_block",
 }
 HOOK_POINT_FR_ACTIVATION_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_activation_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_activation_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_activation_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_activation_post_block",
 }
 HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_activation_params_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_activation_params_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_activation_params_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_activation_params_post_block",
 }
 
 # Buffer attribute tables — used by :func:`unregister_sae_full_recon_buffers`

@@ -29,7 +29,7 @@ def _make_spec(
     value: float = 5.0,
     kind: str = "absolute",
     layer: int = 20,
-    hook: str = "post_mlp",
+    hook: str = "post_block",
     phase: str = "both",
     only_if_active: bool = False,
 ) -> SAEClampSpec:

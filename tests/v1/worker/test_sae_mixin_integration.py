@@ -135,7 +135,7 @@ class _RichHarness(SteeringModelRunnerMixin):
 
 def _sae_payload(
     *,
-    layers: tuple[tuple[int, str], ...] = ((20, "post_mlp"),),
+    layers: tuple[tuple[int, str], ...] = ((20, "post_block"),),
     clampable: tuple[int, ...] = (0, 1, 2, 34),
     activation: str = "relu",
     activation_params: dict[str, float] | None = None,
@@ -161,7 +161,7 @@ def _make_clamp_spec(
     module_name: str = "g",
     feature_idx: int = 0,
     layer: int = 20,
-    hook: str = "post_mlp",
+    hook: str = "post_block",
     value: float = 5.0,
     kind: str = "absolute",
     phase: str = "both",
@@ -191,14 +191,14 @@ class TestRegisterAttachesSaeBuffers:
         h.register_steering_modules(
             {
                 "g": _sae_payload(
-                    layers=((20, "post_mlp"), (21, "post_mlp")),
+                    layers=((20, "post_block"), (21, "post_block")),
                 ),
             }
         )
         site20 = h._steerable_layers_cache[20]
         site21 = h._steerable_layers_cache[21]
-        assert sae_buffers_attached(site20, SteeringHookPoint.POST_MLP)
-        assert sae_buffers_attached(site21, SteeringHookPoint.POST_MLP)
+        assert sae_buffers_attached(site20, SteeringHookPoint.POST_BLOCK)
+        assert sae_buffers_attached(site21, SteeringHookPoint.POST_BLOCK)
         # POST_ATTN has no SAE buffers because the manifest doesn't
         # declare it.
         assert not sae_buffers_attached(site20, SteeringHookPoint.POST_ATTN)
@@ -209,7 +209,7 @@ class TestRegisterAttachesSaeBuffers:
         h.register_steering_modules(
             {
                 "g": _sae_payload(
-                    layers=((20, "post_mlp"), (21, "post_mlp")),
+                    layers=((20, "post_block"), (21, "post_block")),
                 ),
             }
         )
@@ -217,16 +217,16 @@ class TestRegisterAttachesSaeBuffers:
         assert "g" in h._sae_module_registry
         # Site for layer 20 attached; layer 21 was never on this rank.
         assert sae_buffers_attached(
-            h._steerable_layers_cache[20], SteeringHookPoint.POST_MLP
+            h._steerable_layers_cache[20], SteeringHookPoint.POST_BLOCK
         )
-        assert ("g", 21, "post_mlp") not in h._sae_steerable_sites
+        assert ("g", 21, "post_block") not in h._sae_steerable_sites
 
     def test_records_module_name_in_buffer_attribute(self):
         h = _RichHarness()
         h.register_steering_modules({"g": _sae_payload()})
         site = h._steerable_layers_cache[20]
         assert (
-            getattr(site, HOOK_POINT_SAE_MODULE_NAME_ATTR[SteeringHookPoint.POST_MLP])
+            getattr(site, HOOK_POINT_SAE_MODULE_NAME_ATTR[SteeringHookPoint.POST_BLOCK])
             == "g"
         )
 
@@ -237,7 +237,7 @@ class TestRegisterAttachesSaeBuffers:
         )
         site = h._steerable_layers_cache[20]
         enc_w = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert enc_w.shape == (3, 8)
 
@@ -250,10 +250,10 @@ class TestRegisterAttachesSaeBuffers:
 
         assert layer.sae_index.device.type == "meta"  # type: ignore[attr-defined]
         enc_w = getattr(
-            layer, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         kind = getattr(
-            layer, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert enc_w.device.type == "meta"
         assert kind.device.type == "meta"
@@ -263,7 +263,7 @@ class TestRegisterAttachesSaeBuffers:
         h.register_steering_modules(
             {
                 "g": _sae_payload(
-                    layers=((20, "post_mlp"), (21, "post_mlp")),
+                    layers=((20, "post_block"), (21, "post_block")),
                 ),
             }
         )
@@ -281,10 +281,10 @@ class TestRegisterAttachesSaeBuffers:
         """
         h = _RichHarness(layer_indices=(20, 21))
         h.register_steering_modules(
-            {"a": _sae_payload(layers=((20, "post_mlp"),))},
+            {"a": _sae_payload(layers=((20, "post_block"),))},
         )
         h.register_steering_modules(
-            {"b": _sae_payload(layers=((21, "post_mlp"),))},
+            {"b": _sae_payload(layers=((21, "post_block"),))},
         )
         site20 = h._steerable_layers_cache[20]
         site21 = h._steerable_layers_cache[21]
@@ -312,7 +312,7 @@ class TestRegisterAttachesSaeBuffers:
         h.register_steering_modules(
             {
                 "g": _sae_payload(
-                    layers=((20, "post_mlp"), (21, "post_mlp")),
+                    layers=((20, "post_block"), (21, "post_block")),
                     clampable=(0, 1),
                     d_model=4,
                 ),
@@ -330,7 +330,7 @@ class TestRegisterAttachesSaeBuffers:
         h = _RichHarness()
         with pytest.raises(SteeringVectorError, match="non-negative"):
             h.register_steering_modules(
-                {"g": _sae_payload(layers=((-1, "post_mlp"),))},
+                {"g": _sae_payload(layers=((-1, "post_block"),))},
             )
         assert h._sae_module_registry == {}
         assert h._sae_steerable_sites == {}
@@ -355,7 +355,7 @@ class TestRegisterAttachesSaeBuffers:
             h.register_steering_modules({"g": _sae_payload()})
 
         site = h._steerable_layers_cache[20]
-        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
         assert h._sae_module_registry == {}
         assert h._sae_steerable_sites == {}
 
@@ -365,7 +365,7 @@ class TestRegisterAttachesSaeBuffers:
             original_register_index,
         )
         h.register_steering_modules({"g": _sae_payload()})
-        assert sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
 
 
 class TestUnregisterDetachesSaeBuffers:
@@ -374,7 +374,7 @@ class TestUnregisterDetachesSaeBuffers:
         h.register_steering_modules({"g": _sae_payload()})
         h.unregister_steering_modules(["g"])
         site = h._steerable_layers_cache[20]
-        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
         assert h._sae_steerable_sites == {}
 
     def test_replace_clears_existing_sae_buffers(self):
@@ -387,7 +387,7 @@ class TestUnregisterDetachesSaeBuffers:
         assert "g" not in h._sae_module_registry
         # 'new' should be attached.
         assert (
-            getattr(site, HOOK_POINT_SAE_MODULE_NAME_ATTR[SteeringHookPoint.POST_MLP])
+            getattr(site, HOOK_POINT_SAE_MODULE_NAME_ATTR[SteeringHookPoint.POST_BLOCK])
             == "new"
         )
 
@@ -397,18 +397,18 @@ class TestUnregisterDetachesSaeBuffers:
         h = _RichHarness()
         h.register_steering_modules({"g": _sae_payload()})
         site = h._steerable_layers_cache[20]
-        assert sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
         h.register_steering_modules(
             {
                 "g": {
                     "kind": "additive",
-                    "vectors": {"post_mlp": {0: [0.1, 0.2, 0.3, 0.4]}},
+                    "vectors": {"post_block": {0: [0.1, 0.2, 0.3, 0.4]}},
                     "prefill_vectors": None,
                     "decode_vectors": None,
                 },
             }
         )
-        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
 
 
 class TestAttachSaeWeights:
@@ -417,7 +417,7 @@ class TestAttachSaeWeights:
         h.register_steering_modules({"g": _sae_payload(d_model=4, clampable=(0, 1))})
         site = h._steerable_layers_cache[20]
         enc_w_before = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         ).clone()
         new_w = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
         new_b = torch.tensor([0.1, 0.2])
@@ -425,7 +425,7 @@ class TestAttachSaeWeights:
         h.attach_sae_weights(
             "g",
             {
-                (20, "post_mlp"): {
+                (20, "post_block"): {
                     "encoder_weight": new_w,
                     "encoder_bias": new_b,
                     "decoder_weight": new_dec,
@@ -433,13 +433,13 @@ class TestAttachSaeWeights:
             },
         )
         enc_w = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         enc_b = getattr(
-            site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]
+            site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         dec_w = getattr(
-            site, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            site, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert torch.equal(enc_w, new_w)
         assert torch.equal(enc_b, new_b)
@@ -457,7 +457,7 @@ class TestAttachSaeWeights:
         with pytest.raises(SteeringVectorError, match="missing"):
             h.attach_sae_weights(
                 "g",
-                {(20, "post_mlp"): {"encoder_weight": torch.zeros(2, 4)}},
+                {(20, "post_block"): {"encoder_weight": torch.zeros(2, 4)}},
             )
 
     def test_shape_mismatch_raises(self):
@@ -467,7 +467,7 @@ class TestAttachSaeWeights:
             h.attach_sae_weights(
                 "g",
                 {
-                    (20, "post_mlp"): {
+                    (20, "post_block"): {
                         "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
                         "encoder_bias": torch.zeros(2),
                         "decoder_weight": torch.zeros(2, 4),
@@ -480,14 +480,14 @@ class TestAttachSaeWeights:
         h.register_steering_modules(
             {
                 "g": _sae_payload(
-                    layers=((20, "post_mlp"), (21, "post_mlp")),
+                    layers=((20, "post_block"), (21, "post_block")),
                     clampable=(0, 1),
                 )
             }
         )
         site20 = h._steerable_layers_cache[20]
         enc_w20 = getattr(
-            site20, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            site20, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert torch.count_nonzero(enc_w20) == 0
 
@@ -495,12 +495,12 @@ class TestAttachSaeWeights:
             h.attach_sae_weights(
                 "g",
                 {
-                    (20, "post_mlp"): {
+                    (20, "post_block"): {
                         "encoder_weight": torch.ones(2, 4),
                         "encoder_bias": torch.ones(2),
                         "decoder_weight": torch.ones(2, 4),
                     },
-                    (21, "post_mlp"): {
+                    (21, "post_block"): {
                         "encoder_weight": torch.zeros(99, 4),
                         "encoder_bias": torch.zeros(2),
                         "decoder_weight": torch.zeros(2, 4),
@@ -516,7 +516,7 @@ class TestAttachSaeWeights:
             h.attach_sae_weights(
                 "g",
                 {
-                    (20, "post_mlp"): {
+                    (20, "post_block"): {
                         "encoder_weight": torch.zeros(2, 4, dtype=torch.int64),
                         "encoder_bias": torch.zeros(2),
                         "decoder_weight": torch.zeros(2, 4),
@@ -531,7 +531,7 @@ class TestAttachSaeWeights:
             h.attach_sae_weights(
                 "g",
                 {
-                    (20, "post_mlp"): {
+                    (20, "post_block"): {
                         "encoder_weight": [[0.0, 0.0, 0.0, 0.0]],
                         "encoder_bias": torch.zeros(2),
                         "decoder_weight": torch.zeros(2, 4),
@@ -548,7 +548,7 @@ class TestAttachSaeWeights:
             h.attach_sae_weights(
                 "g",
                 {
-                    (20, "post_mlp"): {
+                    (20, "post_block"): {
                         "encoder_weight": bad,
                         "encoder_bias": torch.zeros(2),
                         "decoder_weight": torch.zeros(2, 4),
@@ -562,12 +562,12 @@ class TestAttachSaeWeights:
         # which rank owns which layer; pruning is the rank's job.
         h = _RichHarness(layer_indices=(20,))
         h.register_steering_modules(
-            {"g": _sae_payload(layers=((99, "post_mlp"),), clampable=(0, 1))}
+            {"g": _sae_payload(layers=((99, "post_block"),), clampable=(0, 1))}
         )
         h.attach_sae_weights(
             "g",
             {
-                (99, "post_mlp"): {
+                (99, "post_block"): {
                     "encoder_weight": torch.zeros(2, 4),
                     "encoder_bias": torch.zeros(2),
                     "decoder_weight": torch.zeros(2, 4),
@@ -580,7 +580,7 @@ class TestAttachSaeWeights:
         h.register_steering_modules(
             {
                 "g": _sae_payload(
-                    layers=((20, "post_mlp"), (21, "post_mlp")),
+                    layers=((20, "post_block"), (21, "post_block")),
                     clampable=(0, 1),
                 )
             }
@@ -589,7 +589,7 @@ class TestAttachSaeWeights:
             h.attach_sae_weights(
                 "g",
                 {
-                    (20, "post_mlp"): {
+                    (20, "post_block"): {
                         "encoder_weight": torch.zeros(2, 4),
                         "encoder_bias": torch.zeros(2),
                         "decoder_weight": torch.zeros(2, 4),
@@ -608,7 +608,7 @@ class TestRegisterWithInlineWeights:
         n = len(clampable)
         body = _sae_payload(d_model=d_model, clampable=clampable)
         body["sae_weights"] = {
-            (20, "post_mlp"): {
+            (20, "post_block"): {
                 "encoder_weight": torch.ones(n, d_model),
                 "encoder_bias": torch.full((n,), 0.5),
                 "decoder_weight": torch.full((n, d_model), 2.0),
@@ -621,7 +621,7 @@ class TestRegisterWithInlineWeights:
         h.register_steering_modules({"g": self._payload_with_weights()})
         site = h._steerable_layers_cache[20]
         enc_w = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert torch.equal(enc_w, torch.ones(2, 4))
 
@@ -633,7 +633,7 @@ class TestRegisterWithInlineWeights:
         h = _RichHarness(hidden_size=4)
         bad = _sae_payload(d_model=4, clampable=(0, 1))
         bad["sae_weights"] = {
-            (20, "post_mlp"): {
+            (20, "post_block"): {
                 "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
                 "encoder_bias": torch.zeros(2),
                 "decoder_weight": torch.zeros(2, 4),
@@ -643,7 +643,7 @@ class TestRegisterWithInlineWeights:
             h.register_steering_modules({"g": bad})
         assert "g" not in h._sae_module_registry
         site = h._steerable_layers_cache[20]
-        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
 
     def test_additive_to_sae_replacement_failure_restores_additive(self):
         """A failed additive-to-SAE replacement must leave the additive
@@ -654,7 +654,7 @@ class TestRegisterWithInlineWeights:
         # Seed an additive module at name 'g'.
         additive_payload = {
             "kind": "additive",
-            "vectors": {"post_mlp": {20: [0.1, 0.2, 0.3, 0.4]}},
+            "vectors": {"post_block": {20: [0.1, 0.2, 0.3, 0.4]}},
             "prefill_vectors": None,
             "decode_vectors": None,
         }
@@ -666,7 +666,7 @@ class TestRegisterWithInlineWeights:
         # payload; attach must fail.
         bad = _sae_payload(d_model=4, clampable=(0, 1))
         bad["sae_weights"] = {
-            (20, "post_mlp"): {
+            (20, "post_block"): {
                 "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
                 "encoder_bias": torch.zeros(2),
                 "decoder_weight": torch.zeros(2, 4),
@@ -680,7 +680,7 @@ class TestRegisterWithInlineWeights:
         assert "g" in h._steering_module_registry
         assert h._steering_module_registry["g"] is prior_additive
         site = h._steerable_layers_cache[20]
-        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
 
     def test_replacement_failure_restores_previous_module(self):
         """A failed replacement must put the previously-loaded SAE
@@ -689,7 +689,7 @@ class TestRegisterWithInlineWeights:
         # Seed a working SAE with recognisable weight values.
         good = _sae_payload(d_model=4, clampable=(0, 1))
         good["sae_weights"] = {
-            (20, "post_mlp"): {
+            (20, "post_block"): {
                 "encoder_weight": torch.full((2, 4), 7.0),
                 "encoder_bias": torch.full((2,), 0.25),
                 "decoder_weight": torch.full((2, 4), 3.0),
@@ -699,7 +699,7 @@ class TestRegisterWithInlineWeights:
         site = h._steerable_layers_cache[20]
         assert torch.equal(
             getattr(
-                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
             ),
             torch.full((2, 4), 7.0),
         )
@@ -707,7 +707,7 @@ class TestRegisterWithInlineWeights:
         # Re-register the same name with a bad-shape weight payload.
         bad = _sae_payload(d_model=4, clampable=(0, 1))
         bad["sae_weights"] = {
-            (20, "post_mlp"): {
+            (20, "post_block"): {
                 "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
                 "encoder_bias": torch.zeros(2),
                 "decoder_weight": torch.zeros(2, 4),
@@ -719,15 +719,15 @@ class TestRegisterWithInlineWeights:
         # Registry entry preserved, buffers re-attached with the
         # original tensors.
         assert "g" in h._sae_module_registry
-        assert sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
         assert torch.equal(
             getattr(
-                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
             ),
             torch.full((2, 4), 7.0),
         )
         assert torch.equal(
-            getattr(site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]),
+            getattr(site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]),
             torch.full((2,), 0.25),
         )
 
@@ -737,7 +737,7 @@ class TestRegisterWithInlineWeights:
             {
                 "m": {
                     "kind": "additive",
-                    "vectors": {"post_mlp": {20: [0.1, 0.2, 0.3, 0.4]}},
+                    "vectors": {"post_block": {20: [0.1, 0.2, 0.3, 0.4]}},
                 }
             }
         )
@@ -758,7 +758,7 @@ class TestRegisterWithInlineWeights:
         h = _RichHarness(hidden_size=4)
         good = _sae_payload(d_model=4, clampable=(0, 1))
         good["sae_weights"] = {
-            (20, "post_mlp"): {
+            (20, "post_block"): {
                 "encoder_weight": torch.full((2, 4), 5.0),
                 "encoder_bias": torch.full((2,), 0.75),
                 "decoder_weight": torch.full((2, 4), 6.0),
@@ -769,7 +769,7 @@ class TestRegisterWithInlineWeights:
 
         bad = _sae_payload(d_model=4, clampable=(0, 1))
         bad["sae_weights"] = {
-            (20, "post_mlp"): {
+            (20, "post_block"): {
                 "encoder_weight": torch.zeros(99, 4),
                 "encoder_bias": torch.zeros(2),
                 "decoder_weight": torch.zeros(2, 4),
@@ -780,15 +780,15 @@ class TestRegisterWithInlineWeights:
 
         assert "g" in h._sae_module_registry
         assert "bad" not in h._sae_module_registry
-        assert sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
         assert torch.equal(
             getattr(
-                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
             ),
             torch.full((2, 4), 5.0),
         )
         assert torch.equal(
-            getattr(site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]),
+            getattr(site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]),
             torch.full((2,), 0.75),
         )
 
@@ -985,12 +985,12 @@ class TestUpdateSaeBuffersPopulator:
         populate_sae_clamp_table(
             manager=h._sae_clamp_manager,
             module=site,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="g",
             clampable_features=(34,),
             layer_idx=20,
         )
-        kind = getattr(site, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        kind = getattr(site, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
         row = h._sae_clamp_manager.config_to_row[
             (sp.prefill_sae_clamp_config_hash, "prefill")
         ]
@@ -1036,7 +1036,7 @@ class TestWorkerRpcSurface:
         runner = _Runner()
         worker.model_runner = runner
         weights = {
-            (20, "post_mlp"): {
+            (20, "post_block"): {
                 "encoder_weight": torch.zeros(1, 2),
                 "encoder_bias": torch.zeros(1),
                 "decoder_weight": torch.zeros(1, 2),

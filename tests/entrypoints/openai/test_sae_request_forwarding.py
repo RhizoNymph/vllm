@@ -23,7 +23,7 @@ _RAW_SAE_PAYLOAD = [
         "module_name": "g",
         "phase": "both",
         "clamps": {
-            "post_mlp": {
+            "post_block": {
                 "20": [
                     {
                         "feature_idx": 34,
@@ -53,7 +53,7 @@ class TestCompletionRequestForwarding:
         assert isinstance(sp.sae_clamp_specs[0], SAEClampSpec)
         assert sp.sae_clamp_specs[0].module_name == "g"
         # Layer key was a JSON string; coercion produced an int.
-        assert 20 in sp.sae_clamp_specs[0].clamps["post_mlp"]
+        assert 20 in sp.sae_clamp_specs[0].clamps["post_block"]
 
     def test_field_optional(self):
         """No field on the wire keeps SamplingParams.sae_clamp_specs at None.

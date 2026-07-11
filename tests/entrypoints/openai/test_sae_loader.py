@@ -90,7 +90,7 @@ def _make_synthetic_dir(
     layers: list[tuple[int, str]] | None = None,
     activation: str = "relu",
 ) -> tuple[list[int], dict[tuple[int, str], dict[str, torch.Tensor]]]:
-    layers = layers or [(0, "post_mlp")]
+    layers = layers or [(0, "post_block")]
     rng = torch.Generator(device="cpu").manual_seed(0)
     feats = list(range(n_clamp))
     weights: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
@@ -159,14 +159,14 @@ class TestLoadSAEModuleFromDir:
         assert loaded.manifest.d_sae == 32
         assert loaded.manifest.activation is SAEActivation.RELU
         assert loaded.manifest.clampable_features == tuple(feats)
-        assert loaded.manifest.layers == ((0, "post_mlp"),)
+        assert loaded.manifest.layers == ((0, "post_block"),)
 
         for site, expected in weights.items():
             for key in ("encoder_weight", "encoder_bias", "decoder_weight"):
                 assert torch.allclose(loaded.weights[site][key], expected[key])
 
     def test_round_trip_multi_site(self, tmp_path: Path):
-        layers = [(0, "post_mlp"), (1, "post_attn"), (2, "pre_attn")]
+        layers = [(0, "post_block"), (1, "post_attn"), (2, "pre_attn")]
         _, weights = _make_synthetic_dir(tmp_path, layers=layers, n_clamp=2, d_sae=8)
 
         loaded = load_sae_module_from_dir(tmp_path)
@@ -197,14 +197,14 @@ class TestLoadSAEModuleFromDir:
             d_model=4,
             d_sae=8,
             activation="relu",
-            layers=[(0, "post_mlp"), (1, "post_attn")],
+            layers=[(0, "post_block"), (1, "post_attn")],
             clampable_features=[0, 1],
         )
         # Only first site's file is written.
         _write_site(
             tmp_path,
             layer_idx=0,
-            hook_str="post_mlp",
+            hook_str="post_block",
             encoder_weight=torch.zeros(2, 4),
             encoder_bias=torch.zeros(2),
             decoder_weight=torch.zeros(2, 4),
@@ -233,7 +233,7 @@ class TestLoadSAEModuleFromDir:
             d_model=True,  # type: ignore[arg-type]
             d_sae=8,
             activation="relu",
-            layers=[(0, "post_mlp")],
+            layers=[(0, "post_block")],
             clampable_features=[0],
         )
         with pytest.raises(ValueError, match="d_model"):
@@ -248,7 +248,7 @@ class TestLoadSAEModuleFromDir:
             d_model=4,
             d_sae=8,
             activation="topk",
-            layers=[(0, "post_mlp")],
+            layers=[(0, "post_block")],
             clampable_features=[0],
             activation_params={"k": 0.0},
         )
@@ -262,13 +262,13 @@ class TestLoadSAEModuleFromDir:
             d_model=4,
             d_sae=8,
             activation="relu",
-            layers=[(0, "post_mlp")],
+            layers=[(0, "post_block")],
             clampable_features=[0, 1],
         )
         _write_site(
             tmp_path,
             layer_idx=0,
-            hook_str="post_mlp",
+            hook_str="post_block",
             encoder_weight=torch.zeros(3, 4),  # wrong: should be (2, 4)
             encoder_bias=torch.zeros(3),
             decoder_weight=torch.zeros(3, 4),
@@ -282,7 +282,7 @@ class TestLoadSAEModuleFromDir:
             d_model=4,
             d_sae=8,
             activation="relu",
-            layers=[(0, "post_mlp")],
+            layers=[(0, "post_block")],
             clampable_features=[0],
         )
         from safetensors.torch import save_file
@@ -293,7 +293,7 @@ class TestLoadSAEModuleFromDir:
                 # encoder_bias deliberately omitted
                 "decoder_weight": torch.zeros(1, 4),
             },
-            str(tmp_path / _site_filename(0, "post_mlp")),
+            str(tmp_path / _site_filename(0, "post_block")),
         )
         with pytest.raises(ValueError, match="encoder_bias"):
             load_sae_module_from_dir(tmp_path)
@@ -304,13 +304,13 @@ class TestLoadSAEModuleFromDir:
             d_model=4,
             d_sae=8,
             activation="relu",
-            layers=[(0, "post_mlp")],
+            layers=[(0, "post_block")],
             clampable_features=[0],
         )
         _write_site(
             tmp_path,
             layer_idx=0,
-            hook_str="post_mlp",
+            hook_str="post_block",
             encoder_weight=torch.zeros(1, 4, dtype=torch.int64),
             encoder_bias=torch.zeros(1),
             decoder_weight=torch.zeros(1, 4),
@@ -324,13 +324,13 @@ class TestLoadSAEModuleFromDir:
             d_model=4,
             d_sae=8,
             activation="relu",
-            layers=[(0, "post_mlp")],
+            layers=[(0, "post_block")],
             clampable_features=[0],
         )
         _write_site(
             tmp_path,
             layer_idx=0,
-            hook_str="post_mlp",
+            hook_str="post_block",
             encoder_weight=torch.tensor([[float("nan"), 0.0, 0.0, 0.0]]),
             encoder_bias=torch.zeros(1),
             decoder_weight=torch.zeros(1, 4),
@@ -356,17 +356,17 @@ class TestLoadGemmaScopeSAE:
         loaded = load_gemma_scope_sae(
             path,
             layer_idx=20,
-            hook_str="post_mlp",
+            hook_str="post_block",
             clampable_features=feats,
         )
 
         assert isinstance(loaded, LoadedSAEModule)
         assert loaded.manifest.d_model == d_model
         assert loaded.manifest.d_sae == d_sae
-        assert loaded.manifest.layers == ((20, "post_mlp"),)
+        assert loaded.manifest.layers == ((20, "post_block"),)
         assert loaded.manifest.clampable_features == tuple(feats)
 
-        site = loaded.weights[(20, "post_mlp")]
+        site = loaded.weights[(20, "post_block")]
         # encoder_weight has rows from W_enc.T at the feature indices.
         expected_enc = arrs["W_enc"].T[feats]
         expected_dec = arrs["W_dec"][feats]
@@ -394,7 +394,7 @@ class TestLoadGemmaScopeSAE:
         load_gemma_scope_sae(
             path,
             layer_idx=20,
-            hook_str="post_mlp",
+            hook_str="post_block",
             clampable_features=[0, 1],
         )
         assert npz.zip is None
@@ -406,7 +406,7 @@ class TestLoadGemmaScopeSAE:
 
         feats = [0, 2, 4]
         loaded = load_gemma_scope_sae(
-            path, layer_idx=0, hook_str="post_mlp", clampable_features=feats
+            path, layer_idx=0, hook_str="post_block", clampable_features=feats
         )
         assert loaded.manifest.activation is SAEActivation.JUMPRELU
         threshold = loaded.manifest.activation_params["threshold"]
@@ -421,7 +421,7 @@ class TestLoadGemmaScopeSAE:
         loaded = load_gemma_scope_sae(
             path,
             layer_idx=0,
-            hook_str="post_mlp",
+            hook_str="post_block",
             clampable_features=[0, 1],
             activation_params={"threshold": 0.123},
         )
@@ -435,7 +435,7 @@ class TestLoadGemmaScopeSAE:
             load_gemma_scope_sae(
                 path,
                 layer_idx=0,
-                hook_str="post_mlp",
+                hook_str="post_block",
                 clampable_features=[0, 1],
                 activation_params={"threshold": True},
             )
@@ -450,7 +450,7 @@ class TestLoadGemmaScopeSAE:
             load_gemma_scope_sae(
                 path,
                 layer_idx=20,
-                hook_str="post_mlp",
+                hook_str="post_block",
                 clampable_features=[0],
             )
 
@@ -464,7 +464,7 @@ class TestLoadGemmaScopeSAE:
             load_gemma_scope_sae(
                 path,
                 layer_idx=20,
-                hook_str="post_mlp",
+                hook_str="post_block",
                 clampable_features=[0],
             )
 
@@ -475,7 +475,7 @@ class TestLoadGemmaScopeSAE:
         loaded = load_gemma_scope_sae(
             path,
             layer_idx=0,
-            hook_str="post_mlp",
+            hook_str="post_block",
             clampable_features=[0, 1],
             activation=SAEActivation.RELU,
         )
@@ -490,11 +490,11 @@ class TestLoadGemmaScopeSAE:
         loaded = load_gemma_scope_sae(
             path,
             layer_idx=0,
-            hook_str="post_mlp",
+            hook_str="post_block",
             clampable_features=[0, 1],
             weights_dtype=torch.bfloat16,
         )
-        site = loaded.weights[(0, "post_mlp")]
+        site = loaded.weights[(0, "post_block")]
         assert site["encoder_weight"].dtype is torch.bfloat16
         assert site["encoder_bias"].dtype is torch.bfloat16
         assert site["decoder_weight"].dtype is torch.bfloat16
@@ -516,7 +516,7 @@ class TestLoadGemmaScopeSAE:
             load_gemma_scope_sae(
                 path,
                 layer_idx=-1,
-                hook_str="post_mlp",
+                hook_str="post_block",
                 clampable_features=[0],
             )
 
@@ -528,7 +528,7 @@ class TestLoadGemmaScopeSAE:
             load_gemma_scope_sae(
                 path,
                 layer_idx=0,
-                hook_str="post_mlp",
+                hook_str="post_block",
                 clampable_features=[0],
                 weights_dtype=torch.int64,
             )
@@ -538,7 +538,7 @@ class TestLoadGemmaScopeSAE:
         _make_gemma_scope_npz(path)
         with pytest.raises(ValueError, match="non-empty"):
             load_gemma_scope_sae(
-                path, layer_idx=0, hook_str="post_mlp", clampable_features=[]
+                path, layer_idx=0, hook_str="post_block", clampable_features=[]
             )
 
     def test_duplicate_clampable_features_raises(self, tmp_path: Path):
@@ -548,7 +548,7 @@ class TestLoadGemmaScopeSAE:
             load_gemma_scope_sae(
                 path,
                 layer_idx=0,
-                hook_str="post_mlp",
+                hook_str="post_block",
                 clampable_features=[0, 1, 0],
             )
 
@@ -573,7 +573,7 @@ class TestLoadGemmaScopeSAE:
             load_gemma_scope_sae(
                 path,
                 layer_idx=layer_idx,
-                hook_str="post_mlp",
+                hook_str="post_block",
                 clampable_features=clampable_features,
             )
 
@@ -584,7 +584,7 @@ class TestLoadGemmaScopeSAE:
             load_gemma_scope_sae(
                 path,
                 layer_idx=0,
-                hook_str="post_mlp",
+                hook_str="post_block",
                 clampable_features=[0, 99],
             )
 
@@ -600,7 +600,7 @@ class TestLoadGemmaScopeSAE:
         )
         with pytest.raises(ValueError, match="missing required keys"):
             load_gemma_scope_sae(
-                path, layer_idx=0, hook_str="post_mlp", clampable_features=[0]
+                path, layer_idx=0, hook_str="post_block", clampable_features=[0]
             )
 
     def test_inconsistent_shapes_raise(self, tmp_path: Path):
@@ -615,7 +615,7 @@ class TestLoadGemmaScopeSAE:
         )
         with pytest.raises(ValueError, match="d_sae"):
             load_gemma_scope_sae(
-                path, layer_idx=0, hook_str="post_mlp", clampable_features=[0]
+                path, layer_idx=0, hook_str="post_block", clampable_features=[0]
             )
 
 
@@ -660,34 +660,34 @@ class TestMergeLoadedSAEModules:
         return LoadedSAEModule(manifest=manifest, weights=weights)
 
     def test_merges_two_sites(self):
-        a = self._part(layer_idx=0, hook_str="post_mlp")
+        a = self._part(layer_idx=0, hook_str="post_block")
         b = self._part(layer_idx=1, hook_str="post_attn")
 
         merged = merge_loaded_sae_modules([a, b])
 
-        assert merged.manifest.layers == ((0, "post_mlp"), (1, "post_attn"))
-        assert (0, "post_mlp") in merged.weights
+        assert merged.manifest.layers == ((0, "post_block"), (1, "post_attn"))
+        assert (0, "post_block") in merged.weights
         assert (1, "post_attn") in merged.weights
         # Weights pass through unchanged.
         assert torch.equal(
-            merged.weights[(0, "post_mlp")]["encoder_weight"],
-            a.weights[(0, "post_mlp")]["encoder_weight"],
+            merged.weights[(0, "post_block")]["encoder_weight"],
+            a.weights[(0, "post_block")]["encoder_weight"],
         )
 
     def test_rejects_disagreeing_d_model(self):
-        a = self._part(layer_idx=0, hook_str="post_mlp", d_model=4)
+        a = self._part(layer_idx=0, hook_str="post_block", d_model=4)
         b = self._part(layer_idx=1, hook_str="post_attn", d_model=8)
         with pytest.raises(ValueError, match="d_model"):
             merge_loaded_sae_modules([a, b])
 
     def test_rejects_duplicate_sites(self):
-        a = self._part(layer_idx=0, hook_str="post_mlp")
-        b = self._part(layer_idx=0, hook_str="post_mlp")
+        a = self._part(layer_idx=0, hook_str="post_block")
+        b = self._part(layer_idx=0, hook_str="post_block")
         with pytest.raises(ValueError, match="declared"):
             merge_loaded_sae_modules([a, b])
 
     def test_rejects_disagreeing_clampable_features(self):
-        a = self._part(layer_idx=0, hook_str="post_mlp", clampable_features=(0, 1))
+        a = self._part(layer_idx=0, hook_str="post_block", clampable_features=(0, 1))
         b = self._part(layer_idx=1, hook_str="post_attn", clampable_features=(0, 2))
         with pytest.raises(ValueError, match="clampable_features"):
             merge_loaded_sae_modules([a, b])

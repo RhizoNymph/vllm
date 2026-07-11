@@ -130,7 +130,7 @@ class TestSAEClampEntry:
 def _spec(
     module_name: str = "m",
     *,
-    hook: str = "post_mlp",
+    hook: str = "post_block",
     layer: int = 0,
     feature_idx: int = 0,
     kind: str = "absolute",
@@ -155,13 +155,13 @@ class TestSAEClampSpec:
         s = _spec()
         assert s.module_name == "m"
         assert s.phase == "both"
-        assert "post_mlp" in s.clamps
+        assert "post_block" in s.clamps
 
     def test_empty_module_name_rejected(self):
         with pytest.raises(ValueError, match="module_name"):
             SAEClampSpec(
                 module_name="",
-                clamps={"post_mlp": {0: (SAEClampEntry(0, "absolute", 1.0),)}},
+                clamps={"post_block": {0: (SAEClampEntry(0, "absolute", 1.0),)}},
             )
 
     def test_invalid_phase_rejected(self):
@@ -183,7 +183,7 @@ class TestSAEClampSpec:
         with pytest.raises(ValueError, match="non-negative"):
             SAEClampSpec(
                 module_name="m",
-                clamps={"post_mlp": {-1: (SAEClampEntry(0, "absolute", 1.0),)}},
+                clamps={"post_block": {-1: (SAEClampEntry(0, "absolute", 1.0),)}},
             )
 
     def test_bool_layer_idx_rejected(self):
@@ -191,7 +191,7 @@ class TestSAEClampSpec:
             SAEClampSpec(
                 module_name="m",
                 clamps={
-                    "post_mlp": {
+                    "post_block": {
                         True: (SAEClampEntry(0, "absolute", 1.0),),  # type: ignore[dict-item]
                     }
                 },
@@ -202,7 +202,7 @@ class TestSAEClampSpec:
             SAEClampSpec(
                 module_name="m",
                 clamps={
-                    "post_mlp": {
+                    "post_block": {
                         2**31: (SAEClampEntry(0, "absolute", 1.0),),
                     }
                 },
@@ -213,7 +213,7 @@ class TestSAEClampSpec:
             SAEClampSpec(
                 module_name="m",
                 clamps={
-                    "post_mlp": {
+                    "post_block": {
                         0: (
                             SAEClampEntry(5, "absolute", 1.0),
                             SAEClampEntry(5, "additive", 2.0),
@@ -226,7 +226,7 @@ class TestSAEClampSpec:
         with pytest.raises(ValueError, match="non-empty sequence"):
             SAEClampSpec(
                 module_name="m",
-                clamps={"post_mlp": {0: ()}},
+                clamps={"post_block": {0: ()}},
             )
 
     def test_list_entries_coerced_to_tuple(self):
@@ -236,10 +236,10 @@ class TestSAEClampSpec:
         # ordered sequence of entries", not literally a tuple).
         s = SAEClampSpec(
             module_name="m",
-            clamps={"post_mlp": {0: [SAEClampEntry(0, "absolute", 1.0)]}},  # type: ignore[dict-item]
+            clamps={"post_block": {0: [SAEClampEntry(0, "absolute", 1.0)]}},  # type: ignore[dict-item]
         )
-        assert isinstance(s.clamps["post_mlp"][0], tuple)
-        assert len(s.clamps["post_mlp"][0]) == 1
+        assert isinstance(s.clamps["post_block"][0], tuple)
+        assert len(s.clamps["post_block"][0]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +259,7 @@ class TestCoerceSAEClampSpecs:
             {
                 "module_name": "g",
                 "clamps": {
-                    "post_mlp": {
+                    "post_block": {
                         "20": [
                             {
                                 "feature_idx": 34,
@@ -277,8 +277,8 @@ class TestCoerceSAEClampSpecs:
         spec = specs[0]
         assert spec.module_name == "g"
         # JSON layer key was a string; coercion converted to int.
-        assert 20 in spec.clamps["post_mlp"]
-        entries = spec.clamps["post_mlp"][20]
+        assert 20 in spec.clamps["post_block"]
+        entries = spec.clamps["post_block"][20]
         assert len(entries) == 1 and isinstance(entries[0], SAEClampEntry)
         assert entries[0].feature_idx == 34
 
@@ -289,7 +289,7 @@ class TestCoerceSAEClampSpecs:
                     {
                         "module_name": "g",
                         "clamps": {
-                            "post_mlp": {
+                            "post_block": {
                                 "1": [
                                     {
                                         "feature_idx": 1,
@@ -332,7 +332,7 @@ class TestCoerceSAEClampSpecs:
                     {
                         "module_name": "g",
                         "clamps": {
-                            "post_mlp": {
+                            "post_block": {
                                 "20": [
                                     {
                                         "feature_idx": 34,
@@ -353,7 +353,7 @@ class TestCoerceSAEClampSpecs:
                     {
                         "module_name": "g",
                         "clamps": {
-                            "post_mlp": {
+                            "post_block": {
                                 "20": [
                                     {
                                         "feature_idx": 34,
@@ -381,7 +381,7 @@ class TestCoerceSAEClampSpecs:
                 [
                     {
                         "module_name": "g",
-                        "clamps": {"post_mlp": {"20": [entry]}},
+                        "clamps": {"post_block": {"20": [entry]}},
                     }
                 ]
             )
@@ -393,7 +393,7 @@ class TestCoerceSAEClampSpecs:
                     {
                         "module_name": "g",
                         "clamps": {
-                            "post_mlp": {
+                            "post_block": {
                                 True: [
                                     {
                                         "feature_idx": 34,
@@ -414,7 +414,7 @@ class TestCoerceSAEClampSpecs:
                     {
                         "module_name": "g",
                         "clamps": {
-                            "post_mlp": {
+                            "post_block": {
                                 20.5: [
                                     {
                                         "feature_idx": 34,
@@ -434,7 +434,7 @@ class TestCoerceSAEClampSpecs:
                 "module_name": "g",
                 "phase": "prefill",
                 "clamps": {
-                    "post_mlp": {
+                    "post_block": {
                         "20": [
                             {
                                 "feature_idx": 34,
@@ -449,7 +449,7 @@ class TestCoerceSAEClampSpecs:
                 "module_name": "g",
                 "phase": "prefill",
                 "clamps": {
-                    "post_mlp": {
+                    "post_block": {
                         "20": [
                             {
                                 "feature_idx": 34,
@@ -512,7 +512,7 @@ class TestHashSAEClampSpecs:
         sp_off = SAEClampSpec(
             module_name="m",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     0: (SAEClampEntry(0, "additive", 1.0, only_if_active=False),)
                 }
             },
@@ -520,7 +520,7 @@ class TestHashSAEClampSpecs:
         sp_on = SAEClampSpec(
             module_name="m",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     0: (SAEClampEntry(0, "additive", 1.0, only_if_active=True),)
                 }
             },
@@ -540,12 +540,12 @@ class TestHashSAEClampSpecs:
         spec_a = SAEClampSpec(
             module_name="m",
             phase="both",
-            clamps={"post_mlp": {0: (SAEClampEntry(1, "absolute", 1.0),)}},
+            clamps={"post_block": {0: (SAEClampEntry(1, "absolute", 1.0),)}},
         )
         spec_b = SAEClampSpec(
             module_name="m",
             phase="both",
-            clamps={"post_mlp": {1: (SAEClampEntry(2, "additive", 2.0),)}},
+            clamps={"post_block": {1: (SAEClampEntry(2, "additive", 2.0),)}},
         )
 
         assert hash_sae_clamp_specs((spec_a, spec_b)) == hash_sae_clamp_specs(
@@ -557,8 +557,8 @@ class TestHashSAEClampSpecs:
         of the order the user passed them in."""
         e1 = SAEClampEntry(1, "absolute", 1.0)
         e2 = SAEClampEntry(2, "additive", 2.0)
-        a = SAEClampSpec(module_name="m", clamps={"post_mlp": {0: (e1, e2)}})
-        b = SAEClampSpec(module_name="m", clamps={"post_mlp": {0: (e2, e1)}})
+        a = SAEClampSpec(module_name="m", clamps={"post_block": {0: (e1, e2)}})
+        b = SAEClampSpec(module_name="m", clamps={"post_block": {0: (e2, e1)}})
         assert hash_sae_clamp_specs((a,)) == hash_sae_clamp_specs((b,))
 
     def test_returns_positive_int63(self):
@@ -570,7 +570,7 @@ class TestHashSAEClampSpecs:
         spec = SAEClampSpec(
             module_name="m",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     2**31 - 1: (
                         SAEClampEntry(2**31 - 1, "absolute", 1.0),
                     )
@@ -610,7 +610,7 @@ class TestHashSteeringConfigWithSAE:
         """Critical: callers that don't pass sae_clamp_specs must hash
         bit-identically to before this argument existed.  This is the
         prefix-cache reuse contract for non-SAE deployments."""
-        vecs = {"post_mlp": {0: [0.1, 0.2]}}
+        vecs = {"post_block": {0: [0.1, 0.2]}}
         ref = ("mod", 1.5)
         assert hash_steering_config(vecs) == hash_steering_config(
             vecs, sae_clamp_specs=None
@@ -631,12 +631,12 @@ class TestHashSteeringConfigWithSAE:
         assert h != 0
 
     def test_sae_state_changes_hash(self):
-        vecs = {"post_mlp": {0: [0.1, 0.2]}}
+        vecs = {"post_block": {0: [0.1, 0.2]}}
         h_no_sae = hash_steering_config(vecs)
         h_with_sae = hash_steering_config(vecs, sae_clamp_specs=(_spec(),))
         assert h_no_sae != h_with_sae
 
     def test_returns_positive_int63(self):
-        h = hash_steering_config({"post_mlp": {0: [0.1]}}, sae_clamp_specs=(_spec(),))
+        h = hash_steering_config({"post_block": {0: [0.1]}}, sae_clamp_specs=(_spec(),))
         assert h >= 0
         assert h <= 0x7FFFFFFFFFFFFFFF

@@ -228,7 +228,7 @@ def coerce_sae_clamp_specs(
             "module_name": "golden_gate",
             "phase": "both",  # optional, default "both"
             "clamps": {
-                "post_mlp": {
+                "post_block": {
                     20: [
                         {
                             "feature_idx": 34,

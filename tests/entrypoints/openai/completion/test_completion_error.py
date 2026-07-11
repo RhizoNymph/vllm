@@ -342,7 +342,7 @@ async def test_completion_beam_search_with_sae_steering_returns_error():
             {
                 "module_name": "g",
                 "clamps": {
-                    "post_mlp": {
+                    "post_block": {
                         0: [
                             {
                                 "feature_idx": 0,

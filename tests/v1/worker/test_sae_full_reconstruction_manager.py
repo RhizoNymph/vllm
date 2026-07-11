@@ -134,7 +134,7 @@ class TestPureReconstructionRegistration:
         modified = SAEFullReconstructionSpec(
             module_name="m1",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=3, kind="absolute", value=5.0),)
                 }
             },

@@ -836,7 +836,7 @@ class SteeringManager:
         prefill rows and never feeds prefix-cache keys.
 
         Args:
-            hook_point: Hook point string (e.g. ``"post_mlp"``).
+            hook_point: Hook point string (e.g. ``"post_block"``).
             layer_idx: Layer index.
             vector: The (already gain-scaled) tier vector.
             locally_owned_layers: If provided and ``layer_idx`` is not in

@@ -143,52 +143,52 @@ def _scalar_to_activation_params(
 HOOK_POINT_SAE_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_clamp_kind_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_clamp_kind_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_clamp_kind_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_clamp_kind_post_block",
 }
 HOOK_POINT_SAE_CLAMP_VALUE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_clamp_value_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_clamp_value_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_clamp_value_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_clamp_value_post_block",
 }
 HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_clamp_only_if_active_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_clamp_only_if_active_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_clamp_only_if_active_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_clamp_only_if_active_post_block",
 }
 HOOK_POINT_SAE_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_any_active_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_any_active_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_any_active_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_any_active_post_block",
 }
 HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_encoder_weight_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_encoder_weight_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_encoder_weight_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_encoder_weight_post_block",
 }
 HOOK_POINT_SAE_ENCODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_encoder_bias_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_encoder_bias_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_encoder_bias_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_encoder_bias_post_block",
 }
 HOOK_POINT_SAE_DECODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_decoder_weight_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_decoder_weight_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_decoder_weight_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_decoder_weight_post_block",
 }
 HOOK_POINT_SAE_MODULE_NAME_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_module_name_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_module_name_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_module_name_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_module_name_post_block",
 }
 HOOK_POINT_SAE_ACTIVATION_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_activation_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_activation_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_activation_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_activation_post_block",
 }
 HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_activation_params_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_activation_params_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_activation_params_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_activation_params_post_block",
 }
 
 # Per-hook buffer attribute names that need to be cleaned up on

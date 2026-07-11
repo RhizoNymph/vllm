@@ -29,7 +29,7 @@ def _sae_spec(phase: str = "both", value: float = 1.0) -> SAEClampSpec:
         module_name="g",
         phase=phase,  # type: ignore[arg-type]
         clamps={
-            "post_mlp": {
+            "post_block": {
                 0: (SAEClampEntry(feature_idx=0, kind="absolute", value=value),)
             }
         },
@@ -87,7 +87,7 @@ class TestSeparateAdditiveAndSaeCapacity:
         scheduler = self._scheduler(max_configs=1)
         request = self._request(
             sampling_params=SamplingParams(
-                steering_vectors={"post_mlp": {0: [1.0]}}
+                steering_vectors={"post_block": {0: [1.0]}}
             ),
             prefill_hash=222,
         )
@@ -96,7 +96,7 @@ class TestSeparateAdditiveAndSaeCapacity:
             request, "prefill"
         )
 
-        additive_hash = hash_steering_config({"post_mlp": {0: [1.0]}})
+        additive_hash = hash_steering_config({"post_block": {0: [1.0]}})
         assert additive_pairs == {(additive_hash, "prefill")}
         assert sae_pairs == set()
         assert not scheduler._steering_pool_would_overflow(additive_pairs, set())
@@ -110,7 +110,7 @@ class TestSeparateAdditiveAndSaeCapacity:
         scheduler = self._scheduler(max_configs=1)
         request = self._request(
             sampling_params=SamplingParams(
-                steering_vectors={"post_mlp": {0: [1.0]}}
+                steering_vectors={"post_block": {0: [1.0]}}
             ),
             prefill_hash=222,
         )
@@ -128,7 +128,7 @@ class TestSeparateAdditiveAndSaeCapacity:
             request, "prefill"
         )
 
-        additive_hash = hash_steering_config({"post_mlp": {0: [1.0]}})
+        additive_hash = hash_steering_config({"post_block": {0: [1.0]}})
         assert additive_pairs == {(additive_hash, "prefill")}
         assert sae_pairs == set()
 
@@ -136,7 +136,7 @@ class TestSeparateAdditiveAndSaeCapacity:
         scheduler = self._scheduler(max_configs=1)
         request = self._request(
             sampling_params=SamplingParams(
-                steering_vectors={"post_mlp": {0: [1.0]}},
+                steering_vectors={"post_block": {0: [1.0]}},
                 sae_clamp_specs=(_sae_spec(),),
             ),
             prefill_hash=222,
@@ -147,7 +147,7 @@ class TestSeparateAdditiveAndSaeCapacity:
         )
         sae_hash = hash_sae_clamp_specs_for_phase((_sae_spec(),), "prefill")
 
-        additive_hash = hash_steering_config({"post_mlp": {0: [1.0]}})
+        additive_hash = hash_steering_config({"post_block": {0: [1.0]}})
         assert additive_pairs == {(additive_hash, "prefill")}
         assert sae_pairs == {(sae_hash, "prefill")}
         assert not scheduler._steering_pool_would_overflow(additive_pairs, set())
@@ -160,7 +160,7 @@ class TestSeparateAdditiveAndSaeCapacity:
         recon_spec = _recon_spec()
         request = self._request(
             sampling_params=SamplingParams(
-                steering_vectors={"post_mlp": {0: [1.0]}},
+                steering_vectors={"post_block": {0: [1.0]}},
                 sae_clamp_specs=(_sae_spec(),),
                 sae_full_reconstruction_specs=(recon_spec,),
             ),
@@ -285,14 +285,14 @@ class TestSeparateAdditiveAndSaeCapacity:
         spec = _sae_spec()
         request_a = self._request(
             sampling_params=SamplingParams(
-                steering_vectors={"post_mlp": {0: [1.0]}},
+                steering_vectors={"post_block": {0: [1.0]}},
                 sae_clamp_specs=(spec,),
             ),
             prefill_hash=111,
         )
         request_b = self._request(
             sampling_params=SamplingParams(
-                steering_vectors={"post_mlp": {0: [2.0]}},
+                steering_vectors={"post_block": {0: [2.0]}},
                 sae_clamp_specs=(spec,),
             ),
             prefill_hash=222,
@@ -306,7 +306,7 @@ class TestSeparateAdditiveAndSaeCapacity:
         )
 
         assert sae_a == sae_b
-        additive_hash_b = hash_steering_config({"post_mlp": {0: [2.0]}})
+        additive_hash_b = hash_steering_config({"post_block": {0: [2.0]}})
         assert additive_b == {(additive_hash_b, "prefill")}
         assert not scheduler._steering_pool_would_overflow(sae_b, sae_a)
 
@@ -314,14 +314,14 @@ class TestSeparateAdditiveAndSaeCapacity:
         scheduler = self._scheduler(max_configs=1)
         request_a = self._request(
             sampling_params=SamplingParams(
-                steering_vectors={"post_mlp": {0: [1.0]}},
+                steering_vectors={"post_block": {0: [1.0]}},
                 sae_clamp_specs=(_sae_spec(value=1.0),),
             ),
             prefill_hash=111,
         )
         request_b = self._request(
             sampling_params=SamplingParams(
-                steering_vectors={"post_mlp": {0: [1.0]}},
+                steering_vectors={"post_block": {0: [1.0]}},
                 sae_clamp_specs=(_sae_spec(value=2.0),),
             ),
             prefill_hash=222,

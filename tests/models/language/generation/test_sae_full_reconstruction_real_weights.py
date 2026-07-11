@@ -61,9 +61,9 @@ from ...registry import HF_EXAMPLE_MODELS
 _MODEL = "google/gemma-2-2b"
 _SAE_REPO = "google/gemma-scope-2b-pt-res"
 _SAE_LAYER = 12
-_SAE_HOOK = "post_mlp"
+_SAE_HOOK = "post_block"
 _SAE_RELATIVE_PATH = "layer_12/width_16k/average_l0_82/params.npz"
-_SAE_MODULE_NAME = "gemma_scope_full_recon_layer12_post_mlp"
+_SAE_MODULE_NAME = "gemma_scope_full_recon_layer12_post_block"
 _NUM_CLAMPABLE_FEATURES = 4
 _CLAMP_TARGET_VALUE = 50.0
 

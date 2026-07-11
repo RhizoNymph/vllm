@@ -173,7 +173,7 @@ class _Harness(SteeringModelRunnerMixin):
 
 def _payload(
     *,
-    layers: tuple[tuple[int, str], ...] = ((20, "post_mlp"),),
+    layers: tuple[tuple[int, str], ...] = ((20, "post_block"),),
     clampable: tuple[int, ...] = (0, 1, 34),
     activation: str = "relu",
     activation_params: dict[str, float] | None = None,
@@ -198,16 +198,16 @@ class TestRegisterAttachesFullReconBuffers:
     def test_register_creates_per_site_buffers(self):
         h = _Harness()
         h.register_steering_modules(
-            modules={"g": _payload(layers=((20, "post_mlp"), (21, "post_attn")))}
+            modules={"g": _payload(layers=((20, "post_block"), (21, "post_attn")))}
         )
         assert "g" in h._sae_fr_module_registry
         layer20 = h._steerable_layers_cache[20]
         layer21 = h._steerable_layers_cache[21]
-        assert sae_full_recon_buffers_attached(layer20, SteeringHookPoint.POST_MLP)
+        assert sae_full_recon_buffers_attached(layer20, SteeringHookPoint.POST_BLOCK)
         assert sae_full_recon_buffers_attached(layer21, SteeringHookPoint.POST_ATTN)
         # The owning module name is recorded as a python attribute.
         assert (
-            getattr(layer20, HOOK_POINT_FR_MODULE_NAME_ATTR[SteeringHookPoint.POST_MLP])
+            getattr(layer20, HOOK_POINT_FR_MODULE_NAME_ATTR[SteeringHookPoint.POST_BLOCK])
             == "g"
         )
         assert layer20.sae_recon_index is layer21.sae_recon_index
@@ -215,7 +215,7 @@ class TestRegisterAttachesFullReconBuffers:
     def test_later_registration_shares_index_with_existing_sites(self):
         h = _Harness()
         h.register_steering_modules(
-            modules={"a": _payload(layers=((20, "post_mlp"),))}
+            modules={"a": _payload(layers=((20, "post_block"),))}
         )
         layer20 = h._steerable_layers_cache[20]
         original_index = layer20.sae_recon_index
@@ -233,7 +233,7 @@ class TestRegisterAttachesFullReconBuffers:
         h.unregister_steering_modules(["g"])
         assert "g" not in h._sae_fr_module_registry
         layer = h._steerable_layers_cache[20]
-        assert not sae_full_recon_buffers_attached(layer, SteeringHookPoint.POST_MLP)
+        assert not sae_full_recon_buffers_attached(layer, SteeringHookPoint.POST_BLOCK)
 
     def test_replace_clears_old_full_recon_modules(self):
         h = _Harness()
@@ -249,14 +249,14 @@ class TestRegisterAttachesFullReconBuffers:
         h.register_steering_modules(
             modules={
                 "g": _payload(
-                    layers=((20, "post_mlp"), (99, "post_mlp")),
+                    layers=((20, "post_block"), (99, "post_block")),
                 )
             }
         )
         assert "g" in h._sae_fr_module_registry
         layer20 = h._steerable_layers_cache[20]
-        assert sae_full_recon_buffers_attached(layer20, SteeringHookPoint.POST_MLP)
-        assert ("g", 99, "post_mlp") not in h._sae_fr_steerable_sites
+        assert sae_full_recon_buffers_attached(layer20, SteeringHookPoint.POST_BLOCK)
+        assert ("g", 99, "post_block") not in h._sae_fr_steerable_sites
 
 
 class TestKindSwapDisjoint:
@@ -309,7 +309,7 @@ class TestAttachWeights:
         h.attach_sae_full_recon_weights(
             "g",
             {
-                (20, "post_mlp"): {
+                (20, "post_block"): {
                     "encoder_weight": enc_w,
                     "encoder_bias": enc_b,
                     "decoder_weight": dec_w,
@@ -319,22 +319,22 @@ class TestAttachWeights:
         )
         assert torch.allclose(
             getattr(
-                layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+                layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
             ),
             enc_w,
         )
         assert torch.allclose(
-            getattr(layer, HOOK_POINT_FR_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]),
+            getattr(layer, HOOK_POINT_FR_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]),
             enc_b,
         )
         assert torch.allclose(
             getattr(
-                layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+                layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
             ),
             dec_w,
         )
         assert torch.allclose(
-            getattr(layer, HOOK_POINT_FR_DECODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]),
+            getattr(layer, HOOK_POINT_FR_DECODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]),
             dec_b,
         )
 
@@ -352,7 +352,7 @@ class TestAttachWeights:
             h.attach_sae_full_recon_weights(
                 "g",
                 {
-                    (20, "post_mlp"): {
+                    (20, "post_block"): {
                         "encoder_weight": torch.zeros(8, 4),
                         "encoder_bias": torch.zeros(8),
                         "decoder_weight": torch.zeros(8, 4),
@@ -370,7 +370,7 @@ class TestAttachWeights:
             h.attach_sae_full_recon_weights(
                 "g",
                 {
-                    (20, "post_mlp"): {
+                    (20, "post_block"): {
                         "encoder_weight": torch.zeros(7, 4),  # wrong d_sae
                         "encoder_bias": torch.zeros(8),
                         "decoder_weight": torch.zeros(8, 4),
@@ -386,7 +386,7 @@ class TestAdmissionAndRelease:
             module_name="g",
             phase=phase,
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -588,7 +588,7 @@ class TestPerStepFullReconIndex:
         additive_row = int(site.steering_index[0].item())
         assert additive_row in (0, 1)
         if additive_row == 1:
-            table = getattr(site, HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_MLP])
+            table = getattr(site, HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_BLOCK])
             assert torch.all(table[1] == 0)
         assert int(site.sae_recon_index[0].item()) == 1
 
@@ -602,7 +602,7 @@ class TestStreamingFullReconRefresh:
         old_spec = SAEFullReconstructionSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -622,7 +622,7 @@ class TestStreamingFullReconRefresh:
         new_spec = SAEFullReconstructionSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=1, kind="absolute", value=7.0),)
                 }
             },
@@ -663,7 +663,7 @@ class TestAssertSpecsCanBeApplied:
 
     def test_uncovered_site_rejected(self):
         h = _Harness()
-        h.register_steering_modules(modules={"g": _payload(layers=((20, "post_mlp"),))})
+        h.register_steering_modules(modules={"g": _payload(layers=((20, "post_block"),))})
         sp = SamplingParams(
             sae_full_reconstruction_specs=[
                 SAEFullReconstructionSpec(
@@ -691,7 +691,7 @@ class TestAssertSpecsCanBeApplied:
                 SAEFullReconstructionSpec(
                     module_name="g",
                     clamps={
-                        "post_mlp": {
+                        "post_block": {
                             20: (
                                 SAEClampEntry(
                                     feature_idx=99,  # not clampable

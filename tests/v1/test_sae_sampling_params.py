@@ -15,7 +15,7 @@ def _spec(*, phase: str = "both") -> SAEClampSpec:
         module_name="g",
         phase=phase,  # type: ignore[arg-type]
         clamps={
-            "post_mlp": {
+            "post_block": {
                 20: (SAEClampEntry(feature_idx=34, kind="absolute", value=5.0),)
             }
         },
@@ -40,7 +40,7 @@ class TestSamplingParamsSAEField:
                 {
                     "module_name": "g",
                     "clamps": {
-                        "post_mlp": {
+                        "post_block": {
                             20: [
                                 {
                                     "feature_idx": 34,
@@ -101,25 +101,25 @@ class TestPhaseFilteredHashing:
     def test_no_sae_hash_unchanged(self):
         """Inline-only sampling params (no SAE) must hash identically
         to a build without SAE support."""
-        a = SamplingParams(steering_vectors={"post_mlp": {0: [0.1]}})
-        b = SamplingParams(steering_vectors={"post_mlp": {0: [0.1]}})
+        a = SamplingParams(steering_vectors={"post_block": {0: [0.1]}})
+        b = SamplingParams(steering_vectors={"post_block": {0: [0.1]}})
         assert a.prefill_steering_config_hash == b.prefill_steering_config_hash
         assert a.decode_steering_config_hash == b.decode_steering_config_hash
 
     def test_phase_both_affects_both_hashes(self):
         s = _spec(phase="both")
-        sp_no = SamplingParams(steering_vectors={"post_mlp": {0: [0.1]}})
+        sp_no = SamplingParams(steering_vectors={"post_block": {0: [0.1]}})
         sp_sae = SamplingParams(
-            steering_vectors={"post_mlp": {0: [0.1]}}, sae_clamp_specs=(s,)
+            steering_vectors={"post_block": {0: [0.1]}}, sae_clamp_specs=(s,)
         )
         assert sp_no.prefill_steering_config_hash != sp_sae.prefill_steering_config_hash
         assert sp_no.decode_steering_config_hash != sp_sae.decode_steering_config_hash
 
     def test_phase_prefill_affects_only_prefill(self):
         s = _spec(phase="prefill")
-        sp_no = SamplingParams(steering_vectors={"post_mlp": {0: [0.1]}})
+        sp_no = SamplingParams(steering_vectors={"post_block": {0: [0.1]}})
         sp_sae = SamplingParams(
-            steering_vectors={"post_mlp": {0: [0.1]}}, sae_clamp_specs=(s,)
+            steering_vectors={"post_block": {0: [0.1]}}, sae_clamp_specs=(s,)
         )
         assert sp_no.prefill_steering_config_hash != sp_sae.prefill_steering_config_hash
         # Decode-tier hash must be untouched: the SAE spec is prefill-only.
@@ -127,9 +127,9 @@ class TestPhaseFilteredHashing:
 
     def test_phase_decode_affects_only_decode(self):
         s = _spec(phase="decode")
-        sp_no = SamplingParams(steering_vectors={"post_mlp": {0: [0.1]}})
+        sp_no = SamplingParams(steering_vectors={"post_block": {0: [0.1]}})
         sp_sae = SamplingParams(
-            steering_vectors={"post_mlp": {0: [0.1]}}, sae_clamp_specs=(s,)
+            steering_vectors={"post_block": {0: [0.1]}}, sae_clamp_specs=(s,)
         )
         assert sp_no.prefill_steering_config_hash == sp_sae.prefill_steering_config_hash
         assert sp_no.decode_steering_config_hash != sp_sae.decode_steering_config_hash

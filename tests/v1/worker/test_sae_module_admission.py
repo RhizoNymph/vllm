@@ -48,7 +48,7 @@ def _sae_payload(
     d_model: int = 4096,
     d_sae: int = 65536,
     activation: str = "jumprelu",
-    layers=((20, "post_mlp"),),
+    layers=((20, "post_block"),),
     clampable_features=(0, 1, 2, 34),
     activation_params: dict | None = None,
 ) -> dict:
@@ -75,7 +75,7 @@ def _sae_payload(
 def _additive_payload(*, vec=None) -> dict:
     return {
         "kind": "additive",
-        "vectors": {"post_mlp": {0: vec or [0.1, 0.2]}},
+        "vectors": {"post_block": {0: vec or [0.1, 0.2]}},
         "prefill_vectors": None,
         "decode_vectors": None,
     }
@@ -98,7 +98,7 @@ class TestRegisterDispatch:
 
         assert resolved is h._steering_module_resolved_cache["m"][0]
         assert resolved is not None
-        assert resolved["post_mlp"][0].tolist() == pytest.approx([0.1, 0.2])
+        assert resolved["post_block"][0].tolist() == pytest.approx([0.1, 0.2])
 
     def test_scaled_named_module_uses_resolved_cache_values(self):
         h = _MixinHarness()
@@ -109,7 +109,7 @@ class TestRegisterDispatch:
 
         assert resolved is not h._steering_module_resolved_cache["m"][0]
         assert resolved is not None
-        assert resolved["post_mlp"][0].tolist() == pytest.approx([0.2, 0.4])
+        assert resolved["post_block"][0].tolist() == pytest.approx([0.2, 0.4])
 
     def test_sae_lands_in_sae_registry(self):
         h = _MixinHarness()
@@ -118,14 +118,14 @@ class TestRegisterDispatch:
         assert "g" not in h._steering_module_registry
         manifest = h._sae_module_registry["g"]
         assert manifest.d_model == 4096
-        assert manifest.layers == ((20, "post_mlp"),)
+        assert manifest.layers == ((20, "post_block"),)
 
     def test_legacy_payload_without_kind_treated_as_additive(self):
         """Backwards compatibility: a payload with no ``kind`` field
         (older API server) routes to the additive registry."""
         h = _MixinHarness()
         legacy = {
-            "vectors": {"post_mlp": {0: [0.1]}},
+            "vectors": {"post_block": {0: [0.1]}},
             "prefill_vectors": None,
             "decode_vectors": None,
         }
@@ -185,16 +185,16 @@ class TestRegisterDispatch:
             ),
             (_sae_payload(clampable_features=()), "clampable_features.*empty"),
             (
-                _sae_payload(layers=((20, "post_mlp"), (20, "post_mlp"))),
+                _sae_payload(layers=((20, "post_block"), (20, "post_block"))),
                 "duplicate.*sites",
             ),
             (_sae_payload(layers=((20, "bogus"),)), "unknown hook point"),
             (_sae_payload(d_sae=2, clampable_features=(3,)), "out of range"),
             (_sae_payload(d_model=True), "d_model.*int"),
             (_sae_payload(d_sae=True), "d_sae.*int"),
-            (_sae_payload(layers=((True, "post_mlp"),)), "layers.*int"),
+            (_sae_payload(layers=((True, "post_block"),)), "layers.*int"),
             (_sae_payload(clampable_features=(True,)), "clampable_features.*int"),
-            (_sae_payload(layers=((2**31, "post_mlp"),)), "2147483647"),
+            (_sae_payload(layers=((2**31, "post_block"),)), "2147483647"),
             (
                 _sae_payload(d_sae=2**31 + 1, clampable_features=(2**31,)),
                 "2147483647",
@@ -251,7 +251,7 @@ class TestSAEClampAdmissionGuard:
             sae_clamp_specs=(
                 SAEClampSpec(
                     module_name="missing",
-                    clamps={"post_mlp": {0: (SAEClampEntry(0, "absolute", 1.0),)}},
+                    clamps={"post_block": {0: (SAEClampEntry(0, "absolute", 1.0),)}},
                 ),
             ),
         )
@@ -267,7 +267,7 @@ class TestSAEClampAdmissionGuard:
             sae_clamp_specs=(
                 SAEClampSpec(
                     module_name="g",
-                    clamps={"post_mlp": {20: (SAEClampEntry(34, "absolute", 5.0),)}},
+                    clamps={"post_block": {20: (SAEClampEntry(34, "absolute", 5.0),)}},
                 ),
             ),
         )
@@ -282,7 +282,7 @@ class TestSAEClampAdmissionGuard:
                 SAEClampSpec(
                     module_name="g",
                     # layer 21 is not in the manifest's coverage (only 20).
-                    clamps={"post_mlp": {21: (SAEClampEntry(34, "absolute", 5.0),)}},
+                    clamps={"post_block": {21: (SAEClampEntry(34, "absolute", 5.0),)}},
                 ),
             ),
         )
@@ -297,7 +297,7 @@ class TestSAEClampAdmissionGuard:
                 SAEClampSpec(
                     module_name="g",
                     # feature_idx=999 not in clampable_features=(0, 1, 2, 34)
-                    clamps={"post_mlp": {20: (SAEClampEntry(999, "absolute", 5.0),)}},
+                    clamps={"post_block": {20: (SAEClampEntry(999, "absolute", 5.0),)}},
                 ),
             ),
         )

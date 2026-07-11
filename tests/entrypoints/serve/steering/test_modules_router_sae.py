@@ -88,7 +88,7 @@ def _sae_dir(
     *,
     d_model: int = 4,
     clampable: tuple[int, ...] = (0, 1),
-    layers: tuple[tuple[int, str], ...] = ((0, "post_mlp"),),
+    layers: tuple[tuple[int, str], ...] = ((0, "post_block"),),
 ) -> Path:
     """Write the per-(layer, hook) safetensors files an SAE manifest needs."""
     n_clamp = len(clampable)
@@ -125,7 +125,7 @@ def _sae_request_body(
     weights_uri: str | None,
     d_model: int = 4,
     clampable: tuple[int, ...] = (0, 1),
-    layers: tuple[tuple[int, str], ...] = ((0, "post_mlp"),),
+    layers: tuple[tuple[int, str], ...] = ((0, "post_block"),),
 ) -> dict:
     return {
         "name": name,
@@ -164,7 +164,7 @@ class TestSaeManifestRequestValidation:
         cases = [
             ("d_model", True),
             ("d_sae", True),
-            ("layers", [[True, "post_mlp"]]),
+            ("layers", [[True, "post_block"]]),
             ("clampable_features", [True]),
             ("activation_params", {"threshold": True}),
         ]
@@ -203,7 +203,7 @@ class TestSaeRegistrationLoadsAndBroadcastsWeights:
         # Weights ride along with the manifest so the worker register-
         # and-attach happens in one indivisible step.
         weights = payload["sae_weights"]
-        assert set(weights.keys()) == {(0, "post_mlp")}
+        assert set(weights.keys()) == {(0, "post_block")}
         for tensors in weights.values():
             assert set(tensors.keys()) == {
                 "encoder_weight",
@@ -330,7 +330,7 @@ class TestClampableFeaturesOrderPreserved:
 
         monkeypatch.setattr(modules_router, "_load_weights_for_manifest", fail_load)
         body = _sae_request_body(weights_uri=str(sae_dir))
-        body["vectors"] = {"post_mlp": {"0": [0.1, 0.2, 0.3, 0.4]}}
+        body["vectors"] = {"post_block": {"0": [0.1, 0.2, 0.3, 0.4]}}
 
         resp = client.post("/v1/steering/modules/register", json=body)
 
@@ -373,7 +373,7 @@ class TestClampableFeaturesOrderPreserved:
         sae_dir = _sae_dir(tmp_path)
         body = _sae_request_body(weights_uri=str(sae_dir))
         body["kind"] = "additive"
-        body["vectors"] = {"post_mlp": {"0": [0.1, 0.2, 0.3, 0.4]}}
+        body["vectors"] = {"post_block": {"0": [0.1, 0.2, 0.3, 0.4]}}
 
         resp = client.post("/v1/steering/modules/register", json=body)
 
@@ -397,7 +397,7 @@ class TestClampableFeaturesOrderPreserved:
 
         monkeypatch.setattr(modules_router, "_load_weights_for_manifest", fail_load)
         body = _sae_request_body(weights_uri=str(sae_dir))
-        body["sae_manifest"]["layers"] = [[0, "post_mlp"], [0, "post_mlp"]]
+        body["sae_manifest"]["layers"] = [[0, "post_block"], [0, "post_block"]]
 
         resp = client.post("/v1/steering/modules/register", json=body)
 
@@ -418,10 +418,11 @@ class TestCompensatingBroadcastOnPartialFailure:
         self, engine, registry, tmp_path
     ):
         sae_dir = _sae_dir(tmp_path)
-        # Fail the first RPC (the register attempt) and let the second
-        # (the compensating broadcast) succeed.
+        # Fail the first RPC (the register attempt) and let the
+        # compensating broadcast (pin release + unregister) succeed.
         engine.collective_rpc.side_effect = [
             RuntimeError("worker exploded"),
+            None,
             None,
         ]
         client = _SyncASGIClient(_make_app(engine, registry))
@@ -430,11 +431,14 @@ class TestCompensatingBroadcastOnPartialFailure:
         assert resp.status_code == 500
 
         calls = engine.collective_rpc.await_args_list
-        assert len(calls) == 2
+        assert len(calls) == 3
         assert calls[0].args[0] == "register_steering_modules"
-        # Compensating: no prior entry, so unregister on every rank.
-        assert calls[1].args[0] == "unregister_steering_modules"
-        assert calls[1].kwargs["kwargs"] == {"names": ["g"]}
+        # Compensating: no prior entry, so drop any pre-materialize pin
+        # (a no-op for SAE modules) and unregister on every rank.
+        assert calls[1].args[0] == "release_pre_materialized_steering_module"
+        assert calls[1].kwargs["kwargs"] == {"name": "g"}
+        assert calls[2].args[0] == "unregister_steering_modules"
+        assert calls[2].kwargs["kwargs"] == {"names": ["g"]}
         assert registry.list_modules() == []
 
     def test_replacement_failure_emits_compensating_reregister(
@@ -475,7 +479,7 @@ class TestCompensatingBroadcastOnPartialFailure:
         # without this, partially-committed workers could be left on
         # a half-attached new module.
         assert "sae_weights" in comp_payload
-        assert set(comp_payload["sae_weights"].keys()) == {(0, "post_mlp")}
+        assert set(comp_payload["sae_weights"].keys()) == {(0, "post_block")}
 
     def test_compensating_broadcast_failure_is_swallowed(
         self, engine, registry, tmp_path
@@ -515,7 +519,10 @@ class TestUnregisterRollbackOnPartialFailure:
         prior_module = registry.get("g")
         assert prior_module is not None
 
+        # Removal broadcasts drop the pre-materialize pin first (a no-op
+        # for SAE modules), then unregister; fail the unregister itself.
         engine.collective_rpc.side_effect = [
+            None,
             RuntimeError("worker exploded"),
             None,
         ]
@@ -525,17 +532,20 @@ class TestUnregisterRollbackOnPartialFailure:
 
         calls = engine.collective_rpc.await_args_list
         # First call is the successful seed registration.  The failing
-        # unregister is followed by a compensating re-register.
-        assert len(calls) == 3
-        assert calls[1].args[0] == "unregister_steering_modules"
-        assert calls[1].kwargs["kwargs"] == {"names": ["g"]}
-        assert calls[2].args[0] == "register_steering_modules"
-        comp_modules = calls[2].kwargs["kwargs"]["modules"]
+        # unregister (after its pin release) is followed by a
+        # compensating re-register.
+        assert len(calls) == 4
+        assert calls[1].args[0] == "release_pre_materialized_steering_module"
+        assert calls[1].kwargs["kwargs"] == {"name": "g"}
+        assert calls[2].args[0] == "unregister_steering_modules"
+        assert calls[2].kwargs["kwargs"] == {"names": ["g"]}
+        assert calls[3].args[0] == "register_steering_modules"
+        comp_modules = calls[3].kwargs["kwargs"]["modules"]
         assert set(comp_modules) == {"g"}
         comp_payload = comp_modules["g"]
         assert comp_payload["kind"] == "sae_delta"
         assert "sae_weights" in comp_payload
-        assert set(comp_payload["sae_weights"].keys()) == {(0, "post_mlp")}
+        assert set(comp_payload["sae_weights"].keys()) == {(0, "post_block")}
 
     def test_successful_unregister_resets_prefix_cache(
         self, engine, registry, tmp_path
