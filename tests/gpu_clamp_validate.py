@@ -273,11 +273,11 @@ def run_http_mode(base: str, layer: int, hidden: int) -> int:
         )
     )
     p_add_only = answer_lp(
-        complete(steering_vectors=_pack_vectors(layer, 20.0 * v_add, hook))
+        complete(steering_vectors=_pack_vectors(layer, 60.0 * v_add, hook))
     )
     p_add_clamp = answer_lp(
         complete(
-            steering_vectors=_pack_vectors(layer, 20.0 * v_add, hook),
+            steering_vectors=_pack_vectors(layer, 60.0 * v_add, hook),
             steering_clamps={
                 hook: {str(layer): [{"vector": v_add.tolist(), "value": c}]}
             },
@@ -307,9 +307,11 @@ def run_http_mode(base: str, layer: int, hidden: int) -> int:
     )
 
     # -- 6. decode-only clamps -----------------------------------------------
-    base_multi = complete(max_tokens=8)
+    # Greedy continuations are sticky: a decode-side perturbation can take
+    # several tokens to change the argmax path, so use a 24-token window.
+    base_multi = complete(max_tokens=24)
     dec_multi = complete(
-        max_tokens=8,
+        max_tokens=24,
         decode_steering_clamps=clamps([{"vector": v_pin, "value": 40.0}]),
     )
     base_first = base_multi["logprobs"]["tokens"][0]

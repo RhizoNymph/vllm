@@ -615,9 +615,16 @@ class SteeringManager:
 
         Entries are normalized via :func:`normalize_clamp_entry`
         (idempotent — canonical entries from ``SamplingParams`` validation
-        pass through unchanged).  Directions land on ``self.device`` via
-        the batched :meth:`_stack_vectors_to_device` path; bounds/strength
-        stay on CPU (see :class:`ClampSitePayload`).
+        pass through unchanged).  Directions land on ``self.device`` as a
+        fresh tensor, deliberately NOT via the pinned staging ring of
+        :meth:`_stack_vectors_to_device`: the ring's slots are lazily
+        allocated on the step thread inside ``torch.inference_mode()``, so
+        an in-place ``copy_`` into them from a control-plane RPC thread
+        (global clamp set, module-register broadcast) raises "Inplace
+        update to inference tensor outside InferenceMode".  Clamp payloads
+        are tiny (≤ K x hidden floats), so a plain blocking H2D is fine on
+        every path.  Bounds/strength stay on CPU (see
+        :class:`ClampSitePayload`).
         """
         if self.max_clamp_directions <= 0:
             raise ValueError(
@@ -637,7 +644,9 @@ class SteeringManager:
             vecs.append(np.asarray(vec, dtype=np.float32))
             bounds.append([lo, hi])
             strengths.append(strength)
-        dirs = self._stack_vectors_to_device(vecs)
+        dirs = torch.from_numpy(np.ascontiguousarray(np.stack(vecs)))
+        if self.device is not None:
+            dirs = dirs.to(self.device)
         return ClampSitePayload(
             dirs=dirs,
             bounds=torch.tensor(bounds, dtype=torch.float32),
