@@ -979,6 +979,9 @@ class Worker(WorkerBase):
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
+        clamps: dict[str, dict[int, list[dict]]] | None = None,
+        prefill_clamps: dict[str, dict[int, list[dict]]] | None = None,
+        decode_clamps: dict[str, dict[int, list[dict]]] | None = None,
     ) -> tuple[int, int, list[int]]:
         return self.model_runner.set_steering_vectors(
             vectors=vectors,
@@ -986,6 +989,9 @@ class Worker(WorkerBase):
             decode_vectors=decode_vectors,
             replace=replace,
             validate_only=validate_only,
+            clamps=clamps,
+            prefill_clamps=prefill_clamps,
+            decode_clamps=decode_clamps,
         )
 
     def clear_steering_vectors(self) -> None:
