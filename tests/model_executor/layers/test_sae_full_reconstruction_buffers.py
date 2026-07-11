@@ -51,7 +51,7 @@ class TestRegisterFullReconBuffers:
         feats = torch.tensor([0, 3, 7], dtype=torch.int64)
         register_sae_full_recon_buffers(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -64,16 +64,16 @@ class TestRegisterFullReconBuffers:
         )
         # Encoder / decoder buffers carry the *full* d_sae rows.
         enc_w = getattr(
-            layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         enc_b = getattr(
-            layer, HOOK_POINT_FR_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         dec_w = getattr(
-            layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         dec_b = getattr(
-            layer, HOOK_POINT_FR_DECODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_DECODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert enc_w.shape == (16, 8)
         assert enc_b.shape == (16,)
@@ -85,13 +85,13 @@ class TestRegisterFullReconBuffers:
         # Clamp tables: (max_recon_configs + 1, n_clamp), with row 0
         # reserved as the no-reconstruction sentinel.
         kind_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         value_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         only_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert kind_table.shape == (5, 3)
         assert kind_table.dtype is torch.int8
@@ -102,7 +102,7 @@ class TestRegisterFullReconBuffers:
         # Clampable feature index buffer is what the dispatch shim
         # passes to the op so the decoder pass sees the right rows.
         feat_buf = getattr(
-            layer, HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert feat_buf.dtype is torch.int64
         assert torch.equal(feat_buf, feats)
@@ -111,7 +111,7 @@ class TestRegisterFullReconBuffers:
         layer = _make_layer()
         register_sae_full_recon_buffers(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="golden_gate",
             activation=SAEActivation.JUMPRELU,
             activation_params={"threshold": 0.42},
@@ -123,29 +123,29 @@ class TestRegisterFullReconBuffers:
             dtype=torch.float32,
         )
         assert (
-            getattr(layer, HOOK_POINT_FR_MODULE_NAME_ATTR[SteeringHookPoint.POST_MLP])
+            getattr(layer, HOOK_POINT_FR_MODULE_NAME_ATTR[SteeringHookPoint.POST_BLOCK])
             == "golden_gate"
         )
         assert (
-            getattr(layer, HOOK_POINT_FR_ACTIVATION_ATTR[SteeringHookPoint.POST_MLP])
+            getattr(layer, HOOK_POINT_FR_ACTIVATION_ATTR[SteeringHookPoint.POST_BLOCK])
             is SAEActivation.JUMPRELU
         )
         params = getattr(
-            layer, HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert params == {"threshold": 0.42}
         # Stored as a fresh dict (not a reference to the caller-supplied
         # mapping) so caller mutations don't leak into the module.
         params["threshold"] = 9.0
         params2 = getattr(
-            layer, HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert params2["threshold"] == 9.0  # same dict
         # But the original caller-supplied dict is independent.
         independent = {"threshold": 0.5}
         register_sae_full_recon_buffers(
             _make_layer(layer_idx=1),
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="x",
             activation=SAEActivation.JUMPRELU,
             activation_params=independent,
@@ -164,7 +164,7 @@ class TestRegisterFullReconBuffers:
         layer = _make_layer()
         register_sae_full_recon_buffers(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -175,14 +175,14 @@ class TestRegisterFullReconBuffers:
             clampable_features=torch.tensor([0, 1], dtype=torch.int64),
             dtype=torch.float32,
         )
-        assert not sae_full_recon_buffers_attached(layer, SteeringHookPoint.POST_MLP)
+        assert not sae_full_recon_buffers_attached(layer, SteeringHookPoint.POST_BLOCK)
 
     def test_double_registration_at_same_site_raises(self):
         layer = _make_layer()
         feats = torch.tensor([0, 1], dtype=torch.int64)
         register_sae_full_recon_buffers(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="a",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -196,7 +196,7 @@ class TestRegisterFullReconBuffers:
         with pytest.raises(ValueError, match="already has full-reconstruction"):
             register_sae_full_recon_buffers(
                 layer,
-                hook_point=SteeringHookPoint.POST_MLP,
+                hook_point=SteeringHookPoint.POST_BLOCK,
                 module_name="b",
                 activation=SAEActivation.RELU,
                 activation_params={},
@@ -211,7 +211,7 @@ class TestRegisterFullReconBuffers:
     def test_distinct_hook_points_coexist(self):
         layer = _make_layer()
         for hp, name in (
-            (SteeringHookPoint.POST_MLP, "m1"),
+            (SteeringHookPoint.POST_BLOCK, "m1"),
             (SteeringHookPoint.POST_ATTN, "m2"),
         ):
             register_sae_full_recon_buffers(
@@ -228,7 +228,7 @@ class TestRegisterFullReconBuffers:
                 dtype=torch.float32,
             )
         # Both buffers exist independently.
-        for hp in (SteeringHookPoint.POST_MLP, SteeringHookPoint.POST_ATTN):
+        for hp in (SteeringHookPoint.POST_BLOCK, SteeringHookPoint.POST_ATTN):
             assert sae_full_recon_buffers_attached(layer, hp)
 
     @pytest.mark.parametrize(
@@ -241,7 +241,7 @@ class TestRegisterFullReconBuffers:
     def test_invalid_dimensions_rejected(self, bad_kwargs, match):
         layer = _make_layer()
         kwargs = {
-            "hook_point": SteeringHookPoint.POST_MLP,
+            "hook_point": SteeringHookPoint.POST_BLOCK,
             "module_name": "m",
             "activation": SAEActivation.RELU,
             "activation_params": {},
@@ -267,7 +267,7 @@ class TestRegisterFullReconBuffers:
         with pytest.raises(ValueError, match="int64"):
             register_sae_full_recon_buffers(
                 layer,
-                hook_point=SteeringHookPoint.POST_MLP,
+                hook_point=SteeringHookPoint.POST_BLOCK,
                 module_name="m",
                 activation=SAEActivation.RELU,
                 activation_params={},
@@ -284,7 +284,7 @@ class TestRegisterFullReconBuffers:
         with pytest.raises(ValueError, match="shape"):
             register_sae_full_recon_buffers(
                 layer,
-                hook_point=SteeringHookPoint.POST_MLP,
+                hook_point=SteeringHookPoint.POST_BLOCK,
                 module_name="m",
                 activation=SAEActivation.RELU,
                 activation_params={},
@@ -304,7 +304,7 @@ class TestUnregisterFullReconBuffers:
         layer = _make_layer()
         register_sae_full_recon_buffers(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -315,9 +315,9 @@ class TestUnregisterFullReconBuffers:
             clampable_features=torch.tensor([0, 1], dtype=torch.int64),
             dtype=torch.float32,
         )
-        assert sae_full_recon_buffers_attached(layer, SteeringHookPoint.POST_MLP)
-        unregister_sae_full_recon_buffers(layer, hook_point=SteeringHookPoint.POST_MLP)
-        assert not sae_full_recon_buffers_attached(layer, SteeringHookPoint.POST_MLP)
+        assert sae_full_recon_buffers_attached(layer, SteeringHookPoint.POST_BLOCK)
+        unregister_sae_full_recon_buffers(layer, hook_point=SteeringHookPoint.POST_BLOCK)
+        assert not sae_full_recon_buffers_attached(layer, SteeringHookPoint.POST_BLOCK)
         # Every attribute must be gone — buffers and python attrs alike.
         for attr_table in (
             HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
@@ -332,12 +332,12 @@ class TestUnregisterFullReconBuffers:
             HOOK_POINT_FR_ACTIVATION_ATTR,
             HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR,
         ):
-            assert not hasattr(layer, attr_table[SteeringHookPoint.POST_MLP])
+            assert not hasattr(layer, attr_table[SteeringHookPoint.POST_BLOCK])
 
     def test_unregister_when_absent_is_no_op(self):
         # Idempotent: calling on a layer with no buffers is fine.
         layer = _make_layer()
-        unregister_sae_full_recon_buffers(layer, hook_point=SteeringHookPoint.POST_MLP)
+        unregister_sae_full_recon_buffers(layer, hook_point=SteeringHookPoint.POST_BLOCK)
 
     def test_unregister_then_reregister(self):
         # Round trip: re-registration after detach must succeed.
@@ -345,7 +345,7 @@ class TestUnregisterFullReconBuffers:
         feats = torch.tensor([0, 1], dtype=torch.int64)
         register_sae_full_recon_buffers(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m1",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -356,10 +356,10 @@ class TestUnregisterFullReconBuffers:
             clampable_features=feats,
             dtype=torch.float32,
         )
-        unregister_sae_full_recon_buffers(layer, hook_point=SteeringHookPoint.POST_MLP)
+        unregister_sae_full_recon_buffers(layer, hook_point=SteeringHookPoint.POST_BLOCK)
         register_sae_full_recon_buffers(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m2",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -371,7 +371,7 @@ class TestUnregisterFullReconBuffers:
             dtype=torch.float32,
         )
         assert (
-            getattr(layer, HOOK_POINT_FR_MODULE_NAME_ATTR[SteeringHookPoint.POST_MLP])
+            getattr(layer, HOOK_POINT_FR_MODULE_NAME_ATTR[SteeringHookPoint.POST_BLOCK])
             == "m2"
         )
 

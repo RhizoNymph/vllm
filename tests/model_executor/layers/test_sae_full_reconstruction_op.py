@@ -326,7 +326,7 @@ class TestLayerRouting:
         module = nn.Module()
         register_sae_full_recon_buffers(
             module,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="site_b",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -349,7 +349,7 @@ class TestLayerRouting:
         populate_sae_full_recon_clamp_table(
             manager=manager,
             module=module,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="site_b",
             clampable_features=(),
             layer_idx=0,
@@ -357,7 +357,7 @@ class TestLayerRouting:
 
         hidden = torch.tensor([[1.0, 2.0]])
         out = apply_layer_sae_full_reconstruction(
-            module, hidden, SteeringHookPoint.POST_MLP
+            module, hidden, SteeringHookPoint.POST_BLOCK
         )
 
         assert torch.equal(out, hidden)

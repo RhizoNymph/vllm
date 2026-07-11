@@ -4195,7 +4195,7 @@ class SteeringModelRunnerMixin:
         if (
             not sae_buffers_attached(any_layer, SteeringHookPoint.PRE_ATTN)
             and not sae_buffers_attached(any_layer, SteeringHookPoint.POST_ATTN)
-            and not sae_buffers_attached(any_layer, SteeringHookPoint.POST_MLP)
+            and not sae_buffers_attached(any_layer, SteeringHookPoint.POST_BLOCK)
         ):
             return
         sae_index = cast(torch.Tensor, any_layer.sae_index)
@@ -4329,7 +4329,7 @@ class SteeringModelRunnerMixin:
                 any_layer, SteeringHookPoint.POST_ATTN
             )
             and not sae_full_recon_buffers_attached(
-                any_layer, SteeringHookPoint.POST_MLP
+                any_layer, SteeringHookPoint.POST_BLOCK
             )
         ):
             return

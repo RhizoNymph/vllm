@@ -84,7 +84,7 @@ _SAE_CLAMP_SPECS = [
         "module_name": "golden-gate",
         "phase": "prefill",
         "clamps": {
-            "post_mlp": {
+            "post_block": {
                 "20": [
                     {
                         "feature_idx": 34,
@@ -200,8 +200,8 @@ class TestChatCompletionSteering:
         spec = sp.sae_clamp_specs[0]
         assert spec.module_name == "golden-gate"
         assert spec.phase == "prefill"
-        assert 20 in spec.clamps["post_mlp"]
-        assert spec.clamps["post_mlp"][20][0].feature_idx == 34
+        assert 20 in spec.clamps["post_block"]
+        assert spec.clamps["post_block"][20][0].feature_idx == 34
 
 
 # ---------------------------------------------------------------------------
@@ -294,8 +294,8 @@ class TestCompletionSteering:
         spec = sp.sae_clamp_specs[0]
         assert spec.module_name == "golden-gate"
         assert spec.phase == "prefill"
-        assert 20 in spec.clamps["post_mlp"]
-        assert spec.clamps["post_mlp"][20][0].feature_idx == 34
+        assert 20 in spec.clamps["post_block"]
+        assert spec.clamps["post_block"][20][0].feature_idx == 34
 
 
 # ---------------------------------------------------------------------------

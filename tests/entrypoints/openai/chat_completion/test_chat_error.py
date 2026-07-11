@@ -358,7 +358,7 @@ async def test_chat_beam_search_with_steering_returns_error():
 
     row = _np.asarray([[0.1]], dtype=_np.float32)
     packed_vectors = {
-        "post_mlp": {
+        "post_block": {
             "dtype": "float32",
             "shape": [1, 1],
             "layer_indices": [0],
@@ -397,7 +397,7 @@ async def test_batch_chat_sae_without_raw_request_returns_error():
             {
                 "module_name": "g",
                 "clamps": {
-                    "post_mlp": {
+                    "post_block": {
                         "20": [
                             {
                                 "feature_idx": 0,
@@ -421,7 +421,7 @@ async def test_batch_chat_sae_without_raw_request_returns_error():
 @pytest.mark.asyncio
 async def test_batch_chat_named_steering_applies_sampling_param_hashes():
     registry = SteeringModuleRegistry()
-    await registry.register("named-module", vectors={"post_mlp": {0: [1.0, 2.0]}})
+    await registry.register("named-module", vectors={"post_block": {0: [1.0, 2.0]}})
 
     mock_engine = MagicMock(spec=AsyncLLM)
     mock_engine.errored = False

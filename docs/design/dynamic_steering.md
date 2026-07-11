@@ -788,7 +788,7 @@ As built (replaces the open design notes that follow):
   (so dynamic-tier vectors are expected at sites ≥ the monitor — detect
   at L, steer at layers > L).
 - Ordering caveat: hook execution order within a layer is pre_attn →
-  post_attn → post_mlp; "later sites" includes later hooks of the same
+  post_attn → post_block; "later sites" includes later hooks of the same
   layer.
 
 **Update (2026-06-21) — same-hook fusion default + opt-in cross-layer.**

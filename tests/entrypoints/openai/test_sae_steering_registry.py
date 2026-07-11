@@ -24,7 +24,7 @@ def _manifest(
     d_model: int = 4096,
     d_sae: int = 65536,
     activation: SAEActivation = SAEActivation.JUMPRELU,
-    layers: tuple[tuple[int, str], ...] = ((20, "post_mlp"),),
+    layers: tuple[tuple[int, str], ...] = ((20, "post_block"),),
     clampable_features: tuple[int, ...] = (0, 1, 2, 34),
     activation_params: dict[str, float] | None = None,
     weights_uri: str | None = "/tmp/sae",
@@ -48,7 +48,7 @@ def _raw_sae_clamp_spec(module_name: str = "g") -> dict:
     return {
         "module_name": module_name,
         "clamps": {
-            "post_mlp": {
+            "post_block": {
                 "20": [
                     {
                         "feature_idx": 34,
@@ -67,11 +67,11 @@ class TestRegisterAdditive:
     @pytest.mark.asyncio
     async def test_additive_default_kind(self):
         reg = SteeringModuleRegistry()
-        await reg.register(name="m", vectors={"post_mlp": {0: [0.1, 0.2]}})
+        await reg.register(name="m", vectors={"post_block": {0: [0.1, 0.2]}})
         mod = reg.get("m")
         assert mod is not None
         assert mod.kind is SteeringModuleKind.ADDITIVE
-        assert mod.vectors == {"post_mlp": {0: [0.1, 0.2]}}
+        assert mod.vectors == {"post_block": {0: [0.1, 0.2]}}
         assert mod.sae_manifest is None
 
     @pytest.mark.asyncio
@@ -80,7 +80,7 @@ class TestRegisterAdditive:
         with pytest.raises(ValueError, match="sae_manifest is only valid"):
             await reg.register(
                 name="m",
-                vectors={"post_mlp": {0: [0.1]}},
+                vectors={"post_block": {0: [0.1]}},
                 sae_manifest=_manifest(),
             )
 
@@ -88,13 +88,13 @@ class TestRegisterAdditive:
     async def test_additive_rejects_bool_layer_index(self):
         reg = SteeringModuleRegistry()
         with pytest.raises(ValueError, match="non-negative integer"):
-            await reg.register(name="m", vectors={"post_mlp": {True: [0.1]}})
+            await reg.register(name="m", vectors={"post_block": {True: [0.1]}})
 
     @pytest.mark.asyncio
     async def test_additive_rejects_oversized_layer_index(self):
         reg = SteeringModuleRegistry()
         with pytest.raises(ValueError, match="2147483647"):
-            await reg.register(name="m", vectors={"post_mlp": {2**31: [0.1]}})
+            await reg.register(name="m", vectors={"post_block": {2**31: [0.1]}})
 
 
 class TestRegisterSAE:
@@ -126,7 +126,7 @@ class TestRegisterSAE:
                 name="g",
                 kind=SteeringModuleKind.SAE_DELTA,
                 sae_manifest=_manifest(),
-                vectors={"post_mlp": {0: [0.1]}},
+                vectors={"post_block": {0: [0.1]}},
             )
 
     @pytest.mark.asyncio
@@ -169,7 +169,7 @@ class TestRegisterSAE:
         invalid_manifests = [
             _manifest(d_model=True),  # type: ignore[arg-type]
             _manifest(d_sae=True),  # type: ignore[arg-type]
-            _manifest(layers=((True, "post_mlp"),)),  # type: ignore[arg-type]
+            _manifest(layers=((True, "post_block"),)),  # type: ignore[arg-type]
             _manifest(clampable_features=(True,)),  # type: ignore[arg-type]
         ]
         for manifest in invalid_manifests:
@@ -232,7 +232,7 @@ class TestRegisterSAE:
             await reg.register(
                 name="g",
                 kind=SteeringModuleKind.SAE_DELTA,
-                sae_manifest=_manifest(layers=((42, "post_mlp"),)),
+                sae_manifest=_manifest(layers=((42, "post_block"),)),
             )
 
     @pytest.mark.asyncio
@@ -242,14 +242,14 @@ class TestRegisterSAE:
             await reg.register(
                 name="g",
                 kind=SteeringModuleKind.SAE_DELTA,
-                sae_manifest=_manifest(layers=((-1, "post_mlp"),)),
+                sae_manifest=_manifest(layers=((-1, "post_block"),)),
             )
 
     @pytest.mark.asyncio
     async def test_sae_rejects_oversized_indices(self):
         reg = SteeringModuleRegistry()
         invalid_manifests = [
-            _manifest(layers=((2**31, "post_mlp"),)),
+            _manifest(layers=((2**31, "post_block"),)),
             _manifest(d_sae=2**31 + 1, clampable_features=(2**31,)),
         ]
         for manifest in invalid_manifests:
@@ -278,7 +278,7 @@ class TestRegisterSAE:
                 name="g",
                 kind=SteeringModuleKind.SAE_DELTA,
                 sae_manifest=_manifest(
-                    layers=((0, "post_mlp"), (0, "post_mlp")),
+                    layers=((0, "post_block"), (0, "post_block")),
                 ),
             )
 
@@ -288,14 +288,14 @@ class TestRegisterSAE:
         await reg.register(
             name="g",
             kind=SteeringModuleKind.SAE_DELTA,
-            sae_manifest=_manifest(layers=((0, "post_mlp"),)),
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
         )
 
         with pytest.raises(ValueError, match="overlap existing SAE module"):
             await reg.register(
                 name="h",
                 kind=SteeringModuleKind.SAE_DELTA,
-                sae_manifest=_manifest(layers=((0, "post_mlp"),)),
+                sae_manifest=_manifest(layers=((0, "post_block"),)),
             )
 
     @pytest.mark.asyncio
@@ -304,13 +304,13 @@ class TestRegisterSAE:
         await reg.register(
             name="g",
             kind=SteeringModuleKind.SAE_DELTA,
-            sae_manifest=_manifest(layers=((0, "post_mlp"),)),
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
         )
 
         await reg.register(
             name="g",
             kind=SteeringModuleKind.SAE_DELTA,
-            sae_manifest=_manifest(layers=((0, "post_mlp"),)),
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
         )
 
 
@@ -329,7 +329,7 @@ class TestValidateAdditiveLookup:
     @pytest.mark.asyncio
     async def test_additive_returns_none(self):
         reg = SteeringModuleRegistry()
-        await reg.register(name="m", vectors={"post_mlp": {0: [0.1]}})
+        await reg.register(name="m", vectors={"post_block": {0: [0.1]}})
         assert reg.validate_additive_lookup("m") is None
 
     @pytest.mark.asyncio
@@ -393,7 +393,7 @@ class TestValidateSAEClampSpecs:
         """An additive-kind module under the same name must surface as
         an API-side 400 instead of crashing the worker."""
         reg = SteeringModuleRegistry()
-        await reg.register(name="m", vectors={"post_mlp": {0: [0.1]}})
+        await reg.register(name="m", vectors={"post_block": {0: [0.1]}})
         err = reg.validate_sae_clamp_specs([_raw_sae_clamp_spec("m")])
         assert err is not None
         assert "kind 'additive'" in err
@@ -415,11 +415,11 @@ class TestValidateSAEClampSpecs:
         await reg.register(
             name="g",
             kind=SteeringModuleKind.SAE_DELTA,
-            sae_manifest=_manifest(layers=((20, "post_mlp"),)),
+            sae_manifest=_manifest(layers=((20, "post_block"),)),
         )
         raw = _raw_sae_clamp_spec("g")
         raw["clamps"] = {
-            "post_mlp": {
+            "post_block": {
                 "21": [
                     {
                         "feature_idx": 34,
@@ -464,7 +464,7 @@ class TestValidateSAEClampSpecs:
                 {
                     "module_name": "g",
                     "clamps": {
-                        "post_mlp": {
+                        "post_block": {
                             "20": [
                                 {
                                     "feature_idx": 34,
@@ -501,7 +501,7 @@ class TestMixedKindRegistration:
                 name="x",
                 kind=SteeringModuleKind.SAE_DELTA,
                 sae_manifest=_manifest(),
-                vectors={"post_mlp": {0: [0.1]}},
+                vectors={"post_block": {0: [0.1]}},
             )
 
     @pytest.mark.asyncio
@@ -523,7 +523,7 @@ class TestMixedKindRegistration:
                 name="x",
                 kind=SteeringModuleKind.SAE_DELTA,
                 sae_manifest=_manifest(),
-                decode_vectors={"post_mlp": {0: [0.1]}},
+                decode_vectors={"post_block": {0: [0.1]}},
             )
 
 
@@ -533,10 +533,10 @@ class TestBroadcastRoundTrip:
     @pytest.mark.asyncio
     async def test_additive_payload_carries_kind(self):
         reg = SteeringModuleRegistry()
-        await reg.register(name="m", vectors={"post_mlp": {0: [0.1]}})
+        await reg.register(name="m", vectors={"post_block": {0: [0.1]}})
         dump = reg.dump_for_broadcast()
         assert dump["m"]["kind"] == "additive"
-        assert dump["m"]["vectors"] == {"post_mlp": {0: [0.1]}}
+        assert dump["m"]["vectors"] == {"post_block": {0: [0.1]}}
 
     @pytest.mark.asyncio
     async def test_sae_payload_carries_manifest(self):
@@ -569,7 +569,7 @@ class TestBroadcastRoundTrip:
             sae_manifest=manifest,
         )
         weights = {
-            (20, "post_mlp"): {
+            (20, "post_block"): {
                 "encoder_weight": torch.zeros(4, 4096),
                 "encoder_bias": torch.zeros(4),
                 "decoder_weight": torch.zeros(4, 4096),
@@ -598,7 +598,7 @@ class TestBroadcastRoundTrip:
             "d_model": 8,
             "d_sae": 16,
             "activation": "relu",
-            "layers": [[0, "post_mlp"]],
+            "layers": [[0, "post_block"]],
             "clampable_features": [0, 1],
             "activation_params": {},
             "weights_uri": None,
@@ -613,7 +613,7 @@ class TestBroadcastRoundTrip:
             "encoder_bias": torch.zeros(2),
             "decoder_weight": torch.full((2, 8), 2.0),
         }
-        save_file(weights, str(tmp_path / _site_filename(0, "post_mlp")))
+        save_file(weights, str(tmp_path / _site_filename(0, "post_block")))
 
         reg = SteeringModuleRegistry()
         await reg.load_from_file("g", str(tmp_path))
@@ -627,6 +627,6 @@ class TestBroadcastRoundTrip:
         dump = reg.dump_for_broadcast(include_sae_weights=True)
         assert dump["g"]["kind"] == "sae_delta"
         assert torch.allclose(
-            dump["g"]["sae_weights"][(0, "post_mlp")]["decoder_weight"],
+            dump["g"]["sae_weights"][(0, "post_block")]["decoder_weight"],
             weights["decoder_weight"],
         )

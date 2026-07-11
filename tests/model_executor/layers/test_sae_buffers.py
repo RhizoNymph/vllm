@@ -68,7 +68,7 @@ class TestRegisterSaeBuffers:
         m = _bare_module()
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="golden_gate",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -77,9 +77,9 @@ class TestRegisterSaeBuffers:
             max_sae_configs=3,
             dtype=torch.float32,
         )
-        kind_attr = HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
-        value_attr = HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP]
-        only_attr = HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
+        kind_attr = HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
+        value_attr = HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK]
+        only_attr = HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
         # Row 0 is the no-op sentinel, rows 1/2 are phase globals.
         assert getattr(m, kind_attr).shape == (6, 4)
         assert getattr(m, kind_attr).dtype is torch.int8
@@ -92,7 +92,7 @@ class TestRegisterSaeBuffers:
         m = _bare_module()
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="g",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -101,7 +101,7 @@ class TestRegisterSaeBuffers:
             max_sae_configs=1,
             dtype=torch.float32,
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
         # Row 0 is the no-op sentinel: all zeros = CLAMP_KIND_NONE.
         assert torch.equal(kind[0], torch.zeros(2, dtype=torch.int8))
 
@@ -140,7 +140,7 @@ class TestRegisterSaeBuffers:
         m = _bare_module()
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="golden_gate",
             activation=SAEActivation.JUMPRELU,
             activation_params={"threshold": 0.7},
@@ -152,12 +152,12 @@ class TestRegisterSaeBuffers:
         # Module name and activation are Python attributes (not buffers)
         # so torch.compile sees them as per-instance constants.
         assert (
-            getattr(m, HOOK_POINT_SAE_MODULE_NAME_ATTR[SteeringHookPoint.POST_MLP])
+            getattr(m, HOOK_POINT_SAE_MODULE_NAME_ATTR[SteeringHookPoint.POST_BLOCK])
             == "golden_gate"
         )
         # Activation reachable through a sibling attribute.
-        sae_act = m.sae_activation_post_mlp  # type: ignore[attr-defined]
-        sae_act_params = m.sae_activation_params_post_mlp  # type: ignore[attr-defined]
+        sae_act = m.sae_activation_post_block  # type: ignore[attr-defined]
+        sae_act_params = m.sae_activation_params_post_block  # type: ignore[attr-defined]
         assert sae_act is SAEActivation.JUMPRELU
         assert sae_act_params == {"threshold": 0.7}
 
@@ -185,7 +185,7 @@ class TestRegisterSaeBuffers:
         m = _bare_module()
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="a",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -200,7 +200,7 @@ class TestRegisterSaeBuffers:
         with pytest.raises(ValueError, match="already has SAE buffers"):
             register_sae_buffers(
                 m,
-                hook_point=SteeringHookPoint.POST_MLP,
+                hook_point=SteeringHookPoint.POST_BLOCK,
                 module_name="b",
                 activation=SAEActivation.RELU,
                 activation_params={},
@@ -217,7 +217,7 @@ class TestRegisterSaeBuffers:
         m = _bare_module()
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="g",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -227,7 +227,7 @@ class TestRegisterSaeBuffers:
             dtype=torch.float32,
         )
         assert not hasattr(
-            m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+            m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
         )
 
     def test_partial_registration_failure_rolls_back_buffers(self, monkeypatch):
@@ -247,7 +247,7 @@ class TestRegisterSaeBuffers:
         with pytest.raises(RuntimeError, match="buffer allocation failed"):
             register_sae_buffers(
                 m,
-                hook_point=SteeringHookPoint.POST_MLP,
+                hook_point=SteeringHookPoint.POST_BLOCK,
                 module_name="g",
                 activation=SAEActivation.RELU,
                 activation_params={},
@@ -257,7 +257,7 @@ class TestRegisterSaeBuffers:
                 dtype=torch.float32,
             )
 
-        assert not sae_buffers_attached(m, SteeringHookPoint.POST_MLP)
+        assert not sae_buffers_attached(m, SteeringHookPoint.POST_BLOCK)
         for attr_table in (
             HOOK_POINT_SAE_CLAMP_KIND_ATTR,
             HOOK_POINT_SAE_CLAMP_VALUE_ATTR,
@@ -267,12 +267,12 @@ class TestRegisterSaeBuffers:
             HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
             HOOK_POINT_SAE_MODULE_NAME_ATTR,
         ):
-            assert not hasattr(m, attr_table[SteeringHookPoint.POST_MLP])
+            assert not hasattr(m, attr_table[SteeringHookPoint.POST_BLOCK])
 
         monkeypatch.setattr(m, "register_buffer", original_register_buffer)
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="g",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -281,7 +281,7 @@ class TestRegisterSaeBuffers:
             max_sae_configs=1,
             dtype=torch.float32,
         )
-        assert sae_buffers_attached(m, SteeringHookPoint.POST_MLP)
+        assert sae_buffers_attached(m, SteeringHookPoint.POST_BLOCK)
 
 
 class TestSaeBuffersAttached:
@@ -291,7 +291,7 @@ class TestSaeBuffersAttached:
         m = _bare_module()
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="g",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -300,17 +300,17 @@ class TestSaeBuffersAttached:
             max_sae_configs=1,
             dtype=torch.float32,
         )
-        assert sae_buffers_attached(m, SteeringHookPoint.POST_MLP) is True
+        assert sae_buffers_attached(m, SteeringHookPoint.POST_BLOCK) is True
 
     def test_returns_false_when_no_buffers(self):
         m = _bare_module()
-        assert sae_buffers_attached(m, SteeringHookPoint.POST_MLP) is False
+        assert sae_buffers_attached(m, SteeringHookPoint.POST_BLOCK) is False
 
     def test_per_hook_independence(self):
         m = _bare_module()
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="g",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -322,7 +322,7 @@ class TestSaeBuffersAttached:
         # Other hooks at the same layer remain unattached.
         assert sae_buffers_attached(m, SteeringHookPoint.PRE_ATTN) is False
         assert sae_buffers_attached(m, SteeringHookPoint.POST_ATTN) is False
-        assert sae_buffers_attached(m, SteeringHookPoint.POST_MLP) is True
+        assert sae_buffers_attached(m, SteeringHookPoint.POST_BLOCK) is True
 
 
 class TestUnregisterSaeBuffers:
@@ -332,7 +332,7 @@ class TestUnregisterSaeBuffers:
         m = _bare_module()
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="g",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -341,7 +341,7 @@ class TestUnregisterSaeBuffers:
             max_sae_configs=1,
             dtype=torch.float32,
         )
-        unregister_sae_buffers(m, hook_point=SteeringHookPoint.POST_MLP)
+        unregister_sae_buffers(m, hook_point=SteeringHookPoint.POST_BLOCK)
         for attr_table in (
             HOOK_POINT_SAE_CLAMP_KIND_ATTR,
             HOOK_POINT_SAE_CLAMP_VALUE_ATTR,
@@ -351,12 +351,12 @@ class TestUnregisterSaeBuffers:
             HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
             HOOK_POINT_SAE_MODULE_NAME_ATTR,
         ):
-            assert not hasattr(m, attr_table[SteeringHookPoint.POST_MLP])
+            assert not hasattr(m, attr_table[SteeringHookPoint.POST_BLOCK])
 
     def test_unregister_when_unattached_is_noop(self):
         m = _bare_module()
         # Must not raise.
-        unregister_sae_buffers(m, hook_point=SteeringHookPoint.POST_MLP)
+        unregister_sae_buffers(m, hook_point=SteeringHookPoint.POST_BLOCK)
 
 
 class TestSharedSaeIndex:
@@ -397,7 +397,7 @@ class TestBufferDeviceMatchesModule:
         m = _bare_module()
         register_sae_buffers(
             m,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="g",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -406,5 +406,5 @@ class TestBufferDeviceMatchesModule:
             max_sae_configs=1,
             dtype=torch.float32,
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
         assert kind.device.type == "cpu"

@@ -481,7 +481,7 @@ class TestApplyLayerSteeringHotPath:
 
         self._forbid_sae_import(monkeypatch)
 
-        out = apply_layer_steering(module, hidden, SteeringHookPoint.POST_MLP)
+        out = apply_layer_steering(module, hidden, SteeringHookPoint.POST_BLOCK)
         assert out is hidden
 
     def test_additive_only_does_not_import_sae_steering(self, monkeypatch):
@@ -498,7 +498,7 @@ class TestApplyLayerSteeringHotPath:
 
         self._forbid_sae_import(monkeypatch)
 
-        out = apply_layer_steering(module, hidden, SteeringHookPoint.POST_MLP)
+        out = apply_layer_steering(module, hidden, SteeringHookPoint.POST_BLOCK)
         assert torch.allclose(out, hidden)
 
     @staticmethod

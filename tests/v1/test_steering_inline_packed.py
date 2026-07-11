@@ -295,7 +295,7 @@ class TestMaybePackSAE:
         sae_spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     0: (
                         SAEClampEntry(
                             feature_idx=1,

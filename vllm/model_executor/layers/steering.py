@@ -41,18 +41,10 @@ class SteeringHookPoint(str, Enum):
 
     POST_BLOCK = "post_block"  # block output: residual + mlp branch (true hs[L+1])
     """Steer the block-output residual stream (``residual + mlp_branch``), the
-    true ``hidden_states[L + 1]`` -- see :func:`apply_block_steering`."""
-
-    POST_MLP = "post_mlp"
-    """SAE feature-surgery / full-reconstruction site (the historical
-    ``post_mlp`` hook).  The additive steering framework consolidated this
-    site into :attr:`POST_BLOCK` (both steer the same end-of-block
-    ``residual``), but the SAE clamp / full-reconstruction feature keys its
-    per-site buffers, spec ``clamps`` maps, and prefix-cache hooks by the
-    ``"post_mlp"`` string, so the member is retained as a distinct hook point.
-    SAE surgery at this site is applied on the end-of-block ``residual`` from
-    within :func:`apply_block_steering`; the additive machinery still allocates
-    (unused) tables for it because framework code iterates every enum member."""
+    true ``hidden_states[L + 1]`` -- see :func:`apply_block_steering`.  Also
+    the SAE feature-surgery / full-reconstruction site (the historical
+    ``post_mlp`` hook, renamed and semantically corrected to the true block
+    output)."""
 
 
 # Buffer attribute names on decoder layer modules, keyed by hook point.
@@ -60,11 +52,6 @@ HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "steering_table_pre_attn",
     SteeringHookPoint.POST_ATTN: "steering_table_post_attn",
     SteeringHookPoint.POST_BLOCK: "steering_table_post_block",
-    # POST_MLP is the SAE feature-surgery site; it carries no additive
-    # steering in the merged framework (POST_BLOCK owns end-of-block
-    # additive steering), but every derived hook dict and the buffer
-    # registration loop iterate the full enum, so it needs a table attr.
-    SteeringHookPoint.POST_MLP: "steering_table_post_mlp",
 }
 
 # Per-hook ``any-active`` flag attribute names. The flag is a single-element
@@ -148,7 +135,7 @@ DEFAULT_HOOK_POINT = SteeringHookPoint.POST_BLOCK
 HOOK_POINT_SAE_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_clamp_kind_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_clamp_kind_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_clamp_kind_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_clamp_kind_post_block",
 }
 
 # Full-reconstruction (Phase 4) site marker.  Same pattern as the delta
@@ -157,7 +144,7 @@ HOOK_POINT_SAE_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
 HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_kind_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_clamp_kind_post_attn",
-    SteeringHookPoint.POST_MLP: "sae_fr_clamp_kind_post_mlp",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_clamp_kind_post_block",
 }
 
 
@@ -723,16 +710,24 @@ def apply_block_steering(
     table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_BLOCK]
     if hasattr(module, table_attr):
         residual = _emit_steering_op(module, residual, SteeringHookPoint.POST_BLOCK)
-    # SAE feature-surgery / full-reconstruction historically lived at the
-    # ``post_mlp`` hook, which the additive framework consolidated into this
-    # block-output hook.  Apply SAE surgery on the same end-of-block
-    # ``residual`` the additive path steers, keyed by the retained
-    # ``POST_MLP`` member so it reads the SAE buffers registered under that
-    # site.  Gated on its own marker buffers, so it is a static no-op when
-    # SAE is not configured here.
-    residual = _maybe_apply_layer_sae(
-        module, residual, SteeringHookPoint.POST_MLP
-    )
+    # SAE feature-surgery / full-reconstruction at the block output.  Unlike
+    # additive steering (where adding to either summand is propagation-
+    # equivalent), SAE encode/decode must see the TRUE block output
+    # ``residual + hidden_states`` — encoding the bare ``residual`` would
+    # miss this layer's MLP branch, and full reconstruction would drop it
+    # entirely.  Write back through ``residual`` as a delta so tokens the
+    # SAE ops leave untouched stay bit-identical, and the extra adds only
+    # run when SAE buffers are attached at this site (static per-process).
+    buffers = module._buffers
+    if (
+        HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK] in buffers
+        or HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK] in buffers
+    ):
+        block_out = residual + hidden_states
+        steered = _maybe_apply_layer_sae(
+            module, block_out, SteeringHookPoint.POST_BLOCK
+        )
+        residual = residual + (steered - block_out)
     return hidden_states, residual
 
 

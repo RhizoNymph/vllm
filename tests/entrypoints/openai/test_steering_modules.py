@@ -668,7 +668,7 @@ async def test_init_app_state_preloads_sae_directory_and_broadcasts_weights(
         "d_model": 8,
         "d_sae": 16,
         "activation": "relu",
-        "layers": [[0, "post_mlp"]],
+        "layers": [[0, "post_block"]],
         "clampable_features": [0, 1],
         "activation_params": {},
         "weights_uri": None,
@@ -684,7 +684,7 @@ async def test_init_app_state_preloads_sae_directory_and_broadcasts_weights(
             "encoder_bias": torch.zeros(2),
             "decoder_weight": torch.full((2, 8), 2.0),
         },
-        str(tmp_path / _site_filename(0, "post_mlp")),
+        str(tmp_path / _site_filename(0, "post_block")),
     )
 
     engine_client = MagicMock()
@@ -755,7 +755,7 @@ async def test_init_app_state_preloads_sae_directory_and_broadcasts_weights(
     assert modules["g"]["kind"] == "sae_delta"
     assert modules["g"]["sae_manifest"]["weights_uri"] == str(tmp_path)
     assert torch.equal(
-        modules["g"]["sae_weights"][(0, "post_mlp")]["decoder_weight"],
+        modules["g"]["sae_weights"][(0, "post_block")]["decoder_weight"],
         torch.full((2, 8), 2.0),
     )
     assert register_call.kwargs["kwargs"]["replace"] is True
@@ -903,7 +903,7 @@ class TestSamplingParamsHashOverrides:
             module_name="g",
             phase=phase,  # type: ignore[arg-type]
             clamps={
-                "post_mlp": {
+                "post_block": {
                     0: (
                         SAEClampEntry(
                             feature_idx=1,
@@ -920,7 +920,7 @@ class TestSamplingParamsHashOverrides:
         self, monkeypatch
     ):
         registry = SteeringModuleRegistry()
-        base: SteeringVectorSpec = {"post_mlp": {0: [1.0, 2.0]}}
+        base: SteeringVectorSpec = {"post_block": {0: [1.0, 2.0]}}
         await registry.register("m", vectors=base)
         sp = SamplingParams(steering_module_ref=("m", 1.0))
 
@@ -941,7 +941,7 @@ class TestSamplingParamsHashOverrides:
     @pytest.mark.asyncio
     async def test_named_additive_with_sae_primes_sae_phase_hashes(self):
         registry = SteeringModuleRegistry()
-        base: SteeringVectorSpec = {"post_mlp": {0: [1.0, 2.0]}}
+        base: SteeringVectorSpec = {"post_block": {0: [1.0, 2.0]}}
         sae_spec = self._sae_spec(phase="decode")
         await registry.register("m", vectors=base)
         sp = SamplingParams(
@@ -967,7 +967,7 @@ class TestSamplingParamsHashOverrides:
     @pytest.mark.asyncio
     async def test_decode_only_module_clears_prefill_hashes(self):
         registry = SteeringModuleRegistry()
-        decode: SteeringVectorSpec = {"post_mlp": {0: [1.0, 2.0]}}
+        decode: SteeringVectorSpec = {"post_block": {0: [1.0, 2.0]}}
         await registry.register("decode_only", decode_vectors=decode)
         sp = SamplingParams(steering_module_ref=("decode_only", 1.0))
 
@@ -983,7 +983,7 @@ class TestSamplingParamsHashOverrides:
     @pytest.mark.asyncio
     async def test_inline_prefill_override_keeps_prefill_active(self):
         registry = SteeringModuleRegistry()
-        decode: SteeringVectorSpec = {"post_mlp": {0: [1.0, 2.0]}}
+        decode: SteeringVectorSpec = {"post_block": {0: [1.0, 2.0]}}
         inline_prefill: SteeringVectorSpec = {"pre_attn": {1: [0.5, 0.25]}}
         await registry.register("decode_only", decode_vectors=decode)
         sp = SamplingParams(

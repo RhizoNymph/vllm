@@ -33,7 +33,7 @@ def _sample_sae_clamp_spec() -> SAEClampSpec:
     return SAEClampSpec(
         module_name="m",
         clamps={
-            "post_mlp": {0: (SAEClampEntry(feature_idx=0, kind="absolute", value=1.0),)}
+            "post_block": {0: (SAEClampEntry(feature_idx=0, kind="absolute", value=1.0),)}
         },
     )
 

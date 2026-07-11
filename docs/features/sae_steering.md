@@ -171,11 +171,11 @@ The existing additive path remains the first stage.
 
 ```python
 # Existing, unchanged:
-hidden = apply_layer_steering(hidden, hook_point=POST_MLP)
+hidden = apply_layer_steering(hidden, hook_point=POST_BLOCK)
 
 # SAE stage is present only when SAE buffers are attached; it becomes
 # a runtime no-op when no row in this batch needs SAE delta on this hook.
-hidden = apply_layer_sae_delta(hidden, hook_point=POST_MLP)
+hidden = apply_layer_sae_delta(hidden, hook_point=POST_BLOCK)
 ```
 
 `apply_layer_sae_delta` is registered as `torch.ops.vllm.apply_sae_delta`

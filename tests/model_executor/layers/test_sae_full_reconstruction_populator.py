@@ -71,7 +71,7 @@ class TestPopulator:
         layer.layer_idx = 20
         _attach(
             layer,
-            hook=SteeringHookPoint.POST_MLP,
+            hook=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=[3, 7, 11],
         )
@@ -79,7 +79,7 @@ class TestPopulator:
         spec = SAEFullReconstructionSpec(
             module_name="m",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=7, kind="absolute", value=5.0),)
                 }
             },
@@ -88,16 +88,16 @@ class TestPopulator:
         populate_sae_full_recon_clamp_table(
             manager=manager,
             module=layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=(3, 7, 11),
             layer_idx=20,
         )
         kind_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         value_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         # Position 1 in the clampable tuple is feature_idx=7.
         assert kind_table[1, 1].item() == CLAMP_KIND_ABSOLUTE
@@ -114,7 +114,7 @@ class TestPopulator:
         layer.layer_idx = 0
         _attach(
             layer,
-            hook=SteeringHookPoint.POST_MLP,
+            hook=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=[0, 1],
         )
@@ -124,13 +124,13 @@ class TestPopulator:
         populate_sae_full_recon_clamp_table(
             manager=manager,
             module=layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=(0, 1),
             layer_idx=0,
         )
         kind_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert torch.equal(kind_table[1], torch.zeros(2, dtype=torch.int8))
 
@@ -140,7 +140,7 @@ class TestPopulator:
         layer.layer_idx = 0
         _attach(
             layer,
-            hook=SteeringHookPoint.POST_MLP,
+            hook=SteeringHookPoint.POST_BLOCK,
             module_name="m_a",
             clampable_features=[0, 1],
         )
@@ -148,7 +148,7 @@ class TestPopulator:
         spec = SAEFullReconstructionSpec(
             module_name="m_b",  # different module
             clamps={
-                "post_mlp": {
+                "post_block": {
                     0: (SAEClampEntry(feature_idx=0, kind="absolute", value=99.0),)
                 }
             },
@@ -157,13 +157,13 @@ class TestPopulator:
         populate_sae_full_recon_clamp_table(
             manager=manager,
             module=layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m_a",
             clampable_features=(0, 1),
             layer_idx=0,
         )
         kind_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert torch.equal(kind_table[1], torch.zeros(2, dtype=torch.int8))
 
@@ -176,7 +176,7 @@ class TestPopulator:
         layer.layer_idx = 0
         _attach(
             layer,
-            hook=SteeringHookPoint.POST_MLP,
+            hook=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=[0],
         )
@@ -184,7 +184,7 @@ class TestPopulator:
         prefill = SAEFullReconstructionSpec(
             module_name="m",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     0: (SAEClampEntry(feature_idx=0, kind="absolute", value=11.0),)
                 }
             },
@@ -192,7 +192,7 @@ class TestPopulator:
         decode = SAEFullReconstructionSpec(
             module_name="m",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     0: (SAEClampEntry(feature_idx=0, kind="additive", value=22.0),)
                 }
             },
@@ -202,17 +202,17 @@ class TestPopulator:
         populate_sae_full_recon_clamp_table(
             manager=manager,
             module=layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=(0,),
             layer_idx=0,
             worker_phase="prefill",
         )
         kind_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         value_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert kind_table[prefill_row, 0].item() == CLAMP_KIND_ABSOLUTE
         assert value_table[prefill_row, 0].item() == pytest.approx(11.0)
@@ -225,20 +225,20 @@ class TestPopulator:
         layer.layer_idx = 0
         _attach(
             layer,
-            hook=SteeringHookPoint.POST_MLP,
+            hook=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=[0],
         )
         # Manually corrupt row 0 — populator must defensively reset it.
         kind_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         kind_table[0, 0] = CLAMP_KIND_ABSOLUTE
         manager = SAEFullReconstructionManager(4)
         populate_sae_full_recon_clamp_table(
             manager=manager,
             module=layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=(0,),
             layer_idx=0,
@@ -250,7 +250,7 @@ class TestPopulator:
         layer.layer_idx = 0
         _attach(
             layer,
-            hook=SteeringHookPoint.POST_MLP,
+            hook=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=[0, 1],
         )
@@ -258,7 +258,7 @@ class TestPopulator:
         spec = SAEFullReconstructionSpec(
             module_name="m",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     0: (
                         SAEClampEntry(
                             feature_idx=99,  # not in clampable_features
@@ -274,7 +274,7 @@ class TestPopulator:
             populate_sae_full_recon_clamp_table(
                 manager=manager,
                 module=layer,
-                hook_point=SteeringHookPoint.POST_MLP,
+                hook_point=SteeringHookPoint.POST_BLOCK,
                 module_name="m",
                 clampable_features=(0, 1),
                 layer_idx=0,
@@ -285,7 +285,7 @@ class TestPopulator:
         layer.layer_idx = 0
         _attach(
             layer,
-            hook=SteeringHookPoint.POST_MLP,
+            hook=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=[0],
         )
@@ -294,7 +294,7 @@ class TestPopulator:
             populate_sae_full_recon_clamp_table(
                 manager=manager,
                 module=layer,
-                hook_point=SteeringHookPoint.POST_MLP,
+                hook_point=SteeringHookPoint.POST_BLOCK,
                 module_name="m",
                 clampable_features=(0,),
                 layer_idx=0,
@@ -306,7 +306,7 @@ class TestPopulator:
         layer.layer_idx = 0
         _attach(
             layer,
-            hook=SteeringHookPoint.POST_MLP,
+            hook=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=[0, 1],
         )
@@ -315,7 +315,7 @@ class TestPopulator:
             populate_sae_full_recon_clamp_table(
                 manager=manager,
                 module=layer,
-                hook_point=SteeringHookPoint.POST_MLP,
+                hook_point=SteeringHookPoint.POST_BLOCK,
                 module_name="m",
                 clampable_features=(0, 1, 2),  # wrong length
                 layer_idx=0,
@@ -326,7 +326,7 @@ class TestPopulator:
         layer.layer_idx = 0
         _attach(
             layer,
-            hook=SteeringHookPoint.POST_MLP,
+            hook=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=[0],
         )
@@ -334,7 +334,7 @@ class TestPopulator:
         spec = SAEFullReconstructionSpec(
             module_name="m",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     0: (
                         SAEClampEntry(
                             feature_idx=0,
@@ -350,17 +350,17 @@ class TestPopulator:
         populate_sae_full_recon_clamp_table(
             manager=manager,
             module=layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             clampable_features=(0,),
             layer_idx=0,
         )
         only_table = getattr(
             layer,
-            HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_MLP],
+            HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK],
         )
         kind_table = getattr(
-            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert kind_table[row, 0].item() == CLAMP_KIND_ADDITIVE
         assert only_table[row, 0].item() is True

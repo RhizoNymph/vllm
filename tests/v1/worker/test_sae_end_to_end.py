@@ -229,13 +229,13 @@ def _assert_no_additive_steering(site, additive_row: int) -> None:
 
     assert additive_row in (0, 1, 2)
     if additive_row != 0:
-        table = getattr(site, HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_MLP])
+        table = getattr(site, HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_BLOCK])
         assert torch.all(table[additive_row] == 0)
 
 
 def _sae_payload(
     *,
-    layers: tuple[tuple[int, str], ...] = ((20, "post_mlp"),),
+    layers: tuple[tuple[int, str], ...] = ((20, "post_block"),),
     clampable: tuple[int, ...] = (0,),
     activation: str = "relu",
     d_model: int = 4,
@@ -260,7 +260,7 @@ def _attach_identity_weights(
     *,
     n_clamp: int,
     hidden_size: int,
-    layers: tuple[tuple[int, str], ...] = ((20, "post_mlp"),),
+    layers: tuple[tuple[int, str], ...] = ((20, "post_block"),),
 ) -> None:
     """Attach an encoder that picks h[0..n_clamp-1] and a decoder
     that writes feature i back into h[i].
@@ -290,14 +290,14 @@ class TestSingleRequestEndToEnd:
 
     def test_absolute_clamp_applied_to_residual(self):
         h = _E2EHarness(layer_indices=(20,), hidden_size=4)
-        # Register SAE module for layer 20 / post_mlp covering feature 0.
+        # Register SAE module for layer 20 / post_block covering feature 0.
         h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
         _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
         # Admit a request that clamps feature 0 to 7.0 in prefill.
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=7.0),)
                 }
             },
@@ -332,7 +332,7 @@ class TestSingleRequestEndToEnd:
             ]
         )
         site = h._steerable_layers_cache[20]
-        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
         # Token 0: f = ReLU(2) = 2; delta = 7-2 = 5.  out[0,0] = 7.
         # Token 1: f = ReLU(3) = 3; delta = 7-3 = 4.  out[1,0] = 7.
         assert torch.allclose(out[:, 0], torch.tensor([7.0, 7.0]))
@@ -344,12 +344,12 @@ class TestSingleRequestEndToEnd:
         h = _E2EHarness(layer_indices=(20,), hidden_size=4)
         site = h._steerable_layers_cache[20]
         residual = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
-        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
         # Additive table is zero-initialised → no change; SAE not
         # attached → no change.  Output equals input.
         assert torch.allclose(out, residual)
         # And: no SAE buffers were attached as a side effect.
-        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
 
 
 class TestPerTokenRouting:
@@ -363,7 +363,7 @@ class TestPerTokenRouting:
         spec_a = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=10.0),)
                 }
             },
@@ -371,7 +371,7 @@ class TestPerTokenRouting:
         spec_b = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=1, kind="absolute", value=20.0),)
                 }
             },
@@ -409,7 +409,7 @@ class TestPerTokenRouting:
         # One token per request; req-a is token index 0, req-b is index 1.
         residual = torch.zeros(2, 4)
         site = h._steerable_layers_cache[20]
-        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
         # req-a (token 0): feature 0 clamped to 10 → out[0, 0] = 10.
         # req-b (token 1): feature 1 clamped to 20 → out[1, 1] = 20.
         assert out[0, 0].item() == 10.0
@@ -430,7 +430,7 @@ class TestPrefillToDecodeTransition:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -468,7 +468,7 @@ class TestPrefillToDecodeTransition:
 
         residual = torch.tensor([[2.0, 0.0, 0.0, 0.0]])
         site = h._steerable_layers_cache[20]
-        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
         # Feature 0 clamped to 5: out[0,0] = 5.
         assert out[0, 0].item() == 5.0
 
@@ -483,7 +483,7 @@ class TestPrefillToDecodeTransition:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -514,7 +514,7 @@ class TestPrefillToDecodeTransition:
         assert (decode_sae_hash, "decode") in h._sae_clamp_manager.config_to_row
 
         residual = torch.tensor([[2.0, 0.0, 0.0, 0.0]])
-        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
         assert out[0, 0].item() == 5.0
 
     def test_final_prefill_uses_prefill_content_then_decode_repopulates(self):
@@ -529,7 +529,7 @@ class TestPrefillToDecodeTransition:
             module_name="g",
             phase="prefill",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -538,7 +538,7 @@ class TestPrefillToDecodeTransition:
             module_name="g",
             phase="decode",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=9.0),)
                 }
             },
@@ -564,7 +564,7 @@ class TestPrefillToDecodeTransition:
 
         residual = torch.tensor([[2.0, 0.0, 0.0, 0.0]])
         final_prefill = apply_layer_steering(
-            site, residual, SteeringHookPoint.POST_MLP
+            site, residual, SteeringHookPoint.POST_BLOCK
         )
         assert final_prefill[0, 0].item() == 5.0
 
@@ -573,7 +573,7 @@ class TestPrefillToDecodeTransition:
         h._update_steering_buffers(
             _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
         )
-        decode = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        decode = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
         assert decode[0, 0].item() == 9.0
 
     def test_sae_only_no_active_additive_shortcut_registers_decode_row(self):
@@ -587,7 +587,7 @@ class TestPrefillToDecodeTransition:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -634,7 +634,7 @@ class TestGlobalSaeRows:
             module_name="g",
             phase="prefill",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -643,7 +643,7 @@ class TestGlobalSaeRows:
             module_name="g",
             phase="decode",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=9.0),)
                 }
             },
@@ -666,13 +666,13 @@ class TestGlobalSaeRows:
         h.input_batch.num_computed_tokens_cpu[0] = 3
         h._update_sae_buffers(scheduler_output)
         assert int(site.sae_index[0].item()) == 1
-        prefill = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        prefill = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
         assert prefill[0, 0].item() == 5.0
 
         h.input_batch.num_computed_tokens_cpu[0] = 4
         h._update_sae_buffers(scheduler_output)
         assert int(site.sae_index[0].item()) == 2
-        decode = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        decode = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
         assert decode[0, 0].item() == 9.0
 
 
@@ -687,7 +687,7 @@ class TestPopulatorWritesIntoBuffers:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=1, kind="absolute", value=9.0),)
                 }
             },
@@ -707,7 +707,7 @@ class TestPopulatorWritesIntoBuffers:
         h._update_sae_buffers(scheduler_output)
 
         site = h._steerable_layers_cache[20]
-        kind = getattr(site, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
+        kind = getattr(site, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
         row = h._sae_clamp_manager.config_to_row[
             (sp.prefill_sae_clamp_config_hash, "prefill")
         ]
@@ -730,7 +730,7 @@ class TestNoActiveStateShortCircuit:
         h._update_sae_buffers(_StubSchedulerOutput())
         site = h._steerable_layers_cache[20]
         # No SAE buffers should ever have been allocated.
-        assert not sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
 
     def test_active_to_inactive_clears_any_active_flag(self):
         h = _E2EHarness(layer_indices=(20,), hidden_size=4)
@@ -739,7 +739,7 @@ class TestNoActiveStateShortCircuit:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=7.0),)
                 }
             },
@@ -760,7 +760,7 @@ class TestNoActiveStateShortCircuit:
 
         site = h._steerable_layers_cache[20]
         any_active = getattr(
-            site, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_MLP]
+            site, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
         )
         assert any_active.item()
 
@@ -820,7 +820,7 @@ class TestCrossManagerHashIsolation:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=3.0),)
                 }
             },
@@ -862,7 +862,7 @@ class TestCrossManagerHashIsolation:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=3.0),)
                 }
             },
@@ -903,7 +903,7 @@ class TestCrossManagerHashIsolation:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=3.0),)
                 }
             },
@@ -1023,7 +1023,7 @@ class TestCrossManagerHashIsolation:
             module_name="g",
             phase="decode",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -1074,7 +1074,7 @@ class TestBatchedAdditiveTransitions:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -1121,7 +1121,7 @@ class TestBatchedAdditiveTransitions:
             device=torch.device("cpu"),
         )
         sp = SamplingParams(
-            decode_steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}}
+            decode_steering_vectors={"post_block": {20: [1.0, 0.0, 0.0, 0.0]}}
         )
         h.requests = {"req-1": SimpleNamespace(sampling_params=sp)}
         # Phase tracking lives on _steering_reqs now (seeded by the sync
@@ -1160,13 +1160,13 @@ class TestBatchedAdditiveTransitions:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
         )
         sp = SamplingParams(
-            steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}},
+            steering_vectors={"post_block": {20: [1.0, 0.0, 0.0, 0.0]}},
             sae_clamp_specs=(spec,),
         )
 
@@ -1203,13 +1203,13 @@ class TestBatchedAdditiveTransitions:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
         )
         sp = SamplingParams(
-            steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}},
+            steering_vectors={"post_block": {20: [1.0, 0.0, 0.0, 0.0]}},
             sae_clamp_specs=(spec,),
         )
 
@@ -1248,7 +1248,7 @@ class TestBatchedAdditiveTransitions:
         old_spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
@@ -1268,7 +1268,7 @@ class TestBatchedAdditiveTransitions:
         new_spec = SAEClampSpec(
             module_name="missing",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=7.0),)
                 }
             },
@@ -1303,13 +1303,13 @@ class TestBatchedAdditiveTransitions:
         spec = SAEClampSpec(
             module_name="g",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
                 }
             },
         )
         sp = SamplingParams(
-            steering_vectors={"post_mlp": {20: [1.0, 0.0, 0.0, 0.0]}},
+            steering_vectors={"post_block": {20: [1.0, 0.0, 0.0, 0.0]}},
             sae_clamp_specs=(spec,),
         )
         req_state = SimpleNamespace(
@@ -1357,14 +1357,14 @@ class TestMultiHookSaeRegistration:
         h.register_steering_modules(
             {
                 "g": _sae_payload(
-                    layers=((20, "pre_attn"), (20, "post_mlp")),
+                    layers=((20, "pre_attn"), (20, "post_block")),
                     clampable=(0, 1),
                 )
             },
         )
         site = h._steerable_layers_cache[20]
         assert sae_buffers_attached(site, SteeringHookPoint.PRE_ATTN)
-        assert sae_buffers_attached(site, SteeringHookPoint.POST_MLP)
+        assert sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
         # Only one sae_index buffer materialised on the layer.
         assert hasattr(site, "sae_index")
 

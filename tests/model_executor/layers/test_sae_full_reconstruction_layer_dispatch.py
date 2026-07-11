@@ -91,11 +91,11 @@ class TestLayerDispatchDisabled:
     def test_no_buffers_returns_input_unchanged(self):
         layer = _make_layer()
         h = torch.randn(3, 4)
-        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_MLP)
+        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_BLOCK)
         assert out is h or torch.equal(out, h)
 
     def test_buffers_attached_for_other_hook_still_passes_through(self):
-        # An attached SAE on POST_ATTN must not affect POST_MLP traffic.
+        # An attached SAE on POST_ATTN must not affect POST_BLOCK traffic.
         layer = _make_layer()
         _attach_identity_sae(
             layer,
@@ -105,20 +105,20 @@ class TestLayerDispatchDisabled:
             clampable_features=[0, 1],
         )
         h = torch.randn(3, 4)
-        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_MLP)
+        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_BLOCK)
         assert torch.equal(out, h)
 
     def test_empty_token_batch_short_circuits(self):
         layer = _make_layer()
         _attach_identity_sae(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             d_model=4,
             d_sae=8,
             clampable_features=[0, 1],
         )
         h = torch.zeros(0, 4)
-        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_MLP)
+        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_BLOCK)
         assert out.shape == (0, 4)
 
 
@@ -132,7 +132,7 @@ class TestReconIndexRouting:
         d_model, d_sae = 4, 6
         _attach_identity_sae(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             d_model=d_model,
             d_sae=d_sae,
             clampable_features=[0, 1],
@@ -141,17 +141,17 @@ class TestReconIndexRouting:
         # accidental reconstruction would diverge.
         torch.manual_seed(0)
         getattr(
-            layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         ).copy_(torch.randn(d_sae, d_model))
         getattr(
-            layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         ).copy_(torch.randn(d_sae, d_model))
         getattr(
-            layer, HOOK_POINT_FR_DECODER_BIAS_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_DECODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
         ).copy_(torch.randn(d_model))
         # sae_recon_index is all zeros (default) → all rows = no-op.
         h = torch.randn(3, d_model)
-        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_MLP)
+        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_BLOCK)
         assert torch.equal(out, h)
 
     def test_partial_recon_index_routes_per_token(self):
@@ -162,7 +162,7 @@ class TestReconIndexRouting:
         d_model, d_sae = 3, 3
         _attach_identity_sae(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             d_model=d_model,
             d_sae=d_sae,
             clampable_features=[0],
@@ -170,10 +170,10 @@ class TestReconIndexRouting:
         # Identity encoder, identity decoder, zero biases — pure
         # ReLU reconstruction.
         getattr(
-            layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         ).copy_(torch.eye(d_sae))
         getattr(
-            layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         ).copy_(torch.eye(d_sae))
         h = torch.tensor(
             [
@@ -187,10 +187,10 @@ class TestReconIndexRouting:
         )
         # Row 1 belongs to this site — mark it in the active-row table
         # (the populator does this in production).
-        getattr(layer, HOOK_POINT_FR_ROW_ACTIVE_ATTR[SteeringHookPoint.POST_MLP])[
+        getattr(layer, HOOK_POINT_FR_ROW_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK])[
             1
         ] = True
-        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_MLP)
+        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_BLOCK)
         # Row 0 (no-op) → out[0] == h[0].
         assert torch.allclose(out[0], h[0])
         # Row 1 (recon) → ReLU(h[1]) since enc/dec are identity, no clamps.
@@ -204,31 +204,31 @@ class TestReconIndexRouting:
         d_model, d_sae = 3, 3
         _attach_identity_sae(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             d_model=d_model,
             d_sae=d_sae,
             clampable_features=[0],
         )
         getattr(
-            layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         ).copy_(torch.eye(d_sae))
         getattr(
-            layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_MLP]
+            layer, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
         ).copy_(torch.eye(d_sae))
         # Clamp row 1, position 0 → absolute value 7.
-        getattr(layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])[
+        getattr(layer, HOOK_POINT_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])[
             1, 0
         ] = CLAMP_KIND_ABSOLUTE
-        getattr(layer, HOOK_POINT_FR_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_MLP])[
+        getattr(layer, HOOK_POINT_FR_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])[
             1, 0
         ] = 7.0
         # Token 0 → row 1, marked active for this site.
         h = torch.tensor([[1.0, -1.0, 2.0]])
         layer.sae_recon_index[:1].copy_(torch.tensor([1], dtype=torch.long))  # type: ignore[union-attr]
-        getattr(layer, HOOK_POINT_FR_ROW_ACTIVE_ATTR[SteeringHookPoint.POST_MLP])[
+        getattr(layer, HOOK_POINT_FR_ROW_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK])[
             1
         ] = True
-        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_MLP)
+        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_BLOCK)
         # f = ReLU([1, -1, 2]) = [1, 0, 2]; absolute clamp on feat 0 →
         # [7, 0, 2]; identity decoder → [7, 0, 2].
         assert torch.allclose(out[0], torch.tensor([7.0, 0.0, 2.0]))
@@ -247,7 +247,7 @@ class TestLayerDispatchInvokesCustomOp:
         layer = _make_layer()
         _attach_identity_sae(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             d_model=4,
             d_sae=6,
             clampable_features=[0, 1],
@@ -268,7 +268,7 @@ class TestLayerDispatchInvokesCustomOp:
             torch.tensor([1, 0], dtype=torch.long)
         )
         h = torch.randn(2, 4)
-        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_MLP)
+        out = apply_layer_sae_full_reconstruction(layer, h, SteeringHookPoint.POST_BLOCK)
         assert out.shape == h.shape
         assert calls["n"] == 1
 

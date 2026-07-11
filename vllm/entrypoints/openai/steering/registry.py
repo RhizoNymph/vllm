@@ -535,7 +535,7 @@ class SteeringModuleRegistry:
         Additive modules are loaded from a JSON file with this format::
 
             {
-                "vectors": {"post_mlp": {"14": [0.1, ...]}},
+                "vectors": {"post_block": {"14": [0.1, ...]}},
                 "prefill_vectors": {"pre_attn": {"14": [0.3, ...]}},
                 "decode_vectors": null,
             }

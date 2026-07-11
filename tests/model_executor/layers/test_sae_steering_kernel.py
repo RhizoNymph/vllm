@@ -322,7 +322,7 @@ class TestLayerDispatchUsesCustomOp:
         layer.layer_idx = 0
         register_sae_buffers(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -346,7 +346,7 @@ class TestLayerDispatchUsesCustomOp:
         monkeypatch.setattr(torch.ops.vllm, "apply_sae_delta_indexed", counting_op)
 
         h = torch.randn(3, 4)
-        out = apply_layer_sae_delta(layer, h, SteeringHookPoint.POST_MLP)
+        out = apply_layer_sae_delta(layer, h, SteeringHookPoint.POST_BLOCK)
         assert out.shape == h.shape
         assert calls["n"] == 1
 
@@ -367,7 +367,7 @@ class TestLayerDispatchUsesCustomOp:
         layer.layer_idx = 0
         register_sae_buffers(
             layer,
-            hook_point=SteeringHookPoint.POST_MLP,
+            hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="m",
             activation=SAEActivation.RELU,
             activation_params={},
@@ -379,7 +379,7 @@ class TestLayerDispatchUsesCustomOp:
         register_sae_index_buffer(layer, max_tokens=8)
 
         h = torch.randn(2, 4)
-        out = apply_layer_sae_delta(layer, h, SteeringHookPoint.POST_MLP)
+        out = apply_layer_sae_delta(layer, h, SteeringHookPoint.POST_BLOCK)
         # n_clamp == 0 ⇒ same tensor (no op + no allocation).
         assert torch.equal(out, h)
 

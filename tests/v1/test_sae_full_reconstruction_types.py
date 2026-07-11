@@ -49,13 +49,13 @@ class TestSpecValidation:
         spec = SAEFullReconstructionSpec(
             module_name="m",
             clamps={
-                "post_mlp": {
+                "post_block": {
                     20: (SAEClampEntry(feature_idx=3, kind="absolute", value=5.0),)
                 }
             },
         )
-        assert "post_mlp" in spec.clamps
-        assert 20 in spec.clamps["post_mlp"]
+        assert "post_block" in spec.clamps
+        assert 20 in spec.clamps["post_block"]
 
     def test_empty_module_name_rejected(self):
         with pytest.raises(ValueError, match="module_name"):
@@ -80,14 +80,14 @@ class TestSpecValidation:
         with pytest.raises(ValueError, match="non-empty"):
             SAEFullReconstructionSpec(
                 module_name="m",
-                clamps={"post_mlp": {}},
+                clamps={"post_block": {}},
             )
 
     def test_empty_entries_rejected(self):
         with pytest.raises(ValueError, match="non-empty"):
             SAEFullReconstructionSpec(
                 module_name="m",
-                clamps={"post_mlp": {0: ()}},
+                clamps={"post_block": {0: ()}},
             )
 
     def test_duplicate_feature_idx_rejected(self):
@@ -95,7 +95,7 @@ class TestSpecValidation:
             SAEFullReconstructionSpec(
                 module_name="m",
                 clamps={
-                    "post_mlp": {
+                    "post_block": {
                         0: (
                             SAEClampEntry(feature_idx=3, kind="absolute", value=1.0),
                             SAEClampEntry(feature_idx=3, kind="additive", value=2.0),
@@ -109,7 +109,7 @@ class TestSpecValidation:
             SAEFullReconstructionSpec(
                 module_name="m",
                 clamps={
-                    "post_mlp": {
+                    "post_block": {
                         -1: (SAEClampEntry(feature_idx=0, kind="absolute", value=1.0),)
                     }
                 },
@@ -129,7 +129,7 @@ class TestCoercion:
                 "module_name": "m",
                 "phase": "both",
                 "clamps": {
-                    "post_mlp": {
+                    "post_block": {
                         "20": [{"feature_idx": 3, "kind": "absolute", "value": 5.0}]
                     }
                 },
@@ -140,7 +140,7 @@ class TestCoercion:
         assert len(out) == 1
         spec = out[0]
         # Layer-key string was coerced to int.
-        assert 20 in spec.clamps["post_mlp"]
+        assert 20 in spec.clamps["post_block"]
 
     def test_already_typed_passthrough(self):
         spec = SAEFullReconstructionSpec(module_name="m")
@@ -198,7 +198,7 @@ class TestHashDeterminism:
                 SAEFullReconstructionSpec(
                     module_name="m",
                     clamps={
-                        "post_mlp": {
+                        "post_block": {
                             20: (
                                 SAEClampEntry(
                                     feature_idx=3, kind="absolute", value=5.0
@@ -214,7 +214,7 @@ class TestHashDeterminism:
                 SAEFullReconstructionSpec(
                     module_name="m",
                     clamps={
-                        "post_mlp": {
+                        "post_block": {
                             20: (
                                 SAEClampEntry(
                                     feature_idx=3, kind="absolute", value=5.5
@@ -233,7 +233,7 @@ class TestHashDeterminism:
         # paths produce different residual streams (perturbation vs
         # replacement) and must not share prefix-cache keys.
         clamps = {
-            "post_mlp": {
+            "post_block": {
                 20: (SAEClampEntry(feature_idx=3, kind="absolute", value=5.0),)
             }
         }
@@ -266,7 +266,7 @@ class TestHashSteeringConfigComposition:
                 SAEClampSpec(
                     module_name="m",
                     clamps={
-                        "post_mlp": {
+                        "post_block": {
                             20: (
                                 SAEClampEntry(
                                     feature_idx=3, kind="absolute", value=5.0
@@ -287,7 +287,7 @@ class TestHashSteeringConfigComposition:
                 SAEClampSpec(
                     module_name="m",
                     clamps={
-                        "post_mlp": {
+                        "post_block": {
                             20: (
                                 SAEClampEntry(
                                     feature_idx=3, kind="absolute", value=5.0

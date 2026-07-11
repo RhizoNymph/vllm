@@ -286,7 +286,7 @@ def load_gemma_scope_sae(
     Args:
         npz_path: path to the Gemma Scope ``params.npz`` for this site.
         layer_idx: layer index this SAE is bound to.
-        hook_str: hook point string (e.g. ``"post_mlp"``); validated
+        hook_str: hook point string (e.g. ``"post_block"``); validated
             against :data:`VALID_HOOK_POINT_NAMES`.
         clampable_features: feature indices to extract from the full
             SAE.  Must be non-empty and unique.  Out-of-range indices
