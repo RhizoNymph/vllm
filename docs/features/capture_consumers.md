@@ -573,6 +573,30 @@ genuinely capture.
   cost `max_num_tokens × hidden × dtype` bytes per global `(layer, hook)`
   — negligible for a single-layer `logging`-style probe, but proportional
   to the layer count for an all-layers global spec.
+- **Graph-safe keys for per-request captures.** The same persistent-buffer
+  path can serve *per-request* captures: pre-declare an allowlist of
+  `(layer, hook)` keys at startup with the repeatable
+  `--capture-graphsafe-key LAYER:HOOK` flag (`capture_graphsafe_keys` in
+  YAML/Python), and a client spec that taps **only** allowlisted keys keeps
+  full cudagraph speed instead of forcing the step eager. `LAYER` and/or
+  `HOOK` may be `all`, so the accepted shorthands are `L:hook`, `L:all`
+  (every standard hook at layer `L`), `all:hook` (one hook on every layer),
+  and `all:all`. A request whose spec taps **any** key outside the allowlist
+  gracefully falls back to the eager path — correctness is never affected,
+  only speed. The trade-off mirrors a global spec: each covered key reserves
+  one `max_num_tokens × hidden × dtype` persistent buffer and pays a
+  full-residual `copy_` at that layer on **every** forward step, whether or
+  not an in-flight request currently taps it (the copy must be static to stay
+  in the graph). Size the allowlist to the keys you actually probe; left empty
+  (the default), per-request captures stay on the eager path gated per-step by
+  the `CaptureStepGate` above.
+
+  ```bash
+  vllm serve meta-llama/Llama-3-8B \
+      --capture-consumers filesystem:root=/mnt/nas/activations \
+      --capture-graphsafe-key 12:post_block \
+      --capture-graphsafe-key all:pre_attn
+  ```
 - **Non-blocking finalize.** Finalizing a request flushes its captured
   activations and waits for each `(layer, hook)` result — under the
   `filesystem` consumer, roughly one small-file write per captured layer.
