@@ -19,6 +19,7 @@ Where ``scale(entry)`` means: if entry is a bare list, scale=1.0; if entry is
 from __future__ import annotations
 
 import hashlib
+import math
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
@@ -65,6 +66,18 @@ class SteeringHookPacked(TypedDict):
 
 # Packed full spec: {hook_point_name: SteeringHookPacked}
 SteeringVectorSpecPacked = dict[str, SteeringHookPacked]
+
+# Directional-clamp entry: {"vector": [...], "min": float|None,
+# "max": float|None, "strength": float = 1.0}, with the sugar form
+# {"vector": [...], "value": c} equivalent to min = max = c.  The vector is
+# unit-normalized at ingestion, so bounds live in unit-projection space
+# (``p = h @ v_hat``).  See :func:`normalize_clamp_entry`.
+ClampEntry = dict[str, Any]
+
+# Full clamp spec: {hook_point_name: {layer_idx: [ClampEntry, ...]}}.
+# Unlike ``SteeringVectorSpec`` a site holds a LIST of entries — clamps
+# do not compose additively; each direction is an independent constraint.
+SteeringClampSpec = dict[str, dict[int, list[ClampEntry]]]
 
 
 def _looks_packed(tier: dict) -> bool:
@@ -301,6 +314,185 @@ def validate_spec_row_widths(
                     f"{len(vector)} != expected steering row width "
                     f"{expected_width} (model hidden size)"
                 )
+
+
+def normalize_clamp_entry(
+    entry: ClampEntry,
+) -> tuple[np.ndarray, float, float, float]:
+    """Return ``(unit_direction, lo, hi, strength)`` from a clamp entry.
+
+    Accepts both the raw user forms (``value`` sugar, omitted bounds) and
+    the canonical form produced by ``SamplingParams`` validation
+    (``min``/``max``/``strength`` all present), so hashing and worker-side
+    resolution normalize identically regardless of which form they see.
+
+    The direction is unit-normalized in float64 — bounds are defined in
+    unit-projection space (``p = h @ v_hat``), so normalizing here (rather
+    than trusting the client) keeps bound semantics portable across
+    vectors.  Idempotent: re-normalizing a unit vector is a no-op.
+
+    Raises ``ValueError`` on: missing/zero/non-finite vector, no bound at
+    all, ``value`` combined with ``min``/``max``, ``min > max``, NaN
+    bounds, or ``strength`` outside ``[0, 1]``.
+    """
+    if not isinstance(entry, dict):
+        raise TypeError(
+            f"Clamp entry must be a dict, got {type(entry).__name__}"
+        )
+    allowed = {"vector", "value", "min", "max", "strength"}
+    extra = set(entry.keys()) - allowed
+    if extra:
+        raise ValueError(
+            f"Clamp entry has unexpected keys: {sorted(extra)}; "
+            f"allowed keys: {sorted(allowed)}"
+        )
+    if "vector" not in entry:
+        raise ValueError("Clamp entry missing required key 'vector'")
+
+    has_value = entry.get("value") is not None
+    has_min = entry.get("min") is not None
+    has_max = entry.get("max") is not None
+    if has_value and (has_min or has_max):
+        raise ValueError(
+            "Clamp entry 'value' is mutually exclusive with 'min'/'max'"
+        )
+    if has_value:
+        val = float(entry["value"])
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError(f"Clamp entry 'value' must be finite, got {val}")
+        lo = hi = val
+    else:
+        if not has_min and not has_max:
+            raise ValueError(
+                "Clamp entry must set at least one of 'value', 'min', 'max'"
+            )
+        lo = float(entry["min"]) if has_min else -math.inf
+        hi = float(entry["max"]) if has_max else math.inf
+        if math.isnan(lo) or math.isnan(hi):
+            raise ValueError(
+                f"Clamp entry bounds must not be NaN, got min={lo}, max={hi}"
+            )
+        if lo > hi:
+            raise ValueError(
+                f"Clamp entry min ({lo}) must be <= max ({hi})"
+            )
+
+    strength = float(entry.get("strength", 1.0))
+    if math.isnan(strength) or not (0.0 <= strength <= 1.0):
+        raise ValueError(
+            f"Clamp entry strength must be in [0, 1], got {strength}"
+        )
+
+    arr = np.asarray(entry["vector"], dtype=np.float64)
+    if arr.ndim != 1 or arr.size == 0:
+        raise ValueError(
+            f"Clamp entry vector must be a non-empty 1-D float list, "
+            f"got shape {arr.shape}"
+        )
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Clamp entry vector must contain only finite floats")
+    norm = float(np.linalg.norm(arr))
+    if norm == 0.0:
+        raise ValueError(
+            "Clamp entry vector must be non-zero "
+            "(a zero vector cannot be normalized to a direction)"
+        )
+    return arr / norm, lo, hi, strength
+
+
+def resolve_effective_clamps(
+    base: SteeringClampSpec | None,
+    phase_specific: SteeringClampSpec | None,
+    max_directions: int | None = None,
+) -> SteeringClampSpec | None:
+    """Merge *base* and *phase_specific* clamp specs by concatenation.
+
+    Clamps are independent constraints, not addable vectors, so the tier
+    merge is per-``(hook, layer)`` list concatenation with base entries
+    first.  When *max_directions* is given, a site whose merged list
+    exceeds it raises ``ValueError`` (the per-site direction budget is the
+    ``max_clamp_directions`` engine knob — the K dimension of the clamp
+    buffers).  Returns ``None`` if both inputs are ``None`` or empty; a
+    single-sided input passes through unchanged.
+    """
+
+    def _check_cap(entries: list[ClampEntry], hook: str, layer_idx: int) -> None:
+        if max_directions is not None and len(entries) > max_directions:
+            raise ValueError(
+                f"Clamp spec [{hook!r}][{layer_idx}] has {len(entries)} "
+                f"directions after tier merge, exceeding "
+                f"max_clamp_directions={max_directions}"
+            )
+
+    base_empty = not base
+    phase_empty = not phase_specific
+    if base_empty and phase_empty:
+        return None
+    if phase_empty:
+        assert base is not None
+        for hook, layers in base.items():
+            for layer_idx, entries in layers.items():
+                _check_cap(entries, hook, layer_idx)
+        return base
+    if base_empty:
+        assert phase_specific is not None
+        for hook, layers in phase_specific.items():
+            for layer_idx, entries in layers.items():
+                _check_cap(entries, hook, layer_idx)
+        return phase_specific
+
+    assert base is not None and phase_specific is not None
+    result: SteeringClampSpec = {}
+    all_hooks = set(base.keys()) | set(phase_specific.keys())
+    for hook in all_hooks:
+        base_layers = base.get(hook, {})
+        phase_layers = phase_specific.get(hook, {})
+        hook_result: dict[int, list[ClampEntry]] = {}
+        for layer_idx in set(base_layers.keys()) | set(phase_layers.keys()):
+            merged = list(base_layers.get(layer_idx, [])) + list(
+                phase_layers.get(layer_idx, [])
+            )
+            if not merged:
+                continue
+            _check_cap(merged, hook, layer_idx)
+            hook_result[layer_idx] = merged
+        if hook_result:
+            result[hook] = hook_result
+    return result if result else None
+
+
+def validate_clamp_row_widths(
+    spec: SteeringClampSpec | None,
+    expected_width: int,
+    *,
+    field_name: str,
+) -> None:
+    """Raise ``ValueError`` when any clamp direction in *spec* is not
+    ``expected_width`` wide.
+
+    Clamp-spec sibling of :func:`validate_spec_row_widths`: wrong-width
+    directions pass structural validation but would shape-crash the
+    worker's clamp table population, so every seam that accepts client
+    clamps must width-check before anything is broadcast or admitted.
+    """
+    if not spec:
+        return
+    for hook_name, layers in spec.items():
+        for layer_idx, entries in layers.items():
+            for i, entry in enumerate(entries):
+                vector = entry.get("vector") if isinstance(entry, dict) else None
+                if vector is None:
+                    raise ValueError(
+                        f"{field_name}[{hook_name!r}][{layer_idx}][{i}]: "
+                        f"clamp entry missing 'vector'"
+                    )
+                if len(vector) != expected_width:
+                    raise ValueError(
+                        f"{field_name}[{hook_name!r}][{layer_idx}][{i}]: "
+                        f"clamp direction width {len(vector)} != expected "
+                        f"steering row width {expected_width} "
+                        f"(model hidden size)"
+                    )
 
 
 def _scale_vector(vec: list[float] | np.ndarray, scale: float) -> np.ndarray:
@@ -589,6 +781,7 @@ def merge_steering_specs(
 def hash_steering_config(
     effective_vectors: dict[str, dict[int, list[float] | np.ndarray]] | None,
     module_ref: tuple[str, float] | None = None,
+    clamps: SteeringClampSpec | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 
@@ -609,8 +802,18 @@ def hash_steering_config(
     :func:`resolve_effective_vectors`).  In both cases the float→float32
     cast happens exactly once at the ``tobytes`` boundary, so hashes are
     bit-for-bit identical regardless of the input container.
+
+    *clamps* is an optional :data:`SteeringClampSpec`.  Clamp entries are
+    folded into the digest behind their own domain separator (after the
+    module_ref segment), so a clamps-bearing request gets a distinct,
+    nonzero hash — that nonzero hash is what reserves the request's
+    steering table row through the scheduler.  When ``clamps`` is ``None``
+    or empty the digest byte stream is untouched, keeping vector-only
+    hashes bit-for-bit identical to the pre-clamp behavior.  Entries are
+    normalized via :func:`normalize_clamp_entry` before hashing, so raw
+    (``value`` sugar) and canonical forms hash identically.
     """
-    if not effective_vectors and module_ref is None:
+    if not effective_vectors and module_ref is None and not clamps:
         return 0
     h = hashlib.sha256()
     if effective_vectors:
@@ -644,6 +847,23 @@ def hash_steering_config(
         h.update(b"\x00module_ref\x00")
         h.update(name.encode("utf-8"))
         h.update(np.float64(scale).tobytes())
+    if clamps:
+        # Domain separator: a clamps-only request can never collide with a
+        # vector or module_ref request whose content happens to serialize
+        # to the same bytes.  Entry list order is preserved in the digest —
+        # it is semantic (concat order of the tier merge).
+        h.update(b"\x00clamps\x00")
+        for hook in sorted(clamps.keys()):
+            h.update(hook.encode())
+            layer_dict = clamps[hook]
+            for layer_idx in sorted(layer_dict.keys()):
+                h.update(layer_idx.to_bytes(4, "little", signed=True))
+                for entry in layer_dict[layer_idx]:
+                    vec, lo, hi, strength = normalize_clamp_entry(entry)
+                    h.update(np.asarray(vec, dtype=np.float32).tobytes())
+                    h.update(np.float64(lo).tobytes())
+                    h.update(np.float64(hi).tobytes())
+                    h.update(np.float64(strength).tobytes())
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
 
@@ -679,6 +899,20 @@ def maybe_pack_inline_steering_for_request(
        ``effective_*_steering`` cached_properties so worker-side reads
        return them directly without re-resolving.
     """
+    # Clamp width gate. Runs before the vector-only early returns because a
+    # clamp-only request has no inline vectors to pack but its directions
+    # must still be width-checked here — this helper is the one seam every
+    # inline request crosses before the multiprocessing boundary.
+    if expected_row_width is not None:
+        for clamp_field, clamp_spec in (
+            ("steering_clamps", sp.steering_clamps),
+            ("prefill_steering_clamps", sp.prefill_steering_clamps),
+            ("decode_steering_clamps", sp.decode_steering_clamps),
+        ):
+            validate_clamp_row_widths(
+                clamp_spec, expected_row_width, field_name=clamp_field
+            )
+
     if (
         sp.steering_vectors is None
         and sp.prefill_steering_vectors is None
