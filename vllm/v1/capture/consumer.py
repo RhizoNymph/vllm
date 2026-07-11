@@ -91,6 +91,10 @@ class CaptureConsumer(ABC):
     location: Literal["worker", "driver"] = "worker"
     required_sidecar_fields: ClassVar[frozenset[str]] = frozenset()
     reads_client_spec: ClassVar[bool] = False
+    # When False, the consumer reads only capture metadata (key / shape /
+    # dtype) and never the tensor payload, so the manager may skip the
+    # device->host copy and dispatch/spill pipeline for it.
+    needs_payload: ClassVar[bool] = True
     execution: ClassVar[Literal["async", "sync"]] = "async"
 
     def __init__(  # noqa: B027 — intentional no-op default.

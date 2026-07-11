@@ -332,6 +332,16 @@ class CaptureManager:
                 f"got {overload_policy!r}"
             )
         self._consumers = consumers
+        # A consumer that reads only capture metadata (``needs_payload=False``)
+        # never touches the tensor payload. When *every* active consumer is
+        # metadata-only, the device->host copy and the whole dispatch/spill
+        # pipeline are pure waste — deliver zero-cost ``meta`` views synchronously
+        # instead (see ``_fan_out_metadata``). Gated at dispatch time on
+        # there being no active activation store, which does need real payloads.
+        self._metadata_only_consumers = bool(consumers) and all(
+            not getattr(getattr(s, "_consumer", s), "needs_payload", True)
+            for s in consumers
+        )
         self._consumer_specs = consumer_specs
         # ``num_hidden_layers`` is the GLOBAL layer count (across all
         # pipeline stages); client/global specs reference global layer
@@ -457,6 +467,22 @@ class CaptureManager:
         # compiled forward graph.  Cleared by ``consume_step_plan`` once
         # the runner's finalize path has copied the scratch tensors out.
         self._step_plan: StepCapturePlan | None = None
+        # Cache of the last step's gather-index tensors, keyed by the per-key
+        # row signature. During steady-state decode the signature repeats every
+        # step (each request captures its one new token at a fixed buffer row),
+        # so we reuse the device tensors and skip the per-step H2D entirely.
+        self._gather_cache: tuple[
+            tuple[tuple[tuple[int, str], tuple[int, ...]], ...],
+            dict[tuple[int, str], "torch.Tensor"],
+            dict[tuple[int, str], "torch.Tensor"],
+        ] | None = None
+        # Metadata fast-path row accumulator: req_id -> {(consumer, layer, hook)
+        # -> total rows}. The per-step fan-out just increments counts (no chunk
+        # objects, no submit); one meta chunk per key is flushed at finalize on
+        # the finalize thread. Written on the step thread, popped on the finalize
+        # thread — guarded by the lock.
+        self._meta_accum: dict[str, dict[tuple[int, int, str], int]] = {}
+        self._meta_accum_lock = threading.Lock()
 
         # Slim mode: persistent buffers only — no dispatch pipeline.
         # ``_step_plan`` stays None forever, so ``on_hook`` only ever
@@ -832,17 +858,39 @@ class CaptureManager:
         # global path — the buffer holds the full residual, so any
         # consumer's rows can be sliced from it, and the per-entry
         # ``consumer_mask`` still fans the rows out to both.
-        gather_indices: dict[tuple[int, str], torch.Tensor] = {}
-        global_gather_indices: dict[tuple[int, str], torch.Tensor] = {}
         scratch_gpu: dict[tuple[int, str], torch.Tensor] = {}
-        scratch_dtype: dict[tuple[int, str], torch.dtype] = {}
-        for key, rows in gather_rows.items():
-            idx = torch.tensor(rows, dtype=torch.int64, device=self._device)
-            scratch_dtype[key] = self._model_dtype
-            if key in self._global_keys:
-                global_gather_indices[key] = idx
-            else:
-                gather_indices[key] = idx
+        scratch_dtype: dict[tuple[int, str], torch.dtype] = {
+            key: self._model_dtype for key in gather_rows
+        }
+        # Reuse cached device index tensors when this step's per-key row pattern
+        # is identical to the last (the common case in steady-state decode),
+        # else materialize them in a single batched H2D instead of one per key.
+        signature = tuple(
+            (key, tuple(rows)) for key, rows in sorted(gather_rows.items())
+        )
+        cached = self._gather_cache
+        if cached is not None and cached[0] == signature:
+            gather_indices, global_gather_indices = cached[1], cached[2]
+        else:
+            gather_indices = {}
+            global_gather_indices = {}
+            keys = list(gather_rows.keys())
+            if keys:
+                flat: list[int] = []
+                bounds: list[int] = []
+                for key in keys:
+                    bounds.append(len(flat))
+                    flat.extend(gather_rows[key])
+                bounds.append(len(flat))
+                # One H2D for the whole step; each key's index tensor is a view.
+                big = torch.tensor(flat, dtype=torch.int64, device=self._device)
+                for i, key in enumerate(keys):
+                    idx = big[bounds[i] : bounds[i + 1]]
+                    if key in self._global_keys:
+                        global_gather_indices[key] = idx
+                    else:
+                        gather_indices[key] = idx
+            self._gather_cache = (signature, gather_indices, global_gather_indices)
 
         plan = StepCapturePlan(
             gather_indices=gather_indices,
@@ -970,6 +1018,78 @@ class CaptureManager:
                 continue
             plan.scratch_gpu[key] = buf.index_select(0, idx)
 
+    def _fan_out_metadata(self, plan: StepCapturePlan) -> None:
+        """Deliver a step's captures to metadata-only consumers.
+
+        Every active consumer declared ``needs_payload = False``, so it reads
+        only key / shape / dtype. The per-step work is reduced to incrementing a
+        row counter per ``(consumer, request, layer, hook)`` — no ``meta`` tensor,
+        no ``CaptureChunk``, no ``submit_chunk`` — and one meta chunk per key is
+        flushed at finalize (see :meth:`_flush_metadata_accum`). This keeps the
+        step thread O(entries) with only dict increments instead of O(entries)
+        tensor allocations and sink calls.
+        """
+        with self._meta_accum_lock:
+            for entry in plan.entries:
+                mask = entry.consumer_mask
+                if not mask:
+                    continue
+                req_acc = self._meta_accum.setdefault(entry.request_id, {})
+                layer, hook = entry.layer, entry.hook
+                consumer_idx = 0
+                while mask:
+                    if mask & 1:
+                        k = (consumer_idx, layer, hook)
+                        req_acc[k] = req_acc.get(k, 0) + 1
+                    mask >>= 1
+                    consumer_idx += 1
+
+    def _flush_metadata_accum(self, req_id: str) -> None:
+        """Submit one meta chunk per accumulated key for *req_id* at finalize.
+
+        Runs on the finalize thread (off the step critical path). Builds a
+        single ``meta`` chunk of shape ``(total_rows, hidden)`` per
+        ``(consumer, layer, hook)`` from the accumulated row count, so the sink's
+        ``submit_finalize`` cats one chunk and ``on_capture`` fires once per key
+        with the correct shape and dtype.
+        """
+        with self._meta_accum_lock:
+            acc = self._meta_accum.pop(req_id, None)
+        if not acc:
+            return
+        per_consumer: dict[int, list[CaptureChunk]] = defaultdict(list)
+        for (consumer_idx, layer, hook), rows in acc.items():
+            buf = self._global_buffers.get((layer, hook))
+            if buf is not None:
+                hidden, dtype = buf.shape[1], buf.dtype
+            else:
+                hidden, dtype = 1, self._model_dtype
+            meta = torch.empty((rows, hidden), dtype=dtype, device="meta")
+            per_consumer[consumer_idx].append(
+                CaptureChunk(
+                    key=(VllmInternalRequestId(req_id), layer, hook),
+                    tensor=meta,
+                    dtype=meta.dtype,
+                    row_offset=0,
+                    step_index=0,
+                    metadata={"consumer_index": consumer_idx},
+                )
+            )
+        for consumer_idx, chunks in per_consumer.items():
+            sink = self._consumers[consumer_idx]
+            try:
+                batch_submit = getattr(sink, "submit_chunk_batch", None)
+                if batch_submit is not None:
+                    batch_submit(chunks)
+                else:
+                    for chunk in chunks:
+                        sink.submit_chunk(chunk)
+            except Exception:
+                logger.exception(
+                    "metadata flush: consumer %d raised; others unaffected.",
+                    consumer_idx,
+                )
+
     def dispatch_step_captures(self, plan: StepCapturePlan) -> None:
         """Hand a finished step's scratch tensors to the dispatch thread.
 
@@ -989,13 +1109,22 @@ class CaptureManager:
         to the others.
         """
         self._require_pipeline("dispatch_step_captures")
+
+        if not plan.entries:
+            return
+
+        # Metadata-only fast path: no consumer needs the payload and no store is
+        # active, so nothing has to leave the GPU. Skip the global-key gather,
+        # the D2H copy, the dispatch queue, and the spill — deliver zero-cost
+        # ``meta`` chunks straight from the plan's per-key row counts.
+        if self._metadata_only_consumers and get_active_activation_store() is None:
+            self._fan_out_metadata(plan)
+            return
+
         # Pull global-spec rows out of the persistent buffers into
         # ``scratch_gpu`` first, so the rest of this method treats global
         # and client keys uniformly. No-op when no global key captured.
         self._materialize_global_keys(plan)
-
-        if not plan.entries:
-            return
 
         scratch_pinned: dict[
             tuple[int, str], tuple[torch.Tensor | None, torch.Tensor]
@@ -1612,6 +1741,10 @@ class CaptureManager:
         and no ``_requests`` access — so it runs identically on the calling
         thread (sync path) or the finalize thread (async path).
         """
+        # Metadata fast path: turn accumulated per-key row counts into one meta
+        # chunk each before submit_finalize cats them (no-op otherwise).
+        self._flush_metadata_accum(req_id)
+
         results: dict[int, CaptureResult] = {}
 
         for consumer_idx, spec in state.consumer_specs.items():
