@@ -239,8 +239,9 @@ def register_sae_buffers(
             kernel reads them as constants per-site.
         n_clamp: number of clampable encoder/decoder rows.
         hidden_size: model's hidden size (``d_model``).
-        max_sae_configs: total clamp-table rows minus the no-op
-            sentinel (row 0).  When ``0``, registration is a no-op
+        max_sae_configs: maximum number of per-request clamp table rows.
+            The table also reserves row 0 for the no-op sentinel and
+            rows 1/2 for prefill/decode globals.  When ``0``, registration is a no-op
             (SAE disabled engine-wide), mirroring
             ``register_steering_buffers``.
         dtype: compute dtype for the encoder/decoder weight tensors.
@@ -262,13 +263,12 @@ def register_sae_buffers(
             "Phase-1B constrains at most one SAE module per "
             "(layer, hook) site; unregister the existing module first."
         )
-    # Row 0 = shared sentinel-or-global tier; rows 1..max_sae_configs =
-    # per-request.  The dispatch shim routes tokens by ``sae_index[t]``
-    # into either row 0 (no per-request clamps, picks up any configured
-    # globals) or a per-request row.  The populator writes global
-    # clamps into row 0 *and* into per-request rows (merged with the
-    # request's own clamps) — see :func:`populate_sae_clamp_table`.
-    n_rows = max_sae_configs + 1
+    # Row 0 = hard no-op sentinel; row 1 = prefill globals; row 2 =
+    # decode globals; rows 3..max_sae_configs+2 = per-request.  The
+    # dispatch shim routes no-per-request tokens to row 1 or 2 based
+    # on phase.  The populator writes global clamps into the global
+    # rows and merges the phase's globals into per-request rows.
+    n_rows = max_sae_configs + 3
     try:
         # Clamp tables: per-(row, feature) clamp state.
         module.register_buffer(
@@ -899,7 +899,9 @@ def populate_sae_clamp_table(
     in ``clampable_features`` raises ``ValueError``.
 
     Row 0 (the no-op sentinel) is always reset to all-zero so it stays
-    a true no-op.
+    a true no-op. Rows 1 and 2 hold global prefill/decode clamps,
+    respectively; they remain zero when no globals apply for that
+    phase.
 
     The optional ``worker_phase`` argument is retained for tests that
     want to assert phase-gating behaviour explicitly: when given, the
@@ -944,30 +946,42 @@ def populate_sae_clamp_table(
             f"{len(clampable_features)} vs {n_clamp}."
         )
     feature_to_pos: dict[int, int] = {f: i for i, f in enumerate(clampable_features)}
-    # Row 0: shared sentinel-or-global row.  Zero first, then write any
-    # configured globals on top.  Per-request rows below also stack
-    # globals so a request that opts in still gets globals applied.
+    # Row 0: hard sentinel. Rows 1 and 2 are phase-specific global
+    # rows. Per-request rows below also stack globals so a request that
+    # opts in still gets globals applied.
     kind_table[0].zero_()
     value_table[0].zero_()
     only_table[0].zero_()
+    if worker_phase is None or worker_phase == "prefill":
+        kind_table[1].zero_()
+        value_table[1].zero_()
+        only_table[1].zero_()
+    if worker_phase is None or worker_phase == "decode":
+        kind_table[2].zero_()
+        value_table[2].zero_()
+        only_table[2].zero_()
     if any_active is not None and worker_phase is None:
         any_active.zero_()
     hook_name = hook_point.value
 
+    def _mark_any_active() -> None:
+        if any_active is not None:
+            any_active.fill_(True)
+
     def _write_entries_to_row(
         row: int,
         entries_for_site: list,
+        *,
+        reject_existing: bool = False,
     ) -> bool:
         """Write a list of clamp entries into ``row`` at this site.
 
         Returns True if any entry was written.  The caller is
         responsible for zeroing the row beforehand.  Feature indices
-        already populated at this row (e.g. from a prior
-        ``_write_entries_to_row`` call with global clamps) are
-        overwritten — the no-overlap invariant enforced at admission
-        time means a global and a per-request clamp can never share
-        the same ``feature_idx`` at the same ``(hook, layer)``, so
-        the overwrite never silently loses information in practice.
+        already populated at this row can be rejected by setting
+        ``reject_existing=True``; the manager enforces the same
+        no-overlap invariant at admission time for global/per-request
+        combinations.
         """
         any_written = False
         for entry in entries_for_site:
@@ -978,6 +992,12 @@ def populate_sae_clamp_table(
                     f"module {module_name!r} is not in clampable_features "
                     f"{list(clampable_features)} for site "
                     f"(layer={layer_idx}, hook={hook_name})."
+                )
+            if reject_existing and kind_table[row, pos].item() != CLAMP_KIND_NONE:
+                raise ValueError(
+                    "SAE global and per-request clamps overlap for "
+                    f"module {module_name!r}, hook={hook_name!r}, "
+                    f"layer={layer_idx}, feature_idx={entry.feature_idx}."
                 )
             kind_table[row, pos] = (
                 CLAMP_KIND_ABSOLUTE
@@ -1020,38 +1040,27 @@ def populate_sae_clamp_table(
             return False
         return _write_entries_to_row(row, entries)
 
-    # Apply globals to row 0 for both phases.  Row 0 is read by tokens
-    # whose request has no per-request SAE state, and the dispatch
-    # shim doesn't know the worker phase, so we encode the global
-    # state for *whichever* phase populate is currently running.  In
-    # production (``worker_phase is None``) we apply both phase tiers
-    # — they're disjoint by construction because the global tier
-    # tracks each phase's specs separately, and a token only enters
-    # one phase at a time (the additive runtime already gates that).
-    for global_phase in ("prefill", "decode"):
+    global_rows = {"prefill": 1, "decode": 2}
+    for global_phase, global_row in global_rows.items():
         if worker_phase is not None and worker_phase != global_phase:
             continue
-        if _apply_globals_to_row(0, global_phase):
-            if any_active is not None:
-                any_active.fill_(True)
+        if _apply_globals_to_row(global_row, global_phase):
+            _mark_any_active()
 
     for row, _config_hash, row_phase, specs in manager.active_rows():
         if worker_phase is not None and row_phase != worker_phase:
             continue
         # Default: zero this row at this site.  Then accumulate
-        # globals first (so per-request clamps win on overlap — though
-        # the no-overlap invariant means there's never an overlap in
-        # practice), then the request's own clamps.
+        # globals first, followed by the request's own clamps.  Any
+        # global/request collision is rejected instead of overwritten.
         kind_table[row].zero_()
         value_table[row].zero_()
         only_table[row].zero_()
         if _apply_globals_to_row(row, row_phase):
-            if any_active is not None:
-                any_active.fill_(True)
+            _mark_any_active()
         entries = _gather_entries_for_specs(specs, row_phase)
-        if entries and _write_entries_to_row(row, entries):
-            if any_active is not None:
-                any_active.fill_(True)
+        if entries and _write_entries_to_row(row, entries, reject_existing=True):
+            _mark_any_active()
 
 
 # Note: an earlier draft had a ``_phase_applies(spec_phase, worker_phase,

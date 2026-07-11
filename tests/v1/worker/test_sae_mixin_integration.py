@@ -805,7 +805,7 @@ class TestRegisterInitialSaeClamps:
         )
         assert h._req_sae_phase["req-1"] == "prefill"
         sae_hash = sp.prefill_sae_clamp_config_hash
-        assert h._sae_clamp_manager.config_to_row[(sae_hash, "prefill")] == 1
+        assert h._sae_clamp_manager.config_to_row[(sae_hash, "prefill")] == 3
 
     def test_admit_under_decode_when_full_prefix_cache_hit(self):
         h = _RichHarness()
@@ -820,7 +820,7 @@ class TestRegisterInitialSaeClamps:
         )
         assert h._req_sae_phase["req-1"] == "decode"
         sae_hash = sp.decode_sae_clamp_config_hash
-        assert h._sae_clamp_manager.config_to_row[(sae_hash, "decode")] == 1
+        assert h._sae_clamp_manager.config_to_row[(sae_hash, "decode")] == 3
 
     def test_same_sae_spec_deduplicates_across_different_combined_hashes(self):
         h = _RichHarness()
@@ -843,7 +843,7 @@ class TestRegisterInitialSaeClamps:
         )
 
         sae_hash = sp.prefill_sae_clamp_config_hash
-        assert h._sae_clamp_manager.config_to_row == {(sae_hash, "prefill"): 1}
+        assert h._sae_clamp_manager.config_to_row == {(sae_hash, "prefill"): 3}
         assert h._sae_clamp_manager.config_refcounts[(sae_hash, "prefill")] == 2
 
     def test_no_clamps_no_op(self):
@@ -989,10 +989,13 @@ class TestUpdateSaeBuffersPopulator:
             layer_idx=20,
         )
         kind = getattr(site, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
-        # Row 1 (the prefill registration) gets the absolute clamp.
+        row = h._sae_clamp_manager.config_to_row[
+            (sp.prefill_sae_clamp_config_hash, "prefill")
+        ]
+        # The prefill registration row gets the absolute clamp.
         from vllm.model_executor.layers.sae_steering import CLAMP_KIND_ABSOLUTE
 
-        assert kind[1, 0].item() == CLAMP_KIND_ABSOLUTE
+        assert kind[row, 0].item() == CLAMP_KIND_ABSOLUTE
 
 
 class TestKindSwapClearsTracking:
@@ -1015,7 +1018,7 @@ class TestKindSwapClearsTracking:
         # are independent.  (Production-side, the request will fail
         # validation on its next admission step anyway.)
         sae_hash = sp.prefill_sae_clamp_config_hash
-        assert h._sae_clamp_manager.config_to_row[(sae_hash, "prefill")] == 1
+        assert h._sae_clamp_manager.config_to_row[(sae_hash, "prefill")] == 3
 
 
 class TestWorkerRpcSurface:

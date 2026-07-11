@@ -428,7 +428,7 @@ class TestPrefillToDecodeTransition:
         )
 
         site = h._steerable_layers_cache[20]
-        assert int(site.sae_index[0].item()) == 1
+        assert int(site.sae_index[0].item()) == 3
         prefill_sae_hash = sp.prefill_sae_clamp_config_hash
         decode_sae_hash = sp.decode_sae_clamp_config_hash
         assert (prefill_sae_hash, "prefill") not in h._sae_clamp_manager.config_to_row
@@ -530,11 +530,63 @@ class TestPrefillToDecodeTransition:
 
         site = h._steerable_layers_cache[20]
         assert int(site.steering_index[0].item()) == 0
-        assert int(site.sae_index[0].item()) == 1
+        assert int(site.sae_index[0].item()) == 3
         prefill_sae_hash = sp.prefill_sae_clamp_config_hash
         decode_sae_hash = sp.decode_sae_clamp_config_hash
         assert (prefill_sae_hash, "prefill") not in h._sae_clamp_manager.config_to_row
         assert (decode_sae_hash, "decode") in h._sae_clamp_manager.config_to_row
+
+
+class TestGlobalSaeRows:
+    def test_hash_zero_routes_to_phase_specific_global_rows(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h.register_steering_modules({"g": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "g", n_clamp=1, hidden_size=4)
+
+        prefill_spec = SAEClampSpec(
+            module_name="g",
+            phase="prefill",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=5.0),)
+                }
+            },
+        )
+        decode_spec = SAEClampSpec(
+            module_name="g",
+            phase="decode",
+            clamps={
+                "post_mlp": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=9.0),)
+                }
+            },
+        )
+        h._sae_clamp_manager.set_global_clamps(
+            prefill_specs=(prefill_spec,),
+            decode_specs=(decode_spec,),
+        )
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 0
+        h.input_batch.request_decode_steering_hash[0] = 0
+        scheduler_output = _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+
+        site = h._steerable_layers_cache[20]
+        residual = torch.tensor([[2.0, 0.0, 0.0, 0.0]])
+
+        h.input_batch.num_computed_tokens_cpu[0] = 3
+        h._update_sae_buffers(scheduler_output)
+        assert int(site.sae_index[0].item()) == 1
+        prefill = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        assert prefill[0, 0].item() == 5.0
+
+        h.input_batch.num_computed_tokens_cpu[0] = 4
+        h._update_sae_buffers(scheduler_output)
+        assert int(site.sae_index[0].item()) == 2
+        decode = apply_layer_steering(site, residual, SteeringHookPoint.POST_MLP)
+        assert decode[0, 0].item() == 9.0
 
 
 class TestPopulatorWritesIntoBuffers:
@@ -568,14 +620,17 @@ class TestPopulatorWritesIntoBuffers:
 
         site = h._steerable_layers_cache[20]
         kind = getattr(site, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_MLP])
-        # Row 1 (the prefill row) has feature 1 clamped (not feature 0).
+        row = h._sae_clamp_manager.config_to_row[
+            (sp.prefill_sae_clamp_config_hash, "prefill")
+        ]
+        # The prefill row has feature 1 clamped (not feature 0).
         from vllm.model_executor.layers.sae_steering import (
             CLAMP_KIND_ABSOLUTE,
             CLAMP_KIND_NONE,
         )
 
-        assert kind[1, 0].item() == CLAMP_KIND_NONE
-        assert kind[1, 1].item() == CLAMP_KIND_ABSOLUTE
+        assert kind[row, 0].item() == CLAMP_KIND_NONE
+        assert kind[row, 1].item() == CLAMP_KIND_ABSOLUTE
 
 
 class TestNoActiveStateShortCircuit:
@@ -701,9 +756,8 @@ class TestCrossManagerHashIsolation:
         h._update_steering_buffers(scheduler_output)
         site = h._steerable_layers_cache[20]
         assert int(site.steering_index[0].item()) == 0
-        # SAE side still routes to the request's row (row 1 in the SAE
-        # manager, which is *its* first per-request row).
-        assert int(site.sae_index[0].item()) == 1
+        # SAE side still routes to the request's first per-request row.
+        assert int(site.sae_index[0].item()) == 3
 
     def test_released_sae_row_clears_index_on_additive_no_active_shortcut(self):
         """After the last SAE row is released, the additive no-active
@@ -740,7 +794,7 @@ class TestCrossManagerHashIsolation:
             _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
         )
         site = h._steerable_layers_cache[20]
-        assert int(site.sae_index[0].item()) == 1
+        assert int(site.sae_index[0].item()) == 3
 
         h._release_sae_for_request("req-1", prefill_hash=777, decode_hash=0)
         h.input_batch.req_ids = ["req-2"]
@@ -787,7 +841,7 @@ class TestCrossManagerHashIsolation:
         )
 
         site = h._steerable_layers_cache[20]
-        assert site.sae_index[:2].tolist() == [1, 1]
+        assert site.sae_index[:2].tolist() == [3, 3]
         assert h._sae_rows_scratch.shape[0] == 2
         assert h._steering_n_tokens_scratch is not None
         assert h._steering_n_tokens_scratch.shape[0] == 2
@@ -909,7 +963,7 @@ class TestCrossManagerHashIsolation:
         )
 
         site = h._steerable_layers_cache[20]
-        assert int(site.sae_index[0].item()) == 1
+        assert int(site.sae_index[0].item()) == 3
         assert h._req_sae_phase == {"req-1": "decode"}
 
 
@@ -1010,7 +1064,7 @@ class TestBatchedAdditiveTransitions:
         prefill_sae_hash = sp.prefill_sae_clamp_config_hash
         decode_sae_hash = sp.decode_sae_clamp_config_hash
         assert (prefill_sae_hash, "prefill") not in mgr.config_to_row
-        assert mgr.config_to_row[(decode_sae_hash, "decode")] == 1
+        assert mgr.config_to_row[(decode_sae_hash, "decode")] == 3
         assert mgr.config_refcounts[(decode_sae_hash, "decode")] == 2
         assert h._req_sae_phase == {"req-1": "decode", "req-2": "decode"}
 
@@ -1161,7 +1215,7 @@ class TestBatchedAdditiveTransitions:
         )
         old_sae_hash = old_sp.prefill_sae_clamp_config_hash
         assert h._sae_clamp_manager is not None
-        assert h._sae_clamp_manager.config_to_row == {(old_sae_hash, "prefill"): 1}
+        assert h._sae_clamp_manager.config_to_row == {(old_sae_hash, "prefill"): 3}
 
         new_spec = SAEClampSpec(
             module_name="missing",
@@ -1183,7 +1237,7 @@ class TestBatchedAdditiveTransitions:
                 new_decode_hash=new_sp.decode_steering_config_hash,
             )
 
-        assert h._sae_clamp_manager.config_to_row == {(old_sae_hash, "prefill"): 1}
+        assert h._sae_clamp_manager.config_to_row == {(old_sae_hash, "prefill"): 3}
         assert h._req_sae_phase == {"req-1": "prefill"}
 
     def test_streaming_sae_refresh_failure_restores_old_rows(self, monkeypatch):
@@ -1270,7 +1324,7 @@ class TestBatchedAdditiveTransitions:
             (old_prefill_hash, "prefill"): 3
         }
         assert (new_prefill_hash, "prefill") not in h._steering_manager.config_to_row
-        assert h._sae_clamp_manager.config_to_row == {(old_sae_hash, "prefill"): 1}
+        assert h._sae_clamp_manager.config_to_row == {(old_sae_hash, "prefill"): 3}
         assert (new_sae_hash, "prefill") not in h._sae_clamp_manager.config_to_row
         assert h._req_steering_phase == {"req-1": "prefill"}
         assert h._req_sae_phase == {"req-1": "prefill"}
