@@ -532,10 +532,20 @@ GEMMs per opted-in token per hooked layer).
 - **No HTTP endpoint for the global SAE clamp tier.** Install/clear
   go through `collective_rpc` to the worker methods; an
   `entrypoints/serve/steering/` wrapper is follow-up work.
-- **Startup `replace=True` module pushes are clear-then-readd.** A
-  failed SAE replace-push leaves workers cleared rather than restored
-  to the prior module (per-name runtime registration *does* roll back
-  via the compensating broadcast).
+- **`replace=True` module pushes are per-worker atomic but not
+  cross-rank transactional.** On each worker,
+  `register_steering_modules(replace=True)`
+  (`_replace_steering_modules_atomically`) snapshots the additive and
+  both SAE registries — including attached SAE/FR weights — before
+  clearing and re-adding, and restores them on failure, so a poisoned
+  push cannot destroy a working registry. Pre-materialize pins are
+  released before the clear and *not* re-established on rollback (the
+  next `pre_materialize_steering_module` call re-installs them). What
+  remains best-effort is cross-rank consistency: `collective_rpc` is
+  not transactional, so a failure on some ranks after others committed
+  is not compensated — the same constraint as the additive per-name
+  path (see `_compensating_broadcast_after_failure` in
+  `entrypoints/serve/steering/modules_router.py`).
 - **Batch chat API requires packed steering vectors**
   (`SteeringVectorSpecPacked`); legacy dict-of-lists vectors are not
   accepted on the batch surface.
