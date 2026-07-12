@@ -10,7 +10,7 @@ activation at selected token rows with a source vector captured from a prior
   ``post_attn`` hook points, where the residual *is* the quantity to patch::
 
       out[t] = lerp(hs[t], table[idx[t]], alpha[idx[t]])
-             = hs[t] + alpha[idx[t]] * (table[idx[t]] - hs[t])
+             = (1 - alpha[idx[t]]) * hs[t] + alpha[idx[t]] * table[idx[t]]
 
 - :func:`apply_patch_block_triton` — two-tensor variant for ``post_block``.
   vLLM defers each layer's MLP-branch add into the next fused add+norm, so the
@@ -19,7 +19,8 @@ activation at selected token rows with a source vector captured from a prior
   replace/lerp does **not**, so this op reconstructs the block output, lerps
   that, and folds the delta back into ``residual``::
 
-      out_res[t] = res[t] + alpha[idx[t]] * (table[idx[t]] - (res[t] + hs[t]))
+      out_res[t] = (1 - alpha[idx[t]]) * res[t]
+                 + alpha[idx[t]] * (table[idx[t]] - hs[t])
       # block_out = out_res + hs = lerp(res + hs, table, alpha)
 
 Both kernels mirror the steering kernel contract: one program per token row

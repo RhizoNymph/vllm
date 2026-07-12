@@ -90,6 +90,25 @@ at `(layer, hook, dest_position)` toward `source_run`'s activation at
 `source_position`. The interpolation is the precise form `(1-a)*h + a*source`
 (endpoint-exact at `alpha == 1`).
 
+Positions are integer token indices — only the `/v1/patch_sweep` endpoint
+resolves substring spans server-side. To target a substring in a per-request
+patch without counting tokens by hand, resolve it first with the client helper
+(the same span math the sweep uses — see
+[Substring positions](#substring-positions)) and expand the resolved positions
+into entries:
+
+```python
+from vllm.entrypoints.serve.patch.client import PatchStudy
+
+study = PatchStudy(model=MODEL, hook="post_block")
+positions = await study.positions_for(corrupt_prompt, "Germany")
+patch = [
+    {"layer": 14, "hook": "post_block", "dest_position": p,
+     "source_run": "clean", "source_position": p, "alpha": 1.0}
+    for p in positions
+]
+```
+
 ### Standalone per-request use (outside a study)
 
 `patch` (and `patch_vectors`) are ordinary per-request sampling fields, not a
@@ -189,7 +208,7 @@ An optional **`mask`** (composes with **any** source kind, including
 `source_run`) restricts the patch to a subset of dims:
 
 ```
-out_d = hs_d + alpha * m_d * (src_d - hs_d)
+out_d = (1 - alpha * m_d) * hs_d + alpha * m_d * src_d
 ```
 
 Because `alpha * mask` is just a per-dimension `alpha`, a mask needs no separate
