@@ -92,6 +92,7 @@ impl GenerateRequest {
                 trace_headers,
                 resumable: false,
                 external_req_id: Some(external_request_id),
+                request_metadata: None,
                 reasoning_ended,
                 reasoning_parser_kwargs: None,
                 abort_immediately: false,
