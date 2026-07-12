@@ -1385,22 +1385,15 @@ class TestCoerceSaeWeightsWire:
         payload = _sae_payload(d_model=4, clampable=(0, 1))
         payload["sae_weights"] = self._wire_delta_weights()
         h.register_steering_modules({"g": payload})
-        site = h._steerable_layers_cache[20]
-        enc_w = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        enc_b = getattr(
-            site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        dec_w = getattr(
-            site, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
+        state = _slot(h._steerable_layers_cache[20])
         assert torch.equal(
-            enc_w, torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+            state.encoder_weight,
+            torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]),
         )
-        assert torch.equal(enc_b, torch.tensor([0.5, 0.25]))
+        assert torch.equal(state.encoder_bias, torch.tensor([0.5, 0.25]))
         assert torch.equal(
-            dec_w, torch.tensor([[9.0, 8.0, 7.0, 6.0], [5.0, 4.0, 3.0, 2.0]])
+            state.decoder_weight,
+            torch.tensor([[9.0, 8.0, 7.0, 6.0], [5.0, 4.0, 3.0, 2.0]]),
         )
 
     def test_delta_tuple_keys_and_bytes_data_attach(self):
@@ -1414,11 +1407,8 @@ class TestCoerceSaeWeightsWire:
             ]
         }
         h.register_steering_modules({"g": payload})
-        site = h._steerable_layers_cache[20]
-        enc_b = getattr(
-            site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert torch.equal(enc_b, torch.tensor([0.5, 0.25]))
+        state = _slot(h._steerable_layers_cache[20])
+        assert torch.equal(state.encoder_bias, torch.tensor([0.5, 0.25]))
 
     def test_degraded_tensor_triples_attach(self):
         # Torch tensors sent through the Python API server's own
@@ -1443,11 +1433,8 @@ class TestCoerceSaeWeightsWire:
             }
         }
         h.register_steering_modules({"g": payload})
-        site = h._steerable_layers_cache[20]
-        enc_w = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert torch.equal(enc_w, torch.full((2, 4), 3.0))
+        state = _slot(h._steerable_layers_cache[20])
+        assert torch.equal(state.encoder_weight, torch.full((2, 4), 3.0))
 
     def test_bfloat16_packed_tensor_attaches(self):
         h = _RichHarness(hidden_size=4)
@@ -1460,12 +1447,10 @@ class TestCoerceSaeWeightsWire:
         )
         payload["sae_weights"] = wire
         h.register_steering_modules({"g": payload})
-        site = h._steerable_layers_cache[20]
-        enc_w = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
+        state = _slot(h._steerable_layers_cache[20])
         assert torch.equal(
-            enc_w, torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+            state.encoder_weight,
+            torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]),
         )
 
     def test_full_reconstruction_wire_weights_attach(self):
