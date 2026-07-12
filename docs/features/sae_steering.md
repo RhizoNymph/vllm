@@ -243,6 +243,17 @@ runtime:
 as a steering request (engine must be started with steering enabled)
 and re-raises spec validation errors at admission.
 
+The engine core keeps its own admission guard for frontends that
+don't pre-validate (the Rust frontend, raw ZMQ clients):
+`EngineCore.collective_rpc` mirrors SAE module (un)registrations into
+`_sae_admission_mirror` (name → kind, sites, clampable features), and
+`preprocess_add_request` validates every SAE spec's module reference
+against it — an unknown module, wrong kind, uncovered site, or
+non-clampable feature fails the *request* (`FinishReason.ERROR` via
+the preproc error path) instead of raising on the worker execute
+path, where the same condition is fatal to the engine. The worker
+mixin's `_assert_sae_*_can_be_applied` checks remain as the backstop.
+
 ### Scheduler Capacity (three independent pools)
 
 The scheduler runs config-pool backpressure: rather than falling back
@@ -384,7 +395,11 @@ Global-tier contract (`set_global_clamps` / `clear_global_clamps` /
 
 Worker-side RPC surface and the HTTP endpoints
 ([`api_router.py`](../../vllm/entrypoints/serve/steering/api_router.py))
-that wrap it:
+that wrap it (the three worker methods are exposed to
+`collective_rpc` through delegates on `WorkerBase`/`Worker` in
+[`worker_base.py`](../../vllm/v1/worker/worker_base.py) /
+[`gpu_worker.py`](../../vllm/v1/worker/gpu_worker.py), like the
+attach methods):
 
 | Endpoint | Worker call | Effect |
 |---|---|---|
