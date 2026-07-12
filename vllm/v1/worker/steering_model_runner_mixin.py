@@ -2971,10 +2971,10 @@ class SteeringModelRunnerMixin:
         the supplied specs are validated against the worker SAE
         registry, then committed to :class:`SAEClampManager`'s global
         tier.  Tokens whose request does not carry per-request SAE
-        clamps will gather row 0 on the next forward pass; the
-        populator has already written the global content into that
-        row, so the per-token dispatch picks them up without per-
-        request bookkeeping.
+        clamps gather the phase-specific global row on the next
+        forward pass (row 1 for prefill, row 2 for decode; row 0 stays
+        the all-zero no-op sentinel), so the per-token dispatch picks
+        globals up without per-request bookkeeping.
 
         Args:
             prefill_specs_raw: JSON-shape clamp specs (as accepted by
