@@ -44,12 +44,10 @@ from vllm.config.sae_steering_types import (
 )
 from vllm.exceptions import SteeringVectorError
 from vllm.model_executor.layers.sae_steering import (
-    HOOK_POINT_SAE_CLAMP_KIND_ATTR,
-    HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
-    HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
-    HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
-    HOOK_POINT_SAE_MODULE_NAME_ATTR,
+    SAESlotState,
+    get_sae_slot_state,
     sae_buffers_attached,
+    sae_site_slots,
 )
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
@@ -81,6 +79,16 @@ class _StubVllmConfig:
     model_config: _StubModelConfig = field(default_factory=_StubModelConfig)
     scheduler_config: _StubSchedulerConfig = field(default_factory=_StubSchedulerConfig)
     steering_config: _StubSteeringConfig = field(default_factory=_StubSteeringConfig)
+
+
+def _slot(
+    site: nn.Module,
+    module_name: str = "g",
+    hook: SteeringHookPoint = SteeringHookPoint.POST_BLOCK,
+) -> SAESlotState:
+    state = get_sae_slot_state(site, hook, module_name)
+    assert state is not None, f"no slot for {module_name!r} at {hook.value!r}"
+    return state
 
 
 def _make_decoder_layer(layer_idx: int, hidden_size: int = 4) -> nn.Module:
@@ -222,14 +230,12 @@ class TestRegisterAttachesSaeBuffers:
         )
         assert ("g", 21, "post_block") not in h._sae_steerable_sites
 
-    def test_records_module_name_in_buffer_attribute(self):
+    def test_records_module_name_in_slot_record(self):
         h = _RichHarness()
         h.register_steering_modules({"g": _sae_payload()})
         site = h._steerable_layers_cache[20]
-        assert (
-            getattr(site, HOOK_POINT_SAE_MODULE_NAME_ATTR[SteeringHookPoint.POST_BLOCK])
-            == "g"
-        )
+        slots = sae_site_slots(site, SteeringHookPoint.POST_BLOCK)
+        assert [s.module_name for s in slots] == ["g"]
 
     def test_buffer_shape_matches_manifest(self):
         h = _RichHarness(hidden_size=8)
@@ -237,10 +243,7 @@ class TestRegisterAttachesSaeBuffers:
             {"g": _sae_payload(d_model=8, clampable=(0, 1, 2))},
         )
         site = h._steerable_layers_cache[20]
-        enc_w = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert enc_w.shape == (3, 8)
+        assert _slot(site).encoder_weight.shape == (3, 8)
 
     def test_runtime_buffers_follow_existing_layer_device(self):
         h = _RichHarness(layer_indices=(20,))
@@ -250,14 +253,9 @@ class TestRegisterAttachesSaeBuffers:
         h.register_steering_modules({"g": _sae_payload()})
 
         assert layer.sae_index.device.type == "meta"  # type: ignore[attr-defined]
-        enc_w = getattr(
-            layer, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        kind = getattr(
-            layer, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert enc_w.device.type == "meta"
-        assert kind.device.type == "meta"
+        state = _slot(layer)
+        assert state.encoder_weight.device.type == "meta"
+        assert state.clamp_kind.device.type == "meta"
 
     def test_index_buffer_attached_and_shared(self):
         h = _RichHarness(layer_indices=(20, 21))
@@ -386,11 +384,10 @@ class TestUnregisterDetachesSaeBuffers:
         site = h._steerable_layers_cache[20]
         # 'g' should be gone.
         assert "g" not in h._sae_module_registry
+        assert get_sae_slot_state(site, SteeringHookPoint.POST_BLOCK, "g") is None
         # 'new' should be attached.
-        assert (
-            getattr(site, HOOK_POINT_SAE_MODULE_NAME_ATTR[SteeringHookPoint.POST_BLOCK])
-            == "new"
-        )
+        slots = sae_site_slots(site, SteeringHookPoint.POST_BLOCK)
+        assert [s.module_name for s in slots] == ["new"]
 
     def test_kind_swap_detaches_old_sae_buffers(self):
         # Re-registering the same name as additive must drop the SAE
@@ -417,9 +414,7 @@ class TestAttachSaeWeights:
         h = _RichHarness(hidden_size=4)
         h.register_steering_modules({"g": _sae_payload(d_model=4, clampable=(0, 1))})
         site = h._steerable_layers_cache[20]
-        enc_w_before = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).clone()
+        enc_w_before = _slot(site).encoder_weight.clone()
         new_w = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
         new_b = torch.tensor([0.1, 0.2])
         new_dec = torch.tensor([[9.0, 8.0, 7.0, 6.0], [5.0, 4.0, 3.0, 2.0]])
@@ -433,24 +428,93 @@ class TestAttachSaeWeights:
                 }
             },
         )
-        enc_w = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        enc_b = getattr(
-            site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        dec_w = getattr(
-            site, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert torch.equal(enc_w, new_w)
-        assert torch.equal(enc_b, new_b)
-        assert torch.equal(dec_w, new_dec)
-        assert not torch.equal(enc_w, enc_w_before)
+        state = _slot(site)
+        assert torch.equal(state.encoder_weight, new_w)
+        assert torch.equal(state.encoder_bias, new_b)
+        assert torch.equal(state.decoder_weight, new_dec)
+        assert not torch.equal(state.encoder_weight, enc_w_before)
 
     def test_unknown_module_raises(self):
         h = _RichHarness()
         with pytest.raises(SteeringVectorError, match="not registered"):
             h.attach_sae_weights("g", {})
+
+    def test_jumprelu_requires_threshold_tensor(self):
+        h = _RichHarness()
+        h.register_steering_modules(
+            {"g": _sae_payload(clampable=(0, 1), activation="jumprelu")}
+        )
+        with pytest.raises(SteeringVectorError, match="threshold"):
+            h.attach_sae_weights(
+                "g",
+                {
+                    (20, "post_block"): {
+                        "encoder_weight": torch.zeros(2, 4),
+                        "encoder_bias": torch.zeros(2),
+                        "decoder_weight": torch.zeros(2, 4),
+                        # threshold deliberately absent
+                    }
+                },
+            )
+
+    def test_jumprelu_threshold_copied_into_buffer(self):
+        h = _RichHarness()
+        h.register_steering_modules(
+            {"g": _sae_payload(clampable=(0, 1), activation="jumprelu")}
+        )
+        threshold = torch.tensor([0.25, 0.75])
+        h.attach_sae_weights(
+            "g",
+            {
+                (20, "post_block"): {
+                    "encoder_weight": torch.zeros(2, 4),
+                    "encoder_bias": torch.zeros(2),
+                    "decoder_weight": torch.zeros(2, 4),
+                    "threshold": threshold,
+                }
+            },
+        )
+        site = h._steerable_layers_cache[20]
+        buf = _slot(site).threshold
+        assert buf.dtype is torch.float32
+        assert torch.equal(buf, threshold)
+
+    def test_relu_threshold_is_optional(self):
+        # Non-JumpReLU modules may omit the threshold tensor; the
+        # zero-filled buffer stands in for the fixed op arity.
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload(clampable=(0, 1))})
+        h.attach_sae_weights(
+            "g",
+            {
+                (20, "post_block"): {
+                    "encoder_weight": torch.zeros(2, 4),
+                    "encoder_bias": torch.zeros(2),
+                    "decoder_weight": torch.zeros(2, 4),
+                }
+            },
+        )
+        site = h._steerable_layers_cache[20]
+        buf = _slot(site).threshold
+        assert torch.equal(buf, torch.zeros(2))
+
+    def test_threshold_shape_mismatch_raises(self):
+        h = _RichHarness()
+        h.register_steering_modules(
+            {"g": _sae_payload(clampable=(0, 1), activation="jumprelu")}
+        )
+        with pytest.raises(SteeringVectorError, match="threshold.*shape"):
+            h.attach_sae_weights(
+                "g",
+                {
+                    (20, "post_block"): {
+                        "encoder_weight": torch.zeros(2, 4),
+                        "encoder_bias": torch.zeros(2),
+                        "decoder_weight": torch.zeros(2, 4),
+                        "threshold": torch.zeros(3),  # wrong n_clamp
+                    }
+                },
+            )
 
     def test_missing_tensor_key_raises(self):
         h = _RichHarness()
@@ -487,9 +551,7 @@ class TestAttachSaeWeights:
             }
         )
         site20 = h._steerable_layers_cache[20]
-        enc_w20 = getattr(
-            site20, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
+        enc_w20 = _slot(site20).encoder_weight
         assert torch.count_nonzero(enc_w20) == 0
 
         with pytest.raises(SteeringVectorError, match="shape"):
@@ -621,10 +683,7 @@ class TestRegisterWithInlineWeights:
         h = _RichHarness(hidden_size=4)
         h.register_steering_modules({"g": self._payload_with_weights()})
         site = h._steerable_layers_cache[20]
-        enc_w = getattr(
-            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert torch.equal(enc_w, torch.ones(2, 4))
+        assert torch.equal(_slot(site).encoder_weight, torch.ones(2, 4))
 
     def test_attach_failure_rolls_back_registry_entry(self):
         """A bad weight shape inside the inline payload must leave the
@@ -698,12 +757,7 @@ class TestRegisterWithInlineWeights:
         }
         h.register_steering_modules({"g": good})
         site = h._steerable_layers_cache[20]
-        assert torch.equal(
-            getattr(
-                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-            ),
-            torch.full((2, 4), 7.0),
-        )
+        assert torch.equal(_slot(site).encoder_weight, torch.full((2, 4), 7.0))
 
         # Re-register the same name with a bad-shape weight payload.
         bad = _sae_payload(d_model=4, clampable=(0, 1))
@@ -721,16 +775,44 @@ class TestRegisterWithInlineWeights:
         # original tensors.
         assert "g" in h._sae_module_registry
         assert sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
-        assert torch.equal(
-            getattr(
-                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-            ),
-            torch.full((2, 4), 7.0),
-        )
-        assert torch.equal(
-            getattr(site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]),
-            torch.full((2,), 0.25),
-        )
+        state = _slot(site)
+        assert torch.equal(state.encoder_weight, torch.full((2, 4), 7.0))
+        assert torch.equal(state.encoder_bias, torch.full((2,), 0.25))
+
+    def test_replacement_failure_restores_jumprelu_threshold(self):
+        """Snapshot/rollback must round-trip the per-feature threshold
+        buffer, not just the encoder/decoder weights."""
+        h = _RichHarness(hidden_size=4)
+        threshold = torch.tensor([0.25, 0.75])
+        good = _sae_payload(d_model=4, clampable=(0, 1), activation="jumprelu")
+        good["sae_weights"] = {
+            (20, "post_block"): {
+                "encoder_weight": torch.full((2, 4), 7.0),
+                "encoder_bias": torch.full((2,), 0.25),
+                "decoder_weight": torch.full((2, 4), 3.0),
+                "threshold": threshold,
+            }
+        }
+        h.register_steering_modules({"g": good})
+        site = h._steerable_layers_cache[20]
+        assert torch.equal(_slot(site).threshold, threshold)
+
+        bad = _sae_payload(d_model=4, clampable=(0, 1), activation="jumprelu")
+        bad["sae_weights"] = {
+            (20, "post_block"): {
+                "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
+                "encoder_bias": torch.zeros(2),
+                "decoder_weight": torch.zeros(2, 4),
+                "threshold": torch.zeros(2),
+            }
+        }
+        with pytest.raises(SteeringVectorError):
+            h.register_steering_modules({"g": bad})
+
+        # Registry entry preserved and the original per-feature
+        # thresholds restored after the failed replacement.
+        assert "g" in h._sae_module_registry
+        assert torch.equal(_slot(site).threshold, threshold)
 
     def test_replace_true_failure_restores_additive_registry(self):
         h = _RichHarness(hidden_size=4)
@@ -782,15 +864,115 @@ class TestRegisterWithInlineWeights:
         assert "g" in h._sae_module_registry
         assert "bad" not in h._sae_module_registry
         assert sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
+        state = _slot(site)
+        assert torch.equal(state.encoder_weight, torch.full((2, 4), 5.0))
+        assert torch.equal(state.encoder_bias, torch.full((2,), 0.75))
+
+
+class TestSharedSiteModules:
+    """Multiple SAE delta modules sharing one (layer, hook) site."""
+
+    def _payload_with_fill(self, fill: float) -> dict:
+        body = _sae_payload(d_model=4, clampable=(0, 1))
+        body["sae_weights"] = {
+            (20, "post_block"): {
+                "encoder_weight": torch.full((2, 4), fill),
+                "encoder_bias": torch.full((2,), fill / 10),
+                "decoder_weight": torch.full((2, 4), fill * 2),
+            }
+        }
+        return body
+
+    def test_two_modules_share_site_over_rpc_surface(self):
+        h = _RichHarness(layer_indices=(20,))
+        h.register_steering_modules({"a": _sae_payload(clampable=(0, 1))})
+        h.register_steering_modules({"b": _sae_payload(clampable=(0, 1))})
+        assert "a" in h._sae_module_registry
+        assert "b" in h._sae_module_registry
+        assert ("a", 20, "post_block") in h._sae_steerable_sites
+        assert ("b", 20, "post_block") in h._sae_steerable_sites
+        site = h._steerable_layers_cache[20]
+        slots = sae_site_slots(site, SteeringHookPoint.POST_BLOCK)
+        assert [s.module_name for s in slots] == ["a", "b"]
+
+    def test_attach_weights_lands_in_own_slot(self):
+        h = _RichHarness(layer_indices=(20,))
+        h.register_steering_modules({"a": self._payload_with_fill(1.0)})
+        h.register_steering_modules({"b": self._payload_with_fill(9.0)})
+        site = h._steerable_layers_cache[20]
         assert torch.equal(
-            getattr(
-                site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-            ),
-            torch.full((2, 4), 5.0),
+            _slot(site, "a").encoder_weight, torch.full((2, 4), 1.0)
         )
         assert torch.equal(
-            getattr(site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]),
-            torch.full((2,), 0.75),
+            _slot(site, "b").encoder_weight, torch.full((2, 4), 9.0)
+        )
+
+    def test_unregister_one_module_keeps_sibling_slot(self):
+        h = _RichHarness(layer_indices=(20,))
+        h.register_steering_modules({"a": self._payload_with_fill(1.0)})
+        h.register_steering_modules({"b": self._payload_with_fill(9.0)})
+        site = h._steerable_layers_cache[20]
+        h.unregister_steering_modules(["a"])
+        assert "a" not in h._sae_module_registry
+        assert ("a", 20, "post_block") not in h._sae_steerable_sites
+        assert ("b", 20, "post_block") in h._sae_steerable_sites
+        assert get_sae_slot_state(site, SteeringHookPoint.POST_BLOCK, "a") is None
+        # Sibling's slot and weights are untouched.
+        assert torch.equal(
+            _slot(site, "b").encoder_weight, torch.full((2, 4), 9.0)
+        )
+
+    def test_replacement_of_one_module_preserves_sibling(self):
+        h = _RichHarness(layer_indices=(20,))
+        h.register_steering_modules({"a": self._payload_with_fill(1.0)})
+        h.register_steering_modules({"b": self._payload_with_fill(9.0)})
+        site = h._steerable_layers_cache[20]
+        # Failed replacement of 'a' restores 'a' and leaves 'b' alone.
+        bad = _sae_payload(d_model=4, clampable=(0, 1))
+        bad["sae_weights"] = {
+            (20, "post_block"): {
+                "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
+                "encoder_bias": torch.zeros(2),
+                "decoder_weight": torch.zeros(2, 4),
+            }
+        }
+        with pytest.raises(SteeringVectorError):
+            h.register_steering_modules({"a": bad})
+        assert torch.equal(
+            _slot(site, "a").encoder_weight, torch.full((2, 4), 1.0)
+        )
+        assert torch.equal(
+            _slot(site, "b").encoder_weight, torch.full((2, 4), 9.0)
+        )
+
+    def test_replace_true_failure_restores_both_shared_site_modules(self):
+        # Atomic replace with a poisoned re-add: both prior modules on
+        # the shared site come back, buffers and weights intact.
+        h = _RichHarness(layer_indices=(20,))
+        h.register_steering_modules({"a": self._payload_with_fill(1.0)})
+        h.register_steering_modules({"b": self._payload_with_fill(9.0)})
+        site = h._steerable_layers_cache[20]
+
+        bad = _sae_payload(d_model=4, clampable=(0, 1))
+        bad["sae_weights"] = {
+            (20, "post_block"): {
+                "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
+                "encoder_bias": torch.zeros(2),
+                "decoder_weight": torch.zeros(2, 4),
+            }
+        }
+        with pytest.raises(SteeringVectorError):
+            h.register_steering_modules({"bad": bad}, replace=True)
+
+        assert set(h._sae_module_registry) == {"a", "b"}
+        assert "bad" not in h._sae_module_registry
+        slots = sae_site_slots(site, SteeringHookPoint.POST_BLOCK)
+        assert sorted(s.module_name for s in slots) == ["a", "b"]
+        assert torch.equal(
+            _slot(site, "a").encoder_weight, torch.full((2, 4), 1.0)
+        )
+        assert torch.equal(
+            _slot(site, "b").encoder_weight, torch.full((2, 4), 9.0)
         )
 
 
@@ -991,7 +1173,7 @@ class TestUpdateSaeBuffersPopulator:
             clampable_features=(34,),
             layer_idx=20,
         )
-        kind = getattr(site, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
+        kind = _slot(site).clamp_kind
         row = h._sae_clamp_manager.config_to_row[
             (sp.prefill_sae_clamp_config_hash, "prefill")
         ]

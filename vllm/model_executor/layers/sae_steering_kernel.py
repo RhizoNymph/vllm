@@ -34,11 +34,14 @@ preserves the eager reference's "no in-place" contract so the
 ``torch.compile`` graph keeps value semantics.
 
 Activation encoding (``ACTIVATION_CODE`` constexpr): ``0`` = ReLU,
-``1`` = JumpReLU (``activation_param`` = threshold), ``2`` = TopK
-(``activation_param`` = k, cast to int).  ``activation_code`` is a
-constexpr so each (activation, hook) site compiles to its own
-specialised binary; Triton's JIT cache reuses the binary across
-launches with identical specialisation.
+``1`` = JumpReLU (per-feature ``(n_clamp,)`` fp32 ``threshold``
+tensor), ``2`` = TopK (``activation_param`` = k, cast to int).
+The threshold tensor is a fixed kernel argument for every activation
+— ReLU/TopK sites pass a zero-filled buffer that the specialised
+binary never loads.  ``activation_code`` is a constexpr so each
+(activation, hook) site compiles to its own specialised binary;
+Triton's JIT cache reuses the binary across launches with identical
+specialisation.
 """
 
 from __future__ import annotations
@@ -60,6 +63,7 @@ def _apply_sae_delta_kernel(
     hidden_ptr,
     enc_w_ptr,
     enc_b_ptr,
+    threshold_ptr,
     dec_w_ptr,
     kind_ptr,
     value_ptr,
@@ -74,6 +78,7 @@ def _apply_sae_delta_kernel(
     enc_stride_c,
     enc_stride_h,
     enc_b_stride,
+    thr_stride,
     dec_stride_c,
     dec_stride_h,
     kind_stride_n,
@@ -148,8 +153,11 @@ def _apply_sae_delta_kernel(
     # Apply activation function to obtain f.
     if ACTIVATION_CODE == 0:  # ReLU
         f = tl.maximum(pre_acts, 0.0)
-    elif ACTIVATION_CODE == 1:  # JumpReLU
-        f = tl.where(pre_acts > activation_param, pre_acts, 0.0)
+    elif ACTIVATION_CODE == 1:  # JumpReLU — per-feature thresholds.
+        thr = tl.load(
+            threshold_ptr + c_idx * thr_stride, mask=c_mask, other=0.0
+        ).to(tl.float32)
+        f = tl.where(pre_acts > thr, pre_acts, 0.0)
     else:  # TopK among the clampable subset.
         # rank[i] = number of valid lanes j that sort before i by
         # (-pre_act, feature_idx).  The feature-index tie-break keeps
@@ -222,6 +230,7 @@ def _apply_sae_delta_indexed_kernel(
     hidden_ptr,
     enc_w_ptr,
     enc_b_ptr,
+    threshold_ptr,
     dec_w_ptr,
     kind_table_ptr,
     value_table_ptr,
@@ -237,6 +246,7 @@ def _apply_sae_delta_indexed_kernel(
     enc_stride_c,
     enc_stride_h,
     enc_b_stride,
+    thr_stride,
     dec_stride_c,
     dec_stride_h,
     kind_stride_r,
@@ -309,8 +319,11 @@ def _apply_sae_delta_indexed_kernel(
 
     if ACTIVATION_CODE == 0:
         f = tl.maximum(pre_acts, 0.0)
-    elif ACTIVATION_CODE == 1:
-        f = tl.where(pre_acts > activation_param, pre_acts, 0.0)
+    elif ACTIVATION_CODE == 1:  # JumpReLU — per-feature thresholds.
+        thr = tl.load(
+            threshold_ptr + c_idx * thr_stride, mask=c_mask, other=0.0
+        ).to(tl.float32)
+        f = tl.where(pre_acts > thr, pre_acts, 0.0)
     else:
         masked = tl.where(c_mask, pre_acts, float("-inf"))
         tie_before = (masked[None, :] == masked[:, None]) & (
@@ -416,6 +429,7 @@ def apply_sae_delta_triton(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
     encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
     decoder_weight: torch.Tensor,
     clamp_kind: torch.Tensor,
     clamp_value: torch.Tensor,
@@ -428,9 +442,11 @@ def apply_sae_delta_triton(
 
     Inputs match the eager reference :func:`apply_sae_delta` (except for
     the activation enum being replaced by an integer code and a single
-    float parameter; see :mod:`sae_steering` for the encoding).  The
-    output is a freshly allocated tensor with the same shape and dtype
-    as ``hidden_states``.
+    float parameter; see :mod:`sae_steering` for the encoding).
+    ``threshold`` carries the per-feature JumpReLU thresholds
+    (``(n_clamp,)`` fp32); it is loaded only under the JumpReLU
+    specialisation.  The output is a freshly allocated tensor with the
+    same shape and dtype as ``hidden_states``.
 
     Empty token batches and empty clamp sets short-circuit before the
     kernel launch — Triton can fail on zero-sized grids and the math is
@@ -454,6 +470,7 @@ def apply_sae_delta_triton(
             hidden_states,
             encoder_weight,
             encoder_bias,
+            threshold,
             decoder_weight,
             clamp_kind,
             clamp_value,
@@ -476,6 +493,7 @@ def apply_sae_delta_triton(
         hidden_states,
         encoder_weight,
         encoder_bias,
+        threshold,
         decoder_weight,
         clamp_kind,
         clamp_value,
@@ -490,6 +508,7 @@ def apply_sae_delta_triton(
         encoder_weight.stride(0),
         encoder_weight.stride(1),
         encoder_bias.stride(0),
+        threshold.stride(0),
         decoder_weight.stride(0),
         decoder_weight.stride(1),
         clamp_kind.stride(0),
@@ -512,6 +531,7 @@ def apply_sae_delta_indexed_triton(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
     encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
     decoder_weight: torch.Tensor,
     clamp_kind_table: torch.Tensor,
     clamp_value_table: torch.Tensor,
@@ -548,6 +568,7 @@ def apply_sae_delta_indexed_triton(
             hidden_states,
             encoder_weight,
             encoder_bias,
+            threshold,
             decoder_weight,
             clamp_kind_table[idx],
             clamp_value_table[idx],
@@ -566,6 +587,7 @@ def apply_sae_delta_indexed_triton(
         hidden_states,
         encoder_weight,
         encoder_bias,
+        threshold,
         decoder_weight,
         clamp_kind_table,
         clamp_value_table,
@@ -581,6 +603,7 @@ def apply_sae_delta_indexed_triton(
         encoder_weight.stride(0),
         encoder_weight.stride(1),
         encoder_bias.stride(0),
+        threshold.stride(0),
         decoder_weight.stride(0),
         decoder_weight.stride(1),
         clamp_kind_table.stride(0),
@@ -632,6 +655,7 @@ def warmup_apply_sae_delta_kernel(
     dummy_hidden = torch.zeros(1, hidden_size, dtype=compute_dtype, device=device)
     dummy_enc_w = torch.zeros(n_clamp, hidden_size, dtype=table_dtype, device=device)
     dummy_enc_b = torch.zeros(n_clamp, dtype=table_dtype, device=device)
+    dummy_threshold = torch.zeros(n_clamp, dtype=torch.float32, device=device)
     dummy_dec_w = torch.zeros(n_clamp, hidden_size, dtype=table_dtype, device=device)
     dummy_kind = torch.zeros(1, n_clamp, dtype=torch.int8, device=device)
     dummy_value = torch.zeros(1, n_clamp, dtype=torch.float32, device=device)
@@ -642,6 +666,7 @@ def warmup_apply_sae_delta_kernel(
         dummy_hidden,
         dummy_enc_w,
         dummy_enc_b,
+        dummy_threshold,
         dummy_dec_w,
         dummy_kind,
         dummy_value,
@@ -654,6 +679,7 @@ def warmup_apply_sae_delta_kernel(
         dummy_hidden,
         dummy_enc_w,
         dummy_enc_b,
+        dummy_threshold,
         dummy_dec_w,
         dummy_kind,
         dummy_value,

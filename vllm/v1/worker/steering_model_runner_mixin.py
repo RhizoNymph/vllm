@@ -36,6 +36,7 @@ from vllm.model_executor.layers.sae_full_reconstruction import (
     HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
     HOOK_POINT_FR_ENCODER_BIAS_ATTR,
     HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
+    HOOK_POINT_FR_THRESHOLD_ATTR,
     populate_sae_full_recon_clamp_table,
     register_sae_full_recon_buffers,
     register_sae_recon_index_buffer,
@@ -44,10 +45,7 @@ from vllm.model_executor.layers.sae_full_reconstruction import (
     unregister_sae_full_recon_buffers,
 )
 from vllm.model_executor.layers.sae_steering import (
-    HOOK_POINT_SAE_ANY_ACTIVE_ATTR,
-    HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
-    HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
-    HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
+    get_sae_slot_state,
     populate_sae_clamp_table,
     register_sae_buffers,
     register_sae_index_buffer,
@@ -1399,7 +1397,6 @@ class SteeringModelRunnerMixin:
                 try:
                     manifest = sae_manifest_from_dict(manifest_payload)
                     self._validate_worker_sae_manifest(name, manifest)
-                    self._validate_worker_sae_site_ownership(name, manifest)
                 except (KeyError, TypeError, ValueError) as exc:
                     raise SteeringVectorError(
                         f"Steering module '{name}': invalid sae_manifest "
@@ -3265,15 +3262,11 @@ class SteeringModelRunnerMixin:
                     f"{prefix}: activation_params must be empty for relu."
                 )
         elif manifest.activation is SAEActivation.JUMPRELU:
-            threshold = manifest.activation_params.get("threshold")
-            if (
-                isinstance(threshold, bool)
-                or not isinstance(threshold, (int, float))
-                or not math.isfinite(float(threshold))
-            ):
+            if manifest.activation_params:
                 raise ValueError(
-                    f"{prefix}: jumprelu activation_params requires a finite "
-                    "'threshold'."
+                    f"{prefix}: activation_params must be empty for jumprelu "
+                    "— per-feature thresholds ride the weights payload as a "
+                    "'threshold' tensor."
                 )
         elif manifest.activation is SAEActivation.TOPK:
             k = manifest.activation_params.get("k")
@@ -3324,26 +3317,6 @@ class SteeringModelRunnerMixin:
                     f"duplicates; got feature {feat!r} more than once."
                 )
             seen_features.add(feat)
-
-    def _validate_worker_sae_site_ownership(
-        self,
-        name: str,
-        manifest: SAEModuleManifest,
-    ) -> None:
-        """Reject SAE site overlap before attaching per-layer buffers."""
-        new_sites = set(manifest.layers)
-        for other_name, other_manifest in self._sae_module_registry.items():
-            if other_name == name:
-                continue
-            overlap = new_sites & set(other_manifest.layers)
-            if overlap:
-                raise ValueError(
-                    f"SAE module {name!r}: layers overlap existing SAE "
-                    f"module {other_name!r} at site(s) {sorted(overlap)!r}.  "
-                    "At most one SAE module may own a (layer_idx, "
-                    "hook_point) site on a worker."
-                )
-
 
     def _attach_sae_buffers(
         self,
@@ -3484,7 +3457,12 @@ class SteeringModelRunnerMixin:
         )
 
     def _detach_sae_buffers(self, module_name: str) -> None:
-        """Detach all per-(layer, hook) buffers attached for ``module_name``."""
+        """Detach all per-(layer, hook) buffers attached for ``module_name``.
+
+        Only ``module_name``'s buffer slots are removed; sibling
+        modules sharing a (layer, hook) site keep their slots (and
+        their stable attr names — slot ids are never reused).
+        """
         keys = [k for k in self._sae_steerable_sites if k[0] == module_name]
         for key in keys:
             _, _layer_idx, hook_str = key
@@ -3493,7 +3471,9 @@ class SteeringModelRunnerMixin:
                 hook_point = SteeringHookPoint(hook_str)
             except ValueError:
                 continue
-            unregister_sae_buffers(layer, hook_point=hook_point)
+            unregister_sae_buffers(
+                layer, hook_point=hook_point, module_name=module_name
+            )
 
     def _snapshot_sae_weights(
         self, module_name: str
@@ -3513,18 +3493,15 @@ class SteeringModelRunnerMixin:
                 hook_point = SteeringHookPoint(hook_str)
             except ValueError:
                 continue
-            tensors: dict[str, torch.Tensor] = {}
-            for tensor_key, attr_table in (
-                ("encoder_weight", HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR),
-                ("encoder_bias", HOOK_POINT_SAE_ENCODER_BIAS_ATTR),
-                ("decoder_weight", HOOK_POINT_SAE_DECODER_WEIGHT_ATTR),
-            ):
-                buf = getattr(site, attr_table[hook_point], None)
-                if buf is None:
-                    continue
-                tensors[tensor_key] = buf.detach().clone()
-            if tensors:
-                snapshot[(layer_idx, hook_str)] = tensors
+            state = get_sae_slot_state(site, hook_point, module_name)
+            if state is None:
+                continue
+            snapshot[(layer_idx, hook_str)] = {
+                "encoder_weight": state.encoder_weight.detach().clone(),
+                "encoder_bias": state.encoder_bias.detach().clone(),
+                "decoder_weight": state.decoder_weight.detach().clone(),
+                "threshold": state.threshold.detach().clone(),
+            }
         return snapshot
 
     def attach_sae_weights(
@@ -3536,9 +3513,12 @@ class SteeringModelRunnerMixin:
 
         ``weights`` maps ``(layer_idx, hook_str)`` to a dict with keys
         ``"encoder_weight"``, ``"encoder_bias"``, and
-        ``"decoder_weight"``.  Each tensor is copied into the
-        corresponding zero-initialised buffer in place; shape and
-        dtype must match what ``_attach_sae_buffers`` allocated.
+        ``"decoder_weight"``, plus a per-feature ``(n_clamp,)``
+        ``"threshold"`` tensor — required when the registered
+        manifest's activation is JumpReLU, optional otherwise.  Each
+        tensor is copied into the corresponding zero-initialised
+        buffer in place; shape and dtype must match what
+        ``_attach_sae_buffers`` allocated.
 
         This is the injection point used by tests, runtime registration,
         and startup/full-registry broadcasts after the on-disk loader has
@@ -3548,6 +3528,8 @@ class SteeringModelRunnerMixin:
             raise SteeringVectorError(
                 f"attach_sae_weights: SAE module {module_name!r} is not registered."
             )
+        manifest = self._sae_module_registry[module_name]
+        threshold_required = manifest.activation is SAEActivation.JUMPRELU
         expected_sites = {
             (layer_idx, hook_str)
             for name, layer_idx, hook_str in self._sae_steerable_sites
@@ -3573,18 +3555,25 @@ class SteeringModelRunnerMixin:
                 raise SteeringVectorError(
                     f"attach_sae_weights: unsupported hook point {hook_str!r}."
                 ) from exc
-            for tensor_key, attr_table in (
-                ("encoder_weight", HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR),
-                ("encoder_bias", HOOK_POINT_SAE_ENCODER_BIAS_ATTR),
-                ("decoder_weight", HOOK_POINT_SAE_DECODER_WEIGHT_ATTR),
+            state = get_sae_slot_state(site, hook_point, module_name)
+            if state is None:
+                # Site tracked but slot missing — buffers were torn down
+                # between attach and this call; treat as unowned.
+                continue
+            for tensor_key, buf, required in (
+                ("encoder_weight", state.encoder_weight, True),
+                ("encoder_bias", state.encoder_bias, True),
+                ("decoder_weight", state.decoder_weight, True),
+                ("threshold", state.threshold, threshold_required),
             ):
                 if tensor_key not in tensors:
+                    if not required:
+                        continue
                     raise SteeringVectorError(
                         f"attach_sae_weights({module_name!r}): missing "
                         f"{tensor_key!r} for site (layer={layer_idx}, "
                         f"hook={hook_str!r})."
                 )
-                buf = getattr(site, attr_table[hook_point])
                 raw = tensors[tensor_key]
                 if not isinstance(raw, torch.Tensor):
                     raise SteeringVectorError(
@@ -3891,6 +3880,7 @@ class SteeringModelRunnerMixin:
                 ("encoder_bias", HOOK_POINT_FR_ENCODER_BIAS_ATTR),
                 ("decoder_weight", HOOK_POINT_FR_DECODER_WEIGHT_ATTR),
                 ("decoder_bias", HOOK_POINT_FR_DECODER_BIAS_ATTR),
+                ("threshold", HOOK_POINT_FR_THRESHOLD_ATTR),
             ):
                 buf = getattr(site, attr_table[hook_point], None)
                 if buf is None:
@@ -3909,9 +3899,12 @@ class SteeringModelRunnerMixin:
 
         ``weights`` maps ``(layer_idx, hook_str)`` to a dict with keys
         ``"encoder_weight"``, ``"encoder_bias"``,
-        ``"decoder_weight"``, and ``"decoder_bias"``.  Each tensor is
-        copied into the corresponding zero-initialised buffer in
-        place; shape and dtype must match what
+        ``"decoder_weight"``, and ``"decoder_bias"``, plus a
+        per-feature ``(d_sae,)`` ``"threshold"`` tensor — required
+        when the registered manifest's activation is JumpReLU,
+        optional otherwise.  Each tensor is copied into the
+        corresponding zero-initialised buffer in place; shape and
+        dtype must match what
         :meth:`_attach_sae_full_recon_buffers` allocated.
         """
         if module_name not in self._sae_fr_module_registry:
@@ -3919,6 +3912,8 @@ class SteeringModelRunnerMixin:
                 f"attach_sae_full_recon_weights: SAE full-reconstruction "
                 f"module {module_name!r} is not registered."
             )
+        manifest = self._sae_fr_module_registry[module_name]
+        threshold_required = manifest.activation is SAEActivation.JUMPRELU
         for (layer_idx, hook_str), tensors in weights.items():
             site = self._sae_fr_steerable_sites.get((module_name, layer_idx, hook_str))
             if site is None:
@@ -3930,13 +3925,16 @@ class SteeringModelRunnerMixin:
                     f"attach_sae_full_recon_weights: unsupported hook point "
                     f"{hook_str!r}."
                 ) from exc
-            for tensor_key, attr_table in (
-                ("encoder_weight", HOOK_POINT_FR_ENCODER_WEIGHT_ATTR),
-                ("encoder_bias", HOOK_POINT_FR_ENCODER_BIAS_ATTR),
-                ("decoder_weight", HOOK_POINT_FR_DECODER_WEIGHT_ATTR),
-                ("decoder_bias", HOOK_POINT_FR_DECODER_BIAS_ATTR),
+            for tensor_key, attr_table, required in (
+                ("encoder_weight", HOOK_POINT_FR_ENCODER_WEIGHT_ATTR, True),
+                ("encoder_bias", HOOK_POINT_FR_ENCODER_BIAS_ATTR, True),
+                ("decoder_weight", HOOK_POINT_FR_DECODER_WEIGHT_ATTR, True),
+                ("decoder_bias", HOOK_POINT_FR_DECODER_BIAS_ATTR, True),
+                ("threshold", HOOK_POINT_FR_THRESHOLD_ATTR, threshold_required),
             ):
                 if tensor_key not in tensors:
+                    if not required:
+                        continue
                     raise SteeringVectorError(
                         f"attach_sae_full_recon_weights({module_name!r}): "
                         f"missing {tensor_key!r} for site (layer="
@@ -4290,20 +4288,18 @@ class SteeringModelRunnerMixin:
             return
 
         def clear_sae_any_active_flags() -> None:
-            for (_module_name, _layer_idx, hook_str), site in (
+            for (module_name, _layer_idx, hook_str), site in (
                 self._sae_steerable_sites.items()
             ):
                 try:
                     hook_point = SteeringHookPoint(hook_str)
                 except ValueError:
                     continue
-                flag_buf = getattr(
-                    site,
-                    HOOK_POINT_SAE_ANY_ACTIVE_ATTR[hook_point],
-                    None,
-                )
-                if flag_buf is not None:
-                    flag_buf.zero_()
+                # Per-slot flag: each module sharing the site has its
+                # own ``any_active`` buffer.
+                state = get_sae_slot_state(site, hook_point, module_name)
+                if state is not None:
+                    state.any_active.zero_()
 
         # Fast no-active path: if every SAE row has been released *and*
         # no global SAE clamps are configured, the only required work

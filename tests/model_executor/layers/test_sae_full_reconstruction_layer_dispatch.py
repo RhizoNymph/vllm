@@ -311,6 +311,7 @@ class TestCustomOpRegistration:
             h,
             W_enc,
             b_enc,
+            torch.zeros(d_sae),
             W_dec,
             b_dec,
             feats,

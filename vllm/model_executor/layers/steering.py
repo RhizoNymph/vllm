@@ -126,16 +126,17 @@ VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHo
 DEFAULT_HOOK_POINT = SteeringHookPoint.POST_BLOCK
 
 
-# SAE feature-surgery marker-buffer attribute names, kept as plain strings
+# SAE feature-surgery slot-list attribute names, kept as plain strings
 # here so the no-SAE hot path can short-circuit without importing
 # ``sae_steering`` on every decoder-layer hook call (``sae_steering`` imports
 # ``SteeringHookPoint`` from this module, so a top-level import would cycle).
-# These mirror the identically-named dicts in ``sae_steering.py`` /
-# ``sae_full_reconstruction.py`` (the attr strings must match).
-HOOK_POINT_SAE_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_clamp_kind_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_clamp_kind_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_clamp_kind_post_block",
+# These mirror ``_sae_slots_attr`` in ``sae_steering.py`` (the attr strings
+# must match): the attribute holds the ordered per-site slot records and is
+# present iff at least one SAE delta module holds a buffer slot at the site.
+HOOK_POINT_SAE_SLOTS_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_slots_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_slots_post_attn",
+    SteeringHookPoint.POST_BLOCK: "sae_slots_post_block",
 }
 
 # Full-reconstruction (Phase 4) site marker.  Same pattern as the delta
@@ -166,13 +167,13 @@ def _maybe_apply_layer_sae(
        additive / delta perturbations are still observable on tokens that
        don't opt into reconstruction.
 
-    Each stage short-circuits via a marker-buffer presence check; the local
-    imports keep this module free of a load-time dependency on the SAE
-    modules (they import ``SteeringHookPoint`` from here).
+    Each stage short-circuits via a marker presence check (the slot-list
+    attribute for delta, a marker buffer for FR); the local imports keep
+    this module free of a load-time dependency on the SAE modules (they
+    import ``SteeringHookPoint`` from here).
     """
-    buffers = module._buffers
-    has_sae_delta = HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point] in buffers
-    has_sae_fr = HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR[hook_point] in buffers
+    has_sae_delta = hasattr(module, HOOK_POINT_SAE_SLOTS_ATTR[hook_point])
+    has_sae_fr = HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR[hook_point] in module._buffers
     if not has_sae_delta and not has_sae_fr:
         return hidden_states
     if has_sae_delta:
@@ -718,10 +719,10 @@ def apply_block_steering(
     # entirely.  Write back through ``residual`` as a delta so tokens the
     # SAE ops leave untouched stay bit-identical, and the extra adds only
     # run when SAE buffers are attached at this site (static per-process).
-    buffers = module._buffers
     if (
-        HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK] in buffers
-        or HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK] in buffers
+        hasattr(module, HOOK_POINT_SAE_SLOTS_ATTR[SteeringHookPoint.POST_BLOCK])
+        or HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
+        in module._buffers
     ):
         block_out = residual + hidden_states
         steered = _maybe_apply_layer_sae(

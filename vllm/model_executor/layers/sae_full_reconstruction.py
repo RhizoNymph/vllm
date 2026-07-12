@@ -52,11 +52,14 @@ Numeric dtype contract (matches ``docs/features/sae_steering.md``):
   the eager body to match the contract the kernel will use; results
   are cast back to compute dtype before the decoder GEMM.
 
-Activation support: ``ReLU``, ``JumpReLU``
-(``activation_params['threshold']``), and ``TopK``
-(``activation_params['k']``).  Unlike the delta path, TopK runs over
-the **full** ``d_sae`` here — true Golden-Gate-style semantics —
-because we have the full encoder available.
+Activation support: ``ReLU``, ``JumpReLU`` (per-feature ``(d_sae,)``
+fp32 ``threshold`` tensor riding the per-site weights), and ``TopK``
+(``activation_params['k']``).  The threshold tensor is a required op
+argument for all activations (ReLU/TopK sites pass a zero-filled
+buffer only read under the JumpReLU branch) so the op arity stays
+fixed.  Unlike the delta path, TopK runs over the **full** ``d_sae``
+here — true Golden-Gate-style semantics — because we have the full
+encoder available.
 """
 
 from __future__ import annotations
@@ -107,6 +110,14 @@ HOOK_POINT_FR_DECODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_decoder_bias_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_decoder_bias_post_attn",
     SteeringHookPoint.POST_BLOCK: "sae_fr_decoder_bias_post_block",
+}
+# Per-feature JumpReLU thresholds over the *full* ``d_sae`` feature
+# axis.  Registered for every site (zero-filled for ReLU/TopK) so the
+# op arity stays fixed across activations.
+HOOK_POINT_FR_THRESHOLD_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_fr_threshold_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_fr_threshold_post_attn",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_threshold_post_block",
 }
 # Per-row clamp tables: row ``r`` carries the clamp state for tokens
 # whose ``sae_recon_index`` selects ``r``.  Row 0 is reserved as the
@@ -163,6 +174,7 @@ HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
 _FR_BUFFER_ATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
     HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
     HOOK_POINT_FR_ENCODER_BIAS_ATTR,
+    HOOK_POINT_FR_THRESHOLD_ATTR,
     HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
     HOOK_POINT_FR_DECODER_BIAS_ATTR,
     HOOK_POINT_FR_CLAMP_KIND_ATTR,
@@ -250,8 +262,10 @@ def register_sae_full_recon_buffers(
         raise ValueError(
             f"Layer module already has full-reconstruction SAE buffers for "
             f"hook {hook_point.value!r} (owning module={existing!r}).  "
-            "Phase-4 constrains at most one full-reconstruction SAE module "
-            "per (layer, hook) site; unregister the existing module first."
+            "By design at most one full-reconstruction SAE module may own "
+            "a (layer, hook) site — two residual replacements on one site "
+            "are semantically ill-defined; unregister the existing module "
+            "first.  (Delta modules, by contrast, may share a site.)"
         )
     n_rows = max_recon_configs + 1
     module.register_buffer(
@@ -262,6 +276,14 @@ def register_sae_full_recon_buffers(
     module.register_buffer(
         HOOK_POINT_FR_ENCODER_BIAS_ATTR[hook_point],
         torch.zeros(d_sae, dtype=dtype, device=device),
+        persistent=False,
+    )
+    # Per-feature JumpReLU thresholds over the full d_sae axis.
+    # Always registered — zero-filled fp32 for ReLU/TopK sites — so
+    # the custom op keeps a fixed arity across activations.
+    module.register_buffer(
+        HOOK_POINT_FR_THRESHOLD_ATTR[hook_point],
+        torch.zeros(d_sae, dtype=torch.float32, device=device),
         persistent=False,
     )
     module.register_buffer(
@@ -381,6 +403,7 @@ def sae_encode_full(
     encoder_bias: torch.Tensor,
     activation: SAEActivation,
     activation_params: Mapping[str, float],
+    threshold: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Project ``hidden_states`` through the full SAE encoder.
 
@@ -394,9 +417,11 @@ def sae_encode_full(
         encoder_weight: ``(d_sae, d_model)``.
         encoder_bias: ``(d_sae,)``.
         activation: encoder activation function.
-        activation_params: ``{"threshold": float}`` for JumpReLU,
-            ``{"k": float}`` for TopK (cast to int internally), ignored
-            for ReLU.
+        activation_params: ``{"k": float}`` for TopK (cast to int
+            internally), ignored for ReLU and JumpReLU.
+        threshold: ``(d_sae,)`` per-feature JumpReLU thresholds.
+            Required for JumpReLU; ignored (and may be ``None``) for
+            other activations.
 
     Returns:
         ``(n_tokens, d_sae)`` activation tensor in fp32.  The full-
@@ -410,8 +435,12 @@ def sae_encode_full(
     if activation is SAEActivation.RELU:
         return torch.clamp(pre_act, min=0.0)
     if activation is SAEActivation.JUMPRELU:
-        threshold = float(activation_params["threshold"])
-        return torch.where(pre_act > threshold, pre_act, torch.zeros_like(pre_act))
+        if threshold is None:
+            raise ValueError(
+                "JumpReLU requires a per-feature threshold tensor; got None."
+            )
+        thr_fp32 = threshold.to(torch.float32)
+        return torch.where(pre_act > thr_fp32, pre_act, torch.zeros_like(pre_act))
     if activation is SAEActivation.TOPK:
         k = int(activation_params["k"])
         d_sae = pre_act.shape[1]
@@ -426,6 +455,7 @@ def _apply_sae_full_reconstruction_eager(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
     encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
     decoder_weight: torch.Tensor,
     decoder_bias: torch.Tensor,
     clampable_features: torch.Tensor,
@@ -441,7 +471,9 @@ def _apply_sae_full_reconstruction_eager(
     Same numerics as the eventual Triton kernel; this path is the
     CPU fallback and the test ground truth.  Inputs are tensor-only
     (the activation enum is encoded as ``activation_code`` /
-    ``activation_param`` for the registered torch op).
+    ``activation_param`` for the registered torch op; JumpReLU's
+    per-feature thresholds ride the ``(d_sae,)`` ``threshold``
+    tensor, ignored otherwise).
     """
     n_tokens = hidden_states.shape[0]
     n_clamp = clampable_features.shape[0]
@@ -457,6 +489,7 @@ def _apply_sae_full_reconstruction_eager(
         encoder_bias,
         activation,
         activation_params,
+        threshold=threshold,
     )
 
     if n_clamp > 0:
@@ -491,6 +524,7 @@ def apply_sae_full_reconstruction_op(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
     encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
     decoder_weight: torch.Tensor,
     decoder_bias: torch.Tensor,
     clampable_features: torch.Tensor,
@@ -527,6 +561,7 @@ def apply_sae_full_reconstruction_op(
             hidden_states,
             encoder_weight,
             encoder_bias,
+            threshold,
             decoder_weight,
             decoder_bias,
             clampable_features,
@@ -541,6 +576,7 @@ def apply_sae_full_reconstruction_op(
         hidden_states,
         encoder_weight,
         encoder_bias,
+        threshold,
         decoder_weight,
         decoder_bias,
         clampable_features,
@@ -557,6 +593,7 @@ def apply_sae_full_reconstruction_op_fake(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
     encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
     decoder_weight: torch.Tensor,
     decoder_bias: torch.Tensor,
     clampable_features: torch.Tensor,
@@ -592,6 +629,7 @@ def apply_sae_full_reconstruction(
     clamp_value: torch.Tensor,
     clamp_only_if_active: torch.Tensor,
     recon_mask: torch.Tensor,
+    threshold: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Public Python API for the SAE full-reconstruction op.
 
@@ -619,6 +657,10 @@ def apply_sae_full_reconstruction(
             with ``recon_mask[t] == False`` pass through unchanged;
             tokens with ``recon_mask[t] == True`` have their residual
             replaced by ``decode(clamp(encode(h_t)))``.
+        threshold: ``(d_sae,)`` fp32 per-feature JumpReLU thresholds.
+            Required for JumpReLU; for ReLU/TopK a zero-filled vector
+            is synthesized when omitted (the op reads it only under
+            the JumpReLU branch).
 
     Returns:
         ``(n_tokens, d_model)`` tensor in the same dtype as
@@ -698,6 +740,20 @@ def apply_sae_full_reconstruction(
             "clamp_only_if_active must be torch.bool; "
             f"got {clamp_only_if_active.dtype}."
         )
+    if activation is SAEActivation.JUMPRELU and threshold is None:
+        raise ValueError(
+            "JumpReLU requires a per-feature threshold tensor; got None."
+        )
+    if threshold is not None:
+        if tuple(threshold.shape) != (d_sae,):
+            raise ValueError(
+                f"threshold must be (d_sae,) = ({d_sae},); "
+                f"got {tuple(threshold.shape)}."
+            )
+        if threshold.dtype != torch.float32:
+            raise ValueError(
+                f"threshold must be torch.float32; got {threshold.dtype}."
+            )
 
     if n_clamp > 0 and not clampable_features.is_cuda:
         min_feature = int(clampable_features.min().item())
@@ -722,12 +778,20 @@ def apply_sae_full_reconstruction(
     if not recon_mask.is_cuda and not bool(torch.any(recon_mask).item()):
         return hidden_states.clone()
 
+    if threshold is None:
+        # ReLU/TopK: keep the op arity fixed with a zero-filled vector
+        # that the op only reads under the JumpReLU branch.
+        threshold = torch.zeros(
+            d_sae, dtype=torch.float32, device=hidden_states.device
+        )
+
     code = _ACTIVATION_TO_CODE[activation]
     param = _activation_to_scalar(activation, activation_params)
     return apply_sae_full_reconstruction_op(
         hidden_states,
         encoder_weight,
         encoder_bias,
+        threshold,
         decoder_weight,
         decoder_bias,
         clampable_features,
@@ -777,6 +841,7 @@ def apply_layer_sae_full_reconstruction(
 
     enc_w = getattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
     enc_b = getattr(module, HOOK_POINT_FR_ENCODER_BIAS_ATTR[hook_point])
+    threshold = getattr(module, HOOK_POINT_FR_THRESHOLD_ATTR[hook_point])
     dec_w = getattr(module, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[hook_point])
     dec_b = getattr(module, HOOK_POINT_FR_DECODER_BIAS_ATTR[hook_point])
     kind_table = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
@@ -803,6 +868,7 @@ def apply_layer_sae_full_reconstruction(
         hidden_states,
         enc_w,
         enc_b,
+        threshold,
         dec_w,
         dec_b,
         clampable_features,
@@ -960,6 +1026,7 @@ __all__ = [
     "HOOK_POINT_FR_ENCODER_WEIGHT_ATTR",
     "HOOK_POINT_FR_MODULE_NAME_ATTR",
     "HOOK_POINT_FR_ROW_ACTIVE_ATTR",
+    "HOOK_POINT_FR_THRESHOLD_ATTR",
     "SAEFullReconstructionManager",
     "apply_layer_sae_full_reconstruction",
     "apply_sae_full_reconstruction",

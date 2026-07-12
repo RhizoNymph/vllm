@@ -67,6 +67,7 @@ def _ref_apply_full_reconstruction(
     clamp_value: torch.Tensor,
     clamp_only_if_active: torch.Tensor,
     recon_mask: torch.Tensor,
+    threshold: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Hand-rolled per-(token, feature) reference.
 
@@ -74,7 +75,7 @@ def _ref_apply_full_reconstruction(
     being checked against a transparent definition; this loop must
     promote to fp32 in the same places the contract demands so a
     pure-fp32 expectation cannot mask a bug in the production code's
-    promotion seams.
+    promotion seams.  JumpReLU uses a per-feature ``threshold[j]``.
     """
     n_tokens, d_model = hidden_states.shape
     d_sae = encoder_weight.shape[0]
@@ -93,8 +94,9 @@ def _ref_apply_full_reconstruction(
         if activation is SAEActivation.RELU:
             f = torch.clamp(pre_act, min=0.0)
         elif activation is SAEActivation.JUMPRELU:
-            threshold = activation_params["threshold"]
-            f = torch.where(pre_act > threshold, pre_act, torch.zeros_like(pre_act))
+            assert threshold is not None
+            thr = threshold.to(torch.float32)
+            f = torch.where(pre_act > thr, pre_act, torch.zeros_like(pre_act))
         elif activation is SAEActivation.TOPK:
             k = int(activation_params["k"])
             if k >= d_sae:
@@ -184,8 +186,38 @@ class TestSaeEncodeFull:
         h = torch.tensor([[1.0, 0.5]])
         W_enc = torch.eye(2)
         b_enc = torch.zeros(2)
-        f = sae_encode_full(h, W_enc, b_enc, SAEActivation.JUMPRELU, {"threshold": 0.7})
+        f = sae_encode_full(
+            h,
+            W_enc,
+            b_enc,
+            SAEActivation.JUMPRELU,
+            {},
+            threshold=torch.full((2,), 0.7),
+        )
         assert torch.allclose(f, torch.tensor([[1.0, 0.0]]))
+
+    def test_jumprelu_per_feature_thresholds(self):
+        # Identical pre-activations gated apart purely by per-feature
+        # thresholds.
+        h = torch.tensor([[0.5, 0.5]])
+        W_enc = torch.eye(2)
+        b_enc = torch.zeros(2)
+        f = sae_encode_full(
+            h,
+            W_enc,
+            b_enc,
+            SAEActivation.JUMPRELU,
+            {},
+            threshold=torch.tensor([0.2, 0.8]),
+        )
+        assert torch.allclose(f, torch.tensor([[0.5, 0.0]]))
+
+    def test_jumprelu_requires_threshold(self):
+        h = torch.tensor([[1.0]])
+        W_enc = torch.tensor([[1.0]])
+        b_enc = torch.tensor([0.0])
+        with pytest.raises(ValueError, match="threshold"):
+            sae_encode_full(h, W_enc, b_enc, SAEActivation.JUMPRELU, {})
 
     def test_topk_keeps_only_largest_full_d_sae(self):
         # The full-reconstruction TopK runs across the *full* d_sae,
@@ -535,14 +567,14 @@ class TestApplyFullReconMatchesReference:
     """Vectorized op must match the per-(token, feature) reference."""
 
     @pytest.mark.parametrize(
-        "activation,params",
+        "activation,params,use_threshold",
         [
-            (SAEActivation.RELU, {}),
-            (SAEActivation.JUMPRELU, {"threshold": 0.5}),
-            (SAEActivation.TOPK, {"k": 4}),
+            (SAEActivation.RELU, {}, False),
+            (SAEActivation.JUMPRELU, {}, True),
+            (SAEActivation.TOPK, {"k": 4}, False),
         ],
     )
-    def test_random_inputs_match_reference(self, activation, params):
+    def test_random_inputs_match_reference(self, activation, params, use_threshold):
         torch.manual_seed(0)
         n_tokens, d_model, d_sae, n_clamp = 5, 6, 12, 3
         inputs = _make_random_inputs(
@@ -553,6 +585,10 @@ class TestApplyFullReconMatchesReference:
             seed=42,
         )
         rng = torch.Generator(device="cpu").manual_seed(7)
+        # Non-constant per-feature thresholds over the full d_sae.
+        threshold = (
+            torch.rand(d_sae, generator=rng) - 0.5 if use_threshold else None
+        )
         clamp_kind = torch.randint(
             0, 3, (n_tokens, n_clamp), generator=rng, dtype=torch.int8
         )
@@ -567,6 +603,7 @@ class TestApplyFullReconMatchesReference:
             clamp_value=clamp_value,
             clamp_only_if_active=only,
             recon_mask=recon_mask,
+            threshold=threshold,
         )
         got = apply_sae_full_reconstruction(
             **inputs,
@@ -576,8 +613,44 @@ class TestApplyFullReconMatchesReference:
             clamp_value=clamp_value,
             clamp_only_if_active=only,
             recon_mask=recon_mask,
+            threshold=threshold,
         )
         assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5)
+
+    def test_jumprelu_per_feature_differs_from_median_scalar(self):
+        """Per-feature thresholds must be observably different from
+        folding the vector to its median scalar."""
+        # Identity SAE, d_sae == d_model == 2; both features share the
+        # same pre-activation (1.0) but have different thresholds.
+        h = torch.tensor([[1.0, 1.0]])
+        eye = torch.eye(2)
+        zeros2 = torch.zeros(2)
+        per_feature = torch.tensor([0.5, 1.5])
+        # The old fold used np.median (interpolating) → 1.0.
+        median_scalar = torch.full((2,), 1.0)
+        feats = torch.zeros(0, dtype=torch.int64)
+        clamps = _zero_clamps(1, 0)
+
+        common = dict(
+            hidden_states=h,
+            encoder_weight=eye,
+            encoder_bias=zeros2,
+            decoder_weight=eye,
+            decoder_bias=zeros2,
+            activation=SAEActivation.JUMPRELU,
+            activation_params={},
+            clampable_features=feats,
+            **clamps,
+            recon_mask=torch.ones(1, dtype=torch.bool),
+        )
+        got = apply_sae_full_reconstruction(**common, threshold=per_feature)
+        got_median = apply_sae_full_reconstruction(**common, threshold=median_scalar)
+
+        # Per-feature: feature 0 fires (1.0 > 0.5), feature 1 doesn't
+        # (1.0 <= 1.5).  Median scalar 1.0 gates both features dead.
+        torch.testing.assert_close(got, torch.tensor([[1.0, 0.0]]))
+        torch.testing.assert_close(got_median, torch.tensor([[0.0, 0.0]]))
+        assert not torch.allclose(got, got_median)
 
     def test_per_token_clamp_independence(self):
         # Token A has an absolute clamp; token B has none.  Token B

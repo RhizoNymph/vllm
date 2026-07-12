@@ -29,9 +29,9 @@ def _manifest(
     activation_params: dict[str, float] | None = None,
     weights_uri: str | None = "/tmp/sae",
 ) -> SAEModuleManifest:
-    if activation_params is None and activation is SAEActivation.JUMPRELU:
-        activation_params = {"threshold": 0.0}
-    elif activation_params is None and activation is SAEActivation.TOPK:
+    # JumpReLU carries no activation params — per-feature thresholds
+    # ride the weights payload, not the manifest.
+    if activation_params is None and activation is SAEActivation.TOPK:
         activation_params = {"k": 1.0}
     return SAEModuleManifest(
         d_model=d_model,
@@ -205,7 +205,9 @@ class TestRegisterSAE:
         "manifest",
         [
             _manifest(activation=SAEActivation.RELU, activation_params={"k": 1.0}),
-            _manifest(activation_params={}),
+            # JumpReLU must carry empty activation_params — scalar
+            # thresholds in the manifest are no longer valid.
+            _manifest(activation_params={"threshold": 0.5}),
             _manifest(activation_params={"threshold": True}),  # type: ignore[dict-item]
             _manifest(activation=SAEActivation.TOPK, activation_params={}),
             _manifest(activation=SAEActivation.TOPK, activation_params={"k": 0.0}),
@@ -283,7 +285,9 @@ class TestRegisterSAE:
             )
 
     @pytest.mark.asyncio
-    async def test_sae_rejects_site_overlap_with_existing_module(self):
+    async def test_sae_delta_modules_may_share_sites(self):
+        # Delta modules compose at a shared site (each gets its own
+        # worker buffer slot); the API must not reject the overlap.
         reg = SteeringModuleRegistry()
         await reg.register(
             name="g",
@@ -291,12 +295,14 @@ class TestRegisterSAE:
             sae_manifest=_manifest(layers=((0, "post_block"),)),
         )
 
-        with pytest.raises(ValueError, match="overlap existing SAE module"):
-            await reg.register(
-                name="h",
-                kind=SteeringModuleKind.SAE_DELTA,
-                sae_manifest=_manifest(layers=((0, "post_block"),)),
-            )
+        await reg.register(
+            name="h",
+            kind=SteeringModuleKind.SAE_DELTA,
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
+        )
+
+        assert reg.get("g") is not None
+        assert reg.get("h") is not None
 
     @pytest.mark.asyncio
     async def test_sae_replacement_may_reuse_its_existing_sites(self):
@@ -312,6 +318,80 @@ class TestRegisterSAE:
             kind=SteeringModuleKind.SAE_DELTA,
             sae_manifest=_manifest(layers=((0, "post_block"),)),
         )
+
+    @pytest.mark.asyncio
+    async def test_fr_rejects_site_overlap_with_existing_fr_module(self):
+        # Full reconstruction replaces the residual; two replacements
+        # on one site are semantically ill-defined, so FR-vs-FR
+        # overlap is rejected at registration.
+        reg = SteeringModuleRegistry()
+        await reg.register(
+            name="fr1",
+            kind=SteeringModuleKind.SAE_FULL_RECONSTRUCTION,
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
+        )
+
+        with pytest.raises(
+            ValueError, match="overlap existing full-reconstruction"
+        ):
+            await reg.register(
+                name="fr2",
+                kind=SteeringModuleKind.SAE_FULL_RECONSTRUCTION,
+                sae_manifest=_manifest(layers=((0, "post_block"),)),
+            )
+
+    @pytest.mark.asyncio
+    async def test_fr_replacement_may_reuse_its_existing_sites(self):
+        reg = SteeringModuleRegistry()
+        await reg.register(
+            name="fr",
+            kind=SteeringModuleKind.SAE_FULL_RECONSTRUCTION,
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
+        )
+
+        await reg.register(
+            name="fr",
+            kind=SteeringModuleKind.SAE_FULL_RECONSTRUCTION,
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_fr_over_delta_site_accepted(self):
+        # An FR module may share a site with delta modules: deltas run
+        # first, the reconstruction replaces last.
+        reg = SteeringModuleRegistry()
+        await reg.register(
+            name="g",
+            kind=SteeringModuleKind.SAE_DELTA,
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
+        )
+
+        await reg.register(
+            name="fr",
+            kind=SteeringModuleKind.SAE_FULL_RECONSTRUCTION,
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
+        )
+
+        assert reg.get("g") is not None
+        assert reg.get("fr") is not None
+
+    @pytest.mark.asyncio
+    async def test_delta_over_fr_site_accepted(self):
+        reg = SteeringModuleRegistry()
+        await reg.register(
+            name="fr",
+            kind=SteeringModuleKind.SAE_FULL_RECONSTRUCTION,
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
+        )
+
+        await reg.register(
+            name="g",
+            kind=SteeringModuleKind.SAE_DELTA,
+            sae_manifest=_manifest(layers=((0, "post_block"),)),
+        )
+
+        assert reg.get("g") is not None
+        assert reg.get("fr") is not None
 
 
 class TestValidateAdditiveLookup:

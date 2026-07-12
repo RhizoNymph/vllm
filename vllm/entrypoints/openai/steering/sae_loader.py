@@ -31,18 +31,20 @@ Out of scope:
   artifact and hand the loader a local path.  Keeping this module
   network-free preserves the unit-test contract — the readers are
   deterministic functions of on-disk bytes.
-* **Per-feature JumpReLU thresholds.**  The current kernel takes a
-  scalar ``threshold`` parameter; Gemma Scope ships per-feature
-  thresholds.  When the loader reads a per-feature threshold array,
-  the median of the *clampable-subset* thresholds is used by default,
-  and an explicit ``activation_params={"threshold": value}`` override
-  is honoured if supplied.  Tracked as a follow-up; documented inline
-  on :func:`load_gemma_scope_sae`.
+
+JumpReLU thresholds are **per-feature tensors** riding the weights
+dict — ``weights[site]["threshold"]`` — not the manifest: ``(n_clamp,)``
+for the delta path (aligned with ``clampable_features`` order) and
+``(d_sae,)`` for the full-reconstruction path.  JumpReLU manifests
+carry empty ``activation_params``; an explicit
+``activation_params={"threshold": value}`` override is honoured by
+emitting a constant threshold vector instead of the checkpoint's.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -69,7 +71,8 @@ class LoadedSAEModule:
     ``weights`` maps each ``(layer_idx, hook_str)`` site declared by
     the manifest to a dict of ``{"encoder_weight", "encoder_bias",
     "decoder_weight"}`` tensors whose rows are already aligned to
-    ``manifest.clampable_features``.
+    ``manifest.clampable_features``, plus a per-feature fp32
+    ``"threshold"`` tensor when the activation is JumpReLU.
 
     ``weights`` is sized to *all* (layer, hook) sites declared in
     ``manifest.layers``; callers (e.g. :meth:`attach_sae_weights`)
@@ -115,7 +118,9 @@ def load_sae_module_from_dir(path: str | Path) -> LoadedSAEModule:
     ``encoder_weight`` (``n_clamp, d_model``), ``encoder_bias``
     (``n_clamp,``), and ``decoder_weight`` (``n_clamp, d_model``),
     where the row index ``i`` corresponds to
-    ``manifest.clampable_features[i]``.
+    ``manifest.clampable_features[i]``.  When the manifest activation
+    is JumpReLU, a per-feature ``threshold`` tensor (``n_clamp,``) is
+    also required (optional — but validated — otherwise).
 
     Raises:
         FileNotFoundError: when the directory or a required file is
@@ -184,6 +189,7 @@ def _load_weights_for_manifest(
             d_model=manifest.d_model,
             n_clamp=n_clamp,
             site=(layer_idx, hook_str),
+            activation=manifest.activation,
         )
         out[(layer_idx, hook_str)] = site
     return out
@@ -195,13 +201,21 @@ def _validate_site_tensors(
     d_model: int,
     n_clamp: int,
     site: tuple[int, str],
+    activation: SAEActivation,
 ) -> dict[str, torch.Tensor]:
-    """Validate the three required tensors for one ``(layer, hook)`` site."""
+    """Validate the required tensors for one ``(layer, hook)`` site.
+
+    The per-feature ``threshold`` tensor is required when
+    ``activation`` is JumpReLU; when present for other activations it
+    is validated against the same shape/dtype/finiteness contract.
+    """
     expected_shapes: dict[str, tuple[int, ...]] = {
         "encoder_weight": (n_clamp, d_model),
         "encoder_bias": (n_clamp,),
         "decoder_weight": (n_clamp, d_model),
     }
+    if activation is SAEActivation.JUMPRELU or "threshold" in tensors:
+        expected_shapes["threshold"] = (n_clamp,)
     out: dict[str, torch.Tensor] = {}
     for key, expected in expected_shapes.items():
         if key not in tensors:
@@ -264,17 +278,12 @@ def load_gemma_scope_sae(
     encoder activation function for one feature is
     ``f_i = pre_act_i if pre_act_i > threshold[i] else 0``.
 
-    The current SAE kernel takes a *scalar* ``threshold`` parameter
-    (kept simple so the kernel JIT specialises on a single constexpr
-    branch).  When ``activation_params`` is omitted, the median of
-    the *clampable-subset* thresholds is used.  Pass
-    ``activation_params={"threshold": value}`` to override.  This
-    simplification is acceptable for the absolute-clamp path
-    (``delta = target - f``) where the steering effect is dominated
-    by ``target`` and the choice of threshold only perturbs ``f``;
-    it is **not** acceptable for additive clamps with
-    ``only_if_active=True``, which depend on whether ``f > 0`` matches
-    the SAE's training distribution.  Tracked as a follow-up.
+    The per-feature thresholds are subset to ``clampable_features``
+    (aligned with the encoder/decoder rows) and emitted as a
+    ``(n_clamp,)`` fp32 ``"threshold"`` tensor in the returned
+    ``weights`` dict; the manifest's ``activation_params`` stays
+    empty for JumpReLU.  Pass ``activation_params={"threshold":
+    value}`` to override with a constant threshold vector instead.
 
     Returns a :class:`LoadedSAEModule` covering only the supplied
     ``(layer_idx, hook_str)`` site.  Multi-site composition (one SAE
@@ -293,10 +302,11 @@ def load_gemma_scope_sae(
             raise :class:`ValueError`.
         activation: encoder activation function.  Defaults to
             :attr:`SAEActivation.JUMPRELU`, matching Gemma Scope.
-        activation_params: explicit activation params override.
-            JumpReLU expects ``{"threshold": float}``.  When omitted,
-            the median per-feature threshold over the clampable
-            subset is used.
+        activation_params: explicit activation params override.  For
+            JumpReLU only ``{"threshold": float}`` is accepted; it
+            replaces the checkpoint's per-feature thresholds with a
+            constant vector.  When omitted, the checkpoint's
+            per-feature thresholds (clampable subset) are used.
         weights_dtype: dtype the encoder/decoder tensors are
             materialised in.  Defaults to fp32; callers that intend
             to pass weights to the worker can supply the model's
@@ -403,18 +413,26 @@ def load_gemma_scope_sae(
     )
     dec_w_t = torch.from_numpy(np.ascontiguousarray(decoder_subset)).to(weights_dtype)
 
-    resolved_params = _resolve_jumprelu_params(
-        activation=activation,
-        activation_params=activation_params,
-        threshold_subset=threshold_subset,
-    )
+    site_tensors: dict[str, torch.Tensor] = {
+        "encoder_weight": enc_w_t,
+        "encoder_bias": enc_b_t,
+        "decoder_weight": dec_w_t,
+    }
+    if activation is SAEActivation.JUMPRELU:
+        site_tensors["threshold"] = _jumprelu_threshold_tensor(
+            activation_params=activation_params,
+            per_feature_thresholds=threshold_subset,
+        )
+        manifest_params: dict[str, float] = {}
+    else:
+        manifest_params = dict(activation_params) if activation_params else {}
     manifest = SAEModuleManifest(
         d_model=int(d_model),
         d_sae=int(d_sae),
         activation=activation,
         layers=((layer_idx, str(hook_str)),),
         clampable_features=tuple(feature_list),
-        activation_params=resolved_params,
+        activation_params=manifest_params,
     )
     SteeringModuleRegistry()._validate_sae_manifest(
         name=str(npz_path),
@@ -423,35 +441,48 @@ def load_gemma_scope_sae(
     return LoadedSAEModule(
         manifest=manifest,
         weights={
-            (layer_idx, str(hook_str)): {
-                "encoder_weight": enc_w_t,
-                "encoder_bias": enc_b_t,
-                "decoder_weight": dec_w_t,
-            },
+            (layer_idx, str(hook_str)): site_tensors,
         },
     )
 
 
-def _resolve_jumprelu_params(
+def _jumprelu_threshold_tensor(
     *,
-    activation: SAEActivation,
     activation_params: Mapping[str, float] | None,
-    threshold_subset: np.ndarray,
-) -> dict[str, float]:
-    """Pick the scalar threshold the kernel will use for this site.
+    per_feature_thresholds: np.ndarray,
+) -> torch.Tensor:
+    """Build the per-feature JumpReLU threshold tensor for one site.
 
-    Honours an explicit ``activation_params['threshold']`` override
-    when supplied; otherwise falls back to the median of the
-    clampable-subset thresholds for JumpReLU activations.  Other
-    activations carry their caller-supplied params unchanged.
+    Defaults to the checkpoint's per-feature thresholds.  An explicit
+    ``activation_params={"threshold": value}`` override emits a
+    constant vector of the same length instead; the value must be a
+    finite real number and no other keys are accepted.
     """
-    if activation_params is not None:
-        return dict(activation_params)
-    if activation is SAEActivation.JUMPRELU:
-        if threshold_subset.size == 0:
-            return {"threshold": 0.0}
-        return {"threshold": float(np.median(threshold_subset))}
-    return {}
+    override: float | None = None
+    if activation_params:
+        extra = set(activation_params) - {"threshold"}
+        if extra:
+            raise ValueError(
+                "jumprelu activation_params accepts only a 'threshold' "
+                f"override; got unexpected keys {sorted(extra)}."
+            )
+        raw = activation_params["threshold"]
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, (int, float))
+            or not math.isfinite(float(raw))
+        ):
+            raise ValueError(
+                "jumprelu activation_params 'threshold' override must be "
+                f"a finite number, got {raw!r}."
+            )
+        override = float(raw)
+    n = int(per_feature_thresholds.shape[0])
+    if override is not None:
+        return torch.full((n,), override, dtype=torch.float32)
+    return torch.from_numpy(np.ascontiguousarray(per_feature_thresholds)).to(
+        torch.float32
+    )
 
 
 def merge_loaded_sae_modules(
@@ -466,6 +497,12 @@ def merge_loaded_sae_modules(
     needs the same feature ordering across every site of one module).
     Sites must be unique — declaring the same ``(layer_idx, hook_str)``
     in two parts raises :class:`ValueError`.
+
+    JumpReLU thresholds are per-site tensors in each part's
+    ``weights`` dict, so parts with different per-feature thresholds
+    merge cleanly — their manifests all carry empty
+    ``activation_params`` and the ``activation_params`` equality check
+    is trivially satisfied.
 
     Args:
         parts: per-(layer, hook) loaded modules to merge.
@@ -573,6 +610,8 @@ def load_gemma_scope_sae_full_recon(
     * ``encoder_bias``   : ``(d_sae,)``               — ``b_enc``
     * ``decoder_weight`` : ``(d_sae, d_model)``       — ``W_dec``
     * ``decoder_bias``   : ``(d_model,)``             — ``b_dec``
+    * ``threshold``      : ``(d_sae,)`` fp32          — per-feature
+      JumpReLU thresholds (JumpReLU activation only)
 
     The returned :class:`SAEModuleManifest` carries the full ``d_sae``
     in ``d_sae`` and the caller-supplied ``clampable_features`` —
@@ -581,17 +620,12 @@ def load_gemma_scope_sae_full_recon(
     feature; the kernel reads the clampable subset by gathering at
     those indices.
 
-    JumpReLU thresholds: same simplification as the delta-path
-    loader.  Gemma Scope ships per-feature thresholds; the kernel
-    takes a scalar.  The median over the *clampable subset* is used
-    by default; pass ``activation_params={"threshold": value}`` to
-    override.  This matters more for the full-reconstruction path
-    than for the delta path — the encoder runs over every feature,
-    so a uniform threshold over the full SAE is a noticeable
-    simplification.  Tracked as a follow-up; for the qualitative
-    output-shift assertion in the e2e test the simplification is
-    acceptable, but quantitative reconstruction-fidelity work
-    needs per-feature thresholds first.
+    JumpReLU thresholds: the encoder runs over every feature here,
+    so the loader emits the checkpoint's **full** ``(d_sae,)``
+    per-feature threshold vector (not a clampable subset).  Pass
+    ``activation_params={"threshold": value}`` to override with a
+    constant vector; the manifest's ``activation_params`` stays
+    empty for JumpReLU.
     """
     if hook_str not in VALID_HOOK_POINT_NAMES:
         raise ValueError(
@@ -671,29 +705,33 @@ def load_gemma_scope_sae_full_recon(
     dec_w_t = torch.from_numpy(np.ascontiguousarray(W_dec)).to(weights_dtype)
     dec_b_t = torch.from_numpy(np.ascontiguousarray(b_dec)).to(weights_dtype)
 
-    feat_idx = np.asarray(feature_list, dtype=np.int64)
-    threshold_subset = thresholds[feat_idx]
-    resolved_params = _resolve_jumprelu_params(
-        activation=activation,
-        activation_params=activation_params,
-        threshold_subset=threshold_subset,
-    )
+    site_tensors: dict[str, torch.Tensor] = {
+        "encoder_weight": enc_w_t,
+        "encoder_bias": enc_b_t,
+        "decoder_weight": dec_w_t,
+        "decoder_bias": dec_b_t,
+    }
+    if activation is SAEActivation.JUMPRELU:
+        # Full-reconstruction encodes every feature — emit the full
+        # (d_sae,) per-feature threshold vector.
+        site_tensors["threshold"] = _jumprelu_threshold_tensor(
+            activation_params=activation_params,
+            per_feature_thresholds=thresholds,
+        )
+        manifest_params: dict[str, float] = {}
+    else:
+        manifest_params = dict(activation_params) if activation_params else {}
     manifest = SAEModuleManifest(
         d_model=int(d_model),
         d_sae=int(d_sae),
         activation=activation,
         layers=((int(layer_idx), str(hook_str)),),
         clampable_features=tuple(int(f) for f in feature_list),
-        activation_params=resolved_params,
+        activation_params=manifest_params,
     )
     return LoadedSAEModule(
         manifest=manifest,
         weights={
-            (int(layer_idx), str(hook_str)): {
-                "encoder_weight": enc_w_t,
-                "encoder_bias": enc_b_t,
-                "decoder_weight": dec_w_t,
-                "decoder_bias": dec_b_t,
-            },
+            (int(layer_idx), str(hook_str)): site_tensors,
         },
     )

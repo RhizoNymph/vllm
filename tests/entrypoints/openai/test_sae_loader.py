@@ -28,6 +28,7 @@ from vllm.entrypoints.openai.steering.sae_loader import (
     LoadedSAEModule,
     _site_filename,
     load_gemma_scope_sae,
+    load_gemma_scope_sae_full_recon,
     load_sae_module_from_dir,
     merge_loaded_sae_modules,
 )
@@ -68,15 +69,19 @@ def _write_site(
     encoder_weight: torch.Tensor,
     encoder_bias: torch.Tensor,
     decoder_weight: torch.Tensor,
+    threshold: torch.Tensor | None = None,
 ) -> None:
     from safetensors.torch import save_file
 
+    tensors = {
+        "encoder_weight": encoder_weight.contiguous(),
+        "encoder_bias": encoder_bias.contiguous(),
+        "decoder_weight": decoder_weight.contiguous(),
+    }
+    if threshold is not None:
+        tensors["threshold"] = threshold.contiguous()
     save_file(
-        {
-            "encoder_weight": encoder_weight.contiguous(),
-            "encoder_bias": encoder_bias.contiguous(),
-            "decoder_weight": decoder_weight.contiguous(),
-        },
+        tensors,
         str(base / _site_filename(layer_idx, hook_str)),
     )
 
@@ -338,6 +343,72 @@ class TestLoadSAEModuleFromDir:
         with pytest.raises(ValueError, match="finite values"):
             load_sae_module_from_dir(tmp_path)
 
+    def test_jumprelu_manifest_round_trips_threshold_tensor(self, tmp_path: Path):
+        _write_manifest(
+            tmp_path,
+            d_model=4,
+            d_sae=8,
+            activation="jumprelu",
+            layers=[(0, "post_block")],
+            clampable_features=[0, 3],
+        )
+        threshold = torch.tensor([0.25, 0.75])
+        _write_site(
+            tmp_path,
+            layer_idx=0,
+            hook_str="post_block",
+            encoder_weight=torch.zeros(2, 4),
+            encoder_bias=torch.zeros(2),
+            decoder_weight=torch.zeros(2, 4),
+            threshold=threshold,
+        )
+        loaded = load_sae_module_from_dir(tmp_path)
+        assert loaded.manifest.activation is SAEActivation.JUMPRELU
+        assert loaded.manifest.activation_params == {}
+        assert torch.equal(loaded.weights[(0, "post_block")]["threshold"], threshold)
+
+    def test_jumprelu_manifest_missing_threshold_tensor_raises(self, tmp_path: Path):
+        _write_manifest(
+            tmp_path,
+            d_model=4,
+            d_sae=8,
+            activation="jumprelu",
+            layers=[(0, "post_block")],
+            clampable_features=[0, 3],
+        )
+        _write_site(
+            tmp_path,
+            layer_idx=0,
+            hook_str="post_block",
+            encoder_weight=torch.zeros(2, 4),
+            encoder_bias=torch.zeros(2),
+            decoder_weight=torch.zeros(2, 4),
+            # threshold deliberately omitted — required for JumpReLU.
+        )
+        with pytest.raises(ValueError, match="threshold"):
+            load_sae_module_from_dir(tmp_path)
+
+    def test_jumprelu_manifest_threshold_shape_mismatch_raises(self, tmp_path: Path):
+        _write_manifest(
+            tmp_path,
+            d_model=4,
+            d_sae=8,
+            activation="jumprelu",
+            layers=[(0, "post_block")],
+            clampable_features=[0, 3],
+        )
+        _write_site(
+            tmp_path,
+            layer_idx=0,
+            hook_str="post_block",
+            encoder_weight=torch.zeros(2, 4),
+            encoder_bias=torch.zeros(2),
+            decoder_weight=torch.zeros(2, 4),
+            threshold=torch.zeros(3),  # wrong: should be (2,)
+        )
+        with pytest.raises(ValueError, match="threshold"):
+            load_sae_module_from_dir(tmp_path)
+
 
 # ---------------------------------------------------------------------------
 # Gemma Scope NPZ layout
@@ -399,7 +470,7 @@ class TestLoadGemmaScopeSAE:
         )
         assert npz.zip is None
 
-    def test_default_threshold_is_median_of_subset(self, tmp_path: Path):
+    def test_default_threshold_is_per_feature_subset(self, tmp_path: Path):
         d_model, d_sae = 4, 8
         path = tmp_path / "params.npz"
         arrs = _make_gemma_scope_npz(path, d_model=d_model, d_sae=d_sae)
@@ -409,10 +480,14 @@ class TestLoadGemmaScopeSAE:
             path, layer_idx=0, hook_str="post_block", clampable_features=feats
         )
         assert loaded.manifest.activation is SAEActivation.JUMPRELU
-        threshold = loaded.manifest.activation_params["threshold"]
-        # Median of the three feature thresholds — small enough to assert
-        # exactly under fp32.
-        assert threshold == pytest.approx(float(np.median(arrs["threshold"][feats])))
+        # Per-feature thresholds ride the weights dict, aligned with the
+        # clampable-features order; the manifest stays param-free.
+        assert loaded.manifest.activation_params == {}
+        threshold = loaded.weights[(0, "post_block")]["threshold"]
+        assert threshold.dtype is torch.float32
+        assert torch.equal(
+            threshold, torch.from_numpy(arrs["threshold"][feats]).float()
+        )
 
     def test_explicit_activation_params_override(self, tmp_path: Path):
         path = tmp_path / "params.npz"
@@ -425,7 +500,12 @@ class TestLoadGemmaScopeSAE:
             clampable_features=[0, 1],
             activation_params={"threshold": 0.123},
         )
-        assert loaded.manifest.activation_params == {"threshold": 0.123}
+        # The override emits a constant per-feature vector; the manifest
+        # still carries empty activation_params for JumpReLU.
+        assert loaded.manifest.activation_params == {}
+        threshold = loaded.weights[(0, "post_block")]["threshold"]
+        assert threshold.dtype is torch.float32
+        assert torch.equal(threshold, torch.full((2,), 0.123))
 
     def test_invalid_explicit_activation_params_raise(self, tmp_path: Path):
         path = tmp_path / "params.npz"
@@ -482,6 +562,54 @@ class TestLoadGemmaScopeSAE:
         assert loaded.manifest.activation is SAEActivation.RELU
         # ReLU has no params; default behaviour returns an empty dict.
         assert loaded.manifest.activation_params == {}
+        # And the weights dict carries no threshold tensor — the
+        # zero-filled runtime buffer suffices for non-JumpReLU sites.
+        assert "threshold" not in loaded.weights[(0, "post_block")]
+
+    def test_unexpected_jumprelu_override_keys_raise(self, tmp_path: Path):
+        path = tmp_path / "params.npz"
+        _make_gemma_scope_npz(path)
+
+        with pytest.raises(ValueError, match="activation_params"):
+            load_gemma_scope_sae(
+                path,
+                layer_idx=0,
+                hook_str="post_block",
+                clampable_features=[0, 1],
+                activation_params={"threshold": 0.1, "bogus": 1.0},
+            )
+
+    def test_merge_sites_with_differing_thresholds_succeeds(self, tmp_path: Path):
+        # Two Gemma Scope sites whose per-feature thresholds differ —
+        # under the old scalar-median fold their activation_params
+        # disagreed and the merge failed; per-site threshold tensors
+        # merge cleanly.
+        d_model, d_sae = 4, 8
+        path_a = tmp_path / "a.npz"
+        path_b = tmp_path / "b.npz"
+        arrs_a = _make_gemma_scope_npz(path_a, d_model=d_model, d_sae=d_sae, seed=1)
+        arrs_b = _make_gemma_scope_npz(path_b, d_model=d_model, d_sae=d_sae, seed=2)
+        feats = [1, 3]
+        assert not np.allclose(arrs_a["threshold"][feats], arrs_b["threshold"][feats])
+
+        a = load_gemma_scope_sae(
+            path_a, layer_idx=0, hook_str="post_block", clampable_features=feats
+        )
+        b = load_gemma_scope_sae(
+            path_b, layer_idx=1, hook_str="post_attn", clampable_features=feats
+        )
+        merged = merge_loaded_sae_modules([a, b])
+
+        assert merged.manifest.layers == ((0, "post_block"), (1, "post_attn"))
+        assert merged.manifest.activation_params == {}
+        assert torch.equal(
+            merged.weights[(0, "post_block")]["threshold"],
+            torch.from_numpy(arrs_a["threshold"][feats]).float(),
+        )
+        assert torch.equal(
+            merged.weights[(1, "post_attn")]["threshold"],
+            torch.from_numpy(arrs_b["threshold"][feats]).float(),
+        )
 
     def test_dtype_argument_is_honoured(self, tmp_path: Path):
         path = tmp_path / "params.npz"
@@ -617,6 +745,59 @@ class TestLoadGemmaScopeSAE:
             load_gemma_scope_sae(
                 path, layer_idx=0, hook_str="post_block", clampable_features=[0]
             )
+
+
+class TestLoadGemmaScopeSAEFullRecon:
+    """Full-reconstruction loader: full (d_sae,) threshold vector."""
+
+    def test_emits_full_d_sae_threshold_vector(self, tmp_path: Path):
+        d_model, d_sae = 8, 16
+        path = tmp_path / "params.npz"
+        arrs = _make_gemma_scope_npz(path, d_model=d_model, d_sae=d_sae)
+
+        loaded = load_gemma_scope_sae_full_recon(
+            path,
+            layer_idx=20,
+            hook_str="post_block",
+            clampable_features=[3, 7],
+        )
+        assert loaded.manifest.activation is SAEActivation.JUMPRELU
+        assert loaded.manifest.activation_params == {}
+        site = loaded.weights[(20, "post_block")]
+        threshold = site["threshold"]
+        assert threshold.shape == (d_sae,)
+        assert threshold.dtype is torch.float32
+        assert torch.equal(threshold, torch.from_numpy(arrs["threshold"]).float())
+
+    def test_override_emits_constant_full_vector(self, tmp_path: Path):
+        d_model, d_sae = 8, 16
+        path = tmp_path / "params.npz"
+        _make_gemma_scope_npz(path, d_model=d_model, d_sae=d_sae)
+
+        loaded = load_gemma_scope_sae_full_recon(
+            path,
+            layer_idx=20,
+            hook_str="post_block",
+            clampable_features=[3, 7],
+            activation_params={"threshold": 0.5},
+        )
+        assert loaded.manifest.activation_params == {}
+        threshold = loaded.weights[(20, "post_block")]["threshold"]
+        assert torch.equal(threshold, torch.full((d_sae,), 0.5))
+
+    def test_relu_activation_has_no_threshold(self, tmp_path: Path):
+        path = tmp_path / "params.npz"
+        _make_gemma_scope_npz(path)
+
+        loaded = load_gemma_scope_sae_full_recon(
+            path,
+            layer_idx=20,
+            hook_str="post_block",
+            clampable_features=[0, 1],
+            activation=SAEActivation.RELU,
+        )
+        assert loaded.manifest.activation_params == {}
+        assert "threshold" not in loaded.weights[(20, "post_block")]
 
 
 # ---------------------------------------------------------------------------

@@ -567,11 +567,15 @@ GEMMs per opted-in token per hooked layer).
 - **Batch chat API requires packed steering vectors**
   (`SteeringVectorSpecPacked`); legacy dict-of-lists vectors are not
   accepted on the batch surface.
-- **Scalar JumpReLU threshold.** Gemma Scope's per-feature
-  `(d_sae,)` thresholds are folded to the median over the clampable
-  subset; per-feature thresholds remain a kernel-level follow-up.
-- **At most one SAE module per (layer, hook) site and kind**;
-  double-registration raises.
+- **At most one full-reconstruction SAE module per (layer, hook)
+  site**; double-registration raises by design — two residual
+  replacements on one site are semantically ill-defined. Delta
+  (`sae_delta`) modules are not so limited: any number may share a
+  site (each gets its own buffer slot) and their deltas compose
+  sequentially in registration order, which is identical across ranks.
+  An FR module may also share a site with delta modules — deltas run
+  first, the reconstruction replaces last. Re-registering the *same*
+  module name at a site it already occupies still raises.
 
 ## Resolved Design Decisions
 

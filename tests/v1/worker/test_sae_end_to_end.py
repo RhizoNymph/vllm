@@ -44,8 +44,7 @@ from vllm.config.sae_steering_types import (
 )
 from vllm.exceptions import SteeringVectorError
 from vllm.model_executor.layers.sae_steering import (
-    HOOK_POINT_SAE_ANY_ACTIVE_ATTR,
-    HOOK_POINT_SAE_CLAMP_KIND_ATTR,
+    get_sae_slot_state,
     sae_buffers_attached,
 )
 from vllm.model_executor.layers.steering import (
@@ -707,7 +706,9 @@ class TestPopulatorWritesIntoBuffers:
         h._update_sae_buffers(scheduler_output)
 
         site = h._steerable_layers_cache[20]
-        kind = getattr(site, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
+        state = get_sae_slot_state(site, SteeringHookPoint.POST_BLOCK, "g")
+        assert state is not None
+        kind = state.clamp_kind
         row = h._sae_clamp_manager.config_to_row[
             (sp.prefill_sae_clamp_config_hash, "prefill")
         ]
@@ -759,9 +760,9 @@ class TestNoActiveStateShortCircuit:
         h._update_sae_buffers(scheduler_output)
 
         site = h._steerable_layers_cache[20]
-        any_active = getattr(
-            site, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
+        state = get_sae_slot_state(site, SteeringHookPoint.POST_BLOCK, "g")
+        assert state is not None
+        any_active = state.any_active
         assert any_active.item()
 
         h._release_sae_for_request("req-1", prefill_hash=111, decode_hash=222)
@@ -1368,12 +1369,142 @@ class TestMultiHookSaeRegistration:
         # Only one sae_index buffer materialised on the layer.
         assert hasattr(site, "sae_index")
 
-    def test_overlapping_sae_modules_rejected_worker_side(self):
+    def test_overlapping_sae_modules_accepted_worker_side(self):
+        # Delta modules may share a (layer, hook) site — each gets its
+        # own buffer slot on the layer.
         h = _E2EHarness(layer_indices=(20,), hidden_size=4)
         h.register_steering_modules({"a": _sae_payload(clampable=(0,))})
-
-        with pytest.raises(SteeringVectorError, match="overlap"):
-            h.register_steering_modules({"b": _sae_payload(clampable=(1,))})
+        h.register_steering_modules({"b": _sae_payload(clampable=(1,))})
 
         assert "a" in h._sae_module_registry
-        assert "b" not in h._sae_module_registry
+        assert "b" in h._sae_module_registry
+        site = h._steerable_layers_cache[20]
+        assert get_sae_slot_state(site, SteeringHookPoint.POST_BLOCK, "a") is not None
+        assert get_sae_slot_state(site, SteeringHookPoint.POST_BLOCK, "b") is not None
+
+
+class TestSharedSiteEndToEnd:
+    """Two delta modules on one site, driven through the full per-step
+    pipeline: RPC-surface registration, weight attach for both modules,
+    admission of a request whose clamp specs name both modules, buffer
+    update, and the composed forward."""
+
+    def test_request_clamping_both_modules_composes(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        # Module 'a' clamps feature 0 (identity encoder/decoder on
+        # h[0]); module 'b' clamps feature 1 (identity on h[1]).
+        h.register_steering_modules({"a": _sae_payload(clampable=(0,))})
+        h.register_steering_modules({"b": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "a", n_clamp=1, hidden_size=4)
+        # 'b' encoder reads h[1], decoder writes h[1].
+        enc_b = torch.zeros(1, 4)
+        enc_b[0, 1] = 1.0
+        h.attach_sae_weights(
+            "b",
+            {
+                (20, "post_block"): {
+                    "encoder_weight": enc_b,
+                    "encoder_bias": torch.zeros(1),
+                    "decoder_weight": enc_b.clone(),
+                }
+            },
+        )
+        spec_a = SAEClampSpec(
+            module_name="a",
+            clamps={
+                "post_block": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        spec_b = SAEClampSpec(
+            module_name="b",
+            clamps={
+                "post_block": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=11.0),)
+                }
+            },
+        )
+        sp = SamplingParams(sae_clamp_specs=(spec_a, spec_b))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=111, decode_hash=222, is_prefilling=True
+        )
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 0
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 111
+        scheduler_output = _StubSchedulerOutput(num_scheduled_tokens={"req-1": 2})
+        _sync_reqs_from_batch(h)
+        h._update_sae_buffers(scheduler_output)
+
+        residual = torch.tensor(
+            [
+                [2.0, 3.0, 0.0, 0.0],
+                [5.0, 1.0, 0.0, 0.0],
+            ]
+        )
+        site = h._steerable_layers_cache[20]
+        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
+        # Module 'a' clamps its feature (reading h[0]) to 7; module 'b'
+        # clamps its feature (reading h[1], after 'a' ran — 'a' only
+        # touched h[0], so h[1] is unchanged) to 11.
+        assert torch.allclose(out[:, 0], torch.tensor([7.0, 7.0]))
+        assert torch.allclose(out[:, 1], torch.tensor([11.0, 11.0]))
+        # Untouched dims pass through.
+        assert torch.allclose(out[:, 2:], residual[:, 2:])
+
+    def test_request_naming_one_module_leaves_other_idle(self):
+        h = _E2EHarness(layer_indices=(20,), hidden_size=4)
+        h.register_steering_modules({"a": _sae_payload(clampable=(0,))})
+        h.register_steering_modules({"b": _sae_payload(clampable=(0,))})
+        _attach_identity_weights(h, "a", n_clamp=1, hidden_size=4)
+        enc_b = torch.zeros(1, 4)
+        enc_b[0, 1] = 1.0
+        h.attach_sae_weights(
+            "b",
+            {
+                (20, "post_block"): {
+                    "encoder_weight": enc_b,
+                    "encoder_bias": torch.zeros(1),
+                    "decoder_weight": enc_b.clone(),
+                }
+            },
+        )
+        spec_b = SAEClampSpec(
+            module_name="b",
+            clamps={
+                "post_block": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=11.0),)
+                }
+            },
+        )
+        sp = SamplingParams(sae_clamp_specs=(spec_b,))
+        h._register_initial_sae_clamps(
+            "req-1", sp, prefill_hash=111, decode_hash=222, is_prefilling=True
+        )
+        h.input_batch.num_reqs = 1
+        h.input_batch.req_ids = ["req-1"]
+        h.input_batch.req_id_to_index = {"req-1": 0}
+        h.input_batch.num_computed_tokens_cpu[0] = 0
+        h.input_batch.num_prompt_tokens[0] = 4
+        h.input_batch.request_prefill_steering_hash[0] = 111
+        _sync_reqs_from_batch(h)
+        h._update_sae_buffers(
+            _StubSchedulerOutput(num_scheduled_tokens={"req-1": 1})
+        )
+
+        site = h._steerable_layers_cache[20]
+        # 'a' holds no active clamps: its slot's any_active stays clear
+        # while 'b' is active.
+        state_a = get_sae_slot_state(site, SteeringHookPoint.POST_BLOCK, "a")
+        state_b = get_sae_slot_state(site, SteeringHookPoint.POST_BLOCK, "b")
+        assert state_a is not None and state_b is not None
+        assert not state_a.any_active.item()
+        assert state_b.any_active.item()
+
+        residual = torch.tensor([[2.0, 3.0, 0.0, 0.0]])
+        out = apply_layer_steering(site, residual, SteeringHookPoint.POST_BLOCK)
+        # Only 'b' contributes: h[1] clamped to 11, h[0] untouched.
+        assert torch.allclose(out, torch.tensor([[2.0, 11.0, 0.0, 0.0]]))

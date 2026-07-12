@@ -24,16 +24,10 @@ subset / merge contract on synthetic on-disk fixtures and do not
 require a GPU.
 
 Per-feature JumpReLU thresholds: Gemma Scope ships a per-feature
-``threshold`` array, while the current SAE kernel takes a scalar
-``threshold`` parameter (kept simple so each ``(activation, n_clamp,
-d_model)`` site JIT-specialises on a single constexpr).  The loader
-falls back to the median per-feature threshold over the clampable
-subset (see :func:`load_gemma_scope_sae` for the full rationale).
-For absolute clamps with a high target value, the steering effect
-is dominated by ``target`` rather than the live activation ``f``
-(``delta = target - f``), so the qualitative output-shift assertion
-in this test is robust to the threshold simplification.  Tracked as
-a follow-up.
+``threshold`` array, which the loader subsets to the clampable
+features and emits as the ``(n_clamp,)`` ``"threshold"`` tensor in
+the weights payload (see :func:`load_gemma_scope_sae`); the kernel
+applies it per feature.
 """
 
 from __future__ import annotations
@@ -192,9 +186,7 @@ def _build_clamp_spec(
     """Construct a single-feature absolute clamp spec for the test.
 
     Picks the first clampable feature; absolute clamp with
-    ``target=50`` produces a delta dominated by the target value, so
-    the test is robust to the JumpReLU threshold simplification
-    discussed at module top.
+    ``target=50`` produces a delta dominated by the target value.
     """
     entry = SAEClampEntry(
         feature_idx=int(clampable_features[0]),
