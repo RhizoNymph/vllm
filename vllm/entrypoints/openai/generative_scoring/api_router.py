@@ -11,8 +11,11 @@ from vllm.entrypoints.openai.generative_scoring.serving import (
     GenerativeScoringResponse,
     OpenAIServingGenerativeScoring,
 )
-from vllm.entrypoints.openai.utils import validate_json_request
-from vllm.entrypoints.utils import load_aware_call, with_cancellation
+from vllm.entrypoints.serve.utils.api_utils import (
+    load_aware_call,
+    validate_json_request,
+    with_cancellation,
+)
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -21,7 +24,7 @@ if TYPE_CHECKING:
     from starlette.datastructures import State
 
     from vllm.engine.protocol import EngineClient
-    from vllm.entrypoints.logger import RequestLogger
+    from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 
 router = APIRouter()
 
