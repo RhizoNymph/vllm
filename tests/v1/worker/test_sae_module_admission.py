@@ -52,9 +52,9 @@ def _sae_payload(
     clampable_features=(0, 1, 2, 34),
     activation_params: dict | None = None,
 ) -> dict:
-    if activation_params is None and activation == "jumprelu":
-        activation_params = {"threshold": 0.0}
-    elif activation_params is None and activation == "topk":
+    # JumpReLU carries no activation params — per-feature thresholds
+    # ride the weights payload, not the manifest.
+    if activation_params is None and activation == "topk":
         activation_params = {"k": 1.0}
     else:
         activation_params = activation_params or {}
@@ -200,7 +200,9 @@ class TestRegisterDispatch:
                 "2147483647",
             ),
             (
-                _sae_payload(activation_params={}),
+                # Scalar thresholds in the manifest are no longer valid
+                # for jumprelu — thresholds ride the weights payload.
+                _sae_payload(activation_params={"threshold": 0.0}),
                 "activation_params.*threshold",
             ),
             (
@@ -236,6 +238,16 @@ class TestRegisterDispatch:
         h.unregister_steering_modules(["m", "g"])
         assert h._steering_module_registry == {}
         assert h._sae_module_registry == {}
+
+    def test_delta_modules_may_share_sites(self):
+        # Delta modules compose at a shared (layer, hook) site; the
+        # worker-side admission must not reject the overlap (each
+        # module gets its own buffer slot at attach time).
+        h = _MixinHarness()
+        h.register_steering_modules({"a": _sae_payload()})
+        h.register_steering_modules({"b": _sae_payload()})
+        assert "a" in h._sae_module_registry
+        assert "b" in h._sae_module_registry
 
 
 class TestSAEClampAdmissionGuard:

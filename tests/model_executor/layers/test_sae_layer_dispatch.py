@@ -4,10 +4,12 @@
 and the per-layer SAE clamp-table populator.
 
 The shim is the lifecycle bridge between buffer state and the math
-primitive: pull per-token clamps from the table via ``sae_index``,
-hand them to ``apply_sae_delta``.  The populator is the inverse:
-project ``SAEClampSpec`` row content into the per-(layer, hook)
-buffers so the shim can read them on the next forward.
+primitive: pull per-token clamps from each slot's table via
+``sae_index``, hand them to ``apply_sae_delta``.  The populator is the
+inverse: project ``SAEClampSpec`` row content into the per-(layer,
+hook, slot) buffers so the shim can read them on the next forward.
+Multiple SAE modules may share a site — one op call is chained per
+slot in registration order.
 
 These tests exercise both in isolation, without a worker mixin or a
 real model.  Buffers are constructed directly so the data flow is
@@ -29,14 +31,9 @@ from vllm.model_executor.layers.sae_steering import (
     CLAMP_KIND_ABSOLUTE,
     CLAMP_KIND_ADDITIVE,
     CLAMP_KIND_NONE,
-    HOOK_POINT_SAE_ANY_ACTIVE_ATTR,
-    HOOK_POINT_SAE_CLAMP_KIND_ATTR,
-    HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR,
-    HOOK_POINT_SAE_CLAMP_VALUE_ATTR,
-    HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
-    HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
-    HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
+    SAESlotState,
     apply_layer_sae_delta,
+    get_sae_slot_state,
     populate_sae_clamp_table,
     register_sae_buffers,
     register_sae_index_buffer,
@@ -77,6 +74,16 @@ def _layer_with_sae(
     return m
 
 
+def _slot(
+    m: nn.Module,
+    hook: SteeringHookPoint = SteeringHookPoint.POST_BLOCK,
+    module_name: str = "g",
+) -> SAESlotState:
+    state = get_sae_slot_state(m, hook, module_name)
+    assert state is not None, f"no slot for {module_name!r} at {hook.value!r}"
+    return state
+
+
 class TestApplyLayerSaeDeltaShortCircuits:
     """Disabled / no-op paths short-circuit without changing the residual."""
 
@@ -105,16 +112,11 @@ class TestApplyLayerSaeDeltaShortCircuits:
             max_sae_configs=1,
             max_tokens=4,
         )
-        getattr(
-            m, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).copy_(torch.tensor([[1.0, 0.0]]))
-        getattr(
-            m, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).copy_(torch.tensor([[0.0, 1.0]]))
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])
-        kind[1] = torch.tensor([CLAMP_KIND_ABSOLUTE], dtype=torch.int8)
-        value[1] = torch.tensor([9.0])
+        state = _slot(m)
+        state.encoder_weight.copy_(torch.tensor([[1.0, 0.0]]))
+        state.decoder_weight.copy_(torch.tensor([[0.0, 1.0]]))
+        state.clamp_kind[1] = torch.tensor([CLAMP_KIND_ABSOLUTE], dtype=torch.int8)
+        state.clamp_value[1] = torch.tensor([9.0])
         m.sae_index[0] = 1
 
         h = torch.tensor([[2.0, 0.0]])
@@ -142,26 +144,16 @@ class TestApplyLayerSaeDeltaDispatch:
             max_sae_configs=1,
             max_tokens=4,
         )
+        state = _slot(m)
         # Encoder picks h[0]; decoder writes into h[1].
-        getattr(
-            m, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).copy_(torch.tensor([[1.0, 0.0]]))
-        getattr(
-            m, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).copy_(torch.tensor([[0.0, 1.0]]))
-        getattr(m, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]).zero_()
+        state.encoder_weight.copy_(torch.tensor([[1.0, 0.0]]))
+        state.decoder_weight.copy_(torch.tensor([[0.0, 1.0]]))
+        state.encoder_bias.zero_()
         # Row 1: feature 0 absolute-clamped to 7.0.
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])
-        only = getattr(
-            m, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        kind[1] = torch.tensor([CLAMP_KIND_ABSOLUTE], dtype=torch.int8)
-        value[1] = torch.tensor([7.0])
-        only[1] = torch.tensor([False])
-        getattr(m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]).fill_(
-            True
-        )
+        state.clamp_kind[1] = torch.tensor([CLAMP_KIND_ABSOLUTE], dtype=torch.int8)
+        state.clamp_value[1] = torch.tensor([7.0])
+        state.clamp_only_if_active[1] = torch.tensor([False])
+        state.any_active.fill_(True)
         # Token 0: routed to row 1 (clamp active); token 1: row 0 (no-op).
         m.sae_index[0] = 1
         m.sae_index[1] = 0
@@ -182,26 +174,27 @@ class TestApplyLayerSaeDeltaDispatch:
             max_sae_configs=2,
             max_tokens=4,
         )
+        state = _slot(m)
         # Encoder picks h[0] for feature 0, h[1] for feature 1.
-        getattr(
-            m, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).copy_(torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
+        state.encoder_weight.copy_(
+            torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        )
         # Decoder writes to h[2] for feature 0 (additive=+1), to h[2] for
         # feature 1 (additive=+10).
-        getattr(
-            m, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).copy_(torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]))
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])
-        # Row 1: feature 0 additive +1 (independent of f).
-        kind[1] = torch.tensor([CLAMP_KIND_ADDITIVE, CLAMP_KIND_NONE], dtype=torch.int8)
-        value[1] = torch.tensor([1.0, 0.0])
-        # Row 2: feature 1 additive +10 (independent of f).
-        kind[2] = torch.tensor([CLAMP_KIND_NONE, CLAMP_KIND_ADDITIVE], dtype=torch.int8)
-        value[2] = torch.tensor([0.0, 10.0])
-        getattr(m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]).fill_(
-            True
+        state.decoder_weight.copy_(
+            torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
         )
+        # Row 1: feature 0 additive +1 (independent of f).
+        state.clamp_kind[1] = torch.tensor(
+            [CLAMP_KIND_ADDITIVE, CLAMP_KIND_NONE], dtype=torch.int8
+        )
+        state.clamp_value[1] = torch.tensor([1.0, 0.0])
+        # Row 2: feature 1 additive +10 (independent of f).
+        state.clamp_kind[2] = torch.tensor(
+            [CLAMP_KIND_NONE, CLAMP_KIND_ADDITIVE], dtype=torch.int8
+        )
+        state.clamp_value[2] = torch.tensor([0.0, 10.0])
+        state.any_active.fill_(True)
 
         m.sae_index[0] = 1  # token 0 -> row 1 (delta +1 in h[2])
         m.sae_index[1] = 2  # token 1 -> row 2 (delta +10 in h[2])
@@ -256,28 +249,182 @@ class TestApplyLayerSaeDeltaDispatch:
             dtype=torch.float32,
         )
         register_sae_index_buffer(layer, max_tokens=4)
-        getattr(
-            layer, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).copy_(torch.tensor([[1.0, 0.0]]))
-        getattr(
-            layer, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).copy_(torch.tensor([[0.0, 1.0]]))
-        getattr(layer, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])[
-            1
-        ] = torch.tensor([CLAMP_KIND_ABSOLUTE], dtype=torch.int8)
-        getattr(layer, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])[
-            1
-        ] = torch.tensor([7.0])
-        getattr(
-            layer, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
-        ).fill_(True)
+        state = _slot(layer)
+        state.encoder_weight.copy_(torch.tensor([[1.0, 0.0]]))
+        state.decoder_weight.copy_(torch.tensor([[0.0, 1.0]]))
+        state.clamp_kind[1] = torch.tensor([CLAMP_KIND_ABSOLUTE], dtype=torch.int8)
+        state.clamp_value[1] = torch.tensor([7.0])
+        state.any_active.fill_(True)
         layer.sae_index[0] = 1
 
         torch.testing.assert_close(compiled(h), torch.tensor([[2.0, 5.0]]))
 
 
+def _register_second_module(
+    m: nn.Module,
+    *,
+    module_name: str,
+    n_clamp: int,
+    hidden_size: int,
+    max_sae_configs: int = 2,
+) -> None:
+    register_sae_buffers(
+        m,
+        hook_point=SteeringHookPoint.POST_BLOCK,
+        module_name=module_name,
+        activation=SAEActivation.RELU,
+        activation_params={},
+        n_clamp=n_clamp,
+        hidden_size=hidden_size,
+        max_sae_configs=max_sae_configs,
+        dtype=torch.float32,
+    )
+
+
+def _configure_absolute_clamp(
+    state: SAESlotState,
+    *,
+    enc_row: int,
+    dec_col: int,
+    value: float,
+    hidden_size: int,
+    row: int = 1,
+    feature_pos: int = 0,
+) -> None:
+    """Encoder reads h[enc_row]; decoder writes h[dec_col]; row 1 clamps."""
+    enc = torch.zeros_like(state.encoder_weight)
+    enc[feature_pos, enc_row] = 1.0
+    state.encoder_weight.copy_(enc)
+    dec = torch.zeros_like(state.decoder_weight)
+    dec[feature_pos, dec_col] = 1.0
+    state.decoder_weight.copy_(dec)
+    state.clamp_kind[row, feature_pos] = CLAMP_KIND_ABSOLUTE
+    state.clamp_value[row, feature_pos] = value
+    state.any_active.fill_(True)
+
+
+class TestMultiModuleComposition:
+    """Two delta modules sharing a site compose in registration order."""
+
+    def _two_module_layer(self, *, hidden_size: int = 4) -> nn.Module:
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_BLOCK,
+            module_name="a",
+            n_clamp=1,
+            hidden_size=hidden_size,
+            max_sae_configs=2,
+            max_tokens=8,
+        )
+        _register_second_module(
+            m, module_name="b", n_clamp=1, hidden_size=hidden_size
+        )
+        return m
+
+    def test_composition_equals_sequential_eager_application(self):
+        # A reads h[0] and writes h[1]; B reads h[1] and writes h[2].
+        # Because B's encoder sees A's decoder output, the composed
+        # result is order-dependent — this pins registration order.
+        m = self._two_module_layer()
+        state_a = _slot(m, module_name="a")
+        state_b = _slot(m, module_name="b")
+        _configure_absolute_clamp(
+            state_a, enc_row=0, dec_col=1, value=7.0, hidden_size=4
+        )
+        _configure_absolute_clamp(
+            state_b, enc_row=1, dec_col=2, value=11.0, hidden_size=4
+        )
+        m.sae_index[0] = 1
+
+        h = torch.tensor([[2.0, 1.0, 0.0, 0.0]])
+        out = apply_layer_sae_delta(m, h, SteeringHookPoint.POST_BLOCK)
+
+        # Sequential eager reference in registration order (A then B)
+        # via the public math primitive.
+        from vllm.model_executor.layers.sae_steering import apply_sae_delta
+
+        def _eager(hs: torch.Tensor, state: SAESlotState) -> torch.Tensor:
+            row = 1
+            return apply_sae_delta(
+                hs,
+                state.encoder_weight,
+                state.encoder_bias,
+                state.decoder_weight,
+                SAEActivation.RELU,
+                {},
+                state.clamp_kind[row : row + 1],
+                state.clamp_value[row : row + 1],
+                state.clamp_only_if_active[row : row + 1],
+            )
+
+        expected = _eager(_eager(h, state_a), state_b)
+        assert torch.allclose(out, expected)
+        # Concretely: A clamps f_a (=h[0]=2) to 7 → h[1] += 5 → h[1]=6.
+        # B then sees h[1]=6, clamps f_b to 11 → h[2] += 5.
+        assert torch.allclose(out, torch.tensor([[2.0, 6.0, 5.0, 0.0]]))
+        # Order matters: B-then-A differs (B would see h[1]=1, delta 10).
+        swapped = _eager(_eager(h, state_b), state_a)
+        assert not torch.allclose(out, swapped)
+
+    def test_unclamped_token_bit_identical_through_both(self):
+        m = self._two_module_layer()
+        state_a = _slot(m, module_name="a")
+        state_b = _slot(m, module_name="b")
+        _configure_absolute_clamp(
+            state_a, enc_row=0, dec_col=1, value=7.0, hidden_size=4
+        )
+        _configure_absolute_clamp(
+            state_b, enc_row=1, dec_col=2, value=11.0, hidden_size=4
+        )
+        # Token 0 clamped, token 1 routed to the no-op sentinel row.
+        m.sae_index[0] = 1
+        m.sae_index[1] = 0
+
+        h = torch.randn(2, 4)
+        out = apply_layer_sae_delta(m, h, SteeringHookPoint.POST_BLOCK)
+        # The no-clamp token passes through both slots bit-identically.
+        assert torch.equal(out[1], h[1])
+        # The clamped token was actually modified (sanity).
+        assert not torch.equal(out[0], h[0])
+
+    def test_idle_module_composes_as_identity(self):
+        # A idle (any_active False), B active: output equals B alone.
+        m = self._two_module_layer()
+        state_a = _slot(m, module_name="a")
+        state_b = _slot(m, module_name="b")
+        _configure_absolute_clamp(
+            state_a, enc_row=0, dec_col=1, value=7.0, hidden_size=4
+        )
+        _configure_absolute_clamp(
+            state_b, enc_row=2, dec_col=3, value=11.0, hidden_size=4
+        )
+        state_a.any_active.zero_()  # A idle
+        m.sae_index[0] = 1
+
+        h = torch.tensor([[2.0, 1.0, 3.0, 0.0]])
+        out = apply_layer_sae_delta(m, h, SteeringHookPoint.POST_BLOCK)
+
+        # Reference: a layer with only B registered, same content.
+        m_b_only = _layer_with_sae(
+            hook=SteeringHookPoint.POST_BLOCK,
+            module_name="b",
+            n_clamp=1,
+            hidden_size=4,
+            max_sae_configs=2,
+            max_tokens=8,
+        )
+        state_b_only = _slot(m_b_only, module_name="b")
+        _configure_absolute_clamp(
+            state_b_only, enc_row=2, dec_col=3, value=11.0, hidden_size=4
+        )
+        m_b_only.sae_index[0] = 1
+        expected = apply_layer_sae_delta(m_b_only, h, SteeringHookPoint.POST_BLOCK)
+        assert torch.allclose(out, expected)
+        # f_b = ReLU(3) = 3; delta = 11 - 3 = 8 into h[3].
+        assert torch.allclose(out, torch.tensor([[2.0, 1.0, 3.0, 8.0]]))
+
+
 class TestPopulateSaeClampTable:
-    """Manager rows projected into per-(layer, hook) buffers."""
+    """Manager rows projected into per-(layer, hook, slot) buffers."""
 
     def test_row_zero_remains_zero(self):
         m = _layer_with_sae(
@@ -297,12 +444,9 @@ class TestPopulateSaeClampTable:
             clampable_features=(0, 1),
             worker_phase="prefill",
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        any_active = getattr(
-            m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert torch.equal(kind[0], torch.zeros(2, dtype=torch.int8))
-        assert not any_active.item()
+        state = _slot(m)
+        assert torch.equal(state.clamp_kind[0], torch.zeros(2, dtype=torch.int8))
+        assert not state.any_active.item()
 
     def test_active_row_writes_clamp_for_matching_module(self):
         m = _layer_with_sae(
@@ -332,19 +476,17 @@ class TestPopulateSaeClampTable:
             worker_phase="prefill",
             layer_idx=20,
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])
+        state = _slot(m)
         # The per-request row, position 1 (feature_idx 5), gets the clamp.
-        assert kind[row, 1].item() == CLAMP_KIND_ABSOLUTE
-        assert value[row, 1].item() == 7.0
+        assert state.clamp_kind[row, 1].item() == CLAMP_KIND_ABSOLUTE
+        assert state.clamp_value[row, 1].item() == 7.0
         # Position 0 (feature_idx 2) stays NONE.
-        assert kind[row, 0].item() == CLAMP_KIND_NONE
-        any_active = getattr(
-            m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert any_active.item()
+        assert state.clamp_kind[row, 0].item() == CLAMP_KIND_NONE
+        assert state.any_active.item()
 
-    def test_active_row_zeroed_for_non_matching_module(self):
+    def test_populate_for_module_without_slot_is_noop(self):
+        # This buffer site holds a slot only for 'other_module'; a
+        # populate call naming module 'g' must be a no-op (no slot).
         m = _layer_with_sae(
             hook=SteeringHookPoint.POST_BLOCK,
             n_clamp=2,
@@ -362,8 +504,39 @@ class TestPopulateSaeClampTable:
             },
         )
         row = manager.register_clamp_spec(123, (spec,), "prefill")
-        # This buffer site belongs to module 'other_module' — spec
-        # targets 'g'; the per-request row must be zeroed at this site.
+        populate_sae_clamp_table(
+            manager=manager,
+            module=m,
+            hook_point=SteeringHookPoint.POST_BLOCK,
+            module_name="g",
+            clampable_features=(0, 5),
+            worker_phase="prefill",
+            layer_idx=20,
+        )
+        state = _slot(m, module_name="other_module")
+        assert torch.equal(state.clamp_kind[row], torch.zeros(2, dtype=torch.int8))
+        assert not state.any_active.item()
+
+    def test_active_row_zeroed_for_non_matching_module(self):
+        # The slot belongs to 'other_module'; populating that slot with
+        # a manager holding only 'g' specs zeroes the row at this slot.
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_BLOCK,
+            n_clamp=2,
+            hidden_size=4,
+            max_sae_configs=2,
+            module_name="other_module",
+        )
+        manager = SAEClampManager(max_sae_configs=2)
+        spec = SAEClampSpec(
+            module_name="g",  # spec targets module 'g'
+            clamps={
+                "post_block": {
+                    20: (SAEClampEntry(feature_idx=5, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        row = manager.register_clamp_spec(123, (spec,), "prefill")
         populate_sae_clamp_table(
             manager=manager,
             module=m,
@@ -373,12 +546,50 @@ class TestPopulateSaeClampTable:
             worker_phase="prefill",
             layer_idx=20,
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        any_active = getattr(
-            m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
+        state = _slot(m, module_name="other_module")
+        assert torch.equal(state.clamp_kind[row], torch.zeros(2, dtype=torch.int8))
+        assert not state.any_active.item()
+
+    def test_populator_isolation_between_shared_site_slots(self):
+        # Two modules share the site; module A's rows must land only in
+        # A's slot tables, never in B's.
+        m = _layer_with_sae(
+            hook=SteeringHookPoint.POST_BLOCK,
+            module_name="a",
+            n_clamp=1,
+            hidden_size=4,
+            max_sae_configs=2,
+            max_tokens=8,
         )
-        assert torch.equal(kind[row], torch.zeros(2, dtype=torch.int8))
-        assert not any_active.item()
+        _register_second_module(m, module_name="b", n_clamp=1, hidden_size=4)
+        manager = SAEClampManager(max_sae_configs=2)
+        spec_a = SAEClampSpec(
+            module_name="a",
+            clamps={
+                "post_block": {
+                    20: (SAEClampEntry(feature_idx=0, kind="absolute", value=7.0),)
+                }
+            },
+        )
+        row = manager.register_clamp_spec(123, (spec_a,), "prefill")
+        for name in ("a", "b"):
+            populate_sae_clamp_table(
+                manager=manager,
+                module=m,
+                hook_point=SteeringHookPoint.POST_BLOCK,
+                module_name=name,
+                clampable_features=(0,),
+                layer_idx=20,
+            )
+        state_a = _slot(m, module_name="a")
+        state_b = _slot(m, module_name="b")
+        assert state_a.clamp_kind[row, 0].item() == CLAMP_KIND_ABSOLUTE
+        assert state_a.any_active.item()
+        # B's tables never see A's rows.
+        assert torch.equal(
+            state_b.clamp_kind, torch.zeros_like(state_b.clamp_kind)
+        )
+        assert not state_b.any_active.item()
 
     def test_phase_filter_decode_only(self):
         manager = SAEClampManager(max_sae_configs=2)
@@ -427,14 +638,10 @@ class TestPopulateSaeClampTable:
             worker_phase="decode",
             layer_idx=20,
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])
-        assert kind[row, 0].item() == CLAMP_KIND_ABSOLUTE
-        assert value[row, 0].item() == 9.0
-        any_active = getattr(
-            m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert any_active.item()
+        state = _slot(m)
+        assert state.clamp_kind[row, 0].item() == CLAMP_KIND_ABSOLUTE
+        assert state.clamp_value[row, 0].item() == 9.0
+        assert state.any_active.item()
 
     def test_phase_filtered_populate_preserves_other_phase_any_active(self):
         m = _layer_with_sae(
@@ -465,10 +672,8 @@ class TestPopulateSaeClampTable:
             worker_phase="decode",
             layer_idx=20,
         )
-        any_active = getattr(
-            m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert any_active.item()
+        state = _slot(m)
+        assert state.any_active.item()
 
         populate_sae_clamp_table(
             manager=manager,
@@ -480,11 +685,9 @@ class TestPopulateSaeClampTable:
             layer_idx=20,
         )
 
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])
-        assert kind[row, 0].item() == CLAMP_KIND_ABSOLUTE
-        assert value[row, 0].item() == 9.0
-        assert any_active.item()
+        assert state.clamp_kind[row, 0].item() == CLAMP_KIND_ABSOLUTE
+        assert state.clamp_value[row, 0].item() == 9.0
+        assert state.any_active.item()
 
     def test_layer_with_no_clamps_in_spec_zeroed(self):
         # Spec covers layer 20; site is layer 21 — the per-request row
@@ -515,8 +718,8 @@ class TestPopulateSaeClampTable:
             worker_phase="prefill",
             layer_idx=21,  # spec targets 20, this site is 21
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        assert torch.equal(kind[row], torch.zeros(1, dtype=torch.int8))
+        state = _slot(m)
+        assert torch.equal(state.clamp_kind[row], torch.zeros(1, dtype=torch.int8))
 
     def test_only_if_active_flag_propagates(self):
         m = _layer_with_sae(
@@ -552,10 +755,8 @@ class TestPopulateSaeClampTable:
             worker_phase="prefill",
             layer_idx=20,
         )
-        only = getattr(
-            m, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
-        assert bool(only[row, 0].item()) is True
+        state = _slot(m)
+        assert bool(state.clamp_only_if_active[row, 0].item()) is True
 
     def test_global_clamp_lands_on_phase_global_rows(self):
         # Global clamp at the manager level → populator writes it
@@ -590,11 +791,9 @@ class TestPopulateSaeClampTable:
             clampable_features=(2, 5),
             layer_idx=20,
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])
-        any_active = getattr(
-            m, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[SteeringHookPoint.POST_BLOCK]
-        )
+        state = _slot(m)
+        kind = state.clamp_kind
+        value = state.clamp_value
         # Position 1 corresponds to feature_idx=5 in clampable_features.
         assert int(kind[1, 1].item()) == 1  # prefill global row
         assert float(value[1, 1].item()) == 3.5
@@ -602,7 +801,7 @@ class TestPopulateSaeClampTable:
         assert float(value[2, 1].item()) == 3.5
         assert int(kind[0, 1].item()) == 0  # row 0 remains no-op
         assert int(kind[1, 0].item()) == 0  # other features untouched
-        assert bool(any_active.item()) is True
+        assert bool(state.any_active.item()) is True
 
     def test_phase_specific_globals_do_not_share_row(self):
         m = _layer_with_sae(
@@ -643,8 +842,9 @@ class TestPopulateSaeClampTable:
             clampable_features=(5,),
             layer_idx=20,
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])
+        state = _slot(m)
+        kind = state.clamp_kind
+        value = state.clamp_value
         assert int(kind[0, 0].item()) == CLAMP_KIND_NONE
         assert int(kind[1, 0].item()) == CLAMP_KIND_ABSOLUTE
         assert float(value[1, 0].item()) == 3.5
@@ -692,8 +892,9 @@ class TestPopulateSaeClampTable:
             clampable_features=(2, 5),
             layer_idx=20,
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
-        value = getattr(m, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[SteeringHookPoint.POST_BLOCK])
+        state = _slot(m)
+        kind = state.clamp_kind
+        value = state.clamp_value
         # The prefill global row carries the global clamp.
         assert int(kind[1, 0].item()) == 1
         assert float(value[1, 0].item()) == 1.0
@@ -734,7 +935,8 @@ class TestPopulateSaeClampTable:
             clampable_features=(2, 5),
             layer_idx=20,
         )
-        kind = getattr(m, HOOK_POINT_SAE_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK])
+        state = _slot(m)
+        kind = state.clamp_kind
         # Global active.
         assert int(kind[1, 1].item()) == 1
         assert int(kind[2, 1].item()) == 1
@@ -772,7 +974,6 @@ class TestPopulateSaeClampTable:
             },
         )
         manager.register_clamp_spec(123, (spec,), "prefill")
-        import pytest
 
         with pytest.raises(ValueError, match="not in clampable_features"):
             populate_sae_clamp_table(

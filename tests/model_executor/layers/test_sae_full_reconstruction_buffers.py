@@ -28,6 +28,7 @@ from vllm.model_executor.layers.sae_full_reconstruction import (
     HOOK_POINT_FR_ENCODER_BIAS_ATTR,
     HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
     HOOK_POINT_FR_MODULE_NAME_ATTR,
+    HOOK_POINT_FR_THRESHOLD_ATTR,
     register_sae_full_recon_buffers,
     register_sae_recon_index_buffer,
     sae_full_recon_buffers_attached,
@@ -82,6 +83,15 @@ class TestRegisterFullReconBuffers:
         for buf in (enc_w, enc_b, dec_w, dec_b):
             assert buf.dtype is torch.float32
             assert torch.equal(buf, torch.zeros_like(buf))
+        # Per-feature JumpReLU threshold buffer covers the full d_sae
+        # axis, always fp32 and zero-initialised (also present for
+        # ReLU/TopK sites so the op arity stays fixed).
+        thr = getattr(
+            layer, HOOK_POINT_FR_THRESHOLD_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert thr.shape == (16,)
+        assert thr.dtype is torch.float32
+        assert torch.equal(thr, torch.zeros(16))
         # Clamp tables: (max_recon_configs + 1, n_clamp), with row 0
         # reserved as the no-reconstruction sentinel.
         kind_table = getattr(
@@ -113,8 +123,8 @@ class TestRegisterFullReconBuffers:
             layer,
             hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="golden_gate",
-            activation=SAEActivation.JUMPRELU,
-            activation_params={"threshold": 0.42},
+            activation=SAEActivation.TOPK,
+            activation_params={"k": 4.0},
             d_sae=8,
             n_clamp=2,
             hidden_size=4,
@@ -128,26 +138,26 @@ class TestRegisterFullReconBuffers:
         )
         assert (
             getattr(layer, HOOK_POINT_FR_ACTIVATION_ATTR[SteeringHookPoint.POST_BLOCK])
-            is SAEActivation.JUMPRELU
+            is SAEActivation.TOPK
         )
         params = getattr(
             layer, HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR[SteeringHookPoint.POST_BLOCK]
         )
-        assert params == {"threshold": 0.42}
+        assert params == {"k": 4.0}
         # Stored as a fresh dict (not a reference to the caller-supplied
         # mapping) so caller mutations don't leak into the module.
-        params["threshold"] = 9.0
+        params["k"] = 9.0
         params2 = getattr(
             layer, HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR[SteeringHookPoint.POST_BLOCK]
         )
-        assert params2["threshold"] == 9.0  # same dict
+        assert params2["k"] == 9.0  # same dict
         # But the original caller-supplied dict is independent.
-        independent = {"threshold": 0.5}
+        independent = {"k": 2.0}
         register_sae_full_recon_buffers(
             _make_layer(layer_idx=1),
             hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="x",
-            activation=SAEActivation.JUMPRELU,
+            activation=SAEActivation.TOPK,
             activation_params=independent,
             d_sae=4,
             n_clamp=1,
@@ -156,7 +166,7 @@ class TestRegisterFullReconBuffers:
             clampable_features=torch.tensor([0], dtype=torch.int64),
             dtype=torch.float32,
         )
-        assert independent == {"threshold": 0.5}
+        assert independent == {"k": 2.0}
 
     def test_disabled_engine_is_no_op(self):
         # max_recon_configs == 0 → registration is a no-op so disabled
@@ -322,6 +332,7 @@ class TestUnregisterFullReconBuffers:
         for attr_table in (
             HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
             HOOK_POINT_FR_ENCODER_BIAS_ATTR,
+            HOOK_POINT_FR_THRESHOLD_ATTR,
             HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
             HOOK_POINT_FR_DECODER_BIAS_ATTR,
             HOOK_POINT_FR_CLAMP_KIND_ATTR,

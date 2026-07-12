@@ -105,11 +105,13 @@ class TestActivationCodeHelpers:
         params = _scalar_to_activation_params(SAEActivation.RELU, scalar)
         assert params == {}
 
-    def test_jumprelu_round_trips_threshold(self):
-        scalar = _activation_to_scalar(SAEActivation.JUMPRELU, {"threshold": 0.7})
-        assert scalar == pytest.approx(0.7)
+    def test_jumprelu_has_no_scalar_param(self):
+        # JumpReLU's per-feature thresholds travel as a dedicated
+        # tensor argument, not through the packed scalar.
+        scalar = _activation_to_scalar(SAEActivation.JUMPRELU, {})
+        assert scalar == 0.0
         params = _scalar_to_activation_params(SAEActivation.JUMPRELU, scalar)
-        assert params == {"threshold": pytest.approx(0.7)}
+        assert params == {}
 
     def test_topk_round_trips_k(self):
         scalar = _activation_to_scalar(SAEActivation.TOPK, {"k": 4})
@@ -206,6 +208,7 @@ class TestCustomOpRegistration:
             inputs["hidden_states"],
             inputs["encoder_weight"],
             inputs["encoder_bias"],
+            torch.zeros(n_clamp),
             inputs["decoder_weight"],
             clamps["clamp_kind"],
             clamps["clamp_value"],
@@ -235,6 +238,7 @@ class TestCustomOpRegistration:
             inputs["hidden_states"],
             inputs["encoder_weight"],
             inputs["encoder_bias"],
+            torch.zeros(n_clamp),
             inputs["decoder_weight"],
             clamps["clamp_kind"],
             clamps["clamp_value"],
@@ -262,6 +266,7 @@ class TestCustomOpRegistration:
             hidden,
             encoder_weight,
             encoder_bias,
+            torch.zeros(2),
             decoder_weight,
             kind_table,
             value_table,
@@ -275,9 +280,9 @@ class TestCustomOpRegistration:
         torch.testing.assert_close(out, hidden)
         assert out.data_ptr() != hidden.data_ptr()
 
-    def test_op_func_jumprelu_threshold_param(self):
-        # Distinct threshold values must produce distinct outputs to
-        # confirm the scalar parameter actually flows through.
+    def test_op_func_jumprelu_threshold_tensor(self):
+        # Distinct threshold vectors must produce distinct outputs to
+        # confirm the tensor actually flows through.
         torch.manual_seed(1)
         inputs = _make_random_inputs(n_tokens=2, d_model=4, n_clamp=2, seed=1)
         clamps = _random_clamps(n_tokens=2, n_clamp=2, seed=2)
@@ -285,17 +290,19 @@ class TestCustomOpRegistration:
         loose = apply_sae_delta(
             **inputs,
             activation=SAEActivation.JUMPRELU,
-            activation_params={"threshold": -10.0},  # admits everything
+            activation_params={},
             **clamps,
+            threshold=torch.full((2,), -10.0),  # admits everything
         )
         strict = apply_sae_delta(
             **inputs,
             activation=SAEActivation.JUMPRELU,
-            activation_params={"threshold": 10.0},  # gates almost everything
+            activation_params={},
             **clamps,
+            threshold=torch.full((2,), 10.0),  # gates almost everything
         )
-        # If threshold weren't being threaded through, the two would
-        # come out identical.  They almost certainly should not.
+        # If the threshold tensor weren't being threaded through, the
+        # two would come out identical.  They almost certainly should not.
         assert not torch.allclose(loose, strict)
 
 
@@ -404,23 +411,32 @@ class TestKernelParityFp32:
     """Triton kernel must match the eager body within fp32 tolerance."""
 
     @pytest.mark.parametrize(
-        "activation,params",
+        "activation,params,use_threshold",
         [
-            (SAEActivation.RELU, {}),
-            (SAEActivation.JUMPRELU, {"threshold": 0.5}),
-            (SAEActivation.TOPK, {"k": 2}),
+            (SAEActivation.RELU, {}, False),
+            (SAEActivation.JUMPRELU, {}, True),
+            (SAEActivation.TOPK, {"k": 2}, False),
         ],
     )
     @pytest.mark.parametrize(
         "n_tokens,d_model,n_clamp", [(1, 8, 1), (4, 16, 3), (8, 64, 5), (16, 1024, 8)]
     )
-    def test_random_inputs(self, activation, params, n_tokens, d_model, n_clamp):
+    def test_random_inputs(
+        self, activation, params, use_threshold, n_tokens, d_model, n_clamp
+    ):
         cpu_inputs = _make_random_inputs(
             n_tokens=n_tokens, d_model=d_model, n_clamp=n_clamp, seed=42
         )
         cpu_clamps = _random_clamps(n_tokens=n_tokens, n_clamp=n_clamp, seed=7)
+        # Non-constant per-feature thresholds so the parity check also
+        # covers the per-lane threshold load in the kernel.
+        thr_rng = torch.Generator(device="cpu").manual_seed(17)
+        cpu_threshold = (
+            torch.rand(n_clamp, generator=thr_rng) - 0.5 if use_threshold else None
+        )
         gpu_inputs = {k: v.cuda() for k, v in cpu_inputs.items()}
         gpu_clamps = {k: v.cuda() for k, v in cpu_clamps.items()}
+        gpu_threshold = cpu_threshold.cuda() if cpu_threshold is not None else None
 
         # Eager body via public API on CPU.
         ref = apply_sae_delta(
@@ -428,6 +444,7 @@ class TestKernelParityFp32:
             activation=activation,
             activation_params=params,
             **cpu_clamps,
+            threshold=cpu_threshold,
         )
         # Triton kernel via public API on CUDA.
         got = apply_sae_delta(
@@ -435,6 +452,7 @@ class TestKernelParityFp32:
             activation=activation,
             activation_params=params,
             **gpu_clamps,
+            threshold=gpu_threshold,
         )
         assert got.is_cuda
         assert torch.allclose(got.cpu(), ref, atol=1e-4, rtol=1e-4)
@@ -446,31 +464,38 @@ class TestKernelParityLowPrecision:
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize(
-        "activation,params",
+        "activation,use_threshold",
         [
-            (SAEActivation.RELU, {}),
-            (SAEActivation.JUMPRELU, {"threshold": 0.0}),
+            (SAEActivation.RELU, False),
+            (SAEActivation.JUMPRELU, True),
         ],
     )
-    def test_low_precision(self, dtype, activation, params):
+    def test_low_precision(self, dtype, activation, use_threshold):
         cpu_inputs = _make_random_inputs(
             n_tokens=4, d_model=64, n_clamp=4, dtype=dtype, seed=99
         )
         cpu_clamps = _random_clamps(n_tokens=4, n_clamp=4, seed=101)
+        thr_rng = torch.Generator(device="cpu").manual_seed(103)
+        cpu_threshold = (
+            torch.rand(4, generator=thr_rng) - 0.5 if use_threshold else None
+        )
         gpu_inputs = {k: v.cuda() for k, v in cpu_inputs.items()}
         gpu_clamps = {k: v.cuda() for k, v in cpu_clamps.items()}
+        gpu_threshold = cpu_threshold.cuda() if cpu_threshold is not None else None
 
         ref = apply_sae_delta(
             **cpu_inputs,
             activation=activation,
-            activation_params=params,
+            activation_params={},
             **cpu_clamps,
+            threshold=cpu_threshold,
         )
         got = apply_sae_delta(
             **gpu_inputs,
             activation=activation,
-            activation_params=params,
+            activation_params={},
             **gpu_clamps,
+            threshold=gpu_threshold,
         )
         assert got.dtype is dtype
         atol = 5e-2 if dtype is torch.bfloat16 else 1e-2
@@ -552,14 +577,17 @@ class TestIndexedKernelParity:
         )
         row_clamps = _random_clamps(n_tokens=n_rows, n_clamp=n_clamp, seed=321)
         index = torch.tensor([0, 1, 2, 3, 1], dtype=torch.long)
+        # Non-constant per-feature thresholds.
+        threshold = torch.tensor([0.25, -0.5, 0.75])
 
         ref = apply_sae_delta(
             **cpu_inputs,
             activation=SAEActivation.JUMPRELU,
-            activation_params={"threshold": 0.25},
+            activation_params={},
             clamp_kind=row_clamps["clamp_kind"][index],
             clamp_value=row_clamps["clamp_value"][index],
             clamp_only_if_active=row_clamps["clamp_only_if_active"][index],
+            threshold=threshold,
         )
 
         gpu_inputs = {k: v.cuda() for k, v in cpu_inputs.items()}
@@ -567,6 +595,7 @@ class TestIndexedKernelParity:
             gpu_inputs["hidden_states"],
             gpu_inputs["encoder_weight"],
             gpu_inputs["encoder_bias"],
+            threshold.cuda(),
             gpu_inputs["decoder_weight"],
             row_clamps["clamp_kind"].cuda(),
             row_clamps["clamp_value"].cuda(),
@@ -574,7 +603,7 @@ class TestIndexedKernelParity:
             index.cuda(),
             torch.ones(1, dtype=torch.bool, device="cuda"),
             ACTIVATION_CODE_JUMPRELU,
-            0.25,
+            0.0,
         )
 
         assert got.is_cuda
@@ -594,6 +623,7 @@ class TestIndexedKernelParity:
             hidden,
             encoder_weight,
             encoder_bias,
+            torch.zeros(2, device="cuda"),
             decoder_weight,
             kind_table,
             value_table,
@@ -627,6 +657,7 @@ class TestIndexedKernelParity:
             hidden,
             encoder_weight,
             encoder_bias,
+            torch.zeros(n_clamp, device="cuda"),
             decoder_weight,
             kind_table,
             value_table,
@@ -675,11 +706,13 @@ class TestKernelCudaGraph:
         graph = torch.cuda.CUDAGraph()
         out_buf = torch.empty_like(gpu_inputs["hidden_states"])
         any_active = torch.ones(1, dtype=torch.bool, device="cuda")
+        threshold = torch.zeros(n_clamp, device="cuda")
         with torch.cuda.graph(graph):
             captured = apply_sae_delta_triton(
                 gpu_inputs["hidden_states"],
                 gpu_inputs["encoder_weight"],
                 gpu_inputs["encoder_bias"],
+                threshold,
                 gpu_inputs["decoder_weight"],
                 gpu_clamps["clamp_kind"],
                 gpu_clamps["clamp_value"],
@@ -731,6 +764,7 @@ class TestKernelCudaGraph:
         only_table = row_clamps["clamp_only_if_active"].cuda()
         gpu_index = index.cuda()
         any_active = torch.ones(1, dtype=torch.bool, device="cuda")
+        threshold = torch.zeros(n_clamp, device="cuda")
 
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
@@ -740,6 +774,7 @@ class TestKernelCudaGraph:
                 gpu_inputs["hidden_states"],
                 gpu_inputs["encoder_weight"],
                 gpu_inputs["encoder_bias"],
+                threshold,
                 gpu_inputs["decoder_weight"],
                 kind_table,
                 value_table,

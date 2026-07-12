@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from vllm.config.sae_steering_types import (
     SAEActivation,
     SAEClampSpec,
@@ -224,6 +226,9 @@ class SteeringModuleRegistry:
                     "for kind=SAE_FULL_RECONSTRUCTION."
                 )
             self._validate_sae_manifest(name=name, manifest=sae_manifest)
+            # FR-only site exclusivity; delta modules may share sites and
+            # an FR module may sit atop delta modules on the same site.
+            self._validate_sae_fr_site_overlap(name=name, manifest=sae_manifest)
             module = SteeringModule(
                 name=name,
                 kind=kind,
@@ -522,9 +527,11 @@ class SteeringModuleRegistry:
                         _load_weights_for_manifest,
                     )
 
-                    payload["sae_weights"] = _load_weights_for_manifest(
-                        manifest,
-                        Path(manifest.weights_uri),
+                    payload["sae_weights"] = pack_sae_weights_for_broadcast(
+                        _load_weights_for_manifest(
+                            manifest,
+                            Path(manifest.weights_uri),
+                        )
                     )
             out[name] = payload
         return out
@@ -765,23 +772,6 @@ class SteeringModuleRegistry:
                     f"(layer_idx, hook_point) sites; got {site!r} more than once."
                 )
             seen_sites.add(site)
-        for other_name, other_module in self._modules.items():
-            if (
-                other_name == name
-                or other_module.kind is not SteeringModuleKind.SAE_DELTA
-            ):
-                continue
-            other_manifest = other_module.sae_manifest
-            if other_manifest is None:
-                continue
-            overlap = seen_sites & set(other_manifest.layers)
-            if overlap:
-                raise ValueError(
-                    f"{prefix}: layers overlap existing SAE module "
-                    f"{other_name!r} at site(s) {sorted(overlap)!r}.  "
-                    "At most one SAE module may own a (layer_idx, "
-                    "hook_point) site; unregister the existing module first."
-                )
         if not isinstance(manifest.clampable_features, tuple):
             raise ValueError(
                 f"{prefix}: clampable_features must be a tuple of "
@@ -804,6 +794,46 @@ class SteeringModuleRegistry:
                 )
             seen_features.add(feat)
 
+    def _validate_sae_fr_site_overlap(
+        self, *, name: str, manifest: SAEModuleManifest
+    ) -> None:
+        """Full-reconstruction site exclusivity check.
+
+        SAE *delta* modules may share a (layer_idx, hook_point) site —
+        each registration gets its own worker buffer slot and the
+        deltas compose in registration order — so no overlap check
+        applies to them.  Full reconstruction *replaces* the residual,
+        and two replacements on one site are semantically ill-defined,
+        so an FR manifest is compared against every other registered
+        FR module.  An FR module sharing a site with delta modules is
+        fine: deltas run first, the reconstruction replaces last.
+
+        Kept separate from :meth:`_validate_sae_manifest` because the
+        loader call sites validate manifests on a throwaway registry
+        where overlap is vacuous.
+        """
+        new_sites = set(manifest.layers)
+        for other_name, other_module in self._modules.items():
+            if (
+                other_name == name
+                or other_module.kind
+                is not SteeringModuleKind.SAE_FULL_RECONSTRUCTION
+            ):
+                continue
+            other_manifest = other_module.sae_manifest
+            if other_manifest is None:
+                continue
+            overlap = new_sites & set(other_manifest.layers)
+            if overlap:
+                raise ValueError(
+                    f"SAE module {name!r}: layers overlap existing "
+                    f"full-reconstruction SAE module {other_name!r} at "
+                    f"site(s) {sorted(overlap)!r}.  At most one "
+                    "full-reconstruction SAE module may own a "
+                    "(layer_idx, hook_point) site; unregister the "
+                    "existing module first."
+                )
+
     @staticmethod
     def _validate_sae_activation_params(
         *,
@@ -821,15 +851,11 @@ class SteeringModuleRegistry:
                 )
             return
         if activation is SAEActivation.JUMPRELU:
-            threshold = activation_params.get("threshold")
-            if (
-                isinstance(threshold, bool)
-                or not isinstance(threshold, (int, float))
-                or not math.isfinite(float(threshold))
-            ):
+            if activation_params:
                 raise ValueError(
-                    f"{prefix}: jumprelu activation_params requires a finite "
-                    f"'threshold', got {threshold!r}."
+                    f"{prefix}: activation_params must be empty for jumprelu "
+                    "— per-feature thresholds ride the weights payload as a "
+                    f"'threshold' tensor; got {activation_params!r}."
                 )
             return
         if activation is SAEActivation.TOPK:
@@ -867,6 +893,36 @@ def _sae_manifest_to_dict(manifest: SAEModuleManifest | None) -> dict[str, Any]:
         "activation_params": dict(manifest.activation_params),
         "weights_uri": manifest.weights_uri,
     }
+
+
+def pack_sae_weights_for_broadcast(
+    weights: dict[tuple[int, str], dict[str, Any]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Wire-safe form of an ``sae_weights`` payload for ``collective_rpc``.
+
+    Raw :class:`torch.Tensor` values do not survive the msgpack hop to an
+    out-of-process engine core — small tensors degrade to
+    ``[dtype, shape, buffer]`` triples and large ones to unrecoverable
+    aux-buffer indices. Packing to ``{"dtype", "shape", "data": bytes}``
+    dicts (raw bytes are a native msgpack type, carried inline at any
+    size) with ``"layer:hook"`` site keys matches the Rust frontend's
+    wire shape; the worker's ``_coerce_sae_weights_wire`` rebuilds
+    tensors on arrival.
+    """
+    packed: dict[str, dict[str, dict[str, Any]]] = {}
+    for (layer_idx, hook_str), site_tensors in weights.items():
+        site_out: dict[str, dict[str, Any]] = {}
+        for name, tensor in site_tensors.items():
+            t = tensor.detach().contiguous()
+            site_out[str(name)] = {
+                "dtype": str(t.dtype).removeprefix("torch."),
+                "shape": list(t.shape),
+                "data": t.view(torch.uint8).numpy().tobytes()
+                if t.dtype == torch.bfloat16
+                else t.numpy().tobytes(),
+            }
+        packed[f"{layer_idx}:{hook_str}"] = site_out
+    return packed
 
 
 def _require_int_field(value: Any, *, field_name: str) -> int:

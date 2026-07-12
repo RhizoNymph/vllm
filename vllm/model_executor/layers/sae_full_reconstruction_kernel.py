@@ -43,6 +43,7 @@ def apply_sae_full_recon_triton(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
     encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
     decoder_weight: torch.Tensor,
     decoder_bias: torch.Tensor,
     clampable_features: torch.Tensor,
@@ -94,9 +95,9 @@ def apply_sae_full_recon_triton(
 
     if activation_code == 0:  # ReLU
         f = torch.clamp(pre_act, min=0.0)
-    elif activation_code == 1:  # JumpReLU
-        threshold = float(activation_param)
-        f = torch.where(pre_act > threshold, pre_act, torch.zeros_like(pre_act))
+    elif activation_code == 1:  # JumpReLU — per-feature thresholds.
+        thr_fp32 = threshold.to(torch.float32)
+        f = torch.where(pre_act > thr_fp32, pre_act, torch.zeros_like(pre_act))
     elif activation_code == 2:  # TopK over the full d_sae
         k = int(activation_param)
         d_sae = pre_act.shape[1]
@@ -185,6 +186,7 @@ def warmup_apply_sae_full_recon_kernel(
     dummy_h = torch.zeros(n_active, hidden_size, dtype=compute_dtype, device=device)
     dummy_W_enc = torch.zeros(d_sae, hidden_size, dtype=table_dtype, device=device)
     dummy_b_enc = torch.zeros(d_sae, dtype=table_dtype, device=device)
+    dummy_threshold = torch.zeros(d_sae, dtype=torch.float32, device=device)
     dummy_W_dec = torch.zeros(d_sae, hidden_size, dtype=table_dtype, device=device)
     dummy_b_dec = torch.zeros(hidden_size, dtype=table_dtype, device=device)
     feats = torch.zeros(max(n_clamp, 0), dtype=torch.int64, device=device)
@@ -198,6 +200,7 @@ def warmup_apply_sae_full_recon_kernel(
         dummy_h,
         dummy_W_enc,
         dummy_b_enc,
+        dummy_threshold,
         dummy_W_dec,
         dummy_b_dec,
         feats,

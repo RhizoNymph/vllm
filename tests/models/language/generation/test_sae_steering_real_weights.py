@@ -24,16 +24,10 @@ subset / merge contract on synthetic on-disk fixtures and do not
 require a GPU.
 
 Per-feature JumpReLU thresholds: Gemma Scope ships a per-feature
-``threshold`` array, while the current SAE kernel takes a scalar
-``threshold`` parameter (kept simple so each ``(activation, n_clamp,
-d_model)`` site JIT-specialises on a single constexpr).  The loader
-falls back to the median per-feature threshold over the clampable
-subset (see :func:`load_gemma_scope_sae` for the full rationale).
-For absolute clamps with a high target value, the steering effect
-is dominated by ``target`` rather than the live activation ``f``
-(``delta = target - f``), so the qualitative output-shift assertion
-in this test is robust to the threshold simplification.  Tracked as
-a follow-up.
+``threshold`` array, which the loader subsets to the clampable
+features and emits as the ``(n_clamp,)`` ``"threshold"`` tensor in
+the weights payload (see :func:`load_gemma_scope_sae`); the kernel
+applies it per feature.
 """
 
 from __future__ import annotations
@@ -49,6 +43,9 @@ import torch
 
 from vllm import SamplingParams
 from vllm.config.sae_steering_types import SAEClampEntry, SAEClampSpec
+from vllm.entrypoints.openai.steering.registry import (
+    pack_sae_weights_for_broadcast,
+)
 from vllm.entrypoints.openai.steering.sae_loader import (
     LoadedSAEModule,
     load_gemma_scope_sae,
@@ -192,9 +189,7 @@ def _build_clamp_spec(
     """Construct a single-feature absolute clamp spec for the test.
 
     Picks the first clampable feature; absolute clamp with
-    ``target=50`` produces a delta dominated by the target value, so
-    the test is robust to the JumpReLU threshold simplification
-    discussed at module top.
+    ``target=50`` produces a delta dominated by the target value.
     """
     entry = SAEClampEntry(
         feature_idx=int(clampable_features[0]),
@@ -255,9 +250,9 @@ def test_gemma_scope_sae_clamp_changes_output_real_weights(
             assert llm.llm.reset_prefix_cache()
 
             # Register the SAE module and attach weights.  The dispatch
-            # path runs once per worker rank; tensors are pickled
-            # across the RPC boundary by collective_rpc's marshalling
-            # layer.
+            # path runs once per worker rank; raw tensors do not survive
+            # collective_rpc's msgpack hop to an out-of-process engine
+            # core, so weights cross in the packed wire form.
             llm.llm.collective_rpc(
                 "register_steering_modules",
                 kwargs={
@@ -269,7 +264,7 @@ def test_gemma_scope_sae_clamp_changes_output_real_weights(
                 "attach_sae_weights",
                 kwargs={
                     "module_name": _SAE_MODULE_NAME,
-                    "weights": loaded.weights,
+                    "weights": pack_sae_weights_for_broadcast(loaded.weights),
                 },
             )
             assert llm.llm.reset_prefix_cache()
@@ -379,7 +374,7 @@ def test_gemma_scope_sae_clamp_magnitude_scales_with_target_real_weights(
                 "attach_sae_weights",
                 kwargs={
                     "module_name": _SAE_MODULE_NAME,
-                    "weights": loaded.weights,
+                    "weights": pack_sae_weights_for_broadcast(loaded.weights),
                 },
             )
 

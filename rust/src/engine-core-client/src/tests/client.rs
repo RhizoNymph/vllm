@@ -2557,6 +2557,8 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             capture: None,
             patch: None,
             patch_vectors: None,
+            sae_clamp_specs: None,
+            sae_full_reconstruction_specs: None,
         },
     );
 

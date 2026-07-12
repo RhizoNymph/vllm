@@ -46,10 +46,11 @@
   ([`../design/dynamic_steering.md`](../design/dynamic_steering.md));
   this document is specifically about decoder-direction interventions
   on SAE feature activations.
-- **Rust frontend passthrough.** The Rust frontend proxies additive
-  steering, capture, and patching but has no SAE request fields or
-  SAE module-registration support — see
-  [Current Limitations](#current-limitations).
+- **Rust frontend internals.** The Rust frontend forwards the SAE
+  request fields and registers SAE modules, but its implementation is
+  documented separately in `rust/docs/features/steering_capture.md` —
+  see [Current Limitations](#current-limitations) for the surface it
+  covers.
 
 ## Background and Choice of Variant
 
@@ -381,14 +382,29 @@ Global-tier contract (`set_global_clamps` / `clear_global_clamps` /
   phase-appropriate globals into every per-request row, so a request
   that opts into its own clamps still gets the globals.
 
-Worker-side RPC surface (no HTTP wrapper exists yet — reachable via
-`collective_rpc` only, see [Current Limitations](#current-limitations)):
+Worker-side RPC surface and the HTTP endpoints
+([`api_router.py`](../../vllm/entrypoints/serve/steering/api_router.py))
+that wrap it:
 
-| Call | Effect |
-|---|---|
-| `SteeringModelRunnerMixin.set_sae_global_clamps` | Validate against the registry + active rows, install |
-| `SteeringModelRunnerMixin.clear_sae_global_clamps` | Drop both phase tiers |
-| `SteeringModelRunnerMixin.get_sae_global_clamps_status` | JSON-safe view for status surfaces |
+| Endpoint | Worker call | Effect |
+|---|---|---|
+| `POST /v1/steering/sae/set` | `SteeringModelRunnerMixin.set_sae_global_clamps` | Validate against the registry + active rows, install |
+| `POST /v1/steering/sae/clear` | `SteeringModelRunnerMixin.clear_sae_global_clamps` | Drop both phase tiers |
+| `GET /v1/steering/sae` | `SteeringModelRunnerMixin.get_sae_global_clamps_status` | JSON-safe view of both tiers |
+
+`POST /v1/steering/sae/set` takes
+`{prefill_specs, decode_specs, replace}` (JSON-shape clamp specs, same
+shape as the per-request `sae_clamp_specs` sampling field — see
+`SetSAEGlobalClampsRequest` in
+[`protocol.py`](../../vllm/entrypoints/serve/steering/protocol.py)).
+The mutating endpoints share the additive router's discipline: gated
+by `--steering-api-key`, serialized under the steering lock, two-phase
+validate-then-apply (`validate_only=True` fans out first, so a
+rank-local validation failure surfaces before any rank mutates), and
+a mandatory prefix-cache reset after a successful set or clear (503 if
+the reset fails — global clamps affect every token's prefill/decode
+KV). `GET /v1/steering/sae` is unauthenticated and verifies all
+workers report identical global state (500 on divergence).
 
 `SAEFullReconstructionManager` has **no global tier**: row 0 is the
 no-reconstruction sentinel and rows `1..max` are per-request. Its
@@ -524,26 +540,42 @@ GEMMs per opted-in token per hooked layer).
 
 ## Current Limitations
 
-- **No Rust frontend passthrough.** `rust/` has no
-  `sae_clamp_specs` / `sae_full_reconstruction_specs` request fields
-  and its steering-modules proxy doesn't know the SAE kinds. SAE is
-  currently reachable only through the Python OpenAI server (or
-  offline `LLM` via `SamplingParams`).
-- **No HTTP endpoint for the global SAE clamp tier.** Install/clear
-  go through `collective_rpc` to the worker methods; an
-  `entrypoints/serve/steering/` wrapper is follow-up work.
-- **Startup `replace=True` module pushes are clear-then-readd.** A
-  failed SAE replace-push leaves workers cleared rather than restored
-  to the prior module (per-name runtime registration *does* roll back
-  via the compensating broadcast).
+- **Rust frontend: HTTP only.** `rust/` accepts the per-request
+  `sae_clamp_specs` / `sae_full_reconstruction_specs` fields and its
+  steering-modules surface (startup `--steering-modules` files and
+  `POST /v1/steering/modules`) registers both SAE kinds, sending
+  weights inline as base64-packed `{dtype, shape, data}` tensors
+  keyed by `"layer:hook"` (torch tensors do not survive the
+  `collective_rpc` hop; the worker's `_coerce_sae_weights_wire`
+  rebuilds them). gRPC remains request-passthrough only — SAE module
+  registration over gRPC is deferred. See
+  `rust/docs/features/steering_capture.md`.
+- **`replace=True` module pushes are per-worker atomic but not
+  cross-rank transactional.** On each worker,
+  `register_steering_modules(replace=True)`
+  (`_replace_steering_modules_atomically`) snapshots the additive and
+  both SAE registries — including attached SAE/FR weights — before
+  clearing and re-adding, and restores them on failure, so a poisoned
+  push cannot destroy a working registry. Pre-materialize pins are
+  released before the clear and *not* re-established on rollback (the
+  next `pre_materialize_steering_module` call re-installs them). What
+  remains best-effort is cross-rank consistency: `collective_rpc` is
+  not transactional, so a failure on some ranks after others committed
+  is not compensated — the same constraint as the additive per-name
+  path (see `_compensating_broadcast_after_failure` in
+  `entrypoints/serve/steering/modules_router.py`).
 - **Batch chat API requires packed steering vectors**
   (`SteeringVectorSpecPacked`); legacy dict-of-lists vectors are not
   accepted on the batch surface.
-- **Scalar JumpReLU threshold.** Gemma Scope's per-feature
-  `(d_sae,)` thresholds are folded to the median over the clampable
-  subset; per-feature thresholds remain a kernel-level follow-up.
-- **At most one SAE module per (layer, hook) site and kind**;
-  double-registration raises.
+- **At most one full-reconstruction SAE module per (layer, hook)
+  site**; double-registration raises by design — two residual
+  replacements on one site are semantically ill-defined. Delta
+  (`sae_delta`) modules are not so limited: any number may share a
+  site (each gets its own buffer slot) and their deltas compose
+  sequentially in registration order, which is identical across ranks.
+  An FR module may also share a site with delta modules — deltas run
+  first, the reconstruction replaces last. Re-registering the *same*
+  module name at a site it already occupies still raises.
 
 ## Resolved Design Decisions
 

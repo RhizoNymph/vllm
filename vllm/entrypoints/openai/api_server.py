@@ -412,22 +412,32 @@ async def init_app_state(
             include_sae_weights=True
         )
         if broadcast_payload:
-            await engine_client.collective_rpc(
-                "register_steering_modules",
-                kwargs=dict(modules=broadcast_payload, replace=True),
-            )
-            # Eagerly materialize each named module's rows now so the
-            # first request resolving to one finds a refcount-hit
-            # instead of paying the ~15 ms cold-path materialize cost
-            # in :meth:`SteeringManager.register_config` (the
-            # synchronous bf16 H2D upload of every layer).  Issued
-            # after the registry-update RPC because pre-materialize
-            # reads the resolved cache populated by it.
-            for module_name in broadcast_payload:
+            try:
                 await engine_client.collective_rpc(
-                    "pre_materialize_steering_module",
-                    kwargs=dict(name=module_name),
+                    "register_steering_modules",
+                    kwargs=dict(modules=broadcast_payload, replace=True),
                 )
+                # Eagerly materialize each named module's rows now so the
+                # first request resolving to one finds a refcount-hit
+                # instead of paying the ~15 ms cold-path materialize cost
+                # in :meth:`SteeringManager.register_config` (the
+                # synchronous bf16 H2D upload of every layer).  Issued
+                # after the registry-update RPC because pre-materialize
+                # reads the resolved cache populated by it.
+                for module_name in broadcast_payload:
+                    await engine_client.collective_rpc(
+                        "pre_materialize_steering_module",
+                        kwargs=dict(name=module_name),
+                    )
+            except Exception:
+                # A failed startup push must abort serving — workers
+                # roll back per-rank, but the server cannot assume the
+                # named modules are resolvable cluster-wide.
+                logger.error(
+                    "Startup steering module push failed for module(s) %s",
+                    list(broadcast_payload),
+                )
+                raise
 
         # Frontend-only registry of named probe/steer vectors for declarative
         # per-request steering gates. Resolved to inline packed bytes at

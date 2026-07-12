@@ -213,6 +213,13 @@ class WorkerBase:
     ) -> None:
         raise NotImplementedError
 
+    def attach_sae_full_recon_weights(
+        self,
+        module_name: str,
+        weights: dict[tuple[int, str], dict[str, torch.Tensor]],
+    ) -> None:
+        raise NotImplementedError
+
     def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
         raise NotImplementedError
 

@@ -45,6 +45,7 @@ from vllm.model_executor.layers.sae_full_reconstruction import (
     HOOK_POINT_FR_ENCODER_BIAS_ATTR,
     HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
     HOOK_POINT_FR_MODULE_NAME_ATTR,
+    HOOK_POINT_FR_THRESHOLD_ATTR,
     sae_full_recon_buffers_attached,
 )
 from vllm.model_executor.layers.steering import (
@@ -342,6 +343,80 @@ class TestAttachWeights:
         h = _Harness()
         with pytest.raises(SteeringVectorError, match="not registered"):
             h.attach_sae_full_recon_weights("missing", {})
+
+    def test_jumprelu_requires_threshold_tensor(self):
+        h = _Harness()
+        h.register_steering_modules(
+            modules={
+                "g": _payload(
+                    d_model=4, d_sae=8, clampable=(0, 1, 2), activation="jumprelu"
+                )
+            }
+        )
+        with pytest.raises(SteeringVectorError, match="threshold"):
+            h.attach_sae_full_recon_weights(
+                "g",
+                {
+                    (20, "post_block"): {
+                        "encoder_weight": torch.zeros(8, 4),
+                        "encoder_bias": torch.zeros(8),
+                        "decoder_weight": torch.zeros(8, 4),
+                        "decoder_bias": torch.zeros(4),
+                        # threshold deliberately absent
+                    }
+                },
+            )
+
+    def test_jumprelu_threshold_copied_into_buffer(self):
+        h = _Harness()
+        h.register_steering_modules(
+            modules={
+                "g": _payload(
+                    d_model=4, d_sae=8, clampable=(0, 1, 2), activation="jumprelu"
+                )
+            }
+        )
+        threshold = torch.linspace(0.0, 0.7, 8)
+        h.attach_sae_full_recon_weights(
+            "g",
+            {
+                (20, "post_block"): {
+                    "encoder_weight": torch.zeros(8, 4),
+                    "encoder_bias": torch.zeros(8),
+                    "decoder_weight": torch.zeros(8, 4),
+                    "decoder_bias": torch.zeros(4),
+                    "threshold": threshold,
+                }
+            },
+        )
+        layer = h._steerable_layers_cache[20]
+        buf = getattr(
+            layer, HOOK_POINT_FR_THRESHOLD_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert buf.dtype is torch.float32
+        assert torch.equal(buf, threshold)
+
+    def test_relu_threshold_is_optional(self):
+        h = _Harness()
+        h.register_steering_modules(
+            modules={"g": _payload(d_model=4, d_sae=8, clampable=(0, 1, 2))}
+        )
+        h.attach_sae_full_recon_weights(
+            "g",
+            {
+                (20, "post_block"): {
+                    "encoder_weight": torch.zeros(8, 4),
+                    "encoder_bias": torch.zeros(8),
+                    "decoder_weight": torch.zeros(8, 4),
+                    "decoder_bias": torch.zeros(4),
+                }
+            },
+        )
+        layer = h._steerable_layers_cache[20]
+        buf = getattr(
+            layer, HOOK_POINT_FR_THRESHOLD_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert torch.equal(buf, torch.zeros(8))
 
     def test_missing_decoder_bias_rejected(self):
         h = _Harness()

@@ -34,12 +34,40 @@ fn authorize_steering_mutation(state: &AppState, headers: &HeaderMap) -> Result<
     Ok(())
 }
 
+/// Invalidate KV blocks whose steering hash only names a module.
+///
+/// Request hashes include named-module references by name/scale, not by the
+/// current vector payload or SAE weights, so re-registering a name can make
+/// stale prefix-cache blocks appear reusable. Mirrors the Python frontend's
+/// `_reset_prefix_cache_after_module_change`: called after every successful
+/// register/unregister broadcast (all kinds). The startup load path needs no
+/// reset — the cache is empty before serving starts.
+async fn reset_prefix_cache_after_module_change(
+    state: &AppState,
+    action: &'static str,
+) -> Result<(), ApiError> {
+    match state.engine_core_client().reset_prefix_cache(true, false).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ApiError::service_unavailable(format!(
+            "Steering module was {action} but prefix cache could not be fully invalidated. \
+             Retry the request or reset the prefix cache before generating with this module."
+        ))),
+        Err(error) => Err(ApiError::service_unavailable(format!(
+            "Steering module was {action} but the prefix cache reset failed: {error:#}. \
+             Reset the prefix cache before generating with this module."
+        ))),
+    }
+}
+
 /// Request body for `POST /v1/steering/modules`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct RegisterModulesRequest {
-    /// Map of module name → `{vectors, prefill_vectors, decode_vectors}`. Each
-    /// tier may be inline (`{hook: {layer: [floats] | {vector, scale}}}`) or
-    /// packed (`{hook: {dtype, shape, layer_indices, data, scales}}`).
+    /// Map of module name → module payload. Additive modules carry
+    /// `{vectors, prefill_vectors, decode_vectors}` tiers (inline
+    /// `{hook: {layer: [floats] | {vector, scale}}}` or packed
+    /// `{hook: {dtype, shape, layer_indices, data, scales}}`); SAE modules
+    /// (`kind` of `sae_delta` / `sae_full_reconstruction`) carry
+    /// `sae_manifest` plus `"layer:hook"`-keyed packed `sae_weights`.
     modules: serde_json::Map<String, Value>,
     /// When `true`, the provided set becomes the entire registry (existing
     /// modules not listed are dropped). When `false` (default), the modules are
@@ -109,6 +137,11 @@ pub async fn register_steering_modules(
         state.extend_steering_module_names(payload.keys().cloned());
     }
 
+    // The modules are registered at this point even if the reset fails; the
+    // 503 tells the client the cache may still serve blocks computed against
+    // a previous payload registered under the same name.
+    reset_prefix_cache_after_module_change(&state, "registered").await?;
+
     Ok(Json(SteeringModulesResponse {
         modules: state.list_steering_modules(),
     }))
@@ -132,6 +165,8 @@ pub async fn unregister_steering_module(
         .await
         .map_err(|error| ApiError::server_error(format!("{error:#}")))?;
     state.remove_steering_module_name(&name);
+
+    reset_prefix_cache_after_module_change(&state, "unregistered").await?;
 
     Ok(Json(SteeringModulesResponse {
         modules: state.list_steering_modules(),

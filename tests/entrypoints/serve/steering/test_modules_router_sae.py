@@ -201,15 +201,19 @@ class TestSaeRegistrationLoadsAndBroadcastsWeights:
         payload = modules["g"]
         assert payload["kind"] == "sae_delta"
         # Weights ride along with the manifest so the worker register-
-        # and-attach happens in one indivisible step.
+        # and-attach happens in one indivisible step, in the packed wire
+        # form (raw tensors do not survive the collective_rpc hop).
         weights = payload["sae_weights"]
-        assert set(weights.keys()) == {(0, "post_block")}
+        assert set(weights.keys()) == {"0:post_block"}
         for tensors in weights.values():
             assert set(tensors.keys()) == {
                 "encoder_weight",
                 "encoder_bias",
                 "decoder_weight",
             }
+            for packed in tensors.values():
+                assert set(packed.keys()) == {"dtype", "shape", "data"}
+                assert isinstance(packed["data"], bytes)
         engine.reset_prefix_cache.assert_awaited_once_with(
             reset_running_requests=True
         )
@@ -479,7 +483,7 @@ class TestCompensatingBroadcastOnPartialFailure:
         # without this, partially-committed workers could be left on
         # a half-attached new module.
         assert "sae_weights" in comp_payload
-        assert set(comp_payload["sae_weights"].keys()) == {(0, "post_block")}
+        assert set(comp_payload["sae_weights"].keys()) == {"0:post_block"}
 
     def test_compensating_broadcast_failure_is_swallowed(
         self, engine, registry, tmp_path
@@ -545,7 +549,7 @@ class TestUnregisterRollbackOnPartialFailure:
         comp_payload = comp_modules["g"]
         assert comp_payload["kind"] == "sae_delta"
         assert "sae_weights" in comp_payload
-        assert set(comp_payload["sae_weights"].keys()) == {(0, "post_block")}
+        assert set(comp_payload["sae_weights"].keys()) == {"0:post_block"}
 
     def test_successful_unregister_resets_prefix_cache(
         self, engine, registry, tmp_path

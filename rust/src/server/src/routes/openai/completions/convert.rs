@@ -141,6 +141,8 @@ pub(super) fn prepare_completion_request(
             capture: request.capture,
             patch: request.patch,
             patch_vectors: request.patch_vectors,
+            sae_clamp_specs: request.sae_clamp_specs,
+            sae_full_reconstruction_specs: request.sae_full_reconstruction_specs,
         },
         decode_options: TextDecodeOptions {
             skip_special_tokens: request.skip_special_tokens,
@@ -531,6 +533,105 @@ mod tests {
                 &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
                 ResolvedRequestContext::default(),
             )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prepare_completion_request_decodes_typed_sae_specs() {
+        use vllm_engine_core_client::protocol::{SaeClampKind, SaePhase};
+
+        // JSON layer keys are strings ("20"); the typed boundary must decode
+        // them into integer keys so the southbound msgpack carries int keys.
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hi",
+            "sae_clamp_specs": [{
+                "module_name": "golden_gate",
+                "clamps": {
+                    "post_block": {
+                        "20": [{"feature_idx": 34, "kind": "absolute", "value": 5.0}]
+                    }
+                }
+            }],
+            "sae_full_reconstruction_specs": [{
+                "module_name": "golden_gate_full",
+                "phase": "decode"
+            }],
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+        )
+        .expect("prepare");
+
+        let sp = &prepared.text_request.sampling_params;
+        let specs = sp.sae_clamp_specs.as_ref().expect("clamp specs decoded");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].module_name, "golden_gate");
+        assert_eq!(specs[0].phase, SaePhase::Both);
+        let entries = &specs[0].clamps["post_block"][&20];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].feature_idx, 34);
+        assert_eq!(entries[0].kind, SaeClampKind::Absolute);
+        assert_eq!(entries[0].value, 5.0);
+        assert!(!entries[0].only_if_active);
+
+        let recon = sp.sae_full_reconstruction_specs.as_ref().expect("recon specs decoded");
+        assert_eq!(recon.len(), 1);
+        assert_eq!(recon[0].module_name, "golden_gate_full");
+        assert!(recon[0].clamps.is_empty());
+        assert_eq!(recon[0].phase, SaePhase::Decode);
+    }
+
+    #[test]
+    fn completion_request_rejects_malformed_sae_specs() {
+        // Bad `kind` discriminator.
+        assert!(
+            serde_json::from_value::<CompletionRequest>(json!({
+                "model": "m",
+                "prompt": "hi",
+                "sae_clamp_specs": [{
+                    "module_name": "g",
+                    "clamps": {"post_block": {"20": [
+                        {"feature_idx": 34, "kind": "clamp", "value": 5.0}
+                    ]}}
+                }],
+            }))
+            .is_err()
+        );
+
+        // Bad `phase` discriminator.
+        assert!(
+            serde_json::from_value::<CompletionRequest>(json!({
+                "model": "m",
+                "prompt": "hi",
+                "sae_clamp_specs": [{
+                    "module_name": "g",
+                    "phase": "sometimes",
+                    "clamps": {"post_block": {"20": [
+                        {"feature_idx": 34, "kind": "absolute", "value": 5.0}
+                    ]}}
+                }],
+            }))
+            .is_err()
+        );
+
+        // Non-integer layer key.
+        assert!(
+            serde_json::from_value::<CompletionRequest>(json!({
+                "model": "m",
+                "prompt": "hi",
+                "sae_clamp_specs": [{
+                    "module_name": "g",
+                    "clamps": {"post_block": {"twenty": [
+                        {"feature_idx": 34, "kind": "absolute", "value": 5.0}
+                    ]}}
+                }],
+            }))
             .is_err()
         );
     }
