@@ -252,9 +252,80 @@ function parseHarmonyCompletion(completion: string): string {
   return tail.replace(/<\|[^|]*\|>/g, '').trim();
 }
 
+
+// GLM-4/5 family (e.g. GLM-5.2). Turns are delimited by per-role marker
+// tokens with no separate turn-end token:
+//   [gMASK]<sop>[<|system|>...]<|user|>{content}<|assistant|>{<think>...</think>}{answer}
+// Assistant thinking is inline <think>...</think> (the template pre-opens
+// thinking server-side; the closing tag appears in the stream). Each role
+// marker starts a new bubble; the [gMASK]<sop> prefix joins the first header.
+const GLM_ROLE_TOKENS: Record<string, ChatRole> = {
+  '<|system|>': 'assistant',
+  '<|user|>': 'user',
+  '<|assistant|>': 'assistant',
+  '<|observation|>': 'assistant',
+};
+
+function groupGlmTokens(tokens: LensTokenMessage[]): { messages: JlensTokenGroup[]; hasChatFormat: boolean } {
+  const isRole = (t: string) => Object.prototype.hasOwnProperty.call(GLM_ROLE_TOKENS, t.trim());
+  if (!tokens.some((t) => isRole(t.token))) {
+    return { messages: [], hasChatFormat: false };
+  }
+  const messages: JlensTokenGroup[] = [];
+  let i = 0;
+  const leading: LensTokenMessage[] = [];
+  while (i < tokens.length && !isRole(tokens[i].token)) {
+    leading.push(tokens[i]);
+    i += 1;
+  }
+  let isFirstTurn = true;
+  while (i < tokens.length) {
+    const marker = tokens[i];
+    const trimmed = marker.token.trim();
+    const roleLabel = trimmed.replace(/^<\|/, '').replace(/\|>$/, '');
+    const role: ChatRole = GLM_ROLE_TOKENS[trimmed] ?? 'assistant';
+    const headerTokens: LensTokenMessage[] = isFirstTurn && leading.length > 0 ? [...leading, marker] : [marker];
+    isFirstTurn = false;
+    i += 1;
+    const contentTokens: LensTokenMessage[] = [];
+    while (i < tokens.length && !isRole(tokens[i].token)) {
+      contentTokens.push(tokens[i]);
+      i += 1;
+    }
+    messages.push({ role, roleLabel, headerTokens, contentTokens, footerTokens: [] });
+  }
+  return { messages, hasChatFormat: true };
+}
+
+const glmFormat: JlensChatFormat = {
+  id: 'glm',
+  matchModelId: (id) => id.includes('glm'),
+  turnStartToken: '<|user|>',
+  turnEndToken: '<|assistant|>',
+  assistantRoleName: 'assistant',
+  isSpecialToken: (token) => {
+    const t = token.trim();
+    return (
+      isGlmRoleToken(t) || t === '[gMASK]' || t === '<sop>' || t === '<|endoftext|>' || t === '</s>'
+    );
+  },
+  groupTokens: (tokens) => groupGlmTokens(tokens),
+  // Strip the (template-pre-opened) thinking block: the answer follows the
+  // first closing tag when thinking is enabled.
+  parseCompletion: (completion) => {
+    const idx = completion.indexOf('</think>');
+    const body = idx >= 0 ? completion.slice(idx + '</think>'.length) : completion;
+    return body.replace(/<\/?think>/g, '').trim();
+  },
+};
+
+function isGlmRoleToken(t: string): boolean {
+  return Object.prototype.hasOwnProperty.call(GLM_ROLE_TOKENS, t);
+}
+
 // Ordered list of known formats. `detectChatFormat` returns the first match,
 // falling back to the qwen/ChatML default.
-export const JLENS_CHAT_FORMATS: JlensChatFormat[] = [gemma3Format, gptOssFormat, llama3Format, qwenFormat];
+export const JLENS_CHAT_FORMATS: JlensChatFormat[] = [gemma3Format, gptOssFormat, llama3Format, glmFormat, qwenFormat];
 
 export function detectChatFormat(modelId: string): JlensChatFormat {
   const lower = (modelId || '').toLowerCase();

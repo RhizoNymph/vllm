@@ -4,6 +4,7 @@ import { defineConfig } from 'vite';
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: '/np/',  // served under the sidecar's /np mount
   plugins: [react()],
   resolve: {
     alias: {

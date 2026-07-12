@@ -113,3 +113,16 @@ The app expects:
   the friendly hourly-limit message.
 - `POST /api/lens/share` — optional (see above); success response
   `{"path": "/..."}`.
+
+
+## Post-port functional edits (2026-07-11)
+
+- `jlens-chat-format.ts`: added a `glm` `JlensChatFormat` (custom
+  `groupTokens`). GLM-4/5 turns are delimited by per-role marker tokens
+  (`<|system|>` / `<|user|>` / `<|assistant|>` / `<|observation|>`) with no
+  turn-end token; the `[gMASK]<sop>` prefix folds into the first bubble's
+  header. Without this, glm model ids fell through to the ChatML default,
+  whose markers never occur in GLM streams — token grouping (and per-token
+  inspection of the pre-assistant boundary position) didn't work.
+- `vite.config.ts`: `base: '/np/'` (app is served under the sidecar's /np
+  mount; root-absolute assets 404'd there).
