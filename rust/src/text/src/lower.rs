@@ -109,6 +109,8 @@ pub fn lower_sampling_params(
         capture,
         patch,
         patch_vectors,
+        sae_clamp_specs,
+        sae_full_reconstruction_specs,
     } = sampling_params;
 
     validate_logprobs(
@@ -181,6 +183,8 @@ pub fn lower_sampling_params(
         capture,
         patch,
         patch_vectors,
+        sae_clamp_specs,
+        sae_full_reconstruction_specs,
     };
     validate_vocab_range(&params, &sampling_limits)?;
     Ok(params)
@@ -432,6 +436,8 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -486,6 +492,8 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -627,6 +635,8 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -699,6 +709,8 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -764,6 +776,8 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -1003,6 +1017,8 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -1050,6 +1066,52 @@ mod tests {
             params.capture,
             Some(serde_json::json!({"filesystem": {"tag": "t"}}))
         );
+    }
+
+    #[test]
+    fn lower_sampling_params_threads_sae_specs() {
+        use vllm_engine_core_client::protocol::{
+            SaeClampEntry, SaeClampKind, SaeClampSpec, SaeFullReconstructionSpec, SaePhase,
+        };
+
+        let clamp_spec = SaeClampSpec {
+            module_name: "golden_gate".to_string(),
+            clamps: HashMap::from([(
+                "post_block".to_string(),
+                std::collections::BTreeMap::from([(
+                    20u32,
+                    vec![SaeClampEntry {
+                        feature_idx: 34,
+                        kind: SaeClampKind::Absolute,
+                        value: 5.0,
+                        only_if_active: false,
+                    }],
+                )]),
+            )]),
+            phase: SaePhase::Both,
+        };
+        let recon_spec = SaeFullReconstructionSpec {
+            module_name: "golden_gate_full".to_string(),
+            clamps: HashMap::new(),
+            phase: SaePhase::Decode,
+        };
+        let sampling_params = SamplingParams {
+            sae_clamp_specs: Some(vec![clamp_spec.clone()]),
+            sae_full_reconstruction_specs: Some(vec![recon_spec.clone()]),
+            ..SamplingParams::default()
+        };
+
+        let params = lower_sampling_params(
+            sampling_params,
+            sample_sampling_hints(),
+            sample_sampling_limits(),
+            3,
+            &stub_tokenizer(),
+        )
+        .unwrap();
+
+        assert_eq!(params.sae_clamp_specs, Some(vec![clamp_spec]));
+        assert_eq!(params.sae_full_reconstruction_specs, Some(vec![recon_spec]));
     }
 
     #[test]

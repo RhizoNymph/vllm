@@ -60,6 +60,7 @@ pub mod handshake;
 pub mod logprobs;
 pub mod lora;
 pub mod multimodal;
+pub mod sae;
 pub mod stats;
 pub mod steering;
 pub mod tensor;
@@ -70,6 +71,9 @@ pub use classified_outputs::{
 };
 pub use dtype::ModelDtype;
 pub use logprobs::decode_engine_core_outputs;
+pub use sae::{
+    SaeClampEntry, SaeClampHookMap, SaeClampKind, SaeClampSpec, SaeFullReconstructionSpec, SaePhase,
+};
 pub use steering::{SteeringLayerEntry, SteeringVectorSpec};
 
 /// Request types are encoded as single-byte protocol constants so they can be
@@ -368,6 +372,15 @@ pub struct EngineCoreSamplingParams {
     /// wire payload compatible with clients that never set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_vectors: Option<serde_json::Value>,
+    /// Per-request SAE feature-surgery clamps (delta intervention), referencing
+    /// pre-registered named SAE modules. Typed (not verbatim JSON) because the
+    /// layer map needs msgpack integer keys — see [`sae::SaeClampHookMap`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sae_clamp_specs: Option<Vec<SaeClampSpec>>,
+    /// Per-request SAE full-reconstruction directives (residual replacement).
+    /// Same typed wire form as `sae_clamp_specs`; `clamps` may be empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sae_full_reconstruction_specs: Option<Vec<SaeFullReconstructionSpec>>,
 }
 
 impl EngineCoreSamplingParams {
@@ -403,6 +416,8 @@ impl EngineCoreSamplingParams {
             capture: None,
             patch: None,
             patch_vectors: None,
+            sae_clamp_specs: None,
+            sae_full_reconstruction_specs: None,
         }
     }
 }
@@ -867,6 +882,160 @@ mod tests {
         let decoded: EngineCoreSamplingParams =
             decode_msgpack(&encode_msgpack(&plain).unwrap()).unwrap();
         assert!(decoded.patch_vectors.is_none());
+    }
+
+    /// One-spec SAE fixture shared by the wire tests below (and mirrored, as
+    /// hex, by the Python cross-compat test
+    /// `tests/v1/engine/test_rust_sae_wire_compat.py`).
+    fn sample_sae_clamp_spec() -> SaeClampSpec {
+        SaeClampSpec {
+            module_name: "golden_gate".to_string(),
+            clamps: HashMap::from([(
+                "post_block".to_string(),
+                BTreeMap::from([(
+                    20u32,
+                    vec![SaeClampEntry {
+                        feature_idx: 34,
+                        kind: SaeClampKind::Absolute,
+                        value: 5.0,
+                        only_if_active: false,
+                    }],
+                )]),
+            )]),
+            phase: SaePhase::Both,
+        }
+    }
+
+    #[test]
+    fn sae_specs_use_python_field_names_and_int_layer_keys() {
+        let params = EngineCoreSamplingParams {
+            sae_clamp_specs: Some(vec![sample_sae_clamp_spec()]),
+            sae_full_reconstruction_specs: Some(vec![SaeFullReconstructionSpec {
+                module_name: "golden_gate_full".to_string(),
+                clamps: HashMap::new(),
+                phase: SaePhase::Decode,
+            }]),
+            ..EngineCoreSamplingParams::for_test()
+        };
+
+        let bytes = encode_msgpack(&params).unwrap();
+        let value = decode_value(&bytes).unwrap();
+        let map = match value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let get = |key: &str| map.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v);
+
+        // `sae_clamp_specs` is a list of spec maps under the Python field name.
+        let specs = match get("sae_clamp_specs").expect("sae_clamp_specs present") {
+            Value::Array(a) => a,
+            other => panic!("expected array, got {other:?}"),
+        };
+        let spec = match &specs[0] {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let field = |key: &str| spec.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v);
+        assert_eq!(
+            field("module_name").and_then(Value::as_str),
+            Some("golden_gate")
+        );
+        assert_eq!(field("phase").and_then(Value::as_str), Some("both"));
+
+        // `clamps` is {hook: {layer_idx: [entries]}}; the layer key MUST be a
+        // msgpack integer so Python's strict `dict[int, ...]` decoder accepts it.
+        let hooks = match field("clamps").expect("clamps present") {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let (hook_name, layers) = &hooks[0];
+        assert_eq!(hook_name.as_str(), Some("post_block"));
+        let layers = match layers {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let (layer_key, entries) = &layers[0];
+        assert!(
+            layer_key.is_i64() || layer_key.is_u64(),
+            "layer key must be an integer, got {layer_key:?}"
+        );
+        assert_eq!(layer_key.as_u64(), Some(20));
+        let entry = match entries {
+            Value::Array(a) => match &a[0] {
+                Value::Map(map) => map,
+                other => panic!("expected entry map, got {other:?}"),
+            },
+            other => panic!("expected entries array, got {other:?}"),
+        };
+        let entry_field =
+            |key: &str| entry.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v);
+        assert_eq!(entry_field("feature_idx").and_then(Value::as_u64), Some(34));
+        assert_eq!(
+            entry_field("kind").and_then(Value::as_str),
+            Some("absolute")
+        );
+        assert_eq!(entry_field("value").and_then(Value::as_f64), Some(5.0));
+        assert_eq!(
+            entry_field("only_if_active").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // Full-reconstruction specs travel the same way; empty clamps allowed.
+        let recon = match get("sae_full_reconstruction_specs").expect("recon present") {
+            Value::Array(a) => a,
+            other => panic!("expected array, got {other:?}"),
+        };
+        assert_eq!(recon.len(), 1);
+
+        // Round-trip back into the typed structs.
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.sae_clamp_specs, params.sae_clamp_specs);
+        assert_eq!(
+            decoded.sae_full_reconstruction_specs,
+            params.sae_full_reconstruction_specs
+        );
+    }
+
+    #[test]
+    fn sae_specs_omitted_when_none() {
+        // Requests without SAE specs must not carry the keys at all, keeping
+        // the wire payload identical to a build without SAE support.
+        let params = EngineCoreSamplingParams::for_test();
+        assert!(params.sae_clamp_specs.is_none());
+        assert!(params.sae_full_reconstruction_specs.is_none());
+
+        let bytes = encode_msgpack(&params).unwrap();
+        let map = match decode_value(&bytes).unwrap() {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        assert!(
+            !map.iter().any(|(k, _)| {
+                k.as_str() == Some("sae_clamp_specs")
+                    || k.as_str() == Some("sae_full_reconstruction_specs")
+            }),
+            "SAE keys must be omitted when None"
+        );
+
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
+        assert!(decoded.sae_clamp_specs.is_none());
+        assert!(decoded.sae_full_reconstruction_specs.is_none());
+    }
+
+    #[test]
+    fn sae_clamp_wire_hex_fixture_for_python_cross_compat() {
+        // Pins the exact wire bytes for a params carrying one SAE clamp spec.
+        // The Python cross-compat test
+        // `tests/v1/engine/test_rust_sae_wire_compat.py` embeds this hex and
+        // decodes it with a strict `msgspec.msgpack.Decoder(SamplingParams)`;
+        // regenerate it here (UPDATE_EXPECT=1) and copy it over when the wire
+        // shape changes.
+        let params = EngineCoreSamplingParams {
+            sae_clamp_specs: Some(vec![sample_sae_clamp_spec()]),
+            ..EngineCoreSamplingParams::for_test()
+        };
+        let hex = hex::encode(encode_msgpack(&params).unwrap());
+        expect_test::expect!["8cab74656d7065726174757265ca3f800000a5746f705f70ca3f800000a5746f705f6b00aa6d61785f746f6b656e73ce00010000aa6d696e5f746f6b656e7300a56d696e5f70ca00000000b16672657175656e63795f70656e616c7479ca00000000b070726573656e63655f70656e616c7479ca00000000b272657065746974696f6e5f70656e616c7479ca3f800000ae73746f705f746f6b656e5f69647390b35f616c6c5f73746f705f746f6b656e5f69647390af7361655f636c616d705f73706563739183ab6d6f64756c655f6e616d65ab676f6c64656e5f67617465a6636c616d707381aa706f73745f626c6f636b81149184ab666561747572655f69647822a46b696e64a86162736f6c757465a576616c7565cb4014000000000000ae6f6e6c795f69665f616374697665c2a57068617365a4626f7468"].assert_eq(&hex);
     }
 
     #[test]

@@ -89,6 +89,40 @@ an object (mirroring Python's `_capture_result_to_response_payload`).
 The packed → inline decode is the only transformation; everything else is
 pass-through field threading.
 
+### Per-request SAE specs (passthrough)
+
+Both HTTP surfaces also accept the per-request SAE steering fields
+`sae_clamp_specs` (feature-surgery clamps, delta intervention) and
+`sae_full_reconstruction_specs` (residual replacement), mirroring Python's
+`vllm.config.sae_steering_types` field-for-field:
+
+```
+SAEClampEntry  { feature_idx, kind: "absolute"|"additive", value, only_if_active=false }
+SaeClampSpec   { module_name, clamps: {hook: {layer: [entries]}}, phase: "both"|"prefill"|"decode" }
+SaeFullReconstructionSpec  { module_name, clamps (may be empty), phase }
+```
+
+These are **typed** at the boundary (`SaeClampSpec` /
+`SaeFullReconstructionSpec` in `protocol/sae.rs`) rather than forwarded as
+verbatim JSON like `capture`/`patch`: the Python engine-core decodes
+`SamplingParams` with a strict msgspec decoder whose clamp layer map is
+`dict[int, ...]`, so the layer keys MUST encode as msgpack integers —
+`serde_json::Value` cannot express int map keys. The typed boundary also gives
+free shape validation (bad `kind`/`phase`/layer key → serde 400); semantic
+validation (module existence, hook validity, overlap rules) stays in Python at
+admission. Inbound JSON layer keys are strings (`"20"`) and are parsed to int
+during deserialization. Both fields thread unchanged through
+`vllm_text::SamplingParams` → `lower_sampling_params` →
+`EngineCoreSamplingParams`, omitted from the wire when `None`.
+
+A hex wire fixture is pinned by the Rust test
+`sae_clamp_wire_hex_fixture_for_python_cross_compat` (protocol/mod.rs) and
+decoded on the Python side by `tests/v1/engine/test_rust_sae_wire_compat.py`.
+
+Note: named **SAE module registration** (the registry holding SAE weights) is
+not yet wired into the Rust frontend; these fields are request passthrough
+only, and referenced module names are validated by the engine at admission.
+
 ### Steering wire format (packed)
 
 Per hook point, one `SteeringHookPacked`:
@@ -166,6 +200,7 @@ validation.
 | `src/cmd/src/cli.rs` | `--steering-modules name=path` flag + `parse_steering_module` |
 | `src/server/src/state.rs` | `AppState.steering_module_names` (RwLock), `steering_module_error`, registry mutators, `lock_steering_mutations` |
 | `src/engine-core-client/src/protocol/steering.rs` | inline types `SteeringLayerEntry`, `SteeringVectorSpec` |
+| `src/engine-core-client/src/protocol/sae.rs` | typed per-request SAE types `SaeClampEntry`, `SaeClampSpec`, `SaeFullReconstructionSpec`, `SaeClampKind`, `SaePhase`, `SaeClampHookMap` |
 | `src/engine-core-client/src/protocol/mod.rs` | `EngineCoreSamplingParams` southbound fields; `EngineCoreOutput.capture_results` (tuple index 7) |
 | `src/engine-core-client/src/protocol/capture.rs` | `CaptureResult` wire type (`{key, status, error, payload}`) |
 | `src/server/src/routes/openai/utils/capture.rs` | `CaptureResultResponse` + `build_capture_results_response` (payload coercion) |
