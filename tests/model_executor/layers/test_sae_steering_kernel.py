@@ -345,7 +345,11 @@ class TestLayerDispatchUsesCustomOp:
         # patch the Python-visible accessor on the ops module.
         monkeypatch.setattr(torch.ops.vllm, "apply_sae_delta_indexed", counting_op)
 
-        h = torch.randn(3, 4)
+        # The op registers under the platform dispatch key (CUDA on GPU
+        # machines), so the dispatch must run on that device.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        layer.to(device)
+        h = torch.randn(3, 4, device=device)
         out = apply_layer_sae_delta(layer, h, SteeringHookPoint.POST_BLOCK)
         assert out.shape == h.shape
         assert calls["n"] == 1
