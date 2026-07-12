@@ -87,7 +87,9 @@ Features Index:
       client-provided packed patch_vectors row — optionally through a per-dim
       mask (alpha·mask folded into a per-dim alpha table). Includes a
       server-side (hooks × layers × positions) sweep endpoint (capture- or
-      vector-sourced) with SSE streaming and source-run lifecycle.
+      vector-sourced) with SSE streaming and source-run lifecycle. A Dash
+      dashboard example renders streamed sweeps as a live heatmap
+      (examples/online_serving/patch_dashboard/).
     entry_points:
       ["SamplingParams.patch", "SamplingParams.patch_vectors", "--enable-patching", "POST /v1/patch_sweep"]
     depends_on: [activation_capture, activation_steering]
