@@ -251,9 +251,12 @@ async def register_steering_module(
             # the binary-wire SteeringVectorSpecPacked shape; normalize before
             # handing off so the registry, the broadcast payload, and the
             # pre-materialize path all see the same legacy-shaped dict.
-            vectors = coerce_steering_spec(request.vectors)
-            prefill_vectors = coerce_steering_spec(request.prefill_vectors)
-            decode_vectors = coerce_steering_spec(request.decode_vectors)
+            try:
+                vectors = coerce_steering_spec(request.vectors)
+                prefill_vectors = coerce_steering_spec(request.prefill_vectors)
+                decode_vectors = coerce_steering_spec(request.decode_vectors)
+            except ValueError as err:
+                raise ValueError(f"Malformed steering payload: {err}") from err
             await registry.register(
                 name=request.name,
                 kind=kind,
