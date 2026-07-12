@@ -52,9 +52,9 @@ def _sae_payload(
     clampable_features=(0, 1, 2, 34),
     activation_params: dict | None = None,
 ) -> dict:
-    if activation_params is None and activation == "jumprelu":
-        activation_params = {"threshold": 0.0}
-    elif activation_params is None and activation == "topk":
+    # JumpReLU carries no activation params — per-feature thresholds
+    # ride the weights payload, not the manifest.
+    if activation_params is None and activation == "topk":
         activation_params = {"k": 1.0}
     else:
         activation_params = activation_params or {}
@@ -200,7 +200,9 @@ class TestRegisterDispatch:
                 "2147483647",
             ),
             (
-                _sae_payload(activation_params={}),
+                # Scalar thresholds in the manifest are no longer valid
+                # for jumprelu — thresholds ride the weights payload.
+                _sae_payload(activation_params={"threshold": 0.0}),
                 "activation_params.*threshold",
             ),
             (

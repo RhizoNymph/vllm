@@ -821,15 +821,11 @@ class SteeringModuleRegistry:
                 )
             return
         if activation is SAEActivation.JUMPRELU:
-            threshold = activation_params.get("threshold")
-            if (
-                isinstance(threshold, bool)
-                or not isinstance(threshold, (int, float))
-                or not math.isfinite(float(threshold))
-            ):
+            if activation_params:
                 raise ValueError(
-                    f"{prefix}: jumprelu activation_params requires a finite "
-                    f"'threshold', got {threshold!r}."
+                    f"{prefix}: activation_params must be empty for jumprelu "
+                    "— per-feature thresholds ride the weights payload as a "
+                    f"'threshold' tensor; got {activation_params!r}."
                 )
             return
         if activation is SAEActivation.TOPK:

@@ -48,6 +48,7 @@ from vllm.model_executor.layers.sae_steering import (
     HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
     HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
     HOOK_POINT_SAE_MODULE_NAME_ATTR,
+    HOOK_POINT_SAE_THRESHOLD_ATTR,
     sae_buffers_attached,
 )
 from vllm.model_executor.layers.steering import (
@@ -451,6 +452,83 @@ class TestAttachSaeWeights:
         with pytest.raises(SteeringVectorError, match="not registered"):
             h.attach_sae_weights("g", {})
 
+    def test_jumprelu_requires_threshold_tensor(self):
+        h = _RichHarness()
+        h.register_steering_modules(
+            {"g": _sae_payload(clampable=(0, 1), activation="jumprelu")}
+        )
+        with pytest.raises(SteeringVectorError, match="threshold"):
+            h.attach_sae_weights(
+                "g",
+                {
+                    (20, "post_block"): {
+                        "encoder_weight": torch.zeros(2, 4),
+                        "encoder_bias": torch.zeros(2),
+                        "decoder_weight": torch.zeros(2, 4),
+                        # threshold deliberately absent
+                    }
+                },
+            )
+
+    def test_jumprelu_threshold_copied_into_buffer(self):
+        h = _RichHarness()
+        h.register_steering_modules(
+            {"g": _sae_payload(clampable=(0, 1), activation="jumprelu")}
+        )
+        threshold = torch.tensor([0.25, 0.75])
+        h.attach_sae_weights(
+            "g",
+            {
+                (20, "post_block"): {
+                    "encoder_weight": torch.zeros(2, 4),
+                    "encoder_bias": torch.zeros(2),
+                    "decoder_weight": torch.zeros(2, 4),
+                    "threshold": threshold,
+                }
+            },
+        )
+        site = h._steerable_layers_cache[20]
+        buf = getattr(site, HOOK_POINT_SAE_THRESHOLD_ATTR[SteeringHookPoint.POST_BLOCK])
+        assert buf.dtype is torch.float32
+        assert torch.equal(buf, threshold)
+
+    def test_relu_threshold_is_optional(self):
+        # Non-JumpReLU modules may omit the threshold tensor; the
+        # zero-filled buffer stands in for the fixed op arity.
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload(clampable=(0, 1))})
+        h.attach_sae_weights(
+            "g",
+            {
+                (20, "post_block"): {
+                    "encoder_weight": torch.zeros(2, 4),
+                    "encoder_bias": torch.zeros(2),
+                    "decoder_weight": torch.zeros(2, 4),
+                }
+            },
+        )
+        site = h._steerable_layers_cache[20]
+        buf = getattr(site, HOOK_POINT_SAE_THRESHOLD_ATTR[SteeringHookPoint.POST_BLOCK])
+        assert torch.equal(buf, torch.zeros(2))
+
+    def test_threshold_shape_mismatch_raises(self):
+        h = _RichHarness()
+        h.register_steering_modules(
+            {"g": _sae_payload(clampable=(0, 1), activation="jumprelu")}
+        )
+        with pytest.raises(SteeringVectorError, match="threshold.*shape"):
+            h.attach_sae_weights(
+                "g",
+                {
+                    (20, "post_block"): {
+                        "encoder_weight": torch.zeros(2, 4),
+                        "encoder_bias": torch.zeros(2),
+                        "decoder_weight": torch.zeros(2, 4),
+                        "threshold": torch.zeros(3),  # wrong n_clamp
+                    }
+                },
+            )
+
     def test_missing_tensor_key_raises(self):
         h = _RichHarness()
         h.register_steering_modules({"g": _sae_payload(clampable=(0, 1))})
@@ -730,6 +808,47 @@ class TestRegisterWithInlineWeights:
             getattr(site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]),
             torch.full((2,), 0.25),
         )
+
+    def test_replacement_failure_restores_jumprelu_threshold(self):
+        """Snapshot/rollback must round-trip the per-feature threshold
+        buffer, not just the encoder/decoder weights."""
+        h = _RichHarness(hidden_size=4)
+        threshold = torch.tensor([0.25, 0.75])
+        good = _sae_payload(d_model=4, clampable=(0, 1), activation="jumprelu")
+        good["sae_weights"] = {
+            (20, "post_block"): {
+                "encoder_weight": torch.full((2, 4), 7.0),
+                "encoder_bias": torch.full((2,), 0.25),
+                "decoder_weight": torch.full((2, 4), 3.0),
+                "threshold": threshold,
+            }
+        }
+        h.register_steering_modules({"g": good})
+        site = h._steerable_layers_cache[20]
+        thr_buf = getattr(
+            site, HOOK_POINT_SAE_THRESHOLD_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert torch.equal(thr_buf, threshold)
+
+        bad = _sae_payload(d_model=4, clampable=(0, 1), activation="jumprelu")
+        bad["sae_weights"] = {
+            (20, "post_block"): {
+                "encoder_weight": torch.zeros(99, 4),  # wrong n_clamp
+                "encoder_bias": torch.zeros(2),
+                "decoder_weight": torch.zeros(2, 4),
+                "threshold": torch.zeros(2),
+            }
+        }
+        with pytest.raises(SteeringVectorError):
+            h.register_steering_modules({"g": bad})
+
+        # Registry entry preserved and the original per-feature
+        # thresholds restored after the failed replacement.
+        assert "g" in h._sae_module_registry
+        thr_buf = getattr(
+            site, HOOK_POINT_SAE_THRESHOLD_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert torch.equal(thr_buf, threshold)
 
     def test_replace_true_failure_restores_additive_registry(self):
         h = _RichHarness(hidden_size=4)

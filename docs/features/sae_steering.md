@@ -539,9 +539,6 @@ GEMMs per opted-in token per hooked layer).
 - **Batch chat API requires packed steering vectors**
   (`SteeringVectorSpecPacked`); legacy dict-of-lists vectors are not
   accepted on the batch surface.
-- **Scalar JumpReLU threshold.** Gemma Scope's per-feature
-  `(d_sae,)` thresholds are folded to the median over the clampable
-  subset; per-feature thresholds remain a kernel-level follow-up.
 - **At most one SAE module per (layer, hook) site and kind**;
   double-registration raises.
 

@@ -29,9 +29,9 @@ def _manifest(
     activation_params: dict[str, float] | None = None,
     weights_uri: str | None = "/tmp/sae",
 ) -> SAEModuleManifest:
-    if activation_params is None and activation is SAEActivation.JUMPRELU:
-        activation_params = {"threshold": 0.0}
-    elif activation_params is None and activation is SAEActivation.TOPK:
+    # JumpReLU carries no activation params — per-feature thresholds
+    # ride the weights payload, not the manifest.
+    if activation_params is None and activation is SAEActivation.TOPK:
         activation_params = {"k": 1.0}
     return SAEModuleManifest(
         d_model=d_model,
@@ -205,7 +205,9 @@ class TestRegisterSAE:
         "manifest",
         [
             _manifest(activation=SAEActivation.RELU, activation_params={"k": 1.0}),
-            _manifest(activation_params={}),
+            # JumpReLU must carry empty activation_params — scalar
+            # thresholds in the manifest are no longer valid.
+            _manifest(activation_params={"threshold": 0.5}),
             _manifest(activation_params={"threshold": True}),  # type: ignore[dict-item]
             _manifest(activation=SAEActivation.TOPK, activation_params={}),
             _manifest(activation=SAEActivation.TOPK, activation_params={"k": 0.0}),

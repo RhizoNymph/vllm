@@ -24,6 +24,7 @@ from vllm.model_executor.layers.sae_steering import (
     HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
     HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
     HOOK_POINT_SAE_MODULE_NAME_ATTR,
+    HOOK_POINT_SAE_THRESHOLD_ATTR,
     register_sae_buffers,
     register_sae_index_buffer,
     sae_buffers_attached,
@@ -112,7 +113,7 @@ class TestRegisterSaeBuffers:
             hook_point=SteeringHookPoint.POST_ATTN,
             module_name="g",
             activation=SAEActivation.JUMPRELU,
-            activation_params={"threshold": 0.5},
+            activation_params={},
             n_clamp=3,
             hidden_size=6,
             max_sae_configs=4,
@@ -127,6 +128,7 @@ class TestRegisterSaeBuffers:
         dec_w = getattr(
             m, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_ATTN]
         )
+        thr = getattr(m, HOOK_POINT_SAE_THRESHOLD_ATTR[SteeringHookPoint.POST_ATTN])
         # Encoder/decoder shape and dtype contract: compute dtype, aligned
         # rows for the clampable feature subset.
         assert enc_w.shape == (3, 6)
@@ -135,6 +137,32 @@ class TestRegisterSaeBuffers:
         assert enc_b.dtype is torch.bfloat16
         assert dec_w.shape == (3, 6)
         assert dec_w.dtype is torch.bfloat16
+        # Per-feature JumpReLU thresholds are always fp32 — the
+        # comparison happens in fp32 regardless of compute dtype —
+        # and default to zero until weights are attached.
+        assert thr.shape == (3,)
+        assert thr.dtype is torch.float32
+        assert torch.equal(thr, torch.zeros(3))
+
+    def test_threshold_buffer_registered_for_relu_sites(self):
+        # ReLU/TopK sites still register a zero-filled threshold buffer
+        # so the custom op keeps a fixed arity across activations.
+        m = _bare_module()
+        register_sae_buffers(
+            m,
+            hook_point=SteeringHookPoint.POST_BLOCK,
+            module_name="g",
+            activation=SAEActivation.RELU,
+            activation_params={},
+            n_clamp=2,
+            hidden_size=4,
+            max_sae_configs=1,
+            dtype=torch.float32,
+        )
+        thr = getattr(m, HOOK_POINT_SAE_THRESHOLD_ATTR[SteeringHookPoint.POST_BLOCK])
+        assert thr.shape == (2,)
+        assert thr.dtype is torch.float32
+        assert torch.equal(thr, torch.zeros(2))
 
     def test_records_module_name_and_activation(self):
         m = _bare_module()
@@ -143,7 +171,7 @@ class TestRegisterSaeBuffers:
             hook_point=SteeringHookPoint.POST_BLOCK,
             module_name="golden_gate",
             activation=SAEActivation.JUMPRELU,
-            activation_params={"threshold": 0.7},
+            activation_params={},
             n_clamp=2,
             hidden_size=4,
             max_sae_configs=1,
@@ -155,11 +183,13 @@ class TestRegisterSaeBuffers:
             getattr(m, HOOK_POINT_SAE_MODULE_NAME_ATTR[SteeringHookPoint.POST_BLOCK])
             == "golden_gate"
         )
-        # Activation reachable through a sibling attribute.
+        # Activation reachable through a sibling attribute.  JumpReLU
+        # carries no activation params — per-feature thresholds live
+        # in the dedicated threshold buffer.
         sae_act = m.sae_activation_post_block  # type: ignore[attr-defined]
         sae_act_params = m.sae_activation_params_post_block  # type: ignore[attr-defined]
         assert sae_act is SAEActivation.JUMPRELU
-        assert sae_act_params == {"threshold": 0.7}
+        assert sae_act_params == {}
 
     def test_supports_each_hook_point(self):
         # Iterate the SAE-supported hook points (the keys of the SAE
@@ -264,6 +294,7 @@ class TestRegisterSaeBuffers:
             HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR,
             HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
             HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
+            HOOK_POINT_SAE_THRESHOLD_ATTR,
             HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
             HOOK_POINT_SAE_MODULE_NAME_ATTR,
         ):
@@ -348,6 +379,7 @@ class TestUnregisterSaeBuffers:
             HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR,
             HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
             HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
+            HOOK_POINT_SAE_THRESHOLD_ATTR,
             HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
             HOOK_POINT_SAE_MODULE_NAME_ATTR,
         ):

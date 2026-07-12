@@ -61,6 +61,10 @@ def _make_inputs(
             device
         ),
         "encoder_bias": torch.randn(d_sae, generator=g, dtype=dtype).to(device),
+        # Non-constant per-feature JumpReLU thresholds (fp32).  Read
+        # only under the JumpReLU activation; other activations ignore
+        # the tensor but still require the argument (fixed op arity).
+        "threshold": (torch.rand(d_sae, generator=g) - 0.5).to(device),
         "decoder_weight": torch.randn(d_sae, d_model, generator=g, dtype=dtype).to(
             device
         ),
@@ -94,6 +98,7 @@ class TestEmptyShortCircuits:
         out = apply_sae_full_recon_triton(
             h,
             torch.zeros(8, 4),
+            torch.zeros(8),
             torch.zeros(8),
             torch.zeros(8, 4),
             torch.zeros(4),
@@ -132,13 +137,16 @@ class TestParityWithEager:
         "activation,params,code",
         [
             (SAEActivation.RELU, {}, ACTIVATION_CODE_RELU),
-            (SAEActivation.JUMPRELU, {"threshold": 0.5}, ACTIVATION_CODE_JUMPRELU),
+            (SAEActivation.JUMPRELU, {}, ACTIVATION_CODE_JUMPRELU),
             (SAEActivation.TOPK, {"k": 4}, ACTIVATION_CODE_TOPK),
         ],
     )
     def test_random_inputs_match_eager(self, activation, params, code):
         torch.manual_seed(0)
         n_tokens, d_model, d_sae, n_clamp = 5, 6, 12, 3
+        # ``_make_inputs`` includes a random non-constant per-feature
+        # threshold tensor — the JumpReLU case exercises the per-lane
+        # comparison end-to-end.
         inputs = _make_inputs(
             n_tokens=n_tokens, d_model=d_model, d_sae=d_sae, n_clamp=n_clamp, seed=42
         )
@@ -163,7 +171,7 @@ class TestParityWithEager:
         )
         # Compaction CUDA path — runs on CPU tensors fine, that's the
         # whole point of the design (no real Triton kernel yet).
-        param = float(params.get("threshold", params.get("k", 0.0)))
+        param = float(params.get("k", 0.0))
         got = apply_sae_full_recon_triton(
             **inputs,
             **clamps,
@@ -196,6 +204,7 @@ class TestParityWithEager:
             "hidden_states": hidden,
             "encoder_weight": torch.eye(2),
             "encoder_bias": torch.zeros(2),
+            "threshold": torch.zeros(2),
             "decoder_weight": torch.eye(2),
             "decoder_bias": torch.zeros(2),
             "clampable_features": torch.tensor([0], dtype=torch.int64),
@@ -221,6 +230,7 @@ class TestParityWithEager:
             "hidden_states": torch.zeros(1, 4),
             "encoder_weight": torch.zeros(4, 4),
             "encoder_bias": torch.ones(4),
+            "threshold": torch.zeros(4),
             "decoder_weight": torch.eye(4),
             "decoder_bias": torch.zeros(4),
             "clampable_features": torch.zeros(0, dtype=torch.int64),
@@ -306,7 +316,7 @@ class TestCudaParity:
         "activation,params,code",
         [
             (SAEActivation.RELU, {}, ACTIVATION_CODE_RELU),
-            (SAEActivation.JUMPRELU, {"threshold": 0.5}, ACTIVATION_CODE_JUMPRELU),
+            (SAEActivation.JUMPRELU, {}, ACTIVATION_CODE_JUMPRELU),
         ],
     )
     def test_cuda_matches_cpu_eager(self, activation, params, code):
@@ -335,7 +345,7 @@ class TestCudaParity:
         )
         gpu_inputs = {k: v.cuda() for k, v in cpu_inputs.items()}
         gpu_clamps = {k: v.cuda() for k, v in cpu_clamps.items()}
-        param = float(params.get("threshold", params.get("k", 0.0)))
+        param = float(params.get("k", 0.0))
         got = apply_sae_full_recon_triton(
             **gpu_inputs,
             **gpu_clamps,
