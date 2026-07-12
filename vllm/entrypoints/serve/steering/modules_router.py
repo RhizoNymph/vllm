@@ -14,6 +14,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.steering.registry import (
     SAEModuleManifest,
     SteeringModule,
+    pack_sae_weights_for_broadcast,
 )
 from vllm.entrypoints.openai.steering.sae_loader import (
     _load_weights_for_manifest,
@@ -146,7 +147,7 @@ def _build_broadcast_payload_for_module(module: SteeringModule) -> dict:
             "activation_params": dict(manifest.activation_params),
             "weights_uri": manifest.weights_uri,
         },
-        "sae_weights": weights,
+        "sae_weights": pack_sae_weights_for_broadcast(weights),
     }
 
 
@@ -357,8 +358,9 @@ async def register_steering_module(
                 # failure would leave the worker with a registered SAE
                 # module whose buffers are still zero-filled — the
                 # silent-no-op failure mode this endpoint exists to
-                # prevent.
-                "sae_weights": weights,
+                # prevent.  Packed to the wire-safe form: raw tensors
+                # do not survive the collective_rpc msgpack hop.
+                "sae_weights": pack_sae_weights_for_broadcast(weights),
             }
         # Push the freshly-registered module to every worker so requests
         # carrying ``SamplingParams.steering_module_ref`` (additive) or

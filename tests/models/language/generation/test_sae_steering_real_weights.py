@@ -49,6 +49,9 @@ import torch
 
 from vllm import SamplingParams
 from vllm.config.sae_steering_types import SAEClampEntry, SAEClampSpec
+from vllm.entrypoints.openai.steering.registry import (
+    pack_sae_weights_for_broadcast,
+)
 from vllm.entrypoints.openai.steering.sae_loader import (
     LoadedSAEModule,
     load_gemma_scope_sae,
@@ -255,9 +258,9 @@ def test_gemma_scope_sae_clamp_changes_output_real_weights(
             assert llm.llm.reset_prefix_cache()
 
             # Register the SAE module and attach weights.  The dispatch
-            # path runs once per worker rank; tensors are pickled
-            # across the RPC boundary by collective_rpc's marshalling
-            # layer.
+            # path runs once per worker rank; raw tensors do not survive
+            # collective_rpc's msgpack hop to an out-of-process engine
+            # core, so weights cross in the packed wire form.
             llm.llm.collective_rpc(
                 "register_steering_modules",
                 kwargs={
@@ -269,7 +272,7 @@ def test_gemma_scope_sae_clamp_changes_output_real_weights(
                 "attach_sae_weights",
                 kwargs={
                     "module_name": _SAE_MODULE_NAME,
-                    "weights": loaded.weights,
+                    "weights": pack_sae_weights_for_broadcast(loaded.weights),
                 },
             )
             assert llm.llm.reset_prefix_cache()
@@ -379,7 +382,7 @@ def test_gemma_scope_sae_clamp_magnitude_scales_with_target_real_weights(
                 "attach_sae_weights",
                 kwargs={
                     "module_name": _SAE_MODULE_NAME,
-                    "weights": loaded.weights,
+                    "weights": pack_sae_weights_for_broadcast(loaded.weights),
                 },
             )
 

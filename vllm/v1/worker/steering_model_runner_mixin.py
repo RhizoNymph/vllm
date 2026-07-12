@@ -3534,8 +3534,13 @@ class SteeringModelRunnerMixin:
 
         This is the injection point used by tests, runtime registration,
         and startup/full-registry broadcasts after the on-disk loader has
-        materialised tensors per (layer, hook) site.
+        materialised tensors per (layer, hook) site.  Called directly
+        over ``collective_rpc`` the payload arrives in wire form
+        (degraded tensor triples / packed dicts / string site keys), so
+        it is coerced here — the same normalization the register-branch
+        payloads get.
         """
+        weights = _coerce_sae_weights_wire(weights)
         if module_name not in self._sae_module_registry:
             raise SteeringVectorError(
                 f"attach_sae_weights: SAE module {module_name!r} is not registered."
@@ -3905,7 +3910,10 @@ class SteeringModelRunnerMixin:
         copied into the corresponding zero-initialised buffer in
         place; shape and dtype must match what
         :meth:`_attach_sae_full_recon_buffers` allocated.
+
+        Coerced from wire form on entry, like :meth:`attach_sae_weights`.
         """
+        weights = _coerce_sae_weights_wire(weights)
         if module_name not in self._sae_fr_module_registry:
             raise SteeringVectorError(
                 f"attach_sae_full_recon_weights: SAE full-reconstruction "
