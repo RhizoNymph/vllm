@@ -71,6 +71,7 @@ class EngineCoreRequest(
     trace_headers: dict[str, str] | None = None
     resumable: bool = False
     external_req_id: str | None = None
+    request_metadata: dict[str, object] | None = None
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, object] | None = None
     abort_immediately: bool = False
