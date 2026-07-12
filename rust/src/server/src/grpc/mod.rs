@@ -57,6 +57,24 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         {
             return Err(Status::not_found(message));
         }
+        if let Some((_, message)) = self.state.sae_module_kind_error(
+            text_request
+                .sampling_params
+                .sae_clamp_specs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|spec| spec.module_name.as_str()),
+            text_request
+                .sampling_params
+                .sae_full_reconstruction_specs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|spec| spec.module_name.as_str()),
+        ) {
+            return Err(Status::not_found(message));
+        }
 
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (unary)");
@@ -110,6 +128,24 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
             .state
             .steering_module_error(text_request.sampling_params.steering_name.as_deref())
         {
+            return Err(Status::not_found(message));
+        }
+        if let Some((_, message)) = self.state.sae_module_kind_error(
+            text_request
+                .sampling_params
+                .sae_clamp_specs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|spec| spec.module_name.as_str()),
+            text_request
+                .sampling_params
+                .sae_full_reconstruction_specs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|spec| spec.module_name.as_str()),
+        ) {
             return Err(Status::not_found(message));
         }
 

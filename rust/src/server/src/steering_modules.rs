@@ -436,9 +436,9 @@ fn validate_sae_weights(
 pub async fn load_and_broadcast_steering_modules(
     client: &EngineCoreClient,
     modules: &[SteeringModulePath],
-) -> anyhow::Result<HashSet<String>> {
+) -> anyhow::Result<HashMap<String, SteeringModuleKind>> {
     if modules.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
 
     let mut payload: HashMap<String, SteeringModuleBroadcast> =
@@ -452,8 +452,9 @@ pub async fn load_and_broadcast_steering_modules(
     // Startup pushes the full registry, replacing any prior state.
     register_modules(client, &payload, true).await?;
 
-    let names: HashSet<String> = payload.into_keys().collect();
-    let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+    let names: HashMap<String, SteeringModuleKind> =
+        payload.into_iter().map(|(name, module)| (name, module.kind)).collect();
+    let mut sorted: Vec<&str> = names.keys().map(String::as_str).collect();
     sorted.sort_unstable();
     info!(count = names.len(), modules = ?sorted, "loaded steering modules");
     Ok(names)

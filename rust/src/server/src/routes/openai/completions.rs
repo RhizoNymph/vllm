@@ -61,6 +61,22 @@ pub async fn completions(
     {
         return ApiError::invalid_request(message, Some("steering_name")).into_response();
     }
+    if let Some((field, message)) = state.sae_module_kind_error(
+        prepared.text_request.sampling_params
+            .sae_clamp_specs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|spec| spec.module_name.as_str()),
+        prepared.text_request.sampling_params
+            .sae_full_reconstruction_specs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|spec| spec.module_name.as_str()),
+    ) {
+        return ApiError::invalid_request(message, Some(field)).into_response();
+    }
     let request_span = tracing::info_span!(
         "completions",
         request_id = %prepared.request_id,

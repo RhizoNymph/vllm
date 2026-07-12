@@ -131,10 +131,12 @@ pub async fn register_steering_modules(
         .await
         .map_err(|error| ApiError::server_error(format!("{error:#}")))?;
 
+    let registered_kinds =
+        payload.iter().map(|(name, module)| (name.clone(), module.kind));
     if body.replace {
-        state.set_steering_module_names(payload.keys().cloned().collect());
+        state.set_steering_module_names(registered_kinds.collect());
     } else {
-        state.extend_steering_module_names(payload.keys().cloned());
+        state.extend_steering_module_names(registered_kinds);
     }
 
     // The modules are registered at this point even if the reset fails; the
