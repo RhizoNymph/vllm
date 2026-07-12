@@ -5,7 +5,8 @@
 Activation patching overwrites (``alpha == 1``) or interpolates toward
 (``0 < alpha < 1``) the residual-stream activation at selected token rows with
 a source vector captured from a prior "clean" run. It reuses the steering hook
-points (``pre_attn``, ``post_attn``, ``post_block``) and folds into the same
+points (``pre_attn``, ``post_attn``, ``post_block``, ``mlp_in``, ``mlp_out``)
+and folds into the same
 ``apply_layer_steering`` / ``apply_block_steering`` call sites, so no model file
 changes. The intervention order at each hook is::
 

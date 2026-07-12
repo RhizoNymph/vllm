@@ -51,7 +51,9 @@ transcoders consume them across layers, aligned per token). They are
 wired on **gemma3, gemma4, and the qwen3 family** (`qwen3`, `qwen3_moe`,
 `qwen3_next`/Qwen3.5); request them explicitly by name (e.g.
 `{"mlp_in": [12], "mlp_out": [12]}`). They are deliberately excluded from
-the `:all` fan-out so `:all` stays model-agnostic. On gemma MoE layers
+the `:all` fan-out so `:all` stays model-agnostic, but are injectable
+(steering + patching) like the residual hooks on the wired models. On gemma
+MoE layers
 `mlp_in` covers only the dense path (the parallel MoE branch is normed
 separately); `mlp_out` always captures the combined branch.
 

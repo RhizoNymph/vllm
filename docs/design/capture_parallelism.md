@@ -17,11 +17,11 @@ guide see [Capture Consumers](../features/capture_consumers.md).
 
 ## TL;DR
 
-- **The capturable hooks are replicated.** The three hooks that fire
-  today — `pre_attn`, `post_attn`, `post_block` — read the residual
-  stream *after* the TP all-reduce and the MoE combine, so the tensor
-  is full `hidden_size`, **byte-identical on every TP and every EP
-  rank**. For these hooks, TP/EP support is a *rank gate*, not a
+- **The capturable hooks are replicated.** The residual-stream hooks —
+  `pre_attn`, `post_attn`, `post_block` — read the residual stream
+  *after* the TP all-reduce and the MoE combine, so the tensor is full
+  `hidden_size`, **byte-identical on every TP and every EP rank** (the
+  `mlp_in`/`mlp_out` branch hooks are likewise replicated; see below). For these hooks, TP/EP support is a *rank gate*, not a
   gather: exactly one rank per replication group captures; the rest
   no-op.
 - **Pipeline parallelism is the substantive work.** Layers are

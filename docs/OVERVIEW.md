@@ -75,7 +75,7 @@ Features Index:
   activation_steering:
     description: >
       Per-request, per-token, CUDA-graph-safe additive intervention on the
-      residual stream (three tiers, three hook points).
+      residual stream (three tiers, five hook points).
     entry_points: ["SamplingParams.steering_vectors", "--enable-steering"]
     depends_on: [activation_capture]
     doc: docs/features/steering.md

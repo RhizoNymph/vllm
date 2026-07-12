@@ -83,8 +83,17 @@ class TestValidate:
         c = _consumer()
         with pytest.raises(CaptureValidationError):
             c.validate_client_spec(
-                {"hooks": {"mlp_out": [0]}, "positions": "all_prompt"}, _ctx("r", 3)
+                {"hooks": {"attn_scores": [0]}, "positions": "all_prompt"},
+                _ctx("r", 3),
             )
+
+    def test_accepts_mlp_hooks(self):
+        c = _consumer()
+        spec = c.validate_client_spec(
+            {"hooks": {"mlp_in": [0], "mlp_out": [1]}, "positions": "all_prompt"},
+            _ctx("r", 3),
+        )
+        assert spec.hooks == {"mlp_in": [0], "mlp_out": [1]}
 
     def test_rejects_missing_hooks(self):
         c = _consumer()

@@ -104,7 +104,7 @@ def resolve_patch_prefix_flags(
         if pv_width is not None and hidden_size is not None and pv_width != hidden_size:
             raise PatchValidationError(
                 f"patch[{i}]: patch_vectors width {pv_width} != hook width "
-                f"{hidden_size} (residual-stream hooks are hidden_size-wide)"
+                f"{hidden_size} (injectable hooks are hidden_size-wide)"
             )
 
     prompt_floors: list[int] = []
