@@ -27,6 +27,7 @@ from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
 )
 from vllm.envs import enable_envs_cache
+from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
@@ -226,6 +227,17 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
+
+        # Mirror of SAE steering modules registered through
+        # ``collective_rpc``: name -> (kind, sites, clampable feature ids).
+        # Consulted at request admission so a spec referencing an
+        # unknown module fails the request instead of raising on the
+        # worker execute path (fatal to the engine). Replaced
+        # wholesale on update: the input-processing thread reads it
+        # concurrently.
+        self._sae_admission_mirror: dict[
+            str, tuple[str, frozenset[tuple[int, str]], frozenset[int]]
+        ] = {}
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -848,7 +860,99 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        result = self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        self._maybe_update_sae_admission_mirror(method, kwargs)
+        return result
+
+    def _maybe_update_sae_admission_mirror(
+        self,
+        method: str | Callable[..., _R],
+        kwargs: dict[str, Any] | None,
+    ) -> None:
+        """Track SAE module (un)registrations for admission validation.
+
+        Runs only after the broadcast succeeded on every worker, so the
+        mirror never claims a module the workers don't have. The dict is
+        rebuilt and swapped in one assignment because
+        ``preprocess_add_request`` reads it from the input-processing
+        thread.
+        """
+        if method == "register_steering_modules" and kwargs:
+            modules = kwargs.get("modules") or {}
+            mirror = {} if kwargs.get("replace") else dict(self._sae_admission_mirror)
+            for name, payload in modules.items():
+                if not isinstance(payload, dict):
+                    continue
+                kind = payload.get("kind")
+                if kind not in ("sae_delta", "sae_full_reconstruction"):
+                    # A re-register under the same name may change kind.
+                    mirror.pop(name, None)
+                    continue
+                manifest = payload.get("sae_manifest") or {}
+                mirror[str(name)] = (
+                    kind,
+                    frozenset(
+                        (int(layer), str(hook))
+                        for layer, hook in manifest.get("layers", ())
+                    ),
+                    frozenset(int(f) for f in manifest.get("clampable_features", ())),
+                )
+            self._sae_admission_mirror = mirror
+        elif method == "unregister_steering_modules" and kwargs:
+            names = set(kwargs.get("names") or ())
+            self._sae_admission_mirror = {
+                name: entry
+                for name, entry in self._sae_admission_mirror.items()
+                if name not in names
+            }
+
+    def _validate_sae_specs_for_admission(self, sampling_params) -> None:
+        """Reject SAE specs the workers would fail on, at admission time.
+
+        The worker mixin re-validates on the execute path, but an
+        exception there is fatal to the engine core; raising here turns
+        the same condition into a request-scoped error. Frontends that
+        pre-validate (the Python API server) never reach these raises.
+        """
+        mirror = self._sae_admission_mirror
+        checks = (
+            (sampling_params.sae_clamp_specs or (), "sae_delta", "sae_clamp_specs"),
+            (
+                sampling_params.sae_full_reconstruction_specs or (),
+                "sae_full_reconstruction",
+                "sae_full_reconstruction_specs",
+            ),
+        )
+        for specs, want_kind, field_name in checks:
+            for i, spec in enumerate(specs):
+                entry = mirror.get(spec.module_name)
+                if entry is None or entry[0] != want_kind:
+                    available = sorted(
+                        name for name, e in mirror.items() if e[0] == want_kind
+                    )
+                    raise SteeringVectorError(
+                        f"{field_name}[{i}] references unknown {want_kind} "
+                        f"module {spec.module_name!r}.  Registered "
+                        f"{want_kind} modules: {available or 'none'}."
+                    )
+                _, sites, clampable = entry
+                for hook, layer_map in (spec.clamps or {}).items():
+                    for layer_idx, clamp_entries in layer_map.items():
+                        if (int(layer_idx), str(hook)) not in sites:
+                            raise SteeringVectorError(
+                                f"{field_name}[{i}] clamps site "
+                                f"(layer={layer_idx}, hook={hook!r}) not "
+                                f"covered by module {spec.module_name!r} "
+                                f"(sites: {sorted(sites)})."
+                            )
+                        for clamp_entry in clamp_entries:
+                            if int(clamp_entry.feature_idx) not in clampable:
+                                raise SteeringVectorError(
+                                    f"{field_name}[{i}] clamps feature "
+                                    f"{clamp_entry.feature_idx}, which is not "
+                                    f"in module {spec.module_name!r}'s "
+                                    "clampable set."
+                                )
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
@@ -863,6 +967,10 @@ class EngineCore:
             request.mm_features = self.mm_receiver_cache.get_and_update_features(
                 request.mm_features
             )
+
+        sp = request.sampling_params
+        if sp is not None and (sp.sae_clamp_specs or sp.sae_full_reconstruction_specs):
+            self._validate_sae_specs_for_admission(sp)
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
         if req.use_structured_output:
