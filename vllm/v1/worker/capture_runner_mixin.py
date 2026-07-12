@@ -180,9 +180,7 @@ class CaptureRunnerMixin:
                     extra_global_specs=tuple(
                         c.global_capture_spec() for _, c in self._sync_consumers
                     ),
-                    num_hidden_layers=(
-                        self.model_config.get_total_num_hidden_layers()
-                    ),
+                    num_hidden_layers=(self.model_config.get_total_num_hidden_layers()),
                     local_layer_range=self.model_config.get_layers_start_end_indices(
                         self.parallel_config
                     ),
@@ -328,6 +326,12 @@ class CaptureRunnerMixin:
         rows already captured before preemption.
         """
         if not self._capture_feature_enabled:
+            return
+        if self._in_kernel_warmup:
+            # ``warmup_kernels`` drives synthetic requests through the real
+            # execute_model path (v2). They must never enter capture tracking:
+            # an admitted warmup request would finalize on finish and deliver
+            # a (empty) ``on_capture`` to consumers before any real request.
             return
         req_id = new_req_data.req_id
         # Stash the conversation id for the per-step view (host-side metadata,

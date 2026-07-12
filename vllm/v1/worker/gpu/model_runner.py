@@ -1270,7 +1270,10 @@ class GPUModelRunner(
 
             # Build the capture gather plan (capturer rank only) from the final
             # batch layout; the in-forward capture_residual op populates it.
-            if self._capture_manager is not None:
+            # Skipped during ``warmup_kernels`` (which drives synthetic
+            # requests through this real path) so consumers never receive
+            # warmup activations via ``on_capture``.
+            if self._capture_manager is not None and not self._in_kernel_warmup:
                 self._capture_build_plan(input_batch)
 
             # Populate steering tables + per-token index before the forward.
@@ -1429,7 +1432,9 @@ class GPUModelRunner(
         # Dispatch the rows the in-forward capture op gathered this step. Runs
         # on every PP stage (each capturer rank owns its stage's layers) and
         # before non-last stages return their intermediate tensors below.
-        if self._capture_manager is not None:
+        # Skipped during ``warmup_kernels`` (no plan was built, and warmup
+        # steps must not reach consumer ``on_capture``).
+        if self._capture_manager is not None and not self._in_kernel_warmup:
             self._finalize_capture_step()
 
         # Sync-execution consumers: run on EVERY rank (outside the rank-0-only
