@@ -670,7 +670,14 @@ class TestBroadcastRoundTrip:
 
         assert dump["g"]["kind"] == "sae_delta"
         assert dump["g"]["sae_manifest"]["weights_uri"] == "/tmp/weights"
-        assert dump["g"]["sae_weights"] is weights
+        # Weights are packed to the wire-safe form (raw tensors do not
+        # survive the collective_rpc hop to an out-of-process engine).
+        packed = dump["g"]["sae_weights"]
+        assert set(packed.keys()) == {"20:post_block"}
+        enc_w = packed["20:post_block"]["encoder_weight"]
+        assert enc_w["dtype"] == "float32"
+        assert enc_w["shape"] == [4, 4096]
+        assert isinstance(enc_w["data"], bytes)
 
     @pytest.mark.asyncio
     async def test_load_from_file_accepts_sae_directory(self, tmp_path: Path):
@@ -706,7 +713,10 @@ class TestBroadcastRoundTrip:
 
         dump = reg.dump_for_broadcast(include_sae_weights=True)
         assert dump["g"]["kind"] == "sae_delta"
+        packed_dec = dump["g"]["sae_weights"]["0:post_block"]["decoder_weight"]
         assert torch.allclose(
-            dump["g"]["sae_weights"][(0, "post_block")]["decoder_weight"],
+            torch.frombuffer(bytearray(packed_dec["data"]), dtype=torch.float32).view(
+                *packed_dec["shape"]
+            ),
             weights["decoder_weight"],
         )

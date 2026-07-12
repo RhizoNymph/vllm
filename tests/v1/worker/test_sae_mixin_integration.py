@@ -588,9 +588,12 @@ class TestAttachSaeWeights:
             )
 
     def test_non_tensor_weight_raises_steering_error(self):
+        # Garbage values fail loudly at the wire-coercion boundary
+        # (attach coerces its payload on entry, so the error surfaces
+        # as the coercion ValueError rather than the attach-side check).
         h = _RichHarness()
         h.register_steering_modules({"g": _sae_payload(clampable=(0, 1))})
-        with pytest.raises(SteeringVectorError, match="torch.Tensor"):
+        with pytest.raises(ValueError, match="torch.Tensor"):
             h.attach_sae_weights(
                 "g",
                 {

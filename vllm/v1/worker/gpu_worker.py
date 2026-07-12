@@ -1082,6 +1082,13 @@ class Worker(WorkerBase):
     ) -> None:
         return self.model_runner.attach_sae_weights(module_name, weights)
 
+    def attach_sae_full_recon_weights(
+        self,
+        module_name: str,
+        weights: dict[tuple[int, str], dict[str, torch.Tensor]],
+    ) -> None:
+        return self.model_runner.attach_sae_full_recon_weights(module_name, weights)
+
     def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
         return self.model_runner.pre_materialize_steering_module(name)
 

@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from vllm.config.sae_steering_types import (
     SAEActivation,
     SAEClampSpec,
@@ -525,9 +527,11 @@ class SteeringModuleRegistry:
                         _load_weights_for_manifest,
                     )
 
-                    payload["sae_weights"] = _load_weights_for_manifest(
-                        manifest,
-                        Path(manifest.weights_uri),
+                    payload["sae_weights"] = pack_sae_weights_for_broadcast(
+                        _load_weights_for_manifest(
+                            manifest,
+                            Path(manifest.weights_uri),
+                        )
                     )
             out[name] = payload
         return out
@@ -889,6 +893,36 @@ def _sae_manifest_to_dict(manifest: SAEModuleManifest | None) -> dict[str, Any]:
         "activation_params": dict(manifest.activation_params),
         "weights_uri": manifest.weights_uri,
     }
+
+
+def pack_sae_weights_for_broadcast(
+    weights: dict[tuple[int, str], dict[str, Any]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Wire-safe form of an ``sae_weights`` payload for ``collective_rpc``.
+
+    Raw :class:`torch.Tensor` values do not survive the msgpack hop to an
+    out-of-process engine core — small tensors degrade to
+    ``[dtype, shape, buffer]`` triples and large ones to unrecoverable
+    aux-buffer indices. Packing to ``{"dtype", "shape", "data": bytes}``
+    dicts (raw bytes are a native msgpack type, carried inline at any
+    size) with ``"layer:hook"`` site keys matches the Rust frontend's
+    wire shape; the worker's ``_coerce_sae_weights_wire`` rebuilds
+    tensors on arrival.
+    """
+    packed: dict[str, dict[str, dict[str, Any]]] = {}
+    for (layer_idx, hook_str), site_tensors in weights.items():
+        site_out: dict[str, dict[str, Any]] = {}
+        for name, tensor in site_tensors.items():
+            t = tensor.detach().contiguous()
+            site_out[str(name)] = {
+                "dtype": str(t.dtype).removeprefix("torch."),
+                "shape": list(t.shape),
+                "data": t.view(torch.uint8).numpy().tobytes()
+                if t.dtype == torch.bfloat16
+                else t.numpy().tobytes(),
+            }
+        packed[f"{layer_idx}:{hook_str}"] = site_out
+    return packed
 
 
 def _require_int_field(value: Any, *, field_name: str) -> int:

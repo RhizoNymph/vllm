@@ -51,6 +51,9 @@ from vllm.config.sae_steering_types import (
     SAEClampEntry,
     SAEFullReconstructionSpec,
 )
+from vllm.entrypoints.openai.steering.registry import (
+    pack_sae_weights_for_broadcast,
+)
 from vllm.entrypoints.openai.steering.sae_loader import (
     LoadedSAEModule,
     load_gemma_scope_sae_full_recon,
@@ -255,7 +258,7 @@ def test_full_reconstruction_pure_replacement_changes_output_real_weights(
                 "attach_sae_full_recon_weights",
                 kwargs={
                     "module_name": _SAE_MODULE_NAME,
-                    "weights": loaded.weights,
+                    "weights": pack_sae_weights_for_broadcast(loaded.weights),
                 },
             )
             assert llm.llm.reset_prefix_cache()
@@ -347,7 +350,7 @@ def test_full_reconstruction_clamp_changes_output_real_weights(
                 "attach_sae_full_recon_weights",
                 kwargs={
                     "module_name": _SAE_MODULE_NAME,
-                    "weights": loaded.weights,
+                    "weights": pack_sae_weights_for_broadcast(loaded.weights),
                 },
             )
 
@@ -441,7 +444,7 @@ def test_full_reconstruction_clamp_magnitude_scales_with_target_real_weights(
                 "attach_sae_full_recon_weights",
                 kwargs={
                     "module_name": _SAE_MODULE_NAME,
-                    "weights": loaded.weights,
+                    "weights": pack_sae_weights_for_broadcast(loaded.weights),
                 },
             )
 

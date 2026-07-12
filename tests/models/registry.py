@@ -290,7 +290,13 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "FlexOlmoForCausalLM": _HfExamplesInfo("allenai/Flex-reddit-2x7B-1T"),
     "GemmaForCausalLM": _HfExamplesInfo("google/gemma-1.1-2b-it"),
     "Gemma2ForCausalLM": _HfExamplesInfo(
-        "google/gemma-2-9b", extras={"tiny": "google/gemma-2-2b-it"}
+        "google/gemma-2-9b",
+        extras={
+            "tiny": "google/gemma-2-2b-it",
+            # Base (non-instruct) checkpoint: the Gemma Scope SAEs used by
+            # the SAE-steering real-weights tests are trained on it.
+            "sae-base": "google/gemma-2-2b",
+        },
     ),
     "Gemma3ForCausalLM": _HfExamplesInfo("google/gemma-3-1b-it"),
     "Gemma4ForCausalLM": _HfExamplesInfo(
