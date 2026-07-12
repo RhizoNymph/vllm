@@ -138,6 +138,27 @@ content is rejected before rendering). For exact answer-token grading use the
 completions-only `logprob_token_ids` field (the requested ids replace top-k);
 chat exposes top-k `logprobs` only.
 
+`patch` is a top-level extra field in the OpenAI request body, alongside the
+standard params. The same body posts to `POST /v1/chat/completions` (top-k
+`logprobs` only — no `logprob_token_ids`):
+
+```json
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "messages": [{"role": "user", "content": "The capital of France is"}],
+  "max_tokens": 1, "temperature": 0.0, "logprobs": true, "top_logprobs": 5,
+  "patch": [
+    {"layer": 14, "hook": "post_block", "dest_position": 4,
+     "source_module": "zeros", "mask": {"indices": [12, 815]}}
+  ]
+}
+```
+
+Capture-sourced (`source_run`/`source_position`) and named-module
+(`source_module: "<name>"`) entries take the same shape — only the contents of
+the `patch` entries change. `patch_vectors` (the packed table for
+`source_inline`/mask `inline`) is a sibling top-level field the same way.
+
 To patch from a *named* vector, register a steering module once (a steering
 mutation — send the `Authorization: Bearer <key>` header if the server sets
 `--steering-api-key`) and reference it — the same handle can be steered with
