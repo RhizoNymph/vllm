@@ -2964,6 +2964,7 @@ class SteeringModelRunnerMixin:
         decode_specs_raw: object = None,
         *,
         replace: bool = False,
+        validate_only: bool = False,
     ) -> tuple[int, int]:
         """Install global SAE delta clamps applied to every token in a phase.
 
@@ -2984,6 +2985,11 @@ class SteeringModelRunnerMixin:
             decode_specs_raw: analogous for the decode global tier.
             replace: when True, clear existing globals before applying
                 — used for atomic swap of the global configuration.
+            validate_only: when True, coerce and validate the specs
+                but skip the commit to the manager's global tier.
+                Used by the router's two-phase validate-then-apply
+                flow so a rank-local validation failure surfaces
+                before any rank mutates state.
 
         Returns:
             ``(tp_rank, pp_rank)`` for router-side TP divergence checks.
@@ -3013,6 +3019,8 @@ class SteeringModelRunnerMixin:
             stub = _Stub()
             stub.sae_clamp_specs = tier_specs
             self._assert_sae_clamps_can_be_applied(stub)  # type: ignore[arg-type]
+        if validate_only:
+            return (tp_rank, pp_rank)
         mgr.set_global_clamps(
             prefill_specs=prefill_specs,
             decode_specs=decode_specs,

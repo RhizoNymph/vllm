@@ -1046,3 +1046,115 @@ class TestWorkerRpcSurface:
         worker.attach_sae_weights("g", weights)
 
         assert runner.calls == [("g", weights)]
+
+
+def _raw_global_specs(
+    *,
+    module_name: str = "g",
+    layer: int = 20,
+    hook: str = "post_block",
+    feature_idx: int = 34,
+    value: float = 5.0,
+) -> list[dict]:
+    """JSON-shape clamp specs, as the HTTP router forwards them."""
+    return [
+        {
+            "module_name": module_name,
+            "clamps": {
+                hook: {
+                    str(layer): [
+                        {
+                            "feature_idx": feature_idx,
+                            "kind": "absolute",
+                            "value": value,
+                        }
+                    ]
+                }
+            },
+        }
+    ]
+
+
+class TestSetSaeGlobalClamps:
+    """``set_sae_global_clamps`` — the worker half of the
+    ``/v1/steering/sae`` HTTP surface, including the two-phase
+    ``validate_only`` contract."""
+
+    def test_validate_only_does_not_commit(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+
+        ranks = h.set_sae_global_clamps(
+            prefill_specs_raw=_raw_global_specs(),
+            validate_only=True,
+        )
+
+        assert ranks == (0, 0)
+        assert h._sae_clamp_manager.global_prefill_specs == ()
+        assert h._sae_clamp_manager.global_decode_specs == ()
+
+    def test_validate_only_still_rejects_unknown_module(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+
+        with pytest.raises(SteeringVectorError, match="unknown module"):
+            h.set_sae_global_clamps(
+                prefill_specs_raw=_raw_global_specs(module_name="nope"),
+                validate_only=True,
+            )
+        assert h._sae_clamp_manager.global_prefill_specs == ()
+
+    def test_apply_commits_to_global_tier(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+
+        ranks = h.set_sae_global_clamps(
+            prefill_specs_raw=_raw_global_specs(),
+        )
+
+        assert ranks == (0, 0)
+        assert len(h._sae_clamp_manager.global_prefill_specs) == 1
+        assert h._sae_clamp_manager.global_prefill_specs[0].module_name == "g"
+        assert h._sae_clamp_manager.global_decode_specs == ()
+
+    def test_two_phase_validate_then_apply(self):
+        """Mirrors the router's RPC sequence: validate_only then commit."""
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+
+        h.set_sae_global_clamps(
+            decode_specs_raw=_raw_global_specs(),
+            validate_only=True,
+        )
+        assert h._sae_clamp_manager.global_decode_specs == ()
+
+        h.set_sae_global_clamps(decode_specs_raw=_raw_global_specs())
+        assert len(h._sae_clamp_manager.global_decode_specs) == 1
+
+    def test_clear_drops_both_tiers(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+        h.set_sae_global_clamps(
+            prefill_specs_raw=_raw_global_specs(),
+            decode_specs_raw=_raw_global_specs(feature_idx=1),
+        )
+
+        h.clear_sae_global_clamps()
+
+        assert h._sae_clamp_manager.global_prefill_specs == ()
+        assert h._sae_clamp_manager.global_decode_specs == ()
+
+    def test_status_reports_json_safe_view(self):
+        h = _RichHarness()
+        h.register_steering_modules({"g": _sae_payload()})
+        h.set_sae_global_clamps(prefill_specs_raw=_raw_global_specs())
+
+        status = h.get_sae_global_clamps_status()
+
+        assert status["decode"] == []
+        (spec,) = status["prefill"]
+        assert spec["module_name"] == "g"
+        entry = spec["clamps"]["post_block"]["20"][0]
+        assert entry["feature_idx"] == 34
+        assert entry["kind"] == "absolute"
+        assert entry["value"] == 5.0

@@ -381,14 +381,29 @@ Global-tier contract (`set_global_clamps` / `clear_global_clamps` /
   phase-appropriate globals into every per-request row, so a request
   that opts into its own clamps still gets the globals.
 
-Worker-side RPC surface (no HTTP wrapper exists yet — reachable via
-`collective_rpc` only, see [Current Limitations](#current-limitations)):
+Worker-side RPC surface and the HTTP endpoints
+([`api_router.py`](../../vllm/entrypoints/serve/steering/api_router.py))
+that wrap it:
 
-| Call | Effect |
-|---|---|
-| `SteeringModelRunnerMixin.set_sae_global_clamps` | Validate against the registry + active rows, install |
-| `SteeringModelRunnerMixin.clear_sae_global_clamps` | Drop both phase tiers |
-| `SteeringModelRunnerMixin.get_sae_global_clamps_status` | JSON-safe view for status surfaces |
+| Endpoint | Worker call | Effect |
+|---|---|---|
+| `POST /v1/steering/sae/set` | `SteeringModelRunnerMixin.set_sae_global_clamps` | Validate against the registry + active rows, install |
+| `POST /v1/steering/sae/clear` | `SteeringModelRunnerMixin.clear_sae_global_clamps` | Drop both phase tiers |
+| `GET /v1/steering/sae` | `SteeringModelRunnerMixin.get_sae_global_clamps_status` | JSON-safe view of both tiers |
+
+`POST /v1/steering/sae/set` takes
+`{prefill_specs, decode_specs, replace}` (JSON-shape clamp specs, same
+shape as the per-request `sae_clamp_specs` sampling field — see
+`SetSAEGlobalClampsRequest` in
+[`protocol.py`](../../vllm/entrypoints/serve/steering/protocol.py)).
+The mutating endpoints share the additive router's discipline: gated
+by `--steering-api-key`, serialized under the steering lock, two-phase
+validate-then-apply (`validate_only=True` fans out first, so a
+rank-local validation failure surfaces before any rank mutates), and
+a mandatory prefix-cache reset after a successful set or clear (503 if
+the reset fails — global clamps affect every token's prefill/decode
+KV). `GET /v1/steering/sae` is unauthenticated and verifies all
+workers report identical global state (500 on divergence).
 
 `SAEFullReconstructionManager` has **no global tier**: row 0 is the
 no-reconstruction sentinel and rows `1..max` are per-request. Its
@@ -529,9 +544,6 @@ GEMMs per opted-in token per hooked layer).
   and its steering-modules proxy doesn't know the SAE kinds. SAE is
   currently reachable only through the Python OpenAI server (or
   offline `LLM` via `SamplingParams`).
-- **No HTTP endpoint for the global SAE clamp tier.** Install/clear
-  go through `collective_rpc` to the worker methods; an
-  `entrypoints/serve/steering/` wrapper is follow-up work.
 - **`replace=True` module pushes are per-worker atomic but not
   cross-rank transactional.** On each worker,
   `register_steering_modules(replace=True)`
