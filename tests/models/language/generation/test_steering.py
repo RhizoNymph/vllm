@@ -62,12 +62,6 @@ _STABLELM_OVERRIDES = {
     "num_hidden_layers": 2,
 }
 
-_GROK_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "num_local_experts": 2,
-    "num_experts_per_tok": 2,
-}
-
 _STEP3P5_OVERRIDES = {
     **_SMALL_DECODER_OVERRIDES,
     "num_hidden_layers": 2,
@@ -86,11 +80,6 @@ _MINIMAX_OVERRIDES = {
     "rotary_dim": 64,
     "num_local_experts": 2,
     "num_experts_per_tok": 2,
-}
-
-_MINIMAX_TEXT_OVERRIDES = {
-    **_MINIMAX_OVERRIDES,
-    "num_local_experts": 1,
 }
 
 _AXK1_OVERRIDES = {
@@ -226,19 +215,6 @@ _PHI_OVERRIDES = {
     **_SMALL_DECODER_OVERRIDES,
     "hidden_act": "gelu_new",
     "tie_word_embeddings": False,
-}
-
-_PERSIMMON_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "qk_layernorm": False,
-    "layer_norm_eps": 1e-5,
-}
-
-_STARCODER2_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "hidden_act": "gelu_pytorch_tanh",
-    "norm_epsilon": 1e-5,
-    "use_bias": True,
 }
 
 _JAIS2_OVERRIDES = {
@@ -423,12 +399,6 @@ PHASE1_GENERATION_CASES = [
 
 PHASE2_DISCOVERY_CASES = [
     pytest.param(
-        "baichuan-inc/Baichuan2-7B-chat",
-        _SMALL_DECODER_OVERRIDES,
-        _TRUST_REMOTE_EAGER,
-        id="baichuan",
-    ),
-    pytest.param(
         "internlm/internlm2-chat-7b",
         _SMALL_DECODER_OVERRIDES,
         _TRUST_REMOTE_EAGER,
@@ -477,12 +447,6 @@ PHASE2_DISCOVERY_CASES = [
         id="glm4",
     ),
     pytest.param(
-        "hpcai-tech/grok-1",
-        _GROK_OVERRIDES,
-        _TRUST_REMOTE_EAGER,
-        id="grok1",
-    ),
-    pytest.param(
         "CohereLabs/c4ai-command-r7b-12-2024",
         _SMALL_DECODER_OVERRIDES,
         _TRUST_REMOTE_EAGER,
@@ -497,13 +461,6 @@ PHASE2_DISCOVERY_CASES = [
 ]
 
 PHASE2_GENERATION_CASES = [
-    pytest.param(
-        "baichuan-inc/Baichuan2-7B-chat",
-        _SMALL_DECODER_OVERRIDES,
-        _TRUST_REMOTE_EAGER,
-        500.0,
-        id="baichuan",
-    ),
     pytest.param(
         "OrionStarAI/Orion-14B-Chat",
         _SMALL_DECODER_OVERRIDES,
@@ -525,13 +482,6 @@ PHASE2_GENERATION_CASES = [
         500.0,
         id="glm4",
     ),
-    pytest.param(
-        "hpcai-tech/grok-1",
-        _GROK_OVERRIDES,
-        _TRUST_REMOTE_EAGER,
-        500.0,
-        id="grok1",
-    ),
 ]
 
 PHASE3_DISCOVERY_CASES = [
@@ -540,12 +490,6 @@ PHASE3_DISCOVERY_CASES = [
         _SMALL_DECODER_OVERRIDES,
         _TRUST_REMOTE_EAGER,
         id="apertus",
-    ),
-    pytest.param(
-        "MiniMaxAI/MiniMax-Text-01",
-        _MINIMAX_TEXT_OVERRIDES,
-        _EAGER_ONLY,
-        id="minimax-text",
     ),
     pytest.param(
         "MiniMaxAI/MiniMax-M2",
@@ -660,34 +604,10 @@ PHASE5_DISCOVERY_CASES = [
         id="phi",
     ),
     pytest.param(
-        "adept/persimmon-8b-chat",
-        _PERSIMMON_OVERRIDES,
-        _EAGER_ONLY,
-        id="persimmon",
-    ),
-    pytest.param(
-        "bigcode/starcoder2-3b",
-        _STARCODER2_OVERRIDES,
-        _EAGER_ONLY,
-        id="starcoder2",
-    ),
-    pytest.param(
         "inceptionai/Jais-2-8B-Chat",
         _JAIS2_OVERRIDES,
         _EAGER_ONLY,
         id="jais2",
-    ),
-    pytest.param(
-        "allenai/OLMo-1B-hf",
-        _OLMO_OVERRIDES,
-        _EAGER_ONLY,
-        id="olmo",
-    ),
-    pytest.param(
-        "allenai/OLMo-2-0425-1B",
-        _SMALL_DECODER_OVERRIDES,
-        _EAGER_ONLY,
-        id="olmo2",
     ),
     pytest.param(
         "tiiuae/falcon-7b",
@@ -741,25 +661,11 @@ PHASE5_GENERATION_CASES = [
         id="phi",
     ),
     pytest.param(
-        "bigcode/starcoder2-3b",
-        _STARCODER2_OVERRIDES,
-        _EAGER_ONLY,
-        500.0,
-        id="starcoder2",
-    ),
-    pytest.param(
         "inceptionai/Jais-2-8B-Chat",
         _JAIS2_OVERRIDES,
         _EAGER_ONLY,
         500.0,
         id="jais2",
-    ),
-    pytest.param(
-        "allenai/OLMo-2-0425-1B",
-        _SMALL_DECODER_OVERRIDES,
-        _EAGER_ONLY,
-        500.0,
-        id="olmo2",
     ),
     pytest.param(
         "tiiuae/falcon-7b",

@@ -469,6 +469,9 @@ def test_warmup_kernels_flags_execute_model_as_warmup(monkeypatch):
         is_pooling_model=True,  # skips sampler/decode/grammar branches
         is_last_pp_rank=True,
         kv_connector=SimpleNamespace(set_disabled=lambda _disabled: None),
+        model_state=SimpleNamespace(),
+        model_config=SimpleNamespace(get_vocab_size=lambda: 8),
+        is_encoder_decoder=False,
         _in_kernel_warmup=False,
     )
 

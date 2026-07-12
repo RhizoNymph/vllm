@@ -19,21 +19,25 @@ Steering is wired into the following decoder architectures:
 - Gemma family: `gemma`, `gemma2`, `gemma3`, `gemma3n`, `gemma4`
 - Mixtral / MoE: `mixtral`, `phimoe`, `deepseek_v2`, `glm4_moe`,
   `glm4_moe_lite`, `exaone_moe`, `granitemoe`, `granitemoeshared`, `dots1`,
-  `ernie45_moe`, `olmoe`, `openpangu`, `grok1`, `jais2`, `minimax_m2`,
-  `minimax_text_01`, `arctic`, `param2moe`, `flex_olmo`
+  `ernie45_moe`, `olmoe`, `openpangu`, `jais2`, `minimax_m2`,
+  `arctic`, `param2moe`, `flex_olmo`
 - GLM / ChatGLM: `glm4`
 - InternLM family: `internlm2`, `internlm2_ve`, `interns1_pro`,
   `iquest_loopcoder`
-- Olmo family: `olmo`, `olmo2`, `olmo_hybrid`
+- Olmo family: `olmo_hybrid`
 - Exaone family: `exaone`, `exaone4`
 - Phi family: `phi`
 - Plamo family: `plamo2`, `plamo3`
 - Step family: `step1`, `step3_text`, `step3p5`
 - Molmo family: `molmo`, `molmo2`
-- Falcon / Baichuan / Command / StableLM: `falcon`, `baichuan`, `commandr`,
-  `stablelm`
+- Falcon / Command / StableLM: `falcon`, `commandr`, `stablelm`
 - Other: `AXK1`, `gpt_neox`, `hyperclovax`, `opt`, `orion`, `ouro`,
-  `persimmon`, `seed_oss`, `starcoder2`, `hunyuan_v1`, `mimo_v2_flash`
+  `seed_oss`, `hunyuan_v1`, `mimo_v2_flash`
+
+Architectures removed upstream (steering support dropped with them):
+`baichuan`, `grok1`, `minimax_text_01`, `olmo`, `olmo2`, `persimmon`,
+`starcoder2` (the latter four now run through the Transformers backend,
+which carries no steering hooks).
 
 End-to-end tested with real weights:
 

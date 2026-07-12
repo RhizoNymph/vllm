@@ -347,7 +347,6 @@ class TestSteeringModuleRegistry:
         )
         assert registry.get("anywidth") is not None
 
-
     # --- load_from_file tests ---
 
     @pytest.mark.asyncio
@@ -489,9 +488,7 @@ class TestSteeringModuleRegistry:
             assert module is not None
             stored = module.vectors["post_block"][14]
             assert isinstance(stored, list)
-            assert [round(v, 5) for v in stored] == [
-                round(float(x), 5) for x in vec
-            ]
+            assert [round(v, 5) for v in stored] == [round(float(x), 5) for x in vec]
         finally:
             os.unlink(tmp_path)
 
@@ -556,6 +553,7 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
     engine_client = MagicMock()
     engine_client.vllm_config = SimpleNamespace(
         lora_config=None,
+        model_config=SimpleNamespace(get_hidden_size=lambda: 64),
         structured_outputs_config=SimpleNamespace(enable_in_reasoning=False),
     )
     engine_client.model_config = MagicMock()
@@ -605,8 +603,7 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
             "vllm.entrypoints.openai.api_server.OpenAIServingModels",
             return_value=models,
         ),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+        patch("vllm.entrypoints.openai.api_server.ServingTokenization"),
     ):
         await init_app_state(
             engine_client,
@@ -632,8 +629,7 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
             "vllm.entrypoints.openai.api_server.OpenAIServingModels",
             return_value=models,
         ),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+        patch("vllm.entrypoints.openai.api_server.ServingTokenization"),
     ):
         await init_app_state(
             engine_client,
