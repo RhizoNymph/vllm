@@ -119,9 +119,10 @@ A hex wire fixture is pinned by the Rust test
 `sae_clamp_wire_hex_fixture_for_python_cross_compat` (protocol/mod.rs) and
 decoded on the Python side by `tests/v1/engine/test_rust_sae_wire_compat.py`.
 
-Note: named **SAE module registration** (the registry holding SAE weights) is
-not yet wired into the Rust frontend; these fields are request passthrough
-only, and referenced module names are validated by the engine at admission.
+Referenced module names are validated by the engine at admission; the modules
+themselves are registered either through the Python server or through this
+frontend's module endpoints / startup files (see *SAE module registration*
+below).
 
 ### Steering wire format (packed)
 
@@ -157,12 +158,14 @@ build_state (lib.rs)
   → returns the registered name set → AppState.steering_module_names
 ```
 
-A module file is JSON with optional `vectors` / `prefill_vectors` /
-`decode_vectors` tiers; each tier is either inline
+An **additive** module file is JSON with optional `vectors` /
+`prefill_vectors` / `decode_vectors` tiers; each tier is either inline
 (`{hook: {layer: [floats] | {vector, scale}}}`, layer keys string or int) or the
 packed shape (per-hook `{dtype, shape, layer_indices, data, scales}`). The
 broadcast payload is the same inline `SteeringVectorSpec` (integer layer keys)
-used for per-request steering — no ndarray encoding.
+used for per-request steering — no ndarray encoding. Module files may instead
+carry an SAE module (see *SAE module registration* below); the `name=path`
+parsing is kind-agnostic.
 
 Per-request `steering_name` is validated against `AppState.steering_module_names`
 before forwarding: an unknown name is rejected up front (HTTP
@@ -176,26 +179,90 @@ load), re-broadcasting on every change:
 
 - `GET /v1/steering/modules` — list registered names → `{ "modules": [...] }`.
 - `POST /v1/steering/modules` — register/replace. Body:
-  `{ "modules": { "<name>": { "vectors": ..., "prefill_vectors": ..., "decode_vectors": ... } }, "replace": false }`
-  (tiers inline or packed, same shapes as the module file). `replace: true`
-  makes the provided set the entire registry; `false` adds/overrides. Calls
-  `register_modules` (broadcast + pre-materialize) then updates the name set.
+  `{ "modules": { "<name>": <module payload> }, "replace": false }` where the
+  payload is the additive tier shape (inline or packed, same as the module
+  file) or the SAE shape below. `replace: true` makes the provided set the
+  entire registry; `false` adds/overrides. Calls `register_modules`
+  (broadcast + pre-materialize for additive kinds) then updates the name set.
 - `DELETE /v1/steering/modules/{name}` — unregister one module
   (`unregister_steering_modules` worker RPC, releasing its pinned rows). Unknown
   name → `400`.
+
+After every **successful** register or unregister broadcast (all kinds) the
+handler calls `EngineCoreClient::reset_prefix_cache(true, false)`, mirroring
+the Python frontend's `_reset_prefix_cache_after_module_change`: request
+steering hashes reference named modules by name/scale, not by payload, so
+replacing a module under the same name would otherwise let stale prefix-cache
+blocks appear reusable. If the reset returns `false` or errors, the endpoint
+returns `503 service_unavailable` ("registered/unregistered but prefix cache
+could not be fully invalidated") — the registry change itself has already
+committed. The startup load path performs **no** reset: the cache is empty
+before serving starts.
 
 Mutations are serialized by `AppState.lock_steering_mutations()` so concurrent
 register/unregister requests cannot interleave their broadcasts. The name set is
 an `RwLock<HashSet<String>>` read on every request for `steering_name`
 validation.
 
+### SAE module registration
+
+Module payloads carry a `kind` discriminator (`"additive"` when absent):
+`"sae_delta"` (feature-surgery delta) and `"sae_full_reconstruction"`
+(residual replacement) register SAE modules that per-request
+`sae_clamp_specs` / `sae_full_reconstruction_specs` reference by name. The
+same shape works in a startup `--steering-modules name=path` file and in the
+`POST /v1/steering/modules` body:
+
+```json
+{
+  "kind": "sae_delta",
+  "sae_manifest": {
+    "d_model": 4096, "d_sae": 65536, "activation": "jumprelu",
+    "layers": [[20, "post_block"]],
+    "clampable_features": [1234, 5678],
+    "activation_params": {"threshold": 0.05}
+  },
+  "sae_weights": {
+    "20:post_block": {
+      "encoder_weight": {"dtype": "float32", "shape": [2, 4096], "data": "<base64>"},
+      "encoder_bias":   {"dtype": "float32", "shape": [2],       "data": "<base64>"},
+      "decoder_weight": {"dtype": "float32", "shape": [2, 4096], "data": "<base64>"}
+    }
+  }
+}
+```
+
+Weights travel **inline and packed**: torch tensors do not survive the
+`collective_rpc` msgpack hop, so each tensor crosses as a
+`{dtype, shape, data}` dict (`data` base64, little-endian, dtypes
+`float32|float16|bfloat16|float64`) keyed by a `"layer:hook"` site string; the
+worker's `_coerce_sae_weights_wire` rebuilds tensors on arrival. Tensor names
+pass through opaquely — `encoder_weight`, `encoder_bias`, `decoder_weight` are
+required (`decoder_bias` too for `sae_full_reconstruction`); extra names (e.g.
+a per-feature `threshold`) ride along.
+
+Frontend validation (`parse_module` → 400): known `kind`; SAE kinds require
+`sae_manifest` + `sae_weights` and reject additive tier keys (additive rejects
+the SAE keys); site keys parse as `"layer:hook"` and cover exactly
+`sae_manifest.layers`; each blob's base64 decodes to
+`product(shape) × dtype-itemsize` bytes. Floats are never decoded frontend-side.
+Semantic validation (activation params, shape-vs-manifest, site ownership)
+stays on the worker.
+
+SAE kinds are **exempt from pre-materialization**: `register_modules` skips the
+`pre_materialize_steering_module` RPC for them (there are no additive rows to
+warm; the worker attaches encoder/decoder buffers during the register RPC
+itself). The post-mutation prefix-cache reset applies to SAE kinds exactly as
+to additive ones. gRPC remains request-passthrough only — module registration
+is HTTP-only.
+
 ## Related files
 
 | file | role / key exports |
 | ---- | ------------------ |
 | `rust/proto/vllm_grpc.proto` | `SteeringHookPacked`, `Steering`, and `GenerateRequest.steering` / `.capture` (`google.protobuf.Struct`) |
-| `src/server/src/steering_modules.rs` | `load_steering_module`, `parse_module`, `load_and_broadcast_steering_modules`, `register_modules`, `unregister_modules` |
-| `src/server/src/routes/steering.rs` | runtime endpoints: list / register / unregister |
+| `src/server/src/steering_modules.rs` | `load_steering_module`, `parse_module`, `load_and_broadcast_steering_modules`, `register_modules`, `unregister_modules`; SAE payload types `SteeringModuleKind`, `SaeManifest`, `PackedTensor`, `SaeWeights` |
+| `src/server/src/routes/steering.rs` | runtime endpoints: list / register / unregister; `reset_prefix_cache_after_module_change` (503 on failed invalidation) |
 | `src/server/src/config.rs` | `SteeringModulePath`, `Config.steering_modules` |
 | `src/cmd/src/cli.rs` | `--steering-modules name=path` flag + `parse_steering_module` |
 | `src/server/src/state.rs` | `AppState.steering_module_names` (RwLock), `steering_module_error`, registry mutators, `lock_steering_mutations` |

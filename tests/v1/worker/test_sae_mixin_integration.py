@@ -28,6 +28,7 @@ Coverage:
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -1046,3 +1047,214 @@ class TestWorkerRpcSurface:
         worker.attach_sae_weights("g", weights)
 
         assert runner.calls == [("g", weights)]
+
+
+class TestCoerceSaeWeightsWire:
+    """Wire-form ``sae_weights`` payloads attach correctly.
+
+    Torch tensors do not survive the ``collective_rpc`` msgpack hop, so
+    broadcast payloads may carry weights as ``"layer:hook"``-keyed maps
+    of packed ``{dtype, shape, data}`` dicts (the Rust frontend's form,
+    ``data`` base64 or raw bytes) or as ``[dtype, shape, buffer]``
+    triples (a degraded in-process tensor).  The register branches
+    normalize them via ``_coerce_sae_weights_wire`` before attach.
+    """
+
+    @staticmethod
+    def _packed(t: torch.Tensor, *, data_as_bytes: bool = False) -> dict:
+        raw = t.contiguous().view(torch.uint8).numpy().tobytes()
+        return {
+            "dtype": str(t.dtype).removeprefix("torch."),
+            "shape": list(t.shape),
+            "data": raw if data_as_bytes else base64.b64encode(raw).decode(),
+        }
+
+    def _wire_delta_weights(self, *, data_as_bytes: bool = False) -> dict:
+        return {
+            "20:post_block": {
+                "encoder_weight": self._packed(
+                    torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]),
+                    data_as_bytes=data_as_bytes,
+                ),
+                "encoder_bias": self._packed(
+                    torch.tensor([0.5, 0.25]), data_as_bytes=data_as_bytes
+                ),
+                "decoder_weight": self._packed(
+                    torch.tensor([[9.0, 8.0, 7.0, 6.0], [5.0, 4.0, 3.0, 2.0]]),
+                    data_as_bytes=data_as_bytes,
+                ),
+            }
+        }
+
+    def test_delta_string_keys_and_base64_packed_tensors_attach(self):
+        h = _RichHarness(hidden_size=4)
+        payload = _sae_payload(d_model=4, clampable=(0, 1))
+        payload["sae_weights"] = self._wire_delta_weights()
+        h.register_steering_modules({"g": payload})
+        site = h._steerable_layers_cache[20]
+        enc_w = getattr(
+            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        enc_b = getattr(
+            site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        dec_w = getattr(
+            site, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert torch.equal(
+            enc_w, torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+        )
+        assert torch.equal(enc_b, torch.tensor([0.5, 0.25]))
+        assert torch.equal(
+            dec_w, torch.tensor([[9.0, 8.0, 7.0, 6.0], [5.0, 4.0, 3.0, 2.0]])
+        )
+
+    def test_delta_tuple_keys_and_bytes_data_attach(self):
+        # Tuple site keys with raw-bytes ``data`` (the packed form after a
+        # binary-preserving hop) coerce and attach.
+        h = _RichHarness(hidden_size=4)
+        payload = _sae_payload(d_model=4, clampable=(0, 1))
+        payload["sae_weights"] = {
+            (20, "post_block"): self._wire_delta_weights(data_as_bytes=True)[
+                "20:post_block"
+            ]
+        }
+        h.register_steering_modules({"g": payload})
+        site = h._steerable_layers_cache[20]
+        enc_b = getattr(
+            site, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert torch.equal(enc_b, torch.tensor([0.5, 0.25]))
+
+    def test_degraded_tensor_triples_attach(self):
+        # Torch tensors sent through the Python API server's own
+        # collective_rpc broadcast degrade to [dtype, shape, memoryview]
+        # triples on arrival; the coercion rebuilds them (the latent
+        # online-register bug this helper fixes).
+        h = _RichHarness(hidden_size=4)
+        payload = _sae_payload(d_model=4, clampable=(0, 1))
+
+        def triple(t: torch.Tensor) -> list:
+            return [
+                str(t.dtype).removeprefix("torch."),
+                list(t.shape),
+                memoryview(t.contiguous().view(torch.uint8).numpy().tobytes()),
+            ]
+
+        payload["sae_weights"] = {
+            (20, "post_block"): {
+                "encoder_weight": triple(torch.full((2, 4), 3.0)),
+                "encoder_bias": triple(torch.tensor([1.0, 2.0])),
+                "decoder_weight": triple(torch.full((2, 4), 4.0)),
+            }
+        }
+        h.register_steering_modules({"g": payload})
+        site = h._steerable_layers_cache[20]
+        enc_w = getattr(
+            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert torch.equal(enc_w, torch.full((2, 4), 3.0))
+
+    def test_bfloat16_packed_tensor_attaches(self):
+        h = _RichHarness(hidden_size=4)
+        payload = _sae_payload(d_model=4, clampable=(0, 1))
+        wire = self._wire_delta_weights()
+        wire["20:post_block"]["encoder_weight"] = self._packed(
+            torch.tensor(
+                [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=torch.bfloat16
+            )
+        )
+        payload["sae_weights"] = wire
+        h.register_steering_modules({"g": payload})
+        site = h._steerable_layers_cache[20]
+        enc_w = getattr(
+            site, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert torch.equal(
+            enc_w, torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+        )
+
+    def test_full_reconstruction_wire_weights_attach(self):
+        from vllm.model_executor.layers.sae_full_reconstruction import (
+            HOOK_POINT_FR_DECODER_BIAS_ATTR,
+            HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
+        )
+        from vllm.v1.worker.sae_full_reconstruction_manager import (
+            SAEFullReconstructionManager,
+        )
+
+        h = _RichHarness(hidden_size=4)
+        # Graft the full-reconstruction surface the FR register branch
+        # requires (normally set up by ``_init_steering_state``).
+        h._sae_fr_module_registry = {}
+        h._sae_fr_steerable_sites = {}
+        h._req_sae_fr_phase = {}
+        h._sae_fr_clamp_manager = SAEFullReconstructionManager(4)
+        h._sae_fr_rows_scratch = None
+        h._sae_fr_index_pinned = None
+
+        d_sae, d_model = 8, 4
+        payload = _sae_payload(d_model=d_model, d_sae=d_sae, clampable=(0, 1))
+        payload["kind"] = "sae_full_reconstruction"
+        payload["sae_weights"] = {
+            "20:post_block": {
+                "encoder_weight": self._packed(torch.full((d_sae, d_model), 2.0)),
+                "encoder_bias": self._packed(torch.zeros(d_sae)),
+                "decoder_weight": self._packed(torch.full((d_sae, d_model), 3.0)),
+                "decoder_bias": self._packed(torch.tensor([0.1, 0.2, 0.3, 0.4])),
+            }
+        }
+        h.register_steering_modules({"g": payload})
+        layer = h._steerable_layers_cache[20]
+        enc_w = getattr(
+            layer, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        dec_b = getattr(
+            layer, HOOK_POINT_FR_DECODER_BIAS_ATTR[SteeringHookPoint.POST_BLOCK]
+        )
+        assert torch.equal(enc_w, torch.full((d_sae, d_model), 2.0))
+        assert torch.equal(dec_b, torch.tensor([0.1, 0.2, 0.3, 0.4]))
+
+    def test_malformed_packed_dict_rejected_and_rolled_back(self):
+        h = _RichHarness(hidden_size=4)
+        payload = _sae_payload(d_model=4, clampable=(0, 1))
+        wire = self._wire_delta_weights()
+        del wire["20:post_block"]["encoder_weight"]["data"]
+        payload["sae_weights"] = wire
+        with pytest.raises(ValueError, match="missing key"):
+            h.register_steering_modules({"g": payload})
+        # Atomic register-and-attach: the entry rolled back.
+        assert "g" not in h._sae_module_registry
+        site = h._steerable_layers_cache[20]
+        assert not sae_buffers_attached(site, SteeringHookPoint.POST_BLOCK)
+
+    def test_wrong_byte_length_rejected(self):
+        h = _RichHarness(hidden_size=4)
+        payload = _sae_payload(d_model=4, clampable=(0, 1))
+        wire = self._wire_delta_weights()
+        wire["20:post_block"]["encoder_bias"]["shape"] = [3]  # 2 encoded
+        payload["sae_weights"] = wire
+        with pytest.raises(ValueError, match="byte length"):
+            h.register_steering_modules({"g": payload})
+        assert "g" not in h._sae_module_registry
+
+    def test_bad_site_key_rejected(self):
+        h = _RichHarness(hidden_size=4)
+        payload = _sae_payload(d_model=4, clampable=(0, 1))
+        wire = self._wire_delta_weights()
+        payload["sae_weights"] = {"post_block": wire["20:post_block"]}
+        with pytest.raises(ValueError, match="site key"):
+            h.register_steering_modules({"g": payload})
+        assert "g" not in h._sae_module_registry
+
+    def test_unrecoverable_value_rejected_with_clear_error(self):
+        # A dangling aux-buffer index (large tensors degrade to a bare
+        # int across the hop) cannot be recovered worker-side.
+        h = _RichHarness(hidden_size=4)
+        payload = _sae_payload(d_model=4, clampable=(0, 1))
+        wire = self._wire_delta_weights()
+        wire["20:post_block"]["encoder_weight"] = 7
+        payload["sae_weights"] = wire
+        with pytest.raises(ValueError, match="packed"):
+            h.register_steering_modules({"g": payload})
+        assert "g" not in h._sae_module_registry
