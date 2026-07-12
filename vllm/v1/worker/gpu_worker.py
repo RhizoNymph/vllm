@@ -1089,6 +1089,27 @@ class Worker(WorkerBase):
     ) -> None:
         return self.model_runner.attach_sae_full_recon_weights(module_name, weights)
 
+    def set_sae_global_clamps(
+        self,
+        prefill_specs_raw: object = None,
+        decode_specs_raw: object = None,
+        *,
+        replace: bool = False,
+        validate_only: bool = False,
+    ) -> tuple[int, int]:
+        return self.model_runner.set_sae_global_clamps(
+            prefill_specs_raw,
+            decode_specs_raw,
+            replace=replace,
+            validate_only=validate_only,
+        )
+
+    def clear_sae_global_clamps(self) -> None:
+        return self.model_runner.clear_sae_global_clamps()
+
+    def get_sae_global_clamps_status(self) -> dict:
+        return self.model_runner.get_sae_global_clamps_status()
+
     def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
         return self.model_runner.pre_materialize_steering_module(name)
 

@@ -220,6 +220,22 @@ class WorkerBase:
     ) -> None:
         raise NotImplementedError
 
+    def set_sae_global_clamps(
+        self,
+        prefill_specs_raw: object = None,
+        decode_specs_raw: object = None,
+        *,
+        replace: bool = False,
+        validate_only: bool = False,
+    ) -> tuple[int, int]:
+        raise NotImplementedError
+
+    def clear_sae_global_clamps(self) -> None:
+        raise NotImplementedError
+
+    def get_sae_global_clamps_status(self) -> dict:
+        raise NotImplementedError
+
     def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
         raise NotImplementedError
 
