@@ -301,13 +301,13 @@ class SteeringManager:
         #
         # The ring size needs to cover the longest plausible burst of
         # back-to-back ``_stack_vectors_to_device`` calls inside one
-        # ``register_config``: one per hook point. With a typical
-        # ``HOOK_POINT_TABLE_ATTR`` of ~3 entries plus a small safety
-        # margin, 4 slots is enough that under steady state every reuse
+        # ``register_config``: one per hook point. With
+        # ``HOOK_POINT_TABLE_ATTR`` at 5 entries plus a small safety
+        # margin, 6 slots is enough that under steady state every reuse
         # finds the H2D already complete (event wait is a no-op).
-        self._stack_pinned_ring: list[torch.Tensor | None] = [None] * 4
-        self._stack_pinned_events: list[torch.cuda.Event | None] = [None] * 4
-        self._stack_pinned_numel: list[int] = [0] * 4
+        self._stack_pinned_ring: list[torch.Tensor | None] = [None] * 6
+        self._stack_pinned_events: list[torch.cuda.Event | None] = [None] * 6
+        self._stack_pinned_numel: list[int] = [0] * 6
         self._stack_pinned_next: int = 0
 
     # ------------------------------------------------------------------

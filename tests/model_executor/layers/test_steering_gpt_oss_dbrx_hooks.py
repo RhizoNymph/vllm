@@ -29,7 +29,13 @@ def _install_recorder(monkeypatch):
     def _record(tensor, layer_idx, hook_name):
         rec[hook_name] = (tensor.detach().clone(), layer_idx)
 
+    def _record_add(a, b, layer_idx, hook_name):
+        # apply_block_steering captures post_block as separate summands
+        # (DCE-safe under CUDA graphs); the recorded value is their sum.
+        rec[hook_name] = ((a + b).detach().clone(), layer_idx)
+
     monkeypatch.setattr(steering_mod, "maybe_capture_residual", _record)
+    monkeypatch.setattr(steering_mod, "maybe_capture_residual_add", _record_add)
     monkeypatch.setattr(cap_mod, "get_active_capture_manager", lambda: object())
     return rec
 

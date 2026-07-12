@@ -289,10 +289,20 @@ class TestMultiHook:
 
     def test_bad_hook_in_hooks_400(self):
         eng = _MockEngine(runs=_existing_run())
-        resp = _run(eng, hooks=["mlp_out"])
+        resp = _run(eng, hooks=["attn_scores"])
         assert isinstance(resp, JSONResponse)
         assert resp.status_code == 400
         assert "injectable" in json.loads(resp.body)["error"]
+
+    def test_mlp_hook_accepted(self):
+        # mlp_out is injectable; a source run holding mlp_out rows sweeps
+        # exactly like the residual hooks.
+        runs = _existing_run()
+        runs[0]["hook_layers"] = [["mlp_out", 0], ["mlp_out", 1]]
+        eng = _MockEngine(runs=runs)
+        resp = _run(eng, hook="mlp_out")
+        assert not isinstance(resp, JSONResponse)
+        assert resp.hook == "mlp_out"
 
     def test_single_hook_list_parity(self):
         eng1 = _MockEngine(runs=_existing_run())
@@ -330,12 +340,18 @@ class TestMultiHook:
 
 
 class TestHookCompleteAutoCapture:
-    def test_autocapture_taps_all_three_hooks(self):
+    def test_autocapture_taps_all_injectable_hooks(self):
         eng = _MockEngine(runs=[])
         _run(eng, clean_prompt="ab")  # single hook sweep still taps all hooks
         cap = next(sp for sp in eng.sampling_params if sp.capture is not None)
         hooks = cap.capture["patch_source"]["hooks"]
-        assert set(hooks) == {"pre_attn", "post_attn", "post_block"}
+        assert set(hooks) == {
+            "pre_attn",
+            "post_attn",
+            "post_block",
+            "mlp_in",
+            "mlp_out",
+        }
         # Every hook covers the swept layer set.
         for layers in hooks.values():
             assert list(layers) == [0, 1]

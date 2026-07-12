@@ -32,7 +32,6 @@ from vllm.model_executor.layers.attention import (
     Attention,
     EncoderOnlyAttention,
 )
-from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -330,16 +329,20 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
         )
-        # mlp_in is the normed MLP input (transcoder training tap).
-        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_in")
+        # mlp_in is the normed MLP input (injectable branch-tensor hook).
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
         hidden_states = self.mlp(hidden_states)
         # post_block must observe the true block output: residual + the *normed*
         # MLP branch (= hidden_states[L+1]). Apply the post-FFN norm before the
         # hook. Steering still rides ``residual`` so generation is unchanged.
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         # mlp_out is the normed MLP branch added to the residual stream, so
-        # post_block == post_attn + mlp_out.
-        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_out")
+        # post_block == post_attn + mlp_out (in pristine runs).
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
 
         hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 

@@ -296,8 +296,8 @@ class PatchModelRunnerMixin:
             self._patch_specs[new_req_data.req_id] = entries
 
     def _patch_hidden_size(self) -> int:
-        """Hook width for ``zeros`` / inline sources (all three hooks are
-        residual-width == hidden_size). Read from a patch table so it matches
+        """Hook width for ``zeros`` / inline sources (every injectable hook is
+        hidden_size-wide). Read from a patch table so it matches
         the buffers exactly, falling back to the model config."""
         for mod in self._patchable_layers.values():
             table = getattr(mod, PATCH_TABLE_ATTR[SteeringHookPoint.POST_BLOCK], None)
@@ -406,9 +406,8 @@ class PatchModelRunnerMixin:
 def get_patchable_hook(name: str) -> SteeringHookPoint:
     """Validate and resolve an injection hook name to its enum.
 
-    Only the three steering hook points have patch buffers, so only they are
-    injection-capable (a source run may capture more, but injection reuses the
-    steering apply sites).
+    Only the steering hook points have patch buffers, so only they are
+    injection-capable (injection reuses the steering apply sites).
     """
     try:
         hp = SteeringHookPoint(name)

@@ -50,7 +50,9 @@ Also supported:
 - Global steering through HTTP endpoints
 - Per-request steering through `SamplingParams`
 - Three additive tiers (base / prefill-specific / decode-specific)
-- Three hook points: `pre_attn`, `post_attn`, `post_block`
+- Five hook points: `pre_attn`, `post_attn`, `post_block` (residual stream)
+  plus `mlp_in`, `mlp_out` (MLP branch; wired on gemma3/gemma4 and the qwen3
+  family)
 - Phase-aware scheduler admission for per-request steering
 - Prefix-cache separation for different prefill steering configs
 - Continuous batching
@@ -110,9 +112,21 @@ activation that is discarded immediately afterward.
 | `pre_attn` | Residual stream before attention |
 | `post_attn` | Residual stream after attention |
 | `post_block` | Residual stream after MLP |
+| `mlp_in` | MLP branch: normed input entering the MLP sublayer |
+| `mlp_out` | MLP branch: sublayer output before its residual add |
 
 For supported models, these hooks are wired directly into each decoder
 layer's forward path. Unused hook points are zero-valued no-ops.
+
+The three residual-stream hooks steer the carried residual and are wired on
+every steerable model. `mlp_in`/`mlp_out` steer the MLP *branch* tensor and
+are wired on gemma3, gemma4, and the qwen3 family (`qwen3`, `qwen3_moe`,
+`qwen3_next`/Qwen3.5); on other models they are silent no-ops (buffers exist
+but no emission site). Note an additive steer at `mlp_out` propagates
+identically to `post_block` — the branch is added to the residual stream —
+so `mlp_out` exists chiefly for patching (replace/ablate the MLP branch);
+`mlp_in` is the genuinely new steering site (its effect passes *through*
+the MLP nonlinearity).
 
 ## Global Steering API
 

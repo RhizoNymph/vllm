@@ -15,9 +15,20 @@ capture run.
 
 ## Supported Scope
 
-- **Hook points:** `pre_attn`, `post_attn`, `post_block` (the injection-capable
-  `SteeringHookPoint`s). `post_block` uses a dedicated two-tensor op because
-  vLLM defers each layer's MLP-branch add — see [Invariants](#invariants).
+- **Hook points:** `pre_attn`, `post_attn`, `post_block` (residual stream) and
+  `mlp_in`, `mlp_out` (MLP branch) — all five injection-capable
+  `SteeringHookPoint`s. `post_block` uses a dedicated two-tensor op because
+  vLLM defers each layer's MLP-branch add — see [Invariants](#invariants). The
+  MLP hooks patch the branch tensor directly (single-tensor op, no
+  reconstruction): `mlp_in` is the normed MLP input, `mlp_out` the branch
+  before its residual add — replacing `mlp_out` is the classic
+  attention-vs-MLP causal decomposition. The MLP taps are wired on gemma3,
+  gemma4, and the qwen3 family; on unwired models an mlp patch stages but no
+  emission site reads it (a silent no-op), so use the wired models for
+  MLP-hook studies. After an
+  `mlp_out` intervention, downstream captures (`post_block`) see the
+  intervened branch — `post_block == post_attn + mlp_out` holds for pristine
+  runs only.
 - **Models:** every architecture wired for steering/capture (the patch buffers
   are folded into `register_steering_buffers`, so patching attaches wherever
   steering does — zero per-model changes). **Text-only prompts:** multimodal
@@ -42,6 +53,15 @@ multi-rank configs):
 Both prove no-op / self-identity are bit-exact, cross-run replace reproduces the
 clean run within bf16 accumulation, and single-site denoising surfaces the clean
 answer.
+
+The MLP branch hooks are GPU-validated on **Qwen3-0.6B** TP1/PP1 (eager +
+cudagraph): no-op and self-identity at `mlp_in`/`mlp_out` are bit-exact,
+zero-ablating `mlp_out` lands (output changes), additive steering at
+`mlp_out` matches `post_block` steering within fp addition-order noise, and
+single-site `mlp_out` denoising recovers a majority share of the same site's
+`post_block` shift (`tests/gpu_patch_validate.py` checks G–K). Multi-rank
+mlp-hook validation has not been run yet (the hooks share the residual
+hooks' replicated-tensor contract, so the same TP/PP machinery applies).
 
 ## Frontends
 
@@ -252,7 +272,7 @@ It uses the same binary wire encoding as `SteeringHookPacked`
  "data": "<base64 contiguous bytes>"}
 ```
 
-`width` must equal the hook width (`hidden_size` for all three injectable
+`width` must equal the hook width (`hidden_size` for all five injectable
 hooks). Structural errors (bad base64, shape/length mismatch, out-of-range row
 index, wrong width) are rejected at admission (HTTP 400); malformed structure on
 the direct `SamplingParams` path raises `ValueError`.
@@ -267,10 +287,11 @@ patch = [{"layer": 14, "hook": "post_block", "dest_position": 6,
           "source_module": "zeros", "mask": {"indices": [12, 40, 815]}}]
 ```
 
-The injectable hooks are the **residual-stream** sites
-(`pre_attn`/`post_attn`/`post_block`), so this clamps residual dims.
-`mlp_in`/`mlp_out` remain capture-only, so MLP-width neuron clamping is out of
-scope.
+The residual-stream sites (`pre_attn`/`post_attn`/`post_block`) clamp
+residual dims. `mlp_in`/`mlp_out` are also injectable, but they are
+`hidden_size`-wide branch tensors — clamping *MLP-width* (intermediate)
+neurons remains out of scope; zeroing `mlp_out` dims ablates the MLP
+branch's contribution to those residual dims for that token.
 
 #### Offline named-module caveat
 
@@ -356,7 +377,8 @@ The classic attention-vs-MLP decomposition sweeps the *same* `(layers ×
 positions)` grid at several hooks. Two ways:
 
 - **One request (`hooks` field).** Pass `hooks: [..]` (each injectable —
-  `pre_attn`, `post_attn`, `post_block`; a bad or empty list is a 400) and the
+  `pre_attn`, `post_attn`, `post_block`, `mlp_in`, `mlp_out`; a bad or empty
+  list is a 400) and the
   grid runs at every hook. `hooks` wins over the single `hook` field; the
   corrupt baseline and noise floor are computed **once** and shared across
   hooks (only the patched cells fan out per hook, concurrently). The response
@@ -421,8 +443,9 @@ collapses to a single request. When a sweep references a `source_run` that does
 **not** yet exist in the source manifests *and* supplies `clean_prompt`, the
 server captures the clean run itself before running the grid:
 
-- The capture spec is derived from the grid: **all three injectable hooks**
-  (`pre_attn`, `post_attn`, `post_block`) at the swept layer set, positions =
+- The capture spec is derived from the grid: **all five injectable hooks**
+  (`pre_attn`, `post_attn`, `post_block`, `mlp_in`, `mlp_out`) at the swept
+  layer set, positions =
   `all_prompt` (one forward; the extra cost is only source-store bytes, which
   the [lifecycle](#source-run-lifecycle) makes reclaimable). Tapping every hook
   makes a *kept* run reusable for hook-comparison follow-up sweeps. It runs

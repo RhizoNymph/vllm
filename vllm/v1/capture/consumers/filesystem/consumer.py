@@ -93,7 +93,7 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
 # imported) to keep ``_parse_params`` torch/pydantic-free. Keep this set in
 # sync with ``_VALID_HOOK_NAMES`` -- they must list the same hook points.
 _VALID_GLOBAL_HOOK_NAMES: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_block")
+    ("pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out")
 )
 
 
@@ -158,9 +158,7 @@ def _resolve_layer_spec(spec: Any, num_layers: int, hook_name: str) -> list[int]
     return sorted(set(layers))
 
 
-def _resolve_global_hooks(
-    raw: Any, num_layers: int
-) -> dict[str, list[int]] | None:
+def _resolve_global_hooks(raw: Any, num_layers: int) -> dict[str, list[int]] | None:
     """Resolve the ``global_hooks`` param into ``{hook: [layers]}`` or None.
 
     Accepts either form:
@@ -356,16 +354,12 @@ class FilesystemConsumer:
         # ``default_tag`` (see :meth:`_resolve_chunk_slugs`).
         self._global_spec: CaptureSpec | None = None
         if self._params.global_hooks:
-            num_layers = (
-                self._vllm_config.model_config.get_total_num_hidden_layers()
-            )
+            num_layers = self._vllm_config.model_config.get_total_num_hidden_layers()
             resolved = _resolve_global_hooks(self._params.global_hooks, num_layers)
             if resolved is not None:
                 self._global_spec = CaptureSpec(
                     hooks=cast("dict[HookName, list[int]]", resolved),
-                    positions=cast(
-                        "PositionSelector", self._params.global_positions
-                    ),
+                    positions=cast("PositionSelector", self._params.global_positions),
                 )
         # ``expanduser`` so ``root=~/path`` works: a shell does not expand the
         # ``~`` in ``--capture-consumers filesystem:root=~/path`` (it is not at
