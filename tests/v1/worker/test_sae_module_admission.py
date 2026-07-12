@@ -239,6 +239,16 @@ class TestRegisterDispatch:
         assert h._steering_module_registry == {}
         assert h._sae_module_registry == {}
 
+    def test_delta_modules_may_share_sites(self):
+        # Delta modules compose at a shared (layer, hook) site; the
+        # worker-side admission must not reject the overlap (each
+        # module gets its own buffer slot at attach time).
+        h = _MixinHarness()
+        h.register_steering_modules({"a": _sae_payload()})
+        h.register_steering_modules({"b": _sae_payload()})
+        assert "a" in h._sae_module_registry
+        assert "b" in h._sae_module_registry
+
 
 class TestSAEClampAdmissionGuard:
     def test_no_specs_no_op(self):

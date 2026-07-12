@@ -262,8 +262,10 @@ def register_sae_full_recon_buffers(
         raise ValueError(
             f"Layer module already has full-reconstruction SAE buffers for "
             f"hook {hook_point.value!r} (owning module={existing!r}).  "
-            "Phase-4 constrains at most one full-reconstruction SAE module "
-            "per (layer, hook) site; unregister the existing module first."
+            "By design at most one full-reconstruction SAE module may own "
+            "a (layer, hook) site — two residual replacements on one site "
+            "are semantically ill-defined; unregister the existing module "
+            "first.  (Delta modules, by contrast, may share a site.)"
         )
     n_rows = max_recon_configs + 1
     module.register_buffer(

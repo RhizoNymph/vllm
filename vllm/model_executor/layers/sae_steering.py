@@ -53,6 +53,7 @@ who need full-d_sae TopK semantics must load the full encoder.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -136,88 +137,140 @@ def _scalar_to_activation_params(
     return {}
 
 
-# Per-(layer, hook) buffer attribute names.  Using flat per-hook
-# attributes (rather than e.g. a sub-Module wrapper) means
-# ``torch.compile`` traces them as concrete buffer references rather
-# than introspecting a Python container, mirroring how the additive
-# steering buffers are attached.
-HOOK_POINT_SAE_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_clamp_kind_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_clamp_kind_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_clamp_kind_post_block",
-}
-HOOK_POINT_SAE_CLAMP_VALUE_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_clamp_value_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_clamp_value_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_clamp_value_post_block",
-}
-HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_clamp_only_if_active_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_clamp_only_if_active_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_clamp_only_if_active_post_block",
-}
-HOOK_POINT_SAE_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_any_active_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_any_active_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_any_active_post_block",
-}
-HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_encoder_weight_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_encoder_weight_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_encoder_weight_post_block",
-}
-HOOK_POINT_SAE_ENCODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_encoder_bias_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_encoder_bias_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_encoder_bias_post_block",
-}
-HOOK_POINT_SAE_DECODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_decoder_weight_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_decoder_weight_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_decoder_weight_post_block",
-}
+# Per-(layer, hook, slot) buffer attribute names.  Using flat
+# slot-suffixed attributes (rather than e.g. a sub-Module wrapper)
+# means ``torch.compile`` traces them as concrete buffer references
+# rather than introspecting a Python container, mirroring how the
+# additive steering buffers are attached.
+#
+# Multiple SAE delta modules may share one (layer, hook) site: each
+# registration claims its own *slot* — a full buffer set whose attr
+# names are ``f"{base}_{hook}__s{slot_id}"``.  Slot ids come from a
+# per-(layer, hook) monotonic counter and are never reused within a
+# layer's lifetime, so a surviving module's attr names stay stable
+# when a sibling detaches (no compaction).  The ordered slot records
+# live in the Python attribute ``sae_slots_<hook>`` (see
+# :class:`SAESlotInfo`); registration order is identical across ranks
+# because module RPCs apply in the same order everywhere, which makes
+# the composition order deterministic.
+SAE_CLAMP_KIND_BASE = "sae_clamp_kind"
+SAE_CLAMP_VALUE_BASE = "sae_clamp_value"
+SAE_CLAMP_ONLY_IF_ACTIVE_BASE = "sae_clamp_only_if_active"
+SAE_ANY_ACTIVE_BASE = "sae_any_active"
+SAE_ENCODER_WEIGHT_BASE = "sae_encoder_weight"
+SAE_ENCODER_BIAS_BASE = "sae_encoder_bias"
+SAE_DECODER_WEIGHT_BASE = "sae_decoder_weight"
 # Per-feature JumpReLU thresholds, ``(n_clamp,)`` fp32 aligned with the
-# clampable-features order.  Registered for every site (zero-filled for
+# clampable-features order.  Registered for every slot (zero-filled for
 # ReLU/TopK) so the op arity stays fixed across activations.
-HOOK_POINT_SAE_THRESHOLD_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_threshold_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_threshold_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_threshold_post_block",
-}
-HOOK_POINT_SAE_MODULE_NAME_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_module_name_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_module_name_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_module_name_post_block",
-}
-HOOK_POINT_SAE_ACTIVATION_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_activation_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_activation_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_activation_post_block",
-}
-HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_activation_params_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_activation_params_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_activation_params_post_block",
-}
+SAE_THRESHOLD_BASE = "sae_threshold"
 
-# Per-hook buffer attribute names that need to be cleaned up on
-# unregister.  Module name / activation / activation-params live as
-# Python attributes (not buffers) and have their own cleanup path.
-_SAE_BUFFER_ATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
-    HOOK_POINT_SAE_CLAMP_KIND_ATTR,
-    HOOK_POINT_SAE_CLAMP_VALUE_ATTR,
-    HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR,
-    HOOK_POINT_SAE_ANY_ACTIVE_ATTR,
-    HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR,
-    HOOK_POINT_SAE_ENCODER_BIAS_ATTR,
-    HOOK_POINT_SAE_DECODER_WEIGHT_ATTR,
-    HOOK_POINT_SAE_THRESHOLD_ATTR,
+# All slot-suffixed buffer bases; used for registration and cleanup.
+_SAE_SLOT_BUFFER_BASES: tuple[str, ...] = (
+    SAE_CLAMP_KIND_BASE,
+    SAE_CLAMP_VALUE_BASE,
+    SAE_CLAMP_ONLY_IF_ACTIVE_BASE,
+    SAE_ANY_ACTIVE_BASE,
+    SAE_ENCODER_WEIGHT_BASE,
+    SAE_ENCODER_BIAS_BASE,
+    SAE_DECODER_WEIGHT_BASE,
+    SAE_THRESHOLD_BASE,
 )
-_SAE_PYATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
-    HOOK_POINT_SAE_MODULE_NAME_ATTR,
-    HOOK_POINT_SAE_ACTIVATION_ATTR,
-    HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR,
-)
+
+
+def _sae_slots_attr(hook_point: SteeringHookPoint) -> str:
+    """Python attr holding the ordered list of :class:`SAESlotInfo`."""
+    return f"sae_slots_{hook_point.value}"
+
+
+def _sae_slot_counter_attr(hook_point: SteeringHookPoint) -> str:
+    """Python attr holding the per-(layer, hook) monotonic slot counter."""
+    return f"sae_slot_counter_{hook_point.value}"
+
+
+def _sae_slot_attr(base: str, hook_point: SteeringHookPoint, slot_id: int) -> str:
+    """Slot-suffixed buffer attribute name for one slot's buffer."""
+    return f"{base}_{hook_point.value}__s{slot_id}"
+
+
+@dataclass(frozen=True)
+class SAESlotInfo:
+    """One SAE module's registration record at a (layer, hook) site.
+
+    Stored (in registration order) in the layer module's
+    ``sae_slots_<hook>`` Python attribute.  The dispatch shim reads
+    these as per-instance constants, so ``torch.compile`` unrolls the
+    per-slot op chain at trace time.
+    """
+
+    slot_id: int
+    module_name: str
+    activation: SAEActivation
+    activation_params: dict[str, float]
+
+
+@dataclass(frozen=True)
+class SAESlotState:
+    """Live buffer references for one slot at a (layer, hook) site."""
+
+    slot: SAESlotInfo
+    clamp_kind: torch.Tensor
+    clamp_value: torch.Tensor
+    clamp_only_if_active: torch.Tensor
+    any_active: torch.Tensor
+    encoder_weight: torch.Tensor
+    encoder_bias: torch.Tensor
+    decoder_weight: torch.Tensor
+    threshold: torch.Tensor
+
+
+def sae_site_slots(
+    module: nn.Module, hook_point: SteeringHookPoint
+) -> tuple[SAESlotInfo, ...]:
+    """Ordered slot records registered at ``(module, hook_point)``."""
+    return tuple(getattr(module, _sae_slots_attr(hook_point), ()))
+
+
+def _sae_slot_state(
+    module: nn.Module, hook_point: SteeringHookPoint, record: SAESlotInfo
+) -> SAESlotState:
+    def _buf(base: str) -> torch.Tensor:
+        return getattr(module, _sae_slot_attr(base, hook_point, record.slot_id))
+
+    return SAESlotState(
+        slot=record,
+        clamp_kind=_buf(SAE_CLAMP_KIND_BASE),
+        clamp_value=_buf(SAE_CLAMP_VALUE_BASE),
+        clamp_only_if_active=_buf(SAE_CLAMP_ONLY_IF_ACTIVE_BASE),
+        any_active=_buf(SAE_ANY_ACTIVE_BASE),
+        encoder_weight=_buf(SAE_ENCODER_WEIGHT_BASE),
+        encoder_bias=_buf(SAE_ENCODER_BIAS_BASE),
+        decoder_weight=_buf(SAE_DECODER_WEIGHT_BASE),
+        threshold=_buf(SAE_THRESHOLD_BASE),
+    )
+
+
+def get_sae_slot_state(
+    module: nn.Module, hook_point: SteeringHookPoint, module_name: str
+) -> SAESlotState | None:
+    """Resolve ``module_name``'s buffer set at this site, or ``None``."""
+    for record in sae_site_slots(module, hook_point):
+        if record.module_name == module_name:
+            return _sae_slot_state(module, hook_point, record)
+    return None
+
+
+def _delete_slot_buffers(
+    module: nn.Module, hook_point: SteeringHookPoint, slot_id: int
+) -> None:
+    """Remove one slot's buffers from ``module`` (idempotent)."""
+    for base in _SAE_SLOT_BUFFER_BASES:
+        attr = _sae_slot_attr(base, hook_point, slot_id)
+        if hasattr(module, attr):
+            # ``register_buffer`` puts the entry into ``_buffers`` *and*
+            # makes it accessible via the descriptor; ``delattr`` removes
+            # both consistently.
+            delattr(module, attr)
 
 
 def register_sae_buffers(
@@ -233,20 +286,21 @@ def register_sae_buffers(
     dtype: torch.dtype,
     device: torch.device | None = None,
 ) -> None:
-    """Attach SAE buffers for one ``(layer, hook)`` site to ``module``.
+    """Attach one SAE module's buffer slot at a ``(layer, hook)`` site.
 
-    Phase-1B constrains at most one SAE module per ``(layer, hook)``
-    site.  Calling this twice for the same ``hook_point`` on the same
-    module raises ``ValueError``.
+    Multiple SAE modules may share the site — each call allocates a new
+    slot with its own suffixed buffer set.  Calling this twice for the
+    same ``module_name`` on the same ``hook_point`` raises
+    ``ValueError``.
 
     Args:
         module: the decoder-layer module to attach buffers to.
         hook_point: which hook point this site sits at.
-        module_name: name of the SAE module that owns this site.
+        module_name: name of the SAE module claiming this slot.
         activation: encoder activation function.
         activation_params: parameters for ``activation`` (see
-            :func:`sae_encode`).  Stored as a Python attribute so the
-            kernel reads them as constants per-site.
+            :func:`sae_encode`).  Stored on the slot record so the
+            kernel reads them as constants per-slot.
         n_clamp: number of clampable encoder/decoder rows.
         hidden_size: model's hidden size (``d_model``).
         max_sae_configs: maximum number of per-request clamp table rows.
@@ -262,17 +316,20 @@ def register_sae_buffers(
     """
     if max_sae_configs == 0:
         return
-    kind_attr = HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point]
-    if hasattr(module, kind_attr):
-        existing = getattr(
-            module, HOOK_POINT_SAE_MODULE_NAME_ATTR[hook_point], "<unknown>"
-        )
-        raise ValueError(
-            f"Layer module already has SAE buffers for hook "
-            f"{hook_point.value!r} (owning module={existing!r}).  "
-            "Phase-1B constrains at most one SAE module per "
-            "(layer, hook) site; unregister the existing module first."
-        )
+    slots_attr = _sae_slots_attr(hook_point)
+    slots: list[SAESlotInfo] = list(getattr(module, slots_attr, ()))
+    for record in slots:
+        if record.module_name == module_name:
+            raise ValueError(
+                f"SAE module {module_name!r} already holds a buffer slot "
+                f"at hook {hook_point.value!r} on this layer; unregister "
+                "it before re-registering."
+            )
+    counter_attr = _sae_slot_counter_attr(hook_point)
+    # Monotonic per-(layer, hook) slot id: never reused within the
+    # layer's lifetime, so surviving slots keep stable attr names when
+    # a sibling detaches.
+    slot_id = int(getattr(module, counter_attr, 0))
     # Row 0 = hard no-op sentinel; row 1 = prefill globals; row 2 =
     # decode globals; rows 3..max_sae_configs+2 = per-request.  The
     # dispatch shim routes no-per-request tokens to row 1 or 2 based
@@ -282,22 +339,22 @@ def register_sae_buffers(
     try:
         # Clamp tables: per-(row, feature) clamp state.
         module.register_buffer(
-            kind_attr,
+            _sae_slot_attr(SAE_CLAMP_KIND_BASE, hook_point, slot_id),
             torch.zeros(n_rows, n_clamp, dtype=torch.int8, device=device),
             persistent=False,
         )
         module.register_buffer(
-            HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point],
+            _sae_slot_attr(SAE_CLAMP_VALUE_BASE, hook_point, slot_id),
             torch.zeros(n_rows, n_clamp, dtype=torch.float32, device=device),
             persistent=False,
         )
         module.register_buffer(
-            HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point],
+            _sae_slot_attr(SAE_CLAMP_ONLY_IF_ACTIVE_BASE, hook_point, slot_id),
             torch.zeros(n_rows, n_clamp, dtype=torch.bool, device=device),
             persistent=False,
         )
         module.register_buffer(
-            HOOK_POINT_SAE_ANY_ACTIVE_ATTR[hook_point],
+            _sae_slot_attr(SAE_ANY_ACTIVE_BASE, hook_point, slot_id),
             torch.zeros(1, dtype=torch.bool, device=device),
             persistent=False,
         )
@@ -306,12 +363,12 @@ def register_sae_buffers(
         # weight loading; defaulting to zeros means an unloaded site
         # produces zero delta (safe default, fail-quiet).
         module.register_buffer(
-            HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[hook_point],
+            _sae_slot_attr(SAE_ENCODER_WEIGHT_BASE, hook_point, slot_id),
             torch.zeros(n_clamp, hidden_size, dtype=dtype, device=device),
             persistent=False,
         )
         module.register_buffer(
-            HOOK_POINT_SAE_ENCODER_BIAS_ATTR[hook_point],
+            _sae_slot_attr(SAE_ENCODER_BIAS_BASE, hook_point, slot_id),
             torch.zeros(n_clamp, dtype=dtype, device=device),
             persistent=False,
         )
@@ -319,59 +376,74 @@ def register_sae_buffers(
         # zero-filled fp32 buffer for ReLU/TopK sites — so the custom
         # op keeps a fixed arity across activations.
         module.register_buffer(
-            HOOK_POINT_SAE_THRESHOLD_ATTR[hook_point],
+            _sae_slot_attr(SAE_THRESHOLD_BASE, hook_point, slot_id),
             torch.zeros(n_clamp, dtype=torch.float32, device=device),
             persistent=False,
         )
         module.register_buffer(
-            HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[hook_point],
+            _sae_slot_attr(SAE_DECODER_WEIGHT_BASE, hook_point, slot_id),
             torch.zeros(n_clamp, hidden_size, dtype=dtype, device=device),
             persistent=False,
         )
-        # Python attributes — read as per-site constants by the kernel.
-        setattr(module, HOOK_POINT_SAE_MODULE_NAME_ATTR[hook_point], module_name)
-        setattr(module, HOOK_POINT_SAE_ACTIVATION_ATTR[hook_point], activation)
-        setattr(
-            module,
-            HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR[hook_point],
-            dict(activation_params),
-        )
     except Exception:
-        unregister_sae_buffers(module, hook_point=hook_point)
+        # Partial failure: delete only the new slot's attrs.  Sibling
+        # slots (other modules on this site) are untouched.
+        _delete_slot_buffers(module, hook_point, slot_id)
         raise
+    # Commit: bump the counter and append the slot record.  Python
+    # attributes — read as per-slot constants by the dispatch shim.
+    setattr(module, counter_attr, slot_id + 1)
+    slots.append(
+        SAESlotInfo(
+            slot_id=slot_id,
+            module_name=module_name,
+            activation=activation,
+            activation_params=dict(activation_params),
+        )
+    )
+    setattr(module, slots_attr, slots)
 
 
 def unregister_sae_buffers(
     module: nn.Module,
     *,
     hook_point: SteeringHookPoint,
+    module_name: str,
 ) -> None:
-    """Detach SAE buffers from ``module`` for ``hook_point``.
+    """Detach ``module_name``'s SAE buffer slot for ``hook_point``.
 
-    Idempotent: no-op when buffers aren't attached.  Called when the
-    owning SAE module is unregistered from the worker.
+    Idempotent: no-op when the module holds no slot at this site.
+    Called when the owning SAE module is unregistered from the worker.
+    Sibling slots (other modules sharing the site) are untouched, and
+    the slot counter is kept so slot ids are never reused.  The
+    ``sae_slots_<hook>`` attribute is dropped entirely when the last
+    slot detaches, keeping ``hasattr`` gating clean for dispatch.
     """
-    for table in _SAE_BUFFER_ATTR_TABLES:
-        attr = table[hook_point]
-        if hasattr(module, attr):
-            # ``register_buffer`` puts the entry into ``_buffers`` *and*
-            # makes it accessible via the descriptor; ``delattr`` removes
-            # both consistently.
-            delattr(module, attr)
-    for pytable in _SAE_PYATTR_TABLES:
-        attr = pytable[hook_point]
-        if hasattr(module, attr):
-            delattr(module, attr)
+    slots_attr = _sae_slots_attr(hook_point)
+    slots: list[SAESlotInfo] = list(getattr(module, slots_attr, ()))
+    if not slots:
+        return
+    remaining: list[SAESlotInfo] = []
+    for record in slots:
+        if record.module_name == module_name:
+            _delete_slot_buffers(module, hook_point, record.slot_id)
+        else:
+            remaining.append(record)
+    if remaining:
+        setattr(module, slots_attr, remaining)
+    else:
+        delattr(module, slots_attr)
 
 
 def sae_buffers_attached(module: nn.Module, hook_point: SteeringHookPoint) -> bool:
     """Constant-time check used by the layer-hook dispatch shim.
 
-    ``torch.compile`` traces ``hasattr`` as a static branch (decided
-    once at module instantiation), so the disabled path emits zero
-    SAE kernel code.
+    True when at least one SAE module holds a buffer slot at this
+    site.  ``torch.compile`` traces the attribute presence as a static
+    branch (decided once at module instantiation), so the disabled
+    path emits zero SAE kernel code.
     """
-    return hasattr(module, HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point])
+    return bool(getattr(module, _sae_slots_attr(hook_point), ()))
 
 
 def register_sae_index_buffer(
@@ -871,66 +943,60 @@ def apply_layer_sae_delta(
 ) -> torch.Tensor:
     """Layer-hook dispatch: pull buffer state, hand it to the math primitive.
 
-    When the layer has no SAE buffers attached for ``hook_point``
+    When the layer has no SAE buffer slots attached for ``hook_point``
     (engine started with SAE disabled or the site isn't covered by
     any registered module), this short-circuits and returns
-    ``hidden_states`` unchanged.  The ``hasattr`` check is decided
-    once at module instantiation and is constant for the rest of the
-    layer's lifetime, so ``torch.compile`` traces it as a static
-    branch and the disabled path emits no SAE kernel at all —
+    ``hidden_states`` unchanged.  The slot-list presence check is
+    decided once at module instantiation and is constant for the rest
+    of the layer's lifetime, so ``torch.compile`` traces it as a
+    static branch and the disabled path emits no SAE kernel at all —
     mirroring :func:`apply_layer_steering`.
 
-    The shim passes the row table plus ``sae_index`` to
-    ``torch.ops.vllm.apply_sae_delta_indexed``.  The backend performs
-    the per-token gather after checking ``any_active``, so an attached
-    but idle SAE module avoids table-gather work.  The torch-op
-    indirection is what makes :mod:`torch.compile` treat the SAE call
-    as an opaque splitting point (mirroring
-    :func:`apply_layer_steering` → ``torch.ops.vllm.apply_steering``);
-    under CUDA the op routes to a fused Triton kernel.  ``n_clamp == 0``
-    short-circuits before the op call so we never launch a degenerate
-    kernel.
+    When multiple SAE modules share the site, one
+    ``torch.ops.vllm.apply_sae_delta_indexed`` call is chained per
+    slot in registration order (deterministic across ranks — module
+    RPCs apply in the same order everywhere).  The slot list is a
+    static Python attribute, so the loop unrolls at trace time; N
+    encoder passes for N modules is inherent to the design.  All slots
+    share the layer-wide ``sae_index`` and the manager's global row
+    numbering.
+
+    Each op call passes the slot's row tables plus ``sae_index``.  The
+    backend performs the per-token gather after checking that slot's
+    ``any_active``, so an attached but idle SAE module avoids
+    table-gather work.  The torch-op indirection is what makes
+    :mod:`torch.compile` treat the SAE call as an opaque splitting
+    point (mirroring :func:`apply_layer_steering` →
+    ``torch.ops.vllm.apply_steering``); under CUDA the op routes to a
+    fused Triton kernel.  ``n_clamp == 0`` slots short-circuit before
+    the op call so we never launch a degenerate kernel.
     """
-    if not sae_buffers_attached(module, hook_point):
+    slots = getattr(module, _sae_slots_attr(hook_point), None)
+    if not slots:
         return hidden_states
     n_tokens = hidden_states.shape[0]
     sae_index = module.sae_index[:n_tokens]  # type: ignore[union-attr]
-    kind_table = getattr(module, HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point])
-    value_table = getattr(module, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point])
-    only_table = getattr(module, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
-    enc_w = getattr(module, HOOK_POINT_SAE_ENCODER_WEIGHT_ATTR[hook_point])
-    enc_b = getattr(module, HOOK_POINT_SAE_ENCODER_BIAS_ATTR[hook_point])
-    threshold = getattr(module, HOOK_POINT_SAE_THRESHOLD_ATTR[hook_point])
-    dec_w = getattr(module, HOOK_POINT_SAE_DECODER_WEIGHT_ATTR[hook_point])
-    activation: SAEActivation = getattr(
-        module, HOOK_POINT_SAE_ACTIVATION_ATTR[hook_point]
-    )
-    activation_params: dict[str, float] = getattr(
-        module, HOOK_POINT_SAE_ACTIVATION_PARAMS_ATTR[hook_point]
-    )
-
-    if enc_w.shape[0] == 0:
-        return hidden_states
-    any_active = getattr(module, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[hook_point], None)
-    if any_active is None:
-        any_active = torch.ones(1, dtype=torch.bool, device=hidden_states.device)
-
-    code = _ACTIVATION_TO_CODE[activation]
-    param = _activation_to_scalar(activation, activation_params)
-    return torch.ops.vllm.apply_sae_delta_indexed(
-        hidden_states,
-        enc_w,
-        enc_b,
-        threshold,
-        dec_w,
-        kind_table,
-        value_table,
-        only_table,
-        sae_index,
-        any_active,
-        code,
-        param,
-    )
+    for record in tuple(slots):
+        state = _sae_slot_state(module, hook_point, record)
+        if state.encoder_weight.shape[0] == 0:
+            continue
+        code = _ACTIVATION_TO_CODE[record.activation]
+        param = _activation_to_scalar(record.activation, record.activation_params)
+        hidden_states = torch.ops.vllm.apply_sae_delta_indexed(
+            hidden_states,
+            state.encoder_weight,
+            state.encoder_bias,
+            state.threshold,
+            state.decoder_weight,
+            state.clamp_kind,
+            state.clamp_value,
+            state.clamp_only_if_active,
+            sae_index,
+            state.any_active,
+            code,
+            param,
+        )
+    return hidden_states
 
 
 def populate_sae_clamp_table(
@@ -949,9 +1015,10 @@ def populate_sae_clamp_table(
     into the corresponding row of ``module``'s clamp tables for this
     ``hook_point``, gated by:
 
-    * **Module match** — the spec's ``module_name`` must equal this
-      site's ``module_name``.  Specs from other modules are skipped
-      at this site.
+    * **Module match** — the spec's ``module_name`` must equal
+      ``module_name`` (the slot being populated).  Specs from other
+      modules are skipped: each module's slot has its own tables, so
+      one module's rows never write a sibling slot's buffers.
     * **Phase match** — the spec's ``phase`` field (``"both"`` /
       ``"prefill"`` / ``"decode"``) must be compatible with the
       row's ``row_phase`` (the worker phase the row was admitted
@@ -985,8 +1052,9 @@ def populate_sae_clamp_table(
         manager: the :class:`SAEClampManager` holding active rows.
         module: the layer module with SAE buffers attached.
         hook_point: which hook this site sits at.
-        module_name: name of the SAE module that owns this site;
-            specs from other modules are skipped at this site.
+        module_name: name of the SAE module whose slot tables are
+            populated; specs from other modules are skipped.  When the
+            module holds no slot at this site, the call is a no-op.
         clampable_features: ordered tuple of feature indices that
             define the (feature_idx → row position) mapping for this
             module.
@@ -997,16 +1065,17 @@ def populate_sae_clamp_table(
         worker_phase: optional phase filter — when set, only rows with
             matching ``row_phase`` are touched.
     """
-    if not sae_buffers_attached(module, hook_point):
-        return
     if worker_phase is not None and worker_phase not in ("prefill", "decode"):
         raise ValueError(
             f"worker_phase must be 'prefill' or 'decode' or None; got {worker_phase!r}."
         )
-    kind_table = getattr(module, HOOK_POINT_SAE_CLAMP_KIND_ATTR[hook_point])
-    value_table = getattr(module, HOOK_POINT_SAE_CLAMP_VALUE_ATTR[hook_point])
-    only_table = getattr(module, HOOK_POINT_SAE_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
-    any_active = getattr(module, HOOK_POINT_SAE_ANY_ACTIVE_ATTR[hook_point], None)
+    state = get_sae_slot_state(module, hook_point, module_name)
+    if state is None:
+        return
+    kind_table = state.clamp_kind
+    value_table = state.clamp_value
+    only_table = state.clamp_only_if_active
+    any_active: torch.Tensor | None = state.any_active
     n_clamp = kind_table.shape[1]
     if len(clampable_features) != n_clamp:
         raise ValueError(
