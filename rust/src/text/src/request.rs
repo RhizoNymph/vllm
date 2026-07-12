@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::multimodal::MmFeatures;
-use vllm_engine_core_client::protocol::{SteeringVectorSpec, StructuredOutputsParams};
+use vllm_engine_core_client::protocol::{
+    SaeClampSpec, SaeFullReconstructionSpec, SteeringVectorSpec, StructuredOutputsParams,
+};
 
 use crate::error::{Error, Result};
 use crate::output::TextDecodeOptions;
@@ -124,6 +126,13 @@ pub struct SamplingParams {
     /// Request-level packed table of client-provided patch vectors referenced
     /// by a patch entry's `source_inline` / mask `inline`. Forwarded verbatim.
     pub patch_vectors: Option<Value>,
+    /// Per-request SAE feature-surgery clamps (delta intervention),
+    /// referencing pre-registered named SAE modules. Typed passthrough;
+    /// engine-core validates semantics at admission.
+    pub sae_clamp_specs: Option<Vec<SaeClampSpec>>,
+    /// Per-request SAE full-reconstruction directives (residual replacement).
+    /// Typed passthrough like `sae_clamp_specs`.
+    pub sae_full_reconstruction_specs: Option<Vec<SaeFullReconstructionSpec>>,
 }
 
 #[allow(clippy::derivable_impls)] // more explicit
@@ -158,6 +167,8 @@ impl Default for SamplingParams {
             capture: None,
             patch: None,
             patch_vectors: None,
+            sae_clamp_specs: None,
+            sae_full_reconstruction_specs: None,
         }
     }
 }

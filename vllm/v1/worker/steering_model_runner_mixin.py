@@ -4,6 +4,8 @@
 Define activation steering functionality mixin for model runners.
 """
 
+import base64
+import binascii
 import math
 import struct
 import zlib
@@ -218,6 +220,158 @@ def _steering_action_digest(action) -> bytes:
             )
         )
     return name
+
+
+def _coerce_sae_wire_site_key(key: object) -> tuple[int, str]:
+    """Normalize one ``sae_weights`` site key to ``(layer_idx, hook_str)``.
+
+    Accepts the in-process ``(int, str)`` tuple, the msgpack-degraded
+    ``[layer, hook]`` list, and the Rust frontend's ``"layer:hook"``
+    string. Anything else raises a clear :class:`ValueError`.
+    """
+    if isinstance(key, (tuple, list)) and len(key) == 2:
+        layer, hook = key
+        if (
+            isinstance(layer, int)
+            and not isinstance(layer, bool)
+            and isinstance(hook, str)
+        ):
+            return (layer, hook)
+    elif isinstance(key, str):
+        layer_str, sep, hook = key.partition(":")
+        if sep and hook:
+            try:
+                return (int(layer_str), hook)
+            except ValueError:
+                pass
+    raise ValueError(
+        "SAE weights site key must be an (int layer, str hook) pair or a "
+        f"'layer:hook' string, got {key!r}."
+    )
+
+
+def _coerce_sae_wire_tensor(
+    value: object, *, site: tuple[int, str], tensor_name: str
+) -> torch.Tensor:
+    """Rebuild one weight tensor from its wire form.
+
+    Torch tensors do not survive the ``collective_rpc`` msgpack hop: the
+    utility-call decoder yields ``[dtype_str, shape_list, buffer]``
+    triples (or, for the Rust frontend, ``{dtype, shape, data}`` dicts
+    with base64-encoded ``data``). This helper accepts:
+
+    * ``torch.Tensor`` — passed through unchanged (in-process callers);
+    * ``{"dtype": str, "shape": [int, ...], "data": bytes | memoryview
+      | base64 str}`` packed dicts;
+    * ``[dtype_str, shape_list, buffer]`` triples (the degraded-tensor
+      wire form).
+
+    Raises a clear :class:`ValueError` for anything else — including the
+    dangling aux-buffer indices large tensors degrade to, which cannot
+    be recovered worker-side.
+    """
+    if isinstance(value, torch.Tensor):
+        return value
+    where = f"tensor {tensor_name!r} at site {site!r}"
+    if isinstance(value, dict):
+        missing = [k for k in ("dtype", "shape", "data") if k not in value]
+        if missing:
+            raise ValueError(
+                f"SAE weights {where}: packed dict is missing key(s) {missing}."
+            )
+        dtype_str, shape, data = value["dtype"], value["shape"], value["data"]
+    elif isinstance(value, (list, tuple)) and len(value) == 3:
+        dtype_str, shape, data = value
+    else:
+        raise ValueError(
+            f"SAE weights {where}: expected a torch.Tensor, a packed "
+            "{dtype, shape, data} dict, or a [dtype, shape, data] triple, "
+            f"got {type(value).__name__}."
+        )
+
+    if not isinstance(dtype_str, str):
+        raise ValueError(f"SAE weights {where}: dtype must be a string.")
+    torch_dtype = getattr(torch, dtype_str.removeprefix("torch."), None)
+    if not isinstance(torch_dtype, torch.dtype):
+        raise ValueError(
+            f"SAE weights {where}: unknown dtype {dtype_str!r}."
+        )
+    if not isinstance(shape, (list, tuple)) or not all(
+        isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0
+        for dim in shape
+    ):
+        raise ValueError(
+            f"SAE weights {where}: shape must be a list of non-negative "
+            f"ints, got {shape!r}."
+        )
+    shape = tuple(shape)
+    if isinstance(data, str):
+        try:
+            buffer = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(
+                f"SAE weights {where}: data is not valid base64: {exc}"
+            ) from exc
+    elif isinstance(data, (bytes, bytearray, memoryview)):
+        buffer = bytes(data)
+    else:
+        raise ValueError(
+            f"SAE weights {where}: data must be bytes, a memoryview, or a "
+            f"base64 string, got {type(data).__name__} (large tensors "
+            "must be sent packed — raw tensors do not survive the "
+            "collective_rpc hop)."
+        )
+    expected = math.prod(shape) * torch_dtype.itemsize
+    if len(buffer) != expected:
+        raise ValueError(
+            f"SAE weights {where}: byte length {len(buffer)} does not "
+            f"match expected {expected} for shape {shape} dtype "
+            f"{dtype_str!r}."
+        )
+    if expected == 0:
+        return torch.empty(shape, dtype=torch_dtype)
+    # bytearray copy: frombuffer requires a writable buffer that the
+    # tensor aliases; copying also detaches the tensor's storage from the
+    # transient RPC frame. The uint8 view trick sidesteps dtypes without
+    # a Python buffer-protocol format (bfloat16), mirroring
+    # vllm/v1/serial_utils.py's tensor decode.
+    raw = torch.frombuffer(bytearray(buffer), dtype=torch.uint8)
+    return raw.view(torch_dtype).view(shape)
+
+
+def _coerce_sae_weights_wire(
+    raw: object,
+) -> dict[tuple[int, str], dict[str, torch.Tensor]]:
+    """Normalize an ``sae_weights`` broadcast payload into attach form.
+
+    Applied to the payload in both SAE register branches before
+    :meth:`SteeringModelRunnerMixin.attach_sae_weights` /
+    :meth:`~SteeringModelRunnerMixin.attach_sae_full_recon_weights`.
+    Site keys become ``(layer_idx, hook_str)`` tuples and tensor values
+    become :class:`torch.Tensor` (see :func:`_coerce_sae_wire_tensor`
+    for the accepted wire forms). Tensor names pass through opaquely so
+    additional keys (e.g. a per-feature ``threshold``) survive.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "SAE weights payload must be a dict keyed by (layer, hook) "
+            f"site, got {type(raw).__name__}."
+        )
+    out: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
+    for key, site_tensors in raw.items():
+        site = _coerce_sae_wire_site_key(key)
+        if not isinstance(site_tensors, dict):
+            raise ValueError(
+                f"SAE weights for site {site!r} must be a dict of tensor "
+                f"name to tensor, got {type(site_tensors).__name__}."
+            )
+        out[site] = {
+            str(name): _coerce_sae_wire_tensor(
+                tensor, site=site, tensor_name=str(name)
+            )
+            for name, tensor in site_tensors.items()
+        }
+    return out
 
 
 if TYPE_CHECKING:
@@ -1284,9 +1438,16 @@ class SteeringModelRunnerMixin:
                 # the previously-working module.
                 sae_weights = payload.get("sae_weights")
                 try:
+                    # Wire coercion inside the atomic step: broadcast
+                    # payloads carry weights in the msgpack-safe wire form
+                    # (Rust frontend packed dicts, or tensors degraded by
+                    # the collective_rpc hop), and a malformed payload must
+                    # roll back like any other attach failure.
                     self._attach_sae_buffers(name, manifest)
                     if sae_weights is not None:
-                        self.attach_sae_weights(name, sae_weights)
+                        self.attach_sae_weights(
+                            name, _coerce_sae_weights_wire(sae_weights)
+                        )
                 except Exception:
                     self._detach_sae_buffers(name)
                     self._sae_module_registry.pop(name, None)
@@ -1355,7 +1516,9 @@ class SteeringModelRunnerMixin:
                 try:
                     self._attach_sae_full_recon_buffers(name, manifest)
                     if sae_weights is not None:
-                        self.attach_sae_full_recon_weights(name, sae_weights)
+                        self.attach_sae_full_recon_weights(
+                            name, _coerce_sae_weights_wire(sae_weights)
+                        )
                 except Exception:
                     self._detach_sae_full_recon_buffers(name)
                     fr_registry.pop(name, None)

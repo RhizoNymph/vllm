@@ -46,10 +46,11 @@
   ([`../design/dynamic_steering.md`](../design/dynamic_steering.md));
   this document is specifically about decoder-direction interventions
   on SAE feature activations.
-- **Rust frontend passthrough.** The Rust frontend proxies additive
-  steering, capture, and patching but has no SAE request fields or
-  SAE module-registration support — see
-  [Current Limitations](#current-limitations).
+- **Rust frontend internals.** The Rust frontend forwards the SAE
+  request fields and registers SAE modules, but its implementation is
+  documented separately in `rust/docs/features/steering_capture.md` —
+  see [Current Limitations](#current-limitations) for the surface it
+  covers.
 
 ## Background and Choice of Variant
 
@@ -539,11 +540,16 @@ GEMMs per opted-in token per hooked layer).
 
 ## Current Limitations
 
-- **No Rust frontend passthrough.** `rust/` has no
-  `sae_clamp_specs` / `sae_full_reconstruction_specs` request fields
-  and its steering-modules proxy doesn't know the SAE kinds. SAE is
-  currently reachable only through the Python OpenAI server (or
-  offline `LLM` via `SamplingParams`).
+- **Rust frontend: HTTP only.** `rust/` accepts the per-request
+  `sae_clamp_specs` / `sae_full_reconstruction_specs` fields and its
+  steering-modules surface (startup `--steering-modules` files and
+  `POST /v1/steering/modules`) registers both SAE kinds, sending
+  weights inline as base64-packed `{dtype, shape, data}` tensors
+  keyed by `"layer:hook"` (torch tensors do not survive the
+  `collective_rpc` hop; the worker's `_coerce_sae_weights_wire`
+  rebuilds them). gRPC remains request-passthrough only — SAE module
+  registration over gRPC is deferred. See
+  `rust/docs/features/steering_capture.md`.
 - **`replace=True` module pushes are per-worker atomic but not
   cross-rank transactional.** On each worker,
   `register_steering_modules(replace=True)`
