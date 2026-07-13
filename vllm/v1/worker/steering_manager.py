@@ -62,6 +62,7 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
+from vllm.v1.worker.phase_tiers import PhaseTiers
 from vllm.v1.worker.steering_owner import OwnerStore, RowOwner
 
 logger = init_logger(__name__)
@@ -187,9 +188,11 @@ class SteeringManager:
         #   base:    both-phases vectors (from global API)
         #   prefill: prefill-specific global vectors
         #   decode:  decode-specific global vectors
-        self.global_base_vectors: dict[str, dict[int, torch.Tensor]] = {}
-        self.global_prefill_vectors: dict[str, dict[int, torch.Tensor]] = {}
-        self.global_decode_vectors: dict[str, dict[int, torch.Tensor]] = {}
+        # Exposed per-tier via the ``global_*_vectors`` properties (their
+        # names are read by the mixin and asserted on by tests).
+        self._global_vectors: PhaseTiers[dict[str, dict[int, torch.Tensor]]] = (
+            PhaseTiers(base={}, prefill={}, decode={}, label="global vector")
+        )
 
         # Dynamic additive tier (decode-only): a global steering
         # contribution owned by dynamic consumers, folded ADDITIVELY into
@@ -735,11 +738,21 @@ class SteeringManager:
         # Global rows 1, 2 and all per-request rows depend on this state.
         self._dirty.mark_content()
 
+    @property
+    def global_base_vectors(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._global_vectors.base
+
+    @property
+    def global_prefill_vectors(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._global_vectors.prefill
+
+    @property
+    def global_decode_vectors(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._global_vectors.decode
+
     def clear_global_vectors(self) -> None:
         """Clear all cached global vectors across all phases and hook points."""
-        self.global_base_vectors.clear()
-        self.global_prefill_vectors.clear()
-        self.global_decode_vectors.clear()
+        self._global_vectors.clear_all()
         self._dirty.mark_content()
 
     def update_dynamic_tier(
@@ -1260,17 +1273,7 @@ class SteeringManager:
 
     def _global_dict_for_phase(self, phase: str) -> dict[str, dict[int, torch.Tensor]]:
         """Return the global vector dict for the given phase."""
-        if phase == "base":
-            return self.global_base_vectors
-        elif phase == "prefill":
-            return self.global_prefill_vectors
-        elif phase == "decode":
-            return self.global_decode_vectors
-        else:
-            raise ValueError(
-                f"Invalid global vector phase: {phase!r}. "
-                f"Must be 'base', 'prefill', or 'decode'."
-            )
+        return self._global_vectors.for_phase(phase)
 
     def _get_global_vec(
         self,
