@@ -87,6 +87,11 @@ pub fn to_text_request(
         if !steering.name.is_empty() {
             sampling_params.steering_name = Some(steering.name);
         }
+        sampling_params.steering_clamps = convert_packed_clamps(steering.steering_clamps)?;
+        sampling_params.prefill_steering_clamps =
+            convert_packed_clamps(steering.prefill_steering_clamps)?;
+        sampling_params.decode_steering_clamps =
+            convert_packed_clamps(steering.decode_steering_clamps)?;
     }
     if let Some(capture) = req.capture.as_ref() {
         sampling_params.capture = Some(proto_struct_to_json_prefer_int(capture));
@@ -472,6 +477,62 @@ fn convert_packed_steering(
     Ok(Some(spec))
 }
 
+/// Convert one proto packed-clamp map (hook name → blob) into the packed-JSON
+/// `Value` the HTTP clamp path forwards, so the Python engine owns a single
+/// clamp decoder (`unpack_steering_clamps`).
+///
+/// The direction bytes are base64-encoded and the flattened proto `bounds`
+/// `[lo0, hi0, lo1, hi1, ...]` are re-paired into `[[lo, hi], ...]`. JSON has
+/// no infinity literal, so an infinite bound is encoded as `null` (the Python
+/// unpacker maps `null` back to `±inf`). An empty map yields `None`.
+fn convert_packed_clamps(
+    map: HashMap<String, pb::ClampHookPacked>,
+) -> Result<Option<serde_json::Value>, Status> {
+    use base64::Engine as _;
+
+    if map.is_empty() {
+        return Ok(None);
+    }
+    let bound_to_json = |b: f64| -> serde_json::Value {
+        if b.is_finite() {
+            serde_json::json!(b)
+        } else {
+            serde_json::Value::Null
+        }
+    };
+    let mut obj = serde_json::Map::with_capacity(map.len());
+    for (hook, blob) in map {
+        let n = blob.shape.first().copied().unwrap_or(0) as usize;
+        if blob.bounds.len() != 2 * n {
+            return Err(Status::invalid_argument(format!(
+                "clamp hook '{hook}': bounds length {} != 2 * num_rows {n}",
+                blob.bounds.len(),
+            )));
+        }
+        let bounds: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::Value::Array(vec![
+                    bound_to_json(blob.bounds[2 * i]),
+                    bound_to_json(blob.bounds[2 * i + 1]),
+                ])
+            })
+            .collect();
+        let data = base64::engine::general_purpose::STANDARD.encode(&blob.data);
+        obj.insert(
+            hook,
+            serde_json::json!({
+                "dtype": blob.dtype,
+                "shape": blob.shape,
+                "layer_indices": blob.layer_indices,
+                "data": data,
+                "bounds": bounds,
+                "strengths": blob.strengths,
+            }),
+        );
+    }
+    Ok(Some(serde_json::Value::Object(obj)))
+}
+
 /// Convert a proto `Struct` into JSON, preferring integer JSON numbers for
 /// whole-valued `NumberValue`s.
 ///
@@ -627,6 +688,7 @@ mod tests {
                 prefill_steering_vectors: std::collections::HashMap::new(),
                 decode_steering_vectors: std::collections::HashMap::new(),
                 name: "creativity".to_string(),
+                ..Default::default()
             }),
             capture: Some(prost_types::Struct {
                 fields: std::collections::BTreeMap::from([(
@@ -651,6 +713,45 @@ mod tests {
         let capture = sp.capture.as_ref().expect("capture present");
         assert_eq!(capture["min_position"], serde_json::json!(2));
         assert!(capture["min_position"].is_i64());
+    }
+
+    #[test]
+    fn packed_clamps_convert_to_packed_json_value() {
+        // A proto ClampHookPacked map converts into the same packed-JSON shape
+        // the HTTP path forwards: base64 `data`, re-paired `bounds` with inf
+        // encoded as null, and `strengths`.
+        let data: Vec<u8> = [1.0f64, 0.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let req = pb::GenerateRequest {
+            steering: Some(pb::Steering {
+                steering_clamps: std::collections::HashMap::from([(
+                    "post_attn".to_string(),
+                    pb::ClampHookPacked {
+                        dtype: "float64".to_string(),
+                        shape: vec![2, 2],
+                        layer_indices: vec![5, 5],
+                        data,
+                        // Row 0: [-2, 2]; row 1: [-inf, 4] (lo infinite).
+                        bounds: vec![-2.0, 2.0, f64::NEG_INFINITY, 4.0],
+                        strengths: vec![1.0, 0.5],
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..base_request()
+        };
+
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        let clamps = text.sampling_params.steering_clamps.as_ref().expect("clamps present");
+        let blob = &clamps["post_attn"];
+        assert_eq!(blob["dtype"], serde_json::json!("float64"));
+        assert_eq!(blob["shape"], serde_json::json!([2, 2]));
+        assert_eq!(blob["layer_indices"], serde_json::json!([5, 5]));
+        assert!(blob["data"].is_string());
+        // Infinite lo bound encodes as JSON null; finite bounds pass through.
+        assert_eq!(blob["bounds"][0], serde_json::json!([-2.0, 2.0]));
+        assert_eq!(blob["bounds"][1][0], serde_json::Value::Null);
+        assert_eq!(blob["bounds"][1][1], serde_json::json!(4.0));
+        assert_eq!(blob["strengths"], serde_json::json!([1.0, 0.5]));
     }
 
     #[test]

@@ -955,6 +955,30 @@ mod tests {
     }
 
     #[test]
+    fn packed_steering_clamps_survive_msgpack_roundtrip_verbatim() {
+        // The binary packed clamp form is an opaque `Value`: it must survive
+        // the msgpack encode/decode round-trip byte-for-byte (base64 `data`,
+        // the `bounds` pairs with `null` for infinities, and `strengths`).
+        let packed = serde_json::json!({
+            "post_attn": {
+                "dtype": "float64",
+                "shape": [2, 2],
+                "layer_indices": [5, 5],
+                "data": "AAAAAAAA8D8AAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D8=",
+                "bounds": [[-2.0, 2.0], [null, 4.0]],
+                "strengths": [1.0, 0.5]
+            }
+        });
+        let params = EngineCoreSamplingParams {
+            steering_clamps: Some(packed.clone()),
+            ..EngineCoreSamplingParams::for_test()
+        };
+        let bytes = encode_msgpack(&params).unwrap();
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.steering_clamps, Some(packed));
+    }
+
+    #[test]
     fn engine_core_output_capture_results_sit_at_tuple_index_7() {
         let output = EngineCoreOutput {
             request_id: "r".to_string(),

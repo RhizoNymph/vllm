@@ -1109,6 +1109,38 @@ mod tests {
     }
 
     #[test]
+    fn lower_sampling_params_threads_packed_steering_clamps_verbatim() {
+        // The binary packed clamp form (per-hook `ClampHookPacked`) rides
+        // through lowering unchanged — it is an opaque `Value` and the Python
+        // engine owns the single decoder.
+        let packed = serde_json::json!({
+            "post_attn": {
+                "dtype": "float64",
+                "shape": [2, 2],
+                "layer_indices": [5, 5],
+                "data": "AAAAAAAA8D8AAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D8=",
+                "bounds": [[-2.0, 2.0], [null, 4.0]],
+                "strengths": [1.0, 0.5]
+            }
+        });
+        let sampling_params = SamplingParams {
+            steering_clamps: Some(packed.clone()),
+            ..SamplingParams::default()
+        };
+
+        let params = lower_sampling_params(
+            sampling_params,
+            sample_sampling_hints(),
+            sample_sampling_limits(),
+            3,
+            &stub_tokenizer(),
+        )
+        .unwrap();
+
+        assert_eq!(params.steering_clamps, Some(packed));
+    }
+
+    #[test]
     fn resolve_max_tokens_caps_by_model_len() {
         let result = resolve_max_tokens(Some(150), None, 200, 100);
         assert_eq!(result.unwrap(), 100);

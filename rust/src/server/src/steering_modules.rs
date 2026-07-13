@@ -34,6 +34,16 @@ pub struct SteeringModuleBroadcast {
     pub prefill_vectors: Option<SteeringVectorSpec>,
     /// Decode-only additions.
     pub decode_vectors: Option<SteeringVectorSpec>,
+    /// Base directional clamps (both phases). Forwarded verbatim: either the
+    /// JSON entry-list form `{hook: {layer: [clamp entries]}}` or the binary
+    /// packed form `{hook: ClampHookPacked}`. The Python worker's
+    /// `register_steering_modules` validates deeply and decodes the packed
+    /// form; here we only require a JSON object.
+    pub clamps: Option<Value>,
+    /// Prefill-only clamps, concatenated after base. Forwarded verbatim.
+    pub prefill_clamps: Option<Value>,
+    /// Decode-only clamps, concatenated after base. Forwarded verbatim.
+    pub decode_clamps: Option<Value>,
 }
 
 /// Errors raised while loading a named steering module from disk.
@@ -101,7 +111,31 @@ pub fn parse_module(
         vectors: load_tier(obj.get("vectors"), "vectors")?,
         prefill_vectors: load_tier(obj.get("prefill_vectors"), "prefill_vectors")?,
         decode_vectors: load_tier(obj.get("decode_vectors"), "decode_vectors")?,
+        clamps: load_clamp_tier(obj.get("clamps"), "clamps")?,
+        prefill_clamps: load_clamp_tier(obj.get("prefill_clamps"), "prefill_clamps")?,
+        decode_clamps: load_clamp_tier(obj.get("decode_clamps"), "decode_clamps")?,
     })
+}
+
+/// Pass a clamp tier through verbatim after a minimal structural check.
+///
+/// Clamps ride to the worker as an opaque JSON `Value` (either the entry-list
+/// form or the packed `{hook: ClampHookPacked}` form); the Python worker
+/// validates hook points, entry structure, direction widths and the K cap.
+/// Here we only reject a non-object tier and treat an empty object as absent.
+fn load_clamp_tier(
+    value: Option<&Value>,
+    tier: &'static str,
+) -> Result<Option<Value>, SteeringModuleLoadError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(obj)) if obj.is_empty() => Ok(None),
+        Some(v @ Value::Object(_)) => Ok(Some(v.clone())),
+        Some(_) => Err(SteeringModuleLoadError::Tier {
+            tier,
+            message: "clamp tier must be a JSON object keyed by hook point".to_owned(),
+        }),
+    }
 }
 
 /// Load all configured modules and broadcast them to the engine workers,
@@ -361,6 +395,82 @@ mod tests {
         assert!(matches!(
             load_steering_module(file.path().to_str().unwrap()),
             Err(SteeringModuleLoadError::Tier { .. })
+        ));
+    }
+
+    #[test]
+    fn module_with_clamps_parses_and_broadcasts_them() {
+        // A module carrying vectors AND clamps: the clamp tiers must survive
+        // parse_module and appear verbatim in the serialized broadcast payload
+        // under the exact keys the Python worker reads.
+        let obj = serde_json::json!({
+            "vectors": {"post_block": {"14": [0.1, 0.2]}},
+            "clamps": {"post_attn": {"5": [{"vector": [1.0, 0.0], "min": -2.0, "max": 2.0}]}},
+            "decode_clamps": {"pre_attn": {"3": [{"vector": [0.0, 1.0], "value": 1.5}]}}
+        });
+        let obj = obj.as_object().unwrap();
+        let module = parse_module(obj).expect("parse");
+        assert!(module.vectors.is_some());
+        assert!(module.clamps.is_some());
+        assert!(module.prefill_clamps.is_none());
+        assert!(module.decode_clamps.is_some());
+
+        // The broadcast serialization keeps the clamp keys (and omits the
+        // absent prefill_clamps via skip_serializing_none).
+        let payload = serde_json::to_value(&module).expect("serialize");
+        assert_eq!(
+            payload["clamps"]["post_attn"]["5"][0]["min"],
+            serde_json::json!(-2.0)
+        );
+        assert!(payload.get("prefill_clamps").is_none());
+        assert_eq!(
+            payload["decode_clamps"]["pre_attn"]["3"][0]["value"],
+            serde_json::json!(1.5)
+        );
+    }
+
+    #[test]
+    fn module_with_only_clamps_parses() {
+        // No vector tiers at all: a clamp-only module must still parse (the
+        // worker allocates a vector-empty row for it).
+        let obj = serde_json::json!({
+            "clamps": {"post_attn": {"5": [{"vector": [1.0, 0.0], "value": 0.0}]}}
+        });
+        let obj = obj.as_object().unwrap();
+        let module = parse_module(obj).expect("parse");
+        assert!(module.vectors.is_none());
+        assert!(module.prefill_vectors.is_none());
+        assert!(module.decode_vectors.is_none());
+        assert!(module.clamps.is_some());
+    }
+
+    #[test]
+    fn module_with_packed_clamps_passes_through_verbatim() {
+        // A packed clamp tier rides through as an opaque object; the Rust side
+        // does not decode it (the Python worker does).
+        let packed = serde_json::json!({
+            "post_attn": {
+                "dtype": "float64",
+                "shape": [1, 2],
+                "layer_indices": [5],
+                "data": "AAAAAAAA8D8AAAAAAAAAAA==",
+                "bounds": [[-2.0, 2.0]],
+                "strengths": [1.0]
+            }
+        });
+        let obj = serde_json::json!({ "clamps": packed.clone() });
+        let obj = obj.as_object().unwrap();
+        let module = parse_module(obj).expect("parse");
+        assert_eq!(module.clamps.as_ref().unwrap(), &packed);
+    }
+
+    #[test]
+    fn non_object_clamp_tier_is_rejected() {
+        let obj = serde_json::json!({ "clamps": [1, 2, 3] });
+        let obj = obj.as_object().unwrap();
+        assert!(matches!(
+            parse_module(obj),
+            Err(SteeringModuleLoadError::Tier { tier: "clamps", .. })
         ));
     }
 }
