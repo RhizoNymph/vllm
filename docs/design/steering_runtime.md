@@ -176,6 +176,69 @@ Runtime design decisions:
   clamps). Global clamps ride `/v1/steering/set` (`clamps` /
   `prefill_clamps` / `decode_clamps`) and share its prefix-cache reset.
 
+### Gating clamps (declarative gates modulate clamp strength)
+
+Directional clamps read the **same** shared per-token gate buffer the
+additive steering row term reads (`steering_row_gate`, fp32 `(max_tokens,)`,
+default `1.0`, reset each step). Both clamp ops take two extra tensors —
+`steering_row_gate` and a per-hook `gate_active` bool flag — and, when
+`gate_active` is set, fold the gate into the per-row strength:
+
+```text
+effective_strength[token, k] = clamp_strength[row, k] * row_gate[token]
+```
+
+The gate is **row-level**: a token's single `row_gate[token]` scales all K
+entries of its row uniformly, congruent with how the row gate treats
+additive steering. A closed gate (`row_gate == 0`) yields `delta == 0`
+exactly, so the token is left untouched — the same in-bounds-untouched
+invariant. The `row == 0` no-steering-sentinel passthrough is unaffected
+(those tokens are skipped before the gate is read). Op-schema order (frozen
+before merge): `apply_clamp(hidden, dirs, bounds, strength, index,
+any_active, steering_row_gate, gate_active)` and `apply_clamp_block(hidden,
+residual, dirs, bounds, strength, index, any_active, steering_row_gate,
+gate_active)` — the two gate tensors are the last two args, mirroring
+`ClampOpArgs` / `ClampBlockOpArgs`.
+
+**Two modes, one materialized:**
+
+- **Materialized (`enable_cross_layer_monitor = true`)** — the standalone
+  mutating `steering_monitor` op writes the per-token gate into the shared
+  `steering_row_gate` buffer at the probe layer L, and every layer ≥ L reads
+  it ("detect at L, clamp at layers ≥ L"). The runner stamps each hook's
+  clamp `gate_active` flag `True` once at steering init, so clamps at those
+  layers honor the same materialized gate the additive term honors. This is
+  the only mode in which anything can modulate clamps — and the writer is
+  the **global** monitor (installed untargeted, with `gate_rows`); the
+  mutating op has no per-row form.
+- **Fused (default)** — the gate is recomputed inside the `apply_steering`
+  kernel and folded into the additive row term in registers, never written
+  to the shared buffer. Clamps are a separate op and cannot see it, so
+  `gate_active` stays `False` and clamps run ungated. The fused probe
+  machinery is deliberately NOT duplicated into the clamp kernel.
+
+**Per-request clamp gates are rejected outright** (`ClampApply` in
+`vllm/v1/steering_schema.py` is a forward-compat wire member only). The
+per-row (per-request) monitor is itself fused — non-mutating, same-hook,
+gating the additive row term in registers — so a per-request probe can
+never materialize gate values into `steering_row_gate` for the clamp op to
+read. Accepting a per-request clamp gate would therefore either silently do
+nothing (no global monitor installed) or silently follow the global
+monitor's probe instead of the declared one. `_validate_gate_semantics`
+rejects it unconditionally at the frontend (HTTP 400, both engine modes;
+`validate_clamp_gate_support` carries the mode-tailored messages), and the
+declarative consumer skip-and-warns once as the backstop for non-frontend
+producers. When a materializing per-row monitor lands, acceptance can be
+enabled in `validate_clamp_gate_support` without a wire change.
+
+Because `row_gate` is per-**token**, the materialized global gate modulates
+each token's row — per-request rows 3+ and, for tokens mapped to the global
+rows 1/2, those too — uniformly under one global probe condition.
+Declarative gate specs do not participate in `hash_steering_config` (they
+ride `RequestMetadata`, not the config-row identity), and monitor state is
+runtime state outside any config hash, so gated clamps do not change the
+clamp hash segment — identical to how gated additive steering behaves.
+
 ## Phase Semantics
 
 The critical invariant is:

@@ -18,11 +18,13 @@ import pytest
 import vllm.v1.steering_schema as steering_schema
 from vllm.v1.request_metadata import RequestMetadata
 from vllm.v1.steering_schema import (
+    ClampApply,
     InlineVec,
     SteeringGate,
     build_steering_gates,
     resolve_gates,
     resolve_gates_safe,
+    validate_clamp_gate_support,
 )
 
 HIDDEN = 6
@@ -458,3 +460,96 @@ def test_resolve_gates_safe_skips_unknown_name_gracefully():
         out = resolve_gates_safe(gates, req_id="racy", registry=empty)
     assert out is None
     assert any("racy" in m for m in cap.messages)
+
+
+# --------------------------------------------------------------------------
+# Clamp-target gates (apply.kind == "clamp"): a FORWARD-COMPAT schema member.
+# Per-request clamp gates are unsupported in every engine mode today (the
+# clamp op reads the shared row-gate buffer, written only by the GLOBAL
+# cross-layer monitor), so the frontend rejects them outright. The wire
+# member is kept so the tagged union stays stable when support lands.
+# --------------------------------------------------------------------------
+
+
+def _clamp_gate(scope, *, probe=False, strength=1.0, layer=5):
+    when = (
+        {"kind": "probe", "probe": _inline(np.ones(HIDDEN), layer), "threshold": 0.0}
+        if probe
+        else {"kind": "always"}
+    )
+    return {
+        "when": when,
+        "scope": scope,
+        "apply": {"kind": "clamp", "strength": strength},
+    }
+
+
+def _convert_clamp_gates(raw):
+    """Bypass build-time validation: pin the WIRE schema (forward-compat)."""
+    return msgspec.convert(raw, type=list[SteeringGate])
+
+
+def test_clamp_gate_rejected_at_build_regardless_of_mode():
+    # Unconditional: no engine mode honors per-request clamp gates today.
+    for mode in (None, False, True):
+        with pytest.raises(ValueError, match="clamp"):
+            build_steering_gates(
+                [_clamp_gate("rest_of_request")], None, monitor_writes_gates=mode
+            )
+
+
+def test_clamp_gate_rejection_messages_are_actionable():
+    with pytest.raises(ValueError, match="enable_cross_layer_monitor"):
+        build_steering_gates(
+            [_clamp_gate("rest_of_request")], None, monitor_writes_gates=False
+        )
+    # Materialized mode: the error explains the global-monitor reality.
+    with pytest.raises(ValueError, match="GLOBAL cross-layer monitor"):
+        build_steering_gates(
+            [_clamp_gate("rest_of_request")], None, monitor_writes_gates=True
+        )
+
+
+def test_validate_clamp_gate_support_rejects_both_modes():
+    gates = _convert_clamp_gates([_clamp_gate("rest_of_request")])
+    with pytest.raises(ValueError, match="monitor_writes_gates"):
+        validate_clamp_gate_support(gates, monitor_writes_gates=False)
+    with pytest.raises(ValueError, match="gate_rows"):
+        validate_clamp_gate_support(gates, monitor_writes_gates=True)
+
+
+def test_validate_clamp_gate_support_ignores_non_clamp_gates():
+    gates = build_steering_gates([_add_gate("this_token", probe=True)], None)
+    # add/attenuate gates are unaffected by the clamp-gate rejection.
+    validate_clamp_gate_support(gates, monitor_writes_gates=False)
+    validate_clamp_gate_support(gates, monitor_writes_gates=True)
+
+
+def test_clamp_gate_wire_schema_forward_compat():
+    """The tagged-union member decodes/resolves (wire stability), even though
+    build-time validation rejects it."""
+    gates = _convert_clamp_gates(
+        [_clamp_gate("rest_of_request", probe=True, strength=0.5)]
+    )
+    assert isinstance(gates[0].apply, ClampApply)
+    res = resolve_gates(gates)
+    g = res[0]
+    assert g.apply_kind == "clamp"
+    assert g.strength == 0.5
+    assert g.steer_vectors is None  # clamps are declared statically, not here
+
+
+def test_clamp_gate_strength_defaults_to_one():
+    res = resolve_gates(_convert_clamp_gates([_clamp_gate("rest_of_request")]))
+    assert res[0].apply_kind == "clamp"
+    assert res[0].strength == 1.0
+
+
+def test_clamp_gate_msgpack_roundtrip():
+    gates = _convert_clamp_gates([_clamp_gate("rest_of_request", probe=True)])
+    meta = RequestMetadata(conversation_id="c1", steering=gates)
+    buf = msgspec.msgpack.encode(meta)
+    back = msgspec.msgpack.decode(buf, type=RequestMetadata)
+    assert isinstance(back.steering[0].apply, ClampApply)
+    res = resolve_gates(back.steering)
+    assert res[0].apply_kind == "clamp"

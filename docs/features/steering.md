@@ -128,6 +128,39 @@ whatever leaves the site. They participate in the steering config hash,
 so prefix caching stays correct, and clamp-only requests are admitted
 exactly like vector requests.
 
+### Gating clamps with a probe ("clamp when a feature fires")
+
+Clamps can be **modulated by the in-graph monitor**: when the monitor's
+probe fires, every clamp's effective strength scales with the per-token
+gate value (`effective = strength × gate`, `gate ∈ [0, 1]`). This
+expresses "detect a condition at layer L, clamp a feature at layers ≥ L".
+The gate is row-level — it scales all of a token's clamp directions at a
+site uniformly, the same per-token gate the additive steering row term
+reads.
+
+**The working flow is server-side and global** (not per-request):
+
+1. Start the server with `--steering-config.enable_cross_layer_monitor`
+   (a.k.a. *monitor writes gates*): the monitor then materializes the
+   per-token gate into the shared row-gate buffer that both the additive
+   steering path and the clamp ops read.
+2. Install a **global** steering monitor with `gate_rows` at the probe site
+   (via a server-registered steering consumer emitting an untargeted
+   `SteeringMonitorUpdate`). All steered rows — and all clamps — at layers
+   ≥ the probe layer are then modulated by that probe.
+
+Without `enable_cross_layer_monitor` (the default fused mode) the gate is
+computed inside the additive steering kernel and never reaches the separate
+clamp op, so clamps always run ungated.
+
+**Per-request clamp gates are not supported.** The declarative gate wire
+schema reserves `apply.kind = "clamp"` for a future materializing per-row
+monitor, but requests carrying it are **rejected with HTTP 400** in every
+server mode: the shared row-gate buffer is written only by the global
+monitor, so a per-request probe could never reach the clamp op — the
+request's declared probe/threshold/scope would be silently ignored.
+`add` / `attenuate` gates (which target additive steering) are unaffected.
+
 Picking bounds: capture activations at the target site (the capture
 feature), compute `h · v̂` over representative traffic to see the
 projection's natural range, then set `min`/`max` relative to it.

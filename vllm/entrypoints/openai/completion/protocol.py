@@ -501,7 +501,9 @@ class CompletionRequest(OpenAIBaseModel):
             sampling_params.patch_vectors = dict(self.patch_vectors)
         return sampling_params
 
-    def to_request_metadata(self, vector_registry=None) -> RequestMetadata:
+    def to_request_metadata(
+        self, vector_registry=None, *, monitor_writes_gates: bool | None = None
+    ) -> RequestMetadata:
         """Build the request-level metadata channel for this request.
 
         Holds host-side per-request fields that are not sampling parameters
@@ -510,12 +512,18 @@ class CompletionRequest(OpenAIBaseModel):
         ``SamplingParams``. Named vector sources in ``steering`` are resolved
         via *vector_registry*; raises ``ValueError`` on a malformed spec or
         unknown name (surfaced by the caller as HTTP 400).
+        ``monitor_writes_gates`` (the engine's ``enable_cross_layer_monitor``)
+        rejects a clamp-target gate the engine cannot materialize.
         """
         from vllm.v1.steering_schema import build_steering_gates
 
         return RequestMetadata(
             conversation_id=self.conversation_id,
-            steering=build_steering_gates(self.steering, vector_registry),
+            steering=build_steering_gates(
+                self.steering,
+                vector_registry,
+                monitor_writes_gates=monitor_writes_gates,
+            ),
         )
 
     @model_validator(mode="before")

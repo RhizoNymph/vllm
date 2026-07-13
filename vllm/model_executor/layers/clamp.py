@@ -32,6 +32,19 @@ The intervention order at each hook is::
 Clamp runs LAST: it is a constraint on whatever leaves the site, so an
 additive vector cannot push the projection back out of bounds.
 
+The in-graph monitor modulates clamps through the SHARED
+``steering_row_gate`` buffer: with ``gate_active`` set, the per-row clamp
+strength is scaled by ``row_gate[token]`` — the same per-token gate the
+additive steering row term reads (row-level, all K entries of a token's row
+scaled uniformly). This only works when the gate is *materialized* into
+``steering_row_gate`` by the GLOBAL cross-layer monitor
+(``enable_cross_layer_monitor=True``); in the default fused mode the gate is
+recomputed inside the steering kernel and never written to the shared
+buffer, so clamps run ungated. Per-request declarative clamp gates are
+rejected at admission in every mode (see
+``vllm.v1.steering_schema.ClampApply``) — the per-row monitor is fused and
+cannot materialize gate values for this op to read.
+
 Two ops are registered so ``torch.compile`` treats them as opaque,
 graph-safe split points (``mutates_args=[]``, fresh output):
 :func:`apply_clamp` for the single-tensor hooks and
@@ -69,6 +82,17 @@ CLAMP_STRENGTH_ATTR: dict[SteeringHookPoint, str] = {
 }
 CLAMP_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
     hp: f"steering_clamp_any_active_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
+}
+# Per-hook clamp-gate activity flag. When set, the clamp op folds the shared
+# per-token ``steering_row_gate`` into the per-row clamp strength (effective
+# strength = strength * row_gate[token]), exactly the gate the additive
+# steering row term reads. Default False ⇒ clamps ignore the gate entirely
+# (the ungated behaviour, bit-for-bit). The runner sets it True only when the
+# gate is *materialized* into ``steering_row_gate`` (cross-layer monitor mode),
+# so a fused-mode gate — which the steering kernel recomputes in registers and
+# never writes to the shared buffer — never silently under-gates clamps.
+CLAMP_GATE_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
+    hp: f"steering_clamp_gate_active_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
 }
 
 # Process-global direction count, consulted only when no VllmConfig context
@@ -157,6 +181,15 @@ def register_clamp_buffers(
             torch.zeros(1, dtype=torch.bool),
             persistent=False,
         )
+        # Clamp-gate activity flag (default False ⇒ ungated). See
+        # ``CLAMP_GATE_ACTIVE_ATTR``. A tensor (not a Python bool) so the
+        # compiled graph topology stays stable across steps that do/don't
+        # gate — only the flag's data changes between forward passes.
+        module.register_buffer(
+            CLAMP_GATE_ACTIVE_ATTR[hp],
+            torch.zeros(1, dtype=torch.bool),
+            persistent=False,
+        )
 
 
 def maybe_register_clamp_buffers(
@@ -198,6 +231,8 @@ class ClampOpArgs(NamedTuple):
     clamp_strength: torch.Tensor
     steering_index: torch.Tensor
     any_active: torch.Tensor
+    steering_row_gate: torch.Tensor
+    gate_active: torch.Tensor
 
 
 class ClampBlockOpArgs(NamedTuple):
@@ -210,6 +245,8 @@ class ClampBlockOpArgs(NamedTuple):
     clamp_strength: torch.Tensor
     steering_index: torch.Tensor
     any_active: torch.Tensor
+    steering_row_gate: torch.Tensor
+    gate_active: torch.Tensor
 
 
 def maybe_apply_clamp(
@@ -234,6 +271,8 @@ def maybe_apply_clamp(
             clamp_strength=getattr(module, CLAMP_STRENGTH_ATTR[hook_point]),
             steering_index=module.steering_index,
             any_active=getattr(module, CLAMP_ANY_ACTIVE_ATTR[hook_point]),
+            steering_row_gate=module.steering_row_gate,
+            gate_active=getattr(module, CLAMP_GATE_ACTIVE_ATTR[hook_point]),
         )
     )
 
@@ -260,6 +299,8 @@ def maybe_apply_clamp_block(
             clamp_strength=getattr(module, CLAMP_STRENGTH_ATTR[hp]),
             steering_index=module.steering_index,
             any_active=getattr(module, CLAMP_ANY_ACTIVE_ATTR[hp]),
+            steering_row_gate=module.steering_row_gate,
+            gate_active=getattr(module, CLAMP_GATE_ACTIVE_ATTR[hp]),
         )
     )
 
@@ -270,6 +311,7 @@ def _clamp_correction(
     clamp_bounds: torch.Tensor,
     clamp_strength: torch.Tensor,
     rows: torch.Tensor,
+    gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Shared eager correction term: ``sum_k delta_k * v_hat_k`` in fp32.
 
@@ -278,10 +320,19 @@ def _clamp_correction(
     for ``post_block``).  Returns the fp32 ``(N, H)`` correction; callers
     cast once to the output dtype and add — the frozen cast-order contract
     the Triton kernels mirror.
+
+    ``gate`` is an optional per-token ``(N,)`` fp32 multiplier folded into
+    the per-row strength (``strength * gate[token]``) — the shared
+    ``steering_row_gate``, gating all K entries of a token's row uniformly,
+    congruent with the additive steering row term. ``None`` ⇒ ungated. A
+    gate of 0 yields ``delta == 0`` exactly (no correction for that token).
     """
     dirs = clamp_dirs[rows].to(torch.float32)  # (N, K, H)
     bounds = clamp_bounds[rows]  # (N, K, 2)
     strength = clamp_strength[rows]  # (N, K)
+    if gate is not None:
+        # Row-level gate: fold the per-token scalar into every K entry.
+        strength = strength * gate.to(torch.float32).unsqueeze(-1)
     x32 = projected_onto.to(torch.float32)
     p = (x32.unsqueeze(1) * dirs).sum(dim=-1)  # (N, K)
     p_clamped = torch.clamp(p, min=bounds[..., 0], max=bounds[..., 1])
@@ -298,6 +349,8 @@ def apply_clamp(
     clamp_strength: torch.Tensor,
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
+    steering_row_gate: torch.Tensor | None = None,
+    gate_active: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Directional projection clamp via the shared steering row gather.
 
@@ -310,9 +363,23 @@ def apply_clamp(
     ``any_active`` is a single-element bool; ``False`` skips the gather and
     emits a copy.  Output is always a fresh tensor (graph value semantics).
 
+    ``steering_row_gate`` is the SHARED per-token row gate (fp32,
+    ``(max_tokens,)``, default 1.0) — the SAME buffer the additive steering
+    row term reads. ``gate_active`` is a single-element bool: when set the
+    per-row clamp strength is scaled by ``row_gate[token]`` (effective
+    strength = ``strength * gate``), so the gate multiplies all K entries of
+    a token's row uniformly (row-level gating). When ``False`` the gate is
+    ignored (bit-for-bit the ungated behaviour). A gate of 0 yields a delta
+    of exactly 0 for that token, so a fully-closed gate leaves the token
+    untouched — the same in-bounds-token-untouched invariant.
+
     Projections accumulate in fp32; the summed correction is cast to the
     hidden dtype exactly once before the add.  This eager path is the
     frozen reference the Triton kernel matches.
+
+    ``steering_row_gate`` / ``gate_active`` default to ``None`` (ungated) so a
+    direct eager call may omit them; the in-graph emission sites always pass
+    the real shared buffer + flag (the always-present, cudagraph-safe form).
     """
     if hidden_states.is_cuda:
         from vllm.model_executor.layers.clamp_kernel import apply_clamp_triton
@@ -324,13 +391,22 @@ def apply_clamp(
             clamp_strength,
             steering_index,
             any_active,
+            steering_row_gate,
+            gate_active,
         )
     if not bool(any_active.item()):
         return hidden_states.clone()
     n = hidden_states.shape[0]
     rows = steering_index[:n]
+    gate = (
+        steering_row_gate[:n]
+        if steering_row_gate is not None
+        and gate_active is not None
+        and bool(gate_active.item())
+        else None
+    )
     corr = _clamp_correction(
-        hidden_states, clamp_dirs, clamp_bounds, clamp_strength, rows
+        hidden_states, clamp_dirs, clamp_bounds, clamp_strength, rows, gate
     )
     return hidden_states + corr.to(hidden_states.dtype)
 
@@ -342,6 +418,8 @@ def apply_clamp_fake(
     clamp_strength: torch.Tensor,
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
+    steering_row_gate: torch.Tensor | None = None,
+    gate_active: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)
@@ -355,6 +433,8 @@ def apply_clamp_block(
     clamp_strength: torch.Tensor,
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
+    steering_row_gate: torch.Tensor | None = None,
+    gate_active: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Two-tensor ``post_block`` clamp; returns a fresh clamped ``residual``.
 
@@ -367,6 +447,9 @@ def apply_clamp_block(
 
         out_res = residual + strength * (clip(b @ v, lo, hi) - b @ v) * v
         # b = residual + hidden; out_res + hidden == clamp(b)
+
+    ``steering_row_gate`` / ``gate_active`` gate the per-row strength exactly
+    as in :func:`apply_clamp` (row-level, shared with additive steering).
     """
     if residual.is_cuda:
         from vllm.model_executor.layers.clamp_kernel import (
@@ -381,13 +464,24 @@ def apply_clamp_block(
             clamp_strength,
             steering_index,
             any_active,
+            steering_row_gate,
+            gate_active,
         )
     if not bool(any_active.item()):
         return residual.clone()
     n = residual.shape[0]
     rows = steering_index[:n]
+    gate = (
+        steering_row_gate[:n]
+        if steering_row_gate is not None
+        and gate_active is not None
+        and bool(gate_active.item())
+        else None
+    )
     block_out = residual.to(torch.float32) + hidden_states.to(torch.float32)
-    corr = _clamp_correction(block_out, clamp_dirs, clamp_bounds, clamp_strength, rows)
+    corr = _clamp_correction(
+        block_out, clamp_dirs, clamp_bounds, clamp_strength, rows, gate
+    )
     return residual + corr.to(residual.dtype)
 
 
@@ -399,6 +493,8 @@ def apply_clamp_block_fake(
     clamp_strength: torch.Tensor,
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
+    steering_row_gate: torch.Tensor | None = None,
+    gate_active: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(residual)

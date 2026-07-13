@@ -433,8 +433,23 @@ class SteeringModelRunnerMixin:
         cross_layer = bool(
             getattr(steering_config, "enable_cross_layer_monitor", False)
         )
+        from vllm.model_executor.layers.clamp import CLAMP_GATE_ACTIVE_ATTR
+
         for mod in steerable.values():
             mod._cross_layer_monitor = cross_layer
+            # Directional clamps honor the shared ``steering_row_gate`` only in
+            # the materialized (cross-layer) monitor mode: there the standalone
+            # ``steering_monitor`` op WRITES the per-token gate into the shared
+            # buffer that layers >= L read, so a clamp at those layers reads the
+            # same gate the additive row term reads ("detect at L, clamp at
+            # layers >= L"). In the default fused mode the gate is recomputed in
+            # the steering kernel and never materialized, so clamps stay ungated
+            # (and a declarative gate targeting clamps is rejected at admission).
+            # Set once here, constant for the model's lifetime.
+            for hp in SteeringHookPoint:
+                gate_flag = getattr(mod, CLAMP_GATE_ACTIVE_ATTR[hp], None)
+                if gate_flag is not None:
+                    gate_flag.fill_(cross_layer)
 
         # Per-row (per-request) monitor: opt-in. When enabled, resize the
         # dummy ``(1, 1)`` probe/params buffers to full per-row tables across
