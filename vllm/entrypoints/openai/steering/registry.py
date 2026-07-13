@@ -92,9 +92,9 @@ class SteeringModuleRegistry:
         vectors = coerce_steering_spec(vectors)
         prefill_vectors = coerce_steering_spec(prefill_vectors)
         decode_vectors = coerce_steering_spec(decode_vectors)
-        clamps = coerce_clamp_spec(clamps)
-        prefill_clamps = coerce_clamp_spec(prefill_clamps)
-        decode_clamps = coerce_clamp_spec(decode_clamps)
+        clamps = coerce_clamp_spec(clamps, unpack_packed=True)
+        prefill_clamps = coerce_clamp_spec(prefill_clamps, unpack_packed=True)
+        decode_clamps = coerce_clamp_spec(decode_clamps, unpack_packed=True)
 
         # Validate that at least one tier has vectors or clamps
         if not any(

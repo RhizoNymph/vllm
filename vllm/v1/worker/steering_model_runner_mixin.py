@@ -17,12 +17,14 @@ import torch.nn as nn
 from vllm.config.steering_types import (
     SteeringClampSpec,
     SteeringVectorSpec,
+    _clamps_looks_packed,
     hash_steering_config,
     merge_steering_specs,
     normalize_clamp_entry,
     resolve_effective_clamps,
     resolve_effective_vectors,
     scale_steering_spec,
+    unpack_steering_clamps,
 )
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
@@ -1195,12 +1197,16 @@ class SteeringModelRunnerMixin:
         """Normalize a broadcast payload's optional clamp tiers.
 
         Same int-key coercion as :meth:`_module_payload_to_specs`, applied
-        to the ``clamps`` / ``prefill_clamps`` / ``decode_clamps`` keys.
+        to the ``clamps`` / ``prefill_clamps`` / ``decode_clamps`` keys.  A
+        tier arriving in the binary :class:`SteeringClampSpecPacked` shape
+        (forwarded verbatim by the Rust module route) is decoded once here.
         """
 
         def _coerce(spec):
             if spec is None:
                 return None
+            if _clamps_looks_packed(spec):
+                return unpack_steering_clamps(spec)
             coerced: SteeringClampSpec = {}
             for hook, layer_dict in spec.items():
                 converted: dict[int, list] = {}

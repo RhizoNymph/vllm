@@ -176,11 +176,15 @@ async def set_steering(
             tiers["prefill_vectors"] = v
         if (v := coerce_steering_spec(request.decode_vectors)) is not None:
             tiers["decode_vectors"] = v
-        if (c := coerce_clamp_spec(request.clamps)) is not None:
+        if (c := coerce_clamp_spec(request.clamps, unpack_packed=True)) is not None:
             clamp_tiers["clamps"] = c
-        if (c := coerce_clamp_spec(request.prefill_clamps)) is not None:
+        if (
+            c := coerce_clamp_spec(request.prefill_clamps, unpack_packed=True)
+        ) is not None:
             clamp_tiers["prefill_clamps"] = c
-        if (c := coerce_clamp_spec(request.decode_clamps)) is not None:
+        if (
+            c := coerce_clamp_spec(request.decode_clamps, unpack_packed=True)
+        ) is not None:
             clamp_tiers["decode_clamps"] = c
     except (KeyError, ValueError, TypeError) as err:
         return JSONResponse(

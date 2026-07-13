@@ -21,6 +21,8 @@ from vllm.config.steering_types import (
     SteeringClampSpec,
     SteeringLayerEntry,
     SteeringVectorSpec,
+    _clamps_looks_packed,
+    _validate_packed_clamp_blob,
     hash_steering_config,
     normalize_clamp_entry,
     normalize_layer_entry,
@@ -1119,6 +1121,22 @@ class SamplingParams(
                     f"{field_name} must be a dict mapping hook point "
                     "names to dicts of per-layer clamp entry lists."
                 )
+            # Packed binary wire form: validate structure only (base64 length
+            # vs shape, list widths); directions are unit-normalized worker-
+            # side and inside the hash path, not eagerly on the frontend.
+            if _clamps_looks_packed(spec):
+                for hook_name, blob in spec.items():
+                    if hook_name not in VALID_HOOK_POINT_NAMES:
+                        raise ValueError(
+                            f"{field_name} key {hook_name!r} is not a "
+                            f"valid hook point. Valid values: "
+                            f"{sorted(VALID_HOOK_POINT_NAMES)}."
+                        )
+                    try:
+                        _validate_packed_clamp_blob(hook_name, blob)
+                    except (TypeError, ValueError, KeyError) as exc:
+                        raise ValueError(f"{field_name}[{hook_name!r}]: {exc}") from exc
+                continue
             for hook_name, layer_entries in spec.items():
                 if hook_name not in VALID_HOOK_POINT_NAMES:
                     raise ValueError(

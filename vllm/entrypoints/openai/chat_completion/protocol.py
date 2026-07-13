@@ -546,11 +546,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
-    # Per-request directional clamps. Legacy (unpacked) JSON form only —
-    # {hook: {layer: [ClampEntry, ...]}} with each entry {"vector": [...],
+    # Per-request directional clamps. Accepts EITHER the JSON entry-list form
+    # {hook: {layer: [ClampEntry, ...]}} (each entry {"vector": [...],
     # "min": float?, "max": float?, "strength": float=1.0} or the sugar
-    # {"vector": [...], "value": c}. Layer keys arrive as strings over
-    # JSON and are int-coerced in to_sampling_params.
+    # {"vector": [...], "value": c}; layer keys arrive as strings over JSON and
+    # are int-coerced in to_sampling_params) OR the binary packed form
+    # {hook: ClampHookPacked} (see vllm.config.steering_types.ClampHookPacked).
+    # The packed form travels verbatim to worker-side resolution; only cheap
+    # structural checks run on the frontend.
     steering_clamps: dict[str, Any] | None = Field(
         default=None,
         description="Per-request directional clamps applied to both "

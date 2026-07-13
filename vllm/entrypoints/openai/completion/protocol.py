@@ -280,8 +280,9 @@ class CompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
-    # Per-request directional clamps (legacy JSON form only; see the chat
-    # protocol's steering_clamps for the entry shape).
+    # Per-request directional clamps. Accepts either the JSON entry-list form
+    # or the binary packed form ({hook: ClampHookPacked}); see the chat
+    # protocol's steering_clamps for details.
     steering_clamps: dict[str, Any] | None = Field(
         default=None,
         description="Per-request directional clamps applied to both "
