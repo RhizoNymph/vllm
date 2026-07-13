@@ -36,17 +36,13 @@ class PhaseTiers(Generic[T]):
     label: str = ""
 
     def for_phase(self, phase: str) -> T:
-        if phase == "base":
-            return self.base
-        elif phase == "prefill":
-            return self.prefill
-        elif phase == "decode":
-            return self.decode
-        family = f"{self.label} " if self.label else ""
-        raise ValueError(
-            f"Invalid {family}phase: {phase!r}. "
-            f"Must be 'base', 'prefill', or 'decode'."
-        )
+        if phase not in ("base", "prefill", "decode"):
+            family = f"{self.label} " if self.label else ""
+            raise ValueError(
+                f"Invalid {family}phase: {phase!r}. "
+                f"Must be 'base', 'prefill', or 'decode'."
+            )
+        return getattr(self, phase)
 
     def items(self) -> Iterator[tuple[Phase, T]]:
         yield "base", self.base

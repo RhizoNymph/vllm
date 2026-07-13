@@ -586,6 +586,30 @@ invariant violation" naming the diverging ranks. This indicates a
 model-loading asymmetry (e.g., different weights loaded on different
 ranks) and not a user error.
 
+## Intervention Tier Template
+
+Steering is one of several residual-stream intervention tiers (activation
+patching is another; clamping follows the same shape). The payload-agnostic
+scaffolding a new tier reuses instead of hand-copying:
+
+- `vllm/model_executor/layers/intervention_common.py` — `hook_attrs` /
+  `derived_attrs` for the per-hook buffer attribute-name dicts (the values
+  are a runtime contract read by `getattr`-by-string), and `BufferKnob` for
+  config-first buffer sizing with a TEST-ONLY process-global fallback.
+- `vllm/model_executor/layers/intervention_kernel_common.py` — the kernel
+  warmup harness (`normalize_warmup_sizes` + `run_kernel_warmup` with
+  Triton-version-tolerant compiled-variant accounting); a tier's warmup
+  keeps only buffer allocation and a per-size `drive(n)` closure.
+- `vllm/v1/worker/phase_tiers.py` — `PhaseTiers`, the generic
+  base/prefill/decode container behind `SteeringManager`'s global tiers.
+- `vllm/v1/worker/steering_action_queue.py` —
+  `validate_vector_entries(vectors, steerable_layers, style)`, the single
+  vector-spec check core; callers supply a `VectorValidationStyle` (message
+  templates + unknown-layer skip/reject strictness).
+
+The ops, kernels, and `register_*_buffers` bodies stay per-tier — payload
+semantics (add vs. lerp vs. bound) differ by design.
+
 ## References
 
 - [Steering Runtime Design](../design/steering_runtime.md)
