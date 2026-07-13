@@ -155,8 +155,14 @@ Runtime design decisions:
   independent constraints. Row 1 = concat(global base, global prefill);
   row 2 = concat(global base, global decode); config rows =
   concat(global base, global phase, per-request), capped at K with a loud
-  error naming the site; dynamic-override rows inherit the global decode
-  composition (overrides carry no clamps).
+  error naming the site; dynamic-override rows =
+  concat(global base, global decode, that override's own clamps) — a live
+  override can carry per-override bounds so a closed-loop controller
+  tightens/loosens them mid-decode without free-list churn. The K-cap
+  error names the offending `(hook, layer)` site and the row owner
+  (`dynamic id=…` for override rows). A re-emit that changes only the
+  override's vectors keeps its clamps (`clamps=None`); an empty spec
+  (`clamps={}`) clears them.
 - **Two custom ops**, `apply_clamp` and `apply_clamp_block`
   (non-mutating, fresh output — cudagraph-safe; Triton on CUDA, eager
   reference on CPU). The `post_block` variant reconstructs the true block
