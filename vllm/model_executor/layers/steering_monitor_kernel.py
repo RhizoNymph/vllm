@@ -33,18 +33,14 @@ Layout assumptions mirror ``steering_kernel.py``:
 
 from __future__ import annotations
 
-import time
-
 import torch
 
-from vllm.logger import init_logger
-from vllm.model_executor.layers.steering_kernel import (
-    _choose_block_h,
-    _default_warmup_sizes,
+from vllm.model_executor.layers.intervention_kernel_common import (
+    normalize_warmup_sizes,
+    run_kernel_warmup,
 )
+from vllm.model_executor.layers.steering_kernel import _choose_block_h
 from vllm.triton_utils import tl, triton
-
-logger = init_logger(__name__)
 
 
 @triton.jit
@@ -170,10 +166,7 @@ def warmup_steering_monitor_kernel(
     """
     if device.type != "cuda":
         return
-    # Share the apply-steering kernel's fallback shape list (the union of the
-    # two former lists) so both kernels warm up the same batch dims.
-    sizes = capture_sizes if capture_sizes else _default_warmup_sizes()
-    sizes = sorted({int(s) for s in sizes if int(s) > 0})
+    sizes = normalize_warmup_sizes(capture_sizes)
     if not sizes:
         return
 
@@ -188,8 +181,7 @@ def warmup_steering_monitor_kernel(
     dmask_buf = torch.zeros(max_n, dtype=torch.float32, device=device)
     rgate_buf = torch.ones(max_n, dtype=torch.float32, device=device)
 
-    t0 = time.perf_counter()
-    for n in sizes:
+    def drive(n: int) -> None:
         hidden_view = hidden_buf[:n]
         tscale_view = tscale_buf[:n]
         dmask_view = dmask_buf[:n]
@@ -204,10 +196,10 @@ def warmup_steering_monitor_kernel(
             hidden_view, probe_buf, params_buf, active_flag, tscale_view,
             dmask_view, rgate_view,
         )
-    torch.accelerator.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info(
-        "steering monitor kernel warmup: shapes=%d elapsed_ms=%.1f",
-        len(sizes),
-        elapsed_ms,
+
+    run_kernel_warmup(
+        label="steering monitor",
+        kernels=(_steering_monitor_kernel,),
+        sizes=sizes,
+        drive=drive,
     )
