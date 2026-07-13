@@ -175,6 +175,25 @@ Runtime design decisions:
   entries at worker resolution; the module-level scale does NOT apply to
   clamps). Global clamps ride `/v1/steering/set` (`clamps` /
   `prefill_clamps` / `decode_clamps`) and share its prefix-cache reset.
+- **Packed clamp wire form.** Each clamp tier accepts a binary packed shape
+  (`ClampHookPacked`: `{dtype, shape:[n,hidden], layer_indices:[n],
+  data:<base64 [n,hidden]>, bounds:[[lo,hi]×n], strengths:[n]}`) alongside the
+  JSON entry-list form, mirroring `SteeringHookPacked`. Row `i` is a direction
+  for `layer_indices[i]`; entry order within a layer is preserved (K-cap
+  semantics). `bounds`/`strengths` stay as JSON lists; `null` in `bounds`
+  encodes `±inf` (finite-or-null required). One decoder engine-side
+  (`unpack_steering_clamps`) turns the packed shape back into canonical
+  entries; the HTTP path forwards the packed dict verbatim and the gRPC path
+  (`ClampHookPacked` proto, `bounds` flattened, native `±inf`) is converted to
+  the same packed-JSON dict in `grpc/convert.rs`. `maybe_pack_inline_steering_
+  for_request` packs JSON clamp tiers at `float64` before the multiprocessing
+  boundary, priming the phase hashes from the fp64 entries first so the packed
+  request keeps its cache identity. **Hash invariant:** packed and JSON
+  submissions of the same logical config produce bit-identical prefill/decode
+  hashes, because both are normalized through the idempotent
+  `normalize_clamp_entry` at the (float32) hashing boundary — the reason
+  clamp directions are packed at float64. Vector-only and JSON-clamp hashes
+  are byte-for-byte unchanged.
 
 ## Phase Semantics
 
