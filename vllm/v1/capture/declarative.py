@@ -150,7 +150,17 @@ class DeclarativeSteeringConsumer(SteeringController):
         # reaching the consumer from a non-frontend producer (the frontend
         # rejects the combo; such a gate cannot be latched by reference).
         self._inline_conversation_warned = False
+        self._clamp_gate_warned = False
         self._gate_errors = 0
+        # Whether the engine materializes gates into the shared row-gate buffer
+        # (cross-layer monitor). Used only to tailor the clamp-gate skip
+        # warning: per-request clamp gates are unsupported in EVERY mode today
+        # (the frontend rejects them; this consumer skip-and-warns for
+        # non-frontend producers).
+        steering_config = getattr(vllm_config, "steering_config", None)
+        self._monitor_writes_gates = bool(
+            getattr(steering_config, "enable_cross_layer_monitor", False)
+        )
 
     # -- SyncCaptureConsumer interface -------------------------------------
 
@@ -311,6 +321,34 @@ class DeclarativeSteeringConsumer(SteeringController):
             # ``always`` and ``this_token+probe`` always install; the latter's
             # per-token conditionality is handled in-graph by the row monitor.
 
+            if gate.apply_kind == "clamp":
+                # Per-request clamp gates are unsupported in EVERY mode: the
+                # clamp op reads the shared row-gate buffer, which only the
+                # GLOBAL cross-layer monitor writes — a per-request probe can
+                # never materialize gate values it sees. The frontend rejects
+                # this (HTTP 400, _validate_gate_semantics); a gate reaching
+                # here comes from a non-frontend producer. Always skip-and-warn
+                # once rather than silently doing nothing (no global monitor)
+                # or silently following the global monitor's probe instead of
+                # the declared one.
+                if not self._clamp_gate_warned:
+                    self._clamp_gate_warned = True
+                    if self._monitor_writes_gates:
+                        logger.warning(
+                            "declarative steering: per-request clamp gate "
+                            "skipped; clamp gating follows the server's "
+                            "GLOBAL cross-layer monitor (install one with "
+                            "gate_rows), not per-request probes."
+                        )
+                    else:
+                        logger.warning(
+                            "declarative steering: clamp-target gate skipped; "
+                            "the engine does not materialize gates (set "
+                            "enable_cross_layer_monitor=true) and per-request "
+                            "clamp gates are unsupported in any mode — use a "
+                            "global monitor with gate_rows."
+                        )
+                continue
             if gate.apply_kind == "add":
                 if not gate.steer_vectors:
                     continue

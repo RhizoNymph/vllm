@@ -61,6 +61,8 @@ def _apply_clamp_kernel(
     strength_ptr,
     index_ptr,
     active_ptr,
+    gate_ptr,
+    gate_active_ptr,
     out_ptr,
     N,
     H,
@@ -75,12 +77,16 @@ def _apply_clamp_kernel(
     b_stride_x,
     s_stride_r,
     s_stride_k,
+    g_stride,
     o_stride_n,
     o_stride_h,
     BLOCK_K: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """``out[t] = hs[t] + sum_k strength*(clip(hs[t]@v_k, lo, hi) - hs[t]@v_k)*v_k``."""
+    """``out[t] = hs[t] + sum_k strength*(clip(hs[t]@v_k, lo, hi) - hs[t]@v_k)*v_k``.
+
+    When ``gate_active`` is set the per-row strength is scaled by the shared
+    per-token ``row_gate[t]`` (row-level gating; ``gate == 0`` ⇒ delta 0)."""
     pid_n = tl.program_id(axis=0)
     if pid_n >= N:
         return
@@ -136,6 +142,12 @@ def _apply_clamp_kernel(
     strength = tl.load(
         strength_ptr + row * s_stride_r + k_idx * s_stride_k, mask=kmask, other=0.0
     )
+    # Row-level gate: fold the shared per-token row_gate into strength (all K
+    # entries scaled uniformly). Uniform within a program (per-token scalar),
+    # so no divergence; gate == 0 ⇒ delta 0 exactly.
+    gate_on = tl.load(gate_active_ptr)
+    if gate_on != 0:
+        strength = strength * tl.load(gate_ptr + pid_n * g_stride)
     p_clamped = tl.minimum(tl.maximum(acc, lo), hi)
     delta = strength * (p_clamped - acc)
     delta = tl.where(kmask, delta, 0.0)
@@ -164,6 +176,8 @@ def _apply_clamp_block_kernel(
     strength_ptr,
     index_ptr,
     active_ptr,
+    gate_ptr,
+    gate_active_ptr,
     out_ptr,
     N,
     H,
@@ -180,13 +194,17 @@ def _apply_clamp_block_kernel(
     b_stride_x,
     s_stride_r,
     s_stride_k,
+    g_stride,
     o_stride_n,
     o_stride_h,
     BLOCK_K: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """post_block variant: projection measured on ``residual + hidden``,
-    correction folded into ``residual`` (``out + hidden == clamp(res + hs)``)."""
+    correction folded into ``residual`` (``out + hidden == clamp(res + hs)``).
+
+    When ``gate_active`` is set the per-row strength is scaled by the shared
+    per-token ``row_gate[t]`` (row-level gating; ``gate == 0`` ⇒ delta 0)."""
     pid_n = tl.program_id(axis=0)
     if pid_n >= N:
         return
@@ -243,6 +261,10 @@ def _apply_clamp_block_kernel(
     strength = tl.load(
         strength_ptr + row * s_stride_r + k_idx * s_stride_k, mask=kmask, other=0.0
     )
+    # Row-level gate: fold the shared per-token row_gate into strength.
+    gate_on = tl.load(gate_active_ptr)
+    if gate_on != 0:
+        strength = strength * tl.load(gate_ptr + pid_n * g_stride)
     p_clamped = tl.minimum(tl.maximum(acc, lo), hi)
     delta = strength * (p_clamped - acc)
     delta = tl.where(kmask, delta, 0.0)
@@ -281,6 +303,8 @@ def apply_clamp_triton(
     clamp_strength: torch.Tensor,
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
+    steering_row_gate: torch.Tensor,
+    gate_active: torch.Tensor,
 ) -> torch.Tensor:
     """CUDA dispatch of :func:`vllm.model_executor.layers.clamp.apply_clamp`.
 
@@ -304,6 +328,8 @@ def apply_clamp_triton(
         clamp_strength,
         steering_index,
         any_active,
+        steering_row_gate,
+        gate_active,
         out,
         N,
         H,
@@ -318,6 +344,7 @@ def apply_clamp_triton(
         clamp_bounds.stride(2),
         clamp_strength.stride(0),
         clamp_strength.stride(1),
+        steering_row_gate.stride(0),
         out.stride(0),
         out.stride(1),
         BLOCK_K=block_k,
@@ -334,6 +361,8 @@ def apply_clamp_block_triton(
     clamp_strength: torch.Tensor,
     steering_index: torch.Tensor,
     any_active: torch.Tensor,
+    steering_row_gate: torch.Tensor,
+    gate_active: torch.Tensor,
 ) -> torch.Tensor:
     """CUDA dispatch of ``apply_clamp_block``; returns a fresh ``residual``."""
     out = torch.empty_like(residual)
@@ -353,6 +382,8 @@ def apply_clamp_block_triton(
         clamp_strength,
         steering_index,
         any_active,
+        steering_row_gate,
+        gate_active,
         out,
         N,
         H,
@@ -369,6 +400,7 @@ def apply_clamp_block_triton(
         clamp_bounds.stride(2),
         clamp_strength.stride(0),
         clamp_strength.stride(1),
+        steering_row_gate.stride(0),
         out.stride(0),
         out.stride(1),
         BLOCK_K=block_k,
@@ -418,27 +450,38 @@ def warmup_apply_clamp_kernel(
     strength_buf = torch.ones(rows, max_directions, dtype=torch.float32, device=device)
     index_buf = torch.zeros(max_n, dtype=torch.long, device=device)
     active_flag = torch.zeros(1, dtype=torch.bool, device=device)
+    # Shared per-token row gate (default 1.0) + its activity flag. Warmup must
+    # drive BOTH gate states so cudagraph capture covers the gated and ungated
+    # kernel paths (the ``gate_on`` branch is a distinct specialization).
+    row_gate_buf = torch.ones(max_n, dtype=torch.float32, device=device)
+    gate_flag = torch.zeros(1, dtype=torch.bool, device=device)
 
     def drive(n: int) -> None:
         for active in (False, True):
             active_flag.fill_(active)
-            torch.ops.vllm.apply_clamp(
-                hidden_buf[:n],
-                dirs_buf,
-                bounds_buf,
-                strength_buf,
-                index_buf[:n],
-                active_flag,
-            )
-            torch.ops.vllm.apply_clamp_block(
-                hidden_buf[:n],
-                residual_buf[:n],
-                dirs_buf,
-                bounds_buf,
-                strength_buf,
-                index_buf[:n],
-                active_flag,
-            )
+            for gate_on in (False, True):
+                gate_flag.fill_(gate_on)
+                torch.ops.vllm.apply_clamp(
+                    hidden_buf[:n],
+                    dirs_buf,
+                    bounds_buf,
+                    strength_buf,
+                    index_buf[:n],
+                    active_flag,
+                    row_gate_buf[:n],
+                    gate_flag,
+                )
+                torch.ops.vllm.apply_clamp_block(
+                    hidden_buf[:n],
+                    residual_buf[:n],
+                    dirs_buf,
+                    bounds_buf,
+                    strength_buf,
+                    index_buf[:n],
+                    active_flag,
+                    row_gate_buf[:n],
+                    gate_flag,
+                )
 
     run_kernel_warmup(
         label="clamp",

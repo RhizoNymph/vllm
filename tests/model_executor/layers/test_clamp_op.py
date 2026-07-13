@@ -17,6 +17,7 @@ from vllm.model_executor.layers.clamp import (
     CLAMP_ANY_ACTIVE_ATTR,
     CLAMP_BOUNDS_ATTR,
     CLAMP_DIRS_ATTR,
+    CLAMP_GATE_ACTIVE_ATTR,
     CLAMP_STRENGTH_ATTR,
     ClampBlockOpArgs,
     ClampOpArgs,
@@ -435,3 +436,232 @@ class TestClampEmission:
         hidden = torch.randn(1, HIDDEN)
         out = apply_layer_steering(module, hidden, hp)
         torch.testing.assert_close(out, hidden)
+
+
+def _gate_buffers(n_tokens=MAX_TOKENS):
+    """Shared per-token row gate (default 1.0) + its activity flag."""
+    row_gate = torch.ones(n_tokens, dtype=torch.float32)
+    gate_active = torch.zeros(1, dtype=torch.bool)
+    return row_gate, gate_active
+
+
+class TestClampGating:
+    """Declarative gates modulate clamp strength row-level:
+    effective strength = clamp_strength * row_gate[token] when ``gate_active``.
+    """
+
+    def _pinned_to_zero(self):
+        """Row 1 pins the e0 projection to 0 at full strength; token 0 -> row 1."""
+        dirs, bounds, strength, index, active = _make_buffers()
+        active.fill_(True)
+        v = _unit([1.0] + [0.0] * (HIDDEN - 1))
+        dirs[1, 0] = v
+        bounds[1, 0, 0] = 0.0
+        bounds[1, 0, 1] = 0.0
+        index[:1] = 1
+        return dirs, bounds, strength, index, active
+
+    def test_gate_scales_correction_linearly(self):
+        dirs, bounds, strength, index, active = self._pinned_to_zero()
+        row_gate, gate_active = _gate_buffers()
+        gate_active.fill_(True)
+        row_gate[0] = 0.5
+        hidden = torch.zeros(1, HIDDEN)
+        hidden[0, 0] = 8.0
+        out = apply_clamp(
+            hidden, dirs, bounds, strength, index, active, row_gate, gate_active
+        )
+        # Full clamp: proj 8 -> 0 (delta -8). Gate 0.5 -> delta -4 -> 4.0.
+        assert out[0, 0].item() == pytest.approx(4.0)
+
+    def test_gate_zero_leaves_token_untouched(self):
+        dirs, bounds, strength, index, active = self._pinned_to_zero()
+        row_gate, gate_active = _gate_buffers()
+        gate_active.fill_(True)
+        row_gate[0] = 0.0
+        hidden = torch.randn(1, HIDDEN)
+        out = apply_clamp(
+            hidden, dirs, bounds, strength, index, active, row_gate, gate_active
+        )
+        # gate * strength == 0 -> delta exactly 0 -> bit-identical passthrough.
+        torch.testing.assert_close(out, hidden)
+
+    def test_gate_one_matches_ungated(self):
+        dirs, bounds, strength, index, active = self._pinned_to_zero()
+        row_gate, gate_active = _gate_buffers()
+        gate_active.fill_(True)  # row_gate all 1.0
+        hidden = torch.randn(2, HIDDEN)
+        index[:2] = 1
+        gated = apply_clamp(
+            hidden, dirs, bounds, strength, index, active, row_gate, gate_active
+        )
+        ungated = apply_clamp(hidden, dirs, bounds, strength, index, active)
+        torch.testing.assert_close(gated, ungated)
+
+    def test_gate_inactive_ignores_row_gate(self):
+        dirs, bounds, strength, index, active = self._pinned_to_zero()
+        row_gate, gate_active = _gate_buffers()
+        # gate_active False: the row_gate value is ignored (ungated).
+        row_gate[0] = 0.0
+        hidden = torch.zeros(1, HIDDEN)
+        hidden[0, 0] = 8.0
+        out = apply_clamp(
+            hidden, dirs, bounds, strength, index, active, row_gate, gate_active
+        )
+        assert out[0, 0].item() == pytest.approx(0.0)  # full clamp, gate ignored
+
+    def test_gate_row_zero_passthrough_regardless(self):
+        dirs, bounds, strength, index, active = _make_buffers()
+        active.fill_(True)
+        # Poison row 0 bounds; token 0 -> row 0 sentinel (dirs zero).
+        bounds[0, :, 0] = 2.0
+        bounds[0, :, 1] = 3.0
+        row_gate, gate_active = _gate_buffers()
+        gate_active.fill_(True)
+        row_gate[0] = 0.0
+        hidden = torch.randn(1, HIDDEN)
+        out = apply_clamp(
+            hidden, dirs, bounds, strength, index, active, row_gate, gate_active
+        )
+        torch.testing.assert_close(out, hidden)
+
+    def test_gate_is_row_level_all_k(self):
+        """The token's gate scales every K entry of its row uniformly."""
+        dirs, bounds, strength, index, active = _make_buffers()
+        active.fill_(True)
+        v0 = _unit([1.0] + [0.0] * (HIDDEN - 1))
+        v1 = _unit([0.0, 1.0] + [0.0] * (HIDDEN - 2))
+        dirs[4, 0] = v0
+        dirs[4, 1] = v1
+        bounds[4, 0, 0] = 0.0
+        bounds[4, 0, 1] = 0.0
+        bounds[4, 1, 0] = 0.0
+        bounds[4, 1, 1] = 0.0
+        index[:1] = 4
+        row_gate, gate_active = _gate_buffers()
+        gate_active.fill_(True)
+        row_gate[0] = 0.25
+        hidden = torch.zeros(1, HIDDEN)
+        hidden[0, 0] = 4.0
+        hidden[0, 1] = 8.0
+        out = apply_clamp(
+            hidden, dirs, bounds, strength, index, active, row_gate, gate_active
+        )
+        # Both entries pinned to 0 at gate 0.25: 4 -> 3.0, 8 -> 6.0.
+        assert out[0, 0].item() == pytest.approx(3.0)
+        assert out[0, 1].item() == pytest.approx(6.0)
+
+    def test_mixed_gates_per_token(self):
+        dirs, bounds, strength, index, active = self._pinned_to_zero()
+        index[:2] = 1
+        row_gate, gate_active = _gate_buffers()
+        gate_active.fill_(True)
+        row_gate[0] = 1.0
+        row_gate[1] = 0.0
+        hidden = torch.zeros(2, HIDDEN)
+        hidden[:, 0] = 8.0
+        out = apply_clamp(
+            hidden, dirs, bounds, strength, index, active, row_gate, gate_active
+        )
+        assert out[0, 0].item() == pytest.approx(0.0)  # fully clamped
+        assert out[1, 0].item() == pytest.approx(8.0)  # gate 0 -> untouched
+
+    def test_block_gate_scales_correction(self):
+        dirs, bounds, strength, index, active = _make_buffers()
+        active.fill_(True)
+        v = _unit([1.0] + [0.0] * (HIDDEN - 1))
+        dirs[1, 0] = v
+        bounds[1, 0, 0] = 0.0
+        bounds[1, 0, 1] = 0.0
+        index[:1] = 1
+        row_gate, gate_active = _gate_buffers()
+        gate_active.fill_(True)
+        row_gate[0] = 0.5
+        hidden = torch.zeros(1, HIDDEN)
+        hidden[0, 0] = 3.0
+        residual = torch.zeros(1, HIDDEN)
+        residual[0, 0] = 5.0
+        out_res = apply_clamp_block(
+            hidden,
+            residual,
+            dirs,
+            bounds,
+            strength,
+            index,
+            active,
+            row_gate,
+            gate_active,
+        )
+        # block proj 8 -> full clamp delta -8; gate 0.5 -> -4 -> out_res proj 1.
+        assert (out_res[0, 0] + hidden[0, 0]).item() == pytest.approx(4.0)
+
+    def test_block_gate_matches_single_tensor_op(self):
+        dirs, bounds, strength, index, active = _make_buffers()
+        active.fill_(True)
+        v = _unit(torch.randn(HIDDEN))
+        dirs[2, 0] = v
+        bounds[2, 0, 0] = -0.5
+        bounds[2, 0, 1] = 0.5
+        index[:3] = 2
+        row_gate, gate_active = _gate_buffers()
+        gate_active.fill_(True)
+        row_gate[:3] = torch.tensor([1.0, 0.5, 0.0])
+        hidden = torch.randn(3, HIDDEN)
+        residual = torch.randn(3, HIDDEN)
+        out_res = apply_clamp_block(
+            hidden,
+            residual,
+            dirs,
+            bounds,
+            strength,
+            index,
+            active,
+            row_gate,
+            gate_active,
+        )
+        block_out = apply_clamp(
+            residual + hidden,
+            dirs,
+            bounds,
+            strength,
+            index,
+            active,
+            row_gate,
+            gate_active,
+        )
+        torch.testing.assert_close(out_res + hidden, block_out)
+
+
+class TestClampGateSchema:
+    """Sibling of TestClampOpSchemas pinning the NEW gate args (the existing
+    arity-lock tests compare _fields to the schema dynamically and stay green;
+    these pin the gate fields' presence and position)."""
+
+    def test_apply_clamp_gate_args_last(self):
+        import vllm.model_executor.layers.clamp  # noqa: F401
+
+        schema = torch.ops.vllm.apply_clamp.default._schema
+        names = [arg.name for arg in schema.arguments]
+        assert names[-2:] == ["steering_row_gate", "gate_active"]
+
+    def test_apply_clamp_block_gate_args_last(self):
+        import vllm.model_executor.layers.clamp  # noqa: F401
+
+        schema = torch.ops.vllm.apply_clamp_block.default._schema
+        names = [arg.name for arg in schema.arguments]
+        assert names[-2:] == ["steering_row_gate", "gate_active"]
+
+    def test_opargs_end_with_gate_fields(self):
+        assert ClampOpArgs._fields[-2:] == ("steering_row_gate", "gate_active")
+        assert ClampBlockOpArgs._fields[-2:] == ("steering_row_gate", "gate_active")
+
+    def test_register_attaches_gate_active_flag(self):
+        module = torch.nn.Module()
+        register_clamp_buffers(
+            module, HIDDEN, num_rows=ROWS, max_directions=K, dtype=torch.float32
+        )
+        for hp in SteeringHookPoint:
+            flag = getattr(module, CLAMP_GATE_ACTIVE_ATTR[hp])
+            assert flag.shape == (1,)
+            assert flag.dtype == torch.bool
+            assert not bool(flag.item())
