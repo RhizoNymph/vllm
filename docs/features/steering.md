@@ -132,6 +132,49 @@ Picking bounds: capture activations at the target site (the capture
 feature), compute `h · v̂` over representative traffic to see the
 projection's natural range, then set `min`/`max` relative to it.
 
+### Packed clamp submission format
+
+Each of the three per-request clamp fields (and the `clamps` /
+`prefill_clamps` / `decode_clamps` tiers of `/v1/steering/set` and named
+modules) also accepts a **binary packed** form that avoids re-sending clamp
+directions as JSON float lists and re-parsing/normalizing them per request.
+Per hook point, mirroring `SteeringHookPacked`:
+
+```json
+"steering_clamps": {
+  "post_block": {
+    "dtype": "float64",
+    "shape": [3, 4096],
+    "layer_indices": [20, 20, 21],
+    "data": "<base64 contiguous [n, hidden] tensor>",
+    "bounds": [[-2.0, 2.0], [null, 4.0], [0.0, 0.0]],
+    "strengths": [1.0, 0.5, 1.0]
+  }
+}
+```
+
+- Row `i` is the direction for `layer_indices[i]`; a layer may appear in
+  several rows (one per clamp direction). **Row order within a layer is
+  preserved** — it is the tier-concat order that the per-site `K` budget
+  applies to.
+- `bounds` is one `[lo, hi]` pair per row; `strengths` is one value per row
+  (both stay as small JSON lists — only the direction vectors are bulk). An
+  **infinite** bound is written as JSON `null` (`lo` null → `-inf`, `hi` null
+  → `+inf`); all present bounds must be finite.
+- Pack directions at **`float64`** for a bit-identical prefix-cache hash
+  versus the equivalent JSON submission. Narrower dtypes are accepted but may
+  cost a one-time cache miss when the same config is also sent as JSON
+  (same trade-off as the packed steering-vector path).
+- The packed form travels verbatim to the engine; the direction is
+  unit-normalized worker-side, so a packed and a JSON submission of the same
+  logical config are interchangeable.
+
+Legacy JSON and packed clamp tiers can be mixed across fields in the same
+request (e.g. `steering_clamps` packed, `prefill_steering_clamps` JSON). The
+gRPC API carries the same layout as a `ClampHookPacked` message (with
+`bounds` flattened to `[lo0, hi0, lo1, hi1, ...]` and infinities as native
+`±inf` doubles).
+
 ## Enabling Steering
 
 Global steering is always available for steerable models. Per-request
