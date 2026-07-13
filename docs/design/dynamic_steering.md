@@ -332,12 +332,26 @@ What is implemented instead — **dynamic-override rows**
   rows, sized centrally via `get_steering_buffer_config` (zero
   model-file edits). Dynamic registrations can never steal
   scheduler-reserved rows — the pools share nothing.
-- `RequestSteeringOverride(req_id, vectors | None)` routes the
-  request's decode tokens to a dynamic row populated as
+- `RequestSteeringOverride(req_id, vectors | None, clamps=None)` routes
+  the request's decode tokens to a dynamic row populated as
   `global_decode_effective + override_vectors`. **Pure routing**: the
   admitted config's registration, refcounts, prefill→decode
   transition, and release-on-finish proceed exactly as if the override
   didn't exist. `vectors=None` clears (idempotent).
+- The optional `clamps` carry per-override directional clamps: the
+  dynamic row's clamp buffers become
+  `concat(global base, global decode, override clamps)` (capped at
+  `max_clamp_directions`, a loud populate-time error names the
+  `dynamic id=…` row). REPLACE semantics on a re-emit — `clamps=None`
+  KEEPS the override's previous clamps (the common vectors-only
+  re-emit), `clamps={}` CLEARS them, a non-empty spec replaces them. A
+  dynamic-only clamp (no global, no per-request) still writes its
+  buffers (`has_any_clamps` counts dynamic overrides; `has_dynamic`
+  defeats the nothing-active short-circuit). With `compose_admitted` the
+  request's admitted decode clamps are concatenated before the
+  override's own, mirroring the vector merge. The override's
+  vectors+clamps also fold into the request's effective-decode APC
+  signature (`_dynamic_sig`), rank-identically off the raw spec.
 - Monotonic, never-reused `dyn_id`s keep ranks in lock-step (the
   register/release sequence is identical on every rank).
 - Lifecycle: overrides are dropped automatically on request finish,

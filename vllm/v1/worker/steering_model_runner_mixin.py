@@ -131,6 +131,41 @@ def _vectors_digest(vectors: "dict | None") -> bytes:
     return b"@".join(parts)
 
 
+def _clamps_digest(clamps: "dict | None") -> bytes:
+    """Deterministic digest of a ``SteeringClampSpec``.
+
+    Entries are normalized (``normalize_clamp_entry``) so the raw
+    ``value`` sugar and the canonical ``min``/``max`` forms digest
+    identically. ``None`` and ``{}`` map to distinct sentinels (``keep``
+    vs ``clear`` carry different meaning on a re-emit). Only folded into a
+    :class:`RequestSteeringOverride` digest when the override carries
+    clamps, so clamp-free overrides keep their pre-clamp digest bytes.
+    """
+    if clamps is None:
+        return b"none"
+    if not clamps:
+        return b"empty"
+    parts: list[bytes] = []
+    for hook in sorted(clamps):
+        for layer in sorted(clamps[hook]):
+            for i, entry in enumerate(clamps[hook][layer]):
+                vec, lo, hi, strength = normalize_clamp_entry(entry)
+                arr = np.ascontiguousarray(vec, dtype=np.float32)
+                parts.append(
+                    b"%b|%d|%d|%d|%b%b%b"
+                    % (
+                        hook.encode(),
+                        layer,
+                        i,
+                        zlib.crc32(arr.tobytes()) & 0xFFFFFFFF,
+                        struct.pack("<d", lo),
+                        struct.pack("<d", hi),
+                        struct.pack("<d", strength),
+                    )
+                )
+    return b"@".join(parts)
+
+
 def _steering_action_digest(action) -> bytes:
     """Order-independent, PYTHONHASHSEED-free digest of one action's content.
 
@@ -150,15 +185,19 @@ def _steering_action_digest(action) -> bytes:
             )
         )
     if isinstance(action, RequestSteeringOverride):
-        return b";".join(
-            (
-                name,
-                action.req_id.encode(),
-                b"1" if action.compose_admitted else b"0",
-                action.source.encode(),
-                _vectors_digest(action.vectors),
-            )
-        )
+        parts = [
+            name,
+            action.req_id.encode(),
+            b"1" if action.compose_admitted else b"0",
+            action.source.encode(),
+            _vectors_digest(action.vectors),
+        ]
+        # Gate the clamp segment so a clamp-free override keeps its exact
+        # pre-clamp digest bytes (the pinned-checksum determinism test).
+        clamps = getattr(action, "clamps", None)
+        if clamps:
+            parts.append(_clamps_digest(clamps))
+        return b";".join(parts)
     if isinstance(action, SteeringScaleUpdate):
         return b";".join(
             (
@@ -1862,6 +1901,19 @@ class SteeringModelRunnerMixin:
                 "prefill steering feeds prefix-cache keys)"
             )
 
+        # Per-override clamps (optional). REPLACE semantics on update:
+        # ``None`` keeps the override's previous clamps, ``{}`` clears them,
+        # a non-empty spec replaces them. Validate the override's own spec
+        # (hooks / entry structure / width / K cap) before touching the
+        # manager; the global-decode composition overflow is caught loudly
+        # at populate, naming the dynamic id (same trap as config rows).
+        clamps = action.clamps
+        if clamps:
+            try:
+                self._validate_clamps_spec(clamps, self._steerable_layers_cache)
+            except SteeringVectorError as exc:
+                return _reject(str(exc))
+
         # Compose-on-top: fold the request's admitted decode steering delta
         # into the override so ``action.vectors`` adds to (rather than
         # replaces) the client's static decode steering. Resolving the admitted
@@ -1878,17 +1930,41 @@ class SteeringModelRunnerMixin:
                     return _reject(str(exc))
                 if admitted:
                     vectors = merge_steering_specs(admitted, action.vectors)
+                # Concat the admitted decode clamps BEFORE the override's
+                # own (mirrors the vector merge; clamps concat, not add).
+                if clamps:
+                    try:
+                        admitted_clamps = self._resolve_request_clamps(sp, "decode")
+                    except (RuntimeError, ValueError) as exc:
+                        return _reject(str(exc))
+                    if admitted_clamps:
+                        max_dirs = getattr(self, "_max_clamp_directions", 0)
+                        try:
+                            clamps = resolve_effective_clamps(
+                                admitted_clamps,
+                                clamps,
+                                max_directions=max_dirs if max_dirs > 0 else None,
+                            )
+                        except ValueError as exc:
+                            return _reject(str(exc))
 
         try:
             validate_steering_vectors(vectors, self._steerable_layers_cache)
         except SteeringVectorError as exc:
             return _reject(str(exc))
 
+        # Conditional ``clamps`` kwarg: forwarded only when the override
+        # specifies clamps (``None`` ⇒ keep, so it is omitted). This keeps
+        # duck-typed fake managers in tests — whose register/update
+        # signatures predate the clamp kwarg — working unchanged, while
+        # still forwarding an empty ``{}`` (clear) to real managers.
+        clamp_kw = {"clamps": clamps} if clamps is not None else {}
         if existing_dyn_id is not None:
             mgr.update_dynamic_config(
                 existing_dyn_id,
                 vectors,
                 locally_owned_layers=self._locally_owned_layers,
+                **clamp_kw,
             )
             self._req_override_source[req_id] = source
             return True
@@ -1896,6 +1972,7 @@ class SteeringModelRunnerMixin:
             dyn_id, _row = mgr.register_dynamic_config(
                 vectors,
                 locally_owned_layers=self._locally_owned_layers,
+                **clamp_kw,
             )
         except RuntimeError as exc:
             # Pool exhausted: previous state (admitted routing) kept.

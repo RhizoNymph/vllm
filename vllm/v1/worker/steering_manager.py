@@ -227,6 +227,18 @@ class SteeringManager:
         self.global_clamp_prefill: dict[str, dict[int, ClampSitePayload]] = {}
         self.global_clamp_decode: dict[str, dict[int, ClampSitePayload]] = {}
 
+        # Per-dynamic-override clamps (parallel to ``_dynamic_vectors``):
+        # dyn_id -> {hook: {layer: ClampSitePayload}}. A dynamic-override row
+        # composes ``concat(global base, global decode, override)`` at
+        # populate (see :meth:`_build_clamp_site_rows`), so a controller can
+        # carry per-override bounds on top of the inherited global-decode
+        # clamps. ``_dynamic_clamp_specs`` keeps the RAW (unfiltered) spec so
+        # the rank-identical APC decode signature (``_dynamic_sig``) can fold
+        # clamps in even on a keep-update (materialized payloads are
+        # PP-filtered and would diverge; the raw spec never does).
+        self._dynamic_clamps: dict[int, dict[str, dict[int, ClampSitePayload]]] = {}
+        self._dynamic_clamp_specs: dict[int, dict] = {}
+
         # Dynamic additive tier (decode-only): a global steering
         # contribution owned by dynamic consumers, folded ADDITIVELY into
         # the decode-effective vector at populate time rather than
@@ -670,6 +682,7 @@ class SteeringManager:
         self,
         vectors: dict[str, dict[int, list[float] | np.ndarray]],
         *,
+        clamps: dict | None = None,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> tuple[int, int]:
         """Allocate a dynamic-override row; returns ``(dyn_id, row)``.
@@ -680,6 +693,12 @@ class SteeringManager:
         dynamic register/release sequence is rank-replicated. Raises
         ``RuntimeError`` when the pool is exhausted (callers reject the
         triggering action and keep previous state).
+
+        ``clamps`` is an optional per-override :data:`SteeringClampSpec`;
+        the dynamic row then carries ``concat(global base, global decode,
+        override)``. Materialized BEFORE the row is allocated so a
+        malformed / over-K spec rejects with ``ValueError`` without leaking
+        a pool row (mirrors :meth:`register_config`).
         """
         if not self._dynamic_free_rows:
             raise RuntimeError(
@@ -688,6 +707,10 @@ class SteeringManager:
                 f"{self.max_dynamic_steering_configs}, active="
                 f"{len(self._dynamic_to_row)}"
             )
+        # Materialize clamps BEFORE allocating the row (validation may raise).
+        stored_clamps = (
+            self._store_clamps(clamps, locally_owned_layers) if clamps else None
+        )
         dyn_id = self._next_dynamic_id
         self._next_dynamic_id += 1
         row = self._dynamic_free_rows.pop()
@@ -695,9 +718,12 @@ class SteeringManager:
         self._dynamic_vectors[dyn_id] = self._store_vectors(
             vectors, locally_owned_layers
         )
-        # Cache the override-vector hash for the APC decode signature. Hash
-        # the raw input vectors (np/list) — no device sync, rank-identical.
-        self._dynamic_sig[dyn_id] = hash_steering_config(vectors)
+        if stored_clamps:
+            self._dynamic_clamps[dyn_id] = stored_clamps
+            self._dynamic_clamp_specs[dyn_id] = clamps
+        # Cache the override-vector+clamp hash for the APC decode signature.
+        # Hash the raw input (np/list/spec) — no device sync, rank-identical.
+        self._dynamic_sig[dyn_id] = hash_steering_config(vectors, clamps=clamps)
         self._dirty.mark_membership()
         return dyn_id, row
 
@@ -706,6 +732,7 @@ class SteeringManager:
         dyn_id: int,
         vectors: dict[str, dict[int, list[float] | np.ndarray]],
         *,
+        clamps: dict | None = None,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> None:
         """Replace a live dynamic config's vectors in place (same row).
@@ -713,13 +740,32 @@ class SteeringManager:
         The common re-emit path: gain/vector changes for an existing
         override rewrite the row's content without free-list churn, so
         the cached populate indices stay valid (``_tables_dirty`` only).
+
+        ``clamps`` follows REPLACE semantics for the override's own clamps:
+        ``None`` KEEPS the previous clamp set (the common vectors-only
+        re-emit), ``{}`` CLEARS it, and a non-empty spec replaces it. The
+        clamp change only marks content dirty (never membership), so the
+        cached populate indices stay valid.
         """
         if dyn_id not in self._dynamic_to_row:
             raise KeyError(f"dynamic steering config {dyn_id} is not registered")
         self._dynamic_vectors[dyn_id] = self._store_vectors(
             vectors, locally_owned_layers
         )
-        self._dynamic_sig[dyn_id] = hash_steering_config(vectors)
+        if clamps is not None:
+            # Replace (empty dict clears).
+            if clamps:
+                self._dynamic_clamps[dyn_id] = self._store_clamps(
+                    clamps, locally_owned_layers
+                )
+                self._dynamic_clamp_specs[dyn_id] = clamps
+            else:
+                self._dynamic_clamps.pop(dyn_id, None)
+                self._dynamic_clamp_specs.pop(dyn_id, None)
+        # ``clamps is None`` ⇒ keep the previous clamp set untouched.
+        self._dynamic_sig[dyn_id] = hash_steering_config(
+            vectors, clamps=self._dynamic_clamp_specs.get(dyn_id)
+        )
         self._dirty.mark_content()
 
     def release_dynamic_config(self, dyn_id: int) -> None:
@@ -736,6 +782,8 @@ class SteeringManager:
         if row is None:
             return
         self._dynamic_vectors.pop(dyn_id, None)
+        self._dynamic_clamps.pop(dyn_id, None)
+        self._dynamic_clamp_specs.pop(dyn_id, None)
         self._dynamic_sig.pop(dyn_id, None)
         self._dynamic_free_rows.append(row)
         # Purge the row's owner-keyed runtime state (scale + per-row monitors).
@@ -946,8 +994,18 @@ class SteeringManager:
 
     @property
     def has_any_clamps(self) -> bool:
-        """True when any clamp exists (global tiers or per-request configs)."""
-        return self.has_global_clamps or any(self.config_clamps.values())
+        """True when any clamp exists.
+
+        Global tiers, per-request configs, OR a dynamic override's own
+        clamps — the dynamic case must count so a dynamic-only clamp
+        (no global, no per-request) still populates its buffers rather
+        than short-circuiting to never-written state.
+        """
+        return (
+            self.has_global_clamps
+            or any(self.config_clamps.values())
+            or any(self._dynamic_clamps.values())
+        )
 
     def update_dynamic_tier(
         self,
@@ -1502,7 +1560,8 @@ class SteeringManager:
         return result
 
     def _site_has_clamps(self, hp_str: str, layer_idx: int) -> bool:
-        """True when any clamp (global tier or config) targets this site."""
+        """True when any clamp (global tier, config, or dynamic override)
+        targets this site."""
         for tier in (
             self.global_clamp_base,
             self.global_clamp_prefill,
@@ -1510,9 +1569,14 @@ class SteeringManager:
         ):
             if layer_idx in tier.get(hp_str, {}):
                 return True
-        return any(
+        if any(
             layer_idx in per_config.get(hp_str, {})
             for per_config in self.config_clamps.values()
+        ):
+            return True
+        return any(
+            layer_idx in per_dyn.get(hp_str, {})
+            for per_dyn in self._dynamic_clamps.values()
         )
 
     def _build_clamp_site_rows(
@@ -1535,10 +1599,11 @@ class SteeringManager:
         defaults (zero dirs); row 1 = concat(global base, global prefill);
         row 2 = concat(global base, global decode); config rows =
         concat(global base, global phase, per-request); dynamic-override
-        rows = the global decode composition (overrides carry no clamps).
-        A concat exceeding ``k_cap`` raises with the offending site and
-        row owner named — the per-payload cap can pass while a LATER
-        global-clamp set overflows an already-registered config row.
+        rows = concat(global base, global decode, that override's own
+        clamps).  A concat exceeding ``k_cap`` raises with the offending
+        site and row owner named — the per-payload cap can pass while a
+        LATER global-clamp set overflows an already-registered config or
+        dynamic-override row.
         """
         num_rows = 3 + len(ordered_configs) + len(ordered_dynamic)
         dirs_mat = torch.zeros(
@@ -1592,7 +1657,13 @@ class SteeringManager:
 
         dyn_base = 3 + len(ordered_configs)
         for j, (dyn_id, _row_idx) in enumerate(ordered_dynamic):
-            _fill(dyn_base + j, decode_payloads, f"dynamic id={dyn_id}")
+            per_dyn = (
+                self._dynamic_clamps.get(dyn_id, {}).get(hp_str, {}).get(layer_idx)
+            )
+            payloads = list(decode_payloads)
+            if per_dyn is not None:
+                payloads.append(per_dyn)
+            _fill(dyn_base + j, payloads, f"dynamic id={dyn_id}")
 
         return dirs_mat, bounds_mat, strength_mat, any_clamp
 
