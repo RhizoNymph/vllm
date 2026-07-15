@@ -187,6 +187,47 @@ class TestSpill:
         assert sink.seqs == list(range(8)), sink.seqs
         assert mgr._pending_dispatches == 0
 
+    def test_spill_syncs_cuda_event_before_serializing(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        # Spilling serializes the pinned views on the producer thread,
+        # bypassing the dispatch loop's event sync — the packet's copies
+        # must be awaited before the bytes are snapshotted.
+        sink = _RecordingSink()
+        mgr = CaptureManager(
+            consumers=(sink,), consumer_specs=(None,),
+            num_hidden_layers=NUM_LAYERS, hidden_size=HIDDEN, model_dtype=DTYPE,
+            dispatch_queue_size=1, overload_policy="spill",
+            spill_dir=str(tmp_path),
+        )
+        order: list[str] = []
+        real_serialize = mgr._serialize_packet
+
+        def recording_serialize(packet):
+            order.append("serialize")
+            return real_serialize(packet)
+
+        mgr._serialize_packet = recording_serialize  # type: ignore[assignment]
+        event = MagicMock()
+        event.synchronize = MagicMock(side_effect=lambda: order.append("sync"))
+        base = _marked_packet(0)
+        packet = _DispatchPacket(
+            entries=base.entries,
+            scratch_pinned=base.scratch_pinned,
+            cuda_event=event,
+        )
+        try:
+            with mgr._pending_cond:
+                mgr._pending_dispatches += 1
+            mgr._spill_packet(packet)
+            assert order == ["sync", "serialize"], order
+            mgr._drain_dispatch_queue()
+        finally:
+            mgr.shutdown(timeout=10)
+        # The replayed packet still reached the sink.
+        assert sink.seqs == [0], sink.seqs
+        assert mgr._pending_dispatches == 0
+
     def test_spill_cap_falls_back_to_block_no_loss(
         self, tmp_path: pathlib.Path
     ) -> None:
