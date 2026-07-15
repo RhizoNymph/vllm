@@ -228,6 +228,41 @@ class TestSpill:
         assert sink.seqs == [0], sink.seqs
         assert mgr._pending_dispatches == 0
 
+    def test_spill_entry_published_only_after_file_written(
+        self, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # The dispatch loop pops a ``_spill_pending`` entry and reads its
+        # file without holding the lock — an entry visible before its bytes
+        # are on disk would race the replay path.
+        sink = _RecordingSink()
+        mgr = CaptureManager(
+            consumers=(sink,), consumer_specs=(None,),
+            num_hidden_layers=NUM_LAYERS, hidden_size=HIDDEN, model_dtype=DTYPE,
+            dispatch_queue_size=1, overload_policy="spill",
+            spill_dir=str(tmp_path),
+        )
+        visible_at_write: list[bool] = []
+        real_write = pathlib.Path.write_bytes
+
+        def checking_write(self_path, data):
+            with mgr._spill_lock:
+                pending = [p for p, _ in mgr._spill_pending]
+            visible_at_write.append(self_path in pending)
+            return real_write(self_path, data)
+
+        monkeypatch.setattr(pathlib.Path, "write_bytes", checking_write)
+        try:
+            with mgr._pending_cond:
+                mgr._pending_dispatches += 1
+            mgr._spill_packet(_marked_packet(0))
+            assert visible_at_write == [False], visible_at_write
+            mgr._drain_dispatch_queue()
+        finally:
+            mgr.shutdown(timeout=10)
+        # The spilled packet was still replayed to the sink exactly once.
+        assert sink.seqs == [0], sink.seqs
+        assert mgr._pending_dispatches == 0
+
     def test_spill_cap_falls_back_to_block_no_loss(
         self, tmp_path: pathlib.Path
     ) -> None:

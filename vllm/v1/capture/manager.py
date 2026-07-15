@@ -1264,12 +1264,22 @@ class CaptureManager:
                     path = self._spill_dir / f"spill-{self._spill_seq:012d}.pkt"
                     self._spill_seq += 1
                     self._spill_bytes += n
-                    self._spill_pending.append((path, n))
-                    self._spilled_packets += 1
                     break
             # Spill area full: wait for the dispatch loop to drain some.
             time.sleep(0.01)
-        path.write_bytes(data)
+        # Write the file BEFORE publishing its ``_spill_pending`` entry: the
+        # dispatch loop pops an entry and reads its file without holding the
+        # lock, so an entry must never be visible before its bytes are on
+        # disk.
+        try:
+            path.write_bytes(data)
+        except BaseException:
+            with self._spill_lock:
+                self._spill_bytes -= n
+            raise
+        with self._spill_lock:
+            self._spill_pending.append((path, n))
+            self._spilled_packets += 1
         self._log_overload("spill")
 
     def _log_overload(self, kind: str) -> None:
