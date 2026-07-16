@@ -128,10 +128,7 @@ class SteeringManager:
     Table layout (per hook point):
         Row 0: zeros sentinel (no steering)
         Row 1: global prefill effective (global_base + global_prefill)
-        Row 2: global decode effective
-            (global_base + global_decode + dynamic_tier; the dynamic
-            additive tier is folded in here only — decode-derived rows
-            see it, prefill rows do not. See §5.4.)
+        Row 2: global decode effective (global_base + global_decode).
         Rows 3..max_steering_configs+2: phase-appropriate global
             + per_request combined
         Rows max_steering_configs+3..+2+max_dynamic_steering_configs:
@@ -192,14 +189,13 @@ class SteeringManager:
         self.global_decode_vectors: dict[str, dict[int, torch.Tensor]] = {}
 
         # Dynamic additive tier (decode-only): a global steering
-        # contribution owned by dynamic consumers, folded ADDITIVELY into
-        # the decode-effective vector at populate time rather than
-        # overwriting ``global_decode_vectors``. This is what lets dynamic
+        # contribution owned by dynamic consumers, held in a dedicated
+        # per-hook vector and added by the kernel rather than overwriting
+        # ``global_decode_vectors``. This is what lets dynamic
         # global steering compose with operator-set (``/v1/steering/set``)
         # decode steering instead of clobbering it. Decode-only by
-        # construction (§7): folded into ``global_decode`` only, so it
-        # reaches row 2, decode per-request rows, and dynamic-override
-        # rows, never prefill rows, and never feeds prefix-cache keys.
+        # construction (§7): ``steering_token_scales`` is zero for prefill,
+        # so the tier never reaches prefill tokens or prefix-cache keys.
         # See docs/design/dynamic_steering.md §5.4.
         self.dynamic_tier_vectors: dict[str, dict[int, torch.Tensor]] = {}
         # Scalar strength for the dedicated dynamic tier (§5.4). The runner
@@ -752,12 +748,12 @@ class SteeringManager:
     ) -> None:
         """Set the dynamic additive-tier vector for a hook point and layer.
 
-        The tier is folded ADDITIVELY into the decode-effective vector at
-        populate time (so it reaches row 2, decode per-request rows, and
-        dynamic-override rows), letting dynamic global steering compose
-        with operator-set decode steering rather than overwriting
-        ``global_decode_vectors``. Decode-only (§7): it never touches
-        prefill rows and never feeds prefix-cache keys.
+        The tier is copied into a dedicated per-hook vector buffer and added
+        by the steering kernel on top of the selected row. This lets dynamic
+        global steering compose with operator-set decode steering rather than
+        overwriting ``global_decode_vectors``. Decode-only (§7): the runner
+        writes a zero token scale for prefill, so it never feeds prefix-cache
+        keys.
 
         Args:
             hook_point: Hook point string (e.g. ``"post_mlp"``).

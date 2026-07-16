@@ -46,10 +46,11 @@ class RequestMetadata(
             conditional steering to the request without a server-registered
             consumer; the built-in declarative consumer reads these off
             :class:`vllm.v1.capture.step_view.StepRequestView.steering` and
-            drives the steering substrate. Named vector sources are resolved
-            to inline packed bytes at the frontend, so this always carries
-            self-contained data by the time it reaches the worker. ``None``
-            when the request declares no gates.
+            drives the steering substrate. The frontend validates named vector
+            sources but leaves the short names on the wire; every worker
+            resolves them against its rank-replicated registry at admission.
+            Inline sources remain self-contained packed data. ``None`` when
+            the request declares no gates.
     """
 
     conversation_id: str | None = None
