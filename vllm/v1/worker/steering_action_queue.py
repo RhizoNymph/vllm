@@ -34,9 +34,10 @@ Design contract (see ``docs/design/dynamic_steering.md``):
 
 from __future__ import annotations
 
+import math
 import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -328,6 +329,120 @@ def get_steering_action_queue() -> SteeringActionQueue | None:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class VectorValidationStyle:
+    """Message templates + strictness for :func:`validate_vector_entries`.
+
+    The drain path (this module), the HTTP ``set_steering_vectors`` path
+    (the runner mixin), and the monitor-probe validator share one check
+    core but are load-bearing on different error texts (API tests assert
+    on them) and unknown-layer behavior. Templates receive ``hook``,
+    ``layer``, ``expected``, ``got_len``, ``got_shape`` as ``str.format``
+    kwargs (unused ones are ignored). ``unknown_layer=None`` means skip
+    layers absent on this worker instead of rejecting the whole dict.
+    """
+
+    invalid_hook: str
+    hook_inactive: str
+    bad_width: str
+    non_finite: str
+    unknown_layer: str | None = None
+
+
+# Drain-path style: reject vectors naming layers this worker does not own —
+# a dynamic consumer addressing a missing layer is a bug, not a TP shard
+# artifact (the HTTP path pre-filters per rank; the drain path cannot).
+_DRAIN_STYLE = VectorValidationStyle(
+    invalid_hook="invalid hook point: {hook!r}",
+    unknown_layer="layer {layer} is not steerable on this worker",
+    hook_inactive="hook point {hook!r} not active on layer {layer}",
+    bad_width=(
+        "layer {layer} ({hook}): expected 1-D vector of size {expected}, "
+        "got shape {got_shape}"
+    ),
+    non_finite="layer {layer} ({hook}): vector contains non-finite values",
+)
+
+# Monitor updates are drain-path actions, so their target checks speak the
+# drain dialect (and reject unknown layers); only the payload messages name
+# the probe.
+_MONITOR_STYLE = replace(
+    _DRAIN_STYLE,
+    bad_width=(
+        "monitor probe for layer {layer} ({hook}): expected 1-D vector of "
+        "size {expected}, got shape {got_shape}"
+    ),
+    non_finite="monitor probe contains non-finite values",
+)
+
+
+def validate_vector_entries(
+    vectors: dict[str, dict[int, np.ndarray | list[float] | None]],
+    steerable_layers: dict,
+    style: VectorValidationStyle,
+    *,
+    allow_clear: bool = False,
+) -> set[int]:
+    """Shared per-entry vector-spec checks: hook validity, layer presence,
+    hook-active-on-layer, hidden-size match, finite values.
+
+    Returns the set of layer indices that passed every check (the HTTP path
+    uses it; the drain path ignores it). ndarray entries additionally get a
+    1-D shape check; plain sequences are length-checked as before, so the
+    callers' historical behaviors are preserved exactly. With
+    ``allow_clear=True`` a ``None`` entry validates its ``(hook, layer)``
+    target and carries no payload to check (monitor clears).
+    """
+    valid_indices: set[int] = set()
+    for hook_name, layer_vecs in vectors.items():
+        if hook_name not in VALID_HOOK_POINT_NAMES:
+            raise SteeringVectorError(style.invalid_hook.format(hook=hook_name))
+        table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_name)]
+        for layer_idx, vec in layer_vecs.items():
+            mod = steerable_layers.get(layer_idx)
+            if mod is None:
+                if style.unknown_layer is None:
+                    continue
+                raise SteeringVectorError(style.unknown_layer.format(layer=layer_idx))
+            if not hasattr(mod, table_attr):
+                raise SteeringVectorError(
+                    style.hook_inactive.format(hook=hook_name, layer=layer_idx)
+                )
+            if vec is None and allow_clear:
+                valid_indices.add(layer_idx)
+                continue
+            expected = getattr(mod, table_attr).shape[1]
+            if isinstance(vec, np.ndarray):
+                width_ok = vec.ndim == 1 and vec.shape[0] == expected
+                got_len: int = vec.shape[0] if vec.ndim else 0
+                got_shape = tuple(vec.shape)
+            else:
+                width_ok = len(vec) == expected
+                got_len = len(vec)
+                got_shape = (len(vec),)
+            if not width_ok:
+                raise SteeringVectorError(
+                    style.bad_width.format(
+                        hook=hook_name,
+                        layer=layer_idx,
+                        expected=expected,
+                        got_len=got_len,
+                        got_shape=got_shape,
+                    )
+                )
+            finite = (
+                bool(np.isfinite(vec).all())
+                if isinstance(vec, np.ndarray)
+                else all(math.isfinite(v) for v in vec)
+            )
+            if not finite:
+                raise SteeringVectorError(
+                    style.non_finite.format(hook=hook_name, layer=layer_idx)
+                )
+            valid_indices.add(layer_idx)
+    return valid_indices
+
+
 def validate_steering_vectors(
     vectors: dict[str, dict[int, np.ndarray]],
     steerable_layers: dict,
@@ -341,32 +456,7 @@ def validate_steering_vectors(
     """
     if not vectors:
         raise SteeringVectorError("update contains no vectors")
-    for hook_name, layer_vecs in vectors.items():
-        if hook_name not in VALID_HOOK_POINT_NAMES:
-            raise SteeringVectorError(f"invalid hook point: {hook_name!r}")
-        table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(hook_name)]
-        for layer_idx, vec in layer_vecs.items():
-            mod = steerable_layers.get(layer_idx)
-            if mod is None:
-                raise SteeringVectorError(
-                    f"layer {layer_idx} is not steerable on this worker"
-                )
-            if not hasattr(mod, table_attr):
-                raise SteeringVectorError(
-                    f"hook point {hook_name!r} not active on layer {layer_idx}"
-                )
-            expected = getattr(mod, table_attr).shape[1]
-            arr = np.asarray(vec)
-            if arr.ndim != 1 or arr.shape[0] != expected:
-                raise SteeringVectorError(
-                    f"layer {layer_idx} ({hook_name}): expected 1-D vector "
-                    f"of size {expected}, got shape {tuple(arr.shape)}"
-                )
-            if not np.isfinite(arr).all():
-                raise SteeringVectorError(
-                    f"layer {layer_idx} ({hook_name}): vector contains "
-                    f"non-finite values"
-                )
+    validate_vector_entries(vectors, steerable_layers, _DRAIN_STYLE)
 
 
 def validate_steering_scale(action: SteeringScaleUpdate) -> None:
@@ -412,18 +502,15 @@ def validate_steering_monitor(
         raise SteeringVectorError(
             "monitor update must target at most one of req_id / config_hash / dyn_id"
         )
-    if action.hook not in VALID_HOOK_POINT_NAMES:
-        raise SteeringVectorError(f"invalid hook point: {action.hook!r}")
-    table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint(action.hook)]
-    mod = steerable_layers.get(action.layer)
-    if mod is None:
-        raise SteeringVectorError(
-            f"layer {action.layer} is not steerable on this worker"
-        )
-    if not hasattr(mod, table_attr):
-        raise SteeringVectorError(
-            f"hook point {action.hook!r} not active on layer {action.layer}"
-        )
+    # Target checks first, then the scalar params, then the probe payload —
+    # the historical error precedence. The payload call re-walks the
+    # already-validated target; that costs two dict lookups.
+    validate_vector_entries(
+        {action.hook: {action.layer: None}},
+        steerable_layers,
+        _MONITOR_STYLE,
+        allow_clear=True,
+    )
     if not np.isfinite(action.threshold) or not np.isfinite(action.sharpness):
         raise SteeringVectorError("monitor threshold/sharpness must be finite")
     if action.sharpness < 0:
@@ -432,15 +519,11 @@ def validate_steering_monitor(
         )
     if action.probe is None:
         return  # clear
-    expected = getattr(mod, table_attr).shape[1]
-    arr = np.asarray(action.probe)
-    if arr.ndim != 1 or arr.shape[0] != expected:
-        raise SteeringVectorError(
-            f"monitor probe for layer {action.layer} ({action.hook}): expected "
-            f"1-D vector of size {expected}, got shape {tuple(arr.shape)}"
-        )
-    if not np.isfinite(arr).all():
-        raise SteeringVectorError("monitor probe contains non-finite values")
+    validate_vector_entries(
+        {action.hook: {action.layer: np.asarray(action.probe)}},
+        steerable_layers,
+        _MONITOR_STYLE,
+    )
 
 
 def _validate_update(

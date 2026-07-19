@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.intervention_common import BufferKnob, hook_attrs
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
@@ -47,42 +48,12 @@ if TYPE_CHECKING:
 
 
 # Buffer attribute names on decoder layer modules, keyed by hook point.
-PATCH_TABLE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"patch_table_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
-}
-PATCH_ALPHA_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"patch_alpha_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
-}
-PATCH_INDEX_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"patch_index_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
-}
-PATCH_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"patch_any_active_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
-}
+PATCH_TABLE_ATTR = hook_attrs("patch_table", HOOK_POINT_TABLE_ATTR)
+PATCH_ALPHA_ATTR = hook_attrs("patch_alpha", HOOK_POINT_TABLE_ATTR)
+PATCH_INDEX_ATTR = hook_attrs("patch_index", HOOK_POINT_TABLE_ATTR)
+PATCH_ANY_ACTIVE_ATTR = hook_attrs("patch_any_active", HOOK_POINT_TABLE_ATTR)
 
 DEFAULT_MAX_PATCH_SLOTS = 64
-
-# Process-global patch slot count, set by the runner (per worker process)
-# before model construction so :func:`register_steering_buffers` can attach
-# patch buffers to every decoder layer it sees.  ``0`` => patching disabled,
-# no buffers attached, and the folded apply path constant-folds out.
-_PATCH_MAX_SLOTS: int = 0
-
-
-def set_patch_buffer_slots(max_patch_slots: int) -> None:
-    """TEST-ONLY override of the patch slot count (0 disables patching).
-
-    At runtime the slot count is resolved from the current ``VllmConfig``
-    (see :func:`_resolve_patch_buffer_slots`); this global is consulted only
-    when no config context exists — unit tests constructing layers directly.
-    """
-    global _PATCH_MAX_SLOTS
-    _PATCH_MAX_SLOTS = int(max_patch_slots)
-
-
-def get_patch_buffer_slots() -> int:
-    """Return the process-global patch slot count."""
-    return _PATCH_MAX_SLOTS
 
 
 def get_patch_buffer_config(vllm_config: VllmConfig) -> int:
@@ -95,6 +66,23 @@ def get_patch_buffer_config(vllm_config: VllmConfig) -> int:
     if patch_config is None:
         return 0
     return int(getattr(patch_config, "max_patch_slots", 0))
+
+
+# Patch slot count knob: resolved from the current ``VllmConfig`` at buffer
+# registration; the TEST-ONLY process global is consulted only when no config
+# context exists — unit tests constructing layers directly.  ``0`` => patching
+# disabled, no buffers attached, and the folded apply path constant-folds out.
+_patch_slots_knob = BufferKnob(get_patch_buffer_config)
+
+
+def set_patch_buffer_slots(max_patch_slots: int) -> None:
+    """TEST-ONLY override of the patch slot count (0 disables patching)."""
+    _patch_slots_knob.set_for_tests(max_patch_slots)
+
+
+def get_patch_buffer_slots() -> int:
+    """Return the process-global patch slot count."""
+    return _patch_slots_knob.get_test_value()
 
 
 def get_patch_source_cache_bytes(vllm_config: VllmConfig) -> int:
@@ -206,20 +194,11 @@ def register_patch_buffers(
 def _resolve_patch_buffer_slots() -> int:
     """Resolve the patch slot count at buffer-registration time.
 
-    Primary source is the *current* ``VllmConfig`` (models are always built
-    under ``set_current_vllm_config``, on every runner), so no runner has to
-    remember to set anything before the model build — the v1 runner once
-    silently shipped patching as a no-op precisely because it didn't set the
-    old process-global. The global (``set_patch_buffer_slots``) is consulted
-    only when no config context exists, i.e. unit tests constructing layers
-    directly.
+    Config-first (see :class:`BufferKnob`) — the v1 runner once silently
+    shipped patching as a no-op precisely because it didn't set the old
+    process-global before the model build.
     """
-    from vllm.config import get_current_vllm_config_or_none
-
-    vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is not None:
-        return get_patch_buffer_config(vllm_config)
-    return _PATCH_MAX_SLOTS
+    return _patch_slots_knob.resolve()
 
 
 def maybe_register_patch_buffers(

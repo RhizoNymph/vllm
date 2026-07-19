@@ -39,16 +39,14 @@ all-zeros so a stray slot-0 index yields the input).
 
 from __future__ import annotations
 
-import os
-import time
-
 import torch
 
-from vllm.logger import init_logger
+from vllm.model_executor.layers.intervention_kernel_common import (
+    normalize_warmup_sizes,
+    run_kernel_warmup,
+)
 from vllm.model_executor.layers.steering_kernel import _choose_block_h
 from vllm.triton_utils import tl, triton
-
-logger = init_logger(__name__)
 
 
 @triton.jit
@@ -267,26 +265,6 @@ def apply_patch_block_triton(
     return out
 
 
-def _default_warmup_sizes() -> list[int]:
-    """Fallback warmup batch sizes when no capture-size list is supplied."""
-    return [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256]
-
-
-def _kernel_cache_size() -> int:
-    """Total compiled variants across devices for both patch kernels."""
-    total = 0
-    for kern in (_apply_patch_kernel, _apply_patch_block_kernel):
-        cache = getattr(kern, "cache", None)
-        if cache is None:
-            continue
-        for device_cache in cache.values():
-            try:
-                total += len(device_cache)
-            except TypeError:
-                continue
-    return total
-
-
 def warmup_apply_patch_kernel(
     *,
     hidden_size: int,
@@ -308,12 +286,10 @@ def warmup_apply_patch_kernel(
     if device.type != "cuda":
         return
 
-    sizes = capture_sizes if capture_sizes else _default_warmup_sizes()
-    sizes = sorted({int(s) for s in sizes if int(s) > 0})
+    sizes = normalize_warmup_sizes(capture_sizes)
     if not sizes:
         return
 
-    cache_before = _kernel_cache_size()
     max_n = max(sizes)
     n_slots = max(table_slots, 2)
     hidden_buf = torch.zeros(max_n, hidden_size, dtype=compute_dtype, device=device)
@@ -326,8 +302,7 @@ def warmup_apply_patch_kernel(
         alpha_buf[1, ::2] = 1.0
     active_flag = torch.zeros(1, dtype=torch.bool, device=device)
 
-    t0 = time.perf_counter()
-    for n in sizes:
+    def drive(n: int) -> None:
         hidden_view = hidden_buf[:n]
         residual_view = residual_buf[:n]
         # Index alternates slot 0 (passthrough) and slot 1 (gather) so both
@@ -348,32 +323,11 @@ def warmup_apply_patch_kernel(
         torch.ops.vllm.apply_patch_block(
             hidden_view, residual_view, table_buf, index_view, alpha_buf, active_flag
         )
-    torch.accelerator.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    cache_after = _kernel_cache_size()
-    logger.info(
-        "patch kernel warmup: shapes=%d variants_compiled=%d "
-        "cache_total=%d elapsed_ms=%.1f",
-        len(sizes),
-        cache_after - cache_before,
-        cache_after,
-        elapsed_ms,
+    run_kernel_warmup(
+        label="patch",
+        kernels=(_apply_patch_kernel, _apply_patch_block_kernel),
+        sizes=sizes,
+        drive=drive,
+        dump_env_var="VLLM_PATCH_DUMP_JIT_CACHE",
     )
-
-    if os.environ.get("VLLM_PATCH_DUMP_JIT_CACHE", "0") == "1":
-        for kern in (_apply_patch_kernel, _apply_patch_block_kernel):
-            cache = getattr(kern, "cache", None)
-            if cache is None:
-                continue
-            for device_id, device_cache in cache.items():
-                try:
-                    keys = list(device_cache.keys())
-                except AttributeError:
-                    keys = []
-                logger.info(
-                    "patch JIT cache: kernel=%s device=%s variants=%d",
-                    kern.__name__,
-                    device_id,
-                    len(keys),
-                )

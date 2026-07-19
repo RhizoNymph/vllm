@@ -18,6 +18,7 @@ from vllm.model_executor.layers.activation_capture import (
     maybe_capture_residual,
     maybe_capture_residual_add,
 )
+from vllm.model_executor.layers.intervention_common import derived_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
@@ -69,18 +70,14 @@ HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
 # kernel reads it at launch and short-circuits the gather + add when no row
 # is currently active for that hook point. The attribute name is derived
 # from the table attribute so the two are always discoverable together.
-HOOK_POINT_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_any_active" for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
+HOOK_POINT_ANY_ACTIVE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_any_active")
 
 # Per-hook dedicated dynamic-tier vector attribute names (§5.4). A single
 # fp32 ``(hidden,)`` buffer per hook point holding that hook's global
 # dynamic-tier vector; the apply kernel adds ``dynamic_vec * token_scales``
 # on top of the row gather, gated per token (decode-only). Derived from the
 # table attribute so the two are discoverable together.
-HOOK_POINT_DYNVEC_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_dynvec" for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
+HOOK_POINT_DYNVEC_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_dynvec")
 
 # Per-hook in-graph monitor buffers (Phase 2, §8). At a probe site one
 # ``(layer, hook)`` carries a probe vector ``(hidden,)``, a ``(3,)`` param
@@ -90,18 +87,9 @@ HOOK_POINT_DYNVEC_ATTR: dict[SteeringHookPoint, str] = {
 # per-token gate into the shared ``steering_token_scales`` buffer, which
 # the §5.4 dynamic tier then multiplies by. Derived from the table
 # attribute so they are discoverable together.
-HOOK_POINT_MONITOR_PROBE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_probe"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
-HOOK_POINT_MONITOR_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_params"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
-HOOK_POINT_MONITOR_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_active"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
+HOOK_POINT_MONITOR_PROBE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_probe")
+HOOK_POINT_MONITOR_PARAMS_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_params")
+HOOK_POINT_MONITOR_ACTIVE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_active")
 
 # Per-hook PER-ROW monitor buffers (per-request in-graph monitor). Unlike the
 # single global probe above, these hold one probe + ``[threshold, sharpness]``
@@ -112,18 +100,15 @@ HOOK_POINT_MONITOR_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
 # registered at a ``(1, 1)`` dummy size and resized to ``(rows, hidden)`` by
 # :func:`resize_steering_row_monitor_buffers` only when the engine enables the
 # row monitor — so the op signature stays stable without per-model edits.
-HOOK_POINT_ROW_PROBE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_probe_table"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
-HOOK_POINT_ROW_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_row_params"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
-HOOK_POINT_ROW_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_row_active"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
+HOOK_POINT_ROW_PROBE_ATTR = derived_attrs(
+    HOOK_POINT_TABLE_ATTR, "_monitor_probe_table"
+)
+HOOK_POINT_ROW_PARAMS_ATTR = derived_attrs(
+    HOOK_POINT_TABLE_ATTR, "_monitor_row_params"
+)
+HOOK_POINT_ROW_ACTIVE_ATTR = derived_attrs(
+    HOOK_POINT_TABLE_ATTR, "_monitor_row_active"
+)
 
 # Default per-row monitor params: threshold -1e30, sharpness 1.0. With a
 # default-zero probe this gives ``sigmoid(1*(0 - (-1e30))) == 1.0`` exactly, so
