@@ -363,6 +363,14 @@ def apply_clamp(
     if hidden_states.is_cuda:
         from vllm.model_executor.layers.clamp_kernel import apply_clamp_triton
 
+        # Direct eager callers may omit the gate pair (documented as the
+        # ungated form); the kernel takes always-present tensors, so
+        # substitute an inert gate here.
+        if steering_row_gate is None or gate_active is None:
+            steering_row_gate = torch.ones(
+                1, dtype=torch.float32, device=hidden_states.device
+            )
+            gate_active = torch.zeros(1, dtype=torch.bool, device=hidden_states.device)
         return apply_clamp_triton(
             hidden_states,
             clamp_dirs,
@@ -435,6 +443,11 @@ def apply_clamp_block(
             apply_clamp_block_triton,
         )
 
+        if steering_row_gate is None or gate_active is None:
+            steering_row_gate = torch.ones(
+                1, dtype=torch.float32, device=residual.device
+            )
+            gate_active = torch.zeros(1, dtype=torch.bool, device=residual.device)
         return apply_clamp_block_triton(
             hidden_states,
             residual,
