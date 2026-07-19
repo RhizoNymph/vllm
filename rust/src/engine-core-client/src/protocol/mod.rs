@@ -454,6 +454,12 @@ pub struct EngineCoreRequest {
     /// Original user-provided request ID, used for output reporting and aborts.
     #[serde(default)]
     pub external_req_id: Option<String>,
+    /// Request-level host-side metadata (conversation id, declarative
+    /// steering specs). Positionally between `external_req_id` and
+    /// `reasoning_ended` in the Python `EngineCoreRequest`; omitting it
+    /// shifts every later field by one on the wire.
+    #[serde(default)]
+    pub request_metadata: Option<OpaqueValue>,
     #[serde(default)]
     pub reasoning_ended: Option<bool>,
     /// Opaque reasoning-parser kwargs forwarded from the frontend to the
@@ -729,7 +735,7 @@ mod tests {
             other => panic!("expected array, got {other:?}"),
         };
 
-        assert_eq!(array.len(), 20);
+        assert_eq!(array.len(), 21);
         assert_eq!(array[0], Value::from("req-1"));
         assert_eq!(array[2], Value::Nil);
         assert_eq!(array[4], Value::Nil);
