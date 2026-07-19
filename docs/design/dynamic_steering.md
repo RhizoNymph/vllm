@@ -1,7 +1,8 @@
 # Dynamic Steering — Design
 
-Status: Phases 0 and 1a implemented (this branch); 1b–2 proposed
-Branch: `feat/dynamic-steering`
+Status: Implemented across the async, sync, and in-graph tiers, including
+per-request overrides, gain primitives, declarative gates, conversation
+latching, APC-safe decode signatures, and v1/v2 runner integration
 Audience: contributors familiar with the steering runtime
 ([steering_runtime.md](steering_runtime.md)) and the capture-consumer
 framework ([capture_consumers.md](capture_consumers.md)).
@@ -125,7 +126,7 @@ deterministic function of the **rank-identical post-all-reduce
 residual**, so each TP rank computes the same decision with no
 communication (§6). Standard pretrained probes satisfy this trivially.
 
-## 4. Phase 0 — consumer + action queue (implemented on this branch)
+## 4. Phase 0 — async consumer + action queue (implemented)
 
 Smallest core surface that lets a capture consumer drive steering, for
 validating probes/policies on real traffic.
@@ -133,9 +134,10 @@ validating probes/policies on real traffic.
 **New:** `vllm/v1/worker/steering_action_queue.py`
 
 - `SteeringVectorUpdate(vectors: {hook: {layer: np.float32[hidden]}}, phase, source)` —
-  overwrite semantics per `(hook, layer)`, matching
-  `SteeringManager.update_global_vectors` (set, not add; a zero vector
-  disengages).
+  set semantics per `(hook, layer)`. Decode updates target the dedicated
+  dynamic additive tier, so they compose with operator-set decode steering;
+  the cache-unsafe base/prefill escape hatch retains global overwrite
+  semantics.
 - `SteeringActionQueue` — bounded, thread-safe, non-throwing `submit()`
   (drops newest on overflow, rate-limited warning), `drain()` on the
   step thread only.
@@ -145,9 +147,9 @@ validating probes/policies on real traffic.
   submit time because they are constructed before steering init.
 - `apply_steering_updates()` — drain-side validation (hook validity,
   layer steerable, hidden-size match, finite values — mirroring
-  `set_steering_vectors`) and application via
-  `update_global_vectors()`. Per-update isolation: one malformed update
-  is rejected with a structured warning; the rest apply.
+  `set_steering_vectors`) and application through the manager's
+  dynamic-tier/global-vector APIs. Per-update isolation: one malformed
+  update is rejected with a structured warning; the rest apply.
 
 **Mixin changes** (`steering_model_runner_mixin.py`):
 
@@ -159,33 +161,33 @@ validating probes/policies on real traffic.
   populate path uploads the state; no new buffer code. Empty-queue
   steady state costs one global read + truthiness check per step.
 
-**Plugin:** `examples/capture_consumers/dynamic_steering_controller/`
-(entry point `dynamic_steering`) — a direct `CaptureSink` (the
-`CaptureConsumer` batched adapter only delivers at request finalize,
-far too late). Global spec on one `(layer, hook)`, `all_generated`
-positions; per-token probe scores (cosine or dot), per-request EMA,
-max/mean aggregation, threshold+hysteresis engagement, binary or
-proportional gain, min-delta emission gating; actuates the **global
-decode tier** only. Diagnostics ride `CaptureResult.payload`.
+**Current examples:** `examples/capture_consumers/
+dynamic_steering_controller/` contains both transports. The main
+`dynamic_steering` controller migrated to sync execution in Phase 1 and
+supports per-request/global actuation plus scale and monitor emission modes.
+`AsyncTierExample` remains the minimal proof of this Phase 0 transport: its
+`CaptureConsumer.on_capture()` runs at request finalize and submits a global
+decode-tier update through the queue, so it steers a subsequent request.
 
-**Hard scope limits (enforced, not advisory):**
+**Async-transport scope limits (enforced, not advisory):**
 
-- `tp=1, pp=1` — double-enforced (queue not installed; plugin refuses
-  to construct).
+- `tp=1, pp=1` — the queue is not installed in multi-rank topologies;
+  async submitters must degrade to a no-op when lookup returns `None`.
 - Decode tier only — drain rejects `base`/`prefill` updates because
   this path performs no prefix-cache invalidation (§7). The
   `allow_cache_unsafe_phases` escape hatch exists for callers that own
   invalidation, but nothing sets it today.
-- Global actuation only — the policy aggregates across requests and
-  steers everyone. Per-request actuation is Phase 1.
+- The original Phase 0 policy used global actuation only. The queue now
+  carries the shared `SteeringAction` union; per-request actuation remains
+  most useful through the deterministic sync path in Phase 1.
 
 **Timing** (one full loop):
 
 ```
 step N    forward: graph-baked copy_ fills the monitor's persistent buffer
-          post-forward: dispatch → (H2D, dispatch thread) → controller chunks
+          post-forward: dispatch → (D2H, dispatch thread) → controller chunks
           controller: scores → policy → queue.submit(update)        [~ms after fwd]
-step N+1  _update_steering_buffers: drain → update_global_vectors → populate
+step N+1  _update_steering_buffers: drain → update_dynamic_tier → populate
           forward: decode tokens steered by vec * gain
 ```
 
@@ -198,22 +200,21 @@ deterministic.
 Phase 1 ships in two sub-phases (decided 2026-06-11, see §11):
 
 - **Phase 1a — sync consumers + per-request actuation**
-  (**implemented on this branch**). No kernel changes: the `execution`
+  (**implemented**). No kernel changes: the `execution`
   axis (§5.1), per-request actuation via a dynamic-override row pool
   (§5.2), the budget metric, the observability ring buffer +
   `GET /v1/steering/dynamic` (§5.5), `SteeringHookPacked` probe banks,
   and the example plugin migrated to sync with per-request actuation
   as its default.
-- **Phase 1b — gain primitives.** The kernel work: per-row scale
+- **Phase 1b — gain primitives (implemented).** The kernel work: per-row scale
   tensor (§5.3) and the dynamic additive tier (§5.4), which is also
   the substrate Phase 2's per-token gating extends.
 
-Implementation note: the sync `on_step` hook runs inside
-`sample_tokens` (immediately after `_finalize_capture_step`, i.e.
-post-sampling), not in `execute_model` — `scheduler_output` is in
-scope there, all TP ranks execute it, and same-thread ordering with
-the next step's `_update_steering_buffers` preserves the
-single-mutator contract.
+Implementation note: v1 runs the sync `on_step` hook inside
+`sample_tokens` immediately after `_finalize_capture_step` (post-sampling),
+while v2 runs it in `execute_model` immediately post-forward. Both execute
+on every TP rank and preserve same-thread ordering with the next step's
+`_update_steering_buffers`, which keeps the manager single-mutator.
 
 ### 5.1 The `execution` axis: sync vs async consumers
 
@@ -347,10 +348,12 @@ What is implemented instead — **dynamic-override rows**
 - Semantics: while active, the override *replaces* the request's
   admitted per-request decode delta for routing purposes.
 
-Known limitation: scheduler-side steering-aware APC block hashes
-(`Request.block_hash_decode_steering_config_hash`) never see overrides
-— streaming-continuation cache keys reflect admitted steering only.
-Fixing this needs a worker→scheduler notification; deferred.
+APC correctness is restored by the implemented worker→scheduler effective
+decode-signature channel. The worker folds the admitted decode hash with any
+override, dynamic tier/gain, and monitor state, reports only changed
+signatures, and the scheduler applies them forward-only before hashing newly
+completed decode blocks. See
+[`dynamic_steering_apc_notification.md`](dynamic_steering_apc_notification.md).
 
 In Phase 1a a gain change means re-registering the override's vectors
 (an H2D + repopulate per change — fine at engagement-flip frequency,
@@ -444,17 +447,18 @@ semantically clean on rows whose content the dynamic config owns
 outright — which per-request dynamic configs (§5.2) give us, and which
 the dynamic tier (§5.4) gives the global case.
 
-### 5.4 Dynamic additive tier (Phase 1b)
+### 5.4 Dynamic additive tier (Phase 1b) — IMPLEMENTED
 
 Decided: dynamic steering must compose with, not clobber,
-operator-set steering (§11 Q7). Phase 0 overwrites the global decode
-tier — wrong whenever an operator also uses `/v1/steering/set`.
+operator-set steering (§11 Q7). The original Phase 0 implementation
+overwrote the global decode tier, which was wrong whenever an operator
+also used `/v1/steering/set`.
 
 A correction to an earlier note in this doc: this **cannot** be a
 "reserved row" in the existing tables. `steering_index` maps each
 token to exactly one row, so rows are exclusive — additivity across
 rows does not exist at the kernel level (rows 3+ are *pre-combined* at
-populate time instead). Two implementations, by phase:
+populate time instead). The final implementation is:
 
 - **Dedicated gather — IMPLEMENTED (replaces populate-folding).** The
   tier is a separate additive kernel term, not folded into rows:
@@ -537,15 +541,15 @@ guarantees.
 - **No new plugin system.** Sync consumers register under the existing
   `vllm.capture_consumers` entry-point group and are configured via the
   existing `--capture-consumers name:key=value,...` / YAML / Python
-  surfaces — `execution` is a class attribute, not config. The Phase 0
-  plugin migrates by flipping `execution="sync"` and swapping its chunk
-  plumbing for `on_step`; its `ProbePolicy` is already pure and carries
-  over unchanged.
+  surfaces — `execution` is a class attribute, not config. The original
+  Phase 0 controller migrated by flipping `execution="sync"` and swapping
+  its chunk plumbing for `on_step`; its pure `ProbePolicy` carried over
+  unchanged.
 - **Probe/vector banks** use the `SteeringHookPacked` packed-JSON
   shape (decided) — the same wire format as `--steering-modules`,
   `/v1/steering/set`, and per-request steering, so the loaders already
-  exist. The Phase 0 plugin's `torch.save` single-vector convenience
-  path stays for one-probe prototyping.
+  exist. The example controller retains a `torch.save` single-vector
+  convenience path for one-probe prototyping.
 - **Observability (decided):** read-only `GET /v1/steering/dynamic`
   reporting monitor sites, policy state (engaged/gain per site),
   queue/apply/reject counters, **and a per-consumer ring buffer of
@@ -1121,7 +1125,7 @@ latched/bridged/evicted signal, and auto-registration of inline payloads
 
 ## 9. Test plan
 
-- **Phase 0 (on this branch)**: unit tests for queue mechanics, drain
+- **Phase 0**: unit tests for queue mechanics, drain
   validation/application isolation, and the full plugin policy state
   machine + sink lifecycle, plus real-`SteeringManager` end-to-end
   (drain → populate → table rows, zero-vector disengage, composition
@@ -1130,13 +1134,11 @@ latched/bridged/evicted signal, and auto-registration of inline payloads
   `examples/capture_consumers/dynamic_steering_controller/test.py`;
   46 tests, CPU-only). Existing steering/capture suites unaffected
   (339 passed).
-- **Phase 0 still missing**: an engine-level integration test — tiny
-  fixture decoder, stub consumer submits an update after step 0, assert
-  step ≥ 1 logits shift in the steering vector's direction (pattern:
-  `tests/models/language/generation/test_steering.py` fixture tests).
-  And a GPU smoke run (gemma-3-4b on a 3090 node) — see the validation
-  recipe in the plugin README.
-- **Phase 1a (on this branch, CPU)**: registration-time validation for
+- **Async transport e2e (GPU-validated)**:
+  `tests/v1/worker/test_async_steering_e2e.py` drives
+  `AsyncTierExample` through request-finalize capture, queue submission,
+  step-thread drain, and dynamic-tier application to a subsequent request.
+- **Phase 1a (CPU)**: registration-time validation for
   the `execution` axis (sync ⇒ worker / no client spec / global spec /
   pp=1); slim-manager behavior; step-view construction
   (spans/phase/token ids/zero-copy); the shared apply path; dynamic
@@ -1220,9 +1222,10 @@ latched/bridged/evicted signal, and auto-registration of inline payloads
   (needs CUDA + a tapped gemma4); model via `DYNSTEER_E2E_MODEL`
   (defaults to the gated tiny HF gemma4 with dummy weights; point at a
   local GGUF to run offline). Forces `VLLM_WORKER_MULTIPROC_METHOD=spawn`.
-- **Phase 1a still missing**: tp=2 rank-replication smoke (identical
+- **Phase 1a still missing**: a dedicated tp=2 sync-consumer
+  rank-replication smoke (identical
   tables and emitted actions across ranks — needs a 2-GPU node).
-- **Phase 1b**: kernel-level tests for the scale tensor and dynamic
+- **Phase 1b (implemented)**: kernel-level tests for the scale tensor and dynamic
   tier (row-scale/baked-scale composition, dynamic-tier additivity
   with operator-set vectors, any_active interaction, zero-gain
   equivalence with steering disabled).
@@ -1352,20 +1355,20 @@ All headline questions were settled on 2026-06-11:
 
 Still open (non-blocking):
 
-- **`model_runner_v2`**: steering integration there is pending
-  (dev-flag-gated upstream); dynamic steering inherits whatever lands.
-  Keep the sync `on_step` hook behind the same mixin seam so it ports.
+- ~~**`model_runner_v2` integration**~~ **Resolved:** v2 uses the shared
+  capture and steering mixins with thin batch-state projections; see
+  [`v2_runner_steering_capture.md`](v2_runner_steering_capture.md).
 - ~~**Phase 2 in-graph details** (§8): token-scale reset discipline,
   and whether per-request rows also need token gating.~~ **Resolved
   (implemented, §8):** the runner's per-step overwrite of `token_scales`
   is the reset; the monitor op read-modify-writes (multiplies) within the
-  step. v1 gates only the dynamic tier; per-request-row token gating is
-  deferred (same mechanics, additive when needed).
+  step. Per-request row gating is implemented through the per-row probe table
+  and decode-only `row_gate` term (§8.1).
 
 ## 12. References
 
-- `vllm/v1/worker/steering_action_queue.py` — Phase 0 bridge (this branch)
-- `examples/capture_consumers/dynamic_steering_controller/` — Phase 0 plugin (this branch)
+- `vllm/v1/worker/steering_action_queue.py` — async bridge and shared action vocabulary
+- `examples/capture_consumers/dynamic_steering_controller/` — sync/async/controller examples
 - `vllm/v1/worker/steering_manager.py`, `steering_model_runner_mixin.py` — steering runtime
 - `vllm/v1/capture/manager.py` (`on_hook`, `_global_buffers`), `step_gate.py` — capture runtime
 - `vllm/model_executor/layers/steering.py`, `steering_kernel.py` — hook + kernel

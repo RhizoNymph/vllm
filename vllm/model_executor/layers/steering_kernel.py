@@ -24,15 +24,14 @@ and stores so non-power-of-two hidden sizes are handled correctly.
 
 from __future__ import annotations
 
-import os
-import time
-
 import torch
 
-from vllm.logger import init_logger
+from vllm.model_executor.layers.intervention_kernel_common import (
+    kernel_cache_size,
+    normalize_warmup_sizes,
+    run_kernel_warmup,
+)
 from vllm.triton_utils import tl, triton
-
-logger = init_logger(__name__)
 
 
 @triton.jit
@@ -324,92 +323,14 @@ def apply_steering_triton(
     return out
 
 
-def _default_warmup_sizes() -> list[int]:
-    """Fallback warmup batch sizes when no capture-size list is supplied.
-
-    Mirrors the powers-of-two and small-batch shapes that vLLM commonly
-    captures when ``cudagraph_capture_sizes`` is left to its default.
-    Used only when the caller cannot pass an explicit list (e.g.
-    standalone tests). Also reused by the monitor kernel's warmup
-    (``steering_monitor_kernel``) so both share one fallback shape list.
-    """
-    return [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256]
-
-
-def _jit_device_caches() -> dict | None:
-    """Normalize the kernel's per-device JIT cache across Triton versions.
-
-    Triton < 3.6: ``JITFunction.cache`` is ``{device: {key: kernel}}``.
-    Triton >= 3.6: renamed to ``device_caches`` with per-device tuple
-    values whose FIRST element is the ``{key: kernel}`` dict. Returns a
-    ``{device: {key: kernel}}`` view, or None when the kernel has no
-    cache attribute (Triton disabled in the importing process).
-    """
-    cache = getattr(_apply_steering_kernel, "cache", None)
-    if cache is None:
-        cache = getattr(_apply_steering_kernel, "device_caches", None)
-    if cache is None:
-        return None
-    return {
-        dev: (dc[0] if isinstance(dc, tuple) and dc else dc)
-        for dev, dc in cache.items()
-    }
-
-
-def _dump_jit_cache_keys() -> None:
-    """One-shot diagnostic — log the keys present in the kernel cache.
-
-    Enabled when ``VLLM_STEERING_DUMP_JIT_CACHE=1``.  Walks the kernel's
-    per-device JIT cache (see :func:`_jit_device_caches`) and emits each
-    variant key at INFO so a benchmark run can reveal what
-    specializations Triton actually built.
-    """
-    cache = _jit_device_caches()
-    if cache is None:
-        logger.info(
-            "steering JIT cache dump requested but kernel has no cache "
-            "attribute (Triton may be disabled)"
-        )
-        return
-    total = 0
-    for device_id, device_cache in cache.items():
-        try:
-            keys = list(device_cache.keys())
-        except AttributeError:
-            keys = []
-        total += len(keys)
-        logger.info(
-            "steering JIT cache: device=%s variants=%d",
-            device_id,
-            len(keys),
-        )
-        for i, key in enumerate(keys):
-            logger.info("  variant[%d]: %r", i, key)
-    logger.info("steering JIT cache: total_variants=%d", total)
-
-
 def _kernel_cache_size() -> int:
-    """Return the total number of compiled variants across all devices.
+    """Compiled-variant count for the steering kernel.
 
-    Returns 0 when the kernel has not yet been built (no cache attribute,
-    e.g. when Triton is disabled in the importing process). Triton < 3.6
-    exposes ``JITFunction.cache`` as ``{device: {key: kernel}}``; Triton
-    >= 3.6 renamed it to ``device_caches`` with per-device tuple values
-    whose FIRST element is the ``{key: kernel}`` dict. A probe that reads
-    the wrong attribute silently reports 0 forever, which makes every
-    warmup cache-idempotency check vacuous — handle both layouts via
-    :func:`_jit_device_caches`.
+    Kept as a module-level probe (tests assert on its growth across
+    warmup); the Triton-version handling lives in
+    :func:`vllm.model_executor.layers.intervention_kernel_common.kernel_cache_size`.
     """
-    cache = _jit_device_caches()
-    if cache is None:
-        return 0
-    total = 0
-    for device_cache in cache.values():
-        try:
-            total += len(device_cache)
-        except TypeError:
-            continue
-    return total
+    return kernel_cache_size((_apply_steering_kernel,))
 
 
 def warmup_apply_steering_kernel(
@@ -463,14 +384,10 @@ def warmup_apply_steering_kernel(
     if device.type != "cuda":
         return
 
-    sizes = capture_sizes if capture_sizes else _default_warmup_sizes()
-    # Defensive: deduplicate and sort to drive smaller shapes first
-    # (smaller compiles tend to be slightly cheaper).
-    sizes = sorted({int(s) for s in sizes if int(s) > 0})
+    sizes = normalize_warmup_sizes(capture_sizes)
     if not sizes:
         return
 
-    cache_before = _kernel_cache_size()
     max_n = max(sizes)
     # One large allocation each; we only ever read/write the leading N
     # rows per launch, so reusing a single buffer per dtype avoids
@@ -515,8 +432,7 @@ def warmup_apply_steering_kernel(
 
     from vllm.model_executor.layers.steering import SteeringOpArgs
 
-    t0 = time.perf_counter()
-    for n in sizes:
+    def drive(n: int) -> None:
         # ``active_flag`` is mutated in place between launches, so a single
         # args tuple per shape drives both the inactive and active branches
         # (they share the compiled artifact — the flag is a tensor).
@@ -543,21 +459,11 @@ def warmup_apply_steering_kernel(
         # Active path — exercises the gather + add.
         active_flag.fill_(True)
         torch.ops.vllm.apply_steering(*args)
-    # Block until every JIT compile (and cuLibraryLoadData) has retired so
-    # the wall-clock measurement and cache-size readback reflect reality.
-    torch.accelerator.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    cache_after = _kernel_cache_size()
-    new_variants = cache_after - cache_before
-    logger.info(
-        "steering kernel warmup: shapes=%d variants_compiled=%d "
-        "cache_total=%d elapsed_ms=%.1f",
-        len(sizes),
-        new_variants,
-        cache_after,
-        elapsed_ms,
+    run_kernel_warmup(
+        label="steering",
+        kernels=(_apply_steering_kernel,),
+        sizes=sizes,
+        drive=drive,
+        dump_env_var="VLLM_STEERING_DUMP_JIT_CACHE",
     )
-
-    if os.environ.get("VLLM_STEERING_DUMP_JIT_CACHE", "0") == "1":
-        _dump_jit_cache_keys()

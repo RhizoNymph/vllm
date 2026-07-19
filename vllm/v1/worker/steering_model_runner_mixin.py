@@ -64,6 +64,7 @@ from vllm.model_executor.layers.steering import (
     share_steering_row_gate_across_layers,
     share_steering_token_scales_across_layers,
 )
+from vllm.model_executor.layers.steering_table_layout import TableLayout
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.worker.sae_clamp_manager import SAEClampManager
@@ -77,6 +78,7 @@ from vllm.v1.worker.steering_action_queue import (
     SteeringMonitorUpdate,
     SteeringScaleUpdate,
     SteeringVectorUpdate,
+    VectorValidationStyle,
     apply_steering_updates,
     get_steering_action_queue,
     install_steering_action_queue,
@@ -84,6 +86,7 @@ from vllm.v1.worker.steering_action_queue import (
     validate_steering_monitor,
     validate_steering_scale,
     validate_steering_vectors,
+    validate_vector_entries,
 )
 from vllm.v1.worker.steering_batch_view import SteeringBatchView
 from vllm.v1.worker.steering_manager import SteeringManager
@@ -823,11 +826,7 @@ class SteeringModelRunnerMixin:
             )
             warmup_apply_steering_kernel(
                 hidden_size=hidden_size,
-                table_rows=(
-                    steering_config.max_steering_configs
-                    + getattr(steering_config, "max_dynamic_steering_configs", 0)
-                    + 3
-                ),
+                table_rows=TableLayout.from_steering_config(steering_config).num_rows,
                 table_dtype=table_dtype,
                 compute_dtype=compute_dtype,
                 device=table_device,
@@ -885,6 +884,23 @@ class SteeringModelRunnerMixin:
 
         return layers
 
+    # HTTP-path style: unknown layers are SKIPPED, not rejected — under TP
+    # each rank only owns a shard of the layers and the full spec fans out
+    # to every rank. Message texts are load-bearing (API tests assert on
+    # them); see ``VectorValidationStyle``.
+    _VECTORS_SPEC_STYLE = VectorValidationStyle(
+        invalid_hook="Invalid hook point: {hook!r}",
+        hook_inactive="Hook point {hook!r} not active on layer {layer}",
+        bad_width=(
+            "Layer {layer} ({hook}): expected vector of size {expected}, got {got_len}"
+        ),
+        non_finite=(
+            "Layer {layer} ({hook}): steering vector contains non-finite "
+            "values (NaN or Infinity)"
+        ),
+        unknown_layer=None,
+    )
+
     def _validate_vectors_spec(
         self,
         vectors_data: dict[str, dict[int, list[float]]],
@@ -896,40 +912,9 @@ class SteeringModelRunnerMixin:
         Raises ``SteeringVectorError`` on invalid hook points,
         mismatched sizes, or non-finite values.
         """
-        valid_indices: set[int] = set()
-        for hook_point_str, layer_vecs in vectors_data.items():
-            try:
-                hp_enum = SteeringHookPoint(hook_point_str)
-            except ValueError as exc:
-                raise SteeringVectorError(
-                    f"Invalid hook point: {hook_point_str!r}"
-                ) from exc
-            table_attr = HOOK_POINT_TABLE_ATTR[hp_enum]
-
-            for idx, vec_values in layer_vecs.items():
-                if idx not in steerable:
-                    continue
-                mod = steerable[idx]
-                if not hasattr(mod, table_attr):
-                    raise SteeringVectorError(
-                        f"Hook point {hook_point_str!r} not active on layer {idx}"
-                    )
-                buf = getattr(mod, table_attr)
-                expected_size = buf.shape[1]
-                if len(vec_values) != expected_size:
-                    raise SteeringVectorError(
-                        f"Layer {idx} ({hook_point_str}): expected "
-                        f"vector of size {expected_size}, "
-                        f"got {len(vec_values)}"
-                    )
-                if not all(math.isfinite(v) for v in vec_values):
-                    raise SteeringVectorError(
-                        f"Layer {idx} ({hook_point_str}): steering "
-                        f"vector contains non-finite values "
-                        f"(NaN or Infinity)"
-                    )
-                valid_indices.add(idx)
-        return valid_indices
+        return validate_vector_entries(
+            vectors_data, steerable, self._VECTORS_SPEC_STYLE
+        )
 
     def list_steerable_layers(self) -> dict[int, list[str]]:
         """Return steerable layers on this worker with their hook points.

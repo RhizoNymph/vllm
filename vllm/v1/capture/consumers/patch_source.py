@@ -40,9 +40,9 @@ from vllm.v1.capture.types import (
 
 logger = init_logger(__name__)
 
-# Injection reuses the steering apply sites, which only exist for these three
-# hook points — so a patch source may only capture these (capturing others
-# would store vectors that can never be injected).
+# Injection reuses the steering apply sites — so a patch source may only
+# capture the injectable hook points (capturing others would store vectors
+# that can never be injected).
 _INJECTABLE_HOOKS: frozenset[str] = frozenset(h.value for h in HOOK_POINT_TABLE_ATTR)
 
 # Bound the per-request validate-time bookkeeping so a long-lived server doesn't

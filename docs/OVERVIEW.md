@@ -22,7 +22,13 @@ Overview:
       apply_layer_steering / apply_block_steering. Persistent buffers + opaque
       ops (mutates_args=[]) so a FULL cudagraph replay reads each step's values.
       Buffers attach at model build via register_steering_buffers; disabled mode
-      constant-folds out of the forward.
+      constant-folds out of the forward. Tier-agnostic scaffolding (hook-attr
+      dicts, buffer-sizing knob, kernel warmup harness, phase-tier storage,
+      vector-spec validation core) is shared via intervention_common.py /
+      intervention_kernel_common.py / phase_tiers.py; the steering row space
+      (sentinel/global rows + static/dynamic pools) is defined once in
+      steering_table_layout.py — see "Intervention Tier Template" in
+      docs/features/steering.md.
     control_plane: >
       Per-request specs on SamplingParams / RequestMetadata, resolved
       rank-locally in the model runner (v1 and v2), with scheduler
@@ -75,7 +81,7 @@ Features Index:
   activation_steering:
     description: >
       Per-request, per-token, CUDA-graph-safe additive intervention on the
-      residual stream (three tiers, three hook points).
+      residual stream (three tiers, five hook points).
     entry_points: ["SamplingParams.steering_vectors", "--enable-steering"]
     depends_on: [activation_capture]
     doc: docs/features/steering.md

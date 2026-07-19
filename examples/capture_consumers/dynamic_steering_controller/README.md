@@ -5,7 +5,7 @@ feedback loop with **exactly-one-step latency**: probe the residual
 stream at one `(layer, hook)` site, and steer — per request or globally
 — when the probe fires.
 
-This is the Phase 1a controller from
+This is the sync/controller implementation from
 [`docs/design/dynamic_steering.md`](../../../docs/design/dynamic_steering.md).
 
 ## How it works
@@ -48,9 +48,10 @@ that site, so the monitor never measures its own intervention.
 - Decode-only by construction: per-request overrides are rejected for
   prefilling requests; prefill scores still prime the EMA so engagement
   can fire on the first decode step.
-- Known limitation: steering-aware APC block hashes for streaming
-  continuation reflect *admitted* steering only, never dynamic
-  overrides (`docs/design/dynamic_steering.md` §5.2).
+- Steering-aware APC remains correct under dynamic overrides: workers report
+  an effective decode signature and the scheduler applies it forward-only to
+  newly completed decode blocks. The signature also covers the dynamic tier,
+  gain, and monitor state.
 
 ## Usage
 

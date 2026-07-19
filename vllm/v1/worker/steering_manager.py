@@ -62,6 +62,12 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
+from vllm.model_executor.layers.steering_table_layout import (
+    NUM_RESERVED_ROWS,
+    TableLayout,
+    global_row_for_phase,
+)
+from vllm.v1.worker.phase_tiers import PhaseTiers
 from vllm.v1.worker.steering_owner import OwnerStore, RowOwner
 
 logger = init_logger(__name__)
@@ -128,10 +134,7 @@ class SteeringManager:
     Table layout (per hook point):
         Row 0: zeros sentinel (no steering)
         Row 1: global prefill effective (global_base + global_prefill)
-        Row 2: global decode effective
-            (global_base + global_decode + dynamic_tier; the dynamic
-            additive tier is folded in here only — decode-derived rows
-            see it, prefill rows do not. See §5.4.)
+        Row 2: global decode effective (global_base + global_decode).
         Rows 3..max_steering_configs+2: phase-appropriate global
             + per_request combined
         Rows max_steering_configs+3..+2+max_dynamic_steering_configs:
@@ -176,22 +179,19 @@ class SteeringManager:
             tuple[int, str], dict[str, dict[int, torch.Tensor]]
         ] = {}
         self._content_refcounts: dict[tuple[int, str], int] = defaultdict(int)
-        # Available row indices (rows 3 through max_steering_configs + 2)
-        # Reversed so pop() gives lowest
-        self.free_rows: list[int] = list(range(max_steering_configs + 2, 2, -1))
+        self._layout = TableLayout(
+            num_configs=max_steering_configs,
+            num_dynamic=max_dynamic_steering_configs,
+        )
+        # Available static-pool rows, reversed so pop() gives lowest.
+        self.free_rows: list[int] = list(reversed(self._layout.config_rows))
 
         # Dynamic-override pool (rows above the static pool). Allocated
         # and released only by the dynamic steering path; deterministic
         # monotonically increasing ids keep ranks in lock-step because
         # the register/release call sequence is identical on every rank
         # (rank-replicated sync consumers). Ids are never reused.
-        self._dynamic_free_rows: list[int] = list(
-            range(
-                max_steering_configs + 2 + max_dynamic_steering_configs,
-                max_steering_configs + 2,
-                -1,
-            )
-        )
+        self._dynamic_free_rows: list[int] = list(reversed(self._layout.dynamic_rows))
         # dyn_id -> {hook_point_str: {layer_idx: tensor}} (override
         # vectors only, not combined). Insertion-ordered.
         self._dynamic_vectors: dict[int, dict[str, dict[int, torch.Tensor]]] = {}
@@ -202,19 +202,20 @@ class SteeringManager:
         #   base:    both-phases vectors (from global API)
         #   prefill: prefill-specific global vectors
         #   decode:  decode-specific global vectors
-        self.global_base_vectors: dict[str, dict[int, torch.Tensor]] = {}
-        self.global_prefill_vectors: dict[str, dict[int, torch.Tensor]] = {}
-        self.global_decode_vectors: dict[str, dict[int, torch.Tensor]] = {}
+        # Exposed per-tier via the ``global_*_vectors`` properties (their
+        # names are read by the mixin and asserted on by tests).
+        self._global_vectors: PhaseTiers[dict[str, dict[int, torch.Tensor]]] = (
+            PhaseTiers(base={}, prefill={}, decode={}, label="global vector")
+        )
 
         # Dynamic additive tier (decode-only): a global steering
-        # contribution owned by dynamic consumers, folded ADDITIVELY into
-        # the decode-effective vector at populate time rather than
-        # overwriting ``global_decode_vectors``. This is what lets dynamic
+        # contribution owned by dynamic consumers, held in a dedicated
+        # per-hook vector and added by the kernel rather than overwriting
+        # ``global_decode_vectors``. This is what lets dynamic
         # global steering compose with operator-set (``/v1/steering/set``)
         # decode steering instead of clobbering it. Decode-only by
-        # construction (§7): folded into ``global_decode`` only, so it
-        # reaches row 2, decode per-request rows, and dynamic-override
-        # rows, never prefill rows, and never feeds prefix-cache keys.
+        # construction (§7): ``steering_token_scales`` is zero for prefill,
+        # so the tier never reaches prefill tokens or prefix-cache keys.
         # See docs/design/dynamic_steering.md §5.4.
         self.dynamic_tier_vectors: dict[str, dict[int, torch.Tensor]] = {}
         # Scalar strength for the dedicated dynamic tier (§5.4). The runner
@@ -316,13 +317,13 @@ class SteeringManager:
         #
         # The ring size needs to cover the longest plausible burst of
         # back-to-back ``_stack_vectors_to_device`` calls inside one
-        # ``register_config``: one per hook point. With a typical
-        # ``HOOK_POINT_TABLE_ATTR`` of ~3 entries plus a small safety
-        # margin, 4 slots is enough that under steady state every reuse
+        # ``register_config``: one per hook point. With
+        # ``HOOK_POINT_TABLE_ATTR`` at 5 entries plus a small safety
+        # margin, 6 slots is enough that under steady state every reuse
         # finds the H2D already complete (event wait is a no-op).
-        self._stack_pinned_ring: list[torch.Tensor | None] = [None] * 4
-        self._stack_pinned_events: list[torch.cuda.Event | None] = [None] * 4
-        self._stack_pinned_numel: list[int] = [0] * 4
+        self._stack_pinned_ring: list[torch.Tensor | None] = [None] * 6
+        self._stack_pinned_events: list[torch.cuda.Event | None] = [None] * 6
+        self._stack_pinned_numel: list[int] = [0] * 6
         self._stack_pinned_next: int = 0
 
     # ------------------------------------------------------------------
@@ -748,7 +749,7 @@ class SteeringManager:
         output of requests that asked for per-request steering.
         """
         if config_hash == 0:
-            return 1 if is_prefill else 2
+            return global_row_for_phase(is_prefill)
         phase = "prefill" if is_prefill else "decode"
         row = self.config_to_row.get((config_hash, phase))
         if row is not None:
@@ -811,11 +812,21 @@ class SteeringManager:
         # Global rows 1, 2 and all per-request rows depend on this state.
         self._dirty.mark_content()
 
+    @property
+    def global_base_vectors(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._global_vectors.base
+
+    @property
+    def global_prefill_vectors(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._global_vectors.prefill
+
+    @property
+    def global_decode_vectors(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._global_vectors.decode
+
     def clear_global_vectors(self) -> None:
         """Clear all cached global vectors across all phases and hook points."""
-        self.global_base_vectors.clear()
-        self.global_prefill_vectors.clear()
-        self.global_decode_vectors.clear()
+        self._global_vectors.clear_all()
         self._dirty.mark_content()
 
     def update_dynamic_tier(
@@ -828,12 +839,12 @@ class SteeringManager:
     ) -> None:
         """Set the dynamic additive-tier vector for a hook point and layer.
 
-        The tier is folded ADDITIVELY into the decode-effective vector at
-        populate time (so it reaches row 2, decode per-request rows, and
-        dynamic-override rows), letting dynamic global steering compose
-        with operator-set decode steering rather than overwriting
-        ``global_decode_vectors``. Decode-only (§7): it never touches
-        prefill rows and never feeds prefix-cache keys.
+        The tier is copied into a dedicated per-hook vector buffer and added
+        by the steering kernel on top of the selected row. This lets dynamic
+        global steering compose with operator-set decode steering rather than
+        overwriting ``global_decode_vectors``. Decode-only (§7): the runner
+        writes a zero token scale for prefill, so it never feeds prefix-cache
+        keys.
 
         Args:
             hook_point: Hook point string (e.g. ``"post_block"``).
@@ -1058,7 +1069,7 @@ class SteeringManager:
         ordered_dynamic = self._cached_ordered_dynamic or list(
             self._dynamic_to_row.items()
         )
-        num_rows = 3 + len(ordered_configs) + len(ordered_dynamic)
+        num_rows = NUM_RESERVED_ROWS + len(ordered_configs) + len(ordered_dynamic)
         thr0, sharp0 = _ROW_MONITOR_DEFAULT_PARAMS
         probe_mat = torch.zeros(
             num_rows, hidden_size, dtype=torch.float32, device=device
@@ -1336,17 +1347,7 @@ class SteeringManager:
 
     def _global_dict_for_phase(self, phase: str) -> dict[str, dict[int, torch.Tensor]]:
         """Return the global vector dict for the given phase."""
-        if phase == "base":
-            return self.global_base_vectors
-        elif phase == "prefill":
-            return self.global_prefill_vectors
-        elif phase == "decode":
-            return self.global_decode_vectors
-        else:
-            raise ValueError(
-                f"Invalid global vector phase: {phase!r}. "
-                f"Must be 'base', 'prefill', or 'decode'."
-            )
+        return self._global_vectors.for_phase(phase)
 
     def _get_global_vec(
         self,
@@ -1598,7 +1599,7 @@ class SteeringManager:
                 self._dynamic_to_row.items()
             )
             target_indices_list = (
-                [0, 1, 2]
+                list(range(NUM_RESERVED_ROWS))
                 + [row for _, row in new_ordered_configs]
                 + [row for _, row in new_ordered_dynamic]
             )
@@ -1622,7 +1623,7 @@ class SteeringManager:
         # up shape ``(num_active_tables, num_rows, hidden)``. We do ONE
         # ``.to(dtype=table.dtype)`` cast on the whole stack instead of
         # per-(hook, layer), then index_copy_ each layer's slice.
-        num_rows = 3 + len(ordered_configs) + len(ordered_dynamic)
+        num_rows = NUM_RESERVED_ROWS + len(ordered_configs) + len(ordered_dynamic)
         per_table_rows: list[list[torch.Tensor]] = []
         for _table, hp_str, layer_idx, _mod in active_tables:
             base_vec = self._get_global_vec(hp_str, layer_idx, self.global_base_vectors)

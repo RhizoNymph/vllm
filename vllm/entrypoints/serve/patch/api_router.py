@@ -221,7 +221,7 @@ def _validate_sweep_vectors(body: PatchSweepRequest, vllm_config) -> str | None:
             if width != hidden:
                 return (
                     f"patch_vectors width {width} != hook width {hidden} "
-                    f"(residual-stream hooks are hidden_size-wide)"
+                    f"(injectable hooks are hidden_size-wide)"
                 )
     return None
 
@@ -314,8 +314,9 @@ async def _auto_capture_clean(
 ) -> dict[int, Any] | None:
     """Capture the clean run server-side, blocking until it is durable.
 
-    Taps *every* injectable hook (``pre_attn``, ``post_attn``, ``post_block``)
-    at every swept ``layer`` over ``all_prompt`` positions into ``source_run``
+    Taps *every* injectable hook (``pre_attn``, ``post_attn``, ``post_block``,
+    ``mlp_in``, ``mlp_out``) at every swept ``layer`` over ``all_prompt``
+    positions into ``source_run``
     via the ``patch_source`` capture consumer, then waits for the capture to
     finalize (``capture_wait`` semantics) so the per-worker source store is
     populated before any cell resolves against it. Tapping all hooks (one

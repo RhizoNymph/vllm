@@ -20,6 +20,16 @@ D. cross-prompt full replace @ pre_attn: patch every pre_attn site of a
    the answer to move toward clean (qualitative).
 E. denoising probe @ post_block single site: best single-layer shift toward
    the clean answer (the real causal-tracing use case).
+G. no-op alpha=0 @ mlp_out over all sites reproduces the unpatched logits
+   (plumbing for the MLP branch hooks).
+H. self-identity @ mlp_in / mlp_out (single-tensor op, exact like B).
+I. zero-ablating mlp_out at every site (source_module="zeros") materially
+   changes the output (proves the injection actually lands on the branch).
+J. steering equivalence: the same additive vector at mlp_out and at
+   post_block produces near-identical logits (the branch add commutes into
+   the block output through the deferred residual add).
+K. denoising probe at E's best site via mlp_out (informational: how much of
+   the site's causal effect rides the MLP branch).
 
 Usage (GPU box):
     PYTHONPATH=<plugin-dist-info>:<this-repo> \\
@@ -33,7 +43,12 @@ import argparse
 
 from vllm import LLM, SamplingParams
 
-HOOKS_ALL = {"pre_attn": "all", "post_block": "all"}
+HOOKS_ALL = {
+    "pre_attn": "all",
+    "post_block": "all",
+    "mlp_in": "all",
+    "mlp_out": "all",
+}
 
 
 def _lp(out) -> dict[int, float]:
@@ -73,6 +88,7 @@ def main() -> None:
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--enforce-eager", action="store_true")
     ap.add_argument("--max-patch-slots", type=int, default=64)
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--pipeline-parallel-size", type=int, default=1)
     ap.add_argument(
@@ -86,6 +102,7 @@ def main() -> None:
     llm = LLM(
         model=args.model,
         enable_patching=True,
+        enable_steering=True,
         max_patch_slots=args.max_patch_slots,
         patch_source_cache_bytes=4_000_000_000,
         capture_consumers=[{"name": "patch_source"}],
@@ -97,7 +114,7 @@ def main() -> None:
             if args.tensor_parallel_size * args.pipeline_parallel_size > 1
             else None
         ),
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=2048,
     )
     n_layers = llm.llm_engine.model_config.get_total_num_hidden_layers()
@@ -343,6 +360,123 @@ def main() -> None:
                 bool(ok),
                 f"lp(a=0)={v0} lp(a=0.5)={vh} lp(a=1)={v1}"
                 + ("" if interior else " (saturating, monotone only)"),
+            )
+        )
+
+    # G. no-op alpha=0 @ mlp_out (all sites)
+    noop_mlp = gen(
+        corrupt_prompt,
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            logprobs=20,
+            patch=_patch("mlp_out", n_layers, n_corrupt, "corrupt", alpha=0.0),
+        ),
+    )
+    d = _maxdiff(noop_mlp, corrupt_lp)
+    results.append(
+        ("G no-op alpha=0 (mlp_out, all sites)", d < 1e-3, f"max|d|={d:.4g}")
+    )
+
+    # H. self-identity @ mlp_in / mlp_out (single-tensor op -> exact like B)
+    for hook in ("mlp_in", "mlp_out"):
+        ident = gen(
+            corrupt_prompt,
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=1,
+                logprobs=20,
+                patch=_patch(hook, n_layers, n_corrupt, "corrupt", alpha=1.0),
+            ),
+        )
+        d = _maxdiff(ident, corrupt_lp)
+        results.append(
+            (f"H self-identity @ {hook} (exact)", d < 5e-3, f"max|d|={d:.4g}")
+        )
+
+    # I. zero-ablate mlp_out everywhere: the injection must land (output
+    # changes materially — an unwired hook would silently no-op here).
+    ablate = gen(
+        corrupt_prompt,
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            logprobs=20,
+            patch=[
+                {
+                    "layer": layer,
+                    "hook": "mlp_out",
+                    "dest_position": pos,
+                    "source_module": "zeros",
+                }
+                for layer in range(n_layers)
+                for pos in range(n_corrupt)
+            ],
+        ),
+    )
+    d = _maxdiff(ablate, corrupt_lp)
+    results.append(
+        ("I zero-ablate mlp_out changes output", d > 0.05, f"max|d|={d:.4g}")
+    )
+
+    # J. additive steering at mlp_out == additive steering at post_block:
+    # the branch add commutes into the block output through the deferred
+    # residual add, so the two differ only by fp addition order.
+    hidden = llm.llm_engine.model_config.get_hidden_size()
+    vec = [(((i * 2654435761) % 1000) / 1000.0 - 0.5) * 0.2 for i in range(hidden)]
+    mid = n_layers // 2
+
+    def steer_lp(hook: str) -> dict[int, float]:
+        return gen(
+            corrupt_prompt,
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=1,
+                logprobs=20,
+                steering_vectors={hook: {mid: vec}},
+            ),
+        )
+
+    steer_mlp, steer_pb = steer_lp("mlp_out"), steer_lp("post_block")
+    d_equiv = _maxdiff(steer_mlp, steer_pb)
+    d_moved = _maxdiff(steer_mlp, corrupt_lp)
+    results.append(
+        (
+            "J steer @ mlp_out == steer @ post_block (same vector)",
+            d_equiv < 0.15 and d_moved > 0.01,
+            f"max|d equiv|={d_equiv:.4g} max|d vs base|={d_moved:.4g}",
+        )
+    )
+
+    # K. denoising at E's best site through the MLP branch (informational:
+    # reports how much of the causal effect rides mlp_out; not asserted).
+    if best[0] >= 0:
+        klp = gen(
+            corrupt_prompt,
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=1,
+                logprobs=1,
+                logprob_token_ids=[clean_tok],
+                patch=[
+                    {
+                        "layer": best[0],
+                        "hook": "mlp_out",
+                        "dest_position": best[1],
+                        "source_run": "clean",
+                        "source_position": best[1],
+                        "alpha": 1.0,
+                    }
+                ],
+            ),
+        )
+        kshift = (klp.get(clean_tok) or -20.0) - corrupt_lp.get(clean_tok, -20.0)
+        results.append(
+            (
+                "K mlp_out share of E's best site (informational)",
+                True,
+                f"layer={best[0]} pos={best[1]} shift={kshift:.4g}"
+                f" (post_block shift={best[2]:.4g})",
             )
         )
 

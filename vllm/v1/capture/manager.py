@@ -1241,6 +1241,13 @@ class CaptureManager:
         to reach consumers, never losing it. If the spill area is at its cap,
         blocks until the dispatch loop frees room (degrades to ``block``).
         """
+        # Serialization reads the pinned views on THIS thread, but the
+        # packet's D2H copies may still be in flight — the event is normally
+        # synchronized by the dispatch loop, which spilling bypasses. Spill
+        # engages exactly when dispatch is backlogged, i.e. when the newest
+        # packet's copies are least likely to have landed.
+        if packet.cuda_event is not None:
+            packet.cuda_event.synchronize()
         data = self._serialize_packet(packet)
         # Bytes are captured; release the pinned host buffers now.
         self._release_packet_buffers(packet)
@@ -1257,12 +1264,22 @@ class CaptureManager:
                     path = self._spill_dir / f"spill-{self._spill_seq:012d}.pkt"
                     self._spill_seq += 1
                     self._spill_bytes += n
-                    self._spill_pending.append((path, n))
-                    self._spilled_packets += 1
                     break
             # Spill area full: wait for the dispatch loop to drain some.
             time.sleep(0.01)
-        path.write_bytes(data)
+        # Write the file BEFORE publishing its ``_spill_pending`` entry: the
+        # dispatch loop pops an entry and reads its file without holding the
+        # lock, so an entry must never be visible before its bytes are on
+        # disk.
+        try:
+            path.write_bytes(data)
+        except BaseException:
+            with self._spill_lock:
+                self._spill_bytes -= n
+            raise
+        with self._spill_lock:
+            self._spill_pending.append((path, n))
+            self._spilled_packets += 1
         self._log_overload("spill")
 
     def _log_overload(self, kind: str) -> None:

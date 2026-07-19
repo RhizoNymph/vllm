@@ -66,9 +66,16 @@ class TestPrefixFloor:
 
 class TestValidation:
     def test_bad_hook(self):
-        sp = SamplingParams(patch=[_entry(hook="mlp_out")])
+        sp = SamplingParams(patch=[_entry(hook="attn_scores")])
         with pytest.raises(PatchValidationError):
             resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+
+    @pytest.mark.parametrize("hook", ["mlp_in", "mlp_out"])
+    def test_mlp_hooks_injectable(self, hook):
+        sp = SamplingParams(patch=[_entry(hook=hook, dest=3)])
+        resolve_patch_prefix_flags(sp, _ctx(10), max_patch_slots=64)
+        assert sp.patch_touches_prompt is True
+        assert sp.patch_min_prompt_position == 3
 
     def test_layer_out_of_range(self):
         sp = SamplingParams(patch=[_entry(layer=99)])

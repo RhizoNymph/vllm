@@ -1948,6 +1948,8 @@ def test_steering_changes_output(vllm_runner, monkeypatch, model: str) -> None:
             load_format="dummy",
             max_model_len=512,
             enable_prefix_caching=True,
+            enable_steering=True,
+            max_steering_configs=4,
         ) as llm:
             # 1. Baseline (zero steering buffers)
             baseline_tokens = _gen_tokens(llm, prompt, sampling)
@@ -2478,6 +2480,8 @@ def test_global_prefill_steering_via_worker_api(
             load_format="dummy",
             max_model_len=512,
             enable_prefix_caching=True,
+            enable_steering=True,
+            max_steering_configs=4,
         ) as llm:
             # 1. Baseline (no global steering)
             baseline_tokens = _gen_tokens(llm, prompt, sampling)

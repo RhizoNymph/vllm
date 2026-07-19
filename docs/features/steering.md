@@ -50,7 +50,9 @@ Also supported:
 - Global steering through HTTP endpoints
 - Per-request steering through `SamplingParams`
 - Three additive tiers (base / prefill-specific / decode-specific)
-- Three hook points: `pre_attn`, `post_attn`, `post_block`
+- Five hook points: `pre_attn`, `post_attn`, `post_block` (residual stream)
+  plus `mlp_in`, `mlp_out` (MLP branch; wired on gemma3/gemma4 and the qwen3
+  family)
 - Phase-aware scheduler admission for per-request steering
 - Prefix-cache separation for different prefill steering configs
 - Continuous batching
@@ -110,9 +112,21 @@ activation that is discarded immediately afterward.
 | `pre_attn` | Residual stream before attention |
 | `post_attn` | Residual stream after attention |
 | `post_block` | Residual stream after MLP |
+| `mlp_in` | MLP branch: normed input entering the MLP sublayer |
+| `mlp_out` | MLP branch: sublayer output before its residual add |
 
 For supported models, these hooks are wired directly into each decoder
 layer's forward path. Unused hook points are zero-valued no-ops.
+
+The three residual-stream hooks steer the carried residual and are wired on
+every steerable model. `mlp_in`/`mlp_out` steer the MLP *branch* tensor and
+are wired on gemma3, gemma4, and the qwen3 family (`qwen3`, `qwen3_moe`,
+`qwen3_next`/Qwen3.5); on other models they are silent no-ops (buffers exist
+but no emission site). Note an additive steer at `mlp_out` propagates
+identically to `post_block` — the branch is added to the residual stream —
+so `mlp_out` exists chiefly for patching (replace/ablate the MLP branch);
+`mlp_in` is the genuinely new steering site (its effect passes *through*
+the MLP nonlinearity).
 
 ## Global Steering API
 
@@ -571,6 +585,37 @@ do not, `/v1/steering/set` returns HTTP 500 labelled "Server-side
 invariant violation" naming the diverging ranks. This indicates a
 model-loading asymmetry (e.g., different weights loaded on different
 ranks) and not a user error.
+
+## Intervention Tier Template
+
+Steering is one of several residual-stream intervention tiers (activation
+patching is another; clamping follows the same shape). The payload-agnostic
+scaffolding a new tier reuses instead of hand-copying:
+
+- `vllm/model_executor/layers/intervention_common.py` — `hook_attrs` /
+  `derived_attrs` for the per-hook buffer attribute-name dicts (the values
+  are a runtime contract read by `getattr`-by-string), and `BufferKnob` for
+  config-first buffer sizing with a TEST-ONLY process-global fallback.
+- `vllm/model_executor/layers/intervention_kernel_common.py` — the kernel
+  warmup harness (`normalize_warmup_sizes` + `run_kernel_warmup` with
+  Triton-version-tolerant compiled-variant accounting); a tier's warmup
+  keeps only buffer allocation and a per-size `drive(n)` closure.
+- `vllm/v1/worker/phase_tiers.py` — `PhaseTiers`, the generic
+  base/prefill/decode container behind `SteeringManager`'s global tiers.
+- `vllm/v1/worker/steering_action_queue.py` —
+  `validate_vector_entries(vectors, steerable_layers, style)`, the single
+  vector-spec check core; callers supply a `VectorValidationStyle` (message
+  templates + unknown-layer skip/reject strictness).
+- `vllm/model_executor/layers/steering_table_layout.py` — `TableLayout` and
+  the reserved-row constants, the single definition of the steering row
+  space (row 0 sentinel, rows 1/2 global prefill/decode effective, then the
+  static and dynamic pools). Every buffer family that rides the steering
+  rows (scales, row monitors; clamps on adoption) must be congruent with
+  it — kernels gather through the shared `steering_index`, so a size
+  mismatch fails as silent garbage, not an error.
+
+The ops, kernels, and `register_*_buffers` bodies stay per-tier — payload
+semantics (add vs. lerp vs. bound) differ by design.
 
 ## References
 

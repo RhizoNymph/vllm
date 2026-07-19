@@ -55,7 +55,6 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -456,12 +455,17 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
-        # mlp_in/mlp_out bracket the MLP/MoE sublayer for transcoder training:
-        # mlp_in is the normed MLP input; mlp_out is the branch added to the
-        # residual stream, so post_block == post_attn + mlp_out.
-        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_in")
+        # mlp_in/mlp_out bracket the MLP/MoE sublayer: mlp_in is the normed
+        # MLP input; mlp_out is the branch added to the residual stream, so
+        # post_block == post_attn + mlp_out (in pristine runs). Both are
+        # injectable branch-tensor hooks.
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
         hidden_states = self.mlp(hidden_states)
-        maybe_capture_residual(hidden_states, self.layer_idx, "mlp_out")
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
         hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 

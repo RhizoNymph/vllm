@@ -18,6 +18,11 @@ from vllm.model_executor.layers.activation_capture import (
     maybe_capture_residual,
     maybe_capture_residual_add,
 )
+from vllm.model_executor.layers.intervention_common import derived_attrs
+from vllm.model_executor.layers.steering_table_layout import (
+    NUM_RESERVED_ROWS,
+    TableLayout,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
@@ -27,10 +32,13 @@ if TYPE_CHECKING:
 class SteeringHookPoint(str, Enum):
     """Positions in a decoder layer where steering can be applied.
 
-    All hook points operate on the residual skip tensor carried through
-    the decoder layer, not on the post-norm sublayer input tensor.
-    The names identify approximate regions of the layer where the
-    residual skip tensor is steered.
+    ``PRE_ATTN``/``POST_ATTN``/``POST_BLOCK`` operate on the residual skip
+    tensor carried through the decoder layer, not on the post-norm sublayer
+    input tensor. ``MLP_IN``/``MLP_OUT`` operate on the MLP *branch* tensor
+    bracketing the MLP sublayer; both are ``hidden_size``-wide and
+    TP-replicated (``mlp_out`` is tapped after the down-projection
+    all-reduce), so every hook point shares one width and injection
+    contract.
     """
 
     PRE_ATTN = "pre_attn"
@@ -46,12 +54,22 @@ class SteeringHookPoint(str, Enum):
     ``post_mlp`` hook, renamed and semantically corrected to the true block
     output)."""
 
+    MLP_IN = "mlp_in"
+    """Steer the normed MLP input (the branch tensor entering the MLP)."""
+
+    MLP_OUT = "mlp_out"
+    """Steer the MLP branch output before its deferred residual add. An
+    additive steer here propagates identically to ``POST_BLOCK``; the hook
+    exists chiefly for *patching* (replace/ablate the MLP branch)."""
+
 
 # Buffer attribute names on decoder layer modules, keyed by hook point.
 HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "steering_table_pre_attn",
     SteeringHookPoint.POST_ATTN: "steering_table_post_attn",
     SteeringHookPoint.POST_BLOCK: "steering_table_post_block",
+    SteeringHookPoint.MLP_IN: "steering_table_mlp_in",
+    SteeringHookPoint.MLP_OUT: "steering_table_mlp_out",
 }
 
 # Per-hook ``any-active`` flag attribute names. The flag is a single-element
@@ -59,18 +77,14 @@ HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
 # kernel reads it at launch and short-circuits the gather + add when no row
 # is currently active for that hook point. The attribute name is derived
 # from the table attribute so the two are always discoverable together.
-HOOK_POINT_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_any_active" for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
+HOOK_POINT_ANY_ACTIVE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_any_active")
 
 # Per-hook dedicated dynamic-tier vector attribute names (§5.4). A single
 # fp32 ``(hidden,)`` buffer per hook point holding that hook's global
 # dynamic-tier vector; the apply kernel adds ``dynamic_vec * token_scales``
 # on top of the row gather, gated per token (decode-only). Derived from the
 # table attribute so the two are discoverable together.
-HOOK_POINT_DYNVEC_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_dynvec" for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
+HOOK_POINT_DYNVEC_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_dynvec")
 
 # Per-hook in-graph monitor buffers (Phase 2, §8). At a probe site one
 # ``(layer, hook)`` carries a probe vector ``(hidden,)``, a ``(3,)`` param
@@ -80,18 +94,9 @@ HOOK_POINT_DYNVEC_ATTR: dict[SteeringHookPoint, str] = {
 # per-token gate into the shared ``steering_token_scales`` buffer, which
 # the §5.4 dynamic tier then multiplies by. Derived from the table
 # attribute so they are discoverable together.
-HOOK_POINT_MONITOR_PROBE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_probe"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
-HOOK_POINT_MONITOR_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_params"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
-HOOK_POINT_MONITOR_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_active"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
+HOOK_POINT_MONITOR_PROBE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_probe")
+HOOK_POINT_MONITOR_PARAMS_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_params")
+HOOK_POINT_MONITOR_ACTIVE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_active")
 
 # Per-hook PER-ROW monitor buffers (per-request in-graph monitor). Unlike the
 # single global probe above, these hold one probe + ``[threshold, sharpness]``
@@ -102,18 +107,9 @@ HOOK_POINT_MONITOR_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
 # registered at a ``(1, 1)`` dummy size and resized to ``(rows, hidden)`` by
 # :func:`resize_steering_row_monitor_buffers` only when the engine enables the
 # row monitor — so the op signature stays stable without per-model edits.
-HOOK_POINT_ROW_PROBE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_probe_table"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
-HOOK_POINT_ROW_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_row_params"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
-HOOK_POINT_ROW_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"{table_attr}_monitor_row_active"
-    for hp, table_attr in HOOK_POINT_TABLE_ATTR.items()
-}
+HOOK_POINT_ROW_PROBE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_probe_table")
+HOOK_POINT_ROW_PARAMS_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_row_params")
+HOOK_POINT_ROW_ACTIVE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_row_active")
 
 # Default per-row monitor params: threshold -1e30, sharpness 1.0. With a
 # default-zero probe this gives ``sigmoid(1*(0 - (-1e30))) == 1.0`` exactly, so
@@ -231,10 +227,14 @@ def register_steering_buffers(
     if max_steering_configs == 0:
         return
     table_dtype = dtype if dtype is not None else torch.float32
+    # ``max_steering_configs`` here is the COMBINED pool from
+    # ``get_steering_buffer_config`` (static + dynamic); the row space adds
+    # the reserved sentinel/global rows on top.
+    num_rows = NUM_RESERVED_ROWS + max_steering_configs
     for hp in SteeringHookPoint:
         module.register_buffer(
             HOOK_POINT_TABLE_ATTR[hp],
-            torch.zeros(max_steering_configs + 3, hidden_size, dtype=table_dtype),
+            torch.zeros(num_rows, hidden_size, dtype=table_dtype),
             persistent=False,
         )
         # Per-hook activity flag.  A single-element bool tensor that the
@@ -371,7 +371,7 @@ def register_steering_buffers(
     # every layer's buffer during populate.
     module.register_buffer(
         "steering_scales",
-        torch.ones(max_steering_configs + 3, dtype=torch.float32),
+        torch.ones(num_rows, dtype=torch.float32),
         persistent=False,
     )
 
@@ -391,10 +391,7 @@ def get_steering_buffer_config(vllm_config: "VllmConfig") -> tuple[int, int]:
     steering_config = getattr(vllm_config, "steering_config", None)
     if steering_config is None:
         return max_tokens, 0
-    max_configs = steering_config.max_steering_configs + getattr(
-        steering_config, "max_dynamic_steering_configs", 0
-    )
-    return max_tokens, max_configs
+    return max_tokens, TableLayout.from_steering_config(steering_config).pool_rows
 
 
 def get_steering_buffer_dtype(vllm_config: "VllmConfig") -> torch.dtype:
