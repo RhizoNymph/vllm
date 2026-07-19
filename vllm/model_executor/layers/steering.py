@@ -19,6 +19,10 @@ from vllm.model_executor.layers.activation_capture import (
     maybe_capture_residual_add,
 )
 from vllm.model_executor.layers.intervention_common import derived_attrs
+from vllm.model_executor.layers.steering_table_layout import (
+    NUM_RESERVED_ROWS,
+    TableLayout,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
@@ -100,15 +104,9 @@ HOOK_POINT_MONITOR_ACTIVE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_
 # registered at a ``(1, 1)`` dummy size and resized to ``(rows, hidden)`` by
 # :func:`resize_steering_row_monitor_buffers` only when the engine enables the
 # row monitor — so the op signature stays stable without per-model edits.
-HOOK_POINT_ROW_PROBE_ATTR = derived_attrs(
-    HOOK_POINT_TABLE_ATTR, "_monitor_probe_table"
-)
-HOOK_POINT_ROW_PARAMS_ATTR = derived_attrs(
-    HOOK_POINT_TABLE_ATTR, "_monitor_row_params"
-)
-HOOK_POINT_ROW_ACTIVE_ATTR = derived_attrs(
-    HOOK_POINT_TABLE_ATTR, "_monitor_row_active"
-)
+HOOK_POINT_ROW_PROBE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_probe_table")
+HOOK_POINT_ROW_PARAMS_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_row_params")
+HOOK_POINT_ROW_ACTIVE_ATTR = derived_attrs(HOOK_POINT_TABLE_ATTR, "_monitor_row_active")
 
 # Default per-row monitor params: threshold -1e30, sharpness 1.0. With a
 # default-zero probe this gives ``sigmoid(1*(0 - (-1e30))) == 1.0`` exactly, so
@@ -161,10 +159,14 @@ def register_steering_buffers(
     if max_steering_configs == 0:
         return
     table_dtype = dtype if dtype is not None else torch.float32
+    # ``max_steering_configs`` here is the COMBINED pool from
+    # ``get_steering_buffer_config`` (static + dynamic); the row space adds
+    # the reserved sentinel/global rows on top.
+    num_rows = NUM_RESERVED_ROWS + max_steering_configs
     for hp in SteeringHookPoint:
         module.register_buffer(
             HOOK_POINT_TABLE_ATTR[hp],
-            torch.zeros(max_steering_configs + 3, hidden_size, dtype=table_dtype),
+            torch.zeros(num_rows, hidden_size, dtype=table_dtype),
             persistent=False,
         )
         # Per-hook activity flag.  A single-element bool tensor that the
@@ -301,7 +303,7 @@ def register_steering_buffers(
     # every layer's buffer during populate.
     module.register_buffer(
         "steering_scales",
-        torch.ones(max_steering_configs + 3, dtype=torch.float32),
+        torch.ones(num_rows, dtype=torch.float32),
         persistent=False,
     )
 
@@ -321,10 +323,7 @@ def get_steering_buffer_config(vllm_config: "VllmConfig") -> tuple[int, int]:
     steering_config = getattr(vllm_config, "steering_config", None)
     if steering_config is None:
         return max_tokens, 0
-    max_configs = steering_config.max_steering_configs + getattr(
-        steering_config, "max_dynamic_steering_configs", 0
-    )
-    return max_tokens, max_configs
+    return max_tokens, TableLayout.from_steering_config(steering_config).pool_rows
 
 
 def get_steering_buffer_dtype(vllm_config: "VllmConfig") -> torch.dtype:

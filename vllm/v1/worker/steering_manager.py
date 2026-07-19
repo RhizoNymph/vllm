@@ -62,6 +62,11 @@ from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
+from vllm.model_executor.layers.steering_table_layout import (
+    NUM_RESERVED_ROWS,
+    TableLayout,
+    global_row_for_phase,
+)
 from vllm.v1.worker.phase_tiers import PhaseTiers
 from vllm.v1.worker.steering_owner import OwnerStore, RowOwner
 
@@ -159,22 +164,19 @@ class SteeringManager:
         ] = {}
         # (config_hash, phase) -> number of active requests using this config
         self.config_refcounts: dict[tuple[int, str], int] = defaultdict(int)
-        # Available row indices (rows 3 through max_steering_configs + 2)
-        # Reversed so pop() gives lowest
-        self.free_rows: list[int] = list(range(max_steering_configs + 2, 2, -1))
+        self._layout = TableLayout(
+            num_configs=max_steering_configs,
+            num_dynamic=max_dynamic_steering_configs,
+        )
+        # Available static-pool rows, reversed so pop() gives lowest.
+        self.free_rows: list[int] = list(reversed(self._layout.config_rows))
 
         # Dynamic-override pool (rows above the static pool). Allocated
         # and released only by the dynamic steering path; deterministic
         # monotonically increasing ids keep ranks in lock-step because
         # the register/release call sequence is identical on every rank
         # (rank-replicated sync consumers). Ids are never reused.
-        self._dynamic_free_rows: list[int] = list(
-            range(
-                max_steering_configs + 2 + max_dynamic_steering_configs,
-                max_steering_configs + 2,
-                -1,
-            )
-        )
+        self._dynamic_free_rows: list[int] = list(reversed(self._layout.dynamic_rows))
         # dyn_id -> {hook_point_str: {layer_idx: tensor}} (override
         # vectors only, not combined). Insertion-ordered.
         self._dynamic_vectors: dict[int, dict[str, dict[int, torch.Tensor]]] = {}
@@ -671,7 +673,7 @@ class SteeringManager:
         output of requests that asked for per-request steering.
         """
         if config_hash == 0:
-            return 1 if is_prefill else 2
+            return global_row_for_phase(is_prefill)
         phase = "prefill" if is_prefill else "decode"
         row = self.config_to_row.get((config_hash, phase))
         if row is not None:
@@ -991,7 +993,7 @@ class SteeringManager:
         ordered_dynamic = self._cached_ordered_dynamic or list(
             self._dynamic_to_row.items()
         )
-        num_rows = 3 + len(ordered_configs) + len(ordered_dynamic)
+        num_rows = NUM_RESERVED_ROWS + len(ordered_configs) + len(ordered_dynamic)
         thr0, sharp0 = _ROW_MONITOR_DEFAULT_PARAMS
         probe_mat = torch.zeros(
             num_rows, hidden_size, dtype=torch.float32, device=device
@@ -1514,7 +1516,7 @@ class SteeringManager:
                 self._dynamic_to_row.items()
             )
             target_indices_list = (
-                [0, 1, 2]
+                list(range(NUM_RESERVED_ROWS))
                 + [row for _, row in new_ordered_configs]
                 + [row for _, row in new_ordered_dynamic]
             )
@@ -1538,7 +1540,7 @@ class SteeringManager:
         # up shape ``(num_active_tables, num_rows, hidden)``. We do ONE
         # ``.to(dtype=table.dtype)`` cast on the whole stack instead of
         # per-(hook, layer), then index_copy_ each layer's slice.
-        num_rows = 3 + len(ordered_configs) + len(ordered_dynamic)
+        num_rows = NUM_RESERVED_ROWS + len(ordered_configs) + len(ordered_dynamic)
         per_table_rows: list[list[torch.Tensor]] = []
         for _table, hp_str, layer_idx, _mod in active_tables:
             base_vec = self._get_global_vec(hp_str, layer_idx, self.global_base_vectors)
