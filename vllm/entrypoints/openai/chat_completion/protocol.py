@@ -845,9 +845,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
-            steering_clamps=coerce_clamp_spec(self.steering_clamps),
-            prefill_steering_clamps=coerce_clamp_spec(self.prefill_steering_clamps),
-            decode_steering_clamps=coerce_clamp_spec(self.decode_steering_clamps),
+            # unpack_packed: SamplingParams' typed clamp fields only admit the
+            # canonical int-keyed shape; a packed tier kept verbatim would be
+            # rejected by the engine-core msgpack decoder on the ZMQ hop.
+            steering_clamps=coerce_clamp_spec(self.steering_clamps, unpack_packed=True),
+            prefill_steering_clamps=coerce_clamp_spec(
+                self.prefill_steering_clamps, unpack_packed=True
+            ),
+            decode_steering_clamps=coerce_clamp_spec(
+                self.decode_steering_clamps, unpack_packed=True
+            ),
         )
         # Attach the capture dict (keyed by consumer name). The
         # entrypoint's ``_admit_capture`` mutates each value in place
