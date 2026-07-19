@@ -43,18 +43,14 @@ first ``N`` entries read).
 
 from __future__ import annotations
 
-import time
-
 import torch
 
-from vllm.logger import init_logger
-from vllm.model_executor.layers.steering_kernel import (
-    _choose_block_h,
-    _default_warmup_sizes,
+from vllm.model_executor.layers.intervention_kernel_common import (
+    normalize_warmup_sizes,
+    run_kernel_warmup,
 )
+from vllm.model_executor.layers.steering_kernel import _choose_block_h
 from vllm.triton_utils import tl, triton
-
-logger = init_logger(__name__)
 
 
 @triton.jit
@@ -403,8 +399,7 @@ def warmup_apply_clamp_kernel(
     if device.type != "cuda" or max_directions <= 0:
         return
 
-    sizes = capture_sizes if capture_sizes else _default_warmup_sizes()
-    sizes = sorted({int(s) for s in sizes if int(s) > 0})
+    sizes = normalize_warmup_sizes(capture_sizes)
     if not sizes:
         return
 
@@ -424,8 +419,7 @@ def warmup_apply_clamp_kernel(
     index_buf = torch.zeros(max_n, dtype=torch.long, device=device)
     active_flag = torch.zeros(1, dtype=torch.bool, device=device)
 
-    t0 = time.perf_counter()
-    for n in sizes:
+    def drive(n: int) -> None:
         for active in (False, True):
             active_flag.fill_(active)
             torch.ops.vllm.apply_clamp(
@@ -445,11 +439,11 @@ def warmup_apply_clamp_kernel(
                 index_buf[:n],
                 active_flag,
             )
-    torch.accelerator.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info(
-        "clamp kernel warmup: shapes=%d K=%d elapsed_ms=%.1f",
-        len(sizes),
-        max_directions,
-        elapsed_ms,
+
+    run_kernel_warmup(
+        label="clamp",
+        kernels=(_apply_clamp_kernel, _apply_clamp_block_kernel),
+        sizes=sizes,
+        drive=drive,
+        dump_env_var="VLLM_CLAMP_DUMP_JIT_CACHE",
     )

@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.intervention_common import BufferKnob, hook_attrs
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
@@ -58,30 +59,10 @@ if TYPE_CHECKING:
 
 
 # Buffer attribute names on decoder layer modules, keyed by hook point.
-CLAMP_DIRS_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"steering_clamp_dirs_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
-}
-CLAMP_BOUNDS_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"steering_clamp_bounds_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
-}
-CLAMP_STRENGTH_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"steering_clamp_strength_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
-}
-CLAMP_ANY_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    hp: f"steering_clamp_any_active_{hp.value}" for hp in HOOK_POINT_TABLE_ATTR
-}
-
-# Process-global direction count, consulted only when no VllmConfig context
-# exists (unit tests constructing layers directly) — mirrors the patch-slot
-# global in :mod:`vllm.model_executor.layers.patch`.  ``0`` => clamping
-# disabled, no buffers attached, and the folded apply path constant-folds out.
-_CLAMP_MAX_DIRECTIONS: int = 0
-
-
-def set_clamp_buffer_directions(max_directions: int) -> None:
-    """TEST-ONLY override of the clamp direction count (0 disables)."""
-    global _CLAMP_MAX_DIRECTIONS
-    _CLAMP_MAX_DIRECTIONS = int(max_directions)
+CLAMP_DIRS_ATTR = hook_attrs("steering_clamp_dirs", HOOK_POINT_TABLE_ATTR)
+CLAMP_BOUNDS_ATTR = hook_attrs("steering_clamp_bounds", HOOK_POINT_TABLE_ATTR)
+CLAMP_STRENGTH_ATTR = hook_attrs("steering_clamp_strength", HOOK_POINT_TABLE_ATTR)
+CLAMP_ANY_ACTIVE_ATTR = hook_attrs("steering_clamp_any_active", HOOK_POINT_TABLE_ATTR)
 
 
 def get_clamp_directions_config(vllm_config: VllmConfig) -> int:
@@ -92,20 +73,20 @@ def get_clamp_directions_config(vllm_config: VllmConfig) -> int:
     return int(getattr(steering_config, "max_clamp_directions", 0))
 
 
+# Direction-count knob (see :class:`BufferKnob`): config-first at
+# registration time, TEST-ONLY process-global fallback. ``0`` => clamping
+# disabled, no buffers attached, and the folded apply path constant-folds out.
+_clamp_directions_knob = BufferKnob(get_clamp_directions_config)
+
+
+def set_clamp_buffer_directions(max_directions: int) -> None:
+    """TEST-ONLY override of the clamp direction count (0 disables)."""
+    _clamp_directions_knob.set_for_tests(max_directions)
+
+
 def _resolve_clamp_directions() -> int:
-    """Resolve K at buffer-registration time.
-
-    Primary source is the *current* ``VllmConfig`` (models are always built
-    under ``set_current_vllm_config``); the process global is consulted only
-    when no config context exists — unit tests constructing layers directly.
-    Mirrors ``_resolve_patch_buffer_slots``.
-    """
-    from vllm.config import get_current_vllm_config_or_none
-
-    vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is not None:
-        return get_clamp_directions_config(vllm_config)
-    return _CLAMP_MAX_DIRECTIONS
+    """Resolve K at buffer-registration time (config-first, see the knob)."""
+    return _clamp_directions_knob.resolve()
 
 
 def register_clamp_buffers(

@@ -601,11 +601,9 @@ class SteeringModelRunnerMixin:
 
                 warmup_apply_clamp_kernel(
                     hidden_size=hidden_size,
-                    table_rows=(
-                        steering_config.max_steering_configs
-                        + getattr(steering_config, "max_dynamic_steering_configs", 0)
-                        + 3
-                    ),
+                    table_rows=TableLayout.from_steering_config(
+                        steering_config
+                    ).num_rows,
                     max_directions=self._max_clamp_directions,
                     table_dtype=table_dtype,
                     compute_dtype=compute_dtype,

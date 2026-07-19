@@ -225,9 +225,9 @@ class SteeringManager:
         self.config_clamps: dict[
             tuple[int, str], dict[str, dict[int, ClampSitePayload]]
         ] = {}
-        self.global_clamp_base: dict[str, dict[int, ClampSitePayload]] = {}
-        self.global_clamp_prefill: dict[str, dict[int, ClampSitePayload]] = {}
-        self.global_clamp_decode: dict[str, dict[int, ClampSitePayload]] = {}
+        self._global_clamps: PhaseTiers[dict[str, dict[int, ClampSitePayload]]] = (
+            PhaseTiers(base={}, prefill={}, decode={}, label="global clamp")
+        )
 
         # Dynamic additive tier (decode-only): a global steering
         # contribution owned by dynamic consumers, held in a dedicated
@@ -925,35 +925,33 @@ class SteeringManager:
 
     def clear_global_clamps(self) -> None:
         """Clear all cached global clamps across all phases and hook points."""
-        self.global_clamp_base.clear()
-        self.global_clamp_prefill.clear()
-        self.global_clamp_decode.clear()
+        self._global_clamps.clear_all()
         self._dirty.mark_content()
+
+    # Tier dict names are tested contract (and read across the populate
+    # path); expose the PhaseTiers fields under the historical names.
+    @property
+    def global_clamp_base(self) -> dict[str, dict[int, ClampSitePayload]]:
+        return self._global_clamps.base
+
+    @property
+    def global_clamp_prefill(self) -> dict[str, dict[int, ClampSitePayload]]:
+        return self._global_clamps.prefill
+
+    @property
+    def global_clamp_decode(self) -> dict[str, dict[int, ClampSitePayload]]:
+        return self._global_clamps.decode
 
     def _global_clamp_dict_for_phase(
         self, phase: str
     ) -> dict[str, dict[int, ClampSitePayload]]:
         """Return the global clamp dict for the given phase."""
-        if phase == "base":
-            return self.global_clamp_base
-        elif phase == "prefill":
-            return self.global_clamp_prefill
-        elif phase == "decode":
-            return self.global_clamp_decode
-        else:
-            raise ValueError(
-                f"Invalid global clamp phase: {phase!r}. "
-                f"Must be 'base', 'prefill', or 'decode'."
-            )
+        return self._global_clamps.for_phase(phase)
 
     @property
     def has_global_clamps(self) -> bool:
         """True when any global clamp tier has at least one site."""
-        return bool(
-            self.global_clamp_base
-            or self.global_clamp_prefill
-            or self.global_clamp_decode
-        )
+        return bool(self._global_clamps)
 
     @property
     def has_any_clamps(self) -> bool:
