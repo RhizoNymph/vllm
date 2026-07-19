@@ -1159,8 +1159,14 @@ class SamplingParams(
                         f"{field_name}[{hook_name!r}] must be a dict "
                         f"mapping layer indices to clamp entry lists."
                     )
+                coerced_layers: dict[int, list] = {}
                 for key, entries in layer_entries.items():
                     prefix = f"{field_name}[{hook_name!r}][{key!r}]"
+                    # Layer keys arrive as strings from frontends that
+                    # forward JSON verbatim (the Rust server); coerce
+                    # like every other ingestion seam.
+                    if isinstance(key, str) and key.isdigit():
+                        key = int(key)
                     if not isinstance(key, int) or key < 0:
                         raise ValueError(
                             f"{field_name}[{hook_name!r}] keys must be "
@@ -1182,6 +1188,8 @@ class SamplingParams(
                             "max": hi,
                             "strength": strength,
                         }
+                    coerced_layers[key] = entries
+                spec[hook_name] = coerced_layers
 
     def _validate_single_steering_spec(
         self, field_name: str, spec: SteeringVectorSpec
