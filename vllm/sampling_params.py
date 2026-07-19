@@ -469,8 +469,17 @@ class SamplingParams(
     """Phase-specific steering vectors added to base during decode only.
     Same format as ``steering_vectors``."""
 
-    steering_clamps: SteeringClampSpec | None = None
+    steering_clamps: dict[str, Any] | None = None
     """Base directional clamps applied to both prefill and decode phases.
+
+    Typed loosely (per-hook ``Any``) because the field legitimately holds
+    either shape on the wire: the canonical ``SteeringClampSpec``
+    (int-keyed layer dicts) or the binary ``SteeringClampSpecPacked``
+    hook blobs that ``maybe_pack_inline_steering_for_request`` swaps in
+    before the multiprocessing hop.  A union of two dict types is not
+    msgspec-decodable, and a strict canonical annotation makes the
+    engine-core decoder reject every packed request.
+    ``_validate_steering_clamps`` deep-validates both shapes on decode.
     Keyed by hook point name, then layer index; values are LISTS of clamp
     entries ``{"vector": [...], "min": float|None, "max": float|None,
     "strength": float = 1.0}`` (sugar: ``{"vector", "value": c}`` pins
@@ -481,13 +490,13 @@ class SamplingParams(
     in unit-projection space.  Unlike ``steering_vectors``, tier merging
     concatenates entries (independent constraints, not addable vectors)."""
 
-    prefill_steering_clamps: SteeringClampSpec | None = None
+    prefill_steering_clamps: dict[str, Any] | None = None
     """Phase-specific clamps concatenated after base during prefill only.
-    Same format as ``steering_clamps``."""
+    Same format (and same loose typing) as ``steering_clamps``."""
 
-    decode_steering_clamps: SteeringClampSpec | None = None
+    decode_steering_clamps: dict[str, Any] | None = None
     """Phase-specific clamps concatenated after base during decode only.
-    Same format as ``steering_clamps``."""
+    Same format (and same loose typing) as ``steering_clamps``."""
 
     _effective_prefill_steering_packed: dict[str, dict[int, np.ndarray]] | None = None
     """In-process pre-resolved + packed prefill-phase steering, in the

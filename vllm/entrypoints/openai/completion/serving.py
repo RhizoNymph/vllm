@@ -366,7 +366,6 @@ class OpenAIServingCompletion(OpenAIServing):
                 # vectors over multiprocessing.
                 if steering_module_ref is not None:
                     sampling_params.steering_module_ref = steering_module_ref
-
             request_id_item = f"{request_id}-{i}"
 
             # Per-request capture-consumer admission validation. Each
