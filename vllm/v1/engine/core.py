@@ -1707,7 +1707,17 @@ class EngineCoreProc(EngineCore):
                     # Deserialize the request data.
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
-                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        try:
+                            req: EngineCoreRequest = add_request_decoder.decode(
+                                data_frames
+                            )
+                        except Exception:
+                            # A malformed ADD must not kill this thread: that
+                            # wedges the engine for every subsequent request.
+                            # The sender's request hangs (its id is unknown
+                            # here), but the server survives.
+                            logger.exception("Dropping undecodable ADD request frame")
+                            continue
                         try:
                             request = self.preprocess_add_request(req)
                         except Exception:
