@@ -70,6 +70,7 @@ import torch
 from torch import nn
 
 from vllm.config.sae_steering_types import SAEActivation
+from vllm.model_executor.layers.intervention_common import hook_attrs
 from vllm.model_executor.layers.sae_steering import (
     _ACTIVATION_TO_CODE,
     _CODE_TO_ACTIVATION,
@@ -88,86 +89,44 @@ from vllm.utils.torch_utils import direct_register_custom_op
 # Per-(layer, hook) buffer attribute names.  Flat per-hook attrs (not
 # a sub-Module wrapper) so ``torch.compile`` traces them as concrete
 # buffer references rather than container introspection — the same
-# rationale as :mod:`sae_steering`.
+# rationale as :mod:`sae_steering`.  Full reconstruction hooks only
+# the residual sites (no MLP-branch hooks).
+_FR_HOOKS = (
+    SteeringHookPoint.PRE_ATTN,
+    SteeringHookPoint.POST_ATTN,
+    SteeringHookPoint.POST_BLOCK,
+)
 
 # Full SAE encoder / decoder weight tensors, shared across all rows.
-HOOK_POINT_FR_ENCODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_encoder_weight_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_encoder_weight_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_encoder_weight_post_block",
-}
-HOOK_POINT_FR_ENCODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_encoder_bias_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_encoder_bias_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_encoder_bias_post_block",
-}
-HOOK_POINT_FR_DECODER_WEIGHT_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_decoder_weight_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_decoder_weight_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_decoder_weight_post_block",
-}
-HOOK_POINT_FR_DECODER_BIAS_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_decoder_bias_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_decoder_bias_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_decoder_bias_post_block",
-}
+HOOK_POINT_FR_ENCODER_WEIGHT_ATTR = hook_attrs("sae_fr_encoder_weight", _FR_HOOKS)
+HOOK_POINT_FR_ENCODER_BIAS_ATTR = hook_attrs("sae_fr_encoder_bias", _FR_HOOKS)
+HOOK_POINT_FR_DECODER_WEIGHT_ATTR = hook_attrs("sae_fr_decoder_weight", _FR_HOOKS)
+HOOK_POINT_FR_DECODER_BIAS_ATTR = hook_attrs("sae_fr_decoder_bias", _FR_HOOKS)
 # Per-feature JumpReLU thresholds over the *full* ``d_sae`` feature
 # axis.  Registered for every site (zero-filled for ReLU/TopK) so the
 # op arity stays fixed across activations.
-HOOK_POINT_FR_THRESHOLD_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_threshold_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_threshold_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_threshold_post_block",
-}
+HOOK_POINT_FR_THRESHOLD_ATTR = hook_attrs("sae_fr_threshold", _FR_HOOKS)
 # Per-row clamp tables: row ``r`` carries the clamp state for tokens
 # whose ``sae_recon_index`` selects ``r``.  Row 0 is reserved as the
 # "no reconstruction" sentinel — a token that maps to row 0 passes
 # through unchanged because :func:`apply_layer_sae_full_reconstruction`
 # derives ``recon_mask`` from this site's active-row table.
-HOOK_POINT_FR_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_kind_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_clamp_kind_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_clamp_kind_post_block",
-}
-HOOK_POINT_FR_CLAMP_VALUE_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_value_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_clamp_value_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_clamp_value_post_block",
-}
-HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_only_if_active_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_clamp_only_if_active_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_clamp_only_if_active_post_block",
-}
-HOOK_POINT_FR_ROW_ACTIVE_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_row_active_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_row_active_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_row_active_post_block",
-}
+HOOK_POINT_FR_CLAMP_KIND_ATTR = hook_attrs("sae_fr_clamp_kind", _FR_HOOKS)
+HOOK_POINT_FR_CLAMP_VALUE_ATTR = hook_attrs("sae_fr_clamp_value", _FR_HOOKS)
+HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR = hook_attrs(
+    "sae_fr_clamp_only_if_active", _FR_HOOKS
+)
+HOOK_POINT_FR_ROW_ACTIVE_ATTR = hook_attrs("sae_fr_row_active", _FR_HOOKS)
 # Clampable global feature indices for this site (constant per
 # manifest registration).
-HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_clampable_features_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_clampable_features_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_clampable_features_post_block",
-}
+HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR = hook_attrs(
+    "sae_fr_clampable_features", _FR_HOOKS
+)
 # Module name + activation are Python attributes — read as per-site
 # constants by the kernel.
-HOOK_POINT_FR_MODULE_NAME_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_module_name_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_module_name_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_module_name_post_block",
-}
-HOOK_POINT_FR_ACTIVATION_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_activation_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_activation_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_activation_post_block",
-}
-HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR: dict[SteeringHookPoint, str] = {
-    SteeringHookPoint.PRE_ATTN: "sae_fr_activation_params_pre_attn",
-    SteeringHookPoint.POST_ATTN: "sae_fr_activation_params_post_attn",
-    SteeringHookPoint.POST_BLOCK: "sae_fr_activation_params_post_block",
-}
+HOOK_POINT_FR_MODULE_NAME_ATTR = hook_attrs("sae_fr_module_name", _FR_HOOKS)
+HOOK_POINT_FR_ACTIVATION_ATTR = hook_attrs("sae_fr_activation", _FR_HOOKS)
+HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR = hook_attrs("sae_fr_activation_params", _FR_HOOKS)
 
 # Buffer attribute tables — used by :func:`unregister_sae_full_recon_buffers`
 # to delete every per-(hook) buffer in one pass.
@@ -741,9 +700,7 @@ def apply_sae_full_reconstruction(
             f"got {clamp_only_if_active.dtype}."
         )
     if activation is SAEActivation.JUMPRELU and threshold is None:
-        raise ValueError(
-            "JumpReLU requires a per-feature threshold tensor; got None."
-        )
+        raise ValueError("JumpReLU requires a per-feature threshold tensor; got None.")
     if threshold is not None:
         if tuple(threshold.shape) != (d_sae,):
             raise ValueError(
@@ -751,9 +708,7 @@ def apply_sae_full_reconstruction(
                 f"got {tuple(threshold.shape)}."
             )
         if threshold.dtype != torch.float32:
-            raise ValueError(
-                f"threshold must be torch.float32; got {threshold.dtype}."
-            )
+            raise ValueError(f"threshold must be torch.float32; got {threshold.dtype}.")
 
     if n_clamp > 0 and not clampable_features.is_cuda:
         min_feature = int(clampable_features.min().item())
@@ -781,9 +736,7 @@ def apply_sae_full_reconstruction(
     if threshold is None:
         # ReLU/TopK: keep the op arity fixed with a zero-filled vector
         # that the op only reads under the JumpReLU branch.
-        threshold = torch.zeros(
-            d_sae, dtype=torch.float32, device=hidden_states.device
-        )
+        threshold = torch.zeros(d_sae, dtype=torch.float32, device=hidden_states.device)
 
     code = _ACTIVATION_TO_CODE[activation]
     param = _activation_to_scalar(activation, activation_params)

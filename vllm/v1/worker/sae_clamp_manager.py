@@ -41,6 +41,10 @@ from vllm.config.sae_steering_types import (
     validate_sae_clamp_specs_no_overlap,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.steering_table_layout import (
+    TableLayout,
+    global_row_for_phase,
+)
 
 logger = init_logger(__name__)
 
@@ -94,9 +98,13 @@ class SAEClampManager:
         self._content_to_row: dict[tuple[int, str], int] = {}
         self._content_specs: dict[tuple[int, str], tuple[SAEClampSpec, ...]] = {}
         self._content_refcounts: dict[tuple[int, str], int] = defaultdict(int)
+        # The SAE clamp table is a parallel row space with the SAME shape
+        # as the steering tables (sentinel / global prefill / global decode
+        # / config pool), so it shares the layout definition.
+        self._layout = TableLayout(num_configs=max_sae_configs)
         # Reversed so pop() returns the lowest free per-request row —
         # symmetric and deterministic across ranks.
-        self.free_rows: list[int] = list(range(max_sae_configs + 2, 2, -1))
+        self.free_rows: list[int] = list(reversed(self._layout.config_rows))
 
         # Global SAE clamp tier.  Per-phase tuples of
         # :class:`SAEClampSpec`; the populator materializes these into
@@ -116,9 +124,7 @@ class SAEClampManager:
         # Initialized True so the first populate call always runs.
         self._tables_dirty: bool = True
 
-    def _global_specs_for_phase_unchecked(
-        self, phase: str
-    ) -> tuple[SAEClampSpec, ...]:
+    def _global_specs_for_phase_unchecked(self, phase: str) -> tuple[SAEClampSpec, ...]:
         if phase == "prefill":
             return self.global_prefill_specs
         if phase == "decode":
@@ -292,7 +298,7 @@ class SAEClampManager:
         additive manager.
         """
         if config_hash == 0:
-            return 1 if is_prefill else 2
+            return global_row_for_phase(is_prefill)
         phase = "prefill" if is_prefill else "decode"
         row = self.config_to_row.get((config_hash, phase))
         if row is not None:
@@ -370,9 +376,7 @@ class SAEClampManager:
         """Return True iff any global SAE clamps are configured."""
         return bool(self.global_prefill_specs) or bool(self.global_decode_specs)
 
-    def global_specs_for_phase(
-        self, phase: str
-    ) -> tuple[SAEClampSpec, ...]:
+    def global_specs_for_phase(self, phase: str) -> tuple[SAEClampSpec, ...]:
         """Return the global spec tuple for ``phase``.
 
         Used by the per-layer populator to materialise rows 1 and 2.

@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import torch
 
+from vllm.model_executor.layers.intervention_kernel_common import run_kernel_warmup
 from vllm.triton_utils import tl, triton
 
 # Activation codes — kept in sync with ``sae_steering.py``.  A constexpr
@@ -154,9 +155,9 @@ def _apply_sae_delta_kernel(
     if ACTIVATION_CODE == 0:  # ReLU
         f = tl.maximum(pre_acts, 0.0)
     elif ACTIVATION_CODE == 1:  # JumpReLU — per-feature thresholds.
-        thr = tl.load(
-            threshold_ptr + c_idx * thr_stride, mask=c_mask, other=0.0
-        ).to(tl.float32)
+        thr = tl.load(threshold_ptr + c_idx * thr_stride, mask=c_mask, other=0.0).to(
+            tl.float32
+        )
         f = tl.where(pre_acts > thr, pre_acts, 0.0)
     else:  # TopK among the clampable subset.
         # rank[i] = number of valid lanes j that sort before i by
@@ -320,9 +321,9 @@ def _apply_sae_delta_indexed_kernel(
     if ACTIVATION_CODE == 0:
         f = tl.maximum(pre_acts, 0.0)
     elif ACTIVATION_CODE == 1:  # JumpReLU — per-feature thresholds.
-        thr = tl.load(
-            threshold_ptr + c_idx * thr_stride, mask=c_mask, other=0.0
-        ).to(tl.float32)
+        thr = tl.load(threshold_ptr + c_idx * thr_stride, mask=c_mask, other=0.0).to(
+            tl.float32
+        )
         f = tl.where(pre_acts > thr, pre_acts, 0.0)
     else:
         masked = tl.where(c_mask, pre_acts, float("-inf"))
@@ -662,30 +663,43 @@ def warmup_apply_sae_delta_kernel(
     dummy_only = torch.zeros(1, n_clamp, dtype=torch.bool, device=device)
     dummy_any_active = torch.zeros(1, dtype=torch.bool, device=device)
     dummy_index = torch.zeros(1, dtype=torch.long, device=device)
-    apply_sae_delta_triton(
-        dummy_hidden,
-        dummy_enc_w,
-        dummy_enc_b,
-        dummy_threshold,
-        dummy_dec_w,
-        dummy_kind,
-        dummy_value,
-        dummy_only,
-        dummy_any_active,
-        activation_code,
-        activation_param,
-    )
-    apply_sae_delta_indexed_triton(
-        dummy_hidden,
-        dummy_enc_w,
-        dummy_enc_b,
-        dummy_threshold,
-        dummy_dec_w,
-        dummy_kind,
-        dummy_value,
-        dummy_only,
-        dummy_index,
-        dummy_any_active,
-        activation_code,
-        activation_param,
+
+    def drive(n: int) -> None:
+        apply_sae_delta_triton(
+            dummy_hidden[:n],
+            dummy_enc_w,
+            dummy_enc_b,
+            dummy_threshold,
+            dummy_dec_w,
+            dummy_kind,
+            dummy_value,
+            dummy_only,
+            dummy_any_active,
+            activation_code,
+            activation_param,
+        )
+        apply_sae_delta_indexed_triton(
+            dummy_hidden[:n],
+            dummy_enc_w,
+            dummy_enc_b,
+            dummy_threshold,
+            dummy_dec_w,
+            dummy_kind,
+            dummy_value,
+            dummy_only,
+            dummy_index[:n],
+            dummy_any_active,
+            activation_code,
+            activation_param,
+        )
+
+    # Single-token drive by design: the binaries specialise on
+    # ``activation_code``/``BLOCK_H``/``BLOCK_C``, not the batch dim, so
+    # one launch per op suffices (the harness adds variant accounting).
+    run_kernel_warmup(
+        label="sae delta",
+        kernels=(_apply_sae_delta_kernel, _apply_sae_delta_indexed_kernel),
+        sizes=[1],
+        drive=drive,
+        dump_env_var="VLLM_SAE_DUMP_JIT_CACHE",
     )
