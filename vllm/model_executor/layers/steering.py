@@ -168,8 +168,12 @@ def _maybe_apply_layer_sae(
     this module free of a load-time dependency on the SAE modules (they
     import ``SteeringHookPoint`` from here).
     """
-    has_sae_delta = hasattr(module, HOOK_POINT_SAE_SLOTS_ATTR[hook_point])
-    has_sae_fr = HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR[hook_point] in module._buffers
+    # MLP branch hooks are not SAE sites (the SAE tiers operate on the
+    # residual hooks only), so hooks absent from the attr dicts short-circuit.
+    slots_attr = HOOK_POINT_SAE_SLOTS_ATTR.get(hook_point)
+    fr_attr = HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR.get(hook_point)
+    has_sae_delta = slots_attr is not None and hasattr(module, slots_attr)
+    has_sae_fr = fr_attr is not None and fr_attr in module._buffers
     if not has_sae_delta and not has_sae_fr:
         return hidden_states
     if has_sae_delta:
