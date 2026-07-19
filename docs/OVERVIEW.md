@@ -25,8 +25,10 @@ Overview:
       constant-folds out of the forward. Tier-agnostic scaffolding (hook-attr
       dicts, buffer-sizing knob, kernel warmup harness, phase-tier storage,
       vector-spec validation core) is shared via intervention_common.py /
-      intervention_kernel_common.py / phase_tiers.py — see "Intervention Tier
-      Template" in docs/features/steering.md.
+      intervention_kernel_common.py / phase_tiers.py; the steering row space
+      (sentinel/global rows + static/dynamic pools) is defined once in
+      steering_table_layout.py — see "Intervention Tier Template" in
+      docs/features/steering.md.
     control_plane: >
       Per-request specs on SamplingParams / RequestMetadata, resolved
       rank-locally in the model runner (v1 and v2), with scheduler

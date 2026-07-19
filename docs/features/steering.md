@@ -606,6 +606,13 @@ scaffolding a new tier reuses instead of hand-copying:
   `validate_vector_entries(vectors, steerable_layers, style)`, the single
   vector-spec check core; callers supply a `VectorValidationStyle` (message
   templates + unknown-layer skip/reject strictness).
+- `vllm/model_executor/layers/steering_table_layout.py` — `TableLayout` and
+  the reserved-row constants, the single definition of the steering row
+  space (row 0 sentinel, rows 1/2 global prefill/decode effective, then the
+  static and dynamic pools). Every buffer family that rides the steering
+  rows (scales, row monitors; clamps on adoption) must be congruent with
+  it — kernels gather through the shared `steering_index`, so a size
+  mismatch fails as silent garbage, not an error.
 
 The ops, kernels, and `register_*_buffers` bodies stay per-tier — payload
 semantics (add vs. lerp vs. bound) differ by design.

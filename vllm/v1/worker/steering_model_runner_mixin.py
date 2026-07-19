@@ -33,6 +33,7 @@ from vllm.model_executor.layers.steering import (
     share_steering_row_gate_across_layers,
     share_steering_token_scales_across_layers,
 )
+from vllm.model_executor.layers.steering_table_layout import TableLayout
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.worker.steering_action_queue import (
@@ -556,11 +557,7 @@ class SteeringModelRunnerMixin:
             )
             warmup_apply_steering_kernel(
                 hidden_size=hidden_size,
-                table_rows=(
-                    steering_config.max_steering_configs
-                    + getattr(steering_config, "max_dynamic_steering_configs", 0)
-                    + 3
-                ),
+                table_rows=TableLayout.from_steering_config(steering_config).num_rows,
                 table_dtype=table_dtype,
                 compute_dtype=compute_dtype,
                 device=table_device,
@@ -626,8 +623,7 @@ class SteeringModelRunnerMixin:
         invalid_hook="Invalid hook point: {hook!r}",
         hook_inactive="Hook point {hook!r} not active on layer {layer}",
         bad_width=(
-            "Layer {layer} ({hook}): expected vector of size {expected}, "
-            "got {got_len}"
+            "Layer {layer} ({hook}): expected vector of size {expected}, got {got_len}"
         ),
         non_finite=(
             "Layer {layer} ({hook}): steering vector contains non-finite "
