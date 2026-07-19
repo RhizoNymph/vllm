@@ -874,6 +874,7 @@ direct_register_custom_op(
     op_func=apply_steering,
     fake_impl=apply_steering_fake,
     mutates_args=[],
+    extra_dispatch_keys=("CPU",),
 )
 
 
@@ -977,4 +978,5 @@ direct_register_custom_op(
     op_func=steering_monitor,
     fake_impl=steering_monitor_fake,
     mutates_args=["steering_token_scales", "steering_row_gate"],
+    extra_dispatch_keys=("CPU",),
 )

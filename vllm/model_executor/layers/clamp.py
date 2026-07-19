@@ -390,6 +390,7 @@ direct_register_custom_op(
     op_func=apply_clamp,
     fake_impl=apply_clamp_fake,
     mutates_args=[],
+    extra_dispatch_keys=("CPU",),
 )
 
 direct_register_custom_op(
@@ -397,4 +398,5 @@ direct_register_custom_op(
     op_func=apply_clamp_block,
     fake_impl=apply_clamp_block_fake,
     mutates_args=[],
+    extra_dispatch_keys=("CPU",),
 )
