@@ -498,9 +498,11 @@ def _topk_mask_lowest_indices(pre_act: torch.Tensor, k: int) -> torch.Tensor:
     """
     if k >= pre_act.shape[1]:
         return torch.ones_like(pre_act, dtype=torch.bool)
-    cutoff = torch.topk(pre_act, k, dim=1, largest=True, sorted=False).values.min(
-        dim=1, keepdim=True
-    ).values
+    cutoff = (
+        torch.topk(pre_act, k, dim=1, largest=True, sorted=False)
+        .values.min(dim=1, keepdim=True)
+        .values
+    )
     greater = pre_act > cutoff
     remaining = k - greater.sum(dim=1, keepdim=True)
     ties = pre_act == cutoff
@@ -705,6 +707,7 @@ direct_register_custom_op(
     op_func=apply_sae_delta_op,
     fake_impl=apply_sae_delta_op_fake,
     mutates_args=[],
+    extra_dispatch_keys=("CPU",),
 )
 
 
@@ -789,6 +792,7 @@ direct_register_custom_op(
     op_func=apply_sae_delta_indexed_op,
     fake_impl=apply_sae_delta_indexed_op_fake,
     mutates_args=[],
+    extra_dispatch_keys=("CPU",),
 )
 
 
@@ -893,9 +897,7 @@ def apply_sae_delta(
             f"got {clamp_only_if_active.dtype}."
         )
     if activation is SAEActivation.JUMPRELU and threshold is None:
-        raise ValueError(
-            "JumpReLU requires a per-feature threshold tensor; got None."
-        )
+        raise ValueError("JumpReLU requires a per-feature threshold tensor; got None.")
     if threshold is not None:
         if tuple(threshold.shape) != (n_clamp,):
             raise ValueError(
@@ -903,9 +905,7 @@ def apply_sae_delta(
                 f"got {tuple(threshold.shape)}."
             )
         if threshold.dtype != torch.float32:
-            raise ValueError(
-                f"threshold must be torch.float32; got {threshold.dtype}."
-            )
+            raise ValueError(f"threshold must be torch.float32; got {threshold.dtype}.")
 
     # n_clamp == 0 short-circuit: no features to clamp, no work to do.
     if n_clamp == 0:
@@ -1137,9 +1137,7 @@ def populate_sae_clamp_table(
                     f"layer={layer_idx}, feature_idx={entry.feature_idx}."
                 )
             kind_table[row, pos] = (
-                CLAMP_KIND_ABSOLUTE
-                if entry.kind == "absolute"
-                else CLAMP_KIND_ADDITIVE
+                CLAMP_KIND_ABSOLUTE if entry.kind == "absolute" else CLAMP_KIND_ADDITIVE
             )
             value_table[row, pos] = float(entry.value)
             only_table[row, pos] = bool(entry.only_if_active)

@@ -572,6 +572,7 @@ direct_register_custom_op(
     op_func=apply_sae_full_reconstruction_op,
     fake_impl=apply_sae_full_reconstruction_op_fake,
     mutates_args=[],
+    extra_dispatch_keys=("CPU",),
 )
 
 
