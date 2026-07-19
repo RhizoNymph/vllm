@@ -376,6 +376,7 @@ direct_register_custom_op(
     op_func=apply_patch,
     fake_impl=apply_patch_fake,
     mutates_args=[],
+    extra_dispatch_keys=("CPU",),
 )
 
 direct_register_custom_op(
@@ -383,4 +384,5 @@ direct_register_custom_op(
     op_func=apply_patch_block,
     fake_impl=apply_patch_block_fake,
     mutates_args=[],
+    extra_dispatch_keys=("CPU",),
 )
