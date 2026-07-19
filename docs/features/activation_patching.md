@@ -556,6 +556,12 @@ Cells run concurrently regardless of streaming; if the client disconnects
 mid-stream the server cancels the outstanding cell tasks (best-effort abort of
 their engine requests) rather than grinding through a dead sweep.
 
+`examples/online_serving/patch_dashboard/` is a runnable Dash dashboard built
+on this stream: it drives a sweep from a browser form and renders the cell
+events as a live-updating per-hook heatmap (with progress, cancel-on-close,
+and the summary panel), consuming the SSE protocol above over plain
+`requests` — no vllm import.
+
 `PatchStudy.sweep_layers_positions(..., server_side=True, on_cell=fn)` wires this
 in: passing an `on_cell(event_dict)` callback sends `stream: true`, invokes the
 callback per cell event, and builds the returned `SweepResult` from the summary
@@ -679,5 +685,6 @@ python -m vllm.entrypoints.openai.api_server \
   `api_router.py`; request/response: `protocol.py`; client: `client.py`;
   shared substring→position math: `spans.py`; position alignment:
   `alignment.py`; runnable demo:
-  `examples/online_serving/openai_patch_client.py`).
+  `examples/online_serving/openai_patch_client.py`; live-heatmap Dash
+  dashboard: `examples/online_serving/patch_dashboard/`).
 - GPU validation: `tests/gpu_patch_validate.py`.
