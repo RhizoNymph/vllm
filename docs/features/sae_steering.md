@@ -588,6 +588,14 @@ GEMMs per opted-in token per hooked layer).
 - **Batch chat API requires packed steering vectors**
   (`SteeringVectorSpecPacked`); legacy dict-of-lists vectors are not
   accepted on the batch surface.
+- **Live SAE steering requires `--enforce-eager` serving.** SAE buffer
+  attributes are created at module *registration*, which on a server
+  happens after engine warmup — a compiled graph traced before
+  registration bakes in the "no SAE buffers at this hook" short-circuit
+  and every SAE spec is silently inert (requests succeed, nothing
+  applies). Offline `LLM()` flows and all live validation to date run
+  eager. Lifting this needs either pre-allocated SAE slots at engine
+  init or a re-capture after registration.
 - **At most one full-reconstruction SAE module per (layer, hook)
   site**; double-registration raises by design — two residual
   replacements on one site are semantically ill-defined. Delta
