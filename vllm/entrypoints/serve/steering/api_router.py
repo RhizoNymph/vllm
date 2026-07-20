@@ -396,7 +396,7 @@ async def set_steering(
             if tier:
                 all_hooks.update(tier.keys())
         for ctier in clamp_tiers.values():
-            all_hooks.update(ctier.keys())
+            all_hooks.update(ctier.hooks.keys())
 
         return JSONResponse(
             content={
