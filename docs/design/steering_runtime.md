@@ -181,52 +181,28 @@ Runtime design decisions:
   entries at worker resolution; the module-level scale does NOT apply to
   clamps). Global clamps ride `/v1/steering/set` (`clamps` /
   `prefill_clamps` / `decode_clamps`) and share its prefix-cache reset.
-- **Packed clamp wire form.** Each clamp tier accepts a binary packed shape
-  (`ClampHookPacked`: `{dtype, shape:[n,hidden], layer_indices:[n],
-  data:<base64 [n,hidden]>, bounds:[[lo,hi]×n], strengths:[n]}`) alongside the
-  JSON entry-list form, mirroring `SteeringHookPacked`. Row `i` is a direction
-  for `layer_indices[i]`; entry order within a layer is preserved (K-cap
-  semantics). `bounds`/`strengths` stay as JSON lists; `null` in `bounds`
-  encodes `±inf` (finite-or-null required). One decoder engine-side
-  (`unpack_steering_clamps`) turns the packed shape back into canonical
-  entries; the HTTP path forwards the packed dict verbatim and the gRPC path
-  (`ClampHookPacked` proto, `bounds` flattened, native `±inf`) is converted to
-  the same packed-JSON dict in `grpc/convert.rs`. `maybe_pack_inline_steering_
-  for_request` packs JSON clamp tiers at `float64` before the multiprocessing
-  boundary, priming the phase hashes from the fp64 entries first so the packed
-  request keeps its cache identity. **Hash invariant:** packed and JSON
-  submissions of the same logical config produce bit-identical prefill/decode
-  hashes, because both are normalized through the idempotent
-  `normalize_clamp_entry` at the (float32) hashing boundary — the reason
-  clamp directions are packed at float64. Vector-only and JSON-clamp hashes
-  are byte-for-byte unchanged.
-
-### Gating clamps (declarative gates modulate clamp strength)
-
-Directional clamps read the **same** shared per-token gate buffer the
-additive steering row term reads (`steering_row_gate`, fp32 `(max_tokens,)`,
-default `1.0`, reset each step). Both clamp ops take two extra tensors —
-`steering_row_gate` and a per-hook `gate_active` bool flag — and, when
-`gate_active` is set, fold the gate into the per-row strength:
-
-```text
-effective_strength[token, k] = clamp_strength[row, k] * row_gate[token]
-```
-
-The gate is **row-level**: a token's single `row_gate[token]` scales all K
-entries of its row uniformly, congruent with how the row gate treats
-additive steering. A closed gate (`row_gate == 0`) yields `delta == 0`
-exactly, so the token is left untouched — the same in-bounds-untouched
-invariant. The `row == 0` no-steering-sentinel passthrough is unaffected
-(those tokens are skipped before the gate is read). Op-schema order (frozen
-before merge): `apply_clamp(hidden, dirs, bounds, strength, index,
-any_active, steering_row_gate, gate_active)` and `apply_clamp_block(hidden,
-residual, dirs, bounds, strength, index, any_active, steering_row_gate,
-gate_active)` — the two gate tensors are the last two args, mirroring
-`ClampOpArgs` / `ClampBlockOpArgs`.
-
-**Two modes, one materialized:**
-
+- **Canonical clamp type + accepted input shapes.** Post-ingestion every
+  clamp tier is one canonical msgspec Struct, `SteeringClamps`
+  (`{hook: ClampHookTable}`; each table = raw float64 LE rows as `bytes` +
+  `layer_indices`/`lo`/`hi`/`strength` lists, true `±inf` bounds). Clients
+  may submit either the JSON entry-list shape or the legacy base64-packed
+  shape (`ClampHookPacked`: `{dtype, shape:[n,hidden], layer_indices:[n],
+  data:<base64>, bounds:[[lo,hi]×n], strengths:[n]}`, `null` = `±inf`);
+  `SteeringClamps.from_obj` is the single decoder at every boundary
+  (SamplingParams `__post_init__`, global set, module register, dynamic
+  overrides, worker RPC receivers) and fully validates rows at ingestion.
+  The canonical Struct itself rides the APIServer→EngineCore hop (msgpack
+  map, row data as native `bin` — no base64, no repack), so the strict
+  engine-side decoder accepts exactly what the API server sends;
+  `forbid_unknown_fields` makes any legacy verbatim dict fail decode
+  loudly rather than silently dropping clamps. collective_rpc's type-less
+  decode flattens the Struct to its plain wire map (bytes preserved);
+  receivers revive via `from_obj`. The gRPC path (`ClampHookPacked`
+  proto) still converts to the packed-JSON input shape in
+  `grpc/convert.rs`. **Hash invariant:** rows are stored as submitted and
+  unit-normalized (float64) only at the consumption boundaries (config
+  hash, worker materialization), so packed and JSON submissions of the
+  same logical config produce bit-identical prefill/decode hashes.
 - **Materialized (`enable_cross_layer_monitor = true`)** — the standalone
   mutating `steering_monitor` op writes the per-token gate into the shared
   `steering_row_gate` buffer at the probe layer L, and every layer ≥ L reads

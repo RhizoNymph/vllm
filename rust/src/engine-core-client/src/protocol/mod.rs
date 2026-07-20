@@ -368,11 +368,17 @@ pub struct EngineCoreSamplingParams {
     /// wire payload compatible with clients that never set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_vectors: Option<serde_json::Value>,
-    /// Per-request steering clamps applied to both prefill and decode phases:
-    /// `{hook: {layer: [clamp entries]}}`. Forwarded verbatim; Python's
-    /// `SamplingParams.__post_init__` validates on msgpack decode.
-    /// Omit-when-None keeps the wire payload compatible with clients that
-    /// never set it.
+    /// Per-request steering clamps applied to both prefill and decode phases.
+    /// TODO(clamp-canonical-type): Python now types this field as the
+    /// canonical `SteeringClamps` msgspec Struct (`{"hooks": {hook:
+    /// {shape, layer_indices, data: <msgpack bin f64 rows>, lo, hi,
+    /// strength}}}`) and its strict decoder REJECTS the old verbatim
+    /// `{hook: {layer: [entries]}}` JSON — a clamp-bearing request from
+    /// this frontend is currently dropped at the engine ADD boundary.
+    /// Replace these three `serde_json::Value` fields with a typed mirror
+    /// struct (`serde_bytes` for `data`) that packs entry-list input to
+    /// f64 rows HTTP-side. Omit-when-None keeps the wire payload
+    /// compatible with clients that never set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steering_clamps: Option<serde_json::Value>,
     /// Phase-specific steering clamps applied during prefill only. Forwarded

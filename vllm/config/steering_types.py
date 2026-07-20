@@ -69,36 +69,39 @@ class SteeringHookPacked(TypedDict):
 # Packed full spec: {hook_point_name: SteeringHookPacked}
 SteeringVectorSpecPacked = dict[str, SteeringHookPacked]
 
-# Directional-clamp entry: {"vector": [...], "min": float|None,
-# "max": float|None, "strength": float = 1.0}, with the sugar form
-# {"vector": [...], "value": c} equivalent to min = max = c.  The vector is
-# unit-normalized at ingestion, so bounds live in unit-projection space
-# (``p = h @ v_hat``).  See :func:`normalize_clamp_entry`.
+# Directional-clamp entry AUTHORING shape: {"vector": [...], "min":
+# float|None, "max": float|None, "strength": float = 1.0}, with the sugar
+# form {"vector": [...], "value": c} equivalent to min = max = c.  Rows
+# are unit-normalized at CONSUMPTION (hashing / materialization), so
+# bounds live in unit-projection space (``p = h @ v_hat``).  See
+# :func:`_parse_clamp_entry` / :meth:`SteeringClamps.from_obj`.
 ClampEntry = dict[str, Any]
 
-# Full clamp spec: {hook_point_name: {layer_idx: [ClampEntry, ...]}}.
-# Unlike ``SteeringVectorSpec`` a site holds a LIST of entries — clamps
-# do not compose additively; each direction is an independent constraint.
+# Entry-list clamp AUTHORING shape: {hook: {layer_idx: [ClampEntry, ...]}}.
+# Unlike ``SteeringVectorSpec`` a site holds a LIST of entries — clamps do
+# not compose additively; each direction is an independent constraint.
+# Post-ingestion the canonical representation is :class:`SteeringClamps`;
+# this dict shape (and the packed one below) are accepted client INPUT
+# formats normalized by ``SteeringClamps.from_obj`` at every boundary.
 SteeringClampSpec = dict[str, dict[int, list[ClampEntry]]]
 
 
-# Binary wire form for clamps: one packed blob per hook, mirroring
-# ``SteeringHookPacked``.  ``data`` is a base64-encoded contiguous byte string
-# of a ``(n, hidden)`` array; row ``i`` is the direction for
-# ``layer_indices[i]``.  Multiple rows may share a layer index — entry order
-# WITHIN a layer is preserved (it is semantic: the concat order of the tier
-# merge and the per-site K budget).  ``bounds`` and ``strengths`` stay as small
-# JSON lists (only the direction vectors are bulk).  In ``bounds`` a ``null``
-# component means an infinite bound (``lo`` null -> ``-inf``, ``hi`` null ->
-# ``+inf``); all present bounds must be finite JSON floats.
+# Legacy base64-packed clamp INPUT shape: one packed blob per hook,
+# mirroring ``SteeringHookPacked``.  ``data`` is a base64-encoded
+# contiguous byte string of a ``(n, hidden)`` array; row ``i`` is the
+# direction for ``layer_indices[i]``.  Multiple rows may share a layer
+# index — entry order WITHIN a layer is preserved (it is semantic: the
+# concat order of the tier merge and the per-site K budget).  ``bounds``
+# and ``strengths`` stay as small JSON lists (only the direction vectors
+# are bulk).  In ``bounds`` a ``null`` component means an infinite bound
+# (``lo`` null -> ``-inf``, ``hi`` null -> ``+inf``); all present bounds
+# must be finite JSON floats.
 #
-# Hash parity: pack direction rows at ``float64`` (see
-# :func:`pack_steering_clamps`) so the unpacked-then-normalized direction feeds
-# :func:`hash_steering_config` with the same float64 precision as a JSON
-# submission, giving bit-identical prefill/decode config hashes.  Packing at a
-# narrower dtype is accepted on decode but may not bit-match a JSON submission
-# of the same config (a one-time prefix-cache miss, mirroring the steering
-# vector packed path).
+# Accepted as client input only; ``SteeringClamps.from_obj`` upcasts the
+# rows exactly to float64 at ingestion.  Submitting at ``float64`` hashes
+# bit-identically to the equivalent JSON submission; narrower dtypes are
+# accepted but may not bit-match (a one-time prefix-cache miss, mirroring
+# the steering vector packed path).
 class ClampHookPacked(TypedDict):
     dtype: str  # "float64" | "float32" | "float16" | "bfloat16"
     shape: list[int]  # [n, hidden]
@@ -182,106 +185,6 @@ def _validate_packed_clamp_blob(
             f"{expected} (shape={shape}, dtype={dtype})"
         )
     return dtype, n, hidden
-
-
-def unpack_steering_clamps(
-    packed: SteeringClampSpecPacked | None,
-) -> SteeringClampSpec | None:
-    """Decode a packed clamp spec to the canonical list-of-entries form.
-
-    Clamp sibling of :func:`unpack_steering_vectors`.  Each hook's contiguous
-    ``(n, hidden)`` blob is base64-decoded, reshaped, and split into per-layer
-    entry lists keyed by ``layer_indices`` — preserving row order so multiple
-    directions on the same layer keep their tier-concat order.  Bounds map
-    ``null`` to ``±inf``; the produced entries are the canonical
-    ``{"vector", "min", "max", "strength"}`` dicts (direction NOT unit-
-    normalized here — :func:`normalize_clamp_entry`, run downstream by the hash
-    path and the worker manager, does that idempotently).
-
-    Returns ``None`` if *packed* is ``None`` or empty.  Raises ``ValueError``
-    on any structural mismatch.
-    """
-    if not packed:
-        return None
-    import pybase64 as base64
-
-    result: SteeringClampSpec = {}
-    for hook, blob in packed.items():
-        dtype, n, hidden = _validate_packed_clamp_blob(hook, blob)
-        raw = base64.b64decode(blob["data"])
-        stacked = np.frombuffer(raw, dtype=dtype).reshape((n, hidden))
-        layer_indices = blob["layer_indices"]
-        bounds = blob["bounds"]
-        strengths = blob["strengths"]
-        hook_layers: dict[int, list[ClampEntry]] = {}
-        for i in range(n):
-            layer_idx = int(layer_indices[i])
-            lo_raw, hi_raw = bounds[i]
-            lo = -math.inf if lo_raw is None else float(lo_raw)
-            hi = math.inf if hi_raw is None else float(hi_raw)
-            entry: ClampEntry = {
-                "vector": stacked[i].tolist(),
-                "min": lo,
-                "max": hi,
-                "strength": float(strengths[i]),
-            }
-            hook_layers.setdefault(layer_idx, []).append(entry)
-        if hook_layers:
-            result[hook] = hook_layers
-    return result or None
-
-
-def pack_steering_clamps(
-    spec: SteeringClampSpec | None,
-    dtype: np.dtype | str = np.float64,
-) -> SteeringClampSpecPacked | None:
-    """Pack a canonical clamp spec into the binary wire form.
-
-    Inverse of :func:`unpack_steering_clamps`.  Within a hook, layers are
-    emitted in sorted order and entries in list order, so unpack reconstructs
-    the same per-layer ordering.  ``±inf`` bounds are encoded as JSON ``null``.
-
-    The default ``float64`` direction dtype guarantees the packed request hashes
-    bit-identically to the equivalent JSON submission (see
-    :class:`ClampHookPacked`).  Returns ``None`` if *spec* is ``None`` / empty.
-    """
-    if not spec:
-        return None
-    import pybase64 as base64
-
-    np_dtype = np.dtype(dtype)
-    result: SteeringClampSpecPacked = {}
-    for hook, layer_dict in spec.items():
-        if not layer_dict:
-            continue
-        rows: list[np.ndarray] = []
-        layer_indices: list[int] = []
-        bounds: list[list[float | None]] = []
-        strengths: list[float] = []
-        for layer_idx in sorted(layer_dict.keys()):
-            for entry in layer_dict[layer_idx]:
-                vec, lo, hi, strength = normalize_clamp_entry(entry)
-                rows.append(np.asarray(vec, dtype=np_dtype))
-                layer_indices.append(int(layer_idx))
-                bounds.append(
-                    [
-                        None if math.isinf(lo) else lo,
-                        None if math.isinf(hi) else hi,
-                    ]
-                )
-                strengths.append(strength)
-        if not rows:
-            continue
-        stacked = np.stack(rows).astype(np_dtype, copy=False)
-        result[hook] = {
-            "dtype": np_dtype.name,
-            "shape": [int(stacked.shape[0]), int(stacked.shape[1])],
-            "layer_indices": layer_indices,
-            "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
-            "bounds": bounds,
-            "strengths": strengths,
-        }
-    return result or None
 
 
 def _clamp_unit_rows(dirs: np.ndarray) -> np.ndarray:
@@ -1050,82 +953,6 @@ def validate_spec_row_widths(
                 )
 
 
-def normalize_clamp_entry(
-    entry: ClampEntry,
-) -> tuple[np.ndarray, float, float, float]:
-    """Return ``(unit_direction, lo, hi, strength)`` from a clamp entry.
-
-    Accepts both the raw user forms (``value`` sugar, omitted bounds) and
-    the canonical form produced by ``SamplingParams`` validation
-    (``min``/``max``/``strength`` all present), so hashing and worker-side
-    resolution normalize identically regardless of which form they see.
-
-    The direction is unit-normalized in float64 — bounds are defined in
-    unit-projection space (``p = h @ v_hat``), so normalizing here (rather
-    than trusting the client) keeps bound semantics portable across
-    vectors.  Idempotent: re-normalizing a unit vector is a no-op.
-
-    Raises ``ValueError`` on: missing/zero/non-finite vector, no bound at
-    all, ``value`` combined with ``min``/``max``, ``min > max``, NaN
-    bounds, or ``strength`` outside ``[0, 1]``.
-    """
-    if not isinstance(entry, dict):
-        raise TypeError(f"Clamp entry must be a dict, got {type(entry).__name__}")
-    allowed = {"vector", "value", "min", "max", "strength"}
-    extra = set(entry.keys()) - allowed
-    if extra:
-        raise ValueError(
-            f"Clamp entry has unexpected keys: {sorted(extra)}; "
-            f"allowed keys: {sorted(allowed)}"
-        )
-    if "vector" not in entry:
-        raise ValueError("Clamp entry missing required key 'vector'")
-
-    has_value = entry.get("value") is not None
-    has_min = entry.get("min") is not None
-    has_max = entry.get("max") is not None
-    if has_value and (has_min or has_max):
-        raise ValueError("Clamp entry 'value' is mutually exclusive with 'min'/'max'")
-    if has_value:
-        val = float(entry["value"])
-        if math.isnan(val) or math.isinf(val):
-            raise ValueError(f"Clamp entry 'value' must be finite, got {val}")
-        lo = hi = val
-    else:
-        if not has_min and not has_max:
-            raise ValueError(
-                "Clamp entry must set at least one of 'value', 'min', 'max'"
-            )
-        lo = float(entry["min"]) if has_min else -math.inf
-        hi = float(entry["max"]) if has_max else math.inf
-        if math.isnan(lo) or math.isnan(hi):
-            raise ValueError(
-                f"Clamp entry bounds must not be NaN, got min={lo}, max={hi}"
-            )
-        if lo > hi:
-            raise ValueError(f"Clamp entry min ({lo}) must be <= max ({hi})")
-
-    strength = float(entry.get("strength", 1.0))
-    if math.isnan(strength) or not (0.0 <= strength <= 1.0):
-        raise ValueError(f"Clamp entry strength must be in [0, 1], got {strength}")
-
-    arr = np.asarray(entry["vector"], dtype=np.float64)
-    if arr.ndim != 1 or arr.size == 0:
-        raise ValueError(
-            f"Clamp entry vector must be a non-empty 1-D float list, "
-            f"got shape {arr.shape}"
-        )
-    if not np.all(np.isfinite(arr)):
-        raise ValueError("Clamp entry vector must contain only finite floats")
-    norm = float(np.linalg.norm(arr))
-    if norm == 0.0:
-        raise ValueError(
-            "Clamp entry vector must be non-zero "
-            "(a zero vector cannot be normalized to a direction)"
-        )
-    return arr / norm, lo, hi, strength
-
-
 def resolve_effective_clamps(
     base: SteeringClamps | dict | None,
     phase_specific: SteeringClamps | dict | None,
@@ -1171,100 +998,6 @@ def resolve_effective_clamps(
     if max_directions is not None:
         merged.check_max_directions(max_directions)
     return merged
-
-
-def coerce_clamp_spec(
-    tier: dict | None,
-    *,
-    unpack_packed: bool = False,
-) -> SteeringClampSpec | None:
-    """Return *tier* as a ``SteeringClampSpec``-shaped dict with int layer keys.
-
-    Clamp sibling of :func:`coerce_steering_spec`.  Layer-index keys arriving
-    as strings over JSON are coerced to ``int``; entry lists pass through
-    untouched (deep validation happens at ``SamplingParams`` / worker ingestion
-    via :func:`normalize_clamp_entry`).  Returns ``None`` if *tier* is ``None``
-    or empty; raises ``ValueError`` on a non-dict hook value or a non-integer
-    layer key.
-
-    Packed handling: when *tier* is the binary :class:`SteeringClampSpecPacked`
-    shape and *unpack_packed* is ``False`` (the per-request default), it is
-    returned verbatim — the request keeps the packed form all the way to
-    worker-side resolution.  When *unpack_packed* is ``True`` (used by the
-    one-shot global-set and named-module ingestion seams, which validate and
-    broadcast eagerly) it is decoded to canonical entries here.
-    """
-    if not tier:
-        return None
-    if _clamps_looks_packed(tier):
-        return unpack_steering_clamps(tier) if unpack_packed else tier
-    result: SteeringClampSpec = {}
-    for hook, layer_entries in tier.items():
-        if not isinstance(layer_entries, dict):
-            raise ValueError(
-                f"Clamp tier {hook!r} must map layer indices to entry "
-                f"lists, got {type(layer_entries).__name__}"
-            )
-        coerced: dict[int, list[ClampEntry]] = {}
-        for layer_key, entries in layer_entries.items():
-            try:
-                coerced[int(layer_key)] = entries
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Clamp tier {hook!r} has invalid layer index "
-                    f"{layer_key!r}; expected an integer"
-                ) from exc
-        if coerced:
-            result[hook] = coerced
-    return result or None
-
-
-def validate_clamp_row_widths(
-    spec: SteeringClampSpec | None,
-    expected_width: int,
-    *,
-    field_name: str,
-) -> None:
-    """Raise ``ValueError`` when any clamp direction in *spec* is not
-    ``expected_width`` wide.
-
-    Clamp-spec sibling of :func:`validate_spec_row_widths`: wrong-width
-    directions pass structural validation but would shape-crash the
-    worker's clamp table population, so every seam that accepts client
-    clamps must width-check before anything is broadcast or admitted.
-
-    Handles both the JSON entry-list shape and the binary
-    :class:`SteeringClampSpecPacked` shape (checking ``shape[1]`` per hook
-    blob) without decoding the packed payload.
-    """
-    if not spec:
-        return
-    if _clamps_looks_packed(spec):
-        for hook_name, blob in spec.items():
-            _dtype, _n, hidden = _validate_packed_clamp_blob(hook_name, blob)
-            if hidden != expected_width:
-                raise ValueError(
-                    f"{field_name}[{hook_name!r}]: packed clamp direction width "
-                    f"{hidden} != expected steering row width "
-                    f"{expected_width} (model hidden size)"
-                )
-        return
-    for hook_name, layers in spec.items():
-        for layer_idx, entries in layers.items():
-            for i, entry in enumerate(entries):
-                vector = entry.get("vector") if isinstance(entry, dict) else None
-                if vector is None:
-                    raise ValueError(
-                        f"{field_name}[{hook_name!r}][{layer_idx}][{i}]: "
-                        f"clamp entry missing 'vector'"
-                    )
-                if len(vector) != expected_width:
-                    raise ValueError(
-                        f"{field_name}[{hook_name!r}][{layer_idx}][{i}]: "
-                        f"clamp direction width {len(vector)} != expected "
-                        f"steering row width {expected_width} "
-                        f"(model hidden size)"
-                    )
 
 
 def _scale_vector(vec: list[float] | np.ndarray, scale: float) -> np.ndarray:
