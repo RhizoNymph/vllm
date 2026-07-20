@@ -1078,15 +1078,29 @@ mod tests {
 
     #[test]
     fn lower_sampling_params_threads_steering_clamps_verbatim() {
-        let clamps = serde_json::json!({
-            "post_attn": {"5": [{"vector": [1.0, 0.0], "min": -2.0, "max": 2.0, "strength": 1.0}]}
-        });
-        let prefill_clamps = serde_json::json!({
-            "pre_attn": {"2": [{"vector": [0.0, 1.0], "value": 3.5}]}
-        });
-        let decode_clamps = serde_json::json!({
-            "post_block": {"7": [{"vector": [1.0, 1.0], "min": null, "max": 4.0, "strength": 0.5}]}
-        });
+        use std::collections::HashMap;
+
+        use vllm_engine_core_client::protocol::{ClampHookTable, SteeringClamps};
+
+        // Clamp tiers arrive already in the canonical form (the HTTP/gRPC
+        // layers packed them); lowering moves them through untouched.
+        let table = |layer: u32, lo: f64, hi: f64| ClampHookTable {
+            shape: vec![1, 2],
+            layer_indices: vec![layer],
+            data: [1.0f64, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            lo: vec![lo],
+            hi: vec![hi],
+            strength: vec![1.0],
+        };
+        let clamps = SteeringClamps {
+            hooks: HashMap::from([("post_attn".to_string(), table(5, -2.0, 2.0))]),
+        };
+        let prefill_clamps = SteeringClamps {
+            hooks: HashMap::from([("pre_attn".to_string(), table(2, 3.5, 3.5))]),
+        };
+        let decode_clamps = SteeringClamps {
+            hooks: HashMap::from([("post_block".to_string(), table(7, f64::NEG_INFINITY, 4.0))]),
+        };
         let sampling_params = SamplingParams {
             steering_clamps: Some(clamps.clone()),
             prefill_steering_clamps: Some(prefill_clamps.clone()),
@@ -1106,38 +1120,6 @@ mod tests {
         assert_eq!(params.steering_clamps, Some(clamps));
         assert_eq!(params.prefill_steering_clamps, Some(prefill_clamps));
         assert_eq!(params.decode_steering_clamps, Some(decode_clamps));
-    }
-
-    #[test]
-    fn lower_sampling_params_threads_packed_steering_clamps_verbatim() {
-        // The binary packed clamp form (per-hook `ClampHookPacked`) rides
-        // through lowering unchanged — it is an opaque `Value` and the Python
-        // engine owns the single decoder.
-        let packed = serde_json::json!({
-            "post_attn": {
-                "dtype": "float64",
-                "shape": [2, 2],
-                "layer_indices": [5, 5],
-                "data": "AAAAAAAA8D8AAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D8=",
-                "bounds": [[-2.0, 2.0], [null, 4.0]],
-                "strengths": [1.0, 0.5]
-            }
-        });
-        let sampling_params = SamplingParams {
-            steering_clamps: Some(packed.clone()),
-            ..SamplingParams::default()
-        };
-
-        let params = lower_sampling_params(
-            sampling_params,
-            sample_sampling_hints(),
-            sample_sampling_limits(),
-            3,
-            &stub_tokenizer(),
-        )
-        .unwrap();
-
-        assert_eq!(params.steering_clamps, Some(packed));
     }
 
     #[test]

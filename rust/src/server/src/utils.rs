@@ -86,6 +86,18 @@ pub fn unpack_steering_field(
         .transpose()
 }
 
+/// Parse one optional clamp-tier field (`steering_clamps`,
+/// `prefill_steering_clamps`, or `decode_steering_clamps`) into the canonical
+/// [`SteeringClamps`] forwarded southbound, mapping parse failures to an
+/// invalid-request error tagged with the offending field name.
+pub fn parse_clamp_field(
+    field: Option<serde_json::Value>,
+    field_name: &'static str,
+) -> Result<Option<vllm_engine_core_client::protocol::SteeringClamps>, ApiError> {
+    crate::routes::openai::utils::clamps::parse_clamp_tier(field.as_ref())
+        .map_err(|err| ApiError::invalid_request(format!("{field_name}{err}"), Some(field_name)))
+}
+
 /// Extract common request metadata from HTTP headers: the external request ID
 /// and the optional data-parallel rank used for engine routing.
 pub fn resolve_request_context(

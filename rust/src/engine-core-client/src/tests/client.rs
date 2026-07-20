@@ -2507,6 +2507,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     let multipart_prompt_frames =
         lines.next().expect("missing multipart prompt logprobs fixture line");
     let ready_response_hex = lines.next().expect("missing ready response fixture line");
+    let clamp_request_hex = lines.next().expect("missing clamp request fixture line");
 
     let request_bytes = hex::decode(request_hex).unwrap();
     let multimodal_request_bytes = hex::decode(multimodal_request_hex).unwrap();
@@ -2674,6 +2675,36 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             other => panic!("ready response should encode as a map, got {other:?}"),
         }
     };
+    // Clamp-bearing request: the canonical SteeringClamps must decode typed,
+    // with the raw f64 row bytes and native -inf bound intact — this is the
+    // exact wire contract the strict Python-side decoder enforces in the
+    // other direction.
+    let clamp_request_bytes = hex::decode(clamp_request_hex).unwrap();
+    let decoded_clamps: EngineCoreRequest = rmp_serde::from_slice(&clamp_request_bytes).unwrap();
+    assert_eq!(decoded_clamps.request_id, "req-clamps");
+    let clamp_sampling = decoded_clamps
+        .sampling_params
+        .clone()
+        .expect("clamp request carries sampling params");
+    let clamps = clamp_sampling.steering_clamps.expect("steering_clamps present");
+    let table = &clamps.hooks["post_block"];
+    assert_eq!(table.shape, vec![2, 2]);
+    assert_eq!(table.layer_indices, vec![5, 9]);
+    let rows: Vec<f64> = table
+        .data
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(rows, vec![1.5, -2.0, 0.25, 8.0]);
+    assert_eq!(table.lo, vec![-2.0, f64::NEG_INFINITY]);
+    assert_eq!(table.hi, vec![2.0, 4.0]);
+    assert_eq!(table.strength, vec![1.0, 0.5]);
+    // Round-trip: Rust re-encodes to bytes carrying the same map/bin shapes
+    // Python's strict decoder accepts; decode-equality proves preservation.
+    let reencoded = crate::protocol::encode_msgpack(&decoded_clamps).unwrap();
+    let redecoded: EngineCoreRequest = rmp_serde::from_slice(&reencoded).unwrap();
+    assert_eq!(redecoded, decoded_clamps);
+
     let python_ready_keys = map_keys(&hex::decode(ready_response_hex).unwrap());
     let rust_ready_keys =
         map_keys(&rmp_serde::to_vec_named(&crate::mock_engine::default_ready_response()).unwrap());

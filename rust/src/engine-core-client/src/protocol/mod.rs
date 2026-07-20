@@ -54,6 +54,7 @@ fn default_max_tokens() -> u32 {
     16
 }
 
+pub mod clamps;
 mod classified_outputs;
 pub mod dtype;
 pub mod handshake;
@@ -65,6 +66,7 @@ pub mod steering;
 pub mod tensor;
 pub mod utility;
 pub use capture::CaptureResult;
+pub use clamps::{ClampHookTable, SteeringClamps};
 pub use classified_outputs::{
     ClassifiedEngineCoreOutputs, DpControlMessage, RequestBatchOutputs, UtilityCallOutput,
 };
@@ -368,27 +370,21 @@ pub struct EngineCoreSamplingParams {
     /// wire payload compatible with clients that never set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_vectors: Option<serde_json::Value>,
-    /// Per-request steering clamps applied to both prefill and decode phases.
-    /// TODO(clamp-canonical-type): Python now types this field as the
-    /// canonical `SteeringClamps` msgspec Struct (`{"hooks": {hook:
-    /// {shape, layer_indices, data: <msgpack bin f64 rows>, lo, hi,
-    /// strength}}}`) and its strict decoder REJECTS the old verbatim
-    /// `{hook: {layer: [entries]}}` JSON — a clamp-bearing request from
-    /// this frontend is currently dropped at the engine ADD boundary.
-    /// Replace these three `serde_json::Value` fields with a typed mirror
-    /// struct (`serde_bytes` for `data`) that packs entry-list input to
-    /// f64 rows HTTP-side. Omit-when-None keeps the wire payload
-    /// compatible with clients that never set it.
+    /// Per-request steering clamps applied to both prefill and decode
+    /// phases, in the canonical [`SteeringClamps`] form Python's strict
+    /// decoder expects (the HTTP/gRPC layers pack client input into it).
+    /// Omit-when-None keeps the wire payload compatible with clients that
+    /// never set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub steering_clamps: Option<serde_json::Value>,
-    /// Phase-specific steering clamps applied during prefill only. Forwarded
-    /// verbatim like `steering_clamps`.
+    pub steering_clamps: Option<SteeringClamps>,
+    /// Phase-specific steering clamps applied during prefill only. Same
+    /// canonical form as `steering_clamps`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefill_steering_clamps: Option<serde_json::Value>,
-    /// Phase-specific steering clamps applied during decode only. Forwarded
-    /// verbatim like `steering_clamps`.
+    pub prefill_steering_clamps: Option<SteeringClamps>,
+    /// Phase-specific steering clamps applied during decode only. Same
+    /// canonical form as `steering_clamps`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decode_steering_clamps: Option<serde_json::Value>,
+    pub decode_steering_clamps: Option<SteeringClamps>,
 }
 
 impl EngineCoreSamplingParams {
@@ -901,21 +897,24 @@ mod tests {
 
     #[test]
     fn steering_clamps_use_python_field_names_and_are_omitted_when_none() {
-        // The three clamp fields forward verbatim under their exact Python
-        // msgspec field names, and are skipped on the wire when None.
-        let clamps = serde_json::json!({
-            "post_attn": {"5": [{"vector": [1.0, 0.0], "min": -2.0, "max": 2.0, "strength": 1.0}]}
-        });
-        let prefill_clamps = serde_json::json!({
-            "pre_attn": {"2": [{"vector": [0.0, 1.0], "value": 3.5}]}
-        });
-        let decode_clamps = serde_json::json!({
-            "post_block": {"7": [{"vector": [1.0, 1.0], "min": null, "max": 4.0, "strength": 0.5}]}
-        });
+        // The three clamp fields ride under their exact Python msgspec field
+        // names in the canonical `{"hooks": {...}}` form, and are skipped on
+        // the wire when None.
+        let table = ClampHookTable {
+            shape: vec![1, 2],
+            layer_indices: vec![5],
+            data: [1.0f64, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            lo: vec![-2.0],
+            hi: vec![2.0],
+            strength: vec![1.0],
+        };
+        let clamps = SteeringClamps {
+            hooks: HashMap::from([("post_attn".to_owned(), table.clone())]),
+        };
         let params = EngineCoreSamplingParams {
             steering_clamps: Some(clamps.clone()),
-            prefill_steering_clamps: Some(prefill_clamps.clone()),
-            decode_steering_clamps: Some(decode_clamps.clone()),
+            prefill_steering_clamps: Some(clamps.clone()),
+            decode_steering_clamps: Some(clamps.clone()),
             ..EngineCoreSamplingParams::for_test()
         };
 
@@ -931,16 +930,19 @@ mod tests {
             "prefill_steering_clamps",
             "decode_steering_clamps",
         ] {
+            let Some(Value::Map(outer)) = get(key) else {
+                panic!("{key} must ride as a msgpack map under its exact wire name");
+            };
             assert!(
-                matches!(get(key), Some(Value::Map(_))),
-                "{key} must forward as a msgpack map under its exact wire name"
+                outer.iter().any(|(k, _)| k.as_str() == Some("hooks")),
+                "{key} must carry the canonical hooks nesting"
             );
         }
 
         let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
-        assert_eq!(decoded.steering_clamps, Some(clamps));
-        assert_eq!(decoded.prefill_steering_clamps, Some(prefill_clamps));
-        assert_eq!(decoded.decode_steering_clamps, Some(decode_clamps));
+        assert_eq!(decoded.steering_clamps, Some(clamps.clone()));
+        assert_eq!(decoded.prefill_steering_clamps, Some(clamps.clone()));
+        assert_eq!(decoded.decode_steering_clamps, Some(clamps));
 
         // Absent by default: all three keys are skipped on the wire and decode
         // cleanly to None.
@@ -967,27 +969,89 @@ mod tests {
     }
 
     #[test]
-    fn packed_steering_clamps_survive_msgpack_roundtrip_verbatim() {
-        // The binary packed clamp form is an opaque `Value`: it must survive
-        // the msgpack encode/decode round-trip byte-for-byte (base64 `data`,
-        // the `bounds` pairs with `null` for infinities, and `strengths`).
-        let packed = serde_json::json!({
-            "post_attn": {
-                "dtype": "float64",
-                "shape": [2, 2],
-                "layer_indices": [5, 5],
-                "data": "AAAAAAAA8D8AAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D8=",
-                "bounds": [[-2.0, 2.0], [null, 4.0]],
-                "strengths": [1.0, 0.5]
-            }
-        });
+    fn clamp_row_data_rides_msgpack_bin_with_true_infinities() {
+        // Python msgspec strictly expects `bytes` (msgpack bin) for the row
+        // data and native non-finite floats for open bounds — an integer
+        // array or a null sentinel would fail the engine-side decode.
+        let rows: Vec<u8> = [1.5f64, -2.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let table = ClampHookTable {
+            shape: vec![1, 2],
+            layer_indices: vec![14],
+            data: rows.clone(),
+            lo: vec![f64::NEG_INFINITY],
+            hi: vec![4.0],
+            strength: vec![0.5],
+        };
+        let clamps = SteeringClamps {
+            hooks: HashMap::from([("post_block".to_owned(), table)]),
+        };
         let params = EngineCoreSamplingParams {
-            steering_clamps: Some(packed.clone()),
+            steering_clamps: Some(clamps.clone()),
             ..EngineCoreSamplingParams::for_test()
         };
+
         let bytes = encode_msgpack(&params).unwrap();
+        let value = decode_value(&bytes).unwrap();
+        let Value::Map(map) = value else {
+            panic!("expected map");
+        };
+        let clamps_value = map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("steering_clamps"))
+            .map(|(_, v)| v)
+            .expect("steering_clamps present");
+        let Value::Map(outer) = clamps_value else {
+            panic!("expected hooks map");
+        };
+        let Some((_, Value::Map(hooks))) = outer.iter().find(|(k, _)| k.as_str() == Some("hooks"))
+        else {
+            panic!("expected hooks key");
+        };
+        let Some((_, Value::Map(blob))) =
+            hooks.iter().find(|(k, _)| k.as_str() == Some("post_block"))
+        else {
+            panic!("expected post_block table");
+        };
+        let data = blob.iter().find(|(k, _)| k.as_str() == Some("data")).map(|(_, v)| v);
+        assert!(
+            matches!(data, Some(Value::Binary(b)) if *b == rows),
+            "row data must be a msgpack bin of the raw f64 bytes, got {data:?}"
+        );
+        let lo = blob.iter().find(|(k, _)| k.as_str() == Some("lo")).map(|(_, v)| v);
+        assert!(
+            matches!(lo, Some(Value::Array(vals))
+                if matches!(vals[0], Value::F64(f) if f == f64::NEG_INFINITY)),
+            "open bounds must ride as native -inf, got {lo:?}"
+        );
+
         let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
-        assert_eq!(decoded.steering_clamps, Some(packed));
+        assert_eq!(decoded.steering_clamps, Some(clamps));
+    }
+
+    #[test]
+    fn clamp_data_serializes_as_base64_in_json() {
+        // The module-broadcast kwargs are built via serde_json before the
+        // rmpv utility encoding, so the JSON form must carry base64 (which
+        // Python's from_obj wire-map branch decodes) — never an int array.
+        let rows: Vec<u8> = [3.0f64].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let clamps = SteeringClamps {
+            hooks: HashMap::from([(
+                "post_attn".to_owned(),
+                ClampHookTable {
+                    shape: vec![1, 1],
+                    layer_indices: vec![2],
+                    data: rows,
+                    lo: vec![0.0],
+                    hi: vec![1.0],
+                    strength: vec![1.0],
+                },
+            )]),
+        };
+        let json = serde_json::to_value(&clamps).unwrap();
+        let data = &json["hooks"]["post_attn"]["data"];
+        assert!(data.is_string(), "JSON data must be base64, got {data:?}");
+        let decoded: SteeringClamps = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, clamps);
     }
 
     #[test]
