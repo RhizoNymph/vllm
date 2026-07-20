@@ -754,10 +754,16 @@ async def test_init_app_state_preloads_sae_directory_and_broadcasts_weights(
     modules = register_call.kwargs["kwargs"]["modules"]
     assert modules["g"]["kind"] == "sae_delta"
     assert modules["g"]["sae_manifest"]["weights_uri"] == str(tmp_path)
-    assert torch.equal(
-        modules["g"]["sae_weights"][(0, "post_block")]["decoder_weight"],
-        torch.full((2, 8), 2.0),
-    )
+    # Weights ride the wire in the packed form ("layer:hook" keys,
+    # {dtype, shape, data} blobs) — torch tensors do not survive the
+    # collective_rpc hop.
+    blob = modules["g"]["sae_weights"]["0:post_block"]["decoder_weight"]
+    assert blob["dtype"] == "float32"
+    assert blob["shape"] == [2, 8]
+    decoded = torch.frombuffer(
+        bytearray(blob["data"]), dtype=torch.float32
+    ).view(2, 8)
+    assert torch.equal(decoded, torch.full((2, 8), 2.0))
     assert register_call.kwargs["kwargs"]["replace"] is True
 
 
