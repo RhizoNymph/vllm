@@ -387,7 +387,11 @@ def _parse_clamp_entry(
     return arr, lo, hi, strength
 
 
-class ClampHookTable(msgspec.Struct, omit_defaults=True):
+class ClampHookTable(
+    msgspec.Struct,
+    omit_defaults=True,
+    forbid_unknown_fields=True,
+):
     """One hook point's clamp directions in the canonical packed layout.
 
     ``data`` holds ``shape[0]`` float64 little-endian C-contiguous rows,
@@ -523,7 +527,11 @@ _CLAMP_TABLE_KEYS = frozenset(
 )
 
 
-class SteeringClamps(msgspec.Struct, omit_defaults=True):
+class SteeringClamps(
+    msgspec.Struct,
+    omit_defaults=True,
+    forbid_unknown_fields=True,
+):
     """Canonical directional-clamp spec: ``{hook_point: ClampHookTable}``.
 
     The single post-ingestion representation of a clamp tier.  Every
@@ -535,6 +543,10 @@ class SteeringClamps(msgspec.Struct, omit_defaults=True):
     msgpack ``bin`` on internal hops (no base64).
     """
 
+    # ``forbid_unknown_fields`` makes the strict wire decode REJECT the
+    # legacy verbatim entry-list shape (hook names are unknown fields on
+    # this Struct) instead of silently decoding it to an empty spec —
+    # a malformed/outdated frontend must fail loudly, not run unclamped.
     hooks: dict[str, ClampHookTable] = msgspec.field(default_factory=dict)
 
     def __bool__(self) -> bool:
@@ -1662,51 +1674,12 @@ def maybe_pack_inline_steering_for_request(
        ``effective_*_steering`` cached_properties so worker-side reads
        return them directly without re-resolving.
 
-    Directional clamps are packed the same way: any JSON (unpacked) clamp
-    tier is replaced in place with its :func:`pack_steering_clamps` binary
-    form (float64 directions, so the packed request hashes bit-identically to
-    the JSON one).  The prefill/decode config hashes are primed from the fp64
-    JSON entries before the swap, so a clamp-only request keeps its cache
-    identity across the pack.  Already-packed tiers (client-submitted binary
-    form) are left untouched.
+    Directional clamps need no packing here: the ``steering_clamps``
+    fields are already the canonical :class:`SteeringClamps` after
+    ``__post_init__``, which is itself the efficient wire form (msgpack
+    map with binary row data) — and clamp width validation happens engine
+    side in the input processor, the one seam every frontend crosses.
     """
-    # Clamp width gate. Runs before the vector-only early returns because a
-    # clamp-only request has no inline vectors to pack but its directions
-    # must still be width-checked here — this helper is the one seam every
-    # inline request crosses before the multiprocessing boundary.
-    if expected_row_width is not None:
-        for clamp_field, clamp_spec in (
-            ("steering_clamps", sp.steering_clamps),
-            ("prefill_steering_clamps", sp.prefill_steering_clamps),
-            ("decode_steering_clamps", sp.decode_steering_clamps),
-        ):
-            validate_clamp_row_widths(
-                clamp_spec, expected_row_width, field_name=clamp_field
-            )
-
-    # Pack any JSON clamp tier into the binary wire form.  Done before the
-    # vector-only early return so clamp-only requests are packed too.
-    clamp_fields = (
-        "steering_clamps",
-        "prefill_steering_clamps",
-        "decode_steering_clamps",
-    )
-    has_json_clamps = any(
-        (spec := getattr(sp, f)) is not None and not _clamps_looks_packed(spec)
-        for f in clamp_fields
-    )
-    if has_json_clamps:
-        # Prime the phase hashes against the fp64 JSON entries so the packed
-        # request keeps the same prefix-cache identity (the cached properties
-        # also fold in inline vectors + module_ref, still in their original
-        # form at this point).
-        _ = sp.prefill_steering_config_hash
-        _ = sp.decode_steering_config_hash
-        for f in clamp_fields:
-            spec = getattr(sp, f)
-            if spec is not None and not _clamps_looks_packed(spec):
-                setattr(sp, f, pack_steering_clamps(spec))
-
     if (
         sp.steering_vectors is None
         and sp.prefill_steering_vectors is None

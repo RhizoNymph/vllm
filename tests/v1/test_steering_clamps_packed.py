@@ -11,8 +11,6 @@ Covers:
 - validate_clamp_row_widths on packed tiers
 - CRITICAL: packed-vs-JSON hash equality (prefix-cache correctness), both at
   the hash_steering_config level and the SamplingParams cached-hash level
-- maybe_pack_inline_steering_for_request packing JSON clamps in place while
-  preserving the fp64-derived config hash
 """
 
 import base64
@@ -22,9 +20,9 @@ import numpy as np
 import pytest
 
 from vllm.config.steering_types import (
+    SteeringClamps,
     coerce_clamp_spec,
     hash_steering_config,
-    maybe_pack_inline_steering_for_request,
     pack_steering_clamps,
     resolve_effective_clamps,
     unpack_steering_clamps,
@@ -211,8 +209,8 @@ class TestHashEquality:
             }
         }
         sp_json = SamplingParams(steering_clamps=raw)
-        # Pack the canonicalized (validated, unit-normalized) form.
-        packed = pack_steering_clamps(sp_json.steering_clamps)
+        # Pack the raw entries (pack normalizes rows at fp64).
+        packed = pack_steering_clamps(raw)
         sp_packed = SamplingParams(steering_clamps=packed)
         assert (
             sp_json.prefill_steering_config_hash
@@ -228,9 +226,11 @@ class TestSamplingParamsPackedValidation:
     def test_packed_field_accepted_structurally(self):
         packed = {"post_attn": _pack_blob([[1.0, 0.0]], [3], [[0.0, 1.0]], [1.0])}
         sp = SamplingParams(steering_clamps=packed)
-        # Not eagerly decoded: still packed on the field.
-        assert "data" in sp.steering_clamps["post_attn"]
-        # But resolvable through effective props.
+        # Ingestion normalizes the legacy packed blob to the canonical
+        # SteeringClamps (raw fp64 rows, real ±inf bounds).
+        assert isinstance(sp.steering_clamps, SteeringClamps)
+        table = sp.steering_clamps.hooks["post_attn"]
+        assert table.rows()[0].tolist() == [1.0, 0.0]
         eff = sp.effective_prefill_clamps
         assert eff.hooks["post_attn"].lo == [0.0]
 
@@ -244,29 +244,3 @@ class TestSamplingParamsPackedValidation:
         blob = _pack_blob([[1.0, 0.0]], [3], [[0.0, 1.0]], [1.0])
         with pytest.raises(ValueError):
             SamplingParams(steering_clamps={"not_a_hook": blob})
-
-
-class TestMaybePackClamps:
-    def test_json_clamps_packed_in_place_preserving_hash(self):
-        raw = {
-            "post_attn": {
-                3: [{"vector": [3.0, 4.0], "min": -1.0, "max": 2.0}],
-            }
-        }
-        sp = SamplingParams(steering_clamps=raw)
-        h_prefill = sp.prefill_steering_config_hash
-        h_decode = sp.decode_steering_config_hash
-
-        sp2 = SamplingParams(steering_clamps=raw)
-        maybe_pack_inline_steering_for_request(sp2, np.float32, expected_row_width=2)
-        # Field replaced with the packed form.
-        assert "data" in sp2.steering_clamps["post_attn"]
-        # Hash preserved bit-for-bit.
-        assert sp2.prefill_steering_config_hash == h_prefill
-        assert sp2.decode_steering_config_hash == h_decode
-
-    def test_clamp_only_width_gate_rejects_packed_wrong_width(self):
-        packed = {"post_attn": _pack_blob([[1.0, 0.0]], [3], [[0.0, 1.0]], [1.0])}
-        sp = SamplingParams(steering_clamps=packed)
-        with pytest.raises(ValueError):
-            maybe_pack_inline_steering_for_request(sp, np.float32, expected_row_width=8)

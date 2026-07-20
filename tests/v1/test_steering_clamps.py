@@ -263,16 +263,18 @@ class TestSamplingParamsClamps:
         assert sp.prefill_steering_clamps is None
         assert sp.decode_steering_clamps is None
 
-    def test_valid_clamps_accepted_and_normalized_in_place(self):
+    def test_valid_clamps_accepted_and_canonicalized(self):
         sp = SamplingParams(
             steering_clamps={"post_block": {2: [_entry([3.0, 4.0], 1.0)]}}
         )
-        entry = sp.steering_clamps["post_block"][2][0]
-        assert np.allclose(entry["vector"], [0.6, 0.8])
-        assert entry["min"] == 1.0
-        assert entry["max"] == 1.0
-        assert entry["strength"] == 1.0
-        assert "value" not in entry
+        assert isinstance(sp.steering_clamps, SteeringClamps)
+        table = sp.steering_clamps.hooks["post_block"]
+        # Rows are stored as submitted (consumers unit-normalize).
+        assert table.rows()[0].tolist() == [3.0, 4.0]
+        assert table.layer_indices == [2]
+        assert table.lo == [1.0]
+        assert table.hi == [1.0]
+        assert table.strength == [1.0]
 
     def test_invalid_hook_rejected(self):
         with pytest.raises(ValueError, match="hook"):
@@ -348,27 +350,18 @@ class TestSamplingParamsClamps:
         assert sp2.steering_clamps is not None
         assert sp2.prefill_steering_config_hash == expected_prefill
 
-    def test_pack_path_clamp_width_gate(self):
+    def test_clamp_only_pack_path_noop(self):
+        """Clamp-only requests have no inline vectors to pack; the clamp
+        fields are already canonical and must pass through untouched
+        (width validation lives engine-side in the input processor)."""
         import torch
 
         sp = SamplingParams(
             steering_clamps={"post_block": {0: [_entry([1.0, 0.0], 1.0)]}}
         )
-        with pytest.raises(ValueError, match="width"):
-            maybe_pack_inline_steering_for_request(
-                sp, torch.float32, expected_row_width=4
-            )
-
-    def test_clamp_only_pack_path_noop_but_validates(self):
-        """Clamp-only requests have no inline vectors to pack; the pack
-        helper must still width-validate the clamp spec."""
-        import torch
-
-        sp = SamplingParams(
-            steering_clamps={"post_block": {0: [_entry([1.0, 0.0], 1.0)]}}
-        )
+        before = sp.steering_clamps
         maybe_pack_inline_steering_for_request(sp, torch.float32, expected_row_width=2)
-        assert sp.steering_clamps is not None
+        assert sp.steering_clamps is before
 
     def test_from_optional_threads_clamps(self):
         sp = SamplingParams.from_optional(

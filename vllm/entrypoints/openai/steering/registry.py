@@ -17,15 +17,12 @@ from pathlib import Path
 from typing import Any
 
 from vllm.config.steering_types import (
-    SteeringClampSpec,
+    SteeringClamps,
     SteeringVectorSpec,
     _looks_packed,
-    coerce_clamp_spec,
     coerce_steering_spec,
     merge_steering_specs,
-    normalize_clamp_entry,
     normalize_layer_entry,
-    validate_clamp_row_widths,
     validate_spec_row_widths,
 )
 from vllm.logger import init_logger
@@ -42,9 +39,9 @@ class SteeringModule:
     vectors: SteeringVectorSpec | None = None
     prefill_vectors: SteeringVectorSpec | None = None
     decode_vectors: SteeringVectorSpec | None = None
-    clamps: SteeringClampSpec | None = None
-    prefill_clamps: SteeringClampSpec | None = None
-    decode_clamps: SteeringClampSpec | None = None
+    clamps: SteeringClamps | None = None
+    prefill_clamps: SteeringClamps | None = None
+    decode_clamps: SteeringClamps | None = None
 
 
 class SteeringModuleRegistry:
@@ -70,9 +67,9 @@ class SteeringModuleRegistry:
         vectors: SteeringVectorSpec | dict | None = None,
         prefill_vectors: SteeringVectorSpec | dict | None = None,
         decode_vectors: SteeringVectorSpec | dict | None = None,
-        clamps: SteeringClampSpec | dict | None = None,
-        prefill_clamps: SteeringClampSpec | dict | None = None,
-        decode_clamps: SteeringClampSpec | dict | None = None,
+        clamps: SteeringClamps | dict | None = None,
+        prefill_clamps: SteeringClamps | dict | None = None,
+        decode_clamps: SteeringClamps | dict | None = None,
     ) -> None:
         """Register a named steering module. Overwrites if name exists.
 
@@ -81,10 +78,10 @@ class SteeringModuleRegistry:
         latter is normalized to the former via :func:`coerce_steering_spec`
         so the stored ``SteeringModule`` always carries the legacy shape and
         ``dump_for_broadcast`` continues to emit pickle-friendly plain
-        Python collections.  Clamp tiers have only the legacy JSON form
-        (``{hook: {layer: [ClampEntry, ...]}}``); layer keys are
-        int-coerced via :func:`coerce_clamp_spec` and entries validated via
-        :func:`normalize_clamp_entry`.
+        Python collections.  Clamp tiers are normalized to canonical
+        :class:`SteeringClamps` via ``from_obj`` (accepting entry-list
+        JSON, the type's own wire/JSON form, or legacy base64 blobs) with
+        full row validation at ingestion.
         """
         # Normalize packed-shape inputs to legacy shape so downstream
         # validation (_validate_layer_entry) and the broadcast payload
@@ -92,9 +89,13 @@ class SteeringModuleRegistry:
         vectors = coerce_steering_spec(vectors)
         prefill_vectors = coerce_steering_spec(prefill_vectors)
         decode_vectors = coerce_steering_spec(decode_vectors)
-        clamps = coerce_clamp_spec(clamps, unpack_packed=True)
-        prefill_clamps = coerce_clamp_spec(prefill_clamps, unpack_packed=True)
-        decode_clamps = coerce_clamp_spec(decode_clamps, unpack_packed=True)
+        clamps = SteeringClamps.from_obj(clamps, field_name="clamps")
+        prefill_clamps = SteeringClamps.from_obj(
+            prefill_clamps, field_name="prefill_clamps"
+        )
+        decode_clamps = SteeringClamps.from_obj(
+            decode_clamps, field_name="decode_clamps"
+        )
 
         # Validate that at least one tier has vectors or clamps
         if not any(
@@ -142,8 +143,8 @@ class SteeringModuleRegistry:
                         field_name=f"module {name!r} {tier_name}",
                     )
 
-        # Validate clamp tiers: hook points, layer indices, per-entry
-        # structure (via normalize_clamp_entry) and direction widths.
+        # Validate clamp tiers: hook points, layer indices and direction
+        # widths (row structure was fully validated by from_obj above).
         for tier_name, cspec in [
             ("clamps", clamps),
             ("prefill_clamps", prefill_clamps),
@@ -151,33 +152,18 @@ class SteeringModuleRegistry:
         ]:
             if not cspec:
                 continue
-            invalid = set(cspec.keys()) - VALID_HOOK_POINT_NAMES
+            invalid = set(cspec.hooks.keys()) - VALID_HOOK_POINT_NAMES
             if invalid:
                 raise ValueError(
                     f"Invalid hook point name(s) in module '{name}': "
                     f"{sorted(invalid)}. "
                     f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}"
                 )
-            for hook_name, layer_entries in cspec.items():
-                for layer_idx, entries in layer_entries.items():
+            for table in cspec.hooks.values():
+                for layer_idx in table.site_counts():
                     self._validate_layer_index(name=name, layer_idx=layer_idx)
-                    if not isinstance(entries, list):
-                        raise ValueError(
-                            f"module {name!r} {tier_name}[{hook_name!r}]"
-                            f"[{layer_idx}] must be a list of clamp "
-                            f"entries, got {type(entries).__name__}"
-                        )
-                    for i, entry in enumerate(entries):
-                        try:
-                            normalize_clamp_entry(entry)
-                        except (TypeError, ValueError) as exc:
-                            raise ValueError(
-                                f"module {name!r} {tier_name}[{hook_name!r}]"
-                                f"[{layer_idx}][{i}]: {exc}"
-                            ) from exc
             if self._expected_row_width is not None:
-                validate_clamp_row_widths(
-                    cspec,
+                cspec.validate_row_width(
                     self._expected_row_width,
                     field_name=f"module {name!r} {tier_name}",
                 )

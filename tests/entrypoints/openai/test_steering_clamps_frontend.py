@@ -15,7 +15,6 @@ Covers:
 
 from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 
 from vllm.config.steering import SteeringConfig
@@ -89,12 +88,12 @@ class TestChatProtocolClamps:
             decode_steering_clamps={"post_block": {"6": [_clamp_entry(1, 3.0)]}},
         )
         sp = req.to_sampling_params(max_tokens=100, default_sampling_params={})
-        entry = sp.steering_clamps["post_block"][5][0]
-        # Canonical form: unit direction, resolved bounds.
-        assert np.isclose(np.linalg.norm(entry["vector"]), 1.0)
-        assert entry["min"] == 2.0
-        assert entry["max"] == 2.0
-        assert 6 in sp.decode_steering_clamps["post_block"]
+        # Canonical SteeringClamps: str layer keys coerced, sugar resolved.
+        table = sp.steering_clamps.hooks["post_block"]
+        assert table.layer_indices == [5]
+        assert table.lo == [2.0]
+        assert table.hi == [2.0]
+        assert 6 in sp.decode_steering_clamps.hooks["post_block"].site_counts()
         assert sp.prefill_steering_clamps is None
 
     def test_invalid_entry_rejected_at_sampling_params(self):
@@ -111,7 +110,7 @@ class TestCompletionProtocolClamps:
     def test_to_sampling_params_coerces(self):
         req = _make_completion(steering_clamps=_clamps("7"))
         sp = req.to_sampling_params(max_tokens=100, default_sampling_params={})
-        assert 7 in sp.steering_clamps["post_block"]
+        assert 7 in sp.steering_clamps.hooks["post_block"].site_counts()
 
 
 class TestRegistryClamps:
@@ -121,7 +120,7 @@ class TestRegistryClamps:
         await registry.register(name="c", clamps=_clamps("5"))
         module = registry.get("c")
         assert module.clamps is not None
-        assert 5 in module.clamps["post_block"]
+        assert 5 in module.clamps.hooks["post_block"].site_counts()
 
     @pytest.mark.asyncio
     async def test_dump_for_broadcast_carries_clamps(self):
