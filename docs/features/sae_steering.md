@@ -220,8 +220,13 @@ local; only the schema is replicated.
 ### Request Hashing
 
 `SamplingParams` carries `sae_clamp_specs` and
-`sae_full_reconstruction_specs`. Six cached hash properties feed the
-runtime:
+`sae_full_reconstruction_specs`. Both are accepted by the OpenAI
+completion, chat and batch-chat endpoints (via `extra_body`) on the
+Python and Rust frontends alike; the API server validates them against
+the registry (`validate_sae_clamp_specs` /
+`validate_sae_full_reconstruction_specs`) so unknown-module /
+wrong-kind / uncovered-site errors 400 before admission. Six cached
+hash properties feed the runtime:
 
 - `prefill_steering_config_hash` / `decode_steering_config_hash` — the
   *combined* per-phase identity: `hash_steering_config(...)` folds the
@@ -477,7 +482,8 @@ Core implementation:
   spec fields, phase filters, the six cached hash properties.
 - [`vllm/entrypoints/openai/steering/registry.py`](../../vllm/entrypoints/openai/steering/registry.py)
   — `SAEModuleManifest`, kind-branched `register`,
-  `validate_sae_clamp_specs`, `validate_additive_lookup`,
+  `validate_sae_clamp_specs`, `validate_sae_full_reconstruction_specs`,
+  `validate_additive_lookup`,
   `apply_sampling_params_hash_overrides`, `restore_or_remove`,
   `dump_for_broadcast(include_sae_weights=...)`.
 - [`vllm/entrypoints/openai/steering/sae_loader.py`](../../vllm/entrypoints/openai/steering/sae_loader.py)
