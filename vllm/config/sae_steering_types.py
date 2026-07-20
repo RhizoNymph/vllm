@@ -441,8 +441,9 @@ def _hash_sae_clamp_specs_with_phase(
             for layer_idx in sorted(layer_map.keys()):
                 h.update(b"\x03layer\x03")
                 h.update(
-                    validate_steering_index(layer_idx, "SAEClampSpec layer_idx")
-                    .to_bytes(4, "little", signed=True)
+                    validate_steering_index(
+                        layer_idx, "SAEClampSpec layer_idx"
+                    ).to_bytes(4, "little", signed=True)
                 )
                 entries = sorted(layer_map[layer_idx], key=lambda e: e.feature_idx)
                 for entry in entries:
@@ -687,7 +688,38 @@ def coerce_sae_full_reconstruction_specs(
                 )
             layer_map: SAEClampLayerMap = {}
             for layer_key, entries_raw in layer_map_raw.items():
-                layer_idx = int(layer_key)
+                # Guarded str->int layer-key coercion, matching
+                # coerce_sae_clamp_specs (JSON object keys arrive as
+                # strings; anything else is a caller bug worth a clear
+                # error, not a bare int() TypeError).
+                if type(layer_key) is int:
+                    layer_idx = layer_key
+                elif isinstance(layer_key, str):
+                    try:
+                        layer_idx = int(layer_key)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"sae_full_reconstruction_specs[{i}]['clamps']"
+                            f"[{hook_name!r}] has invalid layer key "
+                            f"{layer_key!r}; expected an integer."
+                        ) from exc
+                else:
+                    raise ValueError(
+                        f"sae_full_reconstruction_specs[{i}]['clamps']"
+                        f"[{hook_name!r}] has invalid layer key "
+                        f"{layer_key!r}; expected an integer."
+                    )
+                validate_steering_index(
+                    layer_idx,
+                    f"sae_full_reconstruction_specs[{i}]['clamps']"
+                    f"[{hook_name!r}] layer key",
+                )
+                if layer_idx in layer_map:
+                    raise ValueError(
+                        f"sae_full_reconstruction_specs[{i}]['clamps']"
+                        f"[{hook_name!r}] contains duplicate layer key "
+                        f"{layer_idx!r} after integer normalization."
+                    )
                 if not isinstance(entries_raw, (list, tuple)):
                     raise ValueError(
                         f"sae_full_reconstruction_specs[{i}]['clamps']"
@@ -752,9 +784,7 @@ def _hash_sae_full_reconstruction_specs_with_phase(
     """Hash *specs*, optionally replacing each spec phase in the digest."""
     h = hashlib.sha256()
     h.update(b"\x00sae_full_recon\x00")
-    for spec in sorted(
-        specs, key=lambda s: (s.module_name, phase_override or s.phase)
-    ):
+    for spec in sorted(specs, key=lambda s: (s.module_name, phase_override or s.phase)):
         h.update(b"\x01module\x01")
         h.update(spec.module_name.encode("utf-8"))
         h.update((phase_override or spec.phase).encode("utf-8"))
