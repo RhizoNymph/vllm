@@ -598,14 +598,17 @@ class SteeringModuleRegistry:
                             "manifest has no 'weights_uri' to load weights from."
                         )
                     from vllm.entrypoints.openai.steering.sae_loader import (
+                        _load_fr_weights_for_manifest,
                         _load_weights_for_manifest,
                     )
 
+                    load_weights = (
+                        _load_fr_weights_for_manifest
+                        if module.kind is SteeringModuleKind.SAE_FULL_RECONSTRUCTION
+                        else _load_weights_for_manifest
+                    )
                     payload["sae_weights"] = pack_sae_weights_for_broadcast(
-                        _load_weights_for_manifest(
-                            manifest,
-                            Path(manifest.weights_uri),
-                        )
+                        load_weights(manifest, Path(manifest.weights_uri))
                     )
             out[name] = payload
         return out
@@ -636,16 +639,37 @@ class SteeringModuleRegistry:
 
         if file_path.is_dir():
             from vllm.entrypoints.openai.steering.sae_loader import (
+                load_sae_full_recon_module_from_dir,
                 load_sae_module_from_dir,
             )
 
-            loaded = load_sae_module_from_dir(file_path)
+            # An optional "kind" discriminator in manifest.json selects the
+            # SAE flavour; absent means sae_delta (the original contract).
+            manifest_path = file_path / "manifest.json"
+            kind_raw = "sae_delta"
+            if manifest_path.exists():
+                with manifest_path.open("r", encoding="utf-8") as fh:
+                    peeked = json.load(fh)
+                if isinstance(peeked, dict):
+                    kind_raw = peeked.get("kind", "sae_delta")
+            if kind_raw == SteeringModuleKind.SAE_FULL_RECONSTRUCTION.value:
+                loaded = load_sae_full_recon_module_from_dir(file_path)
+                kind = SteeringModuleKind.SAE_FULL_RECONSTRUCTION
+            elif kind_raw == SteeringModuleKind.SAE_DELTA.value:
+                loaded = load_sae_module_from_dir(file_path)
+                kind = SteeringModuleKind.SAE_DELTA
+            else:
+                raise ValueError(
+                    f"Steering module directory {path!r} declares "
+                    f"unsupported kind {kind_raw!r}; expected "
+                    f"'sae_delta' or 'sae_full_reconstruction'."
+                )
             # Startup/full-sync broadcasts can include SAE weights only if the
             # manifest has a stable local path to reload from.
             loaded.manifest.weights_uri = str(file_path)
             await self.register(
                 name=name,
-                kind=SteeringModuleKind.SAE_DELTA,
+                kind=kind,
                 sae_manifest=loaded.manifest,
             )
             return
