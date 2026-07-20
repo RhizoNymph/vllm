@@ -164,13 +164,15 @@ class TestResolveUnpacksPacked:
     def test_packed_base_resolves(self):
         packed = {"post_attn": _pack_blob([[1.0, 0.0]], [3], [[0.0, 1.0]], [1.0])}
         resolved = resolve_effective_clamps(packed, None)
-        assert resolved["post_attn"][3][0]["vector"] == [1.0, 0.0]
+        table = resolved.hooks["post_attn"]
+        assert table.layer_indices == [3]
+        assert table.rows()[0].tolist() == [1.0, 0.0]
 
     def test_packed_concat_with_json_phase(self):
         packed = {"post_attn": _pack_blob([[1.0, 0.0]], [3], [[0.0, 1.0]], [1.0])}
         phase = {"post_attn": {3: [{"vector": [0.0, 1.0], "value": 2.0}]}}
         resolved = resolve_effective_clamps(packed, phase)
-        assert len(resolved["post_attn"][3]) == 2
+        assert resolved.hooks["post_attn"].site_counts()[3] == 2
 
 
 class TestValidateWidthsPacked:
@@ -229,7 +231,8 @@ class TestSamplingParamsPackedValidation:
         # Not eagerly decoded: still packed on the field.
         assert "data" in sp.steering_clamps["post_attn"]
         # But resolvable through effective props.
-        assert sp.effective_prefill_clamps["post_attn"][3][0]["min"] == 0.0
+        eff = sp.effective_prefill_clamps
+        assert eff.hooks["post_attn"].lo == [0.0]
 
     def test_packed_bad_structure_rejected(self):
         blob = _pack_blob([[1.0, 0.0]], [3], [[0.0, 1.0]], [1.0])

@@ -14,16 +14,13 @@ import torch
 import torch.nn as nn
 
 from vllm.config.steering_types import (
-    SteeringClampSpec,
+    SteeringClamps,
     SteeringVectorSpec,
-    _clamps_looks_packed,
     hash_steering_config,
     merge_steering_specs,
-    normalize_clamp_entry,
     resolve_effective_clamps,
     resolve_effective_vectors,
     scale_steering_spec,
-    unpack_steering_clamps,
 )
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
@@ -135,26 +132,27 @@ def _vectors_digest(vectors: "dict | None") -> bytes:
     return b"@".join(parts)
 
 
-def _clamps_digest(clamps: "dict | None") -> bytes:
-    """Deterministic digest of a ``SteeringClampSpec``.
+def _clamps_digest(clamps: "SteeringClamps | None") -> bytes:
+    """Deterministic digest of a :class:`SteeringClamps` tier.
 
-    Entries are normalized (``normalize_clamp_entry``) so the raw
-    ``value`` sugar and the canonical ``min``/``max`` forms digest
-    identically. ``None`` and ``{}`` map to distinct sentinels (``keep``
-    vs ``clear`` carry different meaning on a re-emit). Only folded into a
-    :class:`RequestSteeringOverride` digest when the override carries
-    clamps, so clamp-free overrides keep their pre-clamp digest bytes.
+    Rows are digested as stored (raw float64 bytes) — ``value`` sugar and
+    defaults are already resolved at ingestion, so logically-equal
+    submissions are byte-equal. ``None`` and empty map to distinct
+    sentinels (``keep`` vs ``clear`` carry different meaning on a
+    re-emit). Only folded into a :class:`RequestSteeringOverride` digest
+    when the override carries clamps, so clamp-free overrides keep their
+    pre-clamp digest bytes.
     """
     if clamps is None:
         return b"none"
     if not clamps:
         return b"empty"
     parts: list[bytes] = []
-    for hook in sorted(clamps):
-        for layer in sorted(clamps[hook]):
-            for i, entry in enumerate(clamps[hook][layer]):
-                vec, lo, hi, strength = normalize_clamp_entry(entry)
-                arr = np.ascontiguousarray(vec, dtype=np.float32)
+    for hook in sorted(clamps.hooks):
+        table = clamps.hooks[hook]
+        for layer, dirs, lo, hi, strength in table.by_layer():
+            for i in range(dirs.shape[0]):
+                arr = np.ascontiguousarray(dirs[i], dtype=np.float64)
                 parts.append(
                     b"%b|%d|%d|%d|%b%b%b"
                     % (
@@ -162,9 +160,9 @@ def _clamps_digest(clamps: "dict | None") -> bytes:
                         layer,
                         i,
                         zlib.crc32(arr.tobytes()) & 0xFFFFFFFF,
-                        struct.pack("<d", lo),
-                        struct.pack("<d", hi),
-                        struct.pack("<d", strength),
+                        struct.pack("<d", lo[i]),
+                        struct.pack("<d", hi[i]),
+                        struct.pack("<d", strength[i]),
                     )
                 )
     return b"@".join(parts)
@@ -198,7 +196,10 @@ def _steering_action_digest(action) -> bytes:
         ]
         # Gate the clamp segment so a clamp-free override keeps its exact
         # pre-clamp digest bytes (the pinned-checksum determinism test).
-        clamps = getattr(action, "clamps", None)
+        # from_obj revives dict-shaped clamps from duck-typed producers.
+        clamps = SteeringClamps.from_obj(
+            getattr(action, "clamps", None), preserve_empty=True
+        )
         if clamps:
             parts.append(_clamps_digest(clamps))
         return b";".join(parts)
@@ -736,20 +737,21 @@ class SteeringModelRunnerMixin:
 
     def _validate_clamps_spec(
         self,
-        clamps_data: dict[str, dict[int, list[dict]]],
+        clamps_data: "SteeringClamps",
         steerable: dict,
     ) -> set[int]:
-        """Validate a global clamp spec against this worker's layers.
+        """Validate a global clamp tier against this worker's layers.
 
         Clamp sibling of :meth:`_validate_vectors_spec`: checks hook
-        points, per-entry structure (via :func:`normalize_clamp_entry`),
-        direction width against the layer's table hidden size, and the
-        per-site K cap. Returns the set of valid layer indices on this
-        worker; raises ``SteeringVectorError`` on any invalid input.
+        points, direction width against the layer's table hidden size,
+        and the per-site K cap (row structure was already validated at
+        ingestion by ``SteeringClamps.from_obj``). Returns the set of
+        valid layer indices on this worker; raises
+        ``SteeringVectorError`` on any invalid input.
         """
         max_dirs = getattr(self, "_max_clamp_directions", 0)
         valid_indices: set[int] = set()
-        for hook_point_str, layer_entries in clamps_data.items():
+        for hook_point_str, table in clamps_data.hooks.items():
             try:
                 hp_enum = SteeringHookPoint(hook_point_str)
             except ValueError as exc:
@@ -758,7 +760,7 @@ class SteeringModelRunnerMixin:
                 ) from exc
             table_attr = HOOK_POINT_TABLE_ATTR[hp_enum]
 
-            for idx, entries in layer_entries.items():
+            for idx, count in sorted(table.site_counts().items()):
                 if idx not in steerable:
                     continue
                 mod = steerable[idx]
@@ -766,36 +768,24 @@ class SteeringModelRunnerMixin:
                     raise SteeringVectorError(
                         f"Hook point {hook_point_str!r} not active on layer {idx}"
                     )
-                if not isinstance(entries, list):
-                    raise SteeringVectorError(
-                        f"Layer {idx} ({hook_point_str}): clamps must be a "
-                        f"list of clamp entries, got {type(entries).__name__}"
-                    )
                 if max_dirs <= 0:
                     raise SteeringVectorError(
                         "Clamping is disabled on this engine "
                         "(steering_config.max_clamp_directions=0)"
                     )
-                if len(entries) > max_dirs:
+                if count > max_dirs:
                     raise SteeringVectorError(
-                        f"Layer {idx} ({hook_point_str}): {len(entries)} "
+                        f"Layer {idx} ({hook_point_str}): {count} "
                         f"clamp directions exceed max_clamp_directions="
                         f"{max_dirs}"
                     )
                 expected_size = getattr(mod, table_attr).shape[1]
-                for i, entry in enumerate(entries):
-                    try:
-                        vec, _lo, _hi, _strength = normalize_clamp_entry(entry)
-                    except (TypeError, ValueError) as exc:
-                        raise SteeringVectorError(
-                            f"Layer {idx} ({hook_point_str}) clamp[{i}]: {exc}"
-                        ) from exc
-                    if len(vec) != expected_size:
-                        raise SteeringVectorError(
-                            f"Layer {idx} ({hook_point_str}) clamp[{i}]: "
-                            f"expected direction of size {expected_size}, "
-                            f"got {len(vec)}"
-                        )
+                if table.width != expected_size:
+                    raise SteeringVectorError(
+                        f"Layer {idx} ({hook_point_str}): expected clamp "
+                        f"directions of size {expected_size}, got "
+                        f"{table.width}"
+                    )
                 valid_indices.add(idx)
         return valid_indices
 
@@ -860,7 +850,7 @@ class SteeringModelRunnerMixin:
 
     def _notify_manager_clamps(
         self,
-        clamps_data: dict[str, dict[int, list[dict]]],
+        clamps_data: "SteeringClamps",
         steerable: dict,
         valid_indices: set[int],
         phase: str,
@@ -870,14 +860,14 @@ class SteeringModelRunnerMixin:
         if mgr is None:
             return
         locally_owned = getattr(self, "_locally_owned_layers", None)
-        for hook_point_str, layer_entries in clamps_data.items():
-            for idx, entries in layer_entries.items():
+        for hook_point_str, table in clamps_data.hooks.items():
+            for idx, dirs, lo, hi, strength in table.by_layer():
                 if idx not in valid_indices or idx not in steerable:
                     continue
                 mgr.update_global_clamps(
                     hook_point_str,
                     idx,
-                    entries,
+                    (dirs, lo, hi, strength),
                     phase=phase,
                     locally_owned_layers=locally_owned,
                 )
@@ -889,9 +879,9 @@ class SteeringModelRunnerMixin:
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
-        clamps: dict[str, dict[int, list[dict]]] | None = None,
-        prefill_clamps: dict[str, dict[int, list[dict]]] | None = None,
-        decode_clamps: dict[str, dict[int, list[dict]]] | None = None,
+        clamps: "SteeringClamps | dict | None" = None,
+        prefill_clamps: "SteeringClamps | dict | None" = None,
+        decode_clamps: "SteeringClamps | dict | None" = None,
     ) -> tuple[int, int, list[int]]:
         """Set activation steering vectors from plain Python data.
 
@@ -936,13 +926,20 @@ class SteeringModelRunnerMixin:
             all_tiers.append(("prefill", prefill_vectors))
         if decode_vectors:
             all_tiers.append(("decode", decode_vectors))
-        clamp_tiers: list[tuple[str, dict[str, dict[int, list[dict]]]]] = []
-        if clamps:
-            clamp_tiers.append(("base", clamps))
-        if prefill_clamps:
-            clamp_tiers.append(("prefill", prefill_clamps))
-        if decode_clamps:
-            clamp_tiers.append(("decode", decode_clamps))
+        # Revive clamp tiers: collective_rpc flattens SteeringClamps to
+        # its plain wire-map dict, and legacy callers pass entry-lists.
+        clamp_tiers: list[tuple[str, SteeringClamps]] = []
+        for tier_phase, tier_obj, tier_field in (
+            ("base", clamps, "clamps"),
+            ("prefill", prefill_clamps, "prefill_clamps"),
+            ("decode", decode_clamps, "decode_clamps"),
+        ):
+            try:
+                tier_spec = SteeringClamps.from_obj(tier_obj, field_name=tier_field)
+            except (TypeError, ValueError) as exc:
+                raise SteeringVectorError(str(exc)) from exc
+            if tier_spec:
+                clamp_tiers.append((tier_phase, tier_spec))
 
         if not all_tiers and not clamp_tiers:
             if replace:
@@ -1226,36 +1223,26 @@ class SteeringModelRunnerMixin:
     def _module_payload_to_clamps(
         payload: dict,
     ) -> tuple[
-        SteeringClampSpec | None,
-        SteeringClampSpec | None,
-        SteeringClampSpec | None,
+        SteeringClamps | None,
+        SteeringClamps | None,
+        SteeringClamps | None,
     ]:
         """Normalize a broadcast payload's optional clamp tiers.
 
-        Same int-key coercion as :meth:`_module_payload_to_specs`, applied
-        to the ``clamps`` / ``prefill_clamps`` / ``decode_clamps`` keys.  A
-        tier arriving in the binary :class:`SteeringClampSpecPacked` shape
-        (forwarded verbatim by the Rust module route) is decoded once here.
+        Each tier is revived through :meth:`SteeringClamps.from_obj`, so
+        a payload arriving as canonical Structs (flattened to wire maps
+        by the RPC hop), legacy entry-lists with string layer keys (the
+        Rust module route forwards JSON verbatim), or the legacy base64
+        packed shape all normalize identically here.
         """
-
-        def _coerce(spec):
-            if spec is None:
-                return None
-            if _clamps_looks_packed(spec):
-                return unpack_steering_clamps(spec)
-            coerced: SteeringClampSpec = {}
-            for hook, layer_dict in spec.items():
-                converted: dict[int, list] = {}
-                for layer_key, entries in layer_dict.items():
-                    converted[int(layer_key)] = entries
-                if converted:
-                    coerced[hook] = converted
-            return coerced or None
-
         return (
-            _coerce(payload.get("clamps")),
-            _coerce(payload.get("prefill_clamps")),
-            _coerce(payload.get("decode_clamps")),
+            SteeringClamps.from_obj(payload.get("clamps"), field_name="clamps"),
+            SteeringClamps.from_obj(
+                payload.get("prefill_clamps"), field_name="prefill_clamps"
+            ),
+            SteeringClamps.from_obj(
+                payload.get("decode_clamps"), field_name="decode_clamps"
+            ),
         )
 
     def register_steering_modules(
@@ -1610,7 +1597,7 @@ class SteeringModelRunnerMixin:
         self,
         sp: SamplingParams,
         phase: str,
-    ) -> SteeringClampSpec | None:
+    ) -> SteeringClamps | None:
         """Resolve the effective clamps for a request in the given *phase*.
 
         Clamp sibling of :meth:`_resolve_request_steering`: inline tiers
@@ -1905,12 +1892,16 @@ class SteeringModelRunnerMixin:
             )
 
         # Per-override clamps (optional). REPLACE semantics on update:
-        # ``None`` keeps the override's previous clamps, ``{}`` clears them,
-        # a non-empty spec replaces them. Validate the override's own spec
-        # (hooks / entry structure / width / K cap) before touching the
+        # ``None`` keeps the override's previous clamps, an empty spec
+        # clears them, a non-empty spec replaces them. Revive defensively
+        # (in-process producers may pass legacy dicts) and validate the
+        # override's own spec (hooks / width / K cap) before touching the
         # manager; the global-decode composition overflow is caught loudly
         # at populate, naming the dynamic id (same trap as config rows).
-        clamps = action.clamps
+        try:
+            clamps = SteeringClamps.from_obj(action.clamps, preserve_empty=True)
+        except (TypeError, ValueError) as exc:
+            return _reject(str(exc))
         if clamps:
             try:
                 self._validate_clamps_spec(clamps, self._steerable_layers_cache)

@@ -1115,73 +1115,50 @@ def normalize_clamp_entry(
 
 
 def resolve_effective_clamps(
-    base: SteeringClampSpec | None,
-    phase_specific: SteeringClampSpec | None,
+    base: SteeringClamps | dict | None,
+    phase_specific: SteeringClamps | dict | None,
     max_directions: int | None = None,
-) -> SteeringClampSpec | None:
-    """Merge *base* and *phase_specific* clamp specs by concatenation.
+) -> SteeringClamps | None:
+    """Merge *base* and *phase_specific* clamp tiers by concatenation.
 
     Clamps are independent constraints, not addable vectors, so the tier
-    merge is per-``(hook, layer)`` list concatenation with base entries
-    first.  When *max_directions* is given, a site whose merged list
-    exceeds it raises ``ValueError`` (the per-site direction budget is the
-    ``max_clamp_directions`` engine knob — the K dimension of the clamp
-    buffers).  Returns ``None`` if both inputs are ``None`` or empty; a
-    single-sided input passes through unchanged.
+    merge is per-hook table concatenation with base rows first — within
+    any layer, base rows precede phase rows (``by_layer`` grouping
+    preserves relative row order).  When *max_directions* is given, a
+    site whose merged row count exceeds it raises ``ValueError`` (the
+    per-site direction budget is the ``max_clamp_directions`` engine
+    knob — the K dimension of the clamp buffers).  Returns ``None`` if
+    both inputs are ``None`` or empty; a single-sided input passes
+    through unchanged.
 
-    Either input may be the binary :class:`SteeringClampSpecPacked` shape; it
-    is decoded once via :func:`unpack_steering_clamps` before merging, so this
-    is the single seam where the packed per-request/module wire form is turned
-    back into canonical entry lists.
+    Either input may be any shape :meth:`SteeringClamps.from_obj`
+    accepts, so legacy dict-shaped callers keep working.
     """
-    if base is not None and _clamps_looks_packed(base):
-        base = unpack_steering_clamps(base)
-    if phase_specific is not None and _clamps_looks_packed(phase_specific):
-        phase_specific = unpack_steering_clamps(phase_specific)
-
-    def _check_cap(entries: list[ClampEntry], hook: str, layer_idx: int) -> None:
-        if max_directions is not None and len(entries) > max_directions:
-            raise ValueError(
-                f"Clamp spec [{hook!r}][{layer_idx}] has {len(entries)} "
-                f"directions after tier merge, exceeding "
-                f"max_clamp_directions={max_directions}"
-            )
-
-    base_empty = not base
-    phase_empty = not phase_specific
-    if base_empty and phase_empty:
+    base_spec = SteeringClamps.from_obj(base)
+    phase_spec = SteeringClamps.from_obj(phase_specific)
+    if base_spec is None and phase_spec is None:
         return None
-    if phase_empty:
-        assert base is not None
-        for hook, layers in base.items():
-            for layer_idx, entries in layers.items():
-                _check_cap(entries, hook, layer_idx)
-        return base
-    if base_empty:
-        assert phase_specific is not None
-        for hook, layers in phase_specific.items():
-            for layer_idx, entries in layers.items():
-                _check_cap(entries, hook, layer_idx)
-        return phase_specific
-
-    assert base is not None and phase_specific is not None
-    result: SteeringClampSpec = {}
-    all_hooks = set(base.keys()) | set(phase_specific.keys())
-    for hook in all_hooks:
-        base_layers = base.get(hook, {})
-        phase_layers = phase_specific.get(hook, {})
-        hook_result: dict[int, list[ClampEntry]] = {}
-        for layer_idx in set(base_layers.keys()) | set(phase_layers.keys()):
-            merged = list(base_layers.get(layer_idx, [])) + list(
-                phase_layers.get(layer_idx, [])
-            )
-            if not merged:
-                continue
-            _check_cap(merged, hook, layer_idx)
-            hook_result[layer_idx] = merged
-        if hook_result:
-            result[hook] = hook_result
-    return result if result else None
+    if phase_spec is None:
+        merged = base_spec
+    elif base_spec is None:
+        merged = phase_spec
+    else:
+        hooks: dict[str, ClampHookTable] = {}
+        for hook in base_spec.hooks.keys() | phase_spec.hooks.keys():
+            base_table = base_spec.hooks.get(hook)
+            phase_table = phase_spec.hooks.get(hook)
+            if base_table is None:
+                assert phase_table is not None
+                hooks[hook] = phase_table
+            elif phase_table is None:
+                hooks[hook] = base_table
+            else:
+                hooks[hook] = ClampHookTable.concat(base_table, phase_table)
+        merged = SteeringClamps(hooks=hooks)
+    assert merged is not None
+    if max_directions is not None:
+        merged.check_max_directions(max_directions)
+    return merged
 
 
 def coerce_clamp_spec(
@@ -1564,7 +1541,7 @@ def merge_steering_specs(
 def hash_steering_config(
     effective_vectors: dict[str, dict[int, list[float] | np.ndarray]] | None,
     module_ref: tuple[str, float] | None = None,
-    clamps: SteeringClampSpec | None = None,
+    clamps: SteeringClamps | dict | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 
@@ -1586,17 +1563,20 @@ def hash_steering_config(
     cast happens exactly once at the ``tobytes`` boundary, so hashes are
     bit-for-bit identical regardless of the input container.
 
-    *clamps* is an optional :data:`SteeringClampSpec`.  Clamp entries are
-    folded into the digest behind their own domain separator (after the
-    module_ref segment), so a clamps-bearing request gets a distinct,
-    nonzero hash — that nonzero hash is what reserves the request's
-    steering table row through the scheduler.  When ``clamps`` is ``None``
-    or empty the digest byte stream is untouched, keeping vector-only
-    hashes bit-for-bit identical to the pre-clamp behavior.  Entries are
-    normalized via :func:`normalize_clamp_entry` before hashing, so raw
-    (``value`` sugar) and canonical forms hash identically.
+    *clamps* is an optional clamp tier in any shape
+    :meth:`SteeringClamps.from_obj` accepts.  Clamp rows are folded into
+    the digest behind their own domain separator (after the module_ref
+    segment), so a clamps-bearing request gets a distinct, nonzero hash —
+    that nonzero hash is what reserves the request's steering table row
+    through the scheduler.  When ``clamps`` is ``None`` or empty the
+    digest byte stream is untouched, keeping vector-only hashes
+    bit-for-bit identical to the pre-clamp behavior.  Rows are
+    unit-normalized before hashing (bounds live in unit-projection
+    space), so differently-scaled submissions of the same direction hash
+    identically.
     """
-    if not effective_vectors and module_ref is None and not clamps:
+    clamp_spec = SteeringClamps.from_obj(clamps)
+    if not effective_vectors and module_ref is None and clamp_spec is None:
         return 0
     h = hashlib.sha256()
     if effective_vectors:
@@ -1630,23 +1610,23 @@ def hash_steering_config(
         h.update(b"\x00module_ref\x00")
         h.update(name.encode("utf-8"))
         h.update(np.float64(scale).tobytes())
-    if clamps:
+    if clamp_spec:
         # Domain separator: a clamps-only request can never collide with a
         # vector or module_ref request whose content happens to serialize
-        # to the same bytes.  Entry list order is preserved in the digest —
-        # it is semantic (concat order of the tier merge).
+        # to the same bytes.  Row order within a layer is preserved in the
+        # digest — it is semantic (concat order of the tier merge).
         h.update(b"\x00clamps\x00")
-        for hook in sorted(clamps.keys()):
+        for hook in sorted(clamp_spec.hooks.keys()):
             h.update(hook.encode())
-            layer_dict = clamps[hook]
-            for layer_idx in sorted(layer_dict.keys()):
+            table = clamp_spec.hooks[hook]
+            for layer_idx, dirs, lo, hi, strength in table.by_layer():
                 h.update(layer_idx.to_bytes(4, "little", signed=True))
-                for entry in layer_dict[layer_idx]:
-                    vec, lo, hi, strength = normalize_clamp_entry(entry)
-                    h.update(np.asarray(vec, dtype=np.float32).tobytes())
-                    h.update(np.float64(lo).tobytes())
-                    h.update(np.float64(hi).tobytes())
-                    h.update(np.float64(strength).tobytes())
+                unit = _clamp_unit_rows(dirs).astype(np.float32)
+                for i in range(unit.shape[0]):
+                    h.update(unit[i].tobytes())
+                    h.update(np.float64(lo[i]).tobytes())
+                    h.update(np.float64(hi[i]).tobytes())
+                    h.update(np.float64(strength[i]).tobytes())
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
 

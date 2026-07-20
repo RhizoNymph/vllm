@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm.config.steering_types import SteeringClamps
 from vllm.model_executor.layers.clamp import (
     CLAMP_ANY_ACTIVE_ATTR,
     CLAMP_BOUNDS_ATTR,
@@ -77,6 +78,15 @@ def _clamp_entry(axis: int, value: float, strength: float = 1.0) -> dict:
     vec = [0.0] * HIDDEN_SIZE
     vec[axis] = 2.0  # non-unit on purpose: the manager must normalize
     return {"vector": vec, "value": value, "strength": strength}
+
+
+def _site(entries):
+    """Entry list -> one site's (dirs, lo, hi, strength) row group."""
+    spec = SteeringClamps.from_obj({"post_block": {0: entries}})
+    if spec is None:
+        return None
+    _, dirs, lo, hi, strength = spec.hooks["post_block"].by_layer()[0]
+    return dirs, lo, hi, strength
 
 
 def _axis(i: int) -> torch.Tensor:
@@ -214,7 +224,7 @@ class TestClampPopulate:
     def test_global_clamps_reach_rows_1_and_2(self):
         mgr = _make_manager()
         layers = _make_layers(mgr, [0])
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(1, 3.0)], phase="base")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(1, 3.0)]), phase="base")
         mgr.populate_steering_tables(layers)
         dirs, bounds, _, active = _buffers(layers[0])
         assert bool(active.item())
@@ -225,8 +235,8 @@ class TestClampPopulate:
     def test_phase_specific_global_clamps(self):
         mgr = _make_manager()
         layers = _make_layers(mgr, [0])
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(0, 1.0)], phase="prefill")
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(1, 2.0)], phase="decode")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(0, 1.0)]), phase="prefill")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(1, 2.0)]), phase="decode")
         mgr.populate_steering_tables(layers)
         dirs, bounds, _, _ = _buffers(layers[0])
         torch.testing.assert_close(dirs[1, 0], _axis(0))
@@ -237,7 +247,7 @@ class TestClampPopulate:
     def test_config_row_concats_global_then_per_request(self):
         mgr = _make_manager()
         layers = _make_layers(mgr, [0])
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(0, 1.0)], phase="base")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(0, 1.0)]), phase="base")
         row = mgr.register_config(
             7, {}, phase="decode", clamps={_HP: {0: [_clamp_entry(1, 2.0)]}}
         )
@@ -252,7 +262,7 @@ class TestClampPopulate:
         mgr = _make_manager(k=2)
         layers = _make_layers(mgr, [0], k=2)
         mgr.update_global_clamps(
-            _HP, 0, [_clamp_entry(0, 1.0), _clamp_entry(1, 1.0)], phase="base"
+            _HP, 0, _site([_clamp_entry(0, 1.0), _clamp_entry(1, 1.0)]), phase="base"
         )
         mgr.register_config(
             7, {}, phase="decode", clamps={_HP: {0: [_clamp_entry(2, 2.0)]}}
@@ -289,7 +299,7 @@ class TestClampPopulate:
         )
         num_rows = MAX_CONFIGS + 2 + 3
         layers = {0: FakeClampLayer(num_rows, HIDDEN_SIZE)}
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(0, 4.0)], phase="decode")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(0, 4.0)]), phase="decode")
         _, dyn_row = mgr.register_dynamic_config({_HP: {0: [1.0] * HIDDEN_SIZE}})
         mgr.populate_steering_tables(layers)
         dirs, bounds, _, _ = _buffers(layers[0])
@@ -299,7 +309,7 @@ class TestClampPopulate:
     def test_clear_global_clamps(self):
         mgr = _make_manager()
         layers = _make_layers(mgr, [0])
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(0, 1.0)], phase="base")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(0, 1.0)]), phase="base")
         mgr.populate_steering_tables(layers)
         mgr.clear_global_clamps()
         assert not mgr.has_global_clamps
@@ -340,7 +350,7 @@ class TestClampPopulate:
         layers = _make_layers(mgr, [0])
         mgr.populate_steering_tables(layers)
         assert not mgr._tables_dirty
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(0, 1.0)], phase="base")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(0, 1.0)]), phase="base")
         assert mgr._tables_dirty
 
 

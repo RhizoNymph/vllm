@@ -48,7 +48,11 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from vllm.config.steering_types import hash_steering_config, normalize_clamp_entry
+from vllm.config.steering_types import (
+    SteeringClamps,
+    _clamp_unit_rows,
+    hash_steering_config,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.clamp import (
     CLAMP_ANY_ACTIVE_ATTR,
@@ -239,7 +243,7 @@ class SteeringManager:
         # clamps in even on a keep-update (materialized payloads are
         # PP-filtered and would diverge; the raw spec never does).
         self._dynamic_clamps: dict[int, dict[str, dict[int, ClampSitePayload]]] = {}
-        self._dynamic_clamp_specs: dict[int, dict] = {}
+        self._dynamic_clamp_specs: dict[int, SteeringClamps] = {}
 
         # Dynamic additive tier (decode-only): a global steering
         # contribution owned by dynamic consumers, held in a dedicated
@@ -484,7 +488,7 @@ class SteeringManager:
         phase: str = "prefill",
         *,
         locally_owned_layers: frozenset[int] | None = None,
-        clamps: dict | None = None,
+        clamps: SteeringClamps | dict | None = None,
     ) -> int:
         """Register a steering config, return its table row index.
 
@@ -505,9 +509,10 @@ class SteeringManager:
                 identical across ranks (distributed-steering
                 determinism contract).  When ``None`` (default), no
                 filtering — all layers in ``vectors`` get tensors.
-            clamps: Optional per-request clamp spec
-                ``{hook: {layer: [ClampEntry, ...]}}`` (canonical or raw
-                entry form).  Directions are materialized as device
+            clamps: Optional per-request clamp tier — a
+                :class:`SteeringClamps` (or any shape its ``from_obj``
+                accepts, e.g. the plain-dict wire form a collective_rpc
+                hop produces).  Directions are materialized as device
                 tensors like ``vectors``; the clamp content is already
                 part of ``config_hash``, so a refcount hit implies
                 identical clamps.
@@ -533,8 +538,9 @@ class SteeringManager:
 
         # Materialize clamps BEFORE allocating the row so a malformed /
         # over-K clamp spec rejects without leaking a row.
+        clamp_spec = SteeringClamps.from_obj(clamps)
         stored_clamps = (
-            self._store_clamps(clamps, locally_owned_layers) if clamps else None
+            self._store_clamps(clamp_spec, locally_owned_layers) if clamp_spec else None
         )
 
         row = self.free_rows.pop()
@@ -593,43 +599,51 @@ class SteeringManager:
 
     def _store_clamps(
         self,
-        clamps: dict,
+        clamps: SteeringClamps,
         locally_owned_layers: frozenset[int] | None,
     ) -> dict[str, dict[int, ClampSitePayload]]:
-        """Materialize a clamp spec's per-site payloads.
+        """Materialize a clamp tier's per-site payloads.
 
         Mirrors :meth:`_store_vectors`: non-local layers are skipped at
         materialization time only (row allocation is caller-side and
         unconditional).  Raises ``ValueError`` when a site carries more
-        than ``max_clamp_directions`` entries or clamping is disabled.
+        than ``max_clamp_directions`` rows or clamping is disabled.
         """
         stored: dict[str, dict[int, ClampSitePayload]] = {}
-        for hook_point, layer_entries in clamps.items():
+        for hook_point, table in clamps.hooks.items():
             site_map: dict[int, ClampSitePayload] = {}
-            for layer_idx, entries in layer_entries.items():
+            for layer_idx, dirs, lo, hi, strength in table.by_layer():
                 if (
                     locally_owned_layers is not None
                     and layer_idx not in locally_owned_layers
                 ):
                     continue
-                if not entries:
-                    continue
                 site_map[layer_idx] = self._materialize_clamp_site(
-                    entries, site=f"[{hook_point!r}][{layer_idx}]"
+                    dirs,
+                    lo,
+                    hi,
+                    strength,
+                    site=f"[{hook_point!r}][{layer_idx}]",
                 )
             if site_map:
                 stored[hook_point] = site_map
         return stored
 
     def _materialize_clamp_site(
-        self, entries: list[dict], *, site: str
+        self,
+        dirs: np.ndarray,
+        lo: np.ndarray,
+        hi: np.ndarray,
+        strength: np.ndarray,
+        *,
+        site: str,
     ) -> ClampSitePayload:
-        """Convert one site's clamp entries into a :class:`ClampSitePayload`.
+        """Convert one site's clamp rows into a :class:`ClampSitePayload`.
 
-        Entries are normalized via :func:`normalize_clamp_entry`
-        (idempotent — canonical entries from ``SamplingParams`` validation
-        pass through unchanged).  Directions land on ``self.device`` as a
-        fresh tensor, deliberately NOT via the pinned staging ring of
+        Rows arrive raw (as submitted) and are unit-normalized here via
+        :func:`_clamp_unit_rows` — bounds live in unit-projection space.
+        Directions land on ``self.device`` as a fresh tensor, deliberately
+        NOT via the pinned staging ring of
         :meth:`_stack_vectors_to_device`: the ring's slots are lazily
         allocated on the step thread inside ``torch.inference_mode()``, so
         an in-place ``copy_`` into them from a control-plane RPC thread
@@ -644,26 +658,27 @@ class SteeringManager:
                 f"Clamp spec {site} present but clamping is disabled "
                 "(steering_config.max_clamp_directions=0)"
             )
-        if len(entries) > self.max_clamp_directions:
+        n = int(dirs.shape[0])
+        if n > self.max_clamp_directions:
             raise ValueError(
-                f"Clamp spec {site} has {len(entries)} directions, "
+                f"Clamp spec {site} has {n} directions, "
                 f"exceeding max_clamp_directions={self.max_clamp_directions}"
             )
-        vecs: list[np.ndarray] = []
-        bounds: list[list[float]] = []
-        strengths: list[float] = []
-        for entry in entries:
-            vec, lo, hi, strength = normalize_clamp_entry(entry)
-            vecs.append(np.asarray(vec, dtype=np.float32))
-            bounds.append([lo, hi])
-            strengths.append(strength)
-        dirs = torch.from_numpy(np.ascontiguousarray(np.stack(vecs)))
+        unit = _clamp_unit_rows(np.asarray(dirs, dtype=np.float64))
+        stacked = np.ascontiguousarray(unit.astype(np.float32))
+        dirs_t = torch.from_numpy(stacked)
         if self.device is not None:
-            dirs = dirs.to(self.device)
+            dirs_t = dirs_t.to(self.device)
+        bounds = np.stack(
+            [np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)],
+            axis=1,
+        )
         return ClampSitePayload(
-            dirs=dirs,
+            dirs=dirs_t,
             bounds=torch.tensor(bounds, dtype=torch.float32),
-            strength=torch.tensor(strengths, dtype=torch.float32),
+            strength=torch.tensor(
+                np.asarray(strength, dtype=np.float64), dtype=torch.float32
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -683,7 +698,7 @@ class SteeringManager:
         self,
         vectors: dict[str, dict[int, list[float] | np.ndarray]],
         *,
-        clamps: dict | None = None,
+        clamps: SteeringClamps | dict | None = None,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> tuple[int, int]:
         """Allocate a dynamic-override row; returns ``(dyn_id, row)``.
@@ -695,11 +710,12 @@ class SteeringManager:
         ``RuntimeError`` when the pool is exhausted (callers reject the
         triggering action and keep previous state).
 
-        ``clamps`` is an optional per-override :data:`SteeringClampSpec`;
-        the dynamic row then carries ``concat(global base, global decode,
-        override)``. Materialized BEFORE the row is allocated so a
-        malformed / over-K spec rejects with ``ValueError`` without leaking
-        a pool row (mirrors :meth:`register_config`).
+        ``clamps`` is an optional per-override :class:`SteeringClamps`
+        (any ``from_obj``-accepted shape); the dynamic row then carries
+        ``concat(global base, global decode, override)``. Materialized
+        BEFORE the row is allocated so a malformed / over-K spec rejects
+        with ``ValueError`` without leaking a pool row (mirrors
+        :meth:`register_config`).
         """
         if not self._dynamic_free_rows:
             raise RuntimeError(
@@ -709,8 +725,9 @@ class SteeringManager:
                 f"{len(self._dynamic_to_row)}"
             )
         # Materialize clamps BEFORE allocating the row (validation may raise).
+        clamp_spec = SteeringClamps.from_obj(clamps)
         stored_clamps = (
-            self._store_clamps(clamps, locally_owned_layers) if clamps else None
+            self._store_clamps(clamp_spec, locally_owned_layers) if clamp_spec else None
         )
         dyn_id = self._next_dynamic_id
         self._next_dynamic_id += 1
@@ -721,10 +738,10 @@ class SteeringManager:
         )
         if stored_clamps:
             self._dynamic_clamps[dyn_id] = stored_clamps
-            self._dynamic_clamp_specs[dyn_id] = clamps
+            self._dynamic_clamp_specs[dyn_id] = clamp_spec
         # Cache the override-vector+clamp hash for the APC decode signature.
         # Hash the raw input (np/list/spec) — no device sync, rank-identical.
-        self._dynamic_sig[dyn_id] = hash_steering_config(vectors, clamps=clamps)
+        self._dynamic_sig[dyn_id] = hash_steering_config(vectors, clamps=clamp_spec)
         self._dirty.mark_membership()
         return dyn_id, row
 
@@ -733,7 +750,7 @@ class SteeringManager:
         dyn_id: int,
         vectors: dict[str, dict[int, list[float] | np.ndarray]],
         *,
-        clamps: dict | None = None,
+        clamps: SteeringClamps | dict | None = None,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> None:
         """Replace a live dynamic config's vectors in place (same row).
@@ -744,22 +761,24 @@ class SteeringManager:
 
         ``clamps`` follows REPLACE semantics for the override's own clamps:
         ``None`` KEEPS the previous clamp set (the common vectors-only
-        re-emit), ``{}`` CLEARS it, and a non-empty spec replaces it. The
-        clamp change only marks content dirty (never membership), so the
-        cached populate indices stay valid.
+        re-emit), an empty spec (``SteeringClamps.empty()`` / ``{}``)
+        CLEARS it, and a non-empty spec replaces it. The clamp change only
+        marks content dirty (never membership), so the cached populate
+        indices stay valid.
         """
         if dyn_id not in self._dynamic_to_row:
             raise KeyError(f"dynamic steering config {dyn_id} is not registered")
         self._dynamic_vectors[dyn_id] = self._store_vectors(
             vectors, locally_owned_layers
         )
-        if clamps is not None:
-            # Replace (empty dict clears).
-            if clamps:
+        clamp_spec = SteeringClamps.from_obj(clamps, preserve_empty=True)
+        if clamp_spec is not None:
+            # Replace (empty spec clears).
+            if clamp_spec:
                 self._dynamic_clamps[dyn_id] = self._store_clamps(
-                    clamps, locally_owned_layers
+                    clamp_spec, locally_owned_layers
                 )
-                self._dynamic_clamp_specs[dyn_id] = clamps
+                self._dynamic_clamp_specs[dyn_id] = clamp_spec
             else:
                 self._dynamic_clamps.pop(dyn_id, None)
                 self._dynamic_clamp_specs.pop(dyn_id, None)
@@ -935,26 +954,28 @@ class SteeringManager:
         self,
         hook_point: str,
         layer_idx: int,
-        entries: list[dict],
+        site_rows: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None,
         phase: str = "base",
         *,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> None:
         """Update the cached global clamps for a hook point and layer.
 
-        ``entries`` is one site's clamp entry list (canonical or raw form);
-        an empty list removes the site.  Mirrors
-        :meth:`update_global_vectors`, including the cross-thread
-        synchronize: the payload's direction tensors are produced on the
-        control-plane thread but consumed by ``populate_steering_tables``
-        on the step thread, so the H2D must be fully drained before the
-        manager exposes them (see the ``update_global_vectors`` comment
-        for the full stream-ordering rationale).
+        ``site_rows`` is one site's ``(dirs, lo, hi, strength)`` row
+        group as produced by :meth:`ClampHookTable.by_layer` (directions
+        raw float64; normalized at materialization); ``None`` or an empty
+        group removes the site.  Mirrors :meth:`update_global_vectors`,
+        including the cross-thread synchronize: the payload's direction
+        tensors are produced on the control-plane thread but consumed by
+        ``populate_steering_tables`` on the step thread, so the H2D must
+        be fully drained before the manager exposes them (see the
+        ``update_global_vectors`` comment for the full stream-ordering
+        rationale).
         """
         if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
             return
         target = self._global_clamp_dict_for_phase(phase)
-        if not entries:
+        if site_rows is None or len(site_rows[0]) == 0:
             hook_map = target.get(hook_point)
             if hook_map is not None:
                 hook_map.pop(layer_idx, None)
@@ -962,8 +983,13 @@ class SteeringManager:
                     target.pop(hook_point, None)
             self._dirty.mark_content()
             return
+        dirs, lo, hi, strength = site_rows
         payload = self._materialize_clamp_site(
-            entries, site=f"global {phase} [{hook_point!r}][{layer_idx}]"
+            dirs,
+            lo,
+            hi,
+            strength,
+            site=f"global {phase} [{hook_point!r}][{layer_idx}]",
         )
         if payload.dirs.is_cuda:
             torch.cuda.synchronize(payload.dirs.device)

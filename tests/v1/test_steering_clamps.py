@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from vllm.config.steering_types import (
+    SteeringClamps,
     hash_steering_config,
     maybe_pack_inline_steering_for_request,
     normalize_clamp_entry,
@@ -126,26 +127,26 @@ class TestResolveEffectiveClamps:
     def test_base_only_passthrough(self):
         base = {"post_block": {3: [_entry([1.0], 2.0)]}}
         result = resolve_effective_clamps(base, None)
-        assert result == base
+        assert result == SteeringClamps.from_obj(base)
 
     def test_phase_only_passthrough(self):
         phase = {"post_block": {3: [_entry([1.0], 2.0)]}}
-        assert resolve_effective_clamps(None, phase) == phase
+        assert resolve_effective_clamps(None, phase) == SteeringClamps.from_obj(phase)
 
     def test_concat_base_first(self):
         base = {"post_block": {3: [_entry([1.0, 0.0], 1.0)]}}
         phase = {"post_block": {3: [_entry([0.0, 1.0], 2.0)]}}
         result = resolve_effective_clamps(base, phase)
-        entries = result["post_block"][3]
-        assert len(entries) == 2
-        assert entries[0]["vector"] == [1.0, 0.0]
-        assert entries[1]["vector"] == [0.0, 1.0]
+        table = result.hooks["post_block"]
+        assert table.layer_indices == [3, 3]
+        assert table.rows()[0].tolist() == [1.0, 0.0]
+        assert table.rows()[1].tolist() == [0.0, 1.0]
 
     def test_non_overlapping_sites_merge(self):
         base = {"post_block": {3: [_entry([1.0], 1.0)]}}
         phase = {"pre_attn": {5: [_entry([1.0], 2.0)]}}
         result = resolve_effective_clamps(base, phase)
-        assert set(result.keys()) == {"post_block", "pre_attn"}
+        assert set(result.hooks.keys()) == {"post_block", "pre_attn"}
 
     def test_cap_exceeded_raises(self):
         base = {"post_block": {3: [_entry([1.0], 1.0)] * 3}}
@@ -157,12 +158,12 @@ class TestResolveEffectiveClamps:
         base = {"post_block": {3: [_entry([1.0], 1.0)] * 2}}
         phase = {"post_block": {3: [_entry([1.0], 2.0)] * 2}}
         result = resolve_effective_clamps(base, phase, max_directions=4)
-        assert len(result["post_block"][3]) == 4
+        assert result.hooks["post_block"].site_counts()[3] == 4
 
     def test_no_cap_when_max_directions_none(self):
         base = {"post_block": {3: [_entry([1.0], 1.0)] * 8}}
         result = resolve_effective_clamps(base, None)
-        assert len(result["post_block"][3]) == 8
+        assert result.hooks["post_block"].site_counts()[3] == 8
 
 
 # -----------------------------------------------------------------------
@@ -297,8 +298,8 @@ class TestSamplingParamsClamps:
             prefill_steering_clamps={"post_block": {2: [_entry([0.0, 1.0], 2.0)]}},
         )
         eff = sp.effective_prefill_clamps
-        assert len(eff["post_block"][2]) == 2
-        assert sp.effective_decode_clamps == sp.steering_clamps
+        assert eff.hooks["post_block"].site_counts()[2] == 2
+        assert sp.effective_decode_clamps == SteeringClamps.from_obj(sp.steering_clamps)
 
     def test_effective_none_when_no_clamps(self):
         sp = SamplingParams()

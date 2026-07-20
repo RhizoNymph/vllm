@@ -23,6 +23,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm.config.steering_types import SteeringClamps
 from vllm.model_executor.layers.clamp import (
     CLAMP_ANY_ACTIVE_ATTR,
     CLAMP_BOUNDS_ATTR,
@@ -55,6 +56,15 @@ def _clamp_entry(axis: int, value: float, strength: float = 1.0) -> dict:
     vec = [0.0] * HIDDEN
     vec[axis] = 2.0  # non-unit: the manager must normalize
     return {"vector": vec, "value": value, "strength": strength}
+
+
+def _site(entries):
+    """Entry list -> one site's (dirs, lo, hi, strength) row group."""
+    spec = SteeringClamps.from_obj({"post_block": {0: entries}})
+    if spec is None:
+        return None
+    _, dirs, lo, hi, strength = spec.hooks["post_block"].by_layer()[0]
+    return dirs, lo, hi, strength
 
 
 def _axis(i: int) -> torch.Tensor:
@@ -235,8 +245,8 @@ class TestDynamicClampPopulate:
     def test_dynamic_row_concats_global_decode_then_override(self):
         mgr = _mgr()
         layers = {0: _ClampLayer()}
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(2, 1.0)], phase="base")
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(3, 2.0)], phase="decode")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(2, 1.0)]), phase="base")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(3, 2.0)]), phase="decode")
         _dyn_id, row = mgr.register_dynamic_config(
             _vec(), clamps={_HP: {0: [_clamp_entry(1, 7.0)]}}
         )
@@ -253,8 +263,8 @@ class TestDynamicClampPopulate:
     def test_overflow_names_dynamic_id(self):
         mgr = _mgr(k=2)
         layers = {0: _ClampLayer(k=2)}
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(0, 1.0)], phase="base")
-        mgr.update_global_clamps(_HP, 0, [_clamp_entry(1, 1.0)], phase="decode")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(0, 1.0)]), phase="base")
+        mgr.update_global_clamps(_HP, 0, _site([_clamp_entry(1, 1.0)]), phase="decode")
         dyn_id, _row = mgr.register_dynamic_config(
             _vec(), clamps={_HP: {0: [_clamp_entry(2, 2.0)]}}
         )
