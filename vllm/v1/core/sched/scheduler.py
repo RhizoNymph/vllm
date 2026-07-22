@@ -5,7 +5,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -406,6 +406,88 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
 
+    def _request_uses_additive_steering(self, request: Request, phase: str) -> bool:
+        sp = request.sampling_params
+        if sp is None:
+            return False
+        if sp.steering_module_ref is not None:
+            return True
+        if sp.steering_vectors:
+            return True
+        if phase == "prefill":
+            return bool(
+                sp.prefill_steering_vectors or sp._effective_prefill_steering_packed
+            )
+        return bool(sp.decode_steering_vectors or sp._effective_decode_steering_packed)
+
+    def _request_steering_config_pairs(
+        self,
+        request: Request,
+        phase: str,
+    ) -> tuple[set[tuple[int, str]], set[tuple[int, str]]]:
+        if phase == "prefill":
+            config_hash = request.prefill_steering_config_hash
+        else:
+            config_hash = request.decode_steering_config_hash
+        if config_hash == 0:
+            return set(), set()
+
+        sp = request.sampling_params
+        if self._request_uses_additive_steering(request, phase) and sp is not None:
+            if phase == "prefill":
+                additive_hash = sp.prefill_additive_steering_config_hash
+            else:
+                additive_hash = sp.decode_additive_steering_config_hash
+            additive_pairs = (
+                {(additive_hash, phase)} if additive_hash != 0 else set()
+            )
+        else:
+            additive_pairs = set()
+        if sp is not None and sp.sae_clamp_specs:
+            if phase == "prefill":
+                sae_hash = sp.prefill_sae_clamp_config_hash
+            else:
+                sae_hash = sp.decode_sae_clamp_config_hash
+            sae_pairs = {(sae_hash, phase)} if sae_hash != 0 else set()
+        else:
+            sae_pairs = set()
+        return additive_pairs, sae_pairs
+
+    def _request_sae_full_recon_config_pairs(
+        self,
+        request: Request,
+        phase: str,
+    ) -> set[tuple[int, str]]:
+        if phase == "prefill":
+            config_hash = request.prefill_steering_config_hash
+        else:
+            config_hash = request.decode_steering_config_hash
+        if config_hash == 0:
+            return set()
+
+        sp = request.sampling_params
+        if sp is None or not getattr(sp, "sae_full_reconstruction_specs", None):
+            return set()
+        if phase == "prefill":
+            recon_hash = sp.prefill_sae_full_recon_config_hash
+        else:
+            recon_hash = sp.decode_sae_full_recon_config_hash
+        return {(recon_hash, phase)} if recon_hash != 0 else set()
+
+    def _steering_pool_would_overflow(
+        self,
+        new_pairs: set[tuple[int, str]],
+        scheduled_pairs: set[tuple[int, str]],
+    ) -> bool:
+        if not new_pairs:
+            return False
+        new_unique = new_pairs - scheduled_pairs
+        assert self.steering_config is not None
+        return (
+            len(scheduled_pairs) + len(new_unique)
+            > self.steering_config.max_steering_configs
+        )
+
     def _apply_steering_decode_signatures(self, sigs: dict[str, int]) -> None:
         """Apply worker-reported effective-decode-signature deltas.
 
@@ -688,10 +770,12 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Steering config-pool reservation (authoritative replica of the
-        # worker's SteeringManager row pool).  Track the union of reserved
-        # (hash, phase) rows across ALL running requests -- not just those
-        # scheduled this step -- because every running request continues to
-        # hold its worker rows regardless of whether it ran this step.
+        # worker's row pools).  Track the union of reserved (hash, phase)
+        # rows across ALL running requests -- not just those scheduled this
+        # step -- because every running request continues to hold its worker
+        # rows regardless of whether it ran this step.  Additive steering, SAE
+        # clamps, and SAE full-reconstruction are backed by independent worker
+        # row managers, so each pool is tracked independently.
         #
         # A steered request reserves its DECODE row for its whole lifetime
         # (held across the prefill->decode transition), so the worker's
@@ -703,20 +787,34 @@ class Scheduler(SchedulerInterface):
         # is preferable to a transition-time failure.  Capacity pressure is
         # resolved by admission backpressure below: a request that asked for
         # steering waits for a free row rather than running unsteered.
-        scheduled_steering_configs: set[tuple[int, str]] = set()
+        scheduled_additive_steering_configs: set[tuple[int, str]] = set()
+        scheduled_sae_steering_configs: set[tuple[int, str]] = set()
+        scheduled_sae_full_recon_configs: set[tuple[int, str]] = set()
         if self.steering_config:
             for req in self.running:
                 if (
                     req.num_computed_tokens < req.num_prompt_tokens
                     and req.prefill_steering_config_hash != 0
                 ):
-                    scheduled_steering_configs.add(
-                        (req.prefill_steering_config_hash, "prefill")
+                    additive_pairs, sae_pairs = self._request_steering_config_pairs(
+                        req, "prefill"
                     )
+                    recon_pairs = self._request_sae_full_recon_config_pairs(
+                        req, "prefill"
+                    )
+                    scheduled_additive_steering_configs.update(additive_pairs)
+                    scheduled_sae_steering_configs.update(sae_pairs)
+                    scheduled_sae_full_recon_configs.update(recon_pairs)
                 if req.decode_steering_config_hash != 0:
-                    scheduled_steering_configs.add(
-                        (req.decode_steering_config_hash, "decode")
+                    additive_pairs, sae_pairs = self._request_steering_config_pairs(
+                        req, "decode"
                     )
+                    recon_pairs = self._request_sae_full_recon_config_pairs(
+                        req, "decode"
+                    )
+                    scheduled_additive_steering_configs.update(additive_pairs)
+                    scheduled_sae_steering_configs.update(sae_pairs)
+                    scheduled_sae_full_recon_configs.update(recon_pairs)
 
         # Per-(layer, hook) patch-slot reservation (backpressure). Patch slots
         # are ephemeral per step, but a request's positions at a site can all
@@ -779,30 +877,51 @@ class Scheduler(SchedulerInterface):
                 # Steering config-pool capacity (backpressure).  A request
                 # reserves the rows it will need for its lifetime: its prefill
                 # row while prefilling AND its decode row (held through the
-                # transition).  If admitting those new rows would exceed the
-                # pool, hold the request in the waiting queue until a row frees
-                # -- it is never admitted to run unsteered, so a request that
-                # asked for steering always gets it.
+                # transition).  Additive steering, SAE clamps, and SAE full-
+                # reconstruction are backed by independent worker row managers,
+                # so each pool is checked independently.  If admitting those new
+                # rows would exceed any pool, hold the request in the waiting
+                # queue until a row frees -- it is never admitted to run
+                # unsteered, so a request that asked for steering always gets it.
                 if self.steering_config:
-                    new_hashes: set[tuple[int, str]] = set()
                     starting_prefill = (
                         request.num_computed_tokens < request.num_prompt_tokens
                     )
+                    additive_pairs: set[tuple[int, str]] = set()
+                    sae_pairs: set[tuple[int, str]] = set()
+                    recon_pairs: set[tuple[int, str]] = set()
                     if starting_prefill and request.prefill_steering_config_hash != 0:
-                        new_hashes.add(
-                            (request.prefill_steering_config_hash, "prefill")
+                        p_add, p_sae = self._request_steering_config_pairs(
+                            request, "prefill"
+                        )
+                        additive_pairs |= p_add
+                        sae_pairs |= p_sae
+                        recon_pairs |= self._request_sae_full_recon_config_pairs(
+                            request, "prefill"
                         )
                     if request.decode_steering_config_hash != 0:
-                        new_hashes.add((request.decode_steering_config_hash, "decode"))
-                    if new_hashes:
-                        new_unique = new_hashes - scheduled_steering_configs
-                        if (
-                            len(scheduled_steering_configs) + len(new_unique)
-                            > self.steering_config.max_steering_configs
-                        ):
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
+                        d_add, d_sae = self._request_steering_config_pairs(
+                            request, "decode"
+                        )
+                        additive_pairs |= d_add
+                        sae_pairs |= d_sae
+                        recon_pairs |= self._request_sae_full_recon_config_pairs(
+                            request, "decode"
+                        )
+                    if (
+                        self._steering_pool_would_overflow(
+                            additive_pairs, scheduled_additive_steering_configs
+                        )
+                        or self._steering_pool_would_overflow(
+                            sae_pairs, scheduled_sae_steering_configs
+                        )
+                        or self._steering_pool_would_overflow(
+                            recon_pairs, scheduled_sae_full_recon_configs
+                        )
+                    ):
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 # Patch-slot capacity (backpressure). Hold the request if
                 # admitting it would push any patched site past the pool, so a
@@ -1123,17 +1242,32 @@ class Scheduler(SchedulerInterface):
                     # step see them (mirrors the per-request reservation in the
                     # running scan above): the prefill row while it is still
                     # prefilling, and the decode row for its whole lifetime.
+                    # Additive steering, SAE clamps, and SAE full-reconstruction
+                    # are backed by independent worker row managers, so each
+                    # pool is reserved independently.
                     if (
                         num_computed_tokens < request.num_prompt_tokens
                         and request.prefill_steering_config_hash != 0
                     ):
-                        scheduled_steering_configs.add(
-                            (request.prefill_steering_config_hash, "prefill")
+                        additive_pairs, sae_pairs = self._request_steering_config_pairs(
+                            request, "prefill"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            request, "prefill"
+                        )
+                        scheduled_additive_steering_configs.update(additive_pairs)
+                        scheduled_sae_steering_configs.update(sae_pairs)
+                        scheduled_sae_full_recon_configs.update(recon_pairs)
                     if request.decode_steering_config_hash != 0:
-                        scheduled_steering_configs.add(
-                            (request.decode_steering_config_hash, "decode")
+                        additive_pairs, sae_pairs = self._request_steering_config_pairs(
+                            request, "decode"
                         )
+                        recon_pairs = self._request_sae_full_recon_config_pairs(
+                            request, "decode"
+                        )
+                        scheduled_additive_steering_configs.update(additive_pairs)
+                        scheduled_sae_steering_configs.update(sae_pairs)
+                        scheduled_sae_full_recon_configs.update(recon_pairs)
                 if self.patch_config:
                     # Reserve this request's per-site slots so later requests in
                     # the same step see them (mirrors the running scan above).
@@ -1673,6 +1807,7 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
+        assert bitmask is not None
         return GrammarOutput(structured_output_request_ids, bitmask)
 
     def update_from_output(
@@ -1990,7 +2125,7 @@ class Scheduler(SchedulerInterface):
 
         # publish collected KV cache events
         if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
+            batch = KVEventBatch(ts=time.time(), events=cast(Any, events))
             self.kv_event_publisher.publish(batch)
 
         # Create EngineCoreOutputs for all clients that have requests with

@@ -13,7 +13,6 @@ from .common import (
     AttentionBackendCase,
     Matches,
     custom_ops_combos,
-    is_blackwell,
 )
 from .models import (
     FLASHINFER_ATTN,

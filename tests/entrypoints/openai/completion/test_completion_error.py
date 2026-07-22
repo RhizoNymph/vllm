@@ -11,13 +11,12 @@ from pydantic import ValidationError
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
-from vllm.entrypoints.openai.engine.protocol import GenerationError
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse, GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
-from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.engine.async_llm import AsyncLLM
 
 MODEL_NAME = "openai-community/gpt2"
@@ -72,7 +71,25 @@ class MockVllmConfig:
     parallel_config: MockParallelConfig
 
 
+@dataclass
+class DummyTokenizer:
+    max_chars_per_token: int = 1
+
+    def decode(self, tokens: list[int]) -> str:
+        return str(tokens)
+
+    def encode(self, text: str, **kwargs) -> list[int]:
+        return list(range(len(text)))
+
+    def __call__(self, text: str, **kwargs):
+        return type("Tokenized", (), {"input_ids": self.encode(text, **kwargs)})()
+
+
 def _build_serving_completion(engine: AsyncLLM) -> OpenAIServingCompletion:
+    engine.vllm_config = MockVllmConfig(  # type: ignore[attr-defined]
+        engine.model_config,
+        parallel_config=MockParallelConfig(),
+    )
     models = OpenAIServingModels(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
@@ -96,7 +113,7 @@ def _build_serving_completion(engine: AsyncLLM) -> OpenAIServingCompletion:
 def _build_renderer(model_config: MockModelConfig):
     return HfRenderer(
         MockVllmConfig(model_config, parallel_config=MockParallelConfig()),
-        cached_tokenizer_from_config(model_config),
+        DummyTokenizer(),
     )
 
 
@@ -288,6 +305,62 @@ async def test_completion_error_stream():
         f"Expected error message in chunks: {chunks}"
     )
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_completion_named_steering_without_raw_request_returns_error():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_completion = _build_serving_completion(mock_engine)
+
+    request = CompletionRequest(
+        model=MODEL_NAME,
+        prompt="Test prompt",
+        max_tokens=10,
+        steering_name="named-module",
+    )
+
+    response = await serving_completion.create_completion(request)
+
+    assert isinstance(response, ErrorResponse)
+    assert "Named steering modules are not available" in response.error.message
+
+
+@pytest.mark.asyncio
+async def test_completion_beam_search_with_sae_steering_returns_error():
+    request = CompletionRequest(
+        model=MODEL_NAME,
+        prompt="Test prompt",
+        max_tokens=10,
+        use_beam_search=True,
+        sae_clamp_specs=[
+            {
+                "module_name": "g",
+                "clamps": {
+                    "post_block": {
+                        0: [
+                            {
+                                "feature_idx": 0,
+                                "kind": "absolute",
+                                "value": 1.0,
+                            }
+                        ]
+                    }
+                },
+            }
+        ],
+    )
+
+    serving_completion = OpenAIServingCompletion.__new__(OpenAIServingCompletion)
+    response = await serving_completion.create_completion(request)
+
+    assert isinstance(response, ErrorResponse)
+    assert "Beam search does not support steering" in response.error.message
 
 
 def test_json_schema_response_format_missing_schema():

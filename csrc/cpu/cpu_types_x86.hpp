@@ -341,6 +341,77 @@ struct BF16Vec32 : public Vec<BF16Vec32> {
                           5));
   }
 
+  // E4M3 decode (AVX2 path) — same bit-layout trick as the AVX512 variant
+  // above.  Result = true_E4M3 * 2^-8; caller applies scale * 2^8.
+  explicit BF16Vec32(const uint8_t* ptr, fp8_e4m3_tag) {
+    __m256i b8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+    __m128i b8_low = _mm256_extracti128_si256(b8, 0);
+    __m128i b8_high = _mm256_extracti128_si256(b8, 1);
+    __m256i b16_low = _mm256_cvtepu8_epi16(b8_low);
+    __m256i b16_high = _mm256_cvtepu8_epi16(b8_high);
+
+    __m256i sign_low = _mm256_slli_epi16(
+        _mm256_and_si256(b16_low, _mm256_set1_epi16(0x80)), 8);
+    __m256i payload_low = _mm256_slli_epi16(
+        _mm256_and_si256(b16_low, _mm256_set1_epi16(0x7F)), 7);
+    __m256i sign_high = _mm256_slli_epi16(
+        _mm256_and_si256(b16_high, _mm256_set1_epi16(0x80)), 8);
+    __m256i payload_high = _mm256_slli_epi16(
+        _mm256_and_si256(b16_high, _mm256_set1_epi16(0x7F)), 7);
+    reg_low = _mm256_or_si256(sign_low, payload_low);
+    reg_high = _mm256_or_si256(sign_high, payload_high);
+  }
+
+  // E5M2 decode (AVX2 path) — b << 8 maps to FP16 bits; see AVX512 variant
+  // above.
+  explicit BF16Vec32(const uint8_t* ptr, fp8_e5m2_tag) {
+    __m256i b8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+    __m128i b8_low = _mm256_extracti128_si256(b8, 0);
+    __m128i b8_high = _mm256_extracti128_si256(b8, 1);
+    reg_low = _mm256_slli_epi16(_mm256_cvtepu8_epi16(b8_low), 8);
+    reg_high = _mm256_slli_epi16(_mm256_cvtepu8_epi16(b8_high), 8);
+  }
+
+  // Direct FP8-E4M3 → unscaled BF16 for AMX (AVX2 path, no FP32 round-trip).
+  // BF16 value = true_E4M3 * 2^-120; exponent rebiasing folded into k/v scales.
+  explicit BF16Vec32(const uint8_t* ptr, fp8_bf16_e4m3_tag) {
+    __m256i b8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+    __m128i b8_low = _mm256_extracti128_si256(b8, 0);
+    __m128i b8_high = _mm256_extracti128_si256(b8, 1);
+    __m256i b16_low = _mm256_cvtepu8_epi16(b8_low);
+    __m256i b16_high = _mm256_cvtepu8_epi16(b8_high);
+    reg_low = _mm256_or_si256(
+        _mm256_slli_epi16(_mm256_and_si256(b16_low, _mm256_set1_epi16(0x80)),
+                          8),
+        _mm256_slli_epi16(_mm256_and_si256(b16_low, _mm256_set1_epi16(0x7F)),
+                          4));
+    reg_high = _mm256_or_si256(
+        _mm256_slli_epi16(_mm256_and_si256(b16_high, _mm256_set1_epi16(0x80)),
+                          8),
+        _mm256_slli_epi16(_mm256_and_si256(b16_high, _mm256_set1_epi16(0x7F)),
+                          4));
+  }
+
+  // Direct FP8-E5M2 → unscaled BF16 for AMX (AVX2 path, no FP32 round-trip).
+  // BF16 value = true_E5M2 * 2^-112; exponent rebiasing folded into k/v scales.
+  explicit BF16Vec32(const uint8_t* ptr, fp8_bf16_e5m2_tag) {
+    __m256i b8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+    __m128i b8_low = _mm256_extracti128_si256(b8, 0);
+    __m128i b8_high = _mm256_extracti128_si256(b8, 1);
+    __m256i b16_low = _mm256_cvtepu8_epi16(b8_low);
+    __m256i b16_high = _mm256_cvtepu8_epi16(b8_high);
+    reg_low = _mm256_or_si256(
+        _mm256_slli_epi16(_mm256_and_si256(b16_low, _mm256_set1_epi16(0x80)),
+                          8),
+        _mm256_slli_epi16(_mm256_and_si256(b16_low, _mm256_set1_epi16(0x7F)),
+                          5));
+    reg_high = _mm256_or_si256(
+        _mm256_slli_epi16(_mm256_and_si256(b16_high, _mm256_set1_epi16(0x80)),
+                          8),
+        _mm256_slli_epi16(_mm256_and_si256(b16_high, _mm256_set1_epi16(0x7F)),
+                          5));
+  }
+
   void save(void* ptr) const {
     _mm256_storeu_si256((__m256i*)ptr, reg_low);
     _mm256_storeu_si256((__m256i*)ptr + 1, reg_high);

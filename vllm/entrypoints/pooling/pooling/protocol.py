@@ -77,6 +77,11 @@ class IOProcessorRequest(PoolingBasicRequestMixin, EncodingRequestMixin, Generic
             task=self.task,
         )
 
+    def to_pooling_params(self):
+        return PoolingParams(
+            task=self.task,
+        )
+
 
 class IOProcessorResponse(OpenAIBaseModel, Generic[T]):
     request_id: str | None = None

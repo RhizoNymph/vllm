@@ -1,14 +1,362 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for steering config single-phase admission control logic.
+"""Tests for steering config admission control logic.
 
-The scheduler tracks the union of active steering config (hash, phase)
-pairs -- matching the worker's SteeringManager which allocates separate
-table rows per (hash, phase) key.  Running requests contribute their
-currently-active pair.  New WAITING requests only need capacity for their
-starting phase (prefill), because the prefill row is released before the
-decode row is registered in _handle_steering_transition.
+The scheduler tracks active steering config ``(hash, phase)`` pairs.
+Within a row pool, new WAITING requests only need capacity for their
+starting phase because the prefill row is released before the decode row
+is registered in _handle_steering_transition.  Additive steering and SAE
+clamps use independent worker row pools, so tests cover both the legacy
+single-pool arithmetic and the SAE split-pool admission case.
 """
+
+from types import SimpleNamespace
+
+from vllm import SamplingParams
+from vllm.config.sae_steering_types import (
+    SAEClampEntry,
+    SAEClampSpec,
+    SAEFullReconstructionSpec,
+    hash_sae_clamp_specs_for_phase,
+    hash_sae_full_reconstruction_specs_for_phase,
+)
+from vllm.config.steering_types import hash_steering_config
+from vllm.v1.core.sched.scheduler import Scheduler
+
+
+def _sae_spec(phase: str = "both", value: float = 1.0) -> SAEClampSpec:
+    return SAEClampSpec(
+        module_name="g",
+        phase=phase,  # type: ignore[arg-type]
+        clamps={
+            "post_block": {
+                0: (SAEClampEntry(feature_idx=0, kind="absolute", value=value),)
+            }
+        },
+    )
+
+
+def _recon_spec(phase: str = "both") -> SAEFullReconstructionSpec:
+    return SAEFullReconstructionSpec(
+        module_name="r", phase=phase  # type: ignore[arg-type]
+    )
+
+
+class TestSeparateAdditiveAndSaeCapacity:
+    """SAE clamps and additive vectors use independent worker row pools."""
+
+    @staticmethod
+    def _scheduler(max_configs: int = 1) -> Scheduler:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.steering_config = SimpleNamespace(max_steering_configs=max_configs)
+        return scheduler
+
+    @staticmethod
+    def _request(
+        *,
+        sampling_params: SamplingParams,
+        prefill_hash: int,
+        decode_hash: int = 0,
+    ):
+        return SimpleNamespace(
+            sampling_params=sampling_params,
+            prefill_steering_config_hash=prefill_hash,
+            decode_steering_config_hash=decode_hash,
+        )
+
+    def test_additive_capacity_does_not_block_sae_only_request(self):
+        scheduler = self._scheduler(max_configs=1)
+        request = self._request(
+            sampling_params=SamplingParams(sae_clamp_specs=(_sae_spec(),)),
+            prefill_hash=222,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        sae_hash = hash_sae_clamp_specs_for_phase((_sae_spec(),), "prefill")
+
+        assert additive_pairs == set()
+        assert sae_pairs == {(sae_hash, "prefill")}
+        assert not scheduler._steering_pool_would_overflow(
+            additive_pairs, {(111, "prefill")}
+        )
+        assert not scheduler._steering_pool_would_overflow(sae_pairs, set())
+
+    def test_sae_capacity_does_not_block_additive_only_request(self):
+        scheduler = self._scheduler(max_configs=1)
+        request = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_block": {0: [1.0]}}
+            ),
+            prefill_hash=222,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+
+        additive_hash = hash_steering_config({"post_block": {0: [1.0]}})
+        assert additive_pairs == {(additive_hash, "prefill")}
+        assert sae_pairs == set()
+        assert not scheduler._steering_pool_would_overflow(additive_pairs, set())
+        assert not scheduler._steering_pool_would_overflow(
+            sae_pairs, {(111, "prefill")}
+        )
+
+    def test_additive_only_request_skips_sae_hashing(self, monkeypatch):
+        import vllm.sampling_params as sampling_params_mod
+
+        scheduler = self._scheduler(max_configs=1)
+        request = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_block": {0: [1.0]}}
+            ),
+            prefill_hash=222,
+        )
+
+        def fail_hash(*_args, **_kwargs):
+            raise AssertionError("additive-only requests must not hash SAE specs")
+
+        monkeypatch.setattr(
+            sampling_params_mod,
+            "hash_sae_clamp_specs_for_phase",
+            fail_hash,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+
+        additive_hash = hash_steering_config({"post_block": {0: [1.0]}})
+        assert additive_pairs == {(additive_hash, "prefill")}
+        assert sae_pairs == set()
+
+    def test_request_using_both_paths_needs_capacity_in_both_pools(self):
+        scheduler = self._scheduler(max_configs=1)
+        request = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_block": {0: [1.0]}},
+                sae_clamp_specs=(_sae_spec(),),
+            ),
+            prefill_hash=222,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        sae_hash = hash_sae_clamp_specs_for_phase((_sae_spec(),), "prefill")
+
+        additive_hash = hash_steering_config({"post_block": {0: [1.0]}})
+        assert additive_pairs == {(additive_hash, "prefill")}
+        assert sae_pairs == {(sae_hash, "prefill")}
+        assert not scheduler._steering_pool_would_overflow(additive_pairs, set())
+        assert scheduler._steering_pool_would_overflow(
+            sae_pairs, {(111, "prefill")}
+        )
+
+    def test_full_reconstruction_uses_its_own_capacity_pool(self):
+        scheduler = self._scheduler(max_configs=1)
+        recon_spec = _recon_spec()
+        request = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_block": {0: [1.0]}},
+                sae_clamp_specs=(_sae_spec(),),
+                sae_full_reconstruction_specs=(recon_spec,),
+            ),
+            prefill_hash=222,
+        )
+
+        additive_pairs, sae_pairs = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        recon_pairs = scheduler._request_sae_full_recon_config_pairs(
+            request, "prefill"
+        )
+
+        recon_hash = hash_sae_full_reconstruction_specs_for_phase(
+            (recon_spec,), "prefill"
+        )
+        assert additive_pairs
+        assert sae_pairs
+        assert recon_pairs == {(recon_hash, "prefill")}
+        assert not scheduler._steering_pool_would_overflow(recon_pairs, set())
+        assert scheduler._steering_pool_would_overflow(
+            recon_pairs, {(111, "prefill")}
+        )
+
+    def test_sae_phase_filtering_affects_scheduler_pool(self):
+        scheduler = self._scheduler(max_configs=1)
+        spec = _sae_spec("decode")
+        request = self._request(
+            sampling_params=SamplingParams(sae_clamp_specs=(spec,)),
+            prefill_hash=0,
+            decode_hash=333,
+        )
+
+        prefill_additive, prefill_sae = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        decode_additive, decode_sae = scheduler._request_steering_config_pairs(
+            request, "decode"
+        )
+
+        assert prefill_additive == set()
+        assert prefill_sae == set()
+        assert decode_additive == set()
+        assert decode_sae == {
+            (hash_sae_clamp_specs_for_phase((spec,), "decode"), "decode")
+        }
+
+    def test_full_reconstruction_phase_filtering_affects_scheduler_pool(self):
+        scheduler = self._scheduler(max_configs=1)
+        spec = _recon_spec("decode")
+        request = self._request(
+            sampling_params=SamplingParams(sae_full_reconstruction_specs=(spec,)),
+            prefill_hash=0,
+            decode_hash=333,
+        )
+
+        prefill_recon = scheduler._request_sae_full_recon_config_pairs(
+            request, "prefill"
+        )
+        decode_recon = scheduler._request_sae_full_recon_config_pairs(
+            request, "decode"
+        )
+
+        assert prefill_recon == set()
+        assert decode_recon == {
+            (hash_sae_full_reconstruction_specs_for_phase((spec,), "decode"), "decode")
+        }
+
+    def test_sae_phase_hash_is_cached_for_scheduler(self, monkeypatch):
+        import vllm.sampling_params as sampling_params_mod
+
+        scheduler = self._scheduler(max_configs=1)
+        sp = SamplingParams(sae_clamp_specs=(_sae_spec(),))
+        request = self._request(sampling_params=sp, prefill_hash=222)
+        calls = {"n": 0}
+        original_hash = sampling_params_mod.hash_sae_clamp_specs_for_phase
+
+        def counting_hash(*args, **kwargs):
+            calls["n"] += 1
+            return original_hash(*args, **kwargs)
+
+        monkeypatch.setattr(
+            sampling_params_mod,
+            "hash_sae_clamp_specs_for_phase",
+            counting_hash,
+        )
+
+        first = scheduler._request_steering_config_pairs(request, "prefill")
+        second = scheduler._request_steering_config_pairs(request, "prefill")
+
+        assert first == second
+        assert calls["n"] == 1
+
+    def test_named_decode_only_hash_override_skips_prefill_additive_capacity(self):
+        scheduler = self._scheduler(max_configs=1)
+        decode_hash = 333
+        sp = SamplingParams(steering_module_ref=("decode_only", 1.0))
+        sp.__dict__["prefill_steering_config_hash"] = 0
+        sp.__dict__["prefill_additive_steering_config_hash"] = 0
+        sp.__dict__["decode_steering_config_hash"] = decode_hash
+        sp.__dict__["decode_additive_steering_config_hash"] = decode_hash
+        request = self._request(
+            sampling_params=sp,
+            prefill_hash=0,
+            decode_hash=decode_hash,
+        )
+
+        prefill_additive, prefill_sae = scheduler._request_steering_config_pairs(
+            request, "prefill"
+        )
+        decode_additive, decode_sae = scheduler._request_steering_config_pairs(
+            request, "decode"
+        )
+
+        assert prefill_additive == set()
+        assert prefill_sae == set()
+        assert decode_additive == {(decode_hash, "decode")}
+        assert decode_sae == set()
+
+    def test_sae_capacity_deduplicates_across_different_additive_hashes(self):
+        scheduler = self._scheduler(max_configs=1)
+        spec = _sae_spec()
+        request_a = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_block": {0: [1.0]}},
+                sae_clamp_specs=(spec,),
+            ),
+            prefill_hash=111,
+        )
+        request_b = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_block": {0: [2.0]}},
+                sae_clamp_specs=(spec,),
+            ),
+            prefill_hash=222,
+        )
+
+        _additive_a, sae_a = scheduler._request_steering_config_pairs(
+            request_a, "prefill"
+        )
+        additive_b, sae_b = scheduler._request_steering_config_pairs(
+            request_b, "prefill"
+        )
+
+        assert sae_a == sae_b
+        additive_hash_b = hash_steering_config({"post_block": {0: [2.0]}})
+        assert additive_b == {(additive_hash_b, "prefill")}
+        assert not scheduler._steering_pool_would_overflow(sae_b, sae_a)
+
+    def test_additive_capacity_deduplicates_across_different_sae_hashes(self):
+        scheduler = self._scheduler(max_configs=1)
+        request_a = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_block": {0: [1.0]}},
+                sae_clamp_specs=(_sae_spec(value=1.0),),
+            ),
+            prefill_hash=111,
+        )
+        request_b = self._request(
+            sampling_params=SamplingParams(
+                steering_vectors={"post_block": {0: [1.0]}},
+                sae_clamp_specs=(_sae_spec(value=2.0),),
+            ),
+            prefill_hash=222,
+        )
+
+        additive_a, _sae_a = scheduler._request_steering_config_pairs(
+            request_a, "prefill"
+        )
+        additive_b, _sae_b = scheduler._request_steering_config_pairs(
+            request_b, "prefill"
+        )
+
+        assert additive_a == additive_b
+        assert not scheduler._steering_pool_would_overflow(additive_b, additive_a)
+
+    def test_sae_capacity_deduplicates_both_and_prefill_for_prefill_rows(self):
+        scheduler = self._scheduler(max_configs=1)
+        request_both = self._request(
+            sampling_params=SamplingParams(sae_clamp_specs=(_sae_spec("both"),)),
+            prefill_hash=111,
+        )
+        request_prefill = self._request(
+            sampling_params=SamplingParams(sae_clamp_specs=(_sae_spec("prefill"),)),
+            prefill_hash=222,
+        )
+
+        _additive_both, sae_both = scheduler._request_steering_config_pairs(
+            request_both, "prefill"
+        )
+        _additive_prefill, sae_prefill = scheduler._request_steering_config_pairs(
+            request_prefill, "prefill"
+        )
+
+        assert sae_both == sae_prefill
+        assert not scheduler._steering_pool_would_overflow(sae_prefill, sae_both)
 
 
 class TestSinglePhaseAdmission:

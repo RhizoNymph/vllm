@@ -29,7 +29,7 @@ from vllm.v1.worker.steering_action_queue import (
 
 HIDDEN = 8
 LAYER = 0
-HOOK = "post_mlp"
+HOOK = "post_block"
 KEY = (LAYER, HOOK)
 
 

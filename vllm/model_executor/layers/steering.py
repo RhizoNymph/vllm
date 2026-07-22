@@ -49,7 +49,10 @@ class SteeringHookPoint(str, Enum):
 
     POST_BLOCK = "post_block"  # block output: residual + mlp branch (true hs[L+1])
     """Steer the block-output residual stream (``residual + mlp_branch``), the
-    true ``hidden_states[L + 1]`` -- see :func:`apply_block_steering`."""
+    true ``hidden_states[L + 1]`` -- see :func:`apply_block_steering`.  Also
+    the SAE feature-surgery / full-reconstruction site (the historical
+    ``post_mlp`` hook, renamed and semantically corrected to the true block
+    output)."""
 
     MLP_IN = "mlp_in"
     """Steer the normed MLP input (the branch tensor entering the MLP)."""
@@ -117,6 +120,75 @@ _ROW_MONITOR_DEFAULT_PARAMS: tuple[float, float] = (-1.0e30, 1.0)
 VALID_HOOK_POINT_NAMES: frozenset[str] = frozenset(hp.value for hp in SteeringHookPoint)
 
 DEFAULT_HOOK_POINT = SteeringHookPoint.POST_BLOCK
+
+
+# SAE feature-surgery slot-list attribute names, kept as plain strings
+# here so the no-SAE hot path can short-circuit without importing
+# ``sae_steering`` on every decoder-layer hook call (``sae_steering`` imports
+# ``SteeringHookPoint`` from this module, so a top-level import would cycle).
+# These mirror ``_sae_slots_attr`` in ``sae_steering.py`` (the attr strings
+# must match): the attribute holds the ordered per-site slot records and is
+# present iff at least one SAE delta module holds a buffer slot at the site.
+HOOK_POINT_SAE_SLOTS_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_slots_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_slots_post_attn",
+    SteeringHookPoint.POST_BLOCK: "sae_slots_post_block",
+}
+
+# Full-reconstruction (Phase 4) site marker.  Same pattern as the delta
+# marker above — kept as plain strings so the no-FR hot path doesn't import
+# ``sae_full_reconstruction`` on every decoder-layer hook call.
+HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
+    SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_kind_pre_attn",
+    SteeringHookPoint.POST_ATTN: "sae_fr_clamp_kind_post_attn",
+    SteeringHookPoint.POST_BLOCK: "sae_fr_clamp_kind_post_block",
+}
+
+
+def _maybe_apply_layer_sae(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    hook_point: SteeringHookPoint,
+) -> torch.Tensor:
+    """Run SAE feature-surgery (delta) then full-reconstruction at ``hook_point``.
+
+    Composition order (per ``docs/features/sae_steering.md``):
+
+    1. Additive steering (applied by the caller before this runs).
+    2. SAE feature-surgery delta (encode → clamp → decoder-direction add).
+       Runs on the additively-steered residual so additive behaviour is
+       unchanged when SAE is layered on top.
+    3. SAE full reconstruction (replacement) — replaces the residual at
+       tokens whose ``sae_recon_index != 0``.  Runs last so upstream
+       additive / delta perturbations are still observable on tokens that
+       don't opt into reconstruction.
+
+    Each stage short-circuits via a marker presence check (the slot-list
+    attribute for delta, a marker buffer for FR); the local imports keep
+    this module free of a load-time dependency on the SAE modules (they
+    import ``SteeringHookPoint`` from here).
+    """
+    # MLP branch hooks are not SAE sites (the SAE tiers operate on the
+    # residual hooks only), so hooks absent from the attr dicts short-circuit.
+    slots_attr = HOOK_POINT_SAE_SLOTS_ATTR.get(hook_point)
+    fr_attr = HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR.get(hook_point)
+    has_sae_delta = slots_attr is not None and hasattr(module, slots_attr)
+    has_sae_fr = fr_attr is not None and fr_attr in module._buffers
+    if not has_sae_delta and not has_sae_fr:
+        return hidden_states
+    if has_sae_delta:
+        from vllm.model_executor.layers.sae_steering import apply_layer_sae_delta
+
+        hidden_states = apply_layer_sae_delta(module, hidden_states, hook_point)
+    if has_sae_fr:
+        from vllm.model_executor.layers.sae_full_reconstruction import (
+            apply_layer_sae_full_reconstruction,
+        )
+
+        hidden_states = apply_layer_sae_full_reconstruction(
+            module, hidden_states, hook_point
+        )
+    return hidden_states
 
 
 def register_steering_buffers(
@@ -586,9 +658,13 @@ def apply_layer_steering(
     maybe_capture_residual(hidden_states, module.layer_idx, hook_point.value)
     hidden_states = maybe_apply_patch(module, hidden_states, hook_point)
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
-    if not hasattr(module, table_attr):
-        return hidden_states
-    return _emit_steering_op(module, hidden_states, hook_point)
+    if hasattr(module, table_attr):
+        hidden_states = _emit_steering_op(module, hidden_states, hook_point)
+    # SAE feature-surgery runs after the additive op on the same hook.  It is
+    # gated on its own marker buffers (not the additive table) so SAE can be
+    # enabled independently of additive steering, and short-circuits to a
+    # static no-op when no SAE buffers are attached at this site.
+    return _maybe_apply_layer_sae(module, hidden_states, hook_point)
 
 
 def apply_block_steering(
@@ -634,9 +710,26 @@ def apply_block_steering(
         )
     residual = maybe_apply_patch_block(module, hidden_states, residual)
     table_attr = HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_BLOCK]
-    if not hasattr(module, table_attr):
-        return hidden_states, residual
-    residual = _emit_steering_op(module, residual, SteeringHookPoint.POST_BLOCK)
+    if hasattr(module, table_attr):
+        residual = _emit_steering_op(module, residual, SteeringHookPoint.POST_BLOCK)
+    # SAE feature-surgery / full-reconstruction at the block output.  Unlike
+    # additive steering (where adding to either summand is propagation-
+    # equivalent), SAE encode/decode must see the TRUE block output
+    # ``residual + hidden_states`` — encoding the bare ``residual`` would
+    # miss this layer's MLP branch, and full reconstruction would drop it
+    # entirely.  Write back through ``residual`` as a delta so tokens the
+    # SAE ops leave untouched stay bit-identical, and the extra adds only
+    # run when SAE buffers are attached at this site (static per-process).
+    if (
+        hasattr(module, HOOK_POINT_SAE_SLOTS_ATTR[SteeringHookPoint.POST_BLOCK])
+        or HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR[SteeringHookPoint.POST_BLOCK]
+        in module._buffers
+    ):
+        block_out = residual + hidden_states
+        steered = _maybe_apply_layer_sae(
+            module, block_out, SteeringHookPoint.POST_BLOCK
+        )
+        residual = residual + (steered - block_out)
     return hidden_states, residual
 
 

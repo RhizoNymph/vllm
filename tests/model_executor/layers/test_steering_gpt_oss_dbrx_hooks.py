@@ -30,8 +30,9 @@ def _install_recorder(monkeypatch):
         rec[hook_name] = (tensor.detach().clone(), layer_idx)
 
     def _record_add(a, b, layer_idx, hook_name):
-        # apply_block_steering captures post_block as separate summands
-        # (DCE-safe under CUDA graphs); the recorded value is their sum.
+        # ``apply_block_steering`` captures the block output via the
+        # summand-preserving helper (the sum is formed inside the op to
+        # survive torch.compile DCE); record the semantic value it captures.
         rec[hook_name] = ((a + b).detach().clone(), layer_idx)
 
     monkeypatch.setattr(steering_mod, "maybe_capture_residual", _record)

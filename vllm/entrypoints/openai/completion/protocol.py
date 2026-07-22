@@ -10,6 +10,10 @@ from typing import Annotated, Any, Literal
 from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
+from vllm.config.sae_steering_types import (
+    coerce_sae_clamp_specs,
+    coerce_sae_full_reconstruction_specs,
+)
 from vllm.config.steering_types import (
     SteeringVectorSpecPacked,
     unpack_steering_vectors,
@@ -210,6 +214,31 @@ class CompletionRequest(OpenAIBaseModel):
             "Maximum number of tokens allowed for thinking operations "
             "(reasoning models). Non-negative integer sets the limit; "
             "-1 means unlimited (treated as unset)."
+        ),
+    )
+
+    sae_clamp_specs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of SAE feature-surgery clamp directives.  Each entry "
+            "references a named SAE-kind module (registered via "
+            "POST /v1/steering/modules/register with kind='sae_delta') "
+            "and declares which feature activations to clamp on which "
+            "(hook, layer) pairs.  See docs/features/sae_steering.md "
+            "for the schema."
+        ),
+    )
+
+    sae_full_reconstruction_specs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of SAE full-reconstruction directives.  Each entry "
+            "references a named SAE module of kind "
+            "'sae_full_reconstruction' (loaded at startup via "
+            "--steering-modules) and optionally clamps features inside "
+            "the reconstruction.  An entry with no 'clamps' applies the "
+            "pure reconstruction.  See docs/features/sae_steering.md "
+            "for the schema."
         ),
     )
 
@@ -464,6 +493,10 @@ class CompletionRequest(OpenAIBaseModel):
             ),
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
+            ),
+            sae_clamp_specs=coerce_sae_clamp_specs(self.sae_clamp_specs),
+            sae_full_reconstruction_specs=coerce_sae_full_reconstruction_specs(
+                self.sae_full_reconstruction_specs
             ),
         )
         if self.capture is not None:

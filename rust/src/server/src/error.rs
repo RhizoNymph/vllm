@@ -24,6 +24,10 @@ pub enum ApiError {
     Unauthorized { message: String },
     /// An unexpected internal failure happened before streaming started.
     ServerError { message: String },
+    /// The operation partially succeeded but left the server in a state the
+    /// client should retry or remediate (e.g. a steering module mutation
+    /// whose prefix-cache invalidation failed).
+    ServiceUnavailable { message: String },
 }
 
 impl ApiError {
@@ -35,6 +39,7 @@ impl ApiError {
             Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::JsonParseError { .. } => StatusCode::BAD_REQUEST,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+            Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -71,6 +76,12 @@ impl ApiError {
                 error_type: "unauthorized".to_string(),
                 param: None,
                 code: Some("unauthorized".to_string()),
+            },
+            Self::ServiceUnavailable { message } => ErrorDetail {
+                message: message.clone(),
+                error_type: "service_unavailable".to_string(),
+                param: None,
+                code: Some("service_unavailable".to_string()),
             },
         };
 

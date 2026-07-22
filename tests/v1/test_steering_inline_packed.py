@@ -16,6 +16,7 @@ Covers:
 import numpy as np
 import torch
 
+from vllm.config.sae_steering_types import SAEClampEntry, SAEClampSpec
 from vllm.config.steering_types import (
     _torch_dtype_to_pack_dtype,
     maybe_pack_inline_steering_for_request,
@@ -284,3 +285,44 @@ class TestMsgspecRoundtrip:
         assert packed_bytes * 2 < unpacked_bytes, (
             f"packed={packed_bytes} not < unpacked={unpacked_bytes} / 2"
         )
+
+
+class TestMaybePackSAE:
+    """Packing inline additive vectors must not perturb the SAE-clamp
+    contribution to the per-phase steering-config hash (prefix-cache parity)."""
+
+    def test_preserves_sae_hash_contribution(self):
+        sae_spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_block": {
+                    0: (
+                        SAEClampEntry(
+                            feature_idx=1,
+                            kind="absolute",
+                            value=2.0,
+                        ),
+                    )
+                }
+            },
+        )
+        sp = SamplingParams(
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
+            sae_clamp_specs=(sae_spec,),
+        )
+        prefill_hash = sp.prefill_steering_config_hash
+        decode_hash = sp.decode_steering_config_hash
+        prefill_additive_hash = sp.prefill_additive_steering_config_hash
+        decode_additive_hash = sp.decode_additive_steering_config_hash
+        prefill_sae_hash = sp.prefill_sae_clamp_config_hash
+        decode_sae_hash = sp.decode_sae_clamp_config_hash
+
+        maybe_pack_inline_steering_for_request(sp, torch.float32)
+
+        assert sp.prefill_steering_config_hash == prefill_hash
+        assert sp.decode_steering_config_hash == decode_hash
+        assert sp.prefill_additive_steering_config_hash == prefill_additive_hash
+        assert sp.decode_additive_steering_config_hash == decode_additive_hash
+        assert sp.prefill_sae_clamp_config_hash == prefill_sae_hash
+        assert sp.decode_sae_clamp_config_hash == decode_sae_hash
+        assert sp.sae_clamp_specs == (sae_spec,)

@@ -374,6 +374,21 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        has_steering = (
+            request.steering_name is not None
+            or request.steering_vectors is not None
+            or request.prefill_steering_vectors is not None
+            or request.decode_steering_vectors is not None
+            or bool(request.sae_clamp_specs)
+            or bool(request.sae_full_reconstruction_specs)
+        )
+        if request.use_beam_search and has_steering:
+            return self.create_error_response(
+                "Beam search does not support steering. Disable "
+                "use_beam_search or remove steering fields from the request.",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -423,6 +438,7 @@ class OpenAIServingChat(OpenAIServing):
         # the activation-steering plan).  Inline overrides ride along
         # unmodified on ``request.steering_vectors`` etc.
         steering_module_ref: tuple[str, float] | None = None
+        named_steering_registry = None
         if request.steering_name is not None:
             steering_registry = (
                 None
@@ -435,15 +451,56 @@ class OpenAIServingChat(OpenAIServing):
                     "Ensure the server was started with steering enabled.",
                     status_code=HTTPStatus.BAD_REQUEST,
                 )
-            if steering_registry.get(request.steering_name) is None:
+            err = steering_registry.validate_additive_lookup(request.steering_name)
+            if err is not None:
                 return self.create_error_response(
-                    (
-                        f"Unknown steering module '{request.steering_name}'. "
-                        f"Available: {steering_registry.list_modules() or 'none'}"
-                    ),
-                    status_code=HTTPStatus.BAD_REQUEST,
+                    err, status_code=HTTPStatus.BAD_REQUEST
                 )
             steering_module_ref = (request.steering_name, 1.0)
+            named_steering_registry = steering_registry
+
+        # Validate sae_clamp_specs at the API server symmetrically with
+        # steering_name, so the response distinguishes "steering disabled"
+        # / "unknown module" / "wrong kind" failures cleanly with a 400
+        # rather than letting the worker crash later (or silently drop
+        # the SAE state when steering is disabled).
+        if request.sae_clamp_specs:
+            steering_registry = (
+                None
+                if raw_request is None
+                else getattr(raw_request.app.state, "steering_module_registry", None)
+            )
+            if steering_registry is None:
+                return self.create_error_response(
+                    "sae_clamp_specs requires steering to be enabled. "
+                    "Start the server with --enable-steering.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            err = steering_registry.validate_sae_clamp_specs(request.sae_clamp_specs)
+            if err is not None:
+                return self.create_error_response(
+                    err, status_code=HTTPStatus.BAD_REQUEST
+                )
+
+        if request.sae_full_reconstruction_specs:
+            steering_registry = (
+                None
+                if raw_request is None
+                else getattr(raw_request.app.state, "steering_module_registry", None)
+            )
+            if steering_registry is None:
+                return self.create_error_response(
+                    "sae_full_reconstruction_specs requires steering to be "
+                    "enabled. Start the server with --enable-steering.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            err = steering_registry.validate_sae_full_reconstruction_specs(
+                request.sae_full_reconstruction_specs
+            )
+            if err is not None:
+                return self.create_error_response(
+                    err, status_code=HTTPStatus.BAD_REQUEST
+                )
 
         # Build the request-metadata channel once (declarative steering gate
         # names are resolved against the vector registry here; a malformed
@@ -509,6 +566,16 @@ class OpenAIServingChat(OpenAIServing):
                 # vectors over multiprocessing.
                 if steering_module_ref is not None:
                     sampling_params.steering_module_ref = steering_module_ref
+                    assert named_steering_registry is not None
+                    err = named_steering_registry.apply_sampling_params_hash_overrides(
+                        sampling_params,
+                        steering_module_ref[0],
+                        scale=steering_module_ref[1],
+                    )
+                    if err is not None:
+                        return self.create_error_response(
+                            err, status_code=HTTPStatus.BAD_REQUEST
+                        )
 
             # Per-request capture-consumer admission validation. Runs
             # AFTER sampling-params construction (we need the tokenized

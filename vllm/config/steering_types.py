@@ -66,6 +66,24 @@ class SteeringHookPacked(TypedDict):
 # Packed full spec: {hook_point_name: SteeringHookPacked}
 SteeringVectorSpecPacked = dict[str, SteeringHookPacked]
 
+STEERING_INDEX_MAX = 2**31 - 1
+
+
+def validate_steering_index(value: object, label: str) -> int:
+    """Validate an index that is serialized as signed int32.
+
+    Shared by the SAE steering types (layer indices, feature indices)
+    which are hashed via ``int.to_bytes(4, ..., signed=True)`` and must
+    therefore fit in a non-negative signed int32.
+    """
+    if type(value) is not int:
+        raise ValueError(f"{label} must be a non-negative integer, got {value!r}.")
+    if value < 0:
+        raise ValueError(f"{label} must be non-negative, got {value!r}.")
+    if value > STEERING_INDEX_MAX:
+        raise ValueError(f"{label} must be <= {STEERING_INDEX_MAX}, got {value!r}.")
+    return value
+
 
 def _looks_packed(tier: dict) -> bool:
     """Detect whether *tier* is the binary ``SteeringVectorSpecPacked`` shape.
@@ -589,11 +607,14 @@ def merge_steering_specs(
 def hash_steering_config(
     effective_vectors: dict[str, dict[int, list[float] | np.ndarray]] | None,
     module_ref: tuple[str, float] | None = None,
+    sae_clamp_specs: tuple[Any, ...] | None = None,
+    sae_full_reconstruction_specs: tuple[Any, ...] | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 
-    Returns 0 if both *effective_vectors* and *module_ref* are ``None``
-    or empty.  The hash is masked to fit in ``np.int64``.
+    Returns 0 if *effective_vectors*, *module_ref*, *sae_clamp_specs*,
+    and *sae_full_reconstruction_specs* are all ``None`` or empty.  The
+    hash is masked to fit in ``np.int64``.
 
     *module_ref* is an optional ``(name, scale)`` reference to a
     worker-side named steering module.  When set, the reference is
@@ -609,8 +630,22 @@ def hash_steering_config(
     :func:`resolve_effective_vectors`).  In both cases the float→float32
     cast happens exactly once at the ``tobytes`` boundary, so hashes are
     bit-for-bit identical regardless of the input container.
+
+    *sae_clamp_specs* is an optional tuple of
+    :class:`vllm.config.sae_steering_types.SAEClampSpec` describing SAE
+    feature-surgery clamps, and *sae_full_reconstruction_specs* an
+    optional tuple of
+    :class:`vllm.config.sae_steering_types.SAEFullReconstructionSpec`.
+    When ``None`` or empty each SAE block is omitted from the digest, so
+    requests that don't use SAE steering hash bit-for-bit identically to
+    before these arguments existed — required for prefix-cache reuse.
     """
-    if not effective_vectors and module_ref is None:
+    if (
+        not effective_vectors
+        and module_ref is None
+        and not sae_clamp_specs
+        and not sae_full_reconstruction_specs
+    ):
         return 0
     h = hashlib.sha256()
     if effective_vectors:
@@ -644,6 +679,30 @@ def hash_steering_config(
         h.update(b"\x00module_ref\x00")
         h.update(name.encode("utf-8"))
         h.update(np.float64(scale).tobytes())
+    if sae_clamp_specs:
+        # Defer the import to avoid a circular dependency:
+        # sae_steering_types imports ``validate_steering_index`` from this
+        # module.  ``hash_sae_clamp_specs`` writes its own domain
+        # separator into the digest it computes; we incorporate that
+        # result via ``int.to_bytes`` to keep the composition associative.
+        from vllm.config.sae_steering_types import hash_sae_clamp_specs
+
+        sae_hash = hash_sae_clamp_specs(sae_clamp_specs)
+        h.update(b"\x00sae_block\x00")
+        h.update(sae_hash.to_bytes(8, "little", signed=False))
+    if sae_full_reconstruction_specs:
+        # Distinct domain separator from the delta block above so a delta
+        # and a full-reconstruction request with identical clamp content
+        # can never collide on prefix-cache keys: the two paths produce
+        # different residual streams (perturbation vs replacement) and
+        # must not share prefill cache.
+        from vllm.config.sae_steering_types import (
+            hash_sae_full_reconstruction_specs,
+        )
+
+        recon_hash = hash_sae_full_reconstruction_specs(sae_full_reconstruction_specs)
+        h.update(b"\x00sae_full_recon_block\x00")
+        h.update(recon_hash.to_bytes(8, "little", signed=False))
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
 

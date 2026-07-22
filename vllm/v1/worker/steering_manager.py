@@ -164,6 +164,21 @@ class SteeringManager:
         ] = {}
         # (config_hash, phase) -> number of active requests using this config
         self.config_refcounts: dict[tuple[int, str], int] = defaultdict(int)
+        # SAE clamp state is folded into the *logical* request hash
+        # (``config_hash``) so prefix-cache keys stay isolated, but the
+        # physical additive table row only depends on the additive vector
+        # content (``content_hash``, the additive-only identity the scheduler
+        # uses for capacity accounting).  Multiple logical hashes may therefore
+        # alias one physical row.  These maps track that logical->physical
+        # indirection; when ``content_hash`` is not supplied it defaults to
+        # ``config_hash`` so non-SAE callers keep the historical 1:1 mapping
+        # (and theirs' per-row scale/monitor identity) unchanged.
+        self._config_to_content: dict[tuple[int, str], tuple[int, str]] = {}
+        self._content_to_row: dict[tuple[int, str], int] = {}
+        self._content_vectors: dict[
+            tuple[int, str], dict[str, dict[int, torch.Tensor]]
+        ] = {}
+        self._content_refcounts: dict[tuple[int, str], int] = defaultdict(int)
         self._layout = TableLayout(
             num_configs=max_steering_configs,
             num_dynamic=max_dynamic_steering_configs,
@@ -435,6 +450,7 @@ class SteeringManager:
         vectors: dict[str, dict[int, list[float] | np.ndarray]],
         phase: str = "prefill",
         *,
+        content_hash: int | None = None,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> int:
         """Register a steering config, return its table row index.
@@ -446,6 +462,13 @@ class SteeringManager:
                 (the float64 arrays produced by
                 :func:`resolve_effective_vectors`).
             phase: ``"prefill"`` or ``"decode"``
+            content_hash: Optional additive-only identity used for physical
+                row sharing.  Scheduler capacity accounting uses the same
+                value, while ``config_hash`` remains the logical request hash
+                used for lookup and prefix-cache isolation.  When ``None`` it
+                defaults to ``config_hash`` so non-SAE callers keep the
+                historical 1:1 config->row mapping (and per-row scale/monitor
+                identity) unchanged.
             locally_owned_layers: If provided, only layers in this set
                 have tensors materialized on this worker.  Layers
                 outside the set are skipped at tensor-construction time
@@ -464,25 +487,69 @@ class SteeringManager:
         key = (config_hash, phase)
         if key in self.config_to_row:
             self.config_refcounts[key] += 1
+            self._content_refcounts[self._config_to_content[key]] += 1
             return self.config_to_row[key]
+
+        # Physical row identity: an explicit ``content_hash`` (the additive-
+        # only identity the scheduler reserves against) when provided —
+        # this is what the SAE-aware admission path always supplies, for
+        # both phases.  Two logical configs that share this identity alias
+        # onto one physical row.
+        #
+        # Without an explicit ``content_hash``, implicit content-based
+        # aliasing applies to PREFILL rows only.  Prefill rows are pinned
+        # to default scale / never row-gated (cache safety), so sharing a
+        # physical row between logical configs with identical additive
+        # content is unobservable.  Decode rows are the target of the
+        # per-row scale / monitor / dynamic-override machinery — all keyed
+        # by the logical ``config_hash`` — so implicitly aliasing them
+        # would let one config's runtime state bleed onto another's row.
+        # Decode rows therefore keep the historical 1:1 logical->physical
+        # mapping unless the caller explicitly opts in via ``content_hash``.
+        if content_hash is not None:
+            row_hash = content_hash
+        elif phase == "prefill":
+            row_hash = hash_steering_config(vectors)
+        else:
+            row_hash = config_hash
+        content_key = (row_hash, phase)
+        # A different logical config whose additive content matches an
+        # already-registered physical row aliases onto that row instead of
+        # consuming a fresh one.  This keeps physical-row usage bounded by the
+        # number of distinct additive contents (what the scheduler reserves),
+        # even when many logical (clamp-varying) hashes are active at once.
+        if content_key in self._content_to_row:
+            row = self._content_to_row[content_key]
+            self.config_to_row[key] = row
+            self.config_vectors[key] = self._content_vectors[content_key]
+            self.config_refcounts[key] = 1
+            self._config_to_content[key] = content_key
+            self._content_refcounts[content_key] += 1
+            self._dirty.mark_membership()
+            return row
 
         if not self.free_rows:
             raise RuntimeError(
                 f"No free steering table rows. max_steering_configs="
-                f"{self.max_steering_configs}, active configs="
-                f"{len(self.config_to_row)}"
+                f"{self.max_steering_configs}, active physical configs="
+                f"{len(self._content_to_row)}"
             )
 
         row = self.free_rows.pop()
         self.config_to_row[key] = row
         self.config_refcounts[key] = 1
+        self._config_to_content[key] = content_key
         # Store per-request vectors as tensors, keyed by hook point.
         # Under PP, each rank only owns a subset of decoder layers, so
         # materializing tensors for non-local layers is pure waste.
         # Row allocation above is unconditional — the filter only
         # affects what tensors get constructed, not which row is
         # assigned.
-        self.config_vectors[key] = self._store_vectors(vectors, locally_owned_layers)
+        stored = self._store_vectors(vectors, locally_owned_layers)
+        self.config_vectors[key] = stored
+        self._content_to_row[content_key] = row
+        self._content_vectors[content_key] = stored
+        self._content_refcounts[content_key] = 1
         # New row content + a changed row set: rebuild indices scratch and
         # recompose the tables on the next populate (membership implies
         # content). (Refcount-hit path doesn't mark dirty because the row's
@@ -640,16 +707,25 @@ class SteeringManager:
         key = (config_hash, phase)
         if key not in self.config_to_row:
             return
+        content_key = self._config_to_content[key]
         self.config_refcounts[key] -= 1
+        self._content_refcounts[content_key] -= 1
         if self.config_refcounts[key] <= 0:
-            row = self.config_to_row.pop(key)
+            self.config_to_row.pop(key)
             self.config_vectors.pop(key, None)
             del self.config_refcounts[key]
-            self.free_rows.append(row)
-            # Last live registration released: drop its owner-keyed runtime
-            # state so a re-registration of the same hash starts clean.
+            self._config_to_content.pop(key, None)
+            # Last live registration of this logical hash released: drop its
+            # owner-keyed runtime state so a re-registration of the same hash
+            # starts clean.
             self._purge_owner(RowOwner.config(config_hash, phase))
-            # config_to_row shrunk; rebuild indices scratch and recompose the
+        if self._content_refcounts[content_key] <= 0:
+            # No logical config aliases this physical row any more: free it.
+            row = self._content_to_row.pop(content_key)
+            self._content_vectors.pop(content_key, None)
+            del self._content_refcounts[content_key]
+            self.free_rows.append(row)
+            # content_to_row shrunk; rebuild indices scratch and recompose the
             # tables on the next populate (membership implies content) so a
             # config later assigned to this row overwrites the stale content.
             self._dirty.mark_membership()
@@ -771,7 +847,7 @@ class SteeringManager:
         keys.
 
         Args:
-            hook_point: Hook point string (e.g. ``"post_mlp"``).
+            hook_point: Hook point string (e.g. ``"post_block"``).
             layer_idx: Layer index.
             vector: The (already gain-scaled) tier vector.
             locally_owned_layers: If provided and ``layer_idx`` is not in
@@ -1509,6 +1585,13 @@ class SteeringManager:
             or self._cached_ordered_configs is None
             or self._cached_ordered_dynamic is None
         ):
+            # Ordering is keyed by the logical ``config_to_row`` so the
+            # per-row scale / monitor owners (keyed by logical ``config_hash``)
+            # line up position-for-position.  Aliased logical configs share a
+            # physical row, so ``_cached_indices`` may repeat a row id; the
+            # ``index_copy_`` scatters below tolerate the duplicate (aliased
+            # configs carry identical additive content, so whichever write
+            # wins is correct).
             new_ordered_configs: list[tuple[tuple[int, str], int]] = list(
                 self.config_to_row.items()
             )

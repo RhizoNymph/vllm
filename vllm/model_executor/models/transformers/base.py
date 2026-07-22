@@ -16,6 +16,7 @@
 # limitations under the License.
 """Transformers modeling backend base class."""
 
+import sys
 from collections.abc import Callable, Iterable
 from itertools import chain
 from operator import attrgetter
@@ -269,6 +270,87 @@ class Base(
             enable_if=enable_if,
             is_encoder=is_encoder,
         )(cls)
+
+    def _decorate_for_torch_compile(self, **kwargs: dict):
+        """
+        Decorate the model's decoder class to indicate to vLLM that it supports torch
+        compile if `can_enable_torch_compile` is True.
+
+        Args:
+            kwargs: The kwargs to create the model, which are needed to get the decoder
+                class.
+        """
+        self._decorate_cls_for_torch_compile(
+            cls=self._get_decoder_cls(**kwargs),
+            # Applied to a PreTrainedModel so the batch dimension will exist
+            dynamic_arg_dims=dict[str, int](
+                input_ids=1,  # shape: [1, seq_len]
+                inputs_embeds=1,  # shape: [1, seq_len, hidden_size]
+                position_ids=-1,  # shape: [1, seq_len] or [3, 1, seq_len] for mrope
+            ),
+            enable_if=can_enable_torch_compile,
+            is_encoder=False,
+        )
+
+    def _get_decoder_cls(self, **kwargs: dict) -> type[PreTrainedModel]:
+        """
+        Get the decoder class from the model.
+
+        Args:
+            kwargs: The kwargs to create the model.
+
+        Returns:
+            The decoder class.
+        """
+        with torch.device("meta"):
+            model: PreTrainedModel = AutoModel.from_config(**kwargs)
+        decoder_cls = type(model.get_decoder())
+        logger.debug("Identified decoder class as: %s", decoder_cls)
+        del model
+        return decoder_cls
+
+    def _decorate_cls_for_torch_compile(
+        self,
+        cls: type[PreTrainedModel],
+        dynamic_arg_dims: dict[str, int] | None,
+        enable_if: Callable[["VllmConfig"], bool],
+        is_encoder: bool,
+    ):
+        """
+        Decorate `cls` to indicate to vLLM that it supports torch compile.
+
+        Args:
+            cls: The PreTrainedModel class to decorate.
+            dynamic_arg_dims: A mapping from argument name to the dynamic dimensions
+                of the argument. If None, default dynamic arg dims will be used. See
+                [`support_torch_compile`][vllm.compilation.decorators.support_torch_compile]
+                for more details.
+            enable_if: A function which takes in the vLLM config and returns whether
+                torch compile should be enabled for this class.
+            is_encoder: Whether the class being decorated is an encoder.
+        """
+        logger.debug(
+            "Decorating `%s` as %s for torch compile with dynamic_arg_dims of %s",
+            cls.__name__,
+            "encoder" if is_encoder else "decoder",
+            dynamic_arg_dims,
+        )
+
+        @support_torch_compile(
+            dynamic_arg_dims=dynamic_arg_dims,
+            enable_if=enable_if,
+            is_encoder=is_encoder,
+        )
+        class SupportTorchCompileWrapper(cls): ...
+
+        # Preserve __module__ so transformers v5's source-file checks
+        # (e.g. _can_set_experts_implementation) read the original
+        # model's module instead of this file.
+        SupportTorchCompileWrapper.__module__ = cls.__module__
+
+        # Patch the class in its module
+        module = sys.modules[cls.__module__]
+        setattr(module, cls.__name__, SupportTorchCompileWrapper)
 
     def _decorate_for_torch_compile(self, **kwargs: dict):
         """

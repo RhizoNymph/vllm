@@ -148,6 +148,8 @@ pub(super) fn prepare_chat_request(
             capture: request.capture,
             patch: request.patch,
             patch_vectors: request.patch_vectors,
+            sae_clamp_specs: request.sae_clamp_specs,
+            sae_full_reconstruction_specs: request.sae_full_reconstruction_specs,
         },
         chat_options: ChatOptions {
             generation_prompt_mode,
@@ -626,6 +628,50 @@ mod tests {
             ..VllmSamplingParams::default()
         };
         assert_eq!(prepared.chat_request.sampling_params, expected);
+    }
+
+    #[test]
+    fn prepare_chat_request_decodes_typed_sae_specs() {
+        use vllm_engine_core_client::protocol::{SaeClampKind, SaePhase};
+
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "messages": [{"role": "user", "content": "hello"}],
+            "sae_clamp_specs": [{
+                "module_name": "golden_gate",
+                "phase": "prefill",
+                "clamps": {
+                    "post_block": {
+                        "20": [{
+                            "feature_idx": 34,
+                            "kind": "additive",
+                            "value": 2.5,
+                            "only_if_active": true
+                        }]
+                    }
+                }
+            }],
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_chat_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+        )
+        .expect("request is valid");
+
+        let sp = &prepared.chat_request.sampling_params;
+        let specs = sp.sae_clamp_specs.as_ref().expect("clamp specs decoded");
+        assert_eq!(specs[0].module_name, "golden_gate");
+        assert_eq!(specs[0].phase, SaePhase::Prefill);
+        // The JSON string layer key "20" decodes into an integer key.
+        let entries = &specs[0].clamps["post_block"][&20];
+        assert_eq!(entries[0].feature_idx, 34);
+        assert_eq!(entries[0].kind, SaeClampKind::Additive);
+        assert_eq!(entries[0].value, 2.5);
+        assert!(entries[0].only_if_active);
+        assert!(sp.sae_full_reconstruction_specs.is_none());
     }
 
     #[test]

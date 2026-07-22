@@ -13,10 +13,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import torch
 from starlette.datastructures import State
 
+import vllm.entrypoints.openai.steering.registry as registry_mod
+from vllm.config.sae_steering_types import (
+    SAEClampEntry,
+    SAEClampSpec,
+    hash_sae_clamp_specs_for_phase,
+)
 from vllm.config.steering_types import (
     SteeringVectorSpec,
+    hash_steering_config,
     merge_steering_specs,
     validate_spec_row_widths,
 )
@@ -25,6 +33,8 @@ from vllm.entrypoints.openai.steering.registry import (
     SteeringModuleRegistry,
     _convert_layer_keys,
 )
+from vllm.entrypoints.openai.steering.sae_loader import _site_filename
+from vllm.sampling_params import SamplingParams
 
 # ---------------------------------------------------------------------------
 # merge_steering_specs tests
@@ -650,6 +660,113 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
     engine_client.collective_rpc.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_init_app_state_preloads_sae_directory_and_broadcasts_weights(
+    tmp_path,
+):
+    manifest_payload = {
+        "d_model": 8,
+        "d_sae": 16,
+        "activation": "relu",
+        "layers": [[0, "post_block"]],
+        "clampable_features": [0, 1],
+        "activation_params": {},
+        "weights_uri": None,
+    }
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(manifest_payload), encoding="utf-8"
+    )
+    from safetensors.torch import save_file
+
+    save_file(
+        {
+            "encoder_weight": torch.ones(2, 8),
+            "encoder_bias": torch.zeros(2),
+            "decoder_weight": torch.full((2, 8), 2.0),
+        },
+        str(tmp_path / _site_filename(0, "post_block")),
+    )
+
+    engine_client = MagicMock()
+    engine_client.vllm_config = SimpleNamespace(
+        lora_config=None,
+        structured_outputs_config=SimpleNamespace(enable_in_reasoning=False),
+        model_config=MagicMock(),
+    )
+    engine_client.model_config = MagicMock()
+    engine_client.renderer = MagicMock()
+    engine_client.io_processor = MagicMock()
+    # theirs' init flow broadcasts the initial registry (register_steering_modules)
+    # then pre-materializes each named module; no list_steerable_layers RPC.
+    engine_client.collective_rpc = AsyncMock(return_value=None)
+
+    args = Namespace(
+        served_model_name=None,
+        model="test-model",
+        enable_log_requests=False,
+        max_log_len=None,
+        disable_log_stats=False,
+        chat_template=None,
+        lora_modules=None,
+        enable_steering=True,
+        steering_modules=[SimpleNamespace(name="g", path=str(tmp_path))],
+        structured_outputs_config=SimpleNamespace(reasoning_parser=None),
+        chat_template_content_format="auto",
+        trust_request_chat_template=False,
+        enable_auto_tool_choice=False,
+        exclude_tools_when_tool_choice_none=False,
+        tool_call_parser=None,
+        default_chat_template_kwargs=None,
+        log_error_stack=False,
+        enable_server_load_tracking=False,
+    )
+    models = MagicMock()
+    models.registry = MagicMock()
+    models.init_static_loras = AsyncMock()
+    state = State()
+
+    with (
+        patch(
+            "vllm.entrypoints.openai.api_server.load_chat_template",
+            return_value=None,
+        ),
+        patch(
+            "vllm.entrypoints.openai.api_server.process_lora_modules",
+            return_value=[],
+        ),
+        patch(
+            "vllm.entrypoints.openai.api_server.OpenAIServingModels",
+            return_value=models,
+        ),
+        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
+        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+    ):
+        await init_app_state(
+            engine_client,
+            state,
+            args,
+            supported_tasks=(),
+        )
+
+    assert hasattr(state, "steering_module_registry")
+    register_call = engine_client.collective_rpc.await_args_list[0]
+    assert register_call.args == ("register_steering_modules",)
+    modules = register_call.kwargs["kwargs"]["modules"]
+    assert modules["g"]["kind"] == "sae_delta"
+    assert modules["g"]["sae_manifest"]["weights_uri"] == str(tmp_path)
+    # Weights ride the wire in the packed form ("layer:hook" keys,
+    # {dtype, shape, data} blobs) — torch tensors do not survive the
+    # collective_rpc hop.
+    blob = modules["g"]["sae_weights"]["0:post_block"]["decoder_weight"]
+    assert blob["dtype"] == "float32"
+    assert blob["shape"] == [2, 8]
+    decoded = torch.frombuffer(
+        bytearray(blob["data"]), dtype=torch.float32
+    ).view(2, 8)
+    assert torch.equal(decoded, torch.full((2, 8), 2.0))
+    assert register_call.kwargs["kwargs"]["replace"] is True
+
+
 # ---------------------------------------------------------------------------
 # resolve_for_request tests
 # ---------------------------------------------------------------------------
@@ -776,3 +893,116 @@ class TestValidateSpecRowWidths:
                 8,
                 field_name="f",
             )
+
+
+# ---------------------------------------------------------------------------
+# apply_sampling_params_hash_overrides tests
+# ---------------------------------------------------------------------------
+
+
+class TestSamplingParamsHashOverrides:
+    """Tests for named-module phase-effective SamplingParams hashes."""
+
+    @staticmethod
+    def _sae_spec(*, phase: str = "both") -> SAEClampSpec:
+        return SAEClampSpec(
+            module_name="g",
+            phase=phase,  # type: ignore[arg-type]
+            clamps={
+                "post_block": {
+                    0: (
+                        SAEClampEntry(
+                            feature_idx=1,
+                            kind="absolute",
+                            value=2.0,
+                        ),
+                    )
+                }
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_inline_hash_override_uses_registration_time_cache(
+        self, monkeypatch
+    ):
+        registry = SteeringModuleRegistry()
+        base: SteeringVectorSpec = {"post_block": {0: [1.0, 2.0]}}
+        await registry.register("m", vectors=base)
+        sp = SamplingParams(steering_module_ref=("m", 1.0))
+
+        def fail_resolve(*_args, **_kwargs):
+            raise AssertionError("no-inline named hash override should be cached")
+
+        monkeypatch.setattr(registry_mod, "resolve_effective_vectors", fail_resolve)
+
+        err = registry.apply_sampling_params_hash_overrides(sp, "m")
+
+        assert err is None
+        expected = hash_steering_config(base)
+        assert sp.prefill_steering_config_hash == expected
+        assert sp.decode_steering_config_hash == expected
+        assert sp.prefill_additive_steering_config_hash == expected
+        assert sp.decode_additive_steering_config_hash == expected
+
+    @pytest.mark.asyncio
+    async def test_named_additive_with_sae_primes_sae_phase_hashes(self):
+        registry = SteeringModuleRegistry()
+        base: SteeringVectorSpec = {"post_block": {0: [1.0, 2.0]}}
+        sae_spec = self._sae_spec(phase="decode")
+        await registry.register("m", vectors=base)
+        sp = SamplingParams(
+            steering_module_ref=("m", 1.0),
+            sae_clamp_specs=(sae_spec,),
+        )
+
+        err = registry.apply_sampling_params_hash_overrides(sp, "m")
+
+        assert err is None
+        assert sp.__dict__["prefill_sae_clamp_config_hash"] == 0
+        expected_sae_hash = hash_sae_clamp_specs_for_phase((sae_spec,), "decode")
+        assert sp.__dict__["decode_sae_clamp_config_hash"] == expected_sae_hash
+        additive_hash = hash_steering_config(base)
+        assert sp.prefill_additive_steering_config_hash == additive_hash
+        assert sp.decode_additive_steering_config_hash == additive_hash
+        assert sp.prefill_steering_config_hash == additive_hash
+        assert sp.decode_steering_config_hash == hash_steering_config(
+            base,
+            sae_clamp_specs=(sae_spec,),
+        )
+
+    @pytest.mark.asyncio
+    async def test_decode_only_module_clears_prefill_hashes(self):
+        registry = SteeringModuleRegistry()
+        decode: SteeringVectorSpec = {"post_block": {0: [1.0, 2.0]}}
+        await registry.register("decode_only", decode_vectors=decode)
+        sp = SamplingParams(steering_module_ref=("decode_only", 1.0))
+
+        err = registry.apply_sampling_params_hash_overrides(sp, "decode_only")
+
+        assert err is None
+        assert sp.prefill_steering_config_hash == 0
+        assert sp.prefill_additive_steering_config_hash == 0
+        expected_decode = hash_steering_config(decode)
+        assert sp.decode_steering_config_hash == expected_decode
+        assert sp.decode_additive_steering_config_hash == expected_decode
+
+    @pytest.mark.asyncio
+    async def test_inline_prefill_override_keeps_prefill_active(self):
+        registry = SteeringModuleRegistry()
+        decode: SteeringVectorSpec = {"post_block": {0: [1.0, 2.0]}}
+        inline_prefill: SteeringVectorSpec = {"pre_attn": {1: [0.5, 0.25]}}
+        await registry.register("decode_only", decode_vectors=decode)
+        sp = SamplingParams(
+            steering_module_ref=("decode_only", 1.0),
+            prefill_steering_vectors=inline_prefill,
+        )
+
+        err = registry.apply_sampling_params_hash_overrides(sp, "decode_only")
+
+        assert err is None
+        expected_prefill = hash_steering_config(inline_prefill)
+        expected_decode = hash_steering_config(decode)
+        assert sp.prefill_steering_config_hash == expected_prefill
+        assert sp.prefill_additive_steering_config_hash == expected_prefill
+        assert sp.decode_steering_config_hash == expected_decode
+        assert sp.decode_additive_steering_config_hash == expected_decode

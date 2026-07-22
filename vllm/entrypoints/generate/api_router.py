@@ -65,9 +65,17 @@ async def init_generate_state(
     )
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
     from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+    from vllm.entrypoints.openai.fingerprint import set_default_fingerprint_mode
     from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
     from vllm.entrypoints.serve.disagg.serving import ServingTokens
     from vllm.entrypoints.serve.utils.fingerprint import set_default_fingerprint_mode
+
+    # Applied before any serving class is constructed so that each one picks
+    # up the chosen mode on its first cache miss.
+    set_default_fingerprint_mode(
+        getattr(args, "fingerprint_mode", "full"),
+        getattr(args, "fingerprint_value", None),
+    )
 
     # Applied before any serving class is constructed so that each one picks
     # up the chosen mode on its first cache miss.

@@ -4703,6 +4703,20 @@ async fn steering_modules_register_broadcasts_and_lists() {
             let inner = array[3].as_array().expect("collective_rpc args");
             assert_eq!(inner[0], Value::from("pre_materialize_steering_module"));
             send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+
+            // Third: reset_prefix_cache(reset_running_requests=true,
+            // reset_connector=false) invalidates KV blocks whose steering hash
+            // names the (re-)registered module.
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("reset_prefix_cache"));
+            assert_eq!(
+                array[3],
+                Value::Array(vec![Value::from(true), Value::from(false)])
+            );
+            send_outputs(push, utility_outputs(call_id, utility_result_value(true))).await;
         })
     })
     .await;
@@ -4869,6 +4883,14 @@ async fn steering_modules_register_with_key_succeeds() {
                 let array = payload.as_array().expect("utility payload array");
                 let call_id = array[1].as_u64().expect("call id");
                 send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+
+                // reset_prefix_cache follow-up after the registry change.
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                let call_id = array[1].as_u64().expect("call id");
+                assert_eq!(array[2], Value::from("reset_prefix_cache"));
+                send_outputs(push, utility_outputs(call_id, utility_result_value(true))).await;
             })
         },
         vec!["sekrit".to_string()],
@@ -4897,6 +4919,312 @@ async fn steering_modules_register_with_key_succeeds() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
         json!({ "modules": ["m"] })
+    );
+}
+
+/// Request body registering one `sae_delta` module named `gg` covering site
+/// `20:post_block` with `d_model = 4` and two clampable features.
+fn sae_module_register_body() -> String {
+    use base64::Engine as _;
+    let b64_f32 = |values: &[f32]| {
+        base64::engine::general_purpose::STANDARD
+            .encode(values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())
+    };
+    format!(
+        r#"{{"modules":{{"gg":{{
+            "kind":"sae_delta",
+            "sae_manifest":{{
+                "d_model":4,"d_sae":8,"activation":"relu",
+                "layers":[[20,"post_block"]],
+                "clampable_features":[0,1],
+                "activation_params":{{}}
+            }},
+            "sae_weights":{{"20:post_block":{{
+                "encoder_weight":{{"dtype":"float32","shape":[2,4],"data":"{ew}"}},
+                "encoder_bias":{{"dtype":"float32","shape":[2],"data":"{eb}"}},
+                "decoder_weight":{{"dtype":"float32","shape":[2,4],"data":"{dw}"}}
+            }}}}
+        }}}}}}"#,
+        ew = b64_f32(&[1.0; 8]),
+        eb = b64_f32(&[0.5; 2]),
+        dw = b64_f32(&[2.0; 8]),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn steering_modules_sae_register_skips_prematerialize_and_resets_cache() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            // First collective_rpc: register_steering_modules carrying the
+            // SAE payload (kind + sae_manifest + packed sae_weights).
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("collective_rpc"));
+            let inner = array[3].as_array().expect("collective_rpc args");
+            assert_eq!(inner[0], Value::from("register_steering_modules"));
+            let kwargs = inner[3].as_map().expect("kwargs map");
+            let modules = kwargs
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("modules"))
+                .map(|(_, v)| v)
+                .expect("modules kwarg");
+            let module = modules
+                .as_map()
+                .expect("modules map")
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("gg"))
+                .map(|(_, v)| v.as_map().expect("module map"))
+                .expect("gg module");
+            let field =
+                |name: &str| module.iter().find(|(k, _)| k.as_str() == Some(name)).map(|(_, v)| v);
+            assert_eq!(field("kind"), Some(&Value::from("sae_delta")));
+            let manifest = field("sae_manifest").expect("sae_manifest").as_map().unwrap();
+            assert!(
+                manifest
+                    .iter()
+                    .any(|(k, v)| k.as_str() == Some("d_sae") && v.as_u64() == Some(8))
+            );
+            let weights = field("sae_weights").expect("sae_weights").as_map().unwrap();
+            let site = weights
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("20:post_block"))
+                .map(|(_, v)| v.as_map().expect("site map"))
+                .expect("site 20:post_block");
+            assert!(site.iter().any(|(k, _)| k.as_str() == Some("encoder_weight")));
+            // No additive tiers ride along on an SAE payload.
+            assert!(!module.iter().any(|(k, _)| k.as_str() == Some("vectors")));
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+
+            // Second call is the prefix-cache reset directly: SAE kinds are
+            // exempt from pre_materialize_steering_module.
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("reset_prefix_cache"));
+            assert_eq!(
+                array[3],
+                Value::Array(vec![Value::from(true), Value::from(false)])
+            );
+            send_outputs(push, utility_outputs(call_id, utility_result_value(true))).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/steering/modules")
+                .header("content-type", "application/json")
+                .body(Body::from(sae_module_register_body()))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    engine_task.await.expect("mock engine task");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({ "modules": ["gg"] })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn steering_modules_sae_register_invalid_payload_is_bad_request() {
+    // Kind/manifest validation happens before any engine round-trip, so the
+    // mock engine script does nothing.
+    let (app, engine_task) =
+        test_admin_app_with_engine_script(|_dealer, _push| boxed_test_future(async move {})).await;
+
+    for body in [
+        // Additive tier keys are invalid on an SAE kind.
+        r#"{"modules":{"gg":{"kind":"sae_delta","sae_manifest":{"d_model":4,"d_sae":8,"activation":"relu","layers":[[20,"post_block"]],"clampable_features":[0]},"sae_weights":{},"vectors":{"post_block":{"14":[0.1]}}}}}"#
+            .to_string(),
+        // Unknown kind.
+        r#"{"modules":{"gg":{"kind":"sae_banana"}}}"#.to_string(),
+        // SAE kind without a manifest.
+        r#"{"modules":{"gg":{"kind":"sae_delta"}}}"#.to_string(),
+    ] {
+        let response = app
+            .clone()
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/steering/modules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn steering_modules_register_returns_503_when_cache_reset_fails() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            // register_steering_modules broadcast succeeds.
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+
+            // pre_materialize succeeds.
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+
+            // reset_prefix_cache reports failure.
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("reset_prefix_cache"));
+            send_outputs(push, utility_outputs(call_id, utility_result_value(false))).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/steering/modules")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"modules":{"m":{"vectors":{"post_block":{"14":[0.1,0.2]}}}}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    let message = json["error"]["message"].as_str().expect("error message");
+    assert!(
+        message.contains("registered") && message.contains("prefix cache"),
+        "unexpected message: {message}"
+    );
+
+    // The module IS registered despite the failed invalidation (mirrors the
+    // Python endpoint): the list reflects it.
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/steering/modules")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({ "modules": ["m"] })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn steering_modules_unregister_broadcasts_and_resets_cache() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            // Register flow: broadcast + pre-materialize + cache reset.
+            for expect_reset in [false, false, true] {
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                let call_id = array[1].as_u64().expect("call id");
+                if expect_reset {
+                    assert_eq!(array[2], Value::from("reset_prefix_cache"));
+                    send_outputs(push, utility_outputs(call_id, utility_result_value(true))).await;
+                } else {
+                    send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+                }
+            }
+
+            // DELETE flow: unregister_steering_modules broadcast...
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("collective_rpc"));
+            let inner = array[3].as_array().expect("collective_rpc args");
+            assert_eq!(inner[0], Value::from("unregister_steering_modules"));
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+
+            // ...followed by the prefix-cache reset.
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("reset_prefix_cache"));
+            assert_eq!(
+                array[3],
+                Value::Array(vec![Value::from(true), Value::from(false)])
+            );
+            send_outputs(push, utility_outputs(call_id, utility_result_value(true))).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/steering/modules")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"modules":{"m":{"vectors":{"post_block":{"14":[0.1,0.2]}}}}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/steering/modules/m")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    engine_task.await.expect("mock engine task");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({ "modules": [] })
     );
 }
 

@@ -116,6 +116,16 @@ impl SteeringDtype {
     }
 }
 
+/// Byte size of one element for a supported packed dtype string
+/// (`float32` | `float16` | `bfloat16` | `float64`).
+///
+/// Shared with the SAE module-registration path, which validates packed
+/// weight blobs (byte length == element count × element size) without
+/// decoding the floats.
+pub fn steering_dtype_element_size(dtype: &str) -> Result<usize, SteeringDecodeError> {
+    Ok(SteeringDtype::parse(dtype)?.element_size())
+}
+
 /// Decode one packed hook blob from already-decoded raw bytes into the inline
 /// per-layer entries. Shared core for both the HTTP (base64) and gRPC (raw
 /// bytes) paths.

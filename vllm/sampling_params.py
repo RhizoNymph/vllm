@@ -17,12 +17,21 @@ from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
+from vllm.config.sae_steering_types import (
+    SAEClampSpec,
+    SAEFullReconstructionSpec,
+    coerce_sae_clamp_specs,
+    coerce_sae_full_reconstruction_specs,
+    hash_sae_clamp_specs_for_phase,
+    hash_sae_full_reconstruction_specs_for_phase,
+)
 from vllm.config.steering_types import (
     SteeringLayerEntry,
     SteeringVectorSpec,
     hash_steering_config,
     normalize_layer_entry,
     resolve_effective_vectors,
+    validate_steering_index,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -505,6 +514,47 @@ class SamplingParams(
     hash bit-for-bit identically to today, preserving prefix-cache
     reuse."""
 
+    sae_full_reconstruction_specs: tuple[SAEFullReconstructionSpec, ...] | None = None
+    """Optional SAE full-reconstruction directives (residual replacement).
+
+    Each entry references a named SAE module (registered via the
+    standard module-registration API with
+    ``kind="sae_full_reconstruction"``) and optionally declares
+    per-(hook, layer) clamps to apply to the SAE's activations
+    before the decoder pass.  When ``clamps`` is empty the SAE
+    reconstruction replaces the residual without modifications —
+    pure ``decode(activate(encode(h))) + b_dec``.
+
+    Hash determinism: the full-reconstruction state is folded into
+    :pyattr:`prefill_steering_config_hash` /
+    :pyattr:`decode_steering_config_hash` via
+    :func:`hash_steering_config`'s
+    ``sae_full_reconstruction_specs`` argument with a distinct
+    domain separator from the delta block, so a delta-clamp request
+    and a full-reconstruction request with identical clamp content
+    do not collide on prefix-cache keys.  Replacement and
+    perturbation produce different residual streams and must not
+    share prefill cache."""
+
+    sae_clamp_specs: tuple[SAEClampSpec, ...] | None = None
+    """Optional SAE feature-surgery clamps (delta intervention).
+
+    Each entry references a named SAE module (registered via the
+    standard module-registration API with ``kind="sae_delta"``) and
+    declares which feature activations to clamp on which
+    (hook, layer) pairs.  See :class:`SAEClampSpec` and
+    ``docs/features/sae_steering.md`` for the runtime contract.
+
+    Hash determinism: SAE clamp state is folded into
+    :pyattr:`prefill_steering_config_hash` /
+    :pyattr:`decode_steering_config_hash` via
+    :func:`hash_steering_config`'s ``sae_clamp_specs`` argument, so
+    different clamp configurations produce different prefix-cache
+    keys.  Requests that do not use SAE clamps
+    (``sae_clamp_specs is None``) hash bit-for-bit identically to
+    requests on a build without SAE support, preserving prefix-cache
+    reuse."""
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -552,6 +602,8 @@ class SamplingParams(
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
         steering_module_ref: tuple[str, float] | None = None,
+        sae_clamp_specs: object = None,
+        sae_full_reconstruction_specs: object = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -601,6 +653,10 @@ class SamplingParams(
             prefill_steering_vectors=prefill_steering_vectors,
             decode_steering_vectors=decode_steering_vectors,
             steering_module_ref=steering_module_ref,
+            sae_clamp_specs=coerce_sae_clamp_specs(sae_clamp_specs),
+            sae_full_reconstruction_specs=coerce_sae_full_reconstruction_specs(
+                sae_full_reconstruction_specs
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -1199,38 +1255,6 @@ class SamplingParams(
         )
 
     @cached_property
-    def prefill_steering_config_hash(self) -> int:
-        """Cached hash of ``effective_prefill_steering`` plus
-        ``steering_module_ref``.
-
-        Lives on ``SamplingParams`` (not ``Request``) so that many requests
-        sharing the same ``SamplingParams`` object — the common case for
-        batched ``llm.generate(prompts, [sp]*N)`` — only pay the hashing
-        cost once across the whole batch instead of once per request.
-
-        When ``steering_module_ref`` is ``None`` this reduces to the
-        original inline-only hash bit-for-bit, preserving prefix-cache
-        reuse for requests that don't reference a named module.  When set
-        to a *user*-named module, the ``(name, scale)`` tuple is folded
-        into the digest so two requests with the same reference plus
-        identical inline overrides produce the same hash regardless of
-        when the module was registered worker-side.
-        """
-        return hash_steering_config(
-            self.effective_prefill_steering,
-            module_ref=self.steering_module_ref,
-        )
-
-    @cached_property
-    def decode_steering_config_hash(self) -> int:
-        """Cached hash of ``effective_decode_steering`` plus
-        ``steering_module_ref``. See ``prefill_steering_config_hash``."""
-        return hash_steering_config(
-            self.effective_decode_steering,
-            module_ref=self.steering_module_ref,
-        )
-
-    @cached_property
     def patch_site_demand(self) -> dict[tuple[int, str], int]:
         """Per-``(layer, hook)`` patch-slot demand for this request.
 
@@ -1290,6 +1314,366 @@ class SamplingParams(
             payload += repr(self.patch_vectors.get("data"))
         digest = hashlib.sha256(payload.encode()).digest()
         return min(e[2] for e in entries), int.from_bytes(digest[:8], "big")
+
+        self._validate_steering_vectors()
+        self._validate_capture()
+
+    def _validate_capture(self) -> None:
+        """Structural check on ``capture``.
+
+        Only verifies the shape at construction time (``dict[str, Any]``
+        with string keys). Per-consumer validation — against the active
+        consumer registry, with access to the request context — happens
+        in the OpenAI entrypoint (``_admit_capture``). Leaving full
+        validation out of ``SamplingParams`` keeps the module free of
+        any capture-framework imports.
+        """
+        capture = self.capture
+        if capture is None:
+            return
+        if not isinstance(capture, dict):
+            raise ValueError(
+                "capture must be a dict keyed by consumer name, got "
+                f"{type(capture).__name__}"
+            )
+        for key in capture:
+            if not isinstance(key, str):
+                raise ValueError(
+                    "capture keys must be strings (consumer names), got "
+                    f"{type(key).__name__} ({key!r})"
+                )
+
+    def _validate_steering_vectors(self) -> None:
+        """Validate all steering vector fields if provided.
+
+        Expected format per field:
+        ``{hook_point: {layer_idx: SteeringLayerEntry}}``
+        where ``SteeringLayerEntry`` is either ``list[float]`` (scale=1.0)
+        or ``{"vector": list[float], "scale": float}``.
+        """
+        if self.steering_module_ref is not None:
+            ref = self.steering_module_ref
+            # Accept tuple or list (msgspec / JSON round-trips may emit
+            # the latter); coerce to tuple post-validation.
+            if (
+                not isinstance(ref, (tuple, list))
+                or len(ref) != 2
+                or not isinstance(ref[0], str)
+                or isinstance(ref[1], bool)
+                or not isinstance(ref[1], (int, float))
+                or not math.isfinite(float(ref[1]))
+            ):
+                raise ValueError(
+                    "steering_module_ref must be a "
+                    "(name: str, scale: finite float) tuple, got "
+                    f"{ref!r}."
+                )
+            if not isinstance(ref, tuple):
+                self.steering_module_ref = (ref[0], float(ref[1]))
+
+        fields_to_check: list[tuple[str, SteeringVectorSpec | None]] = [
+            ("steering_vectors", self.steering_vectors),
+            ("prefill_steering_vectors", self.prefill_steering_vectors),
+            ("decode_steering_vectors", self.decode_steering_vectors),
+        ]
+        for field_name, spec in fields_to_check:
+            if spec is not None:
+                self._validate_single_steering_spec(field_name, spec)
+
+        # Cross-validate overlapping dimensions between base and phase specs.
+        if self.steering_vectors:
+            for phase_name, phase_spec in [
+                ("prefill_steering_vectors", self.prefill_steering_vectors),
+                ("decode_steering_vectors", self.decode_steering_vectors),
+            ]:
+                if phase_spec is None:
+                    continue
+                for hook, layers in self.steering_vectors.items():
+                    if hook not in phase_spec:
+                        continue
+                    for layer_idx, base_entry in layers.items():
+                        if layer_idx not in phase_spec[hook]:
+                            continue
+                        base_vec, _ = normalize_layer_entry(base_entry)
+                        phase_vec, _ = normalize_layer_entry(
+                            phase_spec[hook][layer_idx]
+                        )
+                        if len(base_vec) != len(phase_vec):
+                            raise ValueError(
+                                f"steering_vectors[{hook!r}]"
+                                f"[{layer_idx}] has "
+                                f"dimension {len(base_vec)} but "
+                                f"{phase_name}[{hook!r}]"
+                                f"[{layer_idx}] has "
+                                f"dimension {len(phase_vec)}. "
+                                f"Overlapping entries must have "
+                                f"matching dimensions."
+                            )
+
+        # Normalize SAE clamp specs.  Direct ``SamplingParams(...)`` callers
+        # may pass raw JSON-shaped dicts; coerce them into validated
+        # ``SAEClampSpec`` tuples here so downstream code only ever sees
+        # the typed form.  ``coerce_sae_clamp_specs`` is idempotent for
+        # already-typed input (no allocation when the field is already a
+        # tuple of SAEClampSpec).
+        if self.sae_clamp_specs is not None:
+            self.sae_clamp_specs = coerce_sae_clamp_specs(self.sae_clamp_specs)
+        if self.sae_full_reconstruction_specs is not None:
+            self.sae_full_reconstruction_specs = coerce_sae_full_reconstruction_specs(
+                self.sae_full_reconstruction_specs
+            )
+
+        # Cross-validate overlapping dimensions between prefill and decode
+        # phase specs (caught even when no base ``steering_vectors`` is set).
+        if self.prefill_steering_vectors and self.decode_steering_vectors:
+            for hook, prefill_layers in self.prefill_steering_vectors.items():
+                if hook not in self.decode_steering_vectors:
+                    continue
+                decode_layers = self.decode_steering_vectors[hook]
+                for layer_idx, prefill_entry in prefill_layers.items():
+                    if layer_idx not in decode_layers:
+                        continue
+                    prefill_vec, _ = normalize_layer_entry(prefill_entry)
+                    decode_vec, _ = normalize_layer_entry(decode_layers[layer_idx])
+                    if len(prefill_vec) != len(decode_vec):
+                        raise ValueError(
+                            f"prefill_steering_vectors[{hook!r}]"
+                            f"[{layer_idx}] has "
+                            f"dimension {len(prefill_vec)} but "
+                            f"decode_steering_vectors[{hook!r}]"
+                            f"[{layer_idx}] has "
+                            f"dimension {len(decode_vec)}. "
+                            f"Overlapping entries must have "
+                            f"matching dimensions."
+                        )
+
+    def _validate_single_steering_spec(
+        self, field_name: str, spec: SteeringVectorSpec
+    ) -> None:
+        """Validate a single steering vector spec."""
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"{field_name} must be a dict mapping hook point "
+                "names to dicts of layer vectors."
+            )
+        for hook_name, layer_vecs in spec.items():
+            if hook_name not in VALID_HOOK_POINT_NAMES:
+                raise ValueError(
+                    f"{field_name} key {hook_name!r} is not a "
+                    f"valid hook point. Valid values: "
+                    f"{sorted(VALID_HOOK_POINT_NAMES)}."
+                )
+            if not isinstance(layer_vecs, dict):
+                raise ValueError(
+                    f"{field_name}[{hook_name!r}] must be a dict "
+                    f"mapping layer indices to layer entries."
+                )
+            for key, value in layer_vecs.items():
+                layer_idx = validate_steering_index(
+                    key, f"{field_name}[{hook_name!r}] key"
+                )
+                self._validate_layer_entry(field_name, hook_name, layer_idx, value)
+
+    def _validate_layer_entry(
+        self,
+        field_name: str,
+        hook_name: str,
+        layer_idx: int,
+        entry: SteeringLayerEntry,
+    ) -> None:
+        """Validate a single layer entry (bare list or dict with scale)."""
+        prefix = f"{field_name}[{hook_name!r}][{layer_idx}]"
+        if isinstance(entry, dict):
+            allowed = {"vector", "scale"}
+            extra = set(entry.keys()) - allowed
+            if extra:
+                raise ValueError(
+                    f"{prefix} dict entry has unexpected keys: {sorted(extra)}; "
+                    f"allowed keys: ['scale', 'vector']"
+                )
+            if "vector" not in entry or "scale" not in entry:
+                raise ValueError(
+                    f"{prefix} dict entries must have 'vector' "
+                    f"and 'scale' keys, got {sorted(entry.keys())}."
+                )
+            if isinstance(entry["scale"], bool) or not isinstance(
+                entry["scale"], (int, float)
+            ):
+                raise ValueError(
+                    f"{prefix}['scale'] must be a finite float, got "
+                    f"{type(entry['scale']).__name__}."
+                )
+            if not math.isfinite(entry["scale"]):
+                raise ValueError(
+                    f"{prefix}['scale'] must be finite, got {entry['scale']}."
+                )
+            self._validate_float_list(prefix + "['vector']", entry["vector"])
+        elif isinstance(entry, list):
+            self._validate_float_list(prefix, entry)
+        elif isinstance(entry, np.ndarray):
+            # ndarray entries arrive from the binary-wire decode path
+            # (``unpack_steering_vectors``).  The downstream resolver
+            # already accepts ndarrays — ``np.asarray`` is a no-op on
+            # them — so we just sanity-check shape/dtype here rather
+            # than rejecting outright.
+            if entry.ndim != 1:
+                raise ValueError(
+                    f"{prefix} ndarray must be 1-D, got shape {entry.shape}."
+                )
+            if entry.dtype.kind != "f":
+                raise ValueError(
+                    f"{prefix} ndarray must be a floating dtype, got {entry.dtype}."
+                )
+        else:
+            raise ValueError(
+                f"{prefix} must be a list of floats or a dict with "
+                f"'vector' and 'scale' keys, got "
+                f"{type(entry).__name__}."
+            )
+
+    @staticmethod
+    def _validate_float_list(prefix: str, values: Any) -> None:
+        """Validate that *values* is a list of finite floats."""
+        if not isinstance(values, list):
+            raise ValueError(
+                f"{prefix} must be a list of floats, got {type(values).__name__}."
+            )
+        for i, v in enumerate(values):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"{prefix}[{i}] must be a finite float, got {type(v).__name__}."
+                )
+            if not math.isfinite(v):
+                raise ValueError(f"{prefix}[{i}] must be finite, got {v}.")
+
+    def _phase_filtered_sae_specs(
+        self, want_phase: str
+    ) -> tuple[SAEClampSpec, ...] | None:
+        """Filter ``sae_clamp_specs`` to those active in *want_phase*.
+
+        A spec with ``phase="both"`` enters both prefill and decode
+        digests; a spec with ``phase="prefill"`` only enters the
+        prefill digest; ``phase="decode"`` only the decode digest.
+        Returns ``None`` when no spec applies — letting
+        :func:`hash_steering_config` skip the SAE block entirely so
+        the resulting digest is bit-for-bit identical to a request
+        without ``sae_clamp_specs``.
+        """
+        if not self.sae_clamp_specs:
+            return None
+        filtered = tuple(
+            s for s in self.sae_clamp_specs if s.phase in ("both", want_phase)
+        )
+        return filtered if filtered else None
+
+    def _phase_filtered_sae_full_recon_specs(
+        self, want_phase: str
+    ) -> tuple[SAEFullReconstructionSpec, ...] | None:
+        """Filter ``sae_full_reconstruction_specs`` to those active in *want_phase*.
+
+        Same shape as :meth:`_phase_filtered_sae_specs`: ``"both"``
+        always matches; ``"prefill"`` / ``"decode"`` match only their
+        own phase.  Returns ``None`` when no spec applies so
+        :func:`hash_steering_config` can skip the full-recon block.
+        """
+        if not self.sae_full_reconstruction_specs:
+            return None
+        filtered = tuple(
+            s
+            for s in self.sae_full_reconstruction_specs
+            if s.phase in ("both", want_phase)
+        )
+        return filtered if filtered else None
+
+    @cached_property
+    def prefill_steering_config_hash(self) -> int:
+        """Cached hash of ``effective_prefill_steering`` plus
+        ``steering_module_ref`` plus prefill-active ``sae_clamp_specs``.
+
+        Lives on ``SamplingParams`` (not ``Request``) so that many requests
+        sharing the same ``SamplingParams`` object — the common case for
+        batched ``llm.generate(prompts, [sp]*N)`` — only pay the hashing
+        cost once across the whole batch instead of once per request.
+
+        When ``steering_module_ref`` and ``sae_clamp_specs`` are both
+        ``None`` this reduces to the original inline-only hash
+        bit-for-bit, preserving prefix-cache reuse for requests that
+        don't reference a named module or SAE clamp.  When set, those
+        fields are folded into the digest so two requests with the
+        same reference + identical inline overrides + identical SAE
+        clamps produce the same hash regardless of when the named
+        modules were registered worker-side.
+        """
+        return hash_steering_config(
+            self.effective_prefill_steering,
+            module_ref=self.steering_module_ref,
+            sae_clamp_specs=self._phase_filtered_sae_specs("prefill"),
+            sae_full_reconstruction_specs=(
+                self._phase_filtered_sae_full_recon_specs("prefill")
+            ),
+        )
+
+    @cached_property
+    def decode_steering_config_hash(self) -> int:
+        """Cached hash of ``effective_decode_steering`` plus
+        ``steering_module_ref`` plus decode-active ``sae_clamp_specs``.
+        See ``prefill_steering_config_hash``."""
+        return hash_steering_config(
+            self.effective_decode_steering,
+            module_ref=self.steering_module_ref,
+            sae_clamp_specs=self._phase_filtered_sae_specs("decode"),
+            sae_full_reconstruction_specs=(
+                self._phase_filtered_sae_full_recon_specs("decode")
+            ),
+        )
+
+    @cached_property
+    def prefill_additive_steering_config_hash(self) -> int:
+        """Cached hash of only the additive prefill steering identity."""
+        return hash_steering_config(
+            self.effective_prefill_steering,
+            module_ref=self.steering_module_ref,
+        )
+
+    @cached_property
+    def decode_additive_steering_config_hash(self) -> int:
+        """Cached hash of only the additive decode steering identity."""
+        return hash_steering_config(
+            self.effective_decode_steering,
+            module_ref=self.steering_module_ref,
+        )
+
+    @cached_property
+    def prefill_sae_clamp_config_hash(self) -> int:
+        """Cached hash of only the prefill-active SAE clamp identity."""
+        return hash_sae_clamp_specs_for_phase(
+            self._phase_filtered_sae_specs("prefill"),
+            "prefill",
+        )
+
+    @cached_property
+    def decode_sae_clamp_config_hash(self) -> int:
+        """Cached hash of only the decode-active SAE clamp identity."""
+        return hash_sae_clamp_specs_for_phase(
+            self._phase_filtered_sae_specs("decode"),
+            "decode",
+        )
+
+    @cached_property
+    def prefill_sae_full_recon_config_hash(self) -> int:
+        """Cached hash of only the prefill-active SAE full-reconstruction identity."""
+        return hash_sae_full_reconstruction_specs_for_phase(
+            self._phase_filtered_sae_full_recon_specs("prefill"),
+            "prefill",
+        )
+
+    @cached_property
+    def decode_sae_full_recon_config_hash(self) -> int:
+        """Cached hash of only the decode-active SAE full-reconstruction identity."""
+        return hash_sae_full_reconstruction_specs_for_phase(
+            self._phase_filtered_sae_full_recon_specs("decode"),
+            "decode",
+        )
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
@@ -1422,11 +1806,19 @@ class SamplingParams(
             self.steering_vectors,
             self.prefill_steering_vectors,
             self.decode_steering_vectors,
+            self._effective_prefill_steering_packed,
+            self._effective_decode_steering_packed,
+            self.sae_clamp_specs,
+            self.sae_full_reconstruction_specs,
         ):
             if attr is not None:
                 memo[id(attr)] = attr
 
         new_sp = copy.deepcopy(self, memo)
+        if self.sae_clamp_specs is not None:
+            new_sp.sae_clamp_specs = self.sae_clamp_specs
+        if self.sae_full_reconstruction_specs is not None:
+            new_sp.sae_full_reconstruction_specs = self.sae_full_reconstruction_specs
 
         # Carry over cached @cached_property values so the clone doesn't
         # re-hash the same steering vectors. cached_property stores its
@@ -1434,6 +1826,12 @@ class SamplingParams(
         for key in (
             "prefill_steering_config_hash",
             "decode_steering_config_hash",
+            "prefill_additive_steering_config_hash",
+            "decode_additive_steering_config_hash",
+            "prefill_sae_clamp_config_hash",
+            "decode_sae_clamp_config_hash",
+            "prefill_sae_full_recon_config_hash",
+            "decode_sae_full_recon_config_hash",
             "effective_prefill_steering",
             "effective_decode_steering",
         ):

@@ -19,6 +19,12 @@ class MockReasoner:
         self.is_reasoning_end_streaming = Mock(return_value=False)
 
 
+class MockReasoner:
+    def __init__(self, tokenizer):
+        self.is_reasoning_end = Mock(return_value=False)
+        self.is_reasoning_end_streaming = Mock(return_value=False)
+
+
 class TestReasoningStructuredOutput:
     """Test reasoning-aware structured output functionality."""
 

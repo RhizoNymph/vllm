@@ -1,0 +1,996 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""SAE feature-surgery (full reconstruction) custom op + per-layer dispatch glue.
+
+Sibling to :mod:`sae_steering` (the *delta* path).  The math, per
+token ``t`` whose ``recon_mask[t]`` is ``True``:
+
+    pre_act     = h_t @ W_enc.T + b_enc          # (d_sae,)
+    f           = activation(pre_act)            # (d_sae,)
+    f' [c]      = apply_clamp(f[clampable_features[c]],
+                              clamp_kind[t, c],
+                              clamp_value[t, c],
+                              clamp_only_if_active[t, c])
+                  # for c ∈ [0, n_clamp); other features are unchanged
+    h_t_new     = f' @ W_dec + b_dec             # (d_model,)
+
+Tokens where ``recon_mask[t]`` is ``False`` pass through unchanged
+(``out[t] = h[t]``).  This per-token gate is what makes per-request
+opt-in tractable: a request that does not register a full-
+reconstruction spec keeps its residual stream identical to a build
+without the SAE module attached, the same per-token-row-indexing
+contract the additive and delta paths use.
+
+Compared to the delta variant (:func:`apply_sae_delta`):
+
+* Encoder / decoder use the **full** ``d_sae`` rows, not just a
+  ``clampable_features`` subset.  The reconstructed residual carries
+  the SAE's reconstruction error along with whatever clamp
+  modifications the caller requested, replacing the original
+  residual entirely (Anthropic Scaling Monosemanticity / Golden Gate
+  Claude semantics).
+* The decoder bias ``b_dec`` participates — it does not in the delta
+  path, where the result is a perturbation around ``h``.
+* Per-token opt-in is via ``recon_mask`` (a bool tensor) rather than
+  via row 0 of an indirection table — the math primitive is
+  layer-buffer-agnostic so the eventual worker integration can wire
+  ``recon_mask`` from any source (an explicit per-token flag, a
+  derived ``recon_index != 0`` mask, etc.).
+
+The compute path dispatches via :func:`apply_sae_full_reconstruction_op`,
+registered as ``torch.ops.vllm.apply_sae_full_reconstruction`` so
+:mod:`torch.compile` treats the call as an opaque splitting point
+(mirroring ``apply_steering`` and ``apply_sae_delta``).  CPU is
+served by the eager body; CUDA dispatches to the fused Triton
+kernel — wired in Stage 4.  Until then the CUDA path also routes to
+the eager body.
+
+Numeric dtype contract (matches ``docs/features/sae_steering.md``):
+
+* Encoder GEMM and decoder GEMM run in the model's compute dtype.
+* The activation tensor and clamp arithmetic are promoted to fp32 in
+  the eager body to match the contract the kernel will use; results
+  are cast back to compute dtype before the decoder GEMM.
+
+Activation support: ``ReLU``, ``JumpReLU`` (per-feature ``(d_sae,)``
+fp32 ``threshold`` tensor riding the per-site weights), and ``TopK``
+(``activation_params['k']``).  The threshold tensor is a required op
+argument for all activations (ReLU/TopK sites pass a zero-filled
+buffer only read under the JumpReLU branch) so the op arity stays
+fixed.  Unlike the delta path, TopK runs over the **full** ``d_sae``
+here — true Golden-Gate-style semantics — because we have the full
+encoder available.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+import torch
+from torch import nn
+
+from vllm.config.sae_steering_types import SAEActivation
+from vllm.model_executor.layers.intervention_common import hook_attrs
+from vllm.model_executor.layers.sae_steering import (
+    _ACTIVATION_TO_CODE,
+    _CODE_TO_ACTIVATION,
+    ACTIVATION_CODE_RELU,
+    CLAMP_KIND_ABSOLUTE,
+    CLAMP_KIND_ADDITIVE,
+    CLAMP_KIND_NONE,
+    _activation_to_scalar,
+    _scalar_to_activation_params,
+    _topk_mask_lowest_indices,
+    _validate_clamp_kind_values,
+)
+from vllm.model_executor.layers.steering import SteeringHookPoint
+from vllm.utils.torch_utils import direct_register_custom_op
+
+# Per-(layer, hook) buffer attribute names.  Flat per-hook attrs (not
+# a sub-Module wrapper) so ``torch.compile`` traces them as concrete
+# buffer references rather than container introspection — the same
+# rationale as :mod:`sae_steering`.  Full reconstruction hooks only
+# the residual sites (no MLP-branch hooks).
+_FR_HOOKS = (
+    SteeringHookPoint.PRE_ATTN,
+    SteeringHookPoint.POST_ATTN,
+    SteeringHookPoint.POST_BLOCK,
+)
+
+# Full SAE encoder / decoder weight tensors, shared across all rows.
+HOOK_POINT_FR_ENCODER_WEIGHT_ATTR = hook_attrs("sae_fr_encoder_weight", _FR_HOOKS)
+HOOK_POINT_FR_ENCODER_BIAS_ATTR = hook_attrs("sae_fr_encoder_bias", _FR_HOOKS)
+HOOK_POINT_FR_DECODER_WEIGHT_ATTR = hook_attrs("sae_fr_decoder_weight", _FR_HOOKS)
+HOOK_POINT_FR_DECODER_BIAS_ATTR = hook_attrs("sae_fr_decoder_bias", _FR_HOOKS)
+# Per-feature JumpReLU thresholds over the *full* ``d_sae`` feature
+# axis.  Registered for every site (zero-filled for ReLU/TopK) so the
+# op arity stays fixed across activations.
+HOOK_POINT_FR_THRESHOLD_ATTR = hook_attrs("sae_fr_threshold", _FR_HOOKS)
+# Per-row clamp tables: row ``r`` carries the clamp state for tokens
+# whose ``sae_recon_index`` selects ``r``.  Row 0 is reserved as the
+# "no reconstruction" sentinel — a token that maps to row 0 passes
+# through unchanged because :func:`apply_layer_sae_full_reconstruction`
+# derives ``recon_mask`` from this site's active-row table.
+HOOK_POINT_FR_CLAMP_KIND_ATTR = hook_attrs("sae_fr_clamp_kind", _FR_HOOKS)
+HOOK_POINT_FR_CLAMP_VALUE_ATTR = hook_attrs("sae_fr_clamp_value", _FR_HOOKS)
+HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR = hook_attrs(
+    "sae_fr_clamp_only_if_active", _FR_HOOKS
+)
+HOOK_POINT_FR_ROW_ACTIVE_ATTR = hook_attrs("sae_fr_row_active", _FR_HOOKS)
+# Clampable global feature indices for this site (constant per
+# manifest registration).
+HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR = hook_attrs(
+    "sae_fr_clampable_features", _FR_HOOKS
+)
+# Module name + activation are Python attributes — read as per-site
+# constants by the kernel.
+HOOK_POINT_FR_MODULE_NAME_ATTR = hook_attrs("sae_fr_module_name", _FR_HOOKS)
+HOOK_POINT_FR_ACTIVATION_ATTR = hook_attrs("sae_fr_activation", _FR_HOOKS)
+HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR = hook_attrs("sae_fr_activation_params", _FR_HOOKS)
+
+# Buffer attribute tables — used by :func:`unregister_sae_full_recon_buffers`
+# to delete every per-(hook) buffer in one pass.
+_FR_BUFFER_ATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
+    HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
+    HOOK_POINT_FR_ENCODER_BIAS_ATTR,
+    HOOK_POINT_FR_THRESHOLD_ATTR,
+    HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
+    HOOK_POINT_FR_DECODER_BIAS_ATTR,
+    HOOK_POINT_FR_CLAMP_KIND_ATTR,
+    HOOK_POINT_FR_CLAMP_VALUE_ATTR,
+    HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR,
+    HOOK_POINT_FR_ROW_ACTIVE_ATTR,
+    HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR,
+)
+_FR_PYATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
+    HOOK_POINT_FR_MODULE_NAME_ATTR,
+    HOOK_POINT_FR_ACTIVATION_ATTR,
+    HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR,
+)
+
+
+def register_sae_full_recon_buffers(
+    module: nn.Module,
+    *,
+    hook_point: SteeringHookPoint,
+    module_name: str,
+    activation: SAEActivation,
+    activation_params: Mapping[str, float],
+    d_sae: int,
+    n_clamp: int,
+    hidden_size: int,
+    max_recon_configs: int,
+    clampable_features: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device | None = None,
+) -> None:
+    """Attach full-reconstruction SAE buffers for one ``(layer, hook)`` site.
+
+    Phase-4 constrains at most one full-reconstruction SAE module per
+    ``(layer, hook)`` site, mirroring the delta path's invariant.
+    Calling this twice for the same ``hook_point`` on the same module
+    raises ``ValueError``.
+
+    The clamp tables are sized ``(max_recon_configs + 1, n_clamp)``
+    where row 0 is the no-reconstruction sentinel — never written
+    by the populator and gated out by the layer-hook dispatch shim
+    via the active-row table.
+
+    Args:
+        module: the decoder-layer module to attach buffers to.
+        hook_point: which hook point this site sits at.
+        module_name: name of the SAE module that owns this site.
+        activation: encoder activation function.
+        activation_params: parameters for ``activation``.
+        d_sae: SAE feature count.  Encoder / decoder weight buffers
+            are sized ``(d_sae, hidden_size)``.
+        n_clamp: number of clampable features (length of
+            ``clampable_features``).  Clamp tables are sized
+            ``(max_recon_configs + 1, n_clamp)``.
+        hidden_size: model's hidden size (``d_model``).
+        max_recon_configs: per-step row capacity (analog of
+            ``max_steering_configs``).  When ``0``, registration is
+            a no-op (full-reconstruction disabled engine-wide).
+        clampable_features: ``(n_clamp,)`` int64 tensor of *global*
+            feature indices that may be clamped at this site.
+        dtype: compute dtype for the encoder / decoder weight tensors.
+        device: device for runtime buffers. Runtime registrations happen
+            after layers may have moved to their worker device, so callers
+            should pass the device of an existing layer buffer.
+    """
+    if max_recon_configs == 0:
+        return
+    if d_sae <= 0:
+        raise ValueError(f"d_sae must be positive; got {d_sae}.")
+    if n_clamp < 0:
+        raise ValueError(f"n_clamp must be non-negative; got {n_clamp}.")
+    if clampable_features.dtype != torch.int64:
+        raise ValueError(
+            f"clampable_features must be int64; got dtype={clampable_features.dtype}."
+        )
+    if tuple(clampable_features.shape) != (n_clamp,):
+        raise ValueError(
+            f"clampable_features must have shape ({n_clamp},); "
+            f"got {tuple(clampable_features.shape)}."
+        )
+    enc_w_attr = HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point]
+    if hasattr(module, enc_w_attr):
+        existing = getattr(
+            module, HOOK_POINT_FR_MODULE_NAME_ATTR[hook_point], "<unknown>"
+        )
+        raise ValueError(
+            f"Layer module already has full-reconstruction SAE buffers for "
+            f"hook {hook_point.value!r} (owning module={existing!r}).  "
+            "By design at most one full-reconstruction SAE module may own "
+            "a (layer, hook) site — two residual replacements on one site "
+            "are semantically ill-defined; unregister the existing module "
+            "first.  (Delta modules, by contrast, may share a site.)"
+        )
+    n_rows = max_recon_configs + 1
+    module.register_buffer(
+        enc_w_attr,
+        torch.zeros(d_sae, hidden_size, dtype=dtype, device=device),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_FR_ENCODER_BIAS_ATTR[hook_point],
+        torch.zeros(d_sae, dtype=dtype, device=device),
+        persistent=False,
+    )
+    # Per-feature JumpReLU thresholds over the full d_sae axis.
+    # Always registered — zero-filled fp32 for ReLU/TopK sites — so
+    # the custom op keeps a fixed arity across activations.
+    module.register_buffer(
+        HOOK_POINT_FR_THRESHOLD_ATTR[hook_point],
+        torch.zeros(d_sae, dtype=torch.float32, device=device),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_FR_DECODER_WEIGHT_ATTR[hook_point],
+        torch.zeros(d_sae, hidden_size, dtype=dtype, device=device),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_FR_DECODER_BIAS_ATTR[hook_point],
+        torch.zeros(hidden_size, dtype=dtype, device=device),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point],
+        torch.zeros(n_rows, n_clamp, dtype=torch.int8, device=device),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_FR_CLAMP_VALUE_ATTR[hook_point],
+        torch.zeros(n_rows, n_clamp, dtype=torch.float32, device=device),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point],
+        torch.zeros(n_rows, n_clamp, dtype=torch.bool, device=device),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point],
+        torch.zeros(n_rows, dtype=torch.bool, device=device),
+        persistent=False,
+    )
+    module.register_buffer(
+        HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR[hook_point],
+        clampable_features.detach().to(dtype=torch.int64, device=device).clone(),
+        persistent=False,
+    )
+    setattr(module, HOOK_POINT_FR_MODULE_NAME_ATTR[hook_point], module_name)
+    setattr(module, HOOK_POINT_FR_ACTIVATION_ATTR[hook_point], activation)
+    setattr(
+        module,
+        HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR[hook_point],
+        dict(activation_params),
+    )
+
+
+def unregister_sae_full_recon_buffers(
+    module: nn.Module,
+    *,
+    hook_point: SteeringHookPoint,
+) -> None:
+    """Detach full-reconstruction SAE buffers from ``module`` for ``hook_point``.
+
+    Idempotent: no-op when buffers aren't attached.  Called when the
+    owning SAE module is unregistered from the worker.
+    """
+    for table in _FR_BUFFER_ATTR_TABLES:
+        attr = table[hook_point]
+        if hasattr(module, attr):
+            delattr(module, attr)
+    for pytable in _FR_PYATTR_TABLES:
+        attr = pytable[hook_point]
+        if hasattr(module, attr):
+            delattr(module, attr)
+
+
+def sae_full_recon_buffers_attached(
+    module: nn.Module, hook_point: SteeringHookPoint
+) -> bool:
+    """Constant-time check used by the layer-hook dispatch shim.
+
+    ``torch.compile`` traces ``hasattr`` as a static branch (decided
+    once at module instantiation), so the disabled path emits zero
+    full-reconstruction kernel code.
+    """
+    return hasattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
+
+
+def register_sae_recon_index_buffer(
+    module: nn.Module, max_tokens: int, device: torch.device | None = None
+) -> None:
+    """Attach the shared per-token ``sae_recon_index`` buffer to ``module``.
+
+    Mirrors the additive ``steering_index`` and the delta path's
+    ``sae_index``: a single ``(max_tokens,)`` int64 tensor, expected
+    to be shared across all SAE-full-reconstruction-covered layers
+    via :func:`share_sae_recon_index_across_layers`.  Row 0 is the
+    no-reconstruction sentinel; each site gates the shared row through
+    its own active-row table.
+    """
+    if max_tokens == 0:
+        return
+    if hasattr(module, "sae_recon_index"):
+        return
+    module.register_buffer(
+        "sae_recon_index",
+        torch.zeros(max_tokens, dtype=torch.long, device=device),
+        persistent=False,
+    )
+
+
+def share_sae_recon_index_across_layers(layers: list[nn.Module]) -> None:
+    """Reuse one ``sae_recon_index`` tensor across all covered layers."""
+    shared: torch.Tensor | None = None
+    for layer in layers:
+        if not hasattr(layer, "sae_recon_index"):
+            continue
+        if shared is None:
+            shared = layer.sae_recon_index  # type: ignore[union-attr]
+            continue
+        layer.sae_recon_index = shared  # type: ignore[union-attr]
+
+
+def sae_encode_full(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    activation: SAEActivation,
+    activation_params: Mapping[str, float],
+    threshold: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project ``hidden_states`` through the full SAE encoder.
+
+    Mirrors :func:`sae_steering.sae_encode` but operates on the full
+    ``d_sae`` encoder rather than a clampable-subset slice; the
+    reconstruction op needs every feature's activation to recompute
+    the residual.
+
+    Args:
+        hidden_states: ``(n_tokens, d_model)``, compute dtype.
+        encoder_weight: ``(d_sae, d_model)``.
+        encoder_bias: ``(d_sae,)``.
+        activation: encoder activation function.
+        activation_params: ``{"k": float}`` for TopK (cast to int
+            internally), ignored for ReLU and JumpReLU.
+        threshold: ``(d_sae,)`` per-feature JumpReLU thresholds.
+            Required for JumpReLU; ignored (and may be ``None``) for
+            other activations.
+
+    Returns:
+        ``(n_tokens, d_sae)`` activation tensor in fp32.  The full-
+        reconstruction caller modifies this in place at the
+        clampable-feature positions before the decoder pass.
+    """
+    h_fp32 = hidden_states.to(torch.float32)
+    enc_w_fp32 = encoder_weight.to(torch.float32)
+    enc_b_fp32 = encoder_bias.to(torch.float32)
+    pre_act = h_fp32 @ enc_w_fp32.t() + enc_b_fp32
+    if activation is SAEActivation.RELU:
+        return torch.clamp(pre_act, min=0.0)
+    if activation is SAEActivation.JUMPRELU:
+        if threshold is None:
+            raise ValueError(
+                "JumpReLU requires a per-feature threshold tensor; got None."
+            )
+        thr_fp32 = threshold.to(torch.float32)
+        return torch.where(pre_act > thr_fp32, pre_act, torch.zeros_like(pre_act))
+    if activation is SAEActivation.TOPK:
+        k = int(activation_params["k"])
+        d_sae = pre_act.shape[1]
+        if k >= d_sae:
+            return pre_act
+        mask = _topk_mask_lowest_indices(pre_act, k)
+        return torch.where(mask, pre_act, torch.zeros_like(pre_act))
+    raise ValueError(f"Unsupported SAE activation: {activation!r}")
+
+
+def _apply_sae_full_reconstruction_eager(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    decoder_bias: torch.Tensor,
+    clampable_features: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    recon_mask: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> torch.Tensor:
+    """Vectorized PyTorch eager body for the full-reconstruction op.
+
+    Same numerics as the eventual Triton kernel; this path is the
+    CPU fallback and the test ground truth.  Inputs are tensor-only
+    (the activation enum is encoded as ``activation_code`` /
+    ``activation_param`` for the registered torch op; JumpReLU's
+    per-feature thresholds ride the ``(d_sae,)`` ``threshold``
+    tensor, ignored otherwise).
+    """
+    n_tokens = hidden_states.shape[0]
+    n_clamp = clampable_features.shape[0]
+    if n_tokens == 0:
+        return hidden_states.clone()
+
+    activation = _CODE_TO_ACTIVATION[int(activation_code)]
+    activation_params = _scalar_to_activation_params(activation, activation_param)
+
+    f = sae_encode_full(
+        hidden_states,
+        encoder_weight,
+        encoder_bias,
+        activation,
+        activation_params,
+        threshold=threshold,
+    )
+
+    if n_clamp > 0:
+        idx_2d = clampable_features.unsqueeze(0).expand(n_tokens, -1)
+        f_subset = f.gather(1, idx_2d)
+
+        kind = clamp_kind.to(torch.int8)
+        value = clamp_value.to(torch.float32)
+        gated = clamp_only_if_active.to(torch.bool)
+        active = f_subset != 0.0 if activation is SAEActivation.TOPK else f_subset > 0.0
+
+        new_f_absolute = value
+        new_f_additive = f_subset + value
+        new_f = torch.where(
+            kind == CLAMP_KIND_ABSOLUTE,
+            new_f_absolute,
+            torch.where(kind == CLAMP_KIND_ADDITIVE, new_f_additive, f_subset),
+        )
+        apply_clamp = (kind != CLAMP_KIND_NONE) & (~gated | active)
+        new_f_subset = torch.where(apply_clamp, new_f, f_subset)
+
+        f = f.scatter(1, idx_2d, new_f_subset)
+
+    f_compute = f.to(hidden_states.dtype)
+    decoder_compute = decoder_weight.to(hidden_states.dtype)
+    decoder_bias_compute = decoder_bias.to(hidden_states.dtype)
+    reconstruction = f_compute @ decoder_compute + decoder_bias_compute
+    return torch.where(recon_mask.unsqueeze(1), reconstruction, hidden_states)
+
+
+def apply_sae_full_reconstruction_op(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    decoder_bias: torch.Tensor,
+    clampable_features: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    recon_mask: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> torch.Tensor:
+    """Tensor-only entry registered as ``torch.ops.vllm.apply_sae_full_reconstruction``.
+
+    On CUDA, will dispatch to the fused Triton kernel once Stage 4
+    lands; until then both CPU and CUDA route through
+    :func:`_apply_sae_full_reconstruction_eager`.  The output is
+    always a freshly allocated tensor with the same shape and dtype
+    as ``hidden_states``.
+
+    No shape validation is performed here — callers in this module
+    (:func:`apply_sae_full_reconstruction`,
+    :func:`apply_layer_sae_full_reconstruction`) validate before
+    calling.  The schema is intentionally primitive-typed so
+    :func:`torch.library.infer_schema` produces a valid signature
+    without bespoke type adapters, mirroring the delta path.
+    """
+    if hidden_states.is_cuda:
+        # Stage-4 CUDA path: compaction-based per-token short-circuit.
+        # See :mod:`sae_full_reconstruction_kernel` for the rationale.
+        from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
+            apply_sae_full_recon_triton,
+        )
+
+        return apply_sae_full_recon_triton(
+            hidden_states,
+            encoder_weight,
+            encoder_bias,
+            threshold,
+            decoder_weight,
+            decoder_bias,
+            clampable_features,
+            clamp_kind,
+            clamp_value,
+            clamp_only_if_active,
+            recon_mask,
+            int(activation_code),
+            float(activation_param),
+        )
+    return _apply_sae_full_reconstruction_eager(
+        hidden_states,
+        encoder_weight,
+        encoder_bias,
+        threshold,
+        decoder_weight,
+        decoder_bias,
+        clampable_features,
+        clamp_kind,
+        clamp_value,
+        clamp_only_if_active,
+        recon_mask,
+        int(activation_code),
+        float(activation_param),
+    )
+
+
+def apply_sae_full_reconstruction_op_fake(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    decoder_bias: torch.Tensor,
+    clampable_features: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    recon_mask: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> torch.Tensor:
+    """FX-tracing fake — correct shape, no computation."""
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="apply_sae_full_reconstruction",
+    op_func=apply_sae_full_reconstruction_op,
+    fake_impl=apply_sae_full_reconstruction_op_fake,
+    mutates_args=[],
+    extra_dispatch_keys=("CPU",),
+)
+
+
+def apply_sae_full_reconstruction(
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    decoder_bias: torch.Tensor,
+    activation: SAEActivation,
+    activation_params: Mapping[str, float],
+    clampable_features: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    recon_mask: torch.Tensor,
+    threshold: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Public Python API for the SAE full-reconstruction op.
+
+    Args:
+        hidden_states: ``(n_tokens, d_model)``, compute dtype.  Output
+            is the same shape and dtype.
+        encoder_weight: ``(d_sae, d_model)`` — *full* encoder rows.
+        encoder_bias: ``(d_sae,)``.
+        decoder_weight: ``(d_sae, d_model)`` — *full* decoder rows.
+        decoder_bias: ``(d_model,)``.
+        activation: encoder activation function.
+        activation_params: parameters for ``activation`` (see
+            :func:`sae_encode_full`).
+        clampable_features: ``(n_clamp,)`` int64 tensor of *global*
+            feature indices that may be clamped per-token.  Indexes
+            into the ``d_sae`` activation tensor; values must lie in
+            ``[0, d_sae)`` and be unique.
+        clamp_kind: ``(n_tokens, n_clamp)`` int8 — clamp kind per
+            (token, clampable-position).
+        clamp_value: ``(n_tokens, n_clamp)`` float — target / offset.
+        clamp_only_if_active: ``(n_tokens, n_clamp)`` bool — when
+            True, suppress the clamp where the live ``f`` for that
+            feature is ≤ 0.
+        recon_mask: ``(n_tokens,)`` bool — per-token gate.  Tokens
+            with ``recon_mask[t] == False`` pass through unchanged;
+            tokens with ``recon_mask[t] == True`` have their residual
+            replaced by ``decode(clamp(encode(h_t)))``.
+        threshold: ``(d_sae,)`` fp32 per-feature JumpReLU thresholds.
+            Required for JumpReLU; for ReLU/TopK a zero-filled vector
+            is synthesized when omitted (the op reads it only under
+            the JumpReLU branch).
+
+    Returns:
+        ``(n_tokens, d_model)`` tensor in the same dtype as
+        ``hidden_states``.
+
+    The compute path goes through :func:`apply_sae_full_reconstruction_op`
+    (the registered torch custom op).  Calling it directly here —
+    rather than via ``torch.ops.vllm.apply_sae_full_reconstruction``
+    — keeps CPU-only test environments insulated from the registered
+    dispatch key (which follows the platform: "CPU" on CPU-only,
+    "CUDA" on a CUDA build).  The op-func branches on
+    ``hidden_states.is_cuda`` to pick the right backend without
+    going through the dispatcher.
+    """
+    n_tokens, d_model = hidden_states.shape
+    d_sae = encoder_weight.shape[0]
+    n_clamp = clampable_features.shape[0]
+
+    if encoder_weight.shape != (d_sae, d_model):
+        raise ValueError(
+            "encoder_weight must be (d_sae, d_model); "
+            f"got {tuple(encoder_weight.shape)} vs d_model={d_model}."
+        )
+    if encoder_bias.shape != (d_sae,):
+        raise ValueError(
+            "encoder_bias must be (d_sae,); "
+            f"got {tuple(encoder_bias.shape)} vs d_sae={d_sae}."
+        )
+    if decoder_weight.shape != (d_sae, d_model):
+        raise ValueError(
+            "decoder_weight must be (d_sae, d_model) aligned with encoder; "
+            f"got {tuple(decoder_weight.shape)} vs (d_sae={d_sae}, "
+            f"d_model={d_model})."
+        )
+    if decoder_bias.shape != (d_model,):
+        raise ValueError(
+            "decoder_bias must be (d_model,); "
+            f"got {tuple(decoder_bias.shape)} vs d_model={d_model}."
+        )
+    if clampable_features.dtype != torch.int64:
+        raise ValueError(
+            f"clampable_features must be int64; got dtype={clampable_features.dtype}."
+        )
+    if clampable_features.ndim != 1:
+        raise ValueError(
+            "clampable_features must be 1-D; "
+            f"got shape={tuple(clampable_features.shape)}."
+        )
+    if recon_mask.shape != (n_tokens,):
+        raise ValueError(
+            "recon_mask must be (n_tokens,); "
+            f"got {tuple(recon_mask.shape)} vs n_tokens={n_tokens}."
+        )
+    if recon_mask.dtype != torch.bool:
+        raise ValueError(
+            f"recon_mask must be torch.bool; got dtype={recon_mask.dtype}."
+        )
+    expected_clamp_shape = (n_tokens, n_clamp)
+    for name, t in (
+        ("clamp_kind", clamp_kind),
+        ("clamp_value", clamp_value),
+        ("clamp_only_if_active", clamp_only_if_active),
+    ):
+        if tuple(t.shape) != expected_clamp_shape:
+            raise ValueError(
+                f"{name} must be {expected_clamp_shape}; got {tuple(t.shape)}."
+            )
+    if clamp_kind.dtype != torch.int8:
+        raise ValueError(f"clamp_kind must be torch.int8; got {clamp_kind.dtype}.")
+    _validate_clamp_kind_values(clamp_kind)
+    if not clamp_value.dtype.is_floating_point:
+        raise ValueError(
+            f"clamp_value must be a floating dtype; got {clamp_value.dtype}."
+        )
+    if clamp_only_if_active.dtype != torch.bool:
+        raise ValueError(
+            "clamp_only_if_active must be torch.bool; "
+            f"got {clamp_only_if_active.dtype}."
+        )
+    if activation is SAEActivation.JUMPRELU and threshold is None:
+        raise ValueError("JumpReLU requires a per-feature threshold tensor; got None.")
+    if threshold is not None:
+        if tuple(threshold.shape) != (d_sae,):
+            raise ValueError(
+                f"threshold must be (d_sae,) = ({d_sae},); "
+                f"got {tuple(threshold.shape)}."
+            )
+        if threshold.dtype != torch.float32:
+            raise ValueError(f"threshold must be torch.float32; got {threshold.dtype}.")
+
+    if n_clamp > 0 and not clampable_features.is_cuda:
+        min_feature = int(clampable_features.min().item())
+        max_feature = int(clampable_features.max().item())
+        if min_feature < 0 or max_feature >= d_sae:
+            raise ValueError(
+                f"clampable_features must lie in [0, d_sae={d_sae}); "
+                f"got min={min_feature}, max={max_feature}."
+            )
+        if torch.unique(clampable_features).numel() != n_clamp:
+            raise ValueError("clampable_features must not contain duplicates.")
+
+    # Empty token batch short-circuit.
+    if n_tokens == 0:
+        return hidden_states.clone()
+    # No token opted into full reconstruction: preserve value
+    # semantics without paying the full encoder/decoder cost that
+    # would just be discarded by the final ``where``.  CPU-only
+    # check; on CUDA, ``.item()`` would synchronize the stream and
+    # regress the common active-mask path — the CUDA kernel does its
+    # own per-token short-circuit via the compaction path.
+    if not recon_mask.is_cuda and not bool(torch.any(recon_mask).item()):
+        return hidden_states.clone()
+
+    if threshold is None:
+        # ReLU/TopK: keep the op arity fixed with a zero-filled vector
+        # that the op only reads under the JumpReLU branch.
+        threshold = torch.zeros(d_sae, dtype=torch.float32, device=hidden_states.device)
+
+    code = _ACTIVATION_TO_CODE[activation]
+    param = _activation_to_scalar(activation, activation_params)
+    return apply_sae_full_reconstruction_op(
+        hidden_states,
+        encoder_weight,
+        encoder_bias,
+        threshold,
+        decoder_weight,
+        decoder_bias,
+        clampable_features,
+        clamp_kind,
+        clamp_value,
+        clamp_only_if_active,
+        recon_mask,
+        code,
+        param,
+    )
+
+
+def apply_layer_sae_full_reconstruction(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    hook_point: SteeringHookPoint,
+) -> torch.Tensor:
+    """Layer-hook dispatch: pull buffer state, hand it to the registered op.
+
+    When the layer has no full-reconstruction SAE buffers attached
+    for ``hook_point`` (engine started with full-reconstruction
+    disabled or this site isn't covered by any registered module),
+    this short-circuits and returns ``hidden_states`` unchanged.
+    The ``hasattr`` check is decided once at module instantiation
+    and stays constant for the rest of the layer's lifetime, so
+    ``torch.compile`` traces it as a static branch — the disabled
+    path emits no kernel at all, mirroring
+    :func:`apply_layer_steering` and :func:`apply_layer_sae_delta`.
+
+    The shim performs a per-token gather from the row tables (keyed
+    by the shared ``sae_recon_index`` buffer), derives
+    ``recon_mask`` from this site's active-row table so row 0 and
+    rows owned by other modules are no-op sentinels, and dispatches to
+    ``torch.ops.vllm.apply_sae_full_reconstruction``.  The torch-op
+    indirection is what makes :mod:`torch.compile` treat the call as
+    an opaque splitting point.
+    """
+    if not sae_full_recon_buffers_attached(module, hook_point):
+        return hidden_states
+    n_tokens = hidden_states.shape[0]
+    if n_tokens == 0:
+        return hidden_states
+    recon_index_full: torch.Tensor = module.sae_recon_index  # type: ignore[assignment]
+    recon_index = recon_index_full[:n_tokens]
+    active_table = getattr(module, HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point])
+    recon_mask = active_table[recon_index]
+
+    enc_w = getattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
+    enc_b = getattr(module, HOOK_POINT_FR_ENCODER_BIAS_ATTR[hook_point])
+    threshold = getattr(module, HOOK_POINT_FR_THRESHOLD_ATTR[hook_point])
+    dec_w = getattr(module, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[hook_point])
+    dec_b = getattr(module, HOOK_POINT_FR_DECODER_BIAS_ATTR[hook_point])
+    kind_table = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
+    value_table = getattr(module, HOOK_POINT_FR_CLAMP_VALUE_ATTR[hook_point])
+    only_table = getattr(module, HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
+    clampable_features = getattr(
+        module, HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR[hook_point]
+    )
+    activation: SAEActivation = getattr(
+        module, HOOK_POINT_FR_ACTIVATION_ATTR[hook_point]
+    )
+    activation_params: dict[str, float] = getattr(
+        module, HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR[hook_point]
+    )
+
+    # Per-token gather: (n_rows, n_clamp) → (n_tokens, n_clamp).
+    clamp_kind = kind_table[recon_index]
+    clamp_value = value_table[recon_index]
+    clamp_only_if_active = only_table[recon_index]
+
+    code = _ACTIVATION_TO_CODE[activation]
+    param = _activation_to_scalar(activation, activation_params)
+    return torch.ops.vllm.apply_sae_full_reconstruction(
+        hidden_states,
+        enc_w,
+        enc_b,
+        threshold,
+        dec_w,
+        dec_b,
+        clampable_features,
+        clamp_kind,
+        clamp_value,
+        clamp_only_if_active,
+        recon_mask,
+        code,
+        param,
+    )
+
+
+def populate_sae_full_recon_clamp_table(
+    *,
+    manager: SAEFullReconstructionManager,  # noqa: F821 — forward ref
+    module: nn.Module,
+    hook_point: SteeringHookPoint,
+    module_name: str,
+    clampable_features: tuple[int, ...],
+    layer_idx: int | None = None,
+    worker_phase: str | None = None,
+) -> None:
+    """Project active manager rows into per-(layer, hook) clamp tables.
+
+    Mirrors :func:`vllm.model_executor.layers.sae_steering.populate_sae_clamp_table`
+    for the full-reconstruction path.  Walks every active row in the
+    :class:`SAEFullReconstructionManager` and writes its clamp content
+    into the corresponding row of ``module``'s clamp tables for this
+    ``hook_point``, gated by:
+
+    * **Module match** — only specs whose ``module_name`` equals this
+      site's owning module are written.
+    * **Phase match** — each row's ``row_phase`` (the worker phase the
+      row was admitted under) gates spec content; ``spec.phase ==
+      "both" or spec.phase == row_phase``.  The optional
+      ``worker_phase`` filter is provided for tests.
+    * **Layer/hook match** — when ``layer_idx`` is given, only entries
+      under ``spec.clamps[hook_point.value][layer_idx]`` are projected.
+
+    Row 0 (the no-reconstruction sentinel) is always re-zeroed so
+    accidental routing to it is a true passthrough.
+
+    Specs with empty ``clamps`` (pure reconstruction) are recorded by
+    *zeroing* the row at this site and marking the active-row table.
+    The clamp tables only carry feature-activation modifications.
+
+    Args:
+        manager: the :class:`SAEFullReconstructionManager` holding active rows.
+        module: the layer module with full-reconstruction buffers attached.
+        hook_point: which hook this site sits at.
+        module_name: name of the SAE module that owns this site;
+            specs from other modules are skipped.
+        clampable_features: ordered tuple of feature indices that
+            define the ``feature_idx → row position`` mapping for this
+            module.  A spec entry referencing a feature outside this
+            tuple raises :class:`ValueError`.
+        layer_idx: layer index this site sits at; when ``None`` (e.g.
+            for tests that don't care about layer specificity), the
+            populator scans all layers in the spec under ``hook_point``.
+        worker_phase: optional phase filter — when set, only rows with
+            matching ``row_phase`` are touched.
+    """
+    if not sae_full_recon_buffers_attached(module, hook_point):
+        return
+    if worker_phase is not None and worker_phase not in ("prefill", "decode"):
+        raise ValueError(
+            f"worker_phase must be 'prefill' or 'decode' or None; got {worker_phase!r}."
+        )
+    kind_table = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
+    value_table = getattr(module, HOOK_POINT_FR_CLAMP_VALUE_ATTR[hook_point])
+    only_table = getattr(module, HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
+    active_table = getattr(module, HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point])
+    n_clamp = kind_table.shape[1]
+    if len(clampable_features) != n_clamp:
+        raise ValueError(
+            "clampable_features length must equal n_clamp; got "
+            f"{len(clampable_features)} vs {n_clamp}."
+        )
+    feature_to_pos: dict[int, int] = {f: i for i, f in enumerate(clampable_features)}
+    # Row 0: no-reconstruction sentinel.  Always all-zero; defensively
+    # re-zeroed in case a previous populate left stale state.
+    kind_table[0].zero_()
+    value_table[0].zero_()
+    only_table[0].zero_()
+    active_table[0].zero_()
+    hook_name = hook_point.value
+    for row, _config_hash, row_phase, specs in manager.active_rows():
+        if worker_phase is not None and row_phase != worker_phase:
+            continue
+        kind_table[row].zero_()
+        value_table[row].zero_()
+        only_table[row].zero_()
+        active_table[row].zero_()
+        for spec in specs:
+            if spec.module_name != module_name:
+                continue
+            if spec.phase != "both" and spec.phase != row_phase:
+                continue
+            active_table[row].fill_(True)
+            layer_map = spec.clamps.get(hook_name)
+            if layer_map is None:
+                # Empty clamps for this hook — row stays zeroed; the
+                # reconstruction still triggers because this site's
+                # active table marks the row as enabled.
+                continue
+            layer_entries: list = []
+            if layer_idx is None:
+                for entries in layer_map.values():
+                    layer_entries.extend(entries)
+            else:
+                layer_entries = list(layer_map.get(layer_idx, ()))
+            for entry in layer_entries:
+                pos = feature_to_pos.get(entry.feature_idx)
+                if pos is None:
+                    raise ValueError(
+                        f"SAEFullReconstructionSpec entry feature_idx="
+                        f"{entry.feature_idx} for module {module_name!r} "
+                        f"is not in clampable_features "
+                        f"{list(clampable_features)} for site "
+                        f"(layer={layer_idx}, hook={hook_name})."
+                    )
+                kind_table[row, pos] = (
+                    CLAMP_KIND_ABSOLUTE
+                    if entry.kind == "absolute"
+                    else CLAMP_KIND_ADDITIVE
+                )
+                value_table[row, pos] = float(entry.value)
+                only_table[row, pos] = bool(entry.only_if_active)
+
+
+# Forward reference resolved at call time to avoid an import cycle:
+# ``sae_full_reconstruction_manager`` lives in the worker hierarchy and
+# imports this module's spec types only transitively.
+from vllm.v1.worker.sae_full_reconstruction_manager import (  # noqa: E402
+    SAEFullReconstructionManager,
+)
+
+# ``ACTIVATION_CODE_RELU`` re-exported so callers (tests, future
+# kernel module) have a single import surface for the activation
+# encoding without touching :mod:`sae_steering` directly.
+__all__ = [
+    "ACTIVATION_CODE_RELU",
+    "CLAMP_KIND_ABSOLUTE",
+    "CLAMP_KIND_ADDITIVE",
+    "CLAMP_KIND_NONE",
+    "HOOK_POINT_FR_ACTIVATION_ATTR",
+    "HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR",
+    "HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR",
+    "HOOK_POINT_FR_CLAMP_KIND_ATTR",
+    "HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR",
+    "HOOK_POINT_FR_CLAMP_VALUE_ATTR",
+    "HOOK_POINT_FR_DECODER_BIAS_ATTR",
+    "HOOK_POINT_FR_DECODER_WEIGHT_ATTR",
+    "HOOK_POINT_FR_ENCODER_BIAS_ATTR",
+    "HOOK_POINT_FR_ENCODER_WEIGHT_ATTR",
+    "HOOK_POINT_FR_MODULE_NAME_ATTR",
+    "HOOK_POINT_FR_ROW_ACTIVE_ATTR",
+    "HOOK_POINT_FR_THRESHOLD_ATTR",
+    "SAEFullReconstructionManager",
+    "apply_layer_sae_full_reconstruction",
+    "apply_sae_full_reconstruction",
+    "apply_sae_full_reconstruction_op",
+    "apply_sae_full_reconstruction_op_fake",
+    "populate_sae_full_recon_clamp_table",
+    "register_sae_full_recon_buffers",
+    "register_sae_recon_index_buffer",
+    "sae_encode_full",
+    "sae_full_recon_buffers_attached",
+    "share_sae_recon_index_across_layers",
+    "unregister_sae_full_recon_buffers",
+]

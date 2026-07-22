@@ -571,6 +571,20 @@ VLM_TEST_SETTINGS = {
             "default_mm_loras": {"image": "ibm-granite/granite-vision-4.1-4b"},
         },
     ),
+    "granite4_vision": VLMTestInfo(
+        models=["ibm-granite/granite-vision-4.1-4b"],
+        test_type=(VLMTestType.IMAGE),
+        prompt_formatter=lambda img_prompt: f"<|user|>\n{img_prompt}\n<|assistant|>\n",
+        max_model_len=8192,
+        auto_cls=AutoModelForImageTextToText,
+        vllm_output_post_proc=_granite4_vision_vllm_to_hf_output,
+        image_size_factors=[(1.0,)],
+        vllm_runner_kwargs={
+            "enable_lora": True,
+            "max_lora_rank": 256,
+            "default_mm_loras": {"image": "ibm-granite/granite-vision-4.1-4b"},
+        },
+    ),
     "h2ovl": VLMTestInfo(
         models=[
             "h2oai/h2ovl-mississippi-800m",

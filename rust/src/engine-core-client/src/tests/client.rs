@@ -29,6 +29,7 @@ use crate::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
     EngineCoreRequestType, EngineCoreSamplingParams, decode_engine_core_outputs,
 };
+use crate::protocol::{SaeClampKind, SaePhase};
 use crate::test_utils::{
     IpcNamespace, setup_bootstrapped_mock_engine, setup_mock_engine_sockets,
     setup_mock_engine_with_init, spawn_mock_engine_task,
@@ -422,7 +423,6 @@ fn is_engine_core_dead(error: &Error) -> bool {
     }
 }
 
-
 fn is_unexpected_dispatcher_output(error: &Error) -> bool {
     match error {
         Error::UnexpectedDispatcherOutput { .. } => true,
@@ -465,10 +465,10 @@ fn multipart_logprob_output_frames(request_id: &str) -> Vec<bytes::Bytes> {
             Value::Nil,
             Value::from(EngineCoreFinishReason::Length as u8),
         ])]),
-        Value::Nil,             // scheduler_stats
-        Value::from(0.0),       // timestamp
-        Value::Nil,             // utility_output
-        Value::Map(vec![]),     // late_capture_results (empty map, real wire)
+        Value::Nil,                                  // scheduler_stats
+        Value::from(0.0),                            // timestamp
+        Value::Nil,                                  // utility_output
+        Value::Map(vec![]),                          // late_capture_results (empty map, real wire)
         Value::Array(vec![Value::from(request_id)]), // finished_requests
     ]);
 
@@ -2508,6 +2508,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     let multipart_prompt_frames =
         lines.next().expect("missing multipart prompt logprobs fixture line");
     let ready_response_hex = lines.next().expect("missing ready response fixture line");
+    let sae_request_hex = lines.next().expect("missing SAE request fixture line");
 
     let request_bytes = hex::decode(request_hex).unwrap();
     let multimodal_request_bytes = hex::decode(multimodal_request_hex).unwrap();
@@ -2557,6 +2558,8 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             capture: None,
             patch: None,
             patch_vectors: None,
+            sae_clamp_specs: None,
+            sae_full_reconstruction_specs: None,
         },
     );
 
@@ -2672,6 +2675,37 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             other => panic!("ready response should encode as a map, got {other:?}"),
         }
     };
+    // SAE-bearing request: the Python-encoded spec dataclasses must decode
+    // into the typed Rust mirrors with integer layer keys intact (the
+    // Rust->Python direction is pinned by the hex fixture in protocol/mod.rs).
+    let sae_request_bytes = hex::decode(sae_request_hex).unwrap();
+    let decoded_sae: EngineCoreRequest = rmp_serde::from_slice(&sae_request_bytes).unwrap();
+    assert_eq!(decoded_sae.request_id, "req-sae");
+    let sae_sampling = decoded_sae
+        .sampling_params
+        .clone()
+        .expect("SAE request carries sampling params");
+    let clamp_specs = sae_sampling.sae_clamp_specs.expect("sae_clamp_specs present");
+    assert_eq!(clamp_specs.len(), 1);
+    let spec = &clamp_specs[0];
+    assert_eq!(spec.module_name, "sae_mod");
+    assert_eq!(spec.phase, SaePhase::Decode);
+    let layer_map = &spec.clamps["post_block"];
+    let entries = &layer_map[&20u32];
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].feature_idx, 34);
+    assert_eq!(entries[0].kind, SaeClampKind::Absolute);
+    assert_eq!(entries[0].value, 5.0);
+    assert!(!entries[0].only_if_active);
+    assert!(entries[1].only_if_active);
+    let fr_specs = sae_sampling.sae_full_reconstruction_specs.expect("FR specs present");
+    assert_eq!(fr_specs[0].module_name, "fr_mod");
+    assert!(fr_specs[0].clamps.is_empty());
+    // Round-trip: Rust re-encodes to the same typed shape.
+    let reencoded = crate::protocol::encode_msgpack(&decoded_sae).unwrap();
+    let redecoded: EngineCoreRequest = rmp_serde::from_slice(&reencoded).unwrap();
+    assert_eq!(redecoded, decoded_sae);
+
     let python_ready_keys = map_keys(&hex::decode(ready_response_hex).unwrap());
     let rust_ready_keys =
         map_keys(&rmp_serde::to_vec_named(&crate::mock_engine::default_ready_response()).unwrap());

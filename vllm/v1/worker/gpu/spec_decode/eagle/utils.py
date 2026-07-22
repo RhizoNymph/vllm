@@ -95,4 +95,19 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 if hasattr(module, "topk_indices_buffer"):
                     module.topk_indices_buffer = target_buffer
 
+        # MTP models call compute_logits via shared_head.head (a
+        # ParallelLMHead inside each MTP layer), not self.model.lm_head.
+        # If the checkpoint omits a copy of the lm_head weights at the
+        # MTP layer path, shared_head.head stays uninitialised and
+        # produces zero/NaN logits. Share it explicitly from the target.
+        inner = getattr(eagle_model, "model", None)
+        layers = getattr(inner, "layers", None) if inner is not None else None
+        if layers is not None:
+            items = layers.values() if isinstance(layers, nn.ModuleDict) else layers
+            for layer in items:
+                sh = getattr(layer, "shared_head", None)
+                if sh is not None and hasattr(sh, "head"):
+                    del sh.head
+                    sh.head = target_model.lm_head
+
     return eagle_model

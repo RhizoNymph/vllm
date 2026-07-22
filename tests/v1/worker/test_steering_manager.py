@@ -79,6 +79,40 @@ class TestRegisterRelease:
         row = mgr.register_config(config_hash=42, vectors=vectors, phase="prefill")
         assert row >= 3
 
+    def test_different_hashes_same_vectors_alias_row(self):
+        """Logical hashes may differ due to SAE state, but additive table
+        rows are keyed by additive vector content."""
+        mgr = _make_manager(max_configs=1)
+        vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        row_a = mgr.register_config(config_hash=100, vectors=vectors, phase="prefill")
+        row_b = mgr.register_config(config_hash=200, vectors=vectors, phase="prefill")
+
+        assert row_a == row_b
+        assert mgr.config_to_row[(100, "prefill")] == row_a
+        assert mgr.config_to_row[(200, "prefill")] == row_a
+        assert mgr.num_active_configs == 2
+
+    def test_explicit_content_hash_controls_row_aliasing(self):
+        """Scheduler and worker must agree on physical additive row keys."""
+        mgr = _make_manager(max_configs=2)
+        vectors = {_HP: {0: [1.0] * HIDDEN_SIZE}}
+        row_a = mgr.register_config(
+            config_hash=100,
+            vectors=vectors,
+            phase="prefill",
+            content_hash=10,
+        )
+        row_b = mgr.register_config(
+            config_hash=200,
+            vectors=vectors,
+            phase="prefill",
+            content_hash=20,
+        )
+
+        assert row_a != row_b
+        assert mgr.config_to_row[(100, "prefill")] == row_a
+        assert mgr.config_to_row[(200, "prefill")] == row_b
+
     def test_duplicate_hash_returns_same_row(self):
         """Re-registering the same hash bumps the refcount, same row."""
         mgr = _make_manager()

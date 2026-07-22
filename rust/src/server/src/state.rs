@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -12,6 +12,7 @@ use vllm_engine_core_client::EngineCoreClient;
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 
 use crate::config::{ApiServerOptions, CorsConfig};
+use crate::steering_modules::SteeringModuleKind;
 use crate::lora::{LoadLoraError, LoraManager, LoraModelResolution, UnloadLoraError};
 use crate::server_info::{ServerInfoConfigFormat, ServerInfoSnapshot};
 
@@ -42,10 +43,12 @@ pub struct AppState {
     /// endpoints (module register/unregister). Empty means unauthenticated,
     /// mirroring the Python frontend's `--steering-api-key` behavior.
     steering_api_key_hashes: Vec<ApiKeyHash>,
-    /// Names of steering modules currently registered with the engine workers.
-    /// Seeded at startup and mutated by the runtime steering endpoints; requests
-    /// referencing an unknown `steering_name` are rejected up front.
-    steering_module_names: RwLock<HashSet<String>>,
+    /// Steering modules currently registered with the engine workers,
+    /// keyed by name with their kind discriminator. Seeded at startup and
+    /// mutated by the runtime steering endpoints; requests referencing an
+    /// unknown `steering_name` or an SAE module of the wrong kind are
+    /// rejected up front.
+    steering_module_names: RwLock<HashMap<String, SteeringModuleKind>>,
     /// Serializes runtime steering-registry mutations so concurrent
     /// register/unregister requests cannot interleave their broadcasts.
     steering_mutation_lock: Mutex<()>,
@@ -111,7 +114,7 @@ impl AppState {
             server_info: None,
             api_key_hashes: Vec::new(),
             steering_api_key_hashes: Vec::new(),
-            steering_module_names: RwLock::new(HashSet::new()),
+            steering_module_names: RwLock::new(HashMap::new()),
             steering_mutation_lock: Mutex::new(()),
             server_load: AtomicU64::new(0),
             lora_manager: LoraManager::new(),
@@ -198,8 +201,11 @@ impl AppState {
         &self.steering_api_key_hashes
     }
 
-    /// Seed the set of steering modules registered with the engine workers.
-    pub fn with_steering_module_names(mut self, names: HashSet<String>) -> Self {
+    /// Seed the steering modules registered with the engine workers.
+    pub fn with_steering_module_names(
+        mut self,
+        names: HashMap<String, SteeringModuleKind>,
+    ) -> Self {
         self.steering_module_names = RwLock::new(names);
         self
     }
@@ -212,43 +218,118 @@ impl AppState {
     pub fn steering_module_error(&self, steering_name: Option<&str>) -> Option<String> {
         let name = steering_name?;
         let registered = self.steering_module_names.read().expect("registry lock");
-        if registered.contains(name) {
-            return None;
+        match registered.get(name) {
+            Some(SteeringModuleKind::Additive) => None,
+            Some(kind) => Some(format!(
+                "Steering module '{name}' has kind '{}'; `steering_name` only \
+                 accepts additive modules",
+                kind.as_str()
+            )),
+            None => {
+                let mut available: Vec<&str> =
+                    registered.keys().map(String::as_str).collect();
+                available.sort_unstable();
+                Some(format!(
+                    "Unknown steering module '{name}'. Available: [{}]",
+                    available.join(", ")
+                ))
+            }
         }
-        let mut available: Vec<&str> = registered.iter().map(String::as_str).collect();
-        available.sort_unstable();
-        Some(format!(
-            "Unknown steering module '{name}'. Available: [{}]",
-            available.join(", ")
-        ))
+    }
+
+    /// Validate the module references in a request's SAE spec fields.
+    ///
+    /// Each referenced name must be registered with the matching SAE kind;
+    /// returns `(offending_field, message)` for the first violation. Deeper
+    /// checks (sites, feature ids) stay on the engine's admission validator.
+    pub fn sae_module_kind_error<'a>(
+        &self,
+        clamp_module_names: impl Iterator<Item = &'a str>,
+        full_recon_module_names: impl Iterator<Item = &'a str>,
+    ) -> Option<(&'static str, String)> {
+        let registered = self.steering_module_names.read().expect("registry lock");
+        let check = |names: &mut dyn Iterator<Item = &'a str>,
+                         want: SteeringModuleKind,
+                         field_name: &'static str|
+         -> Option<(&'static str, String)> {
+            for name in names {
+                match registered.get(name) {
+                    Some(kind) if *kind == want => {}
+                    Some(kind) => {
+                        return Some((
+                            field_name,
+                            format!(
+                                "`{field_name}` references module '{name}' of kind \
+                                 '{}'; expected kind '{}'",
+                                kind.as_str(),
+                                want.as_str()
+                            ),
+                        ));
+                    }
+                    None => {
+                        let mut available: Vec<&str> = registered
+                            .iter()
+                            .filter(|(_, kind)| **kind == want)
+                            .map(|(name, _)| name.as_str())
+                            .collect();
+                        available.sort_unstable();
+                        return Some((
+                            field_name,
+                            format!(
+                                "`{field_name}` references unknown module '{name}'. \
+                                 Available '{}' modules: [{}]",
+                                want.as_str(),
+                                available.join(", ")
+                            ),
+                        ));
+                    }
+                }
+            }
+            None
+        };
+        check(
+            &mut { clamp_module_names },
+            SteeringModuleKind::SaeDelta,
+            "sae_clamp_specs",
+        )
+        .or_else(|| {
+            check(
+                &mut { full_recon_module_names },
+                SteeringModuleKind::SaeFullReconstruction,
+                "sae_full_reconstruction_specs",
+            )
+        })
     }
 
     /// Return the sorted names of currently registered steering modules.
     pub fn list_steering_modules(&self) -> Vec<String> {
         let registered = self.steering_module_names.read().expect("registry lock");
-        let mut names: Vec<String> = registered.iter().cloned().collect();
+        let mut names: Vec<String> = registered.keys().cloned().collect();
         names.sort_unstable();
         names
     }
 
     /// Whether a steering module is currently registered.
     pub fn is_steering_module_registered(&self, name: &str) -> bool {
-        self.steering_module_names.read().expect("registry lock").contains(name)
+        self.steering_module_names.read().expect("registry lock").contains_key(name)
     }
 
-    /// Replace the entire registered-name set (after a `replace=true` register).
-    pub fn set_steering_module_names(&self, names: HashSet<String>) {
+    /// Replace the entire registered set (after a `replace=true` register).
+    pub fn set_steering_module_names(&self, names: HashMap<String, SteeringModuleKind>) {
         *self.steering_module_names.write().expect("registry lock") = names;
     }
 
-    /// Add names to the registered set (after a `replace=false` register).
-    pub fn extend_steering_module_names(&self, names: impl IntoIterator<Item = String>) {
+    /// Add modules to the registered set (after a `replace=false` register).
+    pub fn extend_steering_module_names(
+        &self,
+        names: impl IntoIterator<Item = (String, SteeringModuleKind)>,
+    ) {
         self.steering_module_names.write().expect("registry lock").extend(names);
     }
 
     /// Remove one name from the registered set, returning whether it was present.
     pub fn remove_steering_module_name(&self, name: &str) -> bool {
-        self.steering_module_names.write().expect("registry lock").remove(name)
+        self.steering_module_names.write().expect("registry lock").remove(name).is_some()
     }
 
     /// Acquire the registry-mutation lock, serializing runtime register and

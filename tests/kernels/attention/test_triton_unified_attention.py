@@ -13,6 +13,8 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 
 DEVICE_TYPE = current_platform.device_type
 
+DEVICE_TYPE = current_platform.device_type
+
 NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16]
