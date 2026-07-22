@@ -21,8 +21,10 @@ import torch
 from vllm.config.sae_steering_types import (
     SAEActivation,
     SAEClampSpec,
+    SAEFullReconstructionSpec,
     SteeringModuleKind,
     coerce_sae_clamp_specs,
+    coerce_sae_full_reconstruction_specs,
 )
 from vllm.config.steering_types import (
     SteeringVectorSpec,
@@ -343,6 +345,75 @@ class SteeringModuleRegistry:
                             )
         return None
 
+    def validate_sae_full_reconstruction_specs(
+        self, specs: list[Any] | tuple[Any, ...] | None
+    ) -> str | None:
+        """Validate ``sae_full_reconstruction_specs`` against the registry.
+
+        Full-reconstruction sibling of :meth:`validate_sae_clamp_specs`:
+        the referenced module must exist, be kind
+        ``sae_full_reconstruction`` and carry a manifest; any clamp
+        entries (optional for FR — an empty ``clamps`` is a pure
+        reconstruction) must target manifest-covered sites and
+        clampable features.  Returns an English error message or
+        ``None``.
+        """
+        if not specs:
+            return None
+        try:
+            coerced_specs = coerce_sae_full_reconstruction_specs(specs)
+        except ValueError as exc:
+            return str(exc)
+        if not coerced_specs:
+            return None
+        for i, spec in enumerate(coerced_specs):
+            assert isinstance(spec, SAEFullReconstructionSpec)
+            module_name = spec.module_name
+            module = self._modules.get(module_name)
+            if module is None:
+                return (
+                    f"sae_full_reconstruction_specs[{i}] references unknown "
+                    f"module {module_name!r}.  Available: "
+                    f"{self.list_modules() or 'none'}"
+                )
+            if module.kind is not SteeringModuleKind.SAE_FULL_RECONSTRUCTION:
+                return (
+                    f"sae_full_reconstruction_specs[{i}] references module "
+                    f"{module_name!r} of kind {module.kind.value!r}; only "
+                    "kind='sae_full_reconstruction' modules can be "
+                    "referenced from sae_full_reconstruction_specs.  Use "
+                    "'sae_clamp_specs' for sae_delta modules."
+                )
+            manifest = module.sae_manifest
+            if manifest is None:
+                return (
+                    f"sae_full_reconstruction_specs[{i}] references SAE "
+                    f"module {module_name!r}, but the registry entry has no "
+                    "sae_manifest."
+                )
+            covered = set(manifest.layers)
+            clampable = set(manifest.clampable_features)
+            for hook_name, layer_map in spec.clamps.items():
+                for layer_idx, entries in layer_map.items():
+                    if (layer_idx, hook_name) not in covered:
+                        return (
+                            f"sae_full_reconstruction_specs[{i}] for module "
+                            f"{module_name!r} targets site "
+                            f"(layer={layer_idx}, hook={hook_name!r}) which "
+                            "is not declared in the module's "
+                            "sae_manifest.layers."
+                        )
+                    for entry in entries:
+                        if entry.feature_idx not in clampable:
+                            return (
+                                f"sae_full_reconstruction_specs[{i}] for "
+                                f"module {module_name!r} clamps "
+                                f"feature_idx={entry.feature_idx}, which is "
+                                "not in the module's sae_manifest."
+                                "clampable_features."
+                            )
+        return None
+
     def validate_additive_lookup(self, name: str) -> str | None:
         """Validate ``name`` for use as the OpenAI ``steering_name`` field.
 
@@ -426,6 +497,7 @@ class SteeringModuleRegistry:
             not has_inline_overrides
             and scale == 1.0
             and not sampling_params.sae_clamp_specs
+            and not sampling_params.sae_full_reconstruction_specs
         ):
             sampling_params.__dict__["prefill_additive_steering_config_hash"] = (
                 module.prefill_additive_hash
@@ -445,31 +517,33 @@ class SteeringModuleRegistry:
             prefill = _resolve_phase("prefill")
             decode = _resolve_phase("decode")
         except ValueError as exc:
-            return (
-                f"Invalid steering composition for module '{steering_name}': {exc}"
-            )
+            return f"Invalid steering composition for module '{steering_name}': {exc}"
 
         prefill_additive_hash = hash_steering_config(prefill)
         decode_additive_hash = hash_steering_config(decode)
         _ = sampling_params.prefill_sae_clamp_config_hash
         _ = sampling_params.decode_sae_clamp_config_hash
+        _ = sampling_params.prefill_sae_full_recon_config_hash
+        _ = sampling_params.decode_sae_full_recon_config_hash
         sampling_params.__dict__["prefill_additive_steering_config_hash"] = (
             prefill_additive_hash
         )
         sampling_params.__dict__["decode_additive_steering_config_hash"] = (
             decode_additive_hash
         )
-        sampling_params.__dict__["prefill_steering_config_hash"] = (
-            hash_steering_config(
-                prefill,
-                sae_clamp_specs=sampling_params._phase_filtered_sae_specs("prefill"),
-            )
+        sampling_params.__dict__["prefill_steering_config_hash"] = hash_steering_config(
+            prefill,
+            sae_clamp_specs=sampling_params._phase_filtered_sae_specs("prefill"),
+            sae_full_reconstruction_specs=(
+                sampling_params._phase_filtered_sae_full_recon_specs("prefill")
+            ),
         )
-        sampling_params.__dict__["decode_steering_config_hash"] = (
-            hash_steering_config(
-                decode,
-                sae_clamp_specs=sampling_params._phase_filtered_sae_specs("decode"),
-            )
+        sampling_params.__dict__["decode_steering_config_hash"] = hash_steering_config(
+            decode,
+            sae_clamp_specs=sampling_params._phase_filtered_sae_specs("decode"),
+            sae_full_reconstruction_specs=(
+                sampling_params._phase_filtered_sae_full_recon_specs("decode")
+            ),
         )
         return None
 
@@ -524,14 +598,17 @@ class SteeringModuleRegistry:
                             "manifest has no 'weights_uri' to load weights from."
                         )
                     from vllm.entrypoints.openai.steering.sae_loader import (
+                        _load_fr_weights_for_manifest,
                         _load_weights_for_manifest,
                     )
 
+                    load_weights = (
+                        _load_fr_weights_for_manifest
+                        if module.kind is SteeringModuleKind.SAE_FULL_RECONSTRUCTION
+                        else _load_weights_for_manifest
+                    )
                     payload["sae_weights"] = pack_sae_weights_for_broadcast(
-                        _load_weights_for_manifest(
-                            manifest,
-                            Path(manifest.weights_uri),
-                        )
+                        load_weights(manifest, Path(manifest.weights_uri))
                     )
             out[name] = payload
         return out
@@ -562,16 +639,37 @@ class SteeringModuleRegistry:
 
         if file_path.is_dir():
             from vllm.entrypoints.openai.steering.sae_loader import (
+                load_sae_full_recon_module_from_dir,
                 load_sae_module_from_dir,
             )
 
-            loaded = load_sae_module_from_dir(file_path)
+            # An optional "kind" discriminator in manifest.json selects the
+            # SAE flavour; absent means sae_delta (the original contract).
+            manifest_path = file_path / "manifest.json"
+            kind_raw = "sae_delta"
+            if manifest_path.exists():
+                with manifest_path.open("r", encoding="utf-8") as fh:
+                    peeked = json.load(fh)
+                if isinstance(peeked, dict):
+                    kind_raw = peeked.get("kind", "sae_delta")
+            if kind_raw == SteeringModuleKind.SAE_FULL_RECONSTRUCTION.value:
+                loaded = load_sae_full_recon_module_from_dir(file_path)
+                kind = SteeringModuleKind.SAE_FULL_RECONSTRUCTION
+            elif kind_raw == SteeringModuleKind.SAE_DELTA.value:
+                loaded = load_sae_module_from_dir(file_path)
+                kind = SteeringModuleKind.SAE_DELTA
+            else:
+                raise ValueError(
+                    f"Steering module directory {path!r} declares "
+                    f"unsupported kind {kind_raw!r}; expected "
+                    f"'sae_delta' or 'sae_full_reconstruction'."
+                )
             # Startup/full-sync broadcasts can include SAE weights only if the
             # manifest has a stable local path to reload from.
             loaded.manifest.weights_uri = str(file_path)
             await self.register(
                 name=name,
-                kind=SteeringModuleKind.SAE_DELTA,
+                kind=kind,
                 sae_manifest=loaded.manifest,
             )
             return
@@ -816,8 +914,7 @@ class SteeringModuleRegistry:
         for other_name, other_module in self._modules.items():
             if (
                 other_name == name
-                or other_module.kind
-                is not SteeringModuleKind.SAE_FULL_RECONSTRUCTION
+                or other_module.kind is not SteeringModuleKind.SAE_FULL_RECONSTRUCTION
             ):
                 continue
             other_manifest = other_module.sae_manifest

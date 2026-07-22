@@ -31,6 +31,28 @@ class FinishReason(IntEnum):
     REPETITION = 4
 
 
+# Mirrors of the SAE per-request spec dataclasses
+# (vllm.config.sae_steering_types) — msgspec dataclasses and Structs share
+# the same map wire shape.
+class SAEClampEntry(msgspec.Struct):
+    feature_idx: int
+    kind: str
+    value: float
+    only_if_active: bool = False
+
+
+class SAEClampSpec(msgspec.Struct):
+    module_name: str
+    clamps: dict[str, dict[int, list[SAEClampEntry]]]
+    phase: str = "both"
+
+
+class SAEFullReconstructionSpec(msgspec.Struct):
+    module_name: str
+    clamps: dict[str, dict[int, list[SAEClampEntry]]] = {}
+    phase: str = "both"
+
+
 # Mirror of real SamplingParams; omit_defaults makes fixtures match real maps.
 class EngineCoreSamplingParams(msgspec.Struct, dict=True, omit_defaults=True):
     temperature: float = 1.0
@@ -47,6 +69,8 @@ class EngineCoreSamplingParams(msgspec.Struct, dict=True, omit_defaults=True):
     _eos_token_id: int | None = None
     _all_stop_token_ids: set[int] = set()
     output_kind: RequestOutputKind = RequestOutputKind.DELTA
+    sae_clamp_specs: list[SAEClampSpec] | None = None
+    sae_full_reconstruction_specs: list[SAEFullReconstructionSpec] | None = None
 
 
 class EngineCoreRequest(
@@ -371,6 +395,40 @@ class EngineCoreReadyResponse:
     kv_cache_max_concurrency: float | None = None
 
 
+# SAE-bearing request: pins the Python->Rust direction of the SAE spec
+# wire contract (typed maps, integer layer keys).
+sae_request = EngineCoreRequest(
+    request_id="req-sae",
+    prompt_token_ids=[9, 8],
+    mm_features=None,
+    sampling_params=EngineCoreSamplingParams(
+        temperature=0.0,
+        sae_clamp_specs=[
+            SAEClampSpec(
+                module_name="sae_mod",
+                clamps={
+                    "post_block": {
+                        20: [
+                            SAEClampEntry(feature_idx=34, kind="absolute", value=5.0),
+                            SAEClampEntry(
+                                feature_idx=7,
+                                kind="additive",
+                                value=-1.5,
+                                only_if_active=True,
+                            ),
+                        ]
+                    }
+                },
+                phase="decode",
+            )
+        ],
+        sae_full_reconstruction_specs=[SAEFullReconstructionSpec(module_name="fr_mod")],
+    ),
+    pooling_params=None,
+    arrival_time=3.5,
+)
+
+
 ready_response = EngineCoreReadyResponse(
     max_model_len=32768,
     num_gpu_blocks=1000,
@@ -399,3 +457,4 @@ print(
     )
 )
 print(msgspec.msgpack.encode(ready_response).hex())
+print(msgspec.msgpack.encode(sae_request).hex())

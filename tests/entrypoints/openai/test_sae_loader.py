@@ -876,3 +876,162 @@ class TestMergeLoadedSAEModules:
     def test_rejects_empty_input(self):
         with pytest.raises(ValueError, match="non-empty"):
             merge_loaded_sae_modules([])
+
+
+def _make_fr_dir(
+    base: Path,
+    *,
+    d_model: int = 8,
+    d_sae: int = 16,
+    layers: list[tuple[int, str]] | None = None,
+    activation: str = "relu",
+    kind_key: str | None = "sae_full_reconstruction",
+) -> dict[tuple[int, str], dict[str, torch.Tensor]]:
+    """Write a full-reconstruction module dir (full d_sae rows +
+    decoder_bias, optional manifest kind discriminator)."""
+    from safetensors.torch import save_file
+
+    layers = layers or [(0, "post_block")]
+    rng = torch.Generator(device="cpu").manual_seed(1)
+    weights: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
+    for layer_idx, hook_str in layers:
+        tensors = {
+            "encoder_weight": torch.randn(d_sae, d_model, generator=rng),
+            "encoder_bias": torch.randn(d_sae, generator=rng),
+            "decoder_weight": torch.randn(d_sae, d_model, generator=rng),
+            "decoder_bias": torch.randn(d_model, generator=rng),
+        }
+        if activation == "jumprelu":
+            tensors["threshold"] = torch.rand(d_sae, generator=rng)
+        save_file(
+            {k: v.contiguous() for k, v in tensors.items()},
+            str(base / _site_filename(layer_idx, hook_str)),
+        )
+        weights[(layer_idx, hook_str)] = tensors
+    payload = {
+        "d_model": d_model,
+        "d_sae": d_sae,
+        "activation": activation,
+        "layers": [list(p) for p in layers],
+        "clampable_features": [0, 3],
+        "activation_params": {},
+        "weights_uri": None,
+    }
+    if kind_key is not None:
+        payload["kind"] = kind_key
+    with (base / "manifest.json").open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    return weights
+
+
+class TestLoadSAEFullReconModuleFromDir:
+    def test_round_trip(self, tmp_path):
+        from vllm.entrypoints.openai.steering.sae_loader import (
+            load_sae_full_recon_module_from_dir,
+        )
+
+        expected = _make_fr_dir(tmp_path)
+        loaded = load_sae_full_recon_module_from_dir(tmp_path)
+        assert loaded.manifest.d_sae == 16
+        site = loaded.weights[(0, "post_block")]
+        assert set(site.keys()) == {
+            "encoder_weight",
+            "encoder_bias",
+            "decoder_weight",
+            "decoder_bias",
+        }
+        torch.testing.assert_close(
+            site["decoder_bias"], expected[(0, "post_block")]["decoder_bias"]
+        )
+
+    def test_missing_decoder_bias_rejected(self, tmp_path):
+        from safetensors.torch import save_file
+
+        from vllm.entrypoints.openai.steering.sae_loader import (
+            load_sae_full_recon_module_from_dir,
+        )
+
+        _make_fr_dir(tmp_path)
+        # Rewrite the site without decoder_bias.
+        rng = torch.Generator(device="cpu").manual_seed(2)
+        save_file(
+            {
+                "encoder_weight": torch.randn(16, 8, generator=rng),
+                "encoder_bias": torch.randn(16, generator=rng),
+                "decoder_weight": torch.randn(16, 8, generator=rng),
+            },
+            str(tmp_path / _site_filename(0, "post_block")),
+        )
+        with pytest.raises(ValueError, match="decoder_bias"):
+            load_sae_full_recon_module_from_dir(tmp_path)
+
+    def test_jumprelu_requires_full_threshold(self, tmp_path):
+        from vllm.entrypoints.openai.steering.sae_loader import (
+            load_sae_full_recon_module_from_dir,
+        )
+
+        _make_fr_dir(tmp_path, activation="jumprelu")
+        loaded = load_sae_full_recon_module_from_dir(tmp_path)
+        site = loaded.weights[(0, "post_block")]
+        assert tuple(site["threshold"].shape) == (16,)
+
+    def test_delta_shaped_site_rejected(self, tmp_path):
+        """A delta-subset site (n_clamp rows) must fail the FR shape gate."""
+        from vllm.entrypoints.openai.steering.sae_loader import (
+            load_sae_full_recon_module_from_dir,
+        )
+
+        _make_synthetic_dir(tmp_path)  # n_clamp-row tensors, no decoder_bias
+        with pytest.raises(ValueError):
+            load_sae_full_recon_module_from_dir(tmp_path)
+
+
+class TestLoadFromFileKindDispatch:
+    def _load(self, path):
+        import asyncio
+
+        from vllm.entrypoints.openai.steering.registry import (
+            SteeringModuleRegistry,
+        )
+
+        registry = SteeringModuleRegistry()
+        asyncio.run(registry.load_from_file("m", str(path)))
+        return registry.get("m")
+
+    def test_dir_without_kind_registers_delta(self, tmp_path):
+        from vllm.config.sae_steering_types import SteeringModuleKind
+
+        _make_synthetic_dir(tmp_path)
+        module = self._load(tmp_path)
+        assert module.kind is SteeringModuleKind.SAE_DELTA
+
+    def test_dir_with_fr_kind_registers_full_reconstruction(self, tmp_path):
+        from vllm.config.sae_steering_types import SteeringModuleKind
+
+        _make_fr_dir(tmp_path)
+        module = self._load(tmp_path)
+        assert module.kind is SteeringModuleKind.SAE_FULL_RECONSTRUCTION
+        assert module.sae_manifest.weights_uri == str(tmp_path)
+
+    def test_dir_with_unknown_kind_rejected(self, tmp_path):
+        _make_fr_dir(tmp_path, kind_key="sae_bogus")
+        with pytest.raises(ValueError, match="unsupported kind"):
+            self._load(tmp_path)
+
+    def test_fr_broadcast_reloads_fr_weights(self, tmp_path):
+        _make_fr_dir(tmp_path)
+        registry_module = self._load(tmp_path)
+        assert registry_module is not None
+        import asyncio
+
+        from vllm.entrypoints.openai.steering.registry import (
+            SteeringModuleRegistry,
+        )
+
+        registry = SteeringModuleRegistry()
+        asyncio.run(registry.load_from_file("m", str(tmp_path)))
+        payload = registry.dump_for_broadcast(include_sae_weights=True)["m"]
+        assert payload["kind"] == "sae_full_reconstruction"
+        site = payload["sae_weights"]["0:post_block"]
+        assert "decoder_bias" in site
+        assert site["decoder_bias"]["shape"] == [8]

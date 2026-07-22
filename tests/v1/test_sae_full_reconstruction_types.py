@@ -161,6 +161,81 @@ class TestCoercion:
         with pytest.raises(ValueError, match="module_name"):
             coerce_sae_full_reconstruction_specs([{"phase": "both"}])
 
+    def test_non_numeric_layer_key_rejected_with_context(self):
+        with pytest.raises(ValueError, match=r"invalid layer key 'x'"):
+            coerce_sae_full_reconstruction_specs(
+                [
+                    {
+                        "module_name": "m",
+                        "clamps": {
+                            "post_block": {
+                                "x": [
+                                    {
+                                        "feature_idx": 3,
+                                        "kind": "absolute",
+                                        "value": 5.0,
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                ]
+            )
+
+    def test_non_str_non_int_layer_key_rejected(self):
+        with pytest.raises(ValueError, match="invalid layer key"):
+            coerce_sae_full_reconstruction_specs(
+                [
+                    {
+                        "module_name": "m",
+                        "clamps": {
+                            "post_block": {
+                                (1, 2): [
+                                    {
+                                        "feature_idx": 3,
+                                        "kind": "absolute",
+                                        "value": 5.0,
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                ]
+            )
+
+    def test_duplicate_layer_key_after_normalization_rejected(self):
+        entry = {"feature_idx": 3, "kind": "absolute", "value": 5.0}
+        with pytest.raises(ValueError, match="duplicate layer key"):
+            coerce_sae_full_reconstruction_specs(
+                [
+                    {
+                        "module_name": "m",
+                        "clamps": {"post_block": {5: [entry], "5": [entry]}},
+                    }
+                ]
+            )
+
+    def test_negative_layer_key_rejected(self):
+        with pytest.raises(ValueError, match="layer key"):
+            coerce_sae_full_reconstruction_specs(
+                [
+                    {
+                        "module_name": "m",
+                        "clamps": {
+                            "post_block": {
+                                "-3": [
+                                    {
+                                        "feature_idx": 3,
+                                        "kind": "absolute",
+                                        "value": 5.0,
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                ]
+            )
+
 
 class TestHashDeterminism:
     def test_none_and_empty_hash_zero(self):

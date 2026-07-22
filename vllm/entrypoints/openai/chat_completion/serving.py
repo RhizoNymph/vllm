@@ -380,6 +380,7 @@ class OpenAIServingChat(OpenAIServing):
             or request.prefill_steering_vectors is not None
             or request.decode_steering_vectors is not None
             or bool(request.sae_clamp_specs)
+            or bool(request.sae_full_reconstruction_specs)
         )
         if request.use_beam_search and has_steering:
             return self.create_error_response(
@@ -481,6 +482,26 @@ class OpenAIServingChat(OpenAIServing):
                     err, status_code=HTTPStatus.BAD_REQUEST
                 )
 
+        if request.sae_full_reconstruction_specs:
+            steering_registry = (
+                None
+                if raw_request is None
+                else getattr(raw_request.app.state, "steering_module_registry", None)
+            )
+            if steering_registry is None:
+                return self.create_error_response(
+                    "sae_full_reconstruction_specs requires steering to be "
+                    "enabled. Start the server with --enable-steering.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            err = steering_registry.validate_sae_full_reconstruction_specs(
+                request.sae_full_reconstruction_specs
+            )
+            if err is not None:
+                return self.create_error_response(
+                    err, status_code=HTTPStatus.BAD_REQUEST
+                )
+
         # Build the request-metadata channel once (declarative steering gate
         # names are resolved against the vector registry here; a malformed
         # gate spec or unknown name raises ValueError → HTTP 400).
@@ -546,12 +567,10 @@ class OpenAIServingChat(OpenAIServing):
                 if steering_module_ref is not None:
                     sampling_params.steering_module_ref = steering_module_ref
                     assert named_steering_registry is not None
-                    err = (
-                        named_steering_registry.apply_sampling_params_hash_overrides(
-                            sampling_params,
-                            steering_module_ref[0],
-                            scale=steering_module_ref[1],
-                        )
+                    err = named_steering_registry.apply_sampling_params_hash_overrides(
+                        sampling_params,
+                        steering_module_ref[0],
+                        scale=steering_module_ref[1],
                     )
                     if err is not None:
                         return self.create_error_response(

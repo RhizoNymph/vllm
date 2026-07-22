@@ -220,8 +220,13 @@ local; only the schema is replicated.
 ### Request Hashing
 
 `SamplingParams` carries `sae_clamp_specs` and
-`sae_full_reconstruction_specs`. Six cached hash properties feed the
-runtime:
+`sae_full_reconstruction_specs`. Both are accepted by the OpenAI
+completion, chat and batch-chat endpoints (via `extra_body`) on the
+Python and Rust frontends alike; the API server validates them against
+the registry (`validate_sae_clamp_specs` /
+`validate_sae_full_reconstruction_specs`) so unknown-module /
+wrong-kind / uncovered-site errors 400 before admission. Six cached
+hash properties feed the runtime:
 
 - `prefill_steering_config_hash` / `decode_steering_config_hash` — the
   *combined* per-phase identity: `hash_steering_config(...)` folds the
@@ -477,7 +482,8 @@ Core implementation:
   spec fields, phase filters, the six cached hash properties.
 - [`vllm/entrypoints/openai/steering/registry.py`](../../vllm/entrypoints/openai/steering/registry.py)
   — `SAEModuleManifest`, kind-branched `register`,
-  `validate_sae_clamp_specs`, `validate_additive_lookup`,
+  `validate_sae_clamp_specs`, `validate_sae_full_reconstruction_specs`,
+  `validate_additive_lookup`,
   `apply_sampling_params_hash_overrides`, `restore_or_remove`,
   `dump_for_broadcast(include_sae_weights=...)`.
 - [`vllm/entrypoints/openai/steering/sae_loader.py`](../../vllm/entrypoints/openai/steering/sae_loader.py)
@@ -582,6 +588,14 @@ GEMMs per opted-in token per hooked layer).
 - **Batch chat API requires packed steering vectors**
   (`SteeringVectorSpecPacked`); legacy dict-of-lists vectors are not
   accepted on the batch surface.
+- **Live SAE steering requires `--enforce-eager` serving.** SAE buffer
+  attributes are created at module *registration*, which on a server
+  happens after engine warmup — a compiled graph traced before
+  registration bakes in the "no SAE buffers at this hook" short-circuit
+  and every SAE spec is silently inert (requests succeed, nothing
+  applies). Offline `LLM()` flows and all live validation to date run
+  eager. Lifting this needs either pre-allocated SAE slots at engine
+  init or a re-capture after registration.
 - **At most one full-reconstruction SAE module per (layer, hook)
   site**; double-registration raises by design — two residual
   replacements on one site are semantically ill-defined. Delta

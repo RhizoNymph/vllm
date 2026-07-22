@@ -149,6 +149,20 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 return self.create_error_response(
                     err, status_code=HTTPStatus.BAD_REQUEST
                 )
+        if request.sae_full_reconstruction_specs:
+            if steering_registry is None:
+                return self.create_error_response(
+                    "sae_full_reconstruction_specs requires steering to be "
+                    "enabled. Start the server with --enable-steering.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            err = steering_registry.validate_sae_full_reconstruction_specs(
+                request.sae_full_reconstruction_specs
+            )
+            if err is not None:
+                return self.create_error_response(
+                    err, status_code=HTTPStatus.BAD_REQUEST
+                )
         steering_module_refs = [steering_module_ref] * len(single_requests)
         steering_registries = [steering_registry_for_request] * len(single_requests)
 

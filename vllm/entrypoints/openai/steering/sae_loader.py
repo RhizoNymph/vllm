@@ -216,6 +216,16 @@ def _validate_site_tensors(
     }
     if activation is SAEActivation.JUMPRELU or "threshold" in tensors:
         expected_shapes["threshold"] = (n_clamp,)
+    return _check_tensor_map(tensors, expected_shapes, site=site)
+
+
+def _check_tensor_map(
+    tensors: Mapping[str, torch.Tensor],
+    expected_shapes: dict[str, tuple[int, ...]],
+    *,
+    site: tuple[int, str],
+) -> dict[str, torch.Tensor]:
+    """Shape / dtype / finiteness checks shared by the delta and FR loaders."""
     out: dict[str, torch.Tensor] = {}
     for key, expected in expected_shapes.items():
         if key not in tensors:
@@ -236,11 +246,108 @@ def _validate_site_tensors(
             )
         if not bool(torch.isfinite(tensor).all().item()):
             raise ValueError(
-                f"SAE site {site!r}: tensor {key!r} must contain only "
-                "finite values."
+                f"SAE site {site!r}: tensor {key!r} must contain only finite values."
             )
         out[key] = tensor
     return out
+
+
+def _validate_fr_site_tensors(
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    d_model: int,
+    d_sae: int,
+    site: tuple[int, str],
+    activation: SAEActivation,
+) -> dict[str, torch.Tensor]:
+    """Validate one full-reconstruction site's tensors.
+
+    Full-reconstruction runs the complete SAE forward, so the encoder /
+    decoder cover every feature (``d_sae`` rows, not the clampable
+    subset) and the decoder bias participates.
+    """
+    expected_shapes: dict[str, tuple[int, ...]] = {
+        "encoder_weight": (d_sae, d_model),
+        "encoder_bias": (d_sae,),
+        "decoder_weight": (d_sae, d_model),
+        "decoder_bias": (d_model,),
+    }
+    if activation is SAEActivation.JUMPRELU or "threshold" in tensors:
+        expected_shapes["threshold"] = (d_sae,)
+    return _check_tensor_map(tensors, expected_shapes, site=site)
+
+
+def _load_fr_weights_for_manifest(
+    manifest: SAEModuleManifest, base: Path
+) -> dict[tuple[int, str], dict[str, torch.Tensor]]:
+    """FR sibling of :func:`_load_weights_for_manifest` (full ``d_sae`` rows)."""
+    from safetensors.torch import load_file
+
+    out: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
+    for layer_idx, hook_str in manifest.layers:
+        if hook_str not in VALID_HOOK_POINT_NAMES:
+            raise ValueError(
+                f"Manifest declares unsupported hook point {hook_str!r} for "
+                f"layer {layer_idx}.  Valid hook points: "
+                f"{sorted(VALID_HOOK_POINT_NAMES)}."
+            )
+        weight_path = base / _site_filename(layer_idx, hook_str)
+        if not weight_path.exists():
+            raise FileNotFoundError(
+                f"SAE weight file not found at {weight_path!r}.  "
+                f"Manifest declares site (layer={layer_idx}, "
+                f"hook={hook_str!r})."
+            )
+        tensors = load_file(str(weight_path))
+        out[(layer_idx, hook_str)] = _validate_fr_site_tensors(
+            tensors,
+            d_model=manifest.d_model,
+            d_sae=manifest.d_sae,
+            site=(layer_idx, hook_str),
+            activation=manifest.activation,
+        )
+    return out
+
+
+def load_sae_full_recon_module_from_dir(path: str | Path) -> LoadedSAEModule:
+    """Load a full-reconstruction SAE module from a directory.
+
+    Same ``manifest.json`` + per-site safetensors layout as
+    :func:`load_sae_module_from_dir`, but with the full-``d_sae``
+    tensor contract of :func:`_validate_fr_site_tensors` (including
+    ``decoder_bias``).  The manifest JSON may carry a
+    ``"kind": "sae_full_reconstruction"`` discriminator (used by the
+    registry's ``--steering-modules`` dispatch); it is ignored here.
+    """
+    base = Path(path)
+    if not base.is_dir():
+        raise FileNotFoundError(f"SAE module directory not found: {base!r}.")
+    manifest_path = base / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"SAE manifest not found at {manifest_path!r}.  Expected "
+            "'manifest.json' inside the SAE module directory."
+        )
+    with manifest_path.open("r", encoding="utf-8") as fh:
+        manifest_payload = json.load(fh)
+    if not isinstance(manifest_payload, dict):
+        raise ValueError(f"SAE manifest at {manifest_path!r} must be a JSON object.")
+    try:
+        manifest = sae_manifest_from_dict(manifest_payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"SAE manifest at {manifest_path!r} is invalid: {exc}"
+        ) from exc
+    try:
+        SteeringModuleRegistry()._validate_sae_manifest(
+            name=str(manifest_path), manifest=manifest
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"SAE manifest at {manifest_path!r} is invalid: {exc}"
+        ) from exc
+    weights = _load_fr_weights_for_manifest(manifest, base)
+    return LoadedSAEModule(manifest=manifest, weights=weights)
 
 
 # ---------------------------------------------------------------------------
