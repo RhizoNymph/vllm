@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tracing::info;
 use vllm_engine_core_client::EngineCoreClient;
-use vllm_engine_core_client::protocol::{SteeringLayerEntry, SteeringVectorSpec};
+use vllm_engine_core_client::protocol::{SteeringClamps, SteeringLayerEntry, SteeringVectorSpec};
 
 use crate::config::SteeringModulePath;
 use crate::routes::openai::utils::steering::{
@@ -34,16 +34,17 @@ pub struct SteeringModuleBroadcast {
     pub prefill_vectors: Option<SteeringVectorSpec>,
     /// Decode-only additions.
     pub decode_vectors: Option<SteeringVectorSpec>,
-    /// Base directional clamps (both phases). Forwarded verbatim: either the
-    /// JSON entry-list form `{hook: {layer: [clamp entries]}}` or the binary
-    /// packed form `{hook: ClampHookPacked}`. The Python worker's
-    /// `register_steering_modules` validates deeply and decodes the packed
-    /// form; here we only require a JSON object.
-    pub clamps: Option<Value>,
-    /// Prefill-only clamps, concatenated after base. Forwarded verbatim.
-    pub prefill_clamps: Option<Value>,
-    /// Decode-only clamps, concatenated after base. Forwarded verbatim.
-    pub decode_clamps: Option<Value>,
+    /// Base directional clamps (both phases), parsed from the JSON
+    /// entry-list or base64-packed input shapes into the canonical
+    /// [`SteeringClamps`] form. The broadcast rides collective_rpc as
+    /// msgpack, so the packed row bytes travel as native `bin`; the Python
+    /// worker revives the flattened wire map via `SteeringClamps.from_obj`
+    /// and still validates hook points, direction widths and the K cap.
+    pub clamps: Option<SteeringClamps>,
+    /// Prefill-only clamps, concatenated after base. Same canonical form.
+    pub prefill_clamps: Option<SteeringClamps>,
+    /// Decode-only clamps, concatenated after base. Same canonical form.
+    pub decode_clamps: Option<SteeringClamps>,
 }
 
 /// Errors raised while loading a named steering module from disk.
@@ -117,25 +118,19 @@ pub fn parse_module(
     })
 }
 
-/// Pass a clamp tier through verbatim after a minimal structural check.
-///
-/// Clamps ride to the worker as an opaque JSON `Value` (either the entry-list
-/// form or the packed `{hook: ClampHookPacked}` form); the Python worker
-/// validates hook points, entry structure, direction widths and the K cap.
-/// Here we only reject a non-object tier and treat an empty object as absent.
+/// Parse a clamp tier into the canonical form, with full row/entry
+/// validation at the edge (the Python worker still checks hook points,
+/// direction widths against the model and the K cap).
 fn load_clamp_tier(
     value: Option<&Value>,
     tier: &'static str,
-) -> Result<Option<Value>, SteeringModuleLoadError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Object(obj)) if obj.is_empty() => Ok(None),
-        Some(v @ Value::Object(_)) => Ok(Some(v.clone())),
-        Some(_) => Err(SteeringModuleLoadError::Tier {
+) -> Result<Option<SteeringClamps>, SteeringModuleLoadError> {
+    crate::routes::openai::utils::clamps::parse_clamp_tier(value).map_err(|err| {
+        SteeringModuleLoadError::Tier {
             tier,
-            message: "clamp tier must be a JSON object keyed by hook point".to_owned(),
-        }),
-    }
+            message: format!("{err}"),
+        }
+    })
 }
 
 /// Load all configured modules and broadcast them to the engine workers,
@@ -400,9 +395,10 @@ mod tests {
 
     #[test]
     fn module_with_clamps_parses_and_broadcasts_them() {
-        // A module carrying vectors AND clamps: the clamp tiers must survive
-        // parse_module and appear verbatim in the serialized broadcast payload
-        // under the exact keys the Python worker reads.
+        // A module carrying vectors AND clamps: the clamp tiers parse into
+        // the canonical form and appear in the serialized broadcast payload
+        // under the exact keys the Python worker reads, with row data
+        // base64-encoded on the JSON hop (from_obj's wire-map branch).
         let obj = serde_json::json!({
             "vectors": {"post_block": {"14": [0.1, 0.2]}},
             "clamps": {"post_attn": {"5": [{"vector": [1.0, 0.0], "min": -2.0, "max": 2.0}]}},
@@ -411,21 +407,20 @@ mod tests {
         let obj = obj.as_object().unwrap();
         let module = parse_module(obj).expect("parse");
         assert!(module.vectors.is_some());
-        assert!(module.clamps.is_some());
+        let clamps = module.clamps.as_ref().expect("clamps parsed");
+        assert_eq!(clamps.hooks["post_attn"].layer_indices, vec![5]);
+        assert_eq!(clamps.hooks["post_attn"].lo, vec![-2.0]);
         assert!(module.prefill_clamps.is_none());
-        assert!(module.decode_clamps.is_some());
+        let decode = module.decode_clamps.as_ref().expect("decode clamps parsed");
+        assert_eq!(decode.hooks["pre_attn"].lo, vec![1.5]);
+        assert_eq!(decode.hooks["pre_attn"].hi, vec![1.5]);
 
-        // The broadcast serialization keeps the clamp keys (and omits the
-        // absent prefill_clamps via skip_serializing_none).
         let payload = serde_json::to_value(&module).expect("serialize");
-        assert_eq!(
-            payload["clamps"]["post_attn"]["5"][0]["min"],
-            serde_json::json!(-2.0)
-        );
+        assert!(payload["clamps"]["hooks"]["post_attn"]["data"].is_string());
         assert!(payload.get("prefill_clamps").is_none());
         assert_eq!(
-            payload["decode_clamps"]["pre_attn"]["3"][0]["value"],
-            serde_json::json!(1.5)
+            payload["decode_clamps"]["hooks"]["pre_attn"]["strength"],
+            serde_json::json!([1.0])
         );
     }
 
@@ -445,23 +440,34 @@ mod tests {
     }
 
     #[test]
-    fn module_with_packed_clamps_passes_through_verbatim() {
-        // A packed clamp tier rides through as an opaque object; the Rust side
-        // does not decode it (the Python worker does).
+    fn module_with_packed_clamps_parses_to_canonical() {
+        // The legacy base64-packed input shape decodes into the canonical
+        // form at the edge (rows upcast to f64, null bound -> -inf).
         let packed = serde_json::json!({
             "post_attn": {
                 "dtype": "float64",
                 "shape": [1, 2],
                 "layer_indices": [5],
                 "data": "AAAAAAAA8D8AAAAAAAAAAA==",
-                "bounds": [[-2.0, 2.0]],
+                "bounds": [[null, 2.0]],
                 "strengths": [1.0]
             }
         });
-        let obj = serde_json::json!({ "clamps": packed.clone() });
+        let obj = serde_json::json!({ "clamps": packed });
         let obj = obj.as_object().unwrap();
         let module = parse_module(obj).expect("parse");
-        assert_eq!(module.clamps.as_ref().unwrap(), &packed);
+        let clamps = module.clamps.as_ref().unwrap();
+        let table = &clamps.hooks["post_attn"];
+        assert_eq!(table.shape, vec![1, 2]);
+        assert_eq!(table.lo, vec![f64::NEG_INFINITY]);
+        assert_eq!(table.hi, vec![2.0]);
+        // "AAAAAAAA8D8AAAAAAAAAAA==" is [1.0, 0.0] at f64 LE.
+        let rows: Vec<f64> = table
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(rows, vec![1.0, 0.0]);
     }
 
     #[test]

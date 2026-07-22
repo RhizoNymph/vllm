@@ -5,7 +5,9 @@ use std::collections::HashMap;
 
 use tonic::Status;
 use uuid::Uuid;
-use vllm_engine_core_client::protocol::{SteeringVectorSpec, StopReason, StructuredOutputsParams};
+use vllm_engine_core_client::protocol::{
+    ClampHookTable, SteeringClamps, SteeringVectorSpec, StopReason, StructuredOutputsParams,
+};
 use vllm_text::{
     DecodedLogprobs, DecodedPromptLogprobs, FinishReason, Finished, Prompt, SamplingParams,
     TextDecodeOptions, TextRequest,
@@ -477,60 +479,59 @@ fn convert_packed_steering(
     Ok(Some(spec))
 }
 
-/// Convert one proto packed-clamp map (hook name → blob) into the packed-JSON
-/// `Value` the HTTP clamp path forwards, so the Python engine owns a single
-/// clamp decoder (`unpack_steering_clamps`).
+/// Convert one proto packed-clamp map (hook name → blob) into the canonical
+/// [`SteeringClamps`] engine-core's strict decoder expects.
 ///
-/// The direction bytes are base64-encoded and the flattened proto `bounds`
-/// `[lo0, hi0, lo1, hi1, ...]` are re-paired into `[[lo, hi], ...]`. JSON has
-/// no infinity literal, so an infinite bound is encoded as `null` (the Python
-/// unpacker maps `null` back to `±inf`). An empty map yields `None`.
+/// The raw direction bytes are upcast exactly to float64 and the flattened
+/// proto `bounds` `[lo0, hi0, lo1, hi1, ...]` are re-paired into the per-row
+/// `lo`/`hi` lists (proto doubles carry `±inf` natively). An empty map
+/// yields `None`.
 fn convert_packed_clamps(
     map: HashMap<String, pb::ClampHookPacked>,
-) -> Result<Option<serde_json::Value>, Status> {
-    use base64::Engine as _;
-
+) -> Result<Option<SteeringClamps>, Status> {
     if map.is_empty() {
         return Ok(None);
     }
-    let bound_to_json = |b: f64| -> serde_json::Value {
-        if b.is_finite() {
-            serde_json::json!(b)
-        } else {
-            serde_json::Value::Null
-        }
-    };
-    let mut obj = serde_json::Map::with_capacity(map.len());
+    let mut hooks = std::collections::HashMap::with_capacity(map.len());
     for (hook, blob) in map {
-        let n = blob.shape.first().copied().unwrap_or(0) as usize;
+        let [rows, hidden] = blob.shape[..] else {
+            return Err(Status::invalid_argument(format!(
+                "clamp hook '{hook}': shape must be [n, hidden]; got {:?}",
+                blob.shape,
+            )));
+        };
+        let n = rows as usize;
         if blob.bounds.len() != 2 * n {
             return Err(Status::invalid_argument(format!(
                 "clamp hook '{hook}': bounds length {} != 2 * num_rows {n}",
                 blob.bounds.len(),
             )));
         }
-        let bounds: Vec<serde_json::Value> = (0..n)
-            .map(|i| {
-                serde_json::Value::Array(vec![
-                    bound_to_json(blob.bounds[2 * i]),
-                    bound_to_json(blob.bounds[2 * i + 1]),
-                ])
-            })
-            .collect();
-        let data = base64::engine::general_purpose::STANDARD.encode(&blob.data);
-        obj.insert(
+        if blob.layer_indices.len() != n || blob.strengths.len() != n {
+            return Err(Status::invalid_argument(format!(
+                "clamp hook '{hook}': layer_indices/strengths length must equal num_rows {n}",
+            )));
+        }
+        let data = crate::routes::openai::utils::clamps::upcast_rows_to_f64_le(
+            &blob.dtype,
+            n,
+            hidden as usize,
+            &blob.data,
+        )
+        .map_err(|message| Status::invalid_argument(format!("clamp hook '{hook}': {message}")))?;
+        hooks.insert(
             hook,
-            serde_json::json!({
-                "dtype": blob.dtype,
-                "shape": blob.shape,
-                "layer_indices": blob.layer_indices,
-                "data": data,
-                "bounds": bounds,
-                "strengths": blob.strengths,
-            }),
+            ClampHookTable {
+                shape: vec![rows, hidden],
+                layer_indices: blob.layer_indices,
+                data,
+                lo: (0..n).map(|i| blob.bounds[2 * i]).collect(),
+                hi: (0..n).map(|i| blob.bounds[2 * i + 1]).collect(),
+                strength: blob.strengths.clone(),
+            },
         );
     }
-    Ok(Some(serde_json::Value::Object(obj)))
+    Ok(Some(SteeringClamps { hooks }))
 }
 
 /// Convert a proto `Struct` into JSON, preferring integer JSON numbers for
@@ -716,10 +717,10 @@ mod tests {
     }
 
     #[test]
-    fn packed_clamps_convert_to_packed_json_value() {
-        // A proto ClampHookPacked map converts into the same packed-JSON shape
-        // the HTTP path forwards: base64 `data`, re-paired `bounds` with inf
-        // encoded as null, and `strengths`.
+    fn packed_clamps_convert_to_canonical_form() {
+        // A proto ClampHookPacked map converts into the canonical
+        // SteeringClamps: rows upcast to f64 bytes, the flattened proto
+        // bounds re-paired into per-row lo/hi with native infinities.
         let data: Vec<u8> = [1.0f64, 0.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
         let req = pb::GenerateRequest {
             steering: Some(pb::Steering {
@@ -742,16 +743,18 @@ mod tests {
 
         let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
         let clamps = text.sampling_params.steering_clamps.as_ref().expect("clamps present");
-        let blob = &clamps["post_attn"];
-        assert_eq!(blob["dtype"], serde_json::json!("float64"));
-        assert_eq!(blob["shape"], serde_json::json!([2, 2]));
-        assert_eq!(blob["layer_indices"], serde_json::json!([5, 5]));
-        assert!(blob["data"].is_string());
-        // Infinite lo bound encodes as JSON null; finite bounds pass through.
-        assert_eq!(blob["bounds"][0], serde_json::json!([-2.0, 2.0]));
-        assert_eq!(blob["bounds"][1][0], serde_json::Value::Null);
-        assert_eq!(blob["bounds"][1][1], serde_json::json!(4.0));
-        assert_eq!(blob["strengths"], serde_json::json!([1.0, 0.5]));
+        let table = &clamps.hooks["post_attn"];
+        assert_eq!(table.shape, vec![2, 2]);
+        assert_eq!(table.layer_indices, vec![5, 5]);
+        let rows: Vec<f64> = table
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(rows, vec![1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(table.lo, vec![-2.0, f64::NEG_INFINITY]);
+        assert_eq!(table.hi, vec![2.0, 4.0]);
+        assert_eq!(table.strength, vec![1.0, 0.5]);
     }
 
     #[test]

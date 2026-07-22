@@ -14,7 +14,8 @@ use crate::routes::openai::utils::types::{
     ChatMessage, ContentPart, MessageContent, Tool, ToolChoice, ToolChoiceValue,
 };
 use crate::utils::{
-    ResolvedRequestContext, convert_logit_bias, merge_kv_transfer_params, unpack_steering_field,
+    ResolvedRequestContext, convert_logit_bias, merge_kv_transfer_params, parse_clamp_field,
+    unpack_steering_field,
 };
 
 /// Lowered chat request plus the public response metadata carried by every SSE
@@ -108,6 +109,11 @@ pub(super) fn prepare_chat_request(
     )?;
 
     let steering_vectors = unpack_steering_field(request.steering_vectors, "steering_vectors")?;
+    let steering_clamps = parse_clamp_field(request.steering_clamps, "steering_clamps")?;
+    let prefill_steering_clamps =
+        parse_clamp_field(request.prefill_steering_clamps, "prefill_steering_clamps")?;
+    let decode_steering_clamps =
+        parse_clamp_field(request.decode_steering_clamps, "decode_steering_clamps")?;
     let prefill_steering_vectors =
         unpack_steering_field(request.prefill_steering_vectors, "prefill_steering_vectors")?;
     let decode_steering_vectors =
@@ -148,9 +154,9 @@ pub(super) fn prepare_chat_request(
             capture: request.capture,
             patch: request.patch,
             patch_vectors: request.patch_vectors,
-            steering_clamps: request.steering_clamps,
-            prefill_steering_clamps: request.prefill_steering_clamps,
-            decode_steering_clamps: request.decode_steering_clamps,
+            steering_clamps,
+            prefill_steering_clamps,
+            decode_steering_clamps,
         },
         chat_options: ChatOptions {
             generation_prompt_mode,

@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::multimodal::MmFeatures;
-use vllm_engine_core_client::protocol::{SteeringVectorSpec, StructuredOutputsParams};
+use vllm_engine_core_client::protocol::{
+    SteeringClamps, SteeringVectorSpec, StructuredOutputsParams,
+};
 
 use crate::error::{Error, Result};
 use crate::output::TextDecodeOptions;
@@ -124,15 +126,16 @@ pub struct SamplingParams {
     /// Request-level packed table of client-provided patch vectors referenced
     /// by a patch entry's `source_inline` / mask `inline`. Forwarded verbatim.
     pub patch_vectors: Option<Value>,
-    /// Per-request steering clamps applied to both prefill and decode phases.
-    /// Forwarded verbatim to engine-core; Python validates on decode.
-    pub steering_clamps: Option<Value>,
-    /// Phase-specific steering clamps applied during prefill only. Forwarded
-    /// verbatim.
-    pub prefill_steering_clamps: Option<Value>,
-    /// Phase-specific steering clamps applied during decode only. Forwarded
-    /// verbatim.
-    pub decode_steering_clamps: Option<Value>,
+    /// Per-request steering clamps applied to both prefill and decode
+    /// phases, already packed into the canonical form engine-core's strict
+    /// decoder expects (the HTTP/gRPC layers parse client input).
+    pub steering_clamps: Option<SteeringClamps>,
+    /// Phase-specific steering clamps applied during prefill only. Same
+    /// canonical form.
+    pub prefill_steering_clamps: Option<SteeringClamps>,
+    /// Phase-specific steering clamps applied during decode only. Same
+    /// canonical form.
+    pub decode_steering_clamps: Option<SteeringClamps>,
 }
 
 #[allow(clippy::derivable_impls)] // more explicit
