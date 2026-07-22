@@ -27,6 +27,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm.config.steering_types import SteeringClamps
 from vllm.model_executor.layers.clamp import (
     CLAMP_ANY_ACTIVE_ATTR,
     CLAMP_BOUNDS_ATTR,
@@ -50,6 +51,15 @@ def _clamp_entry(axis: int, value: float) -> dict:
     vec = [0.0] * HIDDEN
     vec[axis] = 1.0
     return {"vector": vec, "value": value}
+
+
+def _site(entries):
+    """Entry list -> one site's (dirs, lo, hi, strength) row group."""
+    spec = SteeringClamps.from_obj({"post_block": {0: entries}})
+    if spec is None:
+        return None
+    _, dirs, lo, hi, strength = spec.hooks["post_block"].by_layer()[0]
+    return dirs, lo, hi, strength
 
 
 class _Layer(nn.Module):
@@ -258,7 +268,7 @@ class TestGlobalClampShortCircuit:
     def test_global_clamps_only_populates(self):
         host = _Host([{"req_id": "r1", "num_computed": 8, "num_prompt": 8}])
         host._steering_manager.update_global_clamps(
-            _HP, 0, [_clamp_entry(0, 4.0)], phase="base"
+            _HP, 0, _site([_clamp_entry(0, 4.0)]), phase="base"
         )
         host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
         assert bool(_layer_clamp_flag(host).item())
@@ -270,7 +280,7 @@ class TestGlobalClampShortCircuit:
     def test_transition_zeroes_clamp_flag(self):
         host = _Host([{"req_id": "r1", "num_computed": 8, "num_prompt": 8}])
         host._steering_manager.update_global_clamps(
-            _HP, 0, [_clamp_entry(0, 4.0)], phase="base"
+            _HP, 0, _site([_clamp_entry(0, 4.0)]), phase="base"
         )
         host._update_steering_buffers(_FakeSchedulerOutput({"r1": 1}))
         assert bool(_layer_clamp_flag(host).item())
@@ -289,8 +299,8 @@ class TestResolveRequestClamps:
         )
         prefill = host._resolve_request_clamps(sp, "prefill")
         decode = host._resolve_request_clamps(sp, "decode")
-        assert len(prefill[_HP][0]) == 1
-        assert len(decode[_HP][0]) == 2
+        assert prefill.hooks[_HP].site_counts()[0] == 1
+        assert decode.hooks[_HP].site_counts()[0] == 2
 
     def test_none_when_no_clamps(self):
         host = _Host([])
@@ -314,7 +324,7 @@ class TestResolveRequestClamps:
         )
         decode = host._resolve_request_clamps(sp, "decode")
         # module base + module decode + inline base = 3 entries
-        assert len(decode[_HP][0]) == 3
+        assert decode.hooks[_HP].site_counts()[0] == 3
 
     def test_k_cap_enforced(self):
         host = _Host([])

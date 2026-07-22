@@ -16,7 +16,6 @@ from pydantic import Field, PrivateAttr, model_serializer, model_validator
 from vllm.config import ModelConfig
 from vllm.config.steering_types import (
     SteeringVectorSpecPacked,
-    coerce_clamp_spec,
     unpack_steering_vectors,
 )
 from vllm.config.utils import replace
@@ -845,9 +844,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
-            steering_clamps=coerce_clamp_spec(self.steering_clamps),
-            prefill_steering_clamps=coerce_clamp_spec(self.prefill_steering_clamps),
-            decode_steering_clamps=coerce_clamp_spec(self.decode_steering_clamps),
+            # SamplingParams' own validation normalizes every accepted
+            # clamp shape via SteeringClamps.from_obj (400 on malformed).
+            steering_clamps=self.steering_clamps,
+            prefill_steering_clamps=self.prefill_steering_clamps,
+            decode_steering_clamps=self.decode_steering_clamps,
         )
         # Attach the capture dict (keyed by consumer name). The
         # entrypoint's ``_admit_capture`` mutates each value in place

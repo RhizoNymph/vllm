@@ -3,7 +3,7 @@
 """Unit tests for directional-clamp steering types and request plumbing.
 
 Covers:
-- normalize_clamp_entry: sugar / bounds / normalization / rejection cases
+- clamp entry parsing at ingestion: sugar / bounds / rejection cases
 - resolve_effective_clamps: tier concatenation and the K cap
 - hash_steering_config: clamp segment determinism, domain separation, and
   bit-for-bit stability of vector-only hashes
@@ -17,97 +17,93 @@ import numpy as np
 import pytest
 
 from vllm.config.steering_types import (
+    SteeringClamps,
     hash_steering_config,
     maybe_pack_inline_steering_for_request,
-    normalize_clamp_entry,
     resolve_effective_clamps,
-    validate_clamp_row_widths,
 )
 from vllm.sampling_params import SamplingParams
 
 # -----------------------------------------------------------------------
-# normalize_clamp_entry
+# clamp-entry parsing (via SteeringClamps.from_obj ingestion)
 # -----------------------------------------------------------------------
 
 
-class TestNormalizeClampEntry:
-    def test_min_max_form(self):
-        vec, lo, hi, strength = normalize_clamp_entry(
-            {"vector": [3.0, 4.0], "min": -1.0, "max": 2.0}
-        )
-        assert np.allclose(vec, [0.6, 0.8])
-        assert lo == -1.0
-        assert hi == 2.0
-        assert strength == 1.0
+def _one(entry):
+    """Ingest a single entry; return its table or raise."""
+    spec = SteeringClamps.from_obj({"post_block": {0: [entry]}})
+    return spec.hooks["post_block"]
 
-    def test_unit_normalization_float64(self):
-        vec, _, _, _ = normalize_clamp_entry({"vector": [1e-3, 0.0, 0.0], "max": 1.0})
-        assert vec.dtype == np.float64
-        assert math.isclose(float(np.linalg.norm(vec)), 1.0, rel_tol=1e-12)
-        assert vec[0] == 1.0
+
+class TestClampEntryParsing:
+    def test_min_max_form_rows_stored_raw(self):
+        table = _one({"vector": [3.0, 4.0], "min": -1.0, "max": 2.0})
+        assert table.rows()[0].tolist() == [3.0, 4.0]
+        assert table.rows().dtype == np.float64
+        assert table.lo == [-1.0]
+        assert table.hi == [2.0]
+        assert table.strength == [1.0]
 
     def test_value_sugar_pins_both_bounds(self):
-        _, lo, hi, _ = normalize_clamp_entry({"vector": [1.0], "value": 5.0})
-        assert lo == 5.0
-        assert hi == 5.0
+        table = _one({"vector": [1.0], "value": 5.0})
+        assert table.lo == [5.0]
+        assert table.hi == [5.0]
 
     def test_one_sided_min_none_is_neg_inf(self):
-        _, lo, hi, _ = normalize_clamp_entry({"vector": [1.0], "max": 4.0})
-        assert lo == -math.inf
-        assert hi == 4.0
+        table = _one({"vector": [1.0], "max": 4.0})
+        assert table.lo == [-math.inf]
+        assert table.hi == [4.0]
 
     def test_one_sided_max_none_is_pos_inf(self):
-        _, lo, hi, _ = normalize_clamp_entry({"vector": [1.0], "min": -4.0})
-        assert lo == -4.0
-        assert hi == math.inf
+        table = _one({"vector": [1.0], "min": -4.0})
+        assert table.lo == [-4.0]
+        assert table.hi == [math.inf]
 
     def test_explicit_strength(self):
-        _, _, _, strength = normalize_clamp_entry(
-            {"vector": [1.0], "value": 0.0, "strength": 0.25}
-        )
-        assert strength == 0.25
+        table = _one({"vector": [1.0], "value": 0.0, "strength": 0.25})
+        assert table.strength == [0.25]
 
     def test_no_bounds_rejected(self):
         with pytest.raises(ValueError, match="at least one"):
-            normalize_clamp_entry({"vector": [1.0]})
+            _one({"vector": [1.0]})
 
     def test_value_plus_min_max_rejected(self):
         with pytest.raises(ValueError, match="value"):
-            normalize_clamp_entry({"vector": [1.0], "value": 1.0, "max": 2.0})
+            _one({"vector": [1.0], "value": 1.0, "max": 2.0})
 
     def test_min_greater_than_max_rejected(self):
         with pytest.raises(ValueError, match="min"):
-            normalize_clamp_entry({"vector": [1.0], "min": 2.0, "max": 1.0})
+            _one({"vector": [1.0], "min": 2.0, "max": 1.0})
 
     def test_zero_vector_rejected(self):
         with pytest.raises(ValueError, match="zero"):
-            normalize_clamp_entry({"vector": [0.0, 0.0], "value": 1.0})
+            _one({"vector": [0.0, 0.0], "value": 1.0})
 
     def test_nonfinite_vector_rejected(self):
         with pytest.raises(ValueError):
-            normalize_clamp_entry({"vector": [1.0, math.inf], "value": 1.0})
+            _one({"vector": [1.0, math.inf], "value": 1.0})
 
     def test_nonfinite_bound_value_rejected(self):
         with pytest.raises(ValueError):
-            normalize_clamp_entry({"vector": [1.0], "value": math.nan})
+            _one({"vector": [1.0], "value": math.nan})
 
     def test_strength_out_of_range_rejected(self):
         with pytest.raises(ValueError, match="strength"):
-            normalize_clamp_entry({"vector": [1.0], "value": 1.0, "strength": 1.5})
+            _one({"vector": [1.0], "value": 1.0, "strength": 1.5})
         with pytest.raises(ValueError, match="strength"):
-            normalize_clamp_entry({"vector": [1.0], "value": 1.0, "strength": -0.1})
+            _one({"vector": [1.0], "value": 1.0, "strength": -0.1})
 
     def test_unexpected_keys_rejected(self):
         with pytest.raises(ValueError, match="unexpected"):
-            normalize_clamp_entry({"vector": [1.0], "value": 1.0, "scale": 2.0})
+            _one({"vector": [1.0], "value": 1.0, "scale": 2.0})
 
     def test_missing_vector_rejected(self):
         with pytest.raises(ValueError, match="vector"):
-            normalize_clamp_entry({"value": 1.0})
+            _one({"value": 1.0})
 
-    def test_non_dict_rejected(self):
+    def test_non_dict_entry_rejected(self):
         with pytest.raises((TypeError, ValueError)):
-            normalize_clamp_entry([1.0, 2.0])
+            _one([1.0, 2.0])
 
 
 # -----------------------------------------------------------------------
@@ -126,26 +122,26 @@ class TestResolveEffectiveClamps:
     def test_base_only_passthrough(self):
         base = {"post_block": {3: [_entry([1.0], 2.0)]}}
         result = resolve_effective_clamps(base, None)
-        assert result == base
+        assert result == SteeringClamps.from_obj(base)
 
     def test_phase_only_passthrough(self):
         phase = {"post_block": {3: [_entry([1.0], 2.0)]}}
-        assert resolve_effective_clamps(None, phase) == phase
+        assert resolve_effective_clamps(None, phase) == SteeringClamps.from_obj(phase)
 
     def test_concat_base_first(self):
         base = {"post_block": {3: [_entry([1.0, 0.0], 1.0)]}}
         phase = {"post_block": {3: [_entry([0.0, 1.0], 2.0)]}}
         result = resolve_effective_clamps(base, phase)
-        entries = result["post_block"][3]
-        assert len(entries) == 2
-        assert entries[0]["vector"] == [1.0, 0.0]
-        assert entries[1]["vector"] == [0.0, 1.0]
+        table = result.hooks["post_block"]
+        assert table.layer_indices == [3, 3]
+        assert table.rows()[0].tolist() == [1.0, 0.0]
+        assert table.rows()[1].tolist() == [0.0, 1.0]
 
     def test_non_overlapping_sites_merge(self):
         base = {"post_block": {3: [_entry([1.0], 1.0)]}}
         phase = {"pre_attn": {5: [_entry([1.0], 2.0)]}}
         result = resolve_effective_clamps(base, phase)
-        assert set(result.keys()) == {"post_block", "pre_attn"}
+        assert set(result.hooks.keys()) == {"post_block", "pre_attn"}
 
     def test_cap_exceeded_raises(self):
         base = {"post_block": {3: [_entry([1.0], 1.0)] * 3}}
@@ -157,31 +153,12 @@ class TestResolveEffectiveClamps:
         base = {"post_block": {3: [_entry([1.0], 1.0)] * 2}}
         phase = {"post_block": {3: [_entry([1.0], 2.0)] * 2}}
         result = resolve_effective_clamps(base, phase, max_directions=4)
-        assert len(result["post_block"][3]) == 4
+        assert result.hooks["post_block"].site_counts()[3] == 4
 
     def test_no_cap_when_max_directions_none(self):
         base = {"post_block": {3: [_entry([1.0], 1.0)] * 8}}
         result = resolve_effective_clamps(base, None)
-        assert len(result["post_block"][3]) == 8
-
-
-# -----------------------------------------------------------------------
-# validate_clamp_row_widths
-# -----------------------------------------------------------------------
-
-
-class TestValidateClampRowWidths:
-    def test_ok(self):
-        spec = {"post_block": {3: [_entry([1.0, 0.0, 0.0], 1.0)]}}
-        validate_clamp_row_widths(spec, 3, field_name="steering_clamps")
-
-    def test_wrong_width_raises(self):
-        spec = {"post_block": {3: [_entry([1.0, 0.0], 1.0)]}}
-        with pytest.raises(ValueError, match="width"):
-            validate_clamp_row_widths(spec, 3, field_name="steering_clamps")
-
-    def test_none_ok(self):
-        validate_clamp_row_widths(None, 3, field_name="steering_clamps")
+        assert result.hooks["post_block"].site_counts()[3] == 8
 
 
 # -----------------------------------------------------------------------
@@ -262,16 +239,18 @@ class TestSamplingParamsClamps:
         assert sp.prefill_steering_clamps is None
         assert sp.decode_steering_clamps is None
 
-    def test_valid_clamps_accepted_and_normalized_in_place(self):
+    def test_valid_clamps_accepted_and_canonicalized(self):
         sp = SamplingParams(
             steering_clamps={"post_block": {2: [_entry([3.0, 4.0], 1.0)]}}
         )
-        entry = sp.steering_clamps["post_block"][2][0]
-        assert np.allclose(entry["vector"], [0.6, 0.8])
-        assert entry["min"] == 1.0
-        assert entry["max"] == 1.0
-        assert entry["strength"] == 1.0
-        assert "value" not in entry
+        assert isinstance(sp.steering_clamps, SteeringClamps)
+        table = sp.steering_clamps.hooks["post_block"]
+        # Rows are stored as submitted (consumers unit-normalize).
+        assert table.rows()[0].tolist() == [3.0, 4.0]
+        assert table.layer_indices == [2]
+        assert table.lo == [1.0]
+        assert table.hi == [1.0]
+        assert table.strength == [1.0]
 
     def test_invalid_hook_rejected(self):
         with pytest.raises(ValueError, match="hook"):
@@ -297,8 +276,8 @@ class TestSamplingParamsClamps:
             prefill_steering_clamps={"post_block": {2: [_entry([0.0, 1.0], 2.0)]}},
         )
         eff = sp.effective_prefill_clamps
-        assert len(eff["post_block"][2]) == 2
-        assert sp.effective_decode_clamps == sp.steering_clamps
+        assert eff.hooks["post_block"].site_counts()[2] == 2
+        assert sp.effective_decode_clamps == SteeringClamps.from_obj(sp.steering_clamps)
 
     def test_effective_none_when_no_clamps(self):
         sp = SamplingParams()
@@ -347,27 +326,18 @@ class TestSamplingParamsClamps:
         assert sp2.steering_clamps is not None
         assert sp2.prefill_steering_config_hash == expected_prefill
 
-    def test_pack_path_clamp_width_gate(self):
+    def test_clamp_only_pack_path_noop(self):
+        """Clamp-only requests have no inline vectors to pack; the clamp
+        fields are already canonical and must pass through untouched
+        (width validation lives engine-side in the input processor)."""
         import torch
 
         sp = SamplingParams(
             steering_clamps={"post_block": {0: [_entry([1.0, 0.0], 1.0)]}}
         )
-        with pytest.raises(ValueError, match="width"):
-            maybe_pack_inline_steering_for_request(
-                sp, torch.float32, expected_row_width=4
-            )
-
-    def test_clamp_only_pack_path_noop_but_validates(self):
-        """Clamp-only requests have no inline vectors to pack; the pack
-        helper must still width-validate the clamp spec."""
-        import torch
-
-        sp = SamplingParams(
-            steering_clamps={"post_block": {0: [_entry([1.0, 0.0], 1.0)]}}
-        )
+        before = sp.steering_clamps
         maybe_pack_inline_steering_for_request(sp, torch.float32, expected_row_width=2)
-        assert sp.steering_clamps is not None
+        assert sp.steering_clamps is before
 
     def test_from_optional_threads_clamps(self):
         sp = SamplingParams.from_optional(

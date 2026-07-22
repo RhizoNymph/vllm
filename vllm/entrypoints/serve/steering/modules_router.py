@@ -147,7 +147,7 @@ async def register_steering_module(
         # locally instead of forcing the API server to materialize the
         # full vector spec into the multiprocessing payload. Clamp tiers
         # are read back from the registry so the broadcast carries the
-        # coerced (int layer keys) form it validated.
+        # canonical SteeringClamps form it validated.
         registered = registry.get(request.name)
         engine = _engine_client(raw_request)
         await _broadcast_module_to_workers(

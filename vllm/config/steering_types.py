@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections import Counter
 from typing import TYPE_CHECKING, Any, TypedDict
 
+import msgspec
 import numpy as np
 from typing_extensions import NotRequired
 
@@ -67,36 +69,39 @@ class SteeringHookPacked(TypedDict):
 # Packed full spec: {hook_point_name: SteeringHookPacked}
 SteeringVectorSpecPacked = dict[str, SteeringHookPacked]
 
-# Directional-clamp entry: {"vector": [...], "min": float|None,
-# "max": float|None, "strength": float = 1.0}, with the sugar form
-# {"vector": [...], "value": c} equivalent to min = max = c.  The vector is
-# unit-normalized at ingestion, so bounds live in unit-projection space
-# (``p = h @ v_hat``).  See :func:`normalize_clamp_entry`.
+# Directional-clamp entry AUTHORING shape: {"vector": [...], "min":
+# float|None, "max": float|None, "strength": float = 1.0}, with the sugar
+# form {"vector": [...], "value": c} equivalent to min = max = c.  Rows
+# are unit-normalized at CONSUMPTION (hashing / materialization), so
+# bounds live in unit-projection space (``p = h @ v_hat``).  See
+# :func:`_parse_clamp_entry` / :meth:`SteeringClamps.from_obj`.
 ClampEntry = dict[str, Any]
 
-# Full clamp spec: {hook_point_name: {layer_idx: [ClampEntry, ...]}}.
-# Unlike ``SteeringVectorSpec`` a site holds a LIST of entries — clamps
-# do not compose additively; each direction is an independent constraint.
+# Entry-list clamp AUTHORING shape: {hook: {layer_idx: [ClampEntry, ...]}}.
+# Unlike ``SteeringVectorSpec`` a site holds a LIST of entries — clamps do
+# not compose additively; each direction is an independent constraint.
+# Post-ingestion the canonical representation is :class:`SteeringClamps`;
+# this dict shape (and the packed one below) are accepted client INPUT
+# formats normalized by ``SteeringClamps.from_obj`` at every boundary.
 SteeringClampSpec = dict[str, dict[int, list[ClampEntry]]]
 
 
-# Binary wire form for clamps: one packed blob per hook, mirroring
-# ``SteeringHookPacked``.  ``data`` is a base64-encoded contiguous byte string
-# of a ``(n, hidden)`` array; row ``i`` is the direction for
-# ``layer_indices[i]``.  Multiple rows may share a layer index — entry order
-# WITHIN a layer is preserved (it is semantic: the concat order of the tier
-# merge and the per-site K budget).  ``bounds`` and ``strengths`` stay as small
-# JSON lists (only the direction vectors are bulk).  In ``bounds`` a ``null``
-# component means an infinite bound (``lo`` null -> ``-inf``, ``hi`` null ->
-# ``+inf``); all present bounds must be finite JSON floats.
+# Legacy base64-packed clamp INPUT shape: one packed blob per hook,
+# mirroring ``SteeringHookPacked``.  ``data`` is a base64-encoded
+# contiguous byte string of a ``(n, hidden)`` array; row ``i`` is the
+# direction for ``layer_indices[i]``.  Multiple rows may share a layer
+# index — entry order WITHIN a layer is preserved (it is semantic: the
+# concat order of the tier merge and the per-site K budget).  ``bounds``
+# and ``strengths`` stay as small JSON lists (only the direction vectors
+# are bulk).  In ``bounds`` a ``null`` component means an infinite bound
+# (``lo`` null -> ``-inf``, ``hi`` null -> ``+inf``); all present bounds
+# must be finite JSON floats.
 #
-# Hash parity: pack direction rows at ``float64`` (see
-# :func:`pack_steering_clamps`) so the unpacked-then-normalized direction feeds
-# :func:`hash_steering_config` with the same float64 precision as a JSON
-# submission, giving bit-identical prefill/decode config hashes.  Packing at a
-# narrower dtype is accepted on decode but may not bit-match a JSON submission
-# of the same config (a one-time prefix-cache miss, mirroring the steering
-# vector packed path).
+# Accepted as client input only; ``SteeringClamps.from_obj`` upcasts the
+# rows exactly to float64 at ingestion.  Submitting at ``float64`` hashes
+# bit-identically to the equivalent JSON submission; narrower dtypes are
+# accepted but may not bit-match (a one-time prefix-cache miss, mirroring
+# the steering vector packed path).
 class ClampHookPacked(TypedDict):
     dtype: str  # "float64" | "float32" | "float16" | "bfloat16"
     shape: list[int]  # [n, hidden]
@@ -182,104 +187,534 @@ def _validate_packed_clamp_blob(
     return dtype, n, hidden
 
 
-def unpack_steering_clamps(
-    packed: SteeringClampSpecPacked | None,
-) -> SteeringClampSpec | None:
-    """Decode a packed clamp spec to the canonical list-of-entries form.
+def _clamp_unit_rows(dirs: np.ndarray) -> np.ndarray:
+    """Unit-normalize each row of a float64 ``(n, hidden)`` array.
 
-    Clamp sibling of :func:`unpack_steering_vectors`.  Each hook's contiguous
-    ``(n, hidden)`` blob is base64-decoded, reshaped, and split into per-layer
-    entry lists keyed by ``layer_indices`` — preserving row order so multiple
-    directions on the same layer keep their tier-concat order.  Bounds map
-    ``null`` to ``±inf``; the produced entries are the canonical
-    ``{"vector", "min", "max", "strength"}`` dicts (direction NOT unit-
-    normalized here — :func:`normalize_clamp_entry`, run downstream by the hash
-    path and the worker manager, does that idempotently).
-
-    Returns ``None`` if *packed* is ``None`` or empty.  Raises ``ValueError``
-    on any structural mismatch.
+    Per-row scalar ``np.linalg.norm`` + division, matching the arithmetic
+    the entry-wise normalization used, so hashes and materialized device
+    tensors stay bit-identical to the entry-list era.
     """
-    if not packed:
-        return None
-    import pybase64 as base64
-
-    result: SteeringClampSpec = {}
-    for hook, blob in packed.items():
-        dtype, n, hidden = _validate_packed_clamp_blob(hook, blob)
-        raw = base64.b64decode(blob["data"])
-        stacked = np.frombuffer(raw, dtype=dtype).reshape((n, hidden))
-        layer_indices = blob["layer_indices"]
-        bounds = blob["bounds"]
-        strengths = blob["strengths"]
-        hook_layers: dict[int, list[ClampEntry]] = {}
-        for i in range(n):
-            layer_idx = int(layer_indices[i])
-            lo_raw, hi_raw = bounds[i]
-            lo = -math.inf if lo_raw is None else float(lo_raw)
-            hi = math.inf if hi_raw is None else float(hi_raw)
-            entry: ClampEntry = {
-                "vector": stacked[i].tolist(),
-                "min": lo,
-                "max": hi,
-                "strength": float(strengths[i]),
-            }
-            hook_layers.setdefault(layer_idx, []).append(entry)
-        if hook_layers:
-            result[hook] = hook_layers
-    return result or None
+    out = np.empty_like(dirs)
+    for i in range(dirs.shape[0]):
+        norm = float(np.linalg.norm(dirs[i]))
+        if norm == 0.0:
+            raise ValueError(
+                "Clamp entry vector must be non-zero "
+                "(a zero vector cannot be normalized to a direction)"
+            )
+        out[i] = dirs[i] / norm
+    return out
 
 
-def pack_steering_clamps(
-    spec: SteeringClampSpec | None,
-    dtype: np.dtype | str = np.float64,
-) -> SteeringClampSpecPacked | None:
-    """Pack a canonical clamp spec into the binary wire form.
+def _check_clamp_rows(rows: np.ndarray, field_name: str, hook: str) -> None:
+    """Reject non-finite or zero direction rows at ingestion."""
+    if not np.all(np.isfinite(rows)):
+        raise ValueError(
+            f"{field_name}[{hook!r}]: clamp direction rows must contain "
+            f"only finite floats"
+        )
+    if rows.size and bool((np.linalg.norm(rows, axis=1) == 0.0).any()):
+        raise ValueError(
+            f"{field_name}[{hook!r}]: clamp direction rows must be non-zero"
+        )
 
-    Inverse of :func:`unpack_steering_clamps`.  Within a hook, layers are
-    emitted in sorted order and entries in list order, so unpack reconstructs
-    the same per-layer ordering.  ``±inf`` bounds are encoded as JSON ``null``.
 
-    The default ``float64`` direction dtype guarantees the packed request hashes
-    bit-identically to the equivalent JSON submission (see
-    :class:`ClampHookPacked`).  Returns ``None`` if *spec* is ``None`` / empty.
+def _parse_clamp_entry(
+    entry: ClampEntry,
+) -> tuple[np.ndarray, float, float, float]:
+    """Return ``(raw_f64_direction, lo, hi, strength)`` from a clamp entry.
+
+    Structure-only sibling of the old ``normalize_clamp_entry``: same
+    validation and ``value``-sugar / omitted-bound resolution, but the
+    direction is returned raw (float64, NOT unit-normalized) — the
+    canonical :class:`SteeringClamps` stores rows as submitted and
+    consumers normalize via :func:`_clamp_unit_rows`.
+
+    Raises ``ValueError`` on: missing/zero/non-finite vector, no bound at
+    all, ``value`` combined with ``min``/``max``, ``min > max``, NaN
+    bounds, or ``strength`` outside ``[0, 1]``.
     """
-    if not spec:
-        return None
-    import pybase64 as base64
+    if not isinstance(entry, dict):
+        raise TypeError(f"Clamp entry must be a dict, got {type(entry).__name__}")
+    allowed = {"vector", "value", "min", "max", "strength"}
+    extra = set(entry.keys()) - allowed
+    if extra:
+        raise ValueError(
+            f"Clamp entry has unexpected keys: {sorted(extra)}; "
+            f"allowed keys: {sorted(allowed)}"
+        )
+    if "vector" not in entry:
+        raise ValueError("Clamp entry missing required key 'vector'")
 
-    np_dtype = np.dtype(dtype)
-    result: SteeringClampSpecPacked = {}
-    for hook, layer_dict in spec.items():
-        if not layer_dict:
-            continue
-        rows: list[np.ndarray] = []
-        layer_indices: list[int] = []
-        bounds: list[list[float | None]] = []
-        strengths: list[float] = []
-        for layer_idx in sorted(layer_dict.keys()):
-            for entry in layer_dict[layer_idx]:
-                vec, lo, hi, strength = normalize_clamp_entry(entry)
-                rows.append(np.asarray(vec, dtype=np_dtype))
-                layer_indices.append(int(layer_idx))
-                bounds.append(
-                    [
-                        None if math.isinf(lo) else lo,
-                        None if math.isinf(hi) else hi,
-                    ]
+    has_value = entry.get("value") is not None
+    has_min = entry.get("min") is not None
+    has_max = entry.get("max") is not None
+    if has_value and (has_min or has_max):
+        raise ValueError("Clamp entry 'value' is mutually exclusive with 'min'/'max'")
+    if has_value:
+        val = float(entry["value"])
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError(f"Clamp entry 'value' must be finite, got {val}")
+        lo = hi = val
+    else:
+        if not has_min and not has_max:
+            raise ValueError(
+                "Clamp entry must set at least one of 'value', 'min', 'max'"
+            )
+        lo = float(entry["min"]) if has_min else -math.inf
+        hi = float(entry["max"]) if has_max else math.inf
+        if math.isnan(lo) or math.isnan(hi):
+            raise ValueError(
+                f"Clamp entry bounds must not be NaN, got min={lo}, max={hi}"
+            )
+        if lo > hi:
+            raise ValueError(f"Clamp entry min ({lo}) must be <= max ({hi})")
+
+    strength = float(entry.get("strength", 1.0))
+    if math.isnan(strength) or not (0.0 <= strength <= 1.0):
+        raise ValueError(f"Clamp entry strength must be in [0, 1], got {strength}")
+
+    arr = np.asarray(entry["vector"], dtype=np.float64)
+    if arr.ndim != 1 or arr.size == 0:
+        raise ValueError(
+            f"Clamp entry vector must be a non-empty 1-D float list, "
+            f"got shape {arr.shape}"
+        )
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Clamp entry vector must contain only finite floats")
+    if float(np.linalg.norm(arr)) == 0.0:
+        raise ValueError(
+            "Clamp entry vector must be non-zero "
+            "(a zero vector cannot be normalized to a direction)"
+        )
+    return arr, lo, hi, strength
+
+
+class ClampHookTable(
+    msgspec.Struct,
+    omit_defaults=True,
+    forbid_unknown_fields=True,
+):
+    """One hook point's clamp directions in the canonical packed layout.
+
+    ``data`` holds ``shape[0]`` float64 little-endian C-contiguous rows,
+    stored exactly as submitted (NOT unit-normalized — every consumer
+    normalizes per row via :func:`_clamp_unit_rows`, so bound semantics
+    stay in unit-projection space regardless of the client's vector
+    scale).  Row order is semantic: within a layer it is the tier-merge
+    concat order and the per-site K budget.
+
+    ``lo``/``hi`` carry true ``±inf`` for open bounds (msgpack encodes
+    non-finite floats natively); the JSON form produced by
+    :meth:`SteeringClamps.to_json_obj` maps them to ``null``.
+
+    Instances are immutable by contract once ingested: they are shared by
+    reference across clones, caches and RPC payloads.
+    """
+
+    shape: list[int]
+    layer_indices: list[int]
+    data: bytes
+    lo: list[float]
+    hi: list[float]
+    strength: list[float]
+
+    def __post_init__(self) -> None:
+        # Structural invariants only — this runs on typed msgpack decode
+        # too, so every process receiving a table over the wire re-checks
+        # them.  Row-content checks (finite, non-zero) live in
+        # ``SteeringClamps.from_obj`` to keep our own wire decode cheap.
+        if len(self.shape) != 2:
+            raise ValueError(
+                f"ClampHookTable.shape must be 2-D [n, hidden]; got {self.shape}"
+            )
+        n, hidden = int(self.shape[0]), int(self.shape[1])
+        if n < 1 or hidden < 1:
+            raise ValueError(
+                f"ClampHookTable.shape entries must be >= 1; got {self.shape}"
+            )
+        if len(self.data) != n * hidden * 8:
+            raise ValueError(
+                f"ClampHookTable.data length {len(self.data)} != expected "
+                f"{n * hidden * 8} (shape={self.shape}, float64)"
+            )
+        for name, vals in (
+            ("layer_indices", self.layer_indices),
+            ("lo", self.lo),
+            ("hi", self.hi),
+            ("strength", self.strength),
+        ):
+            if len(vals) != n:
+                raise ValueError(
+                    f"ClampHookTable.{name} length ({len(vals)}) must equal "
+                    f"shape[0] ({n})"
                 )
-                strengths.append(strength)
-        if not rows:
-            continue
-        stacked = np.stack(rows).astype(np_dtype, copy=False)
-        result[hook] = {
-            "dtype": np_dtype.name,
-            "shape": [int(stacked.shape[0]), int(stacked.shape[1])],
-            "layer_indices": layer_indices,
-            "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
-            "bounds": bounds,
-            "strengths": strengths,
-        }
-    return result or None
+        for layer in self.layer_indices:
+            if not isinstance(layer, int) or isinstance(layer, bool) or layer < 0:
+                raise ValueError(
+                    f"ClampHookTable.layer_indices entries must be "
+                    f"non-negative ints; got {layer!r}"
+                )
+        for i in range(n):
+            lo, hi = self.lo[i], self.hi[i]
+            if math.isnan(lo) or math.isnan(hi):
+                raise ValueError(
+                    f"Clamp entry bounds must not be NaN, got min={lo}, max={hi}"
+                )
+            if lo > hi:
+                raise ValueError(f"Clamp entry min ({lo}) must be <= max ({hi})")
+            strength = self.strength[i]
+            if math.isnan(strength) or not (0.0 <= strength <= 1.0):
+                raise ValueError(
+                    f"Clamp entry strength must be in [0, 1], got {strength}"
+                )
+
+    @property
+    def num_rows(self) -> int:
+        return int(self.shape[0])
+
+    @property
+    def width(self) -> int:
+        return int(self.shape[1])
+
+    def rows(self) -> np.ndarray:
+        """Zero-copy read-only ``(n, hidden)`` float64 view of ``data``."""
+        return np.frombuffer(self.data, dtype=np.float64).reshape(
+            self.num_rows, self.width
+        )
+
+    def by_layer(
+        self,
+    ) -> list[tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Group rows per layer: ``[(layer, dirs, lo, hi, strength), ...]``.
+
+        Layers ascend; row order within a layer is preserved (it is
+        semantic — the tier-merge concat order), including for
+        interleaved ``layer_indices``.
+        """
+        rows = self.rows()
+        lo = np.asarray(self.lo, dtype=np.float64)
+        hi = np.asarray(self.hi, dtype=np.float64)
+        strength = np.asarray(self.strength, dtype=np.float64)
+        groups: dict[int, list[int]] = {}
+        for i, layer in enumerate(self.layer_indices):
+            groups.setdefault(int(layer), []).append(i)
+        return [
+            (layer, rows[idx], lo[idx], hi[idx], strength[idx])
+            for layer, idx in sorted(groups.items())
+        ]
+
+    def site_counts(self) -> dict[int, int]:
+        """Rows per layer index (the per-site K usage)."""
+        return dict(Counter(int(layer) for layer in self.layer_indices))
+
+    @classmethod
+    def concat(cls, first: ClampHookTable, second: ClampHookTable) -> ClampHookTable:
+        """Row-wise concatenation (*first* rows before *second*)."""
+        if first.width != second.width:
+            raise ValueError(
+                f"Cannot concat clamp tables of widths {first.width} and {second.width}"
+            )
+        return cls(
+            shape=[first.num_rows + second.num_rows, first.width],
+            layer_indices=[*first.layer_indices, *second.layer_indices],
+            data=first.data + second.data,
+            lo=[*first.lo, *second.lo],
+            hi=[*first.hi, *second.hi],
+            strength=[*first.strength, *second.strength],
+        )
+
+
+_CLAMP_TABLE_KEYS = frozenset(
+    ("shape", "layer_indices", "data", "lo", "hi", "strength")
+)
+
+
+class SteeringClamps(
+    msgspec.Struct,
+    omit_defaults=True,
+    forbid_unknown_fields=True,
+):
+    """Canonical directional-clamp spec: ``{hook_point: ClampHookTable}``.
+
+    The single post-ingestion representation of a clamp tier.  Every
+    boundary (HTTP request build, ``SamplingParams`` validation, module
+    registration, global set, dynamic overrides, worker RPC receivers)
+    normalizes its input through :meth:`from_obj` and everything
+    downstream — the ZMQ ADD hop, tier merging, config hashing, worker
+    materialization — consumes this type unchanged.  ``data`` rides
+    msgpack ``bin`` on internal hops (no base64).
+    """
+
+    # ``forbid_unknown_fields`` makes the strict wire decode REJECT the
+    # legacy verbatim entry-list shape (hook names are unknown fields on
+    # this Struct) instead of silently decoding it to an empty spec —
+    # a malformed/outdated frontend must fail loudly, not run unclamped.
+    hooks: dict[str, ClampHookTable] = msgspec.field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.hooks)
+
+    @classmethod
+    def empty(cls) -> SteeringClamps:
+        """The explicit empty spec (dynamic-override REPLACE: clear)."""
+        return cls()
+
+    @classmethod
+    def from_obj(
+        cls,
+        obj: Any,
+        *,
+        field_name: str = "clamps",
+        preserve_empty: bool = False,
+    ) -> SteeringClamps | None:
+        """Normalize any accepted clamp-spec shape to the canonical type.
+
+        Accepts:
+
+        1. a ``SteeringClamps`` instance (passthrough — in-process and
+           Ray/cloudpickle callers);
+        2. the type's own wire map ``{"hooks": {...}}`` as produced by an
+           untyped msgpack decode (``data`` as ``bytes``) or by
+           :meth:`to_json_obj` (``data`` base64, ``null`` bounds);
+        3. legacy JSON entry-lists ``{hook: {layer: [entry, ...]}}`` with
+           int or digit-string layer keys, ``value`` sugar, omitted
+           bounds and default strength;
+        4. legacy base64-packed ``ClampHookPacked`` dicts (any dtype,
+           upcast exactly to float64).
+
+        Empty input (``None`` excepted) collapses to ``None`` unless
+        *preserve_empty* — the dynamic-override REPLACE contract keeps
+        ``None`` = leave unchanged, :meth:`empty` = clear.
+
+        Raises ``ValueError`` (messages prefixed with *field_name*) on any
+        malformed input, including non-finite or zero direction rows.
+        """
+        if obj is None:
+            return None
+        if isinstance(obj, SteeringClamps):
+            if obj.hooks or preserve_empty:
+                return obj
+            return None
+        if not isinstance(obj, dict):
+            raise ValueError(f"{field_name} must be a dict, got {type(obj).__name__}")
+        if not obj:
+            return cls.empty() if preserve_empty else None
+        if set(obj.keys()) == {"hooks"}:
+            return cls._from_wire_map(
+                obj["hooks"], field_name=field_name, preserve_empty=preserve_empty
+            )
+        if _clamps_looks_packed(obj):
+            return cls._from_legacy_packed(obj, field_name=field_name)
+        out = cls._from_entry_lists(obj, field_name=field_name)
+        if out.hooks or preserve_empty:
+            return out
+        return None
+
+    @classmethod
+    def _from_wire_map(
+        cls, hooks_obj: Any, *, field_name: str, preserve_empty: bool
+    ) -> SteeringClamps | None:
+        if not isinstance(hooks_obj, dict):
+            raise ValueError(
+                f"{field_name}.hooks must be a dict, got {type(hooks_obj).__name__}"
+            )
+        if not hooks_obj:
+            return cls.empty() if preserve_empty else None
+        import pybase64 as base64
+
+        hooks: dict[str, ClampHookTable] = {}
+        for hook, blob in hooks_obj.items():
+            if isinstance(blob, ClampHookTable):
+                table = blob
+            elif isinstance(blob, dict) and set(blob.keys()) == _CLAMP_TABLE_KEYS:
+                data = blob["data"]
+                if isinstance(data, str):
+                    data = base64.b64decode(data)
+                try:
+                    table = ClampHookTable(
+                        shape=[int(v) for v in blob["shape"]],
+                        layer_indices=[int(v) for v in blob["layer_indices"]],
+                        data=data,
+                        lo=[-math.inf if v is None else float(v) for v in blob["lo"]],
+                        hi=[math.inf if v is None else float(v) for v in blob["hi"]],
+                        strength=[float(v) for v in blob["strength"]],
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{field_name}[{hook!r}]: {exc}") from exc
+            else:
+                raise ValueError(
+                    f"{field_name}[{hook!r}] is not a valid clamp hook table"
+                )
+            _check_clamp_rows(table.rows(), field_name, hook)
+            hooks[hook] = table
+        return cls(hooks=hooks)
+
+    @classmethod
+    def _from_entry_lists(cls, obj: dict, *, field_name: str) -> SteeringClamps:
+        hooks: dict[str, ClampHookTable] = {}
+        for hook, layer_entries in obj.items():
+            if not isinstance(layer_entries, dict):
+                raise ValueError(
+                    f"{field_name}[{hook!r}] must map layer indices to entry "
+                    f"lists, got {type(layer_entries).__name__}"
+                )
+            layers: dict[int, list] = {}
+            for layer_key, entries in layer_entries.items():
+                layer_idx = layer_key
+                if isinstance(layer_idx, str) and layer_idx.isdigit():
+                    layer_idx = int(layer_idx)
+                if (
+                    not isinstance(layer_idx, int)
+                    or isinstance(layer_idx, bool)
+                    or layer_idx < 0
+                ):
+                    raise ValueError(
+                        f"{field_name}[{hook!r}] has invalid layer index "
+                        f"{layer_key!r}; expected a non-negative integer"
+                    )
+                if not isinstance(entries, list):
+                    raise ValueError(
+                        f"{field_name}[{hook!r}][{layer_idx}] must be a list "
+                        f"of clamp entries, got {type(entries).__name__}"
+                    )
+                layers[layer_idx] = entries
+            rows: list[np.ndarray] = []
+            layer_indices: list[int] = []
+            lo: list[float] = []
+            hi: list[float] = []
+            strength: list[float] = []
+            width: int | None = None
+            for layer_idx in sorted(layers):
+                for entry in layers[layer_idx]:
+                    try:
+                        vec, entry_lo, entry_hi, entry_strength = _parse_clamp_entry(
+                            entry
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"{field_name}[{hook!r}][{layer_idx}]: {exc}"
+                        ) from exc
+                    if width is None:
+                        width = int(vec.shape[0])
+                    elif int(vec.shape[0]) != width:
+                        raise ValueError(
+                            f"{field_name}[{hook!r}][{layer_idx}]: direction "
+                            f"width {int(vec.shape[0])} != {width} of earlier "
+                            f"entries in the same hook"
+                        )
+                    rows.append(vec)
+                    layer_indices.append(layer_idx)
+                    lo.append(entry_lo)
+                    hi.append(entry_hi)
+                    strength.append(entry_strength)
+            if not rows:
+                continue
+            stacked = np.ascontiguousarray(np.stack(rows), dtype=np.float64)
+            hooks[hook] = ClampHookTable(
+                shape=[int(stacked.shape[0]), int(stacked.shape[1])],
+                layer_indices=layer_indices,
+                data=stacked.tobytes(),
+                lo=lo,
+                hi=hi,
+                strength=strength,
+            )
+        return cls(hooks=hooks)
+
+    @classmethod
+    def _from_legacy_packed(cls, obj: dict, *, field_name: str) -> SteeringClamps:
+        import pybase64 as base64
+
+        hooks: dict[str, ClampHookTable] = {}
+        for hook, blob in obj.items():
+            try:
+                dtype, n, hidden = _validate_packed_clamp_blob(hook, blob)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise ValueError(f"{field_name}: {exc}") from exc
+            raw = base64.b64decode(blob["data"])
+            stacked = (
+                np.frombuffer(raw, dtype=dtype).reshape((n, hidden)).astype(np.float64)
+            )
+            _check_clamp_rows(stacked, field_name, hook)
+            lo: list[float] = []
+            hi: list[float] = []
+            for pair in blob["bounds"]:
+                lo_raw, hi_raw = pair
+                lo.append(-math.inf if lo_raw is None else float(lo_raw))
+                hi.append(math.inf if hi_raw is None else float(hi_raw))
+            try:
+                hooks[hook] = ClampHookTable(
+                    shape=[n, hidden],
+                    layer_indices=[int(v) for v in blob["layer_indices"]],
+                    data=np.ascontiguousarray(stacked).tobytes(),
+                    lo=lo,
+                    hi=hi,
+                    strength=[float(v) for v in blob["strengths"]],
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{field_name}[{hook!r}]: {exc}") from exc
+        return cls(hooks=hooks)
+
+    def to_json_obj(self) -> dict[str, Any]:
+        """JSON-safe form of the wire map: base64 ``data``, ``null`` for
+        infinite bounds.  ``from_obj`` round-trips it losslessly."""
+        import pybase64 as base64
+
+        hooks: dict[str, Any] = {}
+        for hook, table in self.hooks.items():
+            hooks[hook] = {
+                "shape": list(table.shape),
+                "layer_indices": list(table.layer_indices),
+                "data": base64.b64encode(table.data).decode("ascii"),
+                "lo": [None if math.isinf(v) else v for v in table.lo],
+                "hi": [None if math.isinf(v) else v for v in table.hi],
+                "strength": list(table.strength),
+            }
+        return {"hooks": hooks}
+
+    def validate_row_width(self, expected: int, *, field_name: str = "clamps") -> None:
+        """Reject direction rows whose width differs from *expected*."""
+        for hook, table in self.hooks.items():
+            if table.width != expected:
+                raise ValueError(
+                    f"{field_name}[{hook!r}]: clamp direction width "
+                    f"{table.width} does not match the model hidden size "
+                    f"({expected})"
+                )
+
+    def check_max_directions(
+        self, max_directions: int, *, field_name: str = "clamps"
+    ) -> None:
+        """Enforce the per-(hook, layer) direction budget."""
+        for hook, table in self.hooks.items():
+            for layer, count in sorted(table.site_counts().items()):
+                if count > max_directions:
+                    raise ValueError(
+                        f"Clamp spec [{hook!r}][{layer}] has {count} "
+                        f"directions, exceeding "
+                        f"max_clamp_directions={max_directions}"
+                    )
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type: Any, handler: Any) -> Any:
+        # SamplingParams is embedded in pydantic models (e.g. the disagg
+        # protocol); a bare msgspec Struct field crashes pydantic schema
+        # generation, so define the bridge here.  Lazy imports keep
+        # pydantic out of this module's import graph.
+        from pydantic_core import core_schema
+
+        def _validate(value: Any) -> SteeringClamps | None:
+            return cls.from_obj(value, preserve_empty=True)
+
+        def _serialize(value: Any) -> Any:
+            if isinstance(value, SteeringClamps):
+                return value.to_json_obj()
+            return value
+
+        return core_schema.no_info_plain_validator_function(
+            _validate,
+            serialization=core_schema.plain_serializer_function_ser_schema(_serialize),
+        )
 
 
 def _looks_packed(tier: dict) -> bool:
@@ -518,244 +953,51 @@ def validate_spec_row_widths(
                 )
 
 
-def normalize_clamp_entry(
-    entry: ClampEntry,
-) -> tuple[np.ndarray, float, float, float]:
-    """Return ``(unit_direction, lo, hi, strength)`` from a clamp entry.
-
-    Accepts both the raw user forms (``value`` sugar, omitted bounds) and
-    the canonical form produced by ``SamplingParams`` validation
-    (``min``/``max``/``strength`` all present), so hashing and worker-side
-    resolution normalize identically regardless of which form they see.
-
-    The direction is unit-normalized in float64 — bounds are defined in
-    unit-projection space (``p = h @ v_hat``), so normalizing here (rather
-    than trusting the client) keeps bound semantics portable across
-    vectors.  Idempotent: re-normalizing a unit vector is a no-op.
-
-    Raises ``ValueError`` on: missing/zero/non-finite vector, no bound at
-    all, ``value`` combined with ``min``/``max``, ``min > max``, NaN
-    bounds, or ``strength`` outside ``[0, 1]``.
-    """
-    if not isinstance(entry, dict):
-        raise TypeError(f"Clamp entry must be a dict, got {type(entry).__name__}")
-    allowed = {"vector", "value", "min", "max", "strength"}
-    extra = set(entry.keys()) - allowed
-    if extra:
-        raise ValueError(
-            f"Clamp entry has unexpected keys: {sorted(extra)}; "
-            f"allowed keys: {sorted(allowed)}"
-        )
-    if "vector" not in entry:
-        raise ValueError("Clamp entry missing required key 'vector'")
-
-    has_value = entry.get("value") is not None
-    has_min = entry.get("min") is not None
-    has_max = entry.get("max") is not None
-    if has_value and (has_min or has_max):
-        raise ValueError("Clamp entry 'value' is mutually exclusive with 'min'/'max'")
-    if has_value:
-        val = float(entry["value"])
-        if math.isnan(val) or math.isinf(val):
-            raise ValueError(f"Clamp entry 'value' must be finite, got {val}")
-        lo = hi = val
-    else:
-        if not has_min and not has_max:
-            raise ValueError(
-                "Clamp entry must set at least one of 'value', 'min', 'max'"
-            )
-        lo = float(entry["min"]) if has_min else -math.inf
-        hi = float(entry["max"]) if has_max else math.inf
-        if math.isnan(lo) or math.isnan(hi):
-            raise ValueError(
-                f"Clamp entry bounds must not be NaN, got min={lo}, max={hi}"
-            )
-        if lo > hi:
-            raise ValueError(f"Clamp entry min ({lo}) must be <= max ({hi})")
-
-    strength = float(entry.get("strength", 1.0))
-    if math.isnan(strength) or not (0.0 <= strength <= 1.0):
-        raise ValueError(f"Clamp entry strength must be in [0, 1], got {strength}")
-
-    arr = np.asarray(entry["vector"], dtype=np.float64)
-    if arr.ndim != 1 or arr.size == 0:
-        raise ValueError(
-            f"Clamp entry vector must be a non-empty 1-D float list, "
-            f"got shape {arr.shape}"
-        )
-    if not np.all(np.isfinite(arr)):
-        raise ValueError("Clamp entry vector must contain only finite floats")
-    norm = float(np.linalg.norm(arr))
-    if norm == 0.0:
-        raise ValueError(
-            "Clamp entry vector must be non-zero "
-            "(a zero vector cannot be normalized to a direction)"
-        )
-    return arr / norm, lo, hi, strength
-
-
 def resolve_effective_clamps(
-    base: SteeringClampSpec | None,
-    phase_specific: SteeringClampSpec | None,
+    base: SteeringClamps | dict | None,
+    phase_specific: SteeringClamps | dict | None,
     max_directions: int | None = None,
-) -> SteeringClampSpec | None:
-    """Merge *base* and *phase_specific* clamp specs by concatenation.
+) -> SteeringClamps | None:
+    """Merge *base* and *phase_specific* clamp tiers by concatenation.
 
     Clamps are independent constraints, not addable vectors, so the tier
-    merge is per-``(hook, layer)`` list concatenation with base entries
-    first.  When *max_directions* is given, a site whose merged list
-    exceeds it raises ``ValueError`` (the per-site direction budget is the
-    ``max_clamp_directions`` engine knob — the K dimension of the clamp
-    buffers).  Returns ``None`` if both inputs are ``None`` or empty; a
-    single-sided input passes through unchanged.
+    merge is per-hook table concatenation with base rows first — within
+    any layer, base rows precede phase rows (``by_layer`` grouping
+    preserves relative row order).  When *max_directions* is given, a
+    site whose merged row count exceeds it raises ``ValueError`` (the
+    per-site direction budget is the ``max_clamp_directions`` engine
+    knob — the K dimension of the clamp buffers).  Returns ``None`` if
+    both inputs are ``None`` or empty; a single-sided input passes
+    through unchanged.
 
-    Either input may be the binary :class:`SteeringClampSpecPacked` shape; it
-    is decoded once via :func:`unpack_steering_clamps` before merging, so this
-    is the single seam where the packed per-request/module wire form is turned
-    back into canonical entry lists.
+    Either input may be any shape :meth:`SteeringClamps.from_obj`
+    accepts, so legacy dict-shaped callers keep working.
     """
-    if base is not None and _clamps_looks_packed(base):
-        base = unpack_steering_clamps(base)
-    if phase_specific is not None and _clamps_looks_packed(phase_specific):
-        phase_specific = unpack_steering_clamps(phase_specific)
-
-    def _check_cap(entries: list[ClampEntry], hook: str, layer_idx: int) -> None:
-        if max_directions is not None and len(entries) > max_directions:
-            raise ValueError(
-                f"Clamp spec [{hook!r}][{layer_idx}] has {len(entries)} "
-                f"directions after tier merge, exceeding "
-                f"max_clamp_directions={max_directions}"
-            )
-
-    base_empty = not base
-    phase_empty = not phase_specific
-    if base_empty and phase_empty:
+    base_spec = SteeringClamps.from_obj(base)
+    phase_spec = SteeringClamps.from_obj(phase_specific)
+    if base_spec is None and phase_spec is None:
         return None
-    if phase_empty:
-        assert base is not None
-        for hook, layers in base.items():
-            for layer_idx, entries in layers.items():
-                _check_cap(entries, hook, layer_idx)
-        return base
-    if base_empty:
-        assert phase_specific is not None
-        for hook, layers in phase_specific.items():
-            for layer_idx, entries in layers.items():
-                _check_cap(entries, hook, layer_idx)
-        return phase_specific
-
-    assert base is not None and phase_specific is not None
-    result: SteeringClampSpec = {}
-    all_hooks = set(base.keys()) | set(phase_specific.keys())
-    for hook in all_hooks:
-        base_layers = base.get(hook, {})
-        phase_layers = phase_specific.get(hook, {})
-        hook_result: dict[int, list[ClampEntry]] = {}
-        for layer_idx in set(base_layers.keys()) | set(phase_layers.keys()):
-            merged = list(base_layers.get(layer_idx, [])) + list(
-                phase_layers.get(layer_idx, [])
-            )
-            if not merged:
-                continue
-            _check_cap(merged, hook, layer_idx)
-            hook_result[layer_idx] = merged
-        if hook_result:
-            result[hook] = hook_result
-    return result if result else None
-
-
-def coerce_clamp_spec(
-    tier: dict | None,
-    *,
-    unpack_packed: bool = False,
-) -> SteeringClampSpec | None:
-    """Return *tier* as a ``SteeringClampSpec``-shaped dict with int layer keys.
-
-    Clamp sibling of :func:`coerce_steering_spec`.  Layer-index keys arriving
-    as strings over JSON are coerced to ``int``; entry lists pass through
-    untouched (deep validation happens at ``SamplingParams`` / worker ingestion
-    via :func:`normalize_clamp_entry`).  Returns ``None`` if *tier* is ``None``
-    or empty; raises ``ValueError`` on a non-dict hook value or a non-integer
-    layer key.
-
-    Packed handling: when *tier* is the binary :class:`SteeringClampSpecPacked`
-    shape and *unpack_packed* is ``False`` (the per-request default), it is
-    returned verbatim — the request keeps the packed form all the way to
-    worker-side resolution.  When *unpack_packed* is ``True`` (used by the
-    one-shot global-set and named-module ingestion seams, which validate and
-    broadcast eagerly) it is decoded to canonical entries here.
-    """
-    if not tier:
-        return None
-    if _clamps_looks_packed(tier):
-        return unpack_steering_clamps(tier) if unpack_packed else tier
-    result: SteeringClampSpec = {}
-    for hook, layer_entries in tier.items():
-        if not isinstance(layer_entries, dict):
-            raise ValueError(
-                f"Clamp tier {hook!r} must map layer indices to entry "
-                f"lists, got {type(layer_entries).__name__}"
-            )
-        coerced: dict[int, list[ClampEntry]] = {}
-        for layer_key, entries in layer_entries.items():
-            try:
-                coerced[int(layer_key)] = entries
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Clamp tier {hook!r} has invalid layer index "
-                    f"{layer_key!r}; expected an integer"
-                ) from exc
-        if coerced:
-            result[hook] = coerced
-    return result or None
-
-
-def validate_clamp_row_widths(
-    spec: SteeringClampSpec | None,
-    expected_width: int,
-    *,
-    field_name: str,
-) -> None:
-    """Raise ``ValueError`` when any clamp direction in *spec* is not
-    ``expected_width`` wide.
-
-    Clamp-spec sibling of :func:`validate_spec_row_widths`: wrong-width
-    directions pass structural validation but would shape-crash the
-    worker's clamp table population, so every seam that accepts client
-    clamps must width-check before anything is broadcast or admitted.
-
-    Handles both the JSON entry-list shape and the binary
-    :class:`SteeringClampSpecPacked` shape (checking ``shape[1]`` per hook
-    blob) without decoding the packed payload.
-    """
-    if not spec:
-        return
-    if _clamps_looks_packed(spec):
-        for hook_name, blob in spec.items():
-            _dtype, _n, hidden = _validate_packed_clamp_blob(hook_name, blob)
-            if hidden != expected_width:
-                raise ValueError(
-                    f"{field_name}[{hook_name!r}]: packed clamp direction width "
-                    f"{hidden} != expected steering row width "
-                    f"{expected_width} (model hidden size)"
-                )
-        return
-    for hook_name, layers in spec.items():
-        for layer_idx, entries in layers.items():
-            for i, entry in enumerate(entries):
-                vector = entry.get("vector") if isinstance(entry, dict) else None
-                if vector is None:
-                    raise ValueError(
-                        f"{field_name}[{hook_name!r}][{layer_idx}][{i}]: "
-                        f"clamp entry missing 'vector'"
-                    )
-                if len(vector) != expected_width:
-                    raise ValueError(
-                        f"{field_name}[{hook_name!r}][{layer_idx}][{i}]: "
-                        f"clamp direction width {len(vector)} != expected "
-                        f"steering row width {expected_width} "
-                        f"(model hidden size)"
-                    )
+    if phase_spec is None:
+        merged = base_spec
+    elif base_spec is None:
+        merged = phase_spec
+    else:
+        hooks: dict[str, ClampHookTable] = {}
+        for hook in base_spec.hooks.keys() | phase_spec.hooks.keys():
+            base_table = base_spec.hooks.get(hook)
+            phase_table = phase_spec.hooks.get(hook)
+            if base_table is None:
+                assert phase_table is not None
+                hooks[hook] = phase_table
+            elif phase_table is None:
+                hooks[hook] = base_table
+            else:
+                hooks[hook] = ClampHookTable.concat(base_table, phase_table)
+        merged = SteeringClamps(hooks=hooks)
+    assert merged is not None
+    if max_directions is not None:
+        merged.check_max_directions(max_directions)
+    return merged
 
 
 def _scale_vector(vec: list[float] | np.ndarray, scale: float) -> np.ndarray:
@@ -1044,7 +1286,7 @@ def merge_steering_specs(
 def hash_steering_config(
     effective_vectors: dict[str, dict[int, list[float] | np.ndarray]] | None,
     module_ref: tuple[str, float] | None = None,
-    clamps: SteeringClampSpec | None = None,
+    clamps: SteeringClamps | dict | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 
@@ -1066,17 +1308,20 @@ def hash_steering_config(
     cast happens exactly once at the ``tobytes`` boundary, so hashes are
     bit-for-bit identical regardless of the input container.
 
-    *clamps* is an optional :data:`SteeringClampSpec`.  Clamp entries are
-    folded into the digest behind their own domain separator (after the
-    module_ref segment), so a clamps-bearing request gets a distinct,
-    nonzero hash — that nonzero hash is what reserves the request's
-    steering table row through the scheduler.  When ``clamps`` is ``None``
-    or empty the digest byte stream is untouched, keeping vector-only
-    hashes bit-for-bit identical to the pre-clamp behavior.  Entries are
-    normalized via :func:`normalize_clamp_entry` before hashing, so raw
-    (``value`` sugar) and canonical forms hash identically.
+    *clamps* is an optional clamp tier in any shape
+    :meth:`SteeringClamps.from_obj` accepts.  Clamp rows are folded into
+    the digest behind their own domain separator (after the module_ref
+    segment), so a clamps-bearing request gets a distinct, nonzero hash —
+    that nonzero hash is what reserves the request's steering table row
+    through the scheduler.  When ``clamps`` is ``None`` or empty the
+    digest byte stream is untouched, keeping vector-only hashes
+    bit-for-bit identical to the pre-clamp behavior.  Rows are
+    unit-normalized before hashing (bounds live in unit-projection
+    space), so differently-scaled submissions of the same direction hash
+    identically.
     """
-    if not effective_vectors and module_ref is None and not clamps:
+    clamp_spec = SteeringClamps.from_obj(clamps)
+    if not effective_vectors and module_ref is None and clamp_spec is None:
         return 0
     h = hashlib.sha256()
     if effective_vectors:
@@ -1110,23 +1355,23 @@ def hash_steering_config(
         h.update(b"\x00module_ref\x00")
         h.update(name.encode("utf-8"))
         h.update(np.float64(scale).tobytes())
-    if clamps:
+    if clamp_spec:
         # Domain separator: a clamps-only request can never collide with a
         # vector or module_ref request whose content happens to serialize
-        # to the same bytes.  Entry list order is preserved in the digest —
-        # it is semantic (concat order of the tier merge).
+        # to the same bytes.  Row order within a layer is preserved in the
+        # digest — it is semantic (concat order of the tier merge).
         h.update(b"\x00clamps\x00")
-        for hook in sorted(clamps.keys()):
+        for hook in sorted(clamp_spec.hooks.keys()):
             h.update(hook.encode())
-            layer_dict = clamps[hook]
-            for layer_idx in sorted(layer_dict.keys()):
+            table = clamp_spec.hooks[hook]
+            for layer_idx, dirs, lo, hi, strength in table.by_layer():
                 h.update(layer_idx.to_bytes(4, "little", signed=True))
-                for entry in layer_dict[layer_idx]:
-                    vec, lo, hi, strength = normalize_clamp_entry(entry)
-                    h.update(np.asarray(vec, dtype=np.float32).tobytes())
-                    h.update(np.float64(lo).tobytes())
-                    h.update(np.float64(hi).tobytes())
-                    h.update(np.float64(strength).tobytes())
+                unit = _clamp_unit_rows(dirs).astype(np.float32)
+                for i in range(unit.shape[0]):
+                    h.update(unit[i].tobytes())
+                    h.update(np.float64(lo[i]).tobytes())
+                    h.update(np.float64(hi[i]).tobytes())
+                    h.update(np.float64(strength[i]).tobytes())
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
 
@@ -1162,51 +1407,12 @@ def maybe_pack_inline_steering_for_request(
        ``effective_*_steering`` cached_properties so worker-side reads
        return them directly without re-resolving.
 
-    Directional clamps are packed the same way: any JSON (unpacked) clamp
-    tier is replaced in place with its :func:`pack_steering_clamps` binary
-    form (float64 directions, so the packed request hashes bit-identically to
-    the JSON one).  The prefill/decode config hashes are primed from the fp64
-    JSON entries before the swap, so a clamp-only request keeps its cache
-    identity across the pack.  Already-packed tiers (client-submitted binary
-    form) are left untouched.
+    Directional clamps need no packing here: the ``steering_clamps``
+    fields are already the canonical :class:`SteeringClamps` after
+    ``__post_init__``, which is itself the efficient wire form (msgpack
+    map with binary row data) — and clamp width validation happens engine
+    side in the input processor, the one seam every frontend crosses.
     """
-    # Clamp width gate. Runs before the vector-only early returns because a
-    # clamp-only request has no inline vectors to pack but its directions
-    # must still be width-checked here — this helper is the one seam every
-    # inline request crosses before the multiprocessing boundary.
-    if expected_row_width is not None:
-        for clamp_field, clamp_spec in (
-            ("steering_clamps", sp.steering_clamps),
-            ("prefill_steering_clamps", sp.prefill_steering_clamps),
-            ("decode_steering_clamps", sp.decode_steering_clamps),
-        ):
-            validate_clamp_row_widths(
-                clamp_spec, expected_row_width, field_name=clamp_field
-            )
-
-    # Pack any JSON clamp tier into the binary wire form.  Done before the
-    # vector-only early return so clamp-only requests are packed too.
-    clamp_fields = (
-        "steering_clamps",
-        "prefill_steering_clamps",
-        "decode_steering_clamps",
-    )
-    has_json_clamps = any(
-        (spec := getattr(sp, f)) is not None and not _clamps_looks_packed(spec)
-        for f in clamp_fields
-    )
-    if has_json_clamps:
-        # Prime the phase hashes against the fp64 JSON entries so the packed
-        # request keeps the same prefix-cache identity (the cached properties
-        # also fold in inline vectors + module_ref, still in their original
-        # form at this point).
-        _ = sp.prefill_steering_config_hash
-        _ = sp.decode_steering_config_hash
-        for f in clamp_fields:
-            spec = getattr(sp, f)
-            if spec is not None and not _clamps_looks_packed(spec):
-                setattr(sp, f, pack_steering_clamps(spec))
-
     if (
         sp.steering_vectors is None
         and sp.prefill_steering_vectors is None

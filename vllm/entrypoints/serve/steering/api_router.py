@@ -11,9 +11,8 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from vllm.config.steering_types import (
-    SteeringClampSpec,
+    SteeringClamps,
     SteeringVectorSpec,
-    coerce_clamp_spec,
     coerce_steering_spec,
     normalize_layer_entry,
 )
@@ -168,7 +167,7 @@ async def set_steering(
     # shape; ``coerce_steering_spec`` decodes the latter to ndarray entries
     # that the downstream resolver/normalizer accepts transparently.
     tiers: dict[str, SteeringVectorSpec] = {}
-    clamp_tiers: dict[str, SteeringClampSpec] = {}
+    clamp_tiers: dict[str, SteeringClamps] = {}
     try:
         if (v := coerce_steering_spec(request.vectors)) is not None:
             tiers["vectors"] = v
@@ -176,16 +175,14 @@ async def set_steering(
             tiers["prefill_vectors"] = v
         if (v := coerce_steering_spec(request.decode_vectors)) is not None:
             tiers["decode_vectors"] = v
-        if (c := coerce_clamp_spec(request.clamps, unpack_packed=True)) is not None:
-            clamp_tiers["clamps"] = c
-        if (
-            c := coerce_clamp_spec(request.prefill_clamps, unpack_packed=True)
-        ) is not None:
-            clamp_tiers["prefill_clamps"] = c
-        if (
-            c := coerce_clamp_spec(request.decode_clamps, unpack_packed=True)
-        ) is not None:
-            clamp_tiers["decode_clamps"] = c
+        for clamp_field, clamp_obj in (
+            ("clamps", request.clamps),
+            ("prefill_clamps", request.prefill_clamps),
+            ("decode_clamps", request.decode_clamps),
+        ):
+            c = SteeringClamps.from_obj(clamp_obj, field_name=clamp_field)
+            if c is not None:
+                clamp_tiers[clamp_field] = c
     except (KeyError, ValueError, TypeError) as err:
         return JSONResponse(
             content={"error": f"Malformed steering payload: {err}"},
@@ -212,7 +209,7 @@ async def set_steering(
         if invalid:
             all_invalid.update(invalid)
     for cspec in clamp_tiers.values():
-        invalid = _validate_hook_points(cspec)
+        invalid = _validate_hook_points(cspec.hooks)
         if invalid:
             all_invalid.update(invalid)
     if all_invalid:
@@ -306,8 +303,8 @@ async def set_steering(
                     for layer_vecs in tier.values():
                         requested_layers.update(layer_vecs.keys())
             for ctier in clamp_tiers.values():
-                for layer_entries in ctier.values():
-                    requested_layers.update(layer_entries.keys())
+                for table in ctier.hooks.values():
+                    requested_layers.update(table.site_counts().keys())
 
             missing = requested_layers - validated_layers
             if missing:
@@ -399,7 +396,7 @@ async def set_steering(
             if tier:
                 all_hooks.update(tier.keys())
         for ctier in clamp_tiers.values():
-            all_hooks.update(ctier.keys())
+            all_hooks.update(ctier.hooks.keys())
 
         return JSONResponse(
             content={

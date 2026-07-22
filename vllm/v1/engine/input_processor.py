@@ -199,7 +199,6 @@ class InputProcessor:
         # on every path: online HTTP, offline LLM(), and the Rust frontend.
         from vllm.config.steering_types import (
             resolve_effective_clamps,
-            validate_clamp_row_widths,
             validate_spec_row_widths,
         )
 
@@ -222,7 +221,8 @@ class InputProcessor:
                 ("prefill_steering_clamps", params.prefill_steering_clamps),
                 ("decode_steering_clamps", params.decode_steering_clamps),
             ):
-                validate_clamp_row_widths(cspec, expected, field_name=field_name)
+                if cspec is not None:
+                    cspec.validate_row_width(expected, field_name=field_name)
             # Per-site K cap after the tier concat — reject over-budget
             # requests here (request-level error) rather than crashing the
             # step thread at manager materialization.

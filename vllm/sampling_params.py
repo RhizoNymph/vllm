@@ -18,13 +18,10 @@ from pydantic.dataclasses import dataclass
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
 from vllm.config.steering_types import (
-    SteeringClampSpec,
+    SteeringClamps,
     SteeringLayerEntry,
     SteeringVectorSpec,
-    _clamps_looks_packed,
-    _validate_packed_clamp_blob,
     hash_steering_config,
-    normalize_clamp_entry,
     normalize_layer_entry,
     resolve_effective_clamps,
     resolve_effective_vectors,
@@ -469,34 +466,35 @@ class SamplingParams(
     """Phase-specific steering vectors added to base during decode only.
     Same format as ``steering_vectors``."""
 
-    steering_clamps: dict[str, Any] | None = None
+    steering_clamps: SteeringClamps | None = None
     """Base directional clamps applied to both prefill and decode phases.
 
-    Typed loosely (per-hook ``Any``) because the field legitimately holds
-    either shape on the wire: the canonical ``SteeringClampSpec``
-    (int-keyed layer dicts) or the binary ``SteeringClampSpecPacked``
-    hook blobs that ``maybe_pack_inline_steering_for_request`` swaps in
-    before the multiprocessing hop.  A union of two dict types is not
-    msgspec-decodable, and a strict canonical annotation makes the
-    engine-core decoder reject every packed request.
-    ``_validate_steering_clamps`` deep-validates both shapes on decode.
-    Keyed by hook point name, then layer index; values are LISTS of clamp
-    entries ``{"vector": [...], "min": float|None, "max": float|None,
-    "strength": float = 1.0}`` (sugar: ``{"vector", "value": c}`` pins
-    ``min = max = c``).  Each entry constrains the hidden state's scalar
-    projection along its (unit-normalized) direction to ``[min, max]``:
+    Post-ingestion this is always the canonical
+    :class:`vllm.config.steering_types.SteeringClamps` — per-hook packed
+    tables of raw float64 direction rows plus bounds/strengths, which is
+    also exactly what crosses the engine-core wire (msgpack map with
+    binary ``data``), so the strict typed decoder on the engine side
+    accepts precisely what the API server sends.  Constructor callers may
+    pass any shape ``SteeringClamps.from_obj`` accepts — JSON entry-lists
+    keyed by hook point then layer index with entries ``{"vector": [...],
+    "min": float|None, "max": float|None, "strength": float = 1.0}``
+    (sugar: ``{"vector", "value": c}`` pins ``min = max = c``), the
+    type's own JSON form, or the legacy base64-packed hook blobs —
+    ``__post_init__`` normalizes the field in place.  Each row constrains
+    the hidden state's scalar projection along its direction
+    (unit-normalized at consumption, so bounds live in unit-projection
+    space) to ``[min, max]``:
     ``h' = h + strength * (clip(h @ v_hat, min, max) - h @ v_hat) * v_hat``.
-    Directions are unit-normalized in place at validation, so bounds live
-    in unit-projection space.  Unlike ``steering_vectors``, tier merging
-    concatenates entries (independent constraints, not addable vectors)."""
+    Unlike ``steering_vectors``, tier merging concatenates rows
+    (independent constraints, not addable vectors)."""
 
-    prefill_steering_clamps: dict[str, Any] | None = None
+    prefill_steering_clamps: SteeringClamps | None = None
     """Phase-specific clamps concatenated after base during prefill only.
-    Same format (and same loose typing) as ``steering_clamps``."""
+    Same format as ``steering_clamps``."""
 
-    decode_steering_clamps: dict[str, Any] | None = None
+    decode_steering_clamps: SteeringClamps | None = None
     """Phase-specific clamps concatenated after base during decode only.
-    Same format (and same loose typing) as ``steering_clamps``."""
+    Same format as ``steering_clamps``."""
 
     _effective_prefill_steering_packed: dict[str, dict[int, np.ndarray]] | None = None
     """In-process pre-resolved + packed prefill-phase steering, in the
@@ -586,9 +584,9 @@ class SamplingParams(
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
         steering_module_ref: tuple[str, float] | None = None,
-        steering_clamps: SteeringClampSpec | None = None,
-        prefill_steering_clamps: SteeringClampSpec | None = None,
-        decode_steering_clamps: SteeringClampSpec | None = None,
+        steering_clamps: SteeringClamps | dict | None = None,
+        prefill_steering_clamps: SteeringClamps | dict | None = None,
+        decode_steering_clamps: SteeringClamps | dict | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -1106,90 +1104,35 @@ class SamplingParams(
                         )
 
     def _validate_steering_clamps(self) -> None:
-        """Validate and canonicalize all clamp spec fields in place.
+        """Normalize the clamp fields to canonical SteeringClamps in place.
 
-        Each entry is rewritten to the canonical form
-        ``{"vector": [unit floats], "min": float, "max": float,
-        "strength": float}`` — sugar resolved, omitted bounds replaced with
-        ``±inf``, direction unit-normalized (float64).  Normalizing at
-        ``__post_init__`` makes this the single ingestion seam for every
-        frontend: msgspec runs it on decode, so the Python HTTP path, the
-        offline ``LLM`` path, and the Rust msgpack path all cross it —
-        and hashes (computed downstream from the canonical form) stay
-        deterministic across frontends and ranks.
+        ``SteeringClamps.from_obj`` accepts every submission shape (JSON
+        entry-lists with int or string layer keys, ``value`` sugar and
+        omitted bounds resolved; the type's own wire/JSON form; the
+        legacy base64-packed blobs) and fully validates row content.
+        Running in ``__post_init__`` makes this the single ingestion seam
+        for every frontend: msgspec runs it on decode, so the Python HTTP
+        path, the offline ``LLM`` path, and the Rust msgpack path all
+        cross it.  Hook-point names are checked here — ``from_obj`` is
+        deliberately model-layer-agnostic.
         """
-        fields_to_check: list[tuple[str, SteeringClampSpec | None]] = [
-            ("steering_clamps", self.steering_clamps),
-            ("prefill_steering_clamps", self.prefill_steering_clamps),
-            ("decode_steering_clamps", self.decode_steering_clamps),
-        ]
-        for field_name, spec in fields_to_check:
-            if spec is None:
-                continue
-            if not isinstance(spec, dict):
-                raise ValueError(
-                    f"{field_name} must be a dict mapping hook point "
-                    "names to dicts of per-layer clamp entry lists."
-                )
-            # Packed binary wire form: validate structure only (base64 length
-            # vs shape, list widths); directions are unit-normalized worker-
-            # side and inside the hash path, not eagerly on the frontend.
-            if _clamps_looks_packed(spec):
-                for hook_name, blob in spec.items():
+        for field_name in (
+            "steering_clamps",
+            "prefill_steering_clamps",
+            "decode_steering_clamps",
+        ):
+            spec = SteeringClamps.from_obj(
+                getattr(self, field_name), field_name=field_name
+            )
+            if spec is not None:
+                for hook_name in spec.hooks:
                     if hook_name not in VALID_HOOK_POINT_NAMES:
                         raise ValueError(
                             f"{field_name} key {hook_name!r} is not a "
                             f"valid hook point. Valid values: "
                             f"{sorted(VALID_HOOK_POINT_NAMES)}."
                         )
-                    try:
-                        _validate_packed_clamp_blob(hook_name, blob)
-                    except (TypeError, ValueError, KeyError) as exc:
-                        raise ValueError(f"{field_name}[{hook_name!r}]: {exc}") from exc
-                continue
-            for hook_name, layer_entries in spec.items():
-                if hook_name not in VALID_HOOK_POINT_NAMES:
-                    raise ValueError(
-                        f"{field_name} key {hook_name!r} is not a "
-                        f"valid hook point. Valid values: "
-                        f"{sorted(VALID_HOOK_POINT_NAMES)}."
-                    )
-                if not isinstance(layer_entries, dict):
-                    raise ValueError(
-                        f"{field_name}[{hook_name!r}] must be a dict "
-                        f"mapping layer indices to clamp entry lists."
-                    )
-                coerced_layers: dict[int, list] = {}
-                for key, entries in layer_entries.items():
-                    prefix = f"{field_name}[{hook_name!r}][{key!r}]"
-                    # Layer keys arrive as strings from frontends that
-                    # forward JSON verbatim (the Rust server); coerce
-                    # like every other ingestion seam.
-                    if isinstance(key, str) and key.isdigit():
-                        key = int(key)
-                    if not isinstance(key, int) or key < 0:
-                        raise ValueError(
-                            f"{field_name}[{hook_name!r}] keys must be "
-                            f"non-negative integers, got {key!r}."
-                        )
-                    if not isinstance(entries, list):
-                        raise ValueError(
-                            f"{prefix} must be a list of clamp entries, "
-                            f"got {type(entries).__name__}."
-                        )
-                    for i, entry in enumerate(entries):
-                        try:
-                            vec, lo, hi, strength = normalize_clamp_entry(entry)
-                        except (TypeError, ValueError) as exc:
-                            raise ValueError(f"{prefix}[{i}]: {exc}") from exc
-                        entries[i] = {
-                            "vector": vec.tolist(),
-                            "min": lo,
-                            "max": hi,
-                            "strength": strength,
-                        }
-                    coerced_layers[key] = entries
-                spec[hook_name] = coerced_layers
+            setattr(self, field_name, spec)
 
     def _validate_single_steering_spec(
         self, field_name: str, spec: SteeringVectorSpec
@@ -1327,20 +1270,19 @@ class SamplingParams(
         )
 
     @cached_property
-    def effective_prefill_clamps(self) -> SteeringClampSpec | None:
+    def effective_prefill_clamps(self) -> SteeringClamps | None:
         """Resolved prefill clamps: base + prefill-specific, concatenated.
 
-        Entries are already canonical (unit direction, resolved bounds)
-        after ``__post_init__`` validation.  The per-site K cap is NOT
-        enforced here — ``max_clamp_directions`` is an engine knob unknown
-        at request-construction time; the entrypoint and worker enforce it.
+        The per-site K cap is NOT enforced here —
+        ``max_clamp_directions`` is an engine knob unknown at
+        request-construction time; the entrypoint and worker enforce it.
         """
         return resolve_effective_clamps(
             self.steering_clamps, self.prefill_steering_clamps
         )
 
     @cached_property
-    def effective_decode_clamps(self) -> SteeringClampSpec | None:
+    def effective_decode_clamps(self) -> SteeringClamps | None:
         """Resolved decode clamps: base + decode-specific, concatenated."""
         return resolve_effective_clamps(
             self.steering_clamps, self.decode_steering_clamps
@@ -1572,6 +1514,11 @@ class SamplingParams(
             self.steering_vectors,
             self.prefill_steering_vectors,
             self.decode_steering_vectors,
+            # SteeringClamps are immutable post-ingestion, so clones share
+            # them by reference too.
+            self.steering_clamps,
+            self.prefill_steering_clamps,
+            self.decode_steering_clamps,
         ):
             if attr is not None:
                 memo[id(attr)] = attr
@@ -1586,6 +1533,8 @@ class SamplingParams(
             "decode_steering_config_hash",
             "effective_prefill_steering",
             "effective_decode_steering",
+            "effective_prefill_clamps",
+            "effective_decode_clamps",
         ):
             if key in self.__dict__:
                 new_sp.__dict__[key] = self.__dict__[key]

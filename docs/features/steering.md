@@ -200,9 +200,13 @@ Per hook point, mirroring `SteeringHookPacked`:
   versus the equivalent JSON submission. Narrower dtypes are accepted but may
   cost a one-time cache miss when the same config is also sent as JSON
   (same trade-off as the packed steering-vector path).
-- The packed form travels verbatim to the engine; the direction is
-  unit-normalized worker-side, so a packed and a JSON submission of the same
-  logical config are interchangeable.
+- Both this packed form and the JSON entry-list form are **client input
+  shapes only**: ingestion normalizes every clamp tier into one canonical
+  in-process type (`SteeringClamps`, `vllm/config/steering_types.py` — raw
+  float64 rows + bounds/strengths per hook), which is also exactly what
+  crosses the APIServer→EngineCore wire (msgpack map with binary row data,
+  no base64). Directions are unit-normalized at consumption, so a packed
+  and a JSON submission of the same logical config are interchangeable.
 
 Legacy JSON and packed clamp tiers can be mixed across fields in the same
 request (e.g. `steering_clamps` packed, `prefill_steering_clamps` JSON). The

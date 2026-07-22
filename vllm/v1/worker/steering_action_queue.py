@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from vllm.config.steering_types import SteeringClamps
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import (
@@ -110,17 +111,19 @@ class RequestSteeringOverride:
     # rather than replacing it). Used by the declarative consumer's ``add``
     # gates so a client's static ``decode_steering_vectors`` are preserved.
     compose_admitted: bool = False
-    # Optional per-override directional clamps, a ``SteeringClampSpec``
-    # (``{hook: {layer: [ClampEntry, ...]}}``). The dynamic row then carries
-    # ``concat(global base clamps, global decode clamps, these)`` — a
-    # closed-loop controller can tighten/loosen bounds mid-decode without
-    # free-list churn. REPLACE semantics on a re-emit that changes the
-    # override in place: ``clamps=None`` KEEPS the override's previous
-    # clamps (the common "only vectors changed" re-emit), ``clamps={}``
-    # CLEARS them, and a non-empty dict replaces them. When
-    # ``compose_admitted`` is set the request's admitted decode clamps are
-    # concatenated BEFORE these. Ignored on a clear (``vectors=None``).
-    clamps: dict[str, dict[int, list[dict]]] | None = None
+    # Optional per-override directional clamps, a
+    # ``vllm.config.steering_types.SteeringClamps`` (the apply path also
+    # revives legacy entry-list dicts via ``from_obj``). The dynamic row
+    # then carries ``concat(global base clamps, global decode clamps,
+    # these)`` — a closed-loop controller can tighten/loosen bounds
+    # mid-decode without free-list churn. REPLACE semantics on a re-emit
+    # that changes the override in place: ``clamps=None`` KEEPS the
+    # override's previous clamps (the common "only vectors changed"
+    # re-emit), an empty spec (``SteeringClamps.empty()`` / ``{}``) CLEARS
+    # them, and a non-empty spec replaces them. When ``compose_admitted``
+    # is set the request's admitted decode clamps are concatenated BEFORE
+    # these. Ignored on a clear (``vectors=None``).
+    clamps: SteeringClamps | dict | None = None
     # Identifies the submitting observer in logs and stats.
     source: str = ""
 

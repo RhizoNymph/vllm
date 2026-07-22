@@ -6,7 +6,7 @@ Covers:
 - ``ChatCompletionRequest`` / ``CompletionRequest`` accept the three clamp
   tier fields and ``to_sampling_params`` int-coerces JSON string layer keys
   and lands canonical (unit-normalized) entries on ``SamplingParams``
-- ``coerce_clamp_spec`` layer-key coercion and error cases
+- ``SteeringClamps.from_obj`` layer-key coercion and error cases
 - ``SteeringModuleRegistry`` clamps tier: registration, validation,
   broadcast dump, at-least-one-tier check
 - ``InputProcessor._validate_steering`` clamp gates: disabled steering,
@@ -15,11 +15,10 @@ Covers:
 
 from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 
 from vllm.config.steering import SteeringConfig
-from vllm.config.steering_types import coerce_clamp_spec
+from vllm.config.steering_types import SteeringClamps
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
 )
@@ -54,26 +53,26 @@ def _make_completion(**extra):
     return CompletionRequest.model_validate({**_COMPLETION_BASE, **extra})
 
 
-class TestCoerceClampSpec:
+class TestFromObjIngestionShapes:
     def test_none_and_empty(self):
-        assert coerce_clamp_spec(None) is None
-        assert coerce_clamp_spec({}) is None
+        assert SteeringClamps.from_obj(None) is None
+        assert SteeringClamps.from_obj({}) is None
 
     def test_string_layer_keys_coerced(self):
-        result = coerce_clamp_spec(_clamps("5"))
-        assert 5 in result["post_block"]
+        result = SteeringClamps.from_obj(_clamps("5"))
+        assert 5 in result.hooks["post_block"].site_counts()
 
     def test_int_layer_keys_pass_through(self):
-        result = coerce_clamp_spec({"post_block": {5: [_clamp_entry()]}})
-        assert 5 in result["post_block"]
+        result = SteeringClamps.from_obj({"post_block": {5: [_clamp_entry()]}})
+        assert 5 in result.hooks["post_block"].site_counts()
 
     def test_bad_layer_key_raises(self):
         with pytest.raises(ValueError, match="layer index"):
-            coerce_clamp_spec({"post_block": {"abc": [_clamp_entry()]}})
+            SteeringClamps.from_obj({"post_block": {"abc": [_clamp_entry()]}})
 
     def test_non_dict_hook_value_raises(self):
         with pytest.raises(ValueError, match="must map"):
-            coerce_clamp_spec({"post_block": [_clamp_entry()]})
+            SteeringClamps.from_obj({"post_block": [_clamp_entry()]})
 
 
 class TestChatProtocolClamps:
@@ -89,12 +88,12 @@ class TestChatProtocolClamps:
             decode_steering_clamps={"post_block": {"6": [_clamp_entry(1, 3.0)]}},
         )
         sp = req.to_sampling_params(max_tokens=100, default_sampling_params={})
-        entry = sp.steering_clamps["post_block"][5][0]
-        # Canonical form: unit direction, resolved bounds.
-        assert np.isclose(np.linalg.norm(entry["vector"]), 1.0)
-        assert entry["min"] == 2.0
-        assert entry["max"] == 2.0
-        assert 6 in sp.decode_steering_clamps["post_block"]
+        # Canonical SteeringClamps: str layer keys coerced, sugar resolved.
+        table = sp.steering_clamps.hooks["post_block"]
+        assert table.layer_indices == [5]
+        assert table.lo == [2.0]
+        assert table.hi == [2.0]
+        assert 6 in sp.decode_steering_clamps.hooks["post_block"].site_counts()
         assert sp.prefill_steering_clamps is None
 
     def test_invalid_entry_rejected_at_sampling_params(self):
@@ -111,7 +110,7 @@ class TestCompletionProtocolClamps:
     def test_to_sampling_params_coerces(self):
         req = _make_completion(steering_clamps=_clamps("7"))
         sp = req.to_sampling_params(max_tokens=100, default_sampling_params={})
-        assert 7 in sp.steering_clamps["post_block"]
+        assert 7 in sp.steering_clamps.hooks["post_block"].site_counts()
 
 
 class TestRegistryClamps:
@@ -121,7 +120,7 @@ class TestRegistryClamps:
         await registry.register(name="c", clamps=_clamps("5"))
         module = registry.get("c")
         assert module.clamps is not None
-        assert 5 in module.clamps["post_block"]
+        assert 5 in module.clamps.hooks["post_block"].site_counts()
 
     @pytest.mark.asyncio
     async def test_dump_for_broadcast_carries_clamps(self):
