@@ -1242,9 +1242,12 @@ def populate_sae_clamp_table(
     only_table = state.clamp_only_if_active
     any_active: torch.Tensor | None = state.any_active
     n_clamp = kind_table.shape[1]
-    if len(clampable_features) != n_clamp:
+    # Claimed spare slots reserve a wider table than the claiming
+    # module's feature list; positions past the list stay zero
+    # (no-clamp), so a narrower list is safe — only wider is an error.
+    if len(clampable_features) > n_clamp:
         raise ValueError(
-            "clampable_features length must equal n_clamp; got "
+            "clampable_features length must not exceed n_clamp; got "
             f"{len(clampable_features)} vs {n_clamp}."
         )
     feature_to_pos: dict[int, int] = {f: i for i, f in enumerate(clampable_features)}

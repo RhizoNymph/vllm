@@ -673,6 +673,81 @@ direct_register_custom_op(
 )
 
 
+def apply_sae_full_reconstruction_out_op(
+    out: torch.Tensor,
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    decoder_bias: torch.Tensor,
+    clampable_features: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    recon_mask: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> None:
+    """Out-variant registered as ``torch.ops.vllm.apply_sae_full_reconstruction_out``.
+
+    The layer shim uses this variant (not the value-returning op)
+    because the FR CUDA path is data-dependent (``torch.nonzero``
+    compaction) and must run as a graph-*splitting* op, eagerly
+    between piecewise CUDA-graph segments.  Splitting ops must mutate
+    a caller-provided buffer — the surrounding captured pieces replay
+    against fixed addresses, so a fresh per-call return tensor would
+    leave the downstream piece reading the stale capture-time address.
+    Mirrors ``unified_attention_with_output``.
+    """
+    out.copy_(
+        apply_sae_full_reconstruction_op(
+            hidden_states,
+            encoder_weight,
+            encoder_bias,
+            threshold,
+            decoder_weight,
+            decoder_bias,
+            clampable_features,
+            clamp_kind,
+            clamp_value,
+            clamp_only_if_active,
+            recon_mask,
+            activation_code,
+            activation_param,
+        )
+    )
+
+
+def apply_sae_full_reconstruction_out_op_fake(
+    out: torch.Tensor,
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    decoder_bias: torch.Tensor,
+    clampable_features: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    recon_mask: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> None:
+    """FX-tracing fake — pure mutation, nothing to return."""
+    return None
+
+
+direct_register_custom_op(
+    op_name="apply_sae_full_reconstruction_out",
+    op_func=apply_sae_full_reconstruction_out_op,
+    fake_impl=apply_sae_full_reconstruction_out_op_fake,
+    mutates_args=["out"],
+    extra_dispatch_keys=("CPU",),
+)
+
+
 def apply_sae_full_reconstruction(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
@@ -915,7 +990,14 @@ def apply_layer_sae_full_reconstruction(
 
     code = _ACTIVATION_TO_CODE[activation]
     param = _activation_to_scalar(activation, activation_params)
-    return torch.ops.vllm.apply_sae_full_reconstruction(
+    # Out-variant + caller-allocated output: the allocation is traced
+    # into the surrounding compiled piece (stable address across CUDA
+    # graph replays) while the data-dependent FR op itself runs eagerly
+    # as a splitting op writing into it.  See
+    # ``apply_sae_full_reconstruction_out_op``.
+    out = torch.empty_like(hidden_states)
+    torch.ops.vllm.apply_sae_full_reconstruction_out(
+        out,
         hidden_states,
         enc_w,
         enc_b,
@@ -930,6 +1012,7 @@ def apply_layer_sae_full_reconstruction(
         code,
         param,
     )
+    return out
 
 
 def populate_sae_full_recon_clamp_table(

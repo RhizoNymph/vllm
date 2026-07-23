@@ -955,6 +955,46 @@ class VllmConfig:
             CaptureConsumerSpec(name="_declarative_steering", params=params)
         )
 
+    def _maybe_add_sae_fr_split_op(self) -> None:
+        """Keep the SAE full-reconstruction op out of CUDA graphs.
+
+        The FR CUDA path compacts active tokens with ``torch.nonzero``
+        (data-dependent output size — a host sync), which is illegal
+        during CUDA-graph capture. When a startup-declared FR module
+        pre-allocates its buffers before capture, the op is traced into
+        the compiled graph, so it must be a graph-splitting op (running
+        eagerly between piecewise cudagraph segments, the attention
+        pattern) and full-graph capture must downgrade to piecewise.
+        The delta op is capture-safe and needs no split.
+        """
+        sc = self.steering_config
+        if sc is None or not any(
+            topo.kind == "sae_full_reconstruction"
+            for topo in getattr(sc, "sae_module_topology", ()) or ()
+        ):
+            return
+        cc = self.compilation_config
+        if cc.mode != CompilationMode.VLLM_COMPILE:
+            return
+        if cc.use_inductor_graph_partition:
+            raise ValueError(
+                "Startup-declared SAE full-reconstruction modules require "
+                "FX-level graph splitting to keep the (capture-unsafe) FR op "
+                "out of CUDA graphs; disable use_inductor_graph_partition or "
+                "serve with --enforce-eager."
+            )
+        fr_op = "vllm::apply_sae_full_reconstruction_out"
+        if cc.splitting_ops is not None and fr_op not in cc.splitting_ops:
+            cc.splitting_ops.append(fr_op)
+        if cc.cudagraph_mode.has_full_cudagraphs():
+            logger.warning_once(
+                "Startup-declared SAE full-reconstruction modules cannot run "
+                "inside full CUDA graphs; downgrading cudagraph_mode from %s "
+                "to PIECEWISE.",
+                cc.cudagraph_mode.name,
+            )
+            cc.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
     def _maybe_imply_patch_source_consumer(self) -> None:
         """Register the ``patch_source`` capture consumer when patching is on.
 
@@ -1521,6 +1561,14 @@ class VllmConfig:
         # through the ``patch_source`` consumer, so ``--enable-patching``
         # implies that consumer. Run before capture-dependent finalization.
         self._maybe_imply_patch_source_consumer()
+
+        # Startup-declared SAE full-reconstruction modules pre-allocate
+        # their buffers before capture, so the FR op is traced into the
+        # graph — and its CUDA path is data-dependent (token compaction
+        # via ``torch.nonzero``), which is illegal inside CUDA-graph
+        # capture. Keep it out of captured regions. Runs after
+        # ``set_splitting_ops_for_v1`` so the default list exists.
+        self._maybe_add_sae_fr_split_op()
 
         maybe_add_capture_split_op(
             self.compilation_config,
