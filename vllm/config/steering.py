@@ -1,10 +1,109 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING
+
 from pydantic import ConfigDict, Field
 
 from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
+
+if TYPE_CHECKING:
+    from vllm.config.vllm import VllmConfig
+
+
+@dataclass(frozen=True)
+class SAEModuleTopology:
+    """Graph-shape summary of one startup-declared SAE steering module.
+
+    Distilled from the module dir's ``manifest.json`` at engine-config
+    build time (no tensor I/O) and carried on
+    ``SteeringConfig.sae_module_topology`` so workers can pre-allocate
+    the module's buffers in ``_init_steering_state`` — before
+    torch.compile tracing / CUDA-graph capture. Holds only what
+    determines buffer shapes and per-slot trace-time constants; feature
+    *ids* and weights are data, delivered later by the frontend
+    broadcast into the pre-allocated buffers.
+    """
+
+    name: str
+    kind: str
+    """``"sae_delta"`` or ``"sae_full_reconstruction"``."""
+    layers: tuple[tuple[int, str], ...]
+    """Canonically sorted ``(layer_idx, hook_point)`` sites."""
+    d_model: int
+    d_sae: int
+    n_clamp: int
+    """``len(clampable_features)`` — buffer width only, not the ids."""
+    activation: str
+    """``SAEActivation`` value; baked into the graph per slot."""
+    activation_params: dict[str, float] = field(default_factory=dict)
+
+
+def is_steering_topology_frozen(vllm_config: "VllmConfig | None") -> bool:
+    """Whether SAE buffer topology is fixed after model load.
+
+    True when a compiled artifact or captured CUDA graph will hold
+    references to the steering buffers, so slot/site creation and
+    deletion after ``load_model`` is unsafe — only in-place data
+    updates (weight refresh, deactivation) are allowed. Eager engines
+    return False and keep fully dynamic registration.
+    """
+    if vllm_config is None:
+        return False
+    # Lazy imports: this module is imported during config-package init,
+    # before vllm.config.compilation is guaranteed importable.
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        return False
+    if compilation_config.mode == CompilationMode.VLLM_COMPILE:
+        return True
+    model_config = getattr(vllm_config, "model_config", None)
+    enforce_eager = bool(getattr(model_config, "enforce_eager", False))
+    return not enforce_eager and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+
+
+def sae_topology_mismatch(
+    topo: SAEModuleTopology,
+    *,
+    kind: str,
+    layers: tuple[tuple[int, str], ...],
+    d_model: int,
+    d_sae: int,
+    n_clamp: int,
+    activation: str,
+    activation_params: dict[str, float],
+) -> str | None:
+    """Compare a declared topology against an incoming registration.
+
+    Returns a human-readable description of the first mismatch, or
+    ``None`` when the registration matches the declared graph shape.
+    Single source of truth for both the worker frozen-topology check
+    and the frontend register-endpoint precheck, so the two can never
+    diverge.
+    """
+    if kind != topo.kind:
+        return f"kind {kind!r} != declared {topo.kind!r}"
+    if tuple(sorted(layers)) != topo.layers:
+        return f"sites {sorted(layers)} != declared {list(topo.layers)}"
+    if d_model != topo.d_model:
+        return f"d_model {d_model} != declared {topo.d_model}"
+    if d_sae != topo.d_sae:
+        return f"d_sae {d_sae} != declared {topo.d_sae}"
+    if n_clamp != topo.n_clamp:
+        return f"n_clamp {n_clamp} != declared {topo.n_clamp}"
+    if activation != topo.activation:
+        return f"activation {activation!r} != declared {topo.activation!r}"
+    if dict(activation_params) != topo.activation_params:
+        return (
+            f"activation_params {dict(activation_params)} != declared "
+            f"{topo.activation_params}"
+        )
+    return None
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -66,6 +165,34 @@ class SteeringConfig:
     read them. ``this_token`` probes are computed in-graph and need no capture.
     Empty ⇒ a single default site is captured (see the consumer)."""
 
+    sae_module_topology: list[SAEModuleTopology] = Field(default_factory=list)
+    """Graph-shape summaries of startup-declared SAE modules, distilled
+    from ``--steering-modules`` manifests at engine-config build time.
+    Workers pre-allocate each module's zero-filled buffers in
+    ``_init_steering_state`` — before compile/capture — so SAE steering
+    survives compiled serving; the frontend broadcast then only fills
+    weights in place. On a compiled engine this set (plus spare slots)
+    IS the SAE topology: registrations that don't fit are rejected."""
+
+    sae_spare_slot_sites: list[str] = Field(default_factory=list)
+    """``layer:hook`` sites that reserve spare SAE *delta* buffer slots
+    for modules not known at startup, so they can hot-register on a
+    compiled engine. Spare slots are baked as JumpReLU (per-feature
+    threshold 0 ⇒ exact ReLU, so both activations land via data alone;
+    TopK modules cannot claim spares). Each spare costs
+    ``~2 × sae_spare_slot_features × d_model`` in compute dtype per
+    site per layer — explicit opt-in."""
+
+    sae_spare_slots_per_site: int = Field(default=1, ge=1)
+    """Spare delta slots reserved at each ``sae_spare_slot_sites``
+    entry."""
+
+    sae_spare_slot_features: int = Field(default=0, ge=0)
+    """Clampable-feature capacity (``n_clamp``) reserved per spare
+    slot. A claiming module needs ``n_clamp <= sae_spare_slot_features``
+    (smaller modules are zero-padded). ``0`` disables spare slots even
+    when sites are listed."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -89,6 +216,23 @@ class SteeringConfig:
         # Per-row monitor changes the per-row probe-table buffer shape, which
         # is baked into captured graphs.
         factors.append(self.enable_row_monitor)
+        # SAE topology: every field determines pre-allocated buffer shapes
+        # or per-slot trace-time constants baked into the compiled graph.
+        # Canonical sorted-JSON so dict ordering can't shift the hash;
+        # feature ids / weights are data and deliberately not factors.
+        factors.append(
+            json.dumps(
+                [
+                    asdict(t)
+                    for t in sorted(self.sae_module_topology, key=lambda t: t.name)
+                ],
+                sort_keys=True,
+            )
+        )
+        # Spare slots add zero-filled delta slots (ops) at their sites.
+        factors.append(sorted(self.sae_spare_slot_sites))
+        factors.append(self.sae_spare_slots_per_site)
+        factors.append(self.sae_spare_slot_features)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
