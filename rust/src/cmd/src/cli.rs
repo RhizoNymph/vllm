@@ -606,6 +606,11 @@ impl ServeArgs {
             self.runtime.disable_log_stats,
             self.runtime.shutdown_timeout,
             handshake_port,
+            self.runtime
+                .steering_modules
+                .iter()
+                .map(|m| format!("{}={}", m.name, m.path))
+                .collect(),
         )
     }
 }

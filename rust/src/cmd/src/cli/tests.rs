@@ -193,6 +193,36 @@ fn serve_args_forward_shutdown_timeout_to_managed_engine() {
 }
 
 #[test]
+fn serve_args_forward_steering_modules_to_managed_engine() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--steering-modules",
+        "creativity=/models/creativity.json",
+        "golden=/models/sae_dir",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+
+    // The flag stays frontend-owned (Rust loads + broadcasts weights), but
+    // the module dirs are re-emitted to the Python engine args so the engine
+    // can distill SAE buffer topology before compile/capture.
+    let config = args.to_managed_engine_config(5555);
+    assert_eq!(
+        config.python_args,
+        vec![
+            "--steering-modules",
+            "creativity=/models/creativity.json",
+            "golden=/models/sae_dir",
+        ]
+    );
+}
+
+#[test]
 fn serve_args_forward_disable_log_stats_to_managed_engine() {
     let cli = Cli::try_parse_from(["vllm-rs", "serve", "Qwen/Qwen3-0.6B", "--disable-log-stats"])
         .unwrap();

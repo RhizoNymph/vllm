@@ -67,6 +67,13 @@ impl ManagedEngineArgs {
     }
 
     /// Build the managed Python-engine spawn configuration.
+    ///
+    /// `steering_modules` carries pre-formatted `name=path` entries from the
+    /// Rust frontend's `--steering-modules` flag. The flag is frontend-owned
+    /// (the Rust side loads the weights and broadcasts them post-init), so it
+    /// never reaches Python via the repartitioner — but the Python engine
+    /// needs the same module dirs at boot to distill the SAE buffer topology
+    /// into `SteeringConfig` and pre-allocate buffers before compile/capture.
     pub fn into_config(
         self,
         model: String,
@@ -76,8 +83,13 @@ impl ManagedEngineArgs {
         disable_log_stats: bool,
         shutdown_timeout: u64,
         handshake_port: u16,
+        steering_modules: Vec<String>,
     ) -> ManagedEngineConfig {
         let mut python_args = self.python_args;
+        if !steering_modules.is_empty() {
+            python_args.push("--steering-modules".to_string());
+            python_args.extend(steering_modules);
+        }
         // Manually forward some args to the Python engine.
         if let Some(max_model_len) = max_model_len {
             python_args.push("--max-model-len".to_string());
