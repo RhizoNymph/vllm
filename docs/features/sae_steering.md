@@ -588,14 +588,47 @@ GEMMs per opted-in token per hooked layer).
 - **Batch chat API requires packed steering vectors**
   (`SteeringVectorSpecPacked`); legacy dict-of-lists vectors are not
   accepted on the batch surface.
-- **Live SAE steering requires `--enforce-eager` serving.** SAE buffer
-  attributes are created at module *registration*, which on a server
-  happens after engine warmup — a compiled graph traced before
-  registration bakes in the "no SAE buffers at this hook" short-circuit
-  and every SAE spec is silently inert (requests succeed, nothing
-  applies). Offline `LLM()` flows and all live validation to date run
-  eager. Lifting this needs either pre-allocated SAE slots at engine
-  init or a re-capture after registration.
+- **Compiled serving freezes the SAE buffer topology at startup.**
+  Modules declared via `--steering-modules` have their buffers
+  pre-allocated (zero-filled, gated inert by `any_active` /
+  `row_active`) in `_init_steering_state` — end of `load_model`,
+  before compile/CUDA-graph capture — so the compiled graph contains
+  the device-gated SAE ops and startup-declared modules steer under
+  compiled serving. The engine reads only each module dir's
+  `manifest.json` at config-build time (no tensor I/O; the topology is
+  distilled into `SteeringConfig.sae_module_topology` and folded into
+  the graph hash); the frontend's post-init broadcast then fills
+  weights in place via `copy_`. On a compiled engine:
+  weight refresh of a declared module (same name, same shape /
+  activation) is always allowed; an *undeclared* delta module can
+  hot-register only into pre-reserved spare slots
+  (`--sae-spare-slot-sites layer:hook ...`,
+  `--sae-spare-slots-per-site`, `--sae-spare-slot-features` — spares
+  are baked JumpReLU with zero thresholds, which is exact ReLU, so
+  relu/jumprelu modules fit via data alone and smaller modules land
+  zero-padded; TopK and FR cannot claim spares); any other topology
+  change is rejected with a 400 (frontend precheck) / worker
+  `SteeringVectorError` pointing at startup declaration, spare slots,
+  or `--enforce-eager`. Unregister deactivates in place (buffers
+  zeroed, records kept, claimed spares return to the pool) so
+  compiled-graph references stay valid and the name can re-register
+  with matching topology. Eager engines keep fully dynamic
+  registration. Idle declared sites cost one device-gated op launch
+  per site per step (the kernel short-circuits on the gate before any
+  table gather). Two FR-specific consequences: the FR CUDA path
+  compacts active tokens with `torch.nonzero` (capture-illegal), so a
+  declared FR module registers
+  `vllm::apply_sae_full_reconstruction_out` as a graph-*splitting* op
+  — an out-variant mutating a caller-allocated buffer, like
+  `unified_attention_with_output` — that runs eagerly between
+  piecewise cudagraph segments, and full-graph capture modes downgrade
+  to `PIECEWISE` (logged at startup); `use_inductor_graph_partition`
+  is rejected with declared FR modules. The topology distiller reads
+  both module forms: safetensors dirs with `manifest.json` (Python
+  frontend) and `{kind, sae_manifest, sae_weights}` JSON files
+  (vllm-rs), so both frontends get pre-allocated buffers from the same
+  `--steering-modules` flag (vllm-rs re-emits it into the managed
+  engine's args).
 - **At most one full-reconstruction SAE module per (layer, hook)
   site**; double-registration raises by design — two residual
   replacements on one site are semantically ill-defined. Delta
@@ -604,7 +637,9 @@ GEMMs per opted-in token per hooked layer).
   sequentially in registration order, which is identical across ranks.
   An FR module may also share a site with delta modules — deltas run
   first, the reconstruction replaces last. Re-registering the *same*
-  module name at a site it already occupies still raises.
+  module name at a site it already occupies raises on eager engines;
+  under frozen topology the site's owner re-registers in place
+  (buffers zeroed and refilled) provided shapes and activation match.
 
 ## Resolved Design Decisions
 

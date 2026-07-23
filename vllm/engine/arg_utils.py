@@ -122,6 +122,7 @@ from vllm.version import __version__ as VLLM_VERSION
 
 if TYPE_CHECKING:
     from vllm.config.quantization import QuantizationConfigArgs
+    from vllm.config.steering import SAEModuleTopology
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.model_loader import LoadFormats
     from vllm.usage.usage_lib import UsageContext
@@ -411,6 +412,140 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     return copy.deepcopy(_compute_kwargs(cls))
 
 
+def _steering_module_name_path(entry: Any) -> tuple[str, str]:
+    """Normalize one ``steering_modules`` entry to ``(name, path)``.
+
+    Accepts the frontend's parsed ``SteeringModulePath`` dataclass,
+    ``{"name": ..., "path": ...}`` dicts, and ``(name, path)`` pairs
+    (programmatic use).
+    """
+    if isinstance(entry, dict):
+        return str(entry["name"]), str(entry["path"])
+    name = getattr(entry, "name", None)
+    path = getattr(entry, "path", None)
+    if name is not None and path is not None:
+        return str(name), str(path)
+    try:
+        name, path = entry
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"steering_modules entry {entry!r} is not a SteeringModulePath, "
+            "(name, path) pair, or {'name', 'path'} dict."
+        ) from exc
+    return str(name), str(path)
+
+
+def _build_sae_module_topology(
+    steering_modules: list[Any] | None,
+    model_config: ModelConfig,
+) -> list["SAEModuleTopology"]:
+    """Distill SAE buffer topology from startup steering-module dirs.
+
+    Reads each SAE module directory's ``manifest.json`` only (no tensor
+    I/O — weights are loaded and broadcast by the frontend post-init)
+    and returns :class:`SAEModuleTopology` entries for
+    ``SteeringConfig.sae_module_topology``, so workers can pre-allocate
+    the buffers before compile/capture.  Additive JSON *file* entries
+    contribute no engine-side buffers and are skipped.  Fails fast with
+    ``name=path`` context on unreadable/invalid manifests so a broken
+    module dir stops engine boot instead of surfacing post-init.
+    """
+    if not steering_modules:
+        return []
+    from pathlib import Path
+
+    # Lazy imports: the registry lives in the frontend package; only the
+    # pure dict->dataclass parser is needed here.
+    from vllm.config.steering import SAEModuleTopology
+    from vllm.entrypoints.openai.steering.registry import sae_manifest_from_dict
+
+    topologies: list[SAEModuleTopology] = []
+    seen: set[str] = set()
+    for entry in steering_modules:
+        name, path = _steering_module_name_path(entry)
+        module_dir = Path(path)
+        if module_dir.is_dir():
+            manifest_path = module_dir / "manifest.json"
+            try:
+                with manifest_path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"--steering-modules {name}={path}: cannot read "
+                    f"manifest.json: {exc}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"--steering-modules {name}={path}: manifest.json must be "
+                    "a JSON object."
+                )
+            kind = payload.get("kind", "sae_delta")
+        elif module_dir.is_file():
+            # JSON module file.  The vllm-rs frontend declares SAE
+            # modules as ``{kind, sae_manifest, sae_weights}`` JSON
+            # files; anything else (additive vector files) has no SAE
+            # buffers to pre-allocate and is skipped.
+            try:
+                with module_dir.open("r", encoding="utf-8") as fh:
+                    file_payload = json.load(fh)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"--steering-modules {name}={path}: cannot read module JSON: {exc}"
+                ) from exc
+            if not (
+                isinstance(file_payload, dict)
+                and isinstance(file_payload.get("sae_manifest"), dict)
+                and file_payload.get("kind", "additive")
+                in ("sae_delta", "sae_full_reconstruction")
+            ):
+                continue
+            kind = file_payload["kind"]
+            payload = file_payload["sae_manifest"]
+        else:
+            # Missing path fails fast here rather than at frontend load.
+            raise ValueError(f"--steering-modules {name}={path}: path does not exist.")
+        if kind not in ("sae_delta", "sae_full_reconstruction"):
+            raise ValueError(
+                f"--steering-modules {name}={path}: unsupported kind "
+                f"{kind!r}; expected 'sae_delta' or 'sae_full_reconstruction'."
+            )
+        try:
+            manifest = sae_manifest_from_dict(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"--steering-modules {name}={path}: invalid manifest.json: {exc}"
+            ) from exc
+        hidden_size = model_config.get_hidden_size()
+        if manifest.d_model != hidden_size:
+            raise ValueError(
+                f"--steering-modules {name}={path}: manifest d_model "
+                f"{manifest.d_model} does not match the model's hidden size "
+                f"{hidden_size}."
+            )
+        n_clamp = len(manifest.clampable_features)
+        if n_clamp > manifest.d_sae:
+            raise ValueError(
+                f"--steering-modules {name}={path}: {n_clamp} clampable "
+                f"features exceed d_sae {manifest.d_sae}."
+            )
+        if name in seen:
+            raise ValueError(f"--steering-modules: duplicate module name {name!r}.")
+        seen.add(name)
+        topologies.append(
+            SAEModuleTopology(
+                name=name,
+                kind=kind,
+                layers=tuple(sorted((int(li), str(hs)) for li, hs in manifest.layers)),
+                d_model=int(manifest.d_model),
+                d_sae=int(manifest.d_sae),
+                n_clamp=n_clamp,
+                activation=manifest.activation.value,
+                activation_params=dict(manifest.activation_params),
+            )
+        )
+    return topologies
+
+
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
@@ -604,6 +739,18 @@ class EngineArgs:
     declarative_probe_sites: list[str] = get_field(
         SteeringConfig, "declarative_probe_sites"
     )
+    sae_spare_slot_sites: list[str] = get_field(SteeringConfig, "sae_spare_slot_sites")
+    sae_spare_slots_per_site: int = SteeringConfig.sae_spare_slots_per_site
+    sae_spare_slot_features: int = SteeringConfig.sae_spare_slot_features
+    # Startup steering modules (``name=path`` entries).  CLI parsing is
+    # owned by the frontend (``--steering-modules`` in
+    # vllm/entrypoints/openai/cli_args.py, which also loads the weights
+    # and broadcasts them post-init); this unregistered mirror field is
+    # picked up from the shared parser namespace by ``from_cli_args`` so
+    # the engine can distill SAE buffer topology into ``SteeringConfig``
+    # before model load.  Programmatic use: pass ``SteeringModulePath``
+    # instances, ``(name, path)`` tuples, or ``{"name","path"}`` dicts.
+    steering_modules: list[Any] | None = None
     # Patching fields
     enable_patching: bool = False
     max_patch_slots: int = PatchConfig.max_patch_slots
@@ -1490,6 +1637,18 @@ class EngineArgs:
             "--declarative-probe-sites",
             **steering_kwargs["declarative_probe_sites"],
         )
+        steering_group.add_argument(
+            "--sae-spare-slot-sites",
+            **steering_kwargs["sae_spare_slot_sites"],
+        )
+        steering_group.add_argument(
+            "--sae-spare-slots-per-site",
+            **steering_kwargs["sae_spare_slots_per_site"],
+        )
+        steering_group.add_argument(
+            "--sae-spare-slot-features",
+            **steering_kwargs["sae_spare_slot_features"],
+        )
 
         # Patching related configs
         patch_kwargs = get_kwargs(PatchConfig)
@@ -2237,6 +2396,15 @@ class EngineArgs:
         )
         diffusion_config = self.create_diffusion_config()
 
+        sae_module_topology = _build_sae_module_topology(
+            self.steering_modules, model_config
+        )
+        if sae_module_topology and not self.enable_steering:
+            raise ValueError(
+                "--steering-modules names SAE module directories "
+                f"({[t.name for t in sae_module_topology]}) but steering is "
+                "disabled; pass --enable-steering."
+            )
         steering_config = (
             SteeringConfig(
                 max_steering_configs=self.max_steering_configs,
@@ -2245,6 +2413,10 @@ class EngineArgs:
                 enable_row_monitor=self.enable_row_monitor,
                 enable_declarative_gates=self.enable_declarative_gates,
                 declarative_probe_sites=self.declarative_probe_sites,
+                sae_module_topology=sae_module_topology,
+                sae_spare_slot_sites=self.sae_spare_slot_sites,
+                sae_spare_slots_per_site=self.sae_spare_slots_per_site,
+                sae_spare_slot_features=self.sae_spare_slot_features,
             )
             if self.enable_steering
             else None

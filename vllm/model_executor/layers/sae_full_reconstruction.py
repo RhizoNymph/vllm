@@ -149,6 +149,55 @@ _FR_PYATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
 )
 
 
+def _fr_reuse_mismatch(
+    module: nn.Module,
+    hook_point: SteeringHookPoint,
+    *,
+    module_name: str,
+    activation: SAEActivation,
+    activation_params: Mapping[str, float],
+    d_sae: int,
+    n_clamp: int,
+    hidden_size: int,
+    n_rows: int,
+) -> str | None:
+    """Why this site's existing FR buffers can't serve a registration.
+
+    Returns ``None`` when the site's owner, trace-time activation
+    constants, and buffer shapes match the incoming registration
+    exactly, i.e. an in-place zero-and-refill is behaviourally
+    equivalent to a fresh registration.
+    """
+    owner = getattr(module, HOOK_POINT_FR_MODULE_NAME_ATTR[hook_point], None)
+    if owner != module_name:
+        return f"site is owned by {owner!r}"
+    existing_act = getattr(module, HOOK_POINT_FR_ACTIVATION_ATTR[hook_point], None)
+    if existing_act != activation:
+        return (
+            f"activation {activation.value!r} != existing "
+            f"{getattr(existing_act, 'value', existing_act)!r}"
+        )
+    existing_params = getattr(
+        module, HOOK_POINT_FR_ACTIVATION_PARAMS_ATTR[hook_point], None
+    )
+    if existing_params != dict(activation_params):
+        return (
+            f"activation_params {dict(activation_params)} != existing {existing_params}"
+        )
+    encoder = getattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
+    if tuple(encoder.shape) != (d_sae, hidden_size):
+        return (
+            f"weight shape ({d_sae}, {hidden_size}) != existing {tuple(encoder.shape)}"
+        )
+    clamp_kind = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
+    if tuple(clamp_kind.shape) != (n_rows, n_clamp):
+        return (
+            f"clamp table shape ({n_rows}, {n_clamp}) != existing "
+            f"{tuple(clamp_kind.shape)}"
+        )
+    return None
+
+
 def register_sae_full_recon_buffers(
     module: nn.Module,
     *,
@@ -163,13 +212,21 @@ def register_sae_full_recon_buffers(
     clampable_features: torch.Tensor,
     dtype: torch.dtype,
     device: torch.device | None = None,
+    allow_reuse: bool = False,
 ) -> None:
     """Attach full-reconstruction SAE buffers for one ``(layer, hook)`` site.
 
     Phase-4 constrains at most one full-reconstruction SAE module per
     ``(layer, hook)`` site, mirroring the delta path's invariant.
     Calling this twice for the same ``hook_point`` on the same module
-    raises ``ValueError``.
+    raises ``ValueError`` — unless ``allow_reuse`` is set
+    (frozen-topology mode) and the site's existing buffers belong to
+    the same ``module_name`` with identical shapes and activation, in
+    which case the buffers are zeroed in place (same tensor objects —
+    compiled-graph references stay valid), ``clampable_features`` is
+    refreshed via ``copy_``, and the call returns.  Activation and its
+    params are trace-time constants (Python attrs read by the dispatch
+    shim), so any drift is a reuse mismatch, never an in-place update.
 
     The clamp tables are sized ``(max_recon_configs + 1, n_clamp)``
     where row 0 is the no-reconstruction sentinel — never written
@@ -214,10 +271,38 @@ def register_sae_full_recon_buffers(
             f"got {tuple(clampable_features.shape)}."
         )
     enc_w_attr = HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point]
+    n_rows = max_recon_configs + 1
     if hasattr(module, enc_w_attr):
         existing = getattr(
             module, HOOK_POINT_FR_MODULE_NAME_ATTR[hook_point], "<unknown>"
         )
+        if allow_reuse:
+            mismatch = _fr_reuse_mismatch(
+                module,
+                hook_point,
+                module_name=module_name,
+                activation=activation,
+                activation_params=activation_params,
+                d_sae=d_sae,
+                n_clamp=n_clamp,
+                hidden_size=hidden_size,
+                n_rows=n_rows,
+            )
+            if mismatch is None:
+                for table in _FR_BUFFER_ATTR_TABLES:
+                    getattr(module, table[hook_point]).zero_()
+                getattr(
+                    module, HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR[hook_point]
+                ).copy_(clampable_features.detach().to(dtype=torch.int64))
+                return
+            raise ValueError(
+                f"Full-reconstruction SAE module {module_name!r} cannot "
+                f"reuse the site at hook {hook_point.value!r} "
+                f"(owner={existing!r}): {mismatch}. The topology is frozen "
+                "on a compiled engine — declare the module's final shape "
+                "at startup via --steering-modules, or serve with "
+                "--enforce-eager."
+            )
         raise ValueError(
             f"Layer module already has full-reconstruction SAE buffers for "
             f"hook {hook_point.value!r} (owning module={existing!r}).  "
@@ -226,7 +311,6 @@ def register_sae_full_recon_buffers(
             "are semantically ill-defined; unregister the existing module "
             "first.  (Delta modules, by contrast, may share a site.)"
         )
-    n_rows = max_recon_configs + 1
     module.register_buffer(
         enc_w_attr,
         torch.zeros(d_sae, hidden_size, dtype=dtype, device=device),
@@ -293,12 +377,25 @@ def unregister_sae_full_recon_buffers(
     module: nn.Module,
     *,
     hook_point: SteeringHookPoint,
+    deactivate_only: bool = False,
 ) -> None:
     """Detach full-reconstruction SAE buffers from ``module`` for ``hook_point``.
 
     Idempotent: no-op when buffers aren't attached.  Called when the
     owning SAE module is unregistered from the worker.
+
+    With ``deactivate_only`` (frozen-topology mode) nothing is
+    deleted: every buffer is zeroed in place (``row_active`` all-False
+    gates the site off) and the owner/activation Python attrs are
+    kept, so compiled-graph references stay valid and the owning
+    module can re-register into the same site via ``allow_reuse``.
     """
+    if deactivate_only:
+        for table in _FR_BUFFER_ATTR_TABLES:
+            buf = getattr(module, table[hook_point], None)
+            if buf is not None:
+                buf.zero_()
+        return
     for table in _FR_BUFFER_ATTR_TABLES:
         attr = table[hook_point]
         if hasattr(module, attr):
@@ -576,6 +673,81 @@ direct_register_custom_op(
 )
 
 
+def apply_sae_full_reconstruction_out_op(
+    out: torch.Tensor,
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    decoder_bias: torch.Tensor,
+    clampable_features: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    recon_mask: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> None:
+    """Out-variant registered as ``torch.ops.vllm.apply_sae_full_reconstruction_out``.
+
+    The layer shim uses this variant (not the value-returning op)
+    because the FR CUDA path is data-dependent (``torch.nonzero``
+    compaction) and must run as a graph-*splitting* op, eagerly
+    between piecewise CUDA-graph segments.  Splitting ops must mutate
+    a caller-provided buffer — the surrounding captured pieces replay
+    against fixed addresses, so a fresh per-call return tensor would
+    leave the downstream piece reading the stale capture-time address.
+    Mirrors ``unified_attention_with_output``.
+    """
+    out.copy_(
+        apply_sae_full_reconstruction_op(
+            hidden_states,
+            encoder_weight,
+            encoder_bias,
+            threshold,
+            decoder_weight,
+            decoder_bias,
+            clampable_features,
+            clamp_kind,
+            clamp_value,
+            clamp_only_if_active,
+            recon_mask,
+            activation_code,
+            activation_param,
+        )
+    )
+
+
+def apply_sae_full_reconstruction_out_op_fake(
+    out: torch.Tensor,
+    hidden_states: torch.Tensor,
+    encoder_weight: torch.Tensor,
+    encoder_bias: torch.Tensor,
+    threshold: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    decoder_bias: torch.Tensor,
+    clampable_features: torch.Tensor,
+    clamp_kind: torch.Tensor,
+    clamp_value: torch.Tensor,
+    clamp_only_if_active: torch.Tensor,
+    recon_mask: torch.Tensor,
+    activation_code: int,
+    activation_param: float,
+) -> None:
+    """FX-tracing fake — pure mutation, nothing to return."""
+    return None
+
+
+direct_register_custom_op(
+    op_name="apply_sae_full_reconstruction_out",
+    op_func=apply_sae_full_reconstruction_out_op,
+    fake_impl=apply_sae_full_reconstruction_out_op_fake,
+    mutates_args=["out"],
+    extra_dispatch_keys=("CPU",),
+)
+
+
 def apply_sae_full_reconstruction(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
@@ -818,7 +990,14 @@ def apply_layer_sae_full_reconstruction(
 
     code = _ACTIVATION_TO_CODE[activation]
     param = _activation_to_scalar(activation, activation_params)
-    return torch.ops.vllm.apply_sae_full_reconstruction(
+    # Out-variant + caller-allocated output: the allocation is traced
+    # into the surrounding compiled piece (stable address across CUDA
+    # graph replays) while the data-dependent FR op itself runs eagerly
+    # as a splitting op writing into it.  See
+    # ``apply_sae_full_reconstruction_out_op``.
+    out = torch.empty_like(hidden_states)
+    torch.ops.vllm.apply_sae_full_reconstruction_out(
+        out,
         hidden_states,
         enc_w,
         enc_b,
@@ -833,6 +1012,7 @@ def apply_layer_sae_full_reconstruction(
         code,
         param,
     )
+    return out
 
 
 def populate_sae_full_recon_clamp_table(

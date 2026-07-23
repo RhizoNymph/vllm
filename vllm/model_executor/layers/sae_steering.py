@@ -53,7 +53,7 @@ who need full-d_sae TopK semantics must load the full encoder.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -207,6 +207,11 @@ class SAESlotInfo:
     module_name: str
     activation: SAEActivation
     activation_params: dict[str, float]
+    spare: bool = False
+    """True for a pre-allocated spare slot not yet claimed by a module.
+    Claiming replaces the record (new ``module_name``, ``spare=False``)
+    without touching the buffers' identities, so compiled-graph
+    references stay valid; releasing restores the spare record."""
 
 
 @dataclass(frozen=True)
@@ -273,6 +278,76 @@ def _delete_slot_buffers(
             delattr(module, attr)
 
 
+def _zero_slot_buffers(
+    module: nn.Module, hook_point: SteeringHookPoint, slot_id: int
+) -> None:
+    """Reset one slot's buffers to the inert zero state in place.
+
+    Same tensor objects — compiled-graph / CUDA-graph references stay
+    valid.  Zero weights produce a zero delta and ``any_active=False``
+    short-circuits the kernel's table gather, so a zeroed slot is
+    behaviourally identical to an absent one.
+    """
+    for base in _SAE_SLOT_BUFFER_BASES:
+        attr = _sae_slot_attr(base, hook_point, slot_id)
+        buf = getattr(module, attr, None)
+        if buf is not None:
+            buf.zero_()
+
+
+def _slot_reuse_mismatch(
+    module: nn.Module,
+    hook_point: SteeringHookPoint,
+    record: SAESlotInfo,
+    *,
+    activation: SAEActivation,
+    activation_params: Mapping[str, float],
+    n_clamp: int,
+    hidden_size: int,
+    max_sae_configs: int,
+) -> str | None:
+    """Why ``record``'s existing slot can't serve this registration.
+
+    Returns ``None`` when the slot's trace-time constants (activation
+    code/param, baked into the compiled graph per slot) and buffer
+    shapes match the incoming registration exactly, i.e. an in-place
+    zero-and-refill is behaviourally equivalent to a fresh slot.
+    """
+    if record.activation != activation:
+        return (
+            f"activation {activation.value!r} != existing {record.activation.value!r}"
+        )
+    if record.activation_params != dict(activation_params):
+        return (
+            f"activation_params {dict(activation_params)} != existing "
+            f"{record.activation_params}"
+        )
+    encoder = getattr(
+        module,
+        _sae_slot_attr(SAE_ENCODER_WEIGHT_BASE, hook_point, record.slot_id),
+        None,
+    )
+    clamp_kind = getattr(
+        module,
+        _sae_slot_attr(SAE_CLAMP_KIND_BASE, hook_point, record.slot_id),
+        None,
+    )
+    if encoder is None or clamp_kind is None:
+        return "existing slot is missing its buffers"
+    if tuple(encoder.shape) != (n_clamp, hidden_size):
+        return (
+            f"weight shape ({n_clamp}, {hidden_size}) != existing "
+            f"{tuple(encoder.shape)}"
+        )
+    n_rows = max_sae_configs + 3
+    if tuple(clamp_kind.shape) != (n_rows, n_clamp):
+        return (
+            f"clamp table shape ({n_rows}, {n_clamp}) != existing "
+            f"{tuple(clamp_kind.shape)}"
+        )
+    return None
+
+
 def register_sae_buffers(
     module: nn.Module,
     *,
@@ -285,13 +360,20 @@ def register_sae_buffers(
     max_sae_configs: int,
     dtype: torch.dtype,
     device: torch.device | None = None,
+    allow_reuse: bool = False,
+    spare: bool = False,
 ) -> None:
     """Attach one SAE module's buffer slot at a ``(layer, hook)`` site.
 
     Multiple SAE modules may share the site — each call allocates a new
     slot with its own suffixed buffer set.  Calling this twice for the
     same ``module_name`` on the same ``hook_point`` raises
-    ``ValueError``.
+    ``ValueError`` — unless ``allow_reuse`` is set (frozen-topology
+    mode) and the existing slot matches this registration's shapes and
+    activation exactly, in which case the slot's buffers are zeroed in
+    place (same tensor objects, so compiled-graph references stay
+    valid) and the call returns.  ``spare=True`` marks the slot record
+    as a pre-allocated spare awaiting a claiming module.
 
     Args:
         module: the decoder-layer module to attach buffers to.
@@ -319,17 +401,41 @@ def register_sae_buffers(
     slots_attr = _sae_slots_attr(hook_point)
     slots: list[SAESlotInfo] = list(getattr(module, slots_attr, ()))
     for record in slots:
-        if record.module_name == module_name:
-            raise ValueError(
-                f"SAE module {module_name!r} already holds a buffer slot "
-                f"at hook {hook_point.value!r} on this layer; unregister "
-                "it before re-registering."
+        if record.module_name != module_name:
+            continue
+        if allow_reuse:
+            mismatch = _slot_reuse_mismatch(
+                module,
+                hook_point,
+                record,
+                activation=activation,
+                activation_params=activation_params,
+                n_clamp=n_clamp,
+                hidden_size=hidden_size,
+                max_sae_configs=max_sae_configs,
             )
+            if mismatch is None:
+                _zero_slot_buffers(module, hook_point, record.slot_id)
+                return
+            raise ValueError(
+                f"SAE module {module_name!r} cannot reuse its buffer slot "
+                f"at hook {hook_point.value!r}: {mismatch}. The topology "
+                "is frozen on a compiled engine — declare the module's "
+                "final shape at startup via --steering-modules, register "
+                "into a spare slot, or serve with --enforce-eager."
+            )
+        raise ValueError(
+            f"SAE module {module_name!r} already holds a buffer slot "
+            f"at hook {hook_point.value!r} on this layer; unregister "
+            "it before re-registering."
+        )
     counter_attr = _sae_slot_counter_attr(hook_point)
     # Monotonic per-(layer, hook) slot id: never reused within the
     # layer's lifetime, so surviving slots keep stable attr names when
     # a sibling detaches.
     slot_id = int(getattr(module, counter_attr, 0))
+    if spare and not module_name:
+        module_name = sae_spare_placeholder_name(slot_id)
     # Row 0 = hard no-op sentinel; row 1 = prefill globals; row 2 =
     # decode globals; rows 3..max_sae_configs+2 = per-request.  The
     # dispatch shim routes no-per-request tokens to row 1 or 2 based
@@ -399,6 +505,7 @@ def register_sae_buffers(
             module_name=module_name,
             activation=activation,
             activation_params=dict(activation_params),
+            spare=spare,
         )
     )
     setattr(module, slots_attr, slots)
@@ -409,6 +516,7 @@ def unregister_sae_buffers(
     *,
     hook_point: SteeringHookPoint,
     module_name: str,
+    deactivate_only: bool = False,
 ) -> None:
     """Detach ``module_name``'s SAE buffer slot for ``hook_point``.
 
@@ -418,10 +526,32 @@ def unregister_sae_buffers(
     the slot counter is kept so slot ids are never reused.  The
     ``sae_slots_<hook>`` attribute is dropped entirely when the last
     slot detaches, keeping ``hasattr`` gating clean for dispatch.
+
+    With ``deactivate_only`` (frozen-topology mode) nothing is
+    deleted: the slot's buffers are zeroed in place and the record
+    stays in ``sae_slots_<hook>``, so compiled-graph references remain
+    valid and a later matching re-registration reclaims the slot via
+    ``allow_reuse``.
     """
     slots_attr = _sae_slots_attr(hook_point)
     slots: list[SAESlotInfo] = list(getattr(module, slots_attr, ()))
     if not slots:
+        return
+    if deactivate_only:
+        changed = False
+        for i, record in enumerate(slots):
+            if record.module_name != module_name:
+                continue
+            _zero_slot_buffers(module, hook_point, record.slot_id)
+            if record.spare:
+                # Claimed spare: return it to the unclaimed pool.
+                slots[i] = replace(
+                    record,
+                    module_name=sae_spare_placeholder_name(record.slot_id),
+                )
+                changed = True
+        if changed:
+            setattr(module, slots_attr, slots)
         return
     remaining: list[SAESlotInfo] = []
     for record in slots:
@@ -433,6 +563,41 @@ def unregister_sae_buffers(
         setattr(module, slots_attr, remaining)
     else:
         delattr(module, slots_attr)
+
+
+SAE_SPARE_NAME_PREFIX = "__sae_spare__"
+"""Placeholder ``module_name`` prefix for unclaimed spare slots.  Real
+module names come from the registry, which rejects ``__``-prefixed
+names implicitly (they never round-trip through registration), so the
+prefix cannot collide with a claimable name."""
+
+
+def sae_spare_placeholder_name(slot_id: int) -> str:
+    """Deterministic unclaimed-spare name for ``slot_id`` at a site."""
+    return f"{SAE_SPARE_NAME_PREFIX}s{slot_id}"
+
+
+def claim_sae_spare_slot(
+    module: nn.Module, hook_point: SteeringHookPoint, module_name: str
+) -> SAESlotInfo | None:
+    """Claim the first unclaimed spare slot at this site for a module.
+
+    Renames the slot record in place (buffer identities untouched —
+    only the record's ``module_name`` changes, which is not baked into
+    the compiled graph) and zeroes the slot's buffers so the claimer
+    starts from the inert state.  Returns the claimed record, or
+    ``None`` when no unclaimed spare remains at the site.
+    """
+    slots_attr = _sae_slots_attr(hook_point)
+    slots: list[SAESlotInfo] = list(getattr(module, slots_attr, ()))
+    for i, record in enumerate(slots):
+        if record.spare and record.module_name.startswith(SAE_SPARE_NAME_PREFIX):
+            claimed = replace(record, module_name=module_name)
+            slots[i] = claimed
+            setattr(module, slots_attr, slots)
+            _zero_slot_buffers(module, hook_point, record.slot_id)
+            return claimed
+    return None
 
 
 def sae_buffers_attached(module: nn.Module, hook_point: SteeringHookPoint) -> bool:
@@ -1077,9 +1242,12 @@ def populate_sae_clamp_table(
     only_table = state.clamp_only_if_active
     any_active: torch.Tensor | None = state.any_active
     n_clamp = kind_table.shape[1]
-    if len(clampable_features) != n_clamp:
+    # Claimed spare slots reserve a wider table than the claiming
+    # module's feature list; positions past the list stay zero
+    # (no-clamp), so a narrower list is safe — only wider is an error.
+    if len(clampable_features) > n_clamp:
         raise ValueError(
-            "clampable_features length must equal n_clamp; got "
+            "clampable_features length must not exceed n_clamp; got "
             f"{len(clampable_features)} vs {n_clamp}."
         )
     feature_to_pos: dict[int, int] = {f: i for i, f in enumerate(clampable_features)}

@@ -9,6 +9,10 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from vllm.config.sae_steering_types import SAEActivation, SteeringModuleKind
+from vllm.config.steering import (
+    is_steering_topology_frozen,
+    sae_topology_mismatch,
+)
 from vllm.config.steering_types import coerce_steering_spec
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.steering.registry import (
@@ -31,6 +35,101 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 router = APIRouter()
+
+
+def _check_frozen_sae_topology_frontend(
+    vllm_config,
+    registry,
+    *,
+    name: str,
+    manifest: SAEModuleManifest,
+) -> None:
+    """Reject frozen-topology-violating SAE registrations with a 400.
+
+    Frontend mirror of the worker's ``_check_frozen_sae_topology`` —
+    both compare against ``SteeringConfig.sae_module_topology`` via
+    :func:`sae_topology_mismatch`, so they cannot diverge.  Raising
+    ``ValueError`` here (before any weight I/O or broadcast) maps to a
+    clean 400; the worker check remains the backstop for direct
+    ``collective_rpc`` callers.  Spare availability is estimated from
+    the registry (undeclared delta modules hold one spare per site);
+    the worker's slot records are ground truth.
+    """
+    if not is_steering_topology_frozen(vllm_config):
+        return
+    steering_config = getattr(vllm_config, "steering_config", None)
+    remedy = (
+        "The SAE topology is frozen on a compiled engine — declare the "
+        "module's final shape at startup via --steering-modules, reserve "
+        "spare slots (--sae-spare-slot-sites), or serve with "
+        "--enforce-eager."
+    )
+    declared = {
+        t.name: t for t in (getattr(steering_config, "sae_module_topology", ()) or ())
+    }
+    topo = declared.get(name)
+    if topo is not None:
+        mismatch = sae_topology_mismatch(
+            topo,
+            kind="sae_delta",
+            layers=tuple((int(li), str(hs)) for li, hs in manifest.layers),
+            d_model=manifest.d_model,
+            d_sae=manifest.d_sae,
+            n_clamp=len(manifest.clampable_features),
+            activation=manifest.activation.value,
+            activation_params=dict(manifest.activation_params),
+        )
+        if mismatch is not None:
+            raise ValueError(
+                f"Steering module {name!r} does not match its "
+                f"startup-declared topology: {mismatch}. {remedy}"
+            )
+        return
+    spare_sites = set(getattr(steering_config, "sae_spare_slot_sites", ()) or ())
+    spare_features = int(getattr(steering_config, "sae_spare_slot_features", 0) or 0)
+    per_site = int(getattr(steering_config, "sae_spare_slots_per_site", 1) or 1)
+    if not spare_sites or spare_features <= 0:
+        raise ValueError(
+            f"Steering module {name!r} was not declared at startup and no "
+            f"spare SAE slots are configured. {remedy}"
+        )
+    if manifest.activation not in (SAEActivation.RELU, SAEActivation.JUMPRELU):
+        raise ValueError(
+            f"Steering module {name!r} uses activation "
+            f"{manifest.activation.value!r}, but spare slots are baked as "
+            f"JumpReLU and only serve relu/jumprelu modules. {remedy}"
+        )
+    n_clamp = len(manifest.clampable_features)
+    if n_clamp > spare_features:
+        raise ValueError(
+            f"Steering module {name!r} clamps {n_clamp} features but spare "
+            f"slots reserve only {spare_features}. {remedy}"
+        )
+    for layer_idx, hook_str in manifest.layers:
+        site = f"{layer_idx}:{hook_str}"
+        if site not in spare_sites:
+            raise ValueError(
+                f"Steering module {name!r} targets site (layer={layer_idx}, "
+                f"hook={hook_str!r}) which has no spare slots reserved. "
+                f"{remedy}"
+            )
+        claimed = 0
+        for other_name, other in registry._modules.items():
+            if other_name == name or other_name in declared:
+                continue
+            if other.kind is not SteeringModuleKind.SAE_DELTA:
+                continue
+            other_manifest = other.sae_manifest
+            if other_manifest is not None and (
+                (layer_idx, hook_str) in set(other_manifest.layers)
+            ):
+                claimed += 1
+        if claimed >= per_site:
+            raise ValueError(
+                f"Steering module {name!r}: all {per_site} spare slot(s) at "
+                f"site (layer={layer_idx}, hook={hook_str!r}) are claimed by "
+                f"other modules. {remedy}"
+            )
 
 
 def _get_registry(request: Request):
@@ -308,6 +407,16 @@ async def register_steering_module(
             # but doing it here keeps malformed manifests from triggering
             # expensive SAE weight I/O.
             registry._validate_sae_manifest(name=request.name, manifest=manifest)
+            # Frozen-topology precheck: on a compiled engine this
+            # registration must fit the pre-allocated buffer set
+            # (declared shape or a spare slot).  Fails as a 400 here,
+            # before weight I/O and broadcast.
+            _check_frozen_sae_topology_frontend(
+                getattr(raw_request.app.state, "vllm_config", None),
+                registry,
+                name=request.name,
+                manifest=manifest,
+            )
             if not manifest.weights_uri:
                 # Without a weights_uri the worker would attach
                 # zero-filled encoder/decoder buffers and every clamp
@@ -484,9 +593,7 @@ async def unregister_steering_module(
         )
     except Exception as err:
         await registry.restore_or_remove(request.name, prev_module)
-        await _compensating_broadcast_after_failure(
-            engine, request.name, prev_module
-        )
+        await _compensating_broadcast_after_failure(engine, request.name, prev_module)
         logger.exception("Failed to unregister steering module '%s'", request.name)
         return JSONResponse(
             content={

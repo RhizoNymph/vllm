@@ -18,8 +18,10 @@ from starlette.datastructures import State
 
 import vllm.entrypoints.openai.steering.registry as registry_mod
 from vllm.config.sae_steering_types import (
+    SAEActivation,
     SAEClampEntry,
     SAEClampSpec,
+    SteeringModuleKind,
     hash_sae_clamp_specs_for_phase,
 )
 from vllm.config.steering_types import (
@@ -30,6 +32,7 @@ from vllm.config.steering_types import (
 )
 from vllm.entrypoints.openai.api_server import init_app_state
 from vllm.entrypoints.openai.steering.registry import (
+    SAEModuleManifest,
     SteeringModuleRegistry,
     _convert_layer_keys,
 )
@@ -357,7 +360,6 @@ class TestSteeringModuleRegistry:
         )
         assert registry.get("anywidth") is not None
 
-
     # --- load_from_file tests ---
 
     @pytest.mark.asyncio
@@ -499,9 +501,7 @@ class TestSteeringModuleRegistry:
             assert module is not None
             stored = module.vectors["post_block"][14]
             assert isinstance(stored, list)
-            assert [round(v, 5) for v in stored] == [
-                round(float(x), 5) for x in vec
-            ]
+            assert [round(v, 5) for v in stored] == [round(float(x), 5) for x in vec]
         finally:
             os.unlink(tmp_path)
 
@@ -760,9 +760,7 @@ async def test_init_app_state_preloads_sae_directory_and_broadcasts_weights(
     blob = modules["g"]["sae_weights"]["0:post_block"]["decoder_weight"]
     assert blob["dtype"] == "float32"
     assert blob["shape"] == [2, 8]
-    decoded = torch.frombuffer(
-        bytearray(blob["data"]), dtype=torch.float32
-    ).view(2, 8)
+    decoded = torch.frombuffer(bytearray(blob["data"]), dtype=torch.float32).view(2, 8)
     assert torch.equal(decoded, torch.full((2, 8), 2.0))
     assert register_call.kwargs["kwargs"]["replace"] is True
 
@@ -1006,3 +1004,130 @@ class TestSamplingParamsHashOverrides:
         assert sp.prefill_additive_steering_config_hash == expected_prefill
         assert sp.decode_steering_config_hash == expected_decode
         assert sp.decode_additive_steering_config_hash == expected_decode
+
+
+class TestFrozenTopologyFrontendPrecheck:
+    """The register endpoint's frozen-topology precheck raises ValueError
+    (→ 400) before any weight I/O or broadcast when a compiled engine's
+    pre-allocated SAE buffer set can't serve the registration."""
+
+    def _vllm_config(self, *, frozen: bool = True, **steering_overrides):
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+        from vllm.config.steering import SAEModuleTopology
+
+        steering = SimpleNamespace(
+            sae_module_topology=[
+                SAEModuleTopology(
+                    name="declared",
+                    kind="sae_delta",
+                    layers=((3, "post_block"),),
+                    d_model=4,
+                    d_sae=16,
+                    n_clamp=2,
+                    activation="relu",
+                    activation_params={},
+                )
+            ],
+            sae_spare_slot_sites=[],
+            sae_spare_slots_per_site=1,
+            sae_spare_slot_features=0,
+        )
+        for key, value in steering_overrides.items():
+            setattr(steering, key, value)
+        return SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                mode=(CompilationMode.VLLM_COMPILE if frozen else CompilationMode.NONE),
+                cudagraph_mode=CUDAGraphMode.NONE,
+            ),
+            model_config=SimpleNamespace(enforce_eager=not frozen),
+            steering_config=steering,
+        )
+
+    def _manifest(self, **overrides):
+        base = dict(
+            d_model=4,
+            d_sae=16,
+            activation=SAEActivation.RELU,
+            layers=((3, "post_block"),),
+            clampable_features=(0, 1),
+            activation_params={},
+        )
+        base.update(overrides)
+        return SAEModuleManifest(**base)
+
+    def _registry(self, modules: dict | None = None):
+        return SimpleNamespace(_modules=modules or {})
+
+    def _check(self, vllm_config, registry, name, manifest):
+        from vllm.entrypoints.serve.steering.modules_router import (
+            _check_frozen_sae_topology_frontend,
+        )
+
+        _check_frozen_sae_topology_frontend(
+            vllm_config, registry, name=name, manifest=manifest
+        )
+
+    def test_eager_engine_is_noop(self):
+        self._check(
+            self._vllm_config(frozen=False),
+            self._registry(),
+            "anything",
+            self._manifest(layers=((99, "post_block"),)),
+        )
+
+    def test_declared_match_passes(self):
+        self._check(self._vllm_config(), self._registry(), "declared", self._manifest())
+
+    def test_declared_shape_drift_rejected(self):
+        with pytest.raises(ValueError, match="d_sae"):
+            self._check(
+                self._vllm_config(),
+                self._registry(),
+                "declared",
+                self._manifest(d_sae=99),
+            )
+
+    def test_undeclared_without_spares_rejected(self):
+        with pytest.raises(ValueError, match="not declared at startup"):
+            self._check(self._vllm_config(), self._registry(), "new", self._manifest())
+
+    def test_undeclared_fits_spares_passes(self):
+        cfg = self._vllm_config(
+            sae_spare_slot_sites=["3:post_block"], sae_spare_slot_features=4
+        )
+        self._check(cfg, self._registry(), "new", self._manifest())
+
+    def test_spare_capacity_counts_other_undeclared_modules(self):
+        cfg = self._vllm_config(
+            sae_spare_slot_sites=["3:post_block"],
+            sae_spare_slot_features=4,
+            sae_spare_slots_per_site=1,
+        )
+        occupant = SimpleNamespace(
+            kind=SteeringModuleKind.SAE_DELTA,
+            sae_manifest=self._manifest(),
+        )
+        registry = self._registry({"occupant": occupant})
+        with pytest.raises(ValueError, match="claimed"):
+            self._check(cfg, registry, "new", self._manifest())
+        # Re-registering the occupant itself stays allowed.
+        self._check(cfg, registry, "occupant", self._manifest())
+
+    def test_spare_activation_and_size_limits(self):
+        cfg = self._vllm_config(
+            sae_spare_slot_sites=["3:post_block"], sae_spare_slot_features=1
+        )
+        with pytest.raises(ValueError, match="reserve only 1"):
+            self._check(cfg, self._registry(), "new", self._manifest())
+        cfg2 = self._vllm_config(
+            sae_spare_slot_sites=["3:post_block"], sae_spare_slot_features=4
+        )
+        with pytest.raises(ValueError, match="relu/jumprelu"):
+            self._check(
+                cfg2,
+                self._registry(),
+                "new",
+                self._manifest(
+                    activation=SAEActivation.TOPK, activation_params={"k": 1.0}
+                ),
+            )
