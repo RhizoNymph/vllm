@@ -279,6 +279,30 @@ class CompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
+    # Per-request directional clamps. Accepts either the JSON entry-list form
+    # or the binary packed form ({hook: ClampHookPacked}); see the chat
+    # protocol's steering_clamps for details.
+    steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-request directional clamps applied to both "
+        "phases, keyed by hook point then layer index; each value is a "
+        "list of clamp entries ({'vector': [...], 'min': float?, 'max': "
+        "float?, 'strength': float=1.0} or {'vector': [...], 'value': c} "
+        "to pin).",
+    )
+
+    prefill_steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Phase-specific clamps concatenated after base during "
+        "prefill only. Same format as steering_clamps.",
+    )
+
+    decode_steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Phase-specific clamps concatenated after base during "
+        "decode only. Same format as steering_clamps.",
+    )
+
     conversation_id: str | None = Field(
         default=None,
         description="Opaque client conversation/session id. Carried as "
@@ -465,6 +489,11 @@ class CompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
+            # SamplingParams' own validation normalizes every accepted
+            # clamp shape via SteeringClamps.from_obj (400 on malformed).
+            steering_clamps=self.steering_clamps,
+            prefill_steering_clamps=self.prefill_steering_clamps,
+            decode_steering_clamps=self.decode_steering_clamps,
         )
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)
@@ -474,7 +503,9 @@ class CompletionRequest(OpenAIBaseModel):
             sampling_params.patch_vectors = dict(self.patch_vectors)
         return sampling_params
 
-    def to_request_metadata(self, vector_registry=None) -> RequestMetadata:
+    def to_request_metadata(
+        self, vector_registry=None, *, monitor_writes_gates: bool | None = None
+    ) -> RequestMetadata:
         """Build the request-level metadata channel for this request.
 
         Holds host-side per-request fields that are not sampling parameters
@@ -483,12 +514,18 @@ class CompletionRequest(OpenAIBaseModel):
         ``SamplingParams``. Named vector sources in ``steering`` are resolved
         via *vector_registry*; raises ``ValueError`` on a malformed spec or
         unknown name (surfaced by the caller as HTTP 400).
+        ``monitor_writes_gates`` (the engine's ``enable_cross_layer_monitor``)
+        rejects a clamp-target gate the engine cannot materialize.
         """
         from vllm.v1.steering_schema import build_steering_gates
 
         return RequestMetadata(
             conversation_id=self.conversation_id,
-            steering=build_steering_gates(self.steering, vector_registry),
+            steering=build_steering_gates(
+                self.steering,
+                vector_registry,
+                monitor_writes_gates=monitor_writes_gates,
+            ),
         )
 
     @model_validator(mode="before")

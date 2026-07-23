@@ -24,13 +24,26 @@ class RegisterSteeringModuleRequest(BaseModel):
     )
     prefill_vectors: dict[str, Any] | None = Field(
         default=None,
-        description="Prefill-phase steering vectors. Same accepted shapes "
-        "as vectors.",
+        description="Prefill-phase steering vectors. Same accepted shapes as vectors.",
     )
     decode_vectors: dict[str, Any] | None = Field(
         default=None,
-        description="Decode-phase steering vectors. Same accepted shapes "
-        "as vectors.",
+        description="Decode-phase steering vectors. Same accepted shapes as vectors.",
+    )
+    clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Base directional clamps (both phases): {hook: {layer: "
+        "[{'vector': [...], 'min': float?, 'max': float?, 'strength': "
+        "float=1.0} | {'vector': [...], 'value': c}]}}. Same shape as the "
+        "/v1/steering/set clamps field.",
+    )
+    prefill_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Prefill-phase clamps, concatenated after base.",
+    )
+    decode_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Decode-phase clamps, concatenated after base.",
     )
 
 

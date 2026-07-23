@@ -6,7 +6,8 @@ use crate::lora::LoraModelResolution;
 use crate::routes::openai::completions::validate;
 use crate::routes::openai::utils::structured_outputs::convert_from_response_format_value;
 use crate::utils::{
-    ResolvedRequestContext, convert_logit_bias, merge_kv_transfer_params, unpack_steering_field,
+    ResolvedRequestContext, convert_logit_bias, merge_kv_transfer_params, parse_clamp_field,
+    unpack_steering_field,
 };
 
 /// Lowered completion request plus the public response metadata carried by
@@ -100,6 +101,11 @@ pub(super) fn prepare_completion_request(
         convert_from_response_format_value(&request.response_format, &request.structured_outputs)?;
 
     let steering_vectors = unpack_steering_field(request.steering_vectors, "steering_vectors")?;
+    let steering_clamps = parse_clamp_field(request.steering_clamps, "steering_clamps")?;
+    let prefill_steering_clamps =
+        parse_clamp_field(request.prefill_steering_clamps, "prefill_steering_clamps")?;
+    let decode_steering_clamps =
+        parse_clamp_field(request.decode_steering_clamps, "decode_steering_clamps")?;
     let prefill_steering_vectors =
         unpack_steering_field(request.prefill_steering_vectors, "prefill_steering_vectors")?;
     let decode_steering_vectors =
@@ -141,6 +147,9 @@ pub(super) fn prepare_completion_request(
             capture: request.capture,
             patch: request.patch,
             patch_vectors: request.patch_vectors,
+            steering_clamps,
+            prefill_steering_clamps,
+            decode_steering_clamps,
         },
         decode_options: TextDecodeOptions {
             skip_special_tokens: request.skip_special_tokens,

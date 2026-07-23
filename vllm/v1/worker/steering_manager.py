@@ -43,12 +43,23 @@ effective vectors for each phase.
 import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 import torch
 
-from vllm.config.steering_types import hash_steering_config
+from vllm.config.steering_types import (
+    SteeringClamps,
+    _clamp_unit_rows,
+    hash_steering_config,
+)
 from vllm.logger import init_logger
+from vllm.model_executor.layers.clamp import (
+    CLAMP_ANY_ACTIVE_ATTR,
+    CLAMP_BOUNDS_ATTR,
+    CLAMP_DIRS_ATTR,
+    CLAMP_STRENGTH_ATTR,
+)
 from vllm.model_executor.layers.steering import (
     _ROW_MONITOR_DEFAULT_PARAMS,
     HOOK_POINT_ANY_ACTIVE_ATTR,
@@ -123,6 +134,21 @@ class _DirtyState:
         return self.scales and not (self.content or self.membership)
 
 
+class ClampSitePayload(NamedTuple):
+    """Materialized clamp entries for one (hook, layer) site.
+
+    ``dirs`` is ``(k, hidden)`` fp32 on the manager's device (unit rows);
+    ``bounds`` is ``(k, 2)`` fp32 CPU ``[lo, hi]``; ``strength`` is ``(k,)``
+    fp32 CPU.  ``bounds``/``strength`` stay host-side — they are tiny and
+    are shipped as part of the per-site matrix build at populate time, so
+    materialization never pays a synchronous H2D for them.
+    """
+
+    dirs: torch.Tensor
+    bounds: torch.Tensor
+    strength: torch.Tensor
+
+
 class SteeringManager:
     """Per-request steering config manager.
 
@@ -151,9 +177,11 @@ class SteeringManager:
         max_steering_configs: int,
         device: torch.device | None = None,
         max_dynamic_steering_configs: int = 0,
+        max_clamp_directions: int = 0,
     ):
         self.max_steering_configs = max_steering_configs
         self.max_dynamic_steering_configs = max_dynamic_steering_configs
+        self.max_clamp_directions = max_clamp_directions
         self.device = device
         # (config_hash, phase) -> assigned table row index (3-based)
         self.config_to_row: dict[tuple[int, str], int] = {}
@@ -192,6 +220,30 @@ class SteeringManager:
         self._global_vectors: PhaseTiers[dict[str, dict[int, torch.Tensor]]] = (
             PhaseTiers(base={}, prefill={}, decode={}, label="global vector")
         )
+
+        # Directional-clamp state (mirrors the vector tiers). Per-config
+        # payloads parallel ``config_vectors``; global clamps parallel the
+        # three global tiers. Row composition at populate is CONCATENATION
+        # (independent constraints), not addition: a config row carries
+        # ``concat(global base, global phase, per-request)`` capped at K.
+        self.config_clamps: dict[
+            tuple[int, str], dict[str, dict[int, ClampSitePayload]]
+        ] = {}
+        self._global_clamps: PhaseTiers[dict[str, dict[int, ClampSitePayload]]] = (
+            PhaseTiers(base={}, prefill={}, decode={}, label="global clamp")
+        )
+
+        # Per-dynamic-override clamps (parallel to ``_dynamic_vectors``):
+        # dyn_id -> {hook: {layer: ClampSitePayload}}. A dynamic-override row
+        # composes ``concat(global base, global decode, override)`` at
+        # populate (see :meth:`_build_clamp_site_rows`), so a controller can
+        # carry per-override bounds on top of the inherited global-decode
+        # clamps. ``_dynamic_clamp_specs`` keeps the RAW (unfiltered) spec so
+        # the rank-identical APC decode signature (``_dynamic_sig``) can fold
+        # clamps in even on a keep-update (materialized payloads are
+        # PP-filtered and would diverge; the raw spec never does).
+        self._dynamic_clamps: dict[int, dict[str, dict[int, ClampSitePayload]]] = {}
+        self._dynamic_clamp_specs: dict[int, SteeringClamps] = {}
 
         # Dynamic additive tier (decode-only): a global steering
         # contribution owned by dynamic consumers, held in a dedicated
@@ -436,6 +488,7 @@ class SteeringManager:
         phase: str = "prefill",
         *,
         locally_owned_layers: frozenset[int] | None = None,
+        clamps: SteeringClamps | dict | None = None,
     ) -> int:
         """Register a steering config, return its table row index.
 
@@ -444,7 +497,10 @@ class SteeringManager:
             vectors: ``{hook_point_str: {layer_idx: vec}}`` where ``vec`` is
                 either a ``list[float]`` (legacy) or a 1-D ``np.ndarray``
                 (the float64 arrays produced by
-                :func:`resolve_effective_vectors`).
+                :func:`resolve_effective_vectors`).  May be empty for a
+                clamp-only config — the row is still allocated (the shared
+                ``steering_index`` routes the request's tokens to it and
+                the clamp buffers are gathered by the same row).
             phase: ``"prefill"`` or ``"decode"``
             locally_owned_layers: If provided, only layers in this set
                 have tensors materialized on this worker.  Layers
@@ -453,6 +509,13 @@ class SteeringManager:
                 identical across ranks (distributed-steering
                 determinism contract).  When ``None`` (default), no
                 filtering — all layers in ``vectors`` get tensors.
+            clamps: Optional per-request clamp tier — a
+                :class:`SteeringClamps` (or any shape its ``from_obj``
+                accepts, e.g. the plain-dict wire form a collective_rpc
+                hop produces).  Directions are materialized as device
+                tensors like ``vectors``; the clamp content is already
+                part of ``config_hash``, so a refcount hit implies
+                identical clamps.
 
         If the ``(config_hash, phase)`` pair is already registered,
         increments refcount and returns the existing row. Otherwise
@@ -473,6 +536,13 @@ class SteeringManager:
                 f"{len(self.config_to_row)}"
             )
 
+        # Materialize clamps BEFORE allocating the row so a malformed /
+        # over-K clamp spec rejects without leaking a row.
+        clamp_spec = SteeringClamps.from_obj(clamps)
+        stored_clamps = (
+            self._store_clamps(clamp_spec, locally_owned_layers) if clamp_spec else None
+        )
+
         row = self.free_rows.pop()
         self.config_to_row[key] = row
         self.config_refcounts[key] = 1
@@ -483,6 +553,8 @@ class SteeringManager:
         # affects what tensors get constructed, not which row is
         # assigned.
         self.config_vectors[key] = self._store_vectors(vectors, locally_owned_layers)
+        if stored_clamps:
+            self.config_clamps[key] = stored_clamps
         # New row content + a changed row set: rebuild indices scratch and
         # recompose the tables on the next populate (membership implies
         # content). (Refcount-hit path doesn't mark dirty because the row's
@@ -525,6 +597,90 @@ class SteeringManager:
             }
         return stored
 
+    def _store_clamps(
+        self,
+        clamps: SteeringClamps,
+        locally_owned_layers: frozenset[int] | None,
+    ) -> dict[str, dict[int, ClampSitePayload]]:
+        """Materialize a clamp tier's per-site payloads.
+
+        Mirrors :meth:`_store_vectors`: non-local layers are skipped at
+        materialization time only (row allocation is caller-side and
+        unconditional).  Raises ``ValueError`` when a site carries more
+        than ``max_clamp_directions`` rows or clamping is disabled.
+        """
+        stored: dict[str, dict[int, ClampSitePayload]] = {}
+        for hook_point, table in clamps.hooks.items():
+            site_map: dict[int, ClampSitePayload] = {}
+            for layer_idx, dirs, lo, hi, strength in table.by_layer():
+                if (
+                    locally_owned_layers is not None
+                    and layer_idx not in locally_owned_layers
+                ):
+                    continue
+                site_map[layer_idx] = self._materialize_clamp_site(
+                    dirs,
+                    lo,
+                    hi,
+                    strength,
+                    site=f"[{hook_point!r}][{layer_idx}]",
+                )
+            if site_map:
+                stored[hook_point] = site_map
+        return stored
+
+    def _materialize_clamp_site(
+        self,
+        dirs: np.ndarray,
+        lo: np.ndarray,
+        hi: np.ndarray,
+        strength: np.ndarray,
+        *,
+        site: str,
+    ) -> ClampSitePayload:
+        """Convert one site's clamp rows into a :class:`ClampSitePayload`.
+
+        Rows arrive raw (as submitted) and are unit-normalized here via
+        :func:`_clamp_unit_rows` — bounds live in unit-projection space.
+        Directions land on ``self.device`` as a fresh tensor, deliberately
+        NOT via the pinned staging ring of
+        :meth:`_stack_vectors_to_device`: the ring's slots are lazily
+        allocated on the step thread inside ``torch.inference_mode()``, so
+        an in-place ``copy_`` into them from a control-plane RPC thread
+        (global clamp set, module-register broadcast) raises "Inplace
+        update to inference tensor outside InferenceMode".  Clamp payloads
+        are tiny (≤ K x hidden floats), so a plain blocking H2D is fine on
+        every path.  Bounds/strength stay on CPU (see
+        :class:`ClampSitePayload`).
+        """
+        if self.max_clamp_directions <= 0:
+            raise ValueError(
+                f"Clamp spec {site} present but clamping is disabled "
+                "(steering_config.max_clamp_directions=0)"
+            )
+        n = int(dirs.shape[0])
+        if n > self.max_clamp_directions:
+            raise ValueError(
+                f"Clamp spec {site} has {n} directions, "
+                f"exceeding max_clamp_directions={self.max_clamp_directions}"
+            )
+        unit = _clamp_unit_rows(np.asarray(dirs, dtype=np.float64))
+        stacked = np.ascontiguousarray(unit.astype(np.float32))
+        dirs_t = torch.from_numpy(stacked)
+        if self.device is not None:
+            dirs_t = dirs_t.to(self.device)
+        bounds = np.stack(
+            [np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)],
+            axis=1,
+        )
+        return ClampSitePayload(
+            dirs=dirs_t,
+            bounds=torch.tensor(bounds, dtype=torch.float32),
+            strength=torch.tensor(
+                np.asarray(strength, dtype=np.float64), dtype=torch.float32
+            ),
+        )
+
     # ------------------------------------------------------------------
     # Dynamic-override pool (docs/design/dynamic_steering.md §5.2)
     # ------------------------------------------------------------------
@@ -542,6 +698,7 @@ class SteeringManager:
         self,
         vectors: dict[str, dict[int, list[float] | np.ndarray]],
         *,
+        clamps: SteeringClamps | dict | None = None,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> tuple[int, int]:
         """Allocate a dynamic-override row; returns ``(dyn_id, row)``.
@@ -552,6 +709,13 @@ class SteeringManager:
         dynamic register/release sequence is rank-replicated. Raises
         ``RuntimeError`` when the pool is exhausted (callers reject the
         triggering action and keep previous state).
+
+        ``clamps`` is an optional per-override :class:`SteeringClamps`
+        (any ``from_obj``-accepted shape); the dynamic row then carries
+        ``concat(global base, global decode, override)``. Materialized
+        BEFORE the row is allocated so a malformed / over-K spec rejects
+        with ``ValueError`` without leaking a pool row (mirrors
+        :meth:`register_config`).
         """
         if not self._dynamic_free_rows:
             raise RuntimeError(
@@ -560,6 +724,11 @@ class SteeringManager:
                 f"{self.max_dynamic_steering_configs}, active="
                 f"{len(self._dynamic_to_row)}"
             )
+        # Materialize clamps BEFORE allocating the row (validation may raise).
+        clamp_spec = SteeringClamps.from_obj(clamps)
+        stored_clamps = (
+            self._store_clamps(clamp_spec, locally_owned_layers) if clamp_spec else None
+        )
         dyn_id = self._next_dynamic_id
         self._next_dynamic_id += 1
         row = self._dynamic_free_rows.pop()
@@ -567,9 +736,12 @@ class SteeringManager:
         self._dynamic_vectors[dyn_id] = self._store_vectors(
             vectors, locally_owned_layers
         )
-        # Cache the override-vector hash for the APC decode signature. Hash
-        # the raw input vectors (np/list) — no device sync, rank-identical.
-        self._dynamic_sig[dyn_id] = hash_steering_config(vectors)
+        if stored_clamps:
+            self._dynamic_clamps[dyn_id] = stored_clamps
+            self._dynamic_clamp_specs[dyn_id] = clamp_spec
+        # Cache the override-vector+clamp hash for the APC decode signature.
+        # Hash the raw input (np/list/spec) — no device sync, rank-identical.
+        self._dynamic_sig[dyn_id] = hash_steering_config(vectors, clamps=clamp_spec)
         self._dirty.mark_membership()
         return dyn_id, row
 
@@ -578,6 +750,7 @@ class SteeringManager:
         dyn_id: int,
         vectors: dict[str, dict[int, list[float] | np.ndarray]],
         *,
+        clamps: SteeringClamps | dict | None = None,
         locally_owned_layers: frozenset[int] | None = None,
     ) -> None:
         """Replace a live dynamic config's vectors in place (same row).
@@ -585,13 +758,34 @@ class SteeringManager:
         The common re-emit path: gain/vector changes for an existing
         override rewrite the row's content without free-list churn, so
         the cached populate indices stay valid (``_tables_dirty`` only).
+
+        ``clamps`` follows REPLACE semantics for the override's own clamps:
+        ``None`` KEEPS the previous clamp set (the common vectors-only
+        re-emit), an empty spec (``SteeringClamps.empty()`` / ``{}``)
+        CLEARS it, and a non-empty spec replaces it. The clamp change only
+        marks content dirty (never membership), so the cached populate
+        indices stay valid.
         """
         if dyn_id not in self._dynamic_to_row:
             raise KeyError(f"dynamic steering config {dyn_id} is not registered")
         self._dynamic_vectors[dyn_id] = self._store_vectors(
             vectors, locally_owned_layers
         )
-        self._dynamic_sig[dyn_id] = hash_steering_config(vectors)
+        clamp_spec = SteeringClamps.from_obj(clamps, preserve_empty=True)
+        if clamp_spec is not None:
+            # Replace (empty spec clears).
+            if clamp_spec:
+                self._dynamic_clamps[dyn_id] = self._store_clamps(
+                    clamp_spec, locally_owned_layers
+                )
+                self._dynamic_clamp_specs[dyn_id] = clamp_spec
+            else:
+                self._dynamic_clamps.pop(dyn_id, None)
+                self._dynamic_clamp_specs.pop(dyn_id, None)
+        # ``clamps is None`` ⇒ keep the previous clamp set untouched.
+        self._dynamic_sig[dyn_id] = hash_steering_config(
+            vectors, clamps=self._dynamic_clamp_specs.get(dyn_id)
+        )
         self._dirty.mark_content()
 
     def release_dynamic_config(self, dyn_id: int) -> None:
@@ -608,6 +802,8 @@ class SteeringManager:
         if row is None:
             return
         self._dynamic_vectors.pop(dyn_id, None)
+        self._dynamic_clamps.pop(dyn_id, None)
+        self._dynamic_clamp_specs.pop(dyn_id, None)
         self._dynamic_sig.pop(dyn_id, None)
         self._dynamic_free_rows.append(row)
         # Purge the row's owner-keyed runtime state (scale + per-row monitors).
@@ -644,6 +840,7 @@ class SteeringManager:
         if self.config_refcounts[key] <= 0:
             row = self.config_to_row.pop(key)
             self.config_vectors.pop(key, None)
+            self.config_clamps.pop(key, None)
             del self.config_refcounts[key]
             self.free_rows.append(row)
             # Last live registration released: drop its owner-keyed runtime
@@ -752,6 +949,98 @@ class SteeringManager:
         """Clear all cached global vectors across all phases and hook points."""
         self._global_vectors.clear_all()
         self._dirty.mark_content()
+
+    def update_global_clamps(
+        self,
+        hook_point: str,
+        layer_idx: int,
+        site_rows: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None,
+        phase: str = "base",
+        *,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Update the cached global clamps for a hook point and layer.
+
+        ``site_rows`` is one site's ``(dirs, lo, hi, strength)`` row
+        group as produced by :meth:`ClampHookTable.by_layer` (directions
+        raw float64; normalized at materialization); ``None`` or an empty
+        group removes the site.  Mirrors :meth:`update_global_vectors`,
+        including the cross-thread synchronize: the payload's direction
+        tensors are produced on the control-plane thread but consumed by
+        ``populate_steering_tables`` on the step thread, so the H2D must
+        be fully drained before the manager exposes them (see the
+        ``update_global_vectors`` comment for the full stream-ordering
+        rationale).
+        """
+        if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
+            return
+        target = self._global_clamp_dict_for_phase(phase)
+        if site_rows is None or len(site_rows[0]) == 0:
+            hook_map = target.get(hook_point)
+            if hook_map is not None:
+                hook_map.pop(layer_idx, None)
+                if not hook_map:
+                    target.pop(hook_point, None)
+            self._dirty.mark_content()
+            return
+        dirs, lo, hi, strength = site_rows
+        payload = self._materialize_clamp_site(
+            dirs,
+            lo,
+            hi,
+            strength,
+            site=f"global {phase} [{hook_point!r}][{layer_idx}]",
+        )
+        if payload.dirs.is_cuda:
+            torch.cuda.synchronize(payload.dirs.device)
+        target.setdefault(hook_point, {})[layer_idx] = payload
+        # Global rows 1, 2 and all per-request rows depend on this state.
+        self._dirty.mark_content()
+
+    def clear_global_clamps(self) -> None:
+        """Clear all cached global clamps across all phases and hook points."""
+        self._global_clamps.clear_all()
+        self._dirty.mark_content()
+
+    # Tier dict names are tested contract (and read across the populate
+    # path); expose the PhaseTiers fields under the historical names.
+    @property
+    def global_clamp_base(self) -> dict[str, dict[int, ClampSitePayload]]:
+        return self._global_clamps.base
+
+    @property
+    def global_clamp_prefill(self) -> dict[str, dict[int, ClampSitePayload]]:
+        return self._global_clamps.prefill
+
+    @property
+    def global_clamp_decode(self) -> dict[str, dict[int, ClampSitePayload]]:
+        return self._global_clamps.decode
+
+    def _global_clamp_dict_for_phase(
+        self, phase: str
+    ) -> dict[str, dict[int, ClampSitePayload]]:
+        """Return the global clamp dict for the given phase."""
+        return self._global_clamps.for_phase(phase)
+
+    @property
+    def has_global_clamps(self) -> bool:
+        """True when any global clamp tier has at least one site."""
+        return bool(self._global_clamps)
+
+    @property
+    def has_any_clamps(self) -> bool:
+        """True when any clamp exists.
+
+        Global tiers, per-request configs, OR a dynamic override's own
+        clamps — the dynamic case must count so a dynamic-only clamp
+        (no global, no per-request) still populates its buffers rather
+        than short-circuiting to never-written state.
+        """
+        return (
+            self.has_global_clamps
+            or any(self.config_clamps.values())
+            or any(self._dynamic_clamps.values())
+        )
 
     def update_dynamic_tier(
         self,
@@ -1295,6 +1584,114 @@ class SteeringManager:
             result = squeezed.clone() if result is None else result + squeezed
         return result
 
+    def _site_has_clamps(self, hp_str: str, layer_idx: int) -> bool:
+        """True when any clamp (global tier, config, or dynamic override)
+        targets this site."""
+        for tier in (
+            self.global_clamp_base,
+            self.global_clamp_prefill,
+            self.global_clamp_decode,
+        ):
+            if layer_idx in tier.get(hp_str, {}):
+                return True
+        if any(
+            layer_idx in per_config.get(hp_str, {})
+            for per_config in self.config_clamps.values()
+        ):
+            return True
+        return any(
+            layer_idx in per_dyn.get(hp_str, {})
+            for per_dyn in self._dynamic_clamps.values()
+        )
+
+    def _build_clamp_site_rows(
+        self,
+        hp_str: str,
+        layer_idx: int,
+        ordered_configs: list[tuple[tuple[int, str], int]],
+        ordered_dynamic: list[tuple[int, int]],
+        *,
+        k_cap: int,
+        hidden_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        """Assemble one site's clamp matrices in row-position order.
+
+        Returns ``(dirs (num_rows, K, hidden) fp32 on *device*,
+        bounds (num_rows, K, 2) fp32 CPU, strength (num_rows, K) fp32 CPU,
+        any_clamp)``.  Row positions match ``_cached_indices``:
+        ``[0, 1, 2, *config_rows, *dynamic_rows]``.  Row 0 keeps the no-op
+        defaults (zero dirs); row 1 = concat(global base, global prefill);
+        row 2 = concat(global base, global decode); config rows =
+        concat(global base, global phase, per-request); dynamic-override
+        rows = concat(global base, global decode, that override's own
+        clamps).  A concat exceeding ``k_cap`` raises with the offending
+        site and row owner named — the per-payload cap can pass while a
+        LATER global-clamp set overflows an already-registered config or
+        dynamic-override row.
+        """
+        num_rows = 3 + len(ordered_configs) + len(ordered_dynamic)
+        dirs_mat = torch.zeros(
+            num_rows, k_cap, hidden_size, dtype=torch.float32, device=device
+        )
+        bounds_mat = torch.empty(num_rows, k_cap, 2, dtype=torch.float32)
+        bounds_mat[..., 0] = -float("inf")
+        bounds_mat[..., 1] = float("inf")
+        strength_mat = torch.ones(num_rows, k_cap, dtype=torch.float32)
+        any_clamp = False
+
+        g_base = self.global_clamp_base.get(hp_str, {}).get(layer_idx)
+        g_prefill = self.global_clamp_prefill.get(hp_str, {}).get(layer_idx)
+        g_decode = self.global_clamp_decode.get(hp_str, {}).get(layer_idx)
+
+        def _fill(pos: int, payloads: list[ClampSitePayload], owner: str) -> None:
+            nonlocal any_clamp
+            k_total = sum(int(p.dirs.shape[0]) for p in payloads)
+            if k_total > k_cap:
+                raise ValueError(
+                    f"Clamp row for {owner} at [{hp_str!r}][{layer_idx}] "
+                    f"needs {k_total} directions after composing global + "
+                    f"per-request tiers, exceeding max_clamp_directions="
+                    f"{k_cap}"
+                )
+            offset = 0
+            for p in payloads:
+                k = int(p.dirs.shape[0])
+                dirs_mat[pos, offset : offset + k] = p.dirs.to(device)
+                bounds_mat[pos, offset : offset + k] = p.bounds
+                strength_mat[pos, offset : offset + k] = p.strength
+                offset += k
+            if k_total > 0:
+                any_clamp = True
+
+        prefill_payloads = [p for p in (g_base, g_prefill) if p is not None]
+        decode_payloads = [p for p in (g_base, g_decode) if p is not None]
+        _fill(1, prefill_payloads, "global prefill")
+        _fill(2, decode_payloads, "global decode")
+
+        for i, ((config_hash, phase), _row_idx) in enumerate(ordered_configs):
+            per_req = (
+                self.config_clamps.get((config_hash, phase), {})
+                .get(hp_str, {})
+                .get(layer_idx)
+            )
+            payloads = list(prefill_payloads if phase == "prefill" else decode_payloads)
+            if per_req is not None:
+                payloads.append(per_req)
+            _fill(3 + i, payloads, f"config hash={config_hash} phase={phase}")
+
+        dyn_base = 3 + len(ordered_configs)
+        for j, (dyn_id, _row_idx) in enumerate(ordered_dynamic):
+            per_dyn = (
+                self._dynamic_clamps.get(dyn_id, {}).get(hp_str, {}).get(layer_idx)
+            )
+            payloads = list(decode_payloads)
+            if per_dyn is not None:
+                payloads.append(per_dyn)
+            _fill(dyn_base + j, payloads, f"dynamic id={dyn_id}")
+
+        return dirs_mat, bounds_mat, strength_mat, any_clamp
+
     def _stack_vectors_to_device(
         self, vecs: list[list[float] | np.ndarray]
     ) -> torch.Tensor:
@@ -1769,6 +2166,48 @@ class SteeringManager:
             probe_tbl.index_copy_(0, indices, probe_mat.to(probe_tbl.dtype))
             row_params_buf.index_copy_(0, indices, params_mat.to(row_params_buf.dtype))
             row_active_buf.fill_(True)
+
+        # Write each (hook, layer)'s directional-clamp dirs/bounds/strength
+        # buffers, in the same row-position order (and with the same scatter
+        # ``indices``) as the table write. Modeled on the per-row-monitor
+        # block above, not the fp32 mega-stack — the 3-D ``(rows, K,
+        # hidden)`` dirs shape opts out of the batched cast. Sites with no
+        # clamps configured anywhere skip the matrix build entirely (the
+        # flag write keeps the kernel's short-circuit correct on clamp
+        # active->inactive transitions).
+        for active_pos, (_table, hp_str, layer_idx, mod) in enumerate(active_tables):
+            try:
+                hp_enum = SteeringHookPoint(hp_str)
+            except ValueError:
+                continue
+            clamp_active_buf = getattr(mod, CLAMP_ANY_ACTIVE_ATTR[hp_enum], None)
+            if clamp_active_buf is None:
+                continue
+            if not self.has_any_clamps or not self._site_has_clamps(hp_str, layer_idx):
+                clamp_active_buf.fill_(False)
+                continue
+            dirs_buf = getattr(mod, CLAMP_DIRS_ATTR[hp_enum], None)
+            bounds_buf = getattr(mod, CLAMP_BOUNDS_ATTR[hp_enum], None)
+            strength_buf = getattr(mod, CLAMP_STRENGTH_ATTR[hp_enum], None)
+            if dirs_buf is None or bounds_buf is None or strength_buf is None:
+                clamp_active_buf.fill_(False)
+                continue
+            dirs_mat, bounds_mat, strength_mat, any_clamp = self._build_clamp_site_rows(
+                hp_str,
+                layer_idx,
+                ordered_configs,
+                ordered_dynamic,
+                k_cap=int(dirs_buf.shape[1]),
+                hidden_size=hidden_size,
+                device=dirs_buf.device,
+            )
+            if not any_clamp:
+                clamp_active_buf.fill_(False)
+                continue
+            dirs_buf.index_copy_(0, indices, dirs_mat.to(dirs_buf.dtype))
+            bounds_buf.index_copy_(0, indices, bounds_mat.to(bounds_buf.device))
+            strength_buf.index_copy_(0, indices, strength_mat.to(strength_buf.device))
+            clamp_active_buf.fill_(True)
 
         # Write the per-row strength scales (§5.3) alongside the tables.
         # The scale vector is hook/layer-independent, so build it once and

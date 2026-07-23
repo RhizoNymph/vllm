@@ -54,6 +54,7 @@ fn default_max_tokens() -> u32 {
     16
 }
 
+pub mod clamps;
 mod classified_outputs;
 pub mod dtype;
 pub mod handshake;
@@ -65,6 +66,7 @@ pub mod steering;
 pub mod tensor;
 pub mod utility;
 pub use capture::CaptureResult;
+pub use clamps::{ClampHookTable, SteeringClamps};
 pub use classified_outputs::{
     ClassifiedEngineCoreOutputs, DpControlMessage, RequestBatchOutputs, UtilityCallOutput,
 };
@@ -368,6 +370,21 @@ pub struct EngineCoreSamplingParams {
     /// wire payload compatible with clients that never set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_vectors: Option<serde_json::Value>,
+    /// Per-request steering clamps applied to both prefill and decode
+    /// phases, in the canonical [`SteeringClamps`] form Python's strict
+    /// decoder expects (the HTTP/gRPC layers pack client input into it).
+    /// Omit-when-None keeps the wire payload compatible with clients that
+    /// never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_clamps: Option<SteeringClamps>,
+    /// Phase-specific steering clamps applied during prefill only. Same
+    /// canonical form as `steering_clamps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_steering_clamps: Option<SteeringClamps>,
+    /// Phase-specific steering clamps applied during decode only. Same
+    /// canonical form as `steering_clamps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_steering_clamps: Option<SteeringClamps>,
 }
 
 impl EngineCoreSamplingParams {
@@ -403,6 +420,9 @@ impl EngineCoreSamplingParams {
             capture: None,
             patch: None,
             patch_vectors: None,
+            steering_clamps: None,
+            prefill_steering_clamps: None,
+            decode_steering_clamps: None,
         }
     }
 }
@@ -876,6 +896,165 @@ mod tests {
     }
 
     #[test]
+    fn steering_clamps_use_python_field_names_and_are_omitted_when_none() {
+        // The three clamp fields ride under their exact Python msgspec field
+        // names in the canonical `{"hooks": {...}}` form, and are skipped on
+        // the wire when None.
+        let table = ClampHookTable {
+            shape: vec![1, 2],
+            layer_indices: vec![5],
+            data: [1.0f64, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            lo: vec![-2.0],
+            hi: vec![2.0],
+            strength: vec![1.0],
+        };
+        let clamps = SteeringClamps {
+            hooks: HashMap::from([("post_attn".to_owned(), table.clone())]),
+        };
+        let params = EngineCoreSamplingParams {
+            steering_clamps: Some(clamps.clone()),
+            prefill_steering_clamps: Some(clamps.clone()),
+            decode_steering_clamps: Some(clamps.clone()),
+            ..EngineCoreSamplingParams::for_test()
+        };
+
+        let bytes = encode_msgpack(&params).unwrap();
+        let value = decode_value(&bytes).unwrap();
+        let map = match value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let get = |key: &str| map.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v);
+        for key in [
+            "steering_clamps",
+            "prefill_steering_clamps",
+            "decode_steering_clamps",
+        ] {
+            let Some(Value::Map(outer)) = get(key) else {
+                panic!("{key} must ride as a msgpack map under its exact wire name");
+            };
+            assert!(
+                outer.iter().any(|(k, _)| k.as_str() == Some("hooks")),
+                "{key} must carry the canonical hooks nesting"
+            );
+        }
+
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.steering_clamps, Some(clamps.clone()));
+        assert_eq!(decoded.prefill_steering_clamps, Some(clamps.clone()));
+        assert_eq!(decoded.decode_steering_clamps, Some(clamps));
+
+        // Absent by default: all three keys are skipped on the wire and decode
+        // cleanly to None.
+        let plain = EngineCoreSamplingParams::for_test();
+        let plain_bytes = encode_msgpack(&plain).unwrap();
+        let plain_map = match decode_value(&plain_bytes).unwrap() {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        for key in [
+            "steering_clamps",
+            "prefill_steering_clamps",
+            "decode_steering_clamps",
+        ] {
+            assert!(
+                !plain_map.iter().any(|(k, _)| k.as_str() == Some(key)),
+                "{key} must be omitted from the wire payload when None"
+            );
+        }
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&plain_bytes).unwrap();
+        assert!(decoded.steering_clamps.is_none());
+        assert!(decoded.prefill_steering_clamps.is_none());
+        assert!(decoded.decode_steering_clamps.is_none());
+    }
+
+    #[test]
+    fn clamp_row_data_rides_msgpack_bin_with_true_infinities() {
+        // Python msgspec strictly expects `bytes` (msgpack bin) for the row
+        // data and native non-finite floats for open bounds — an integer
+        // array or a null sentinel would fail the engine-side decode.
+        let rows: Vec<u8> = [1.5f64, -2.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let table = ClampHookTable {
+            shape: vec![1, 2],
+            layer_indices: vec![14],
+            data: rows.clone(),
+            lo: vec![f64::NEG_INFINITY],
+            hi: vec![4.0],
+            strength: vec![0.5],
+        };
+        let clamps = SteeringClamps {
+            hooks: HashMap::from([("post_block".to_owned(), table)]),
+        };
+        let params = EngineCoreSamplingParams {
+            steering_clamps: Some(clamps.clone()),
+            ..EngineCoreSamplingParams::for_test()
+        };
+
+        let bytes = encode_msgpack(&params).unwrap();
+        let value = decode_value(&bytes).unwrap();
+        let Value::Map(map) = value else {
+            panic!("expected map");
+        };
+        let clamps_value = map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("steering_clamps"))
+            .map(|(_, v)| v)
+            .expect("steering_clamps present");
+        let Value::Map(outer) = clamps_value else {
+            panic!("expected hooks map");
+        };
+        let Some((_, Value::Map(hooks))) = outer.iter().find(|(k, _)| k.as_str() == Some("hooks"))
+        else {
+            panic!("expected hooks key");
+        };
+        let Some((_, Value::Map(blob))) =
+            hooks.iter().find(|(k, _)| k.as_str() == Some("post_block"))
+        else {
+            panic!("expected post_block table");
+        };
+        let data = blob.iter().find(|(k, _)| k.as_str() == Some("data")).map(|(_, v)| v);
+        assert!(
+            matches!(data, Some(Value::Binary(b)) if *b == rows),
+            "row data must be a msgpack bin of the raw f64 bytes, got {data:?}"
+        );
+        let lo = blob.iter().find(|(k, _)| k.as_str() == Some("lo")).map(|(_, v)| v);
+        assert!(
+            matches!(lo, Some(Value::Array(vals))
+                if matches!(vals[0], Value::F64(f) if f == f64::NEG_INFINITY)),
+            "open bounds must ride as native -inf, got {lo:?}"
+        );
+
+        let decoded: EngineCoreSamplingParams = decode_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.steering_clamps, Some(clamps));
+    }
+
+    #[test]
+    fn clamp_data_serializes_as_base64_in_json() {
+        // The module-broadcast kwargs are built via serde_json before the
+        // rmpv utility encoding, so the JSON form must carry base64 (which
+        // Python's from_obj wire-map branch decodes) — never an int array.
+        let rows: Vec<u8> = [3.0f64].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let clamps = SteeringClamps {
+            hooks: HashMap::from([(
+                "post_attn".to_owned(),
+                ClampHookTable {
+                    shape: vec![1, 1],
+                    layer_indices: vec![2],
+                    data: rows,
+                    lo: vec![0.0],
+                    hi: vec![1.0],
+                    strength: vec![1.0],
+                },
+            )]),
+        };
+        let json = serde_json::to_value(&clamps).unwrap();
+        let data = &json["hooks"]["post_attn"]["data"];
+        assert!(data.is_string(), "JSON data must be base64, got {data:?}");
+        let decoded: SteeringClamps = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, clamps);
+    }
+
+    #[test]
     fn engine_core_output_capture_results_sit_at_tuple_index_7() {
         let output = EngineCoreOutput {
             request_id: "r".to_string(),
@@ -987,20 +1166,20 @@ mod tests {
             (Value::from("num_external_cached_tokens"), Value::from(0u32)),
         ]);
         let inner = Value::Array(vec![
-            Value::from("cmpl-fcdb0f49-f04b1c4e"), // request_id
+            Value::from("cmpl-fcdb0f49-f04b1c4e"),     // request_id
             Value::Array(vec![Value::from(12095u32)]), // new_token_ids
-            Value::Nil,                            // new_logprobs
-            Value::Nil,                            // new_prompt_logprobs_tensors
-            Value::Nil,                            // pooling_output
-            Value::from(1u8),                      // finish_reason (Length)
-            Value::Nil,                            // stop_reason
-            Value::Map(vec![]),                    // capture_results (empty map)
+            Value::Nil,                                // new_logprobs
+            Value::Nil,                                // new_prompt_logprobs_tensors
+            Value::Nil,                                // pooling_output
+            Value::from(1u8),                          // finish_reason (Length)
+            Value::Nil,                                // stop_reason
+            Value::Map(vec![]),                        // capture_results (empty map)
             Value::Array(vec![event(1, 1495680.63), event(2, 1495680.63)]), // events (list of maps)
-            Value::Nil,                            // kv_transfer_params
-            Value::Nil,                            // trace_headers
-            prefill_stats,                         // prefill_stats (map)
-            Value::Nil,                            // routed_experts
-            Value::from(0u32),                     // num_nans_in_logits
+            Value::Nil,                                // kv_transfer_params
+            Value::Nil,                                // trace_headers
+            prefill_stats,                             // prefill_stats (map)
+            Value::Nil,                                // routed_experts
+            Value::from(0u32),                         // num_nans_in_logits
         ]);
 
         // Real scheduler_stats is a dataclass -> named map with every field
@@ -1012,13 +1191,13 @@ mod tests {
         // Outer EngineCoreOutputs: only the first 7 slots are present; the
         // trailing wave_complete/start_wave are elided by omit_defaults.
         let outer = Value::Array(vec![
-            Value::from(0u32),          // engine_index
-            Value::Array(vec![inner]),  // outputs
-            scheduler_stats,            // scheduler_stats (map)
+            Value::from(0u32),                 // engine_index
+            Value::Array(vec![inner]),         // outputs
+            scheduler_stats,                   // scheduler_stats (map)
             Value::from(1495680.686869659f64), // timestamp
-            Value::Nil,                 // utility_output
-            Value::Map(vec![]),         // late_capture_results (empty map) <- regression
-            Value::Nil,                 // finished_requests
+            Value::Nil,                        // utility_output
+            Value::Map(vec![]),                // late_capture_results (empty map) <- regression
+            Value::Nil,                        // finished_requests
         ]);
 
         let mut bytes = Vec::new();
@@ -1033,11 +1212,11 @@ mod tests {
         assert_eq!(output.request_id, "cmpl-fcdb0f49-f04b1c4e");
         assert_eq!(output.new_token_ids, vec![12095]);
         assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Length));
+        assert_eq!(output.events.as_ref().map(|events| events.len()), Some(2));
         assert_eq!(
-            output.events.as_ref().map(|events| events.len()),
-            Some(2)
+            output.events.as_ref().unwrap()[1].r#type,
+            EngineCoreEventType::Scheduled
         );
-        assert_eq!(output.events.as_ref().unwrap()[1].r#type, EngineCoreEventType::Scheduled);
         assert_eq!(output.prefill_stats.as_ref().unwrap().num_prompt_tokens, 5);
         assert!(decoded.late_capture_results.is_empty());
         assert!(decoded.scheduler_stats.is_some());
@@ -1066,12 +1245,12 @@ mod tests {
             Value::Map(vec![(Value::from("filesystem"), capture_result)]),
         )]);
         let outer = Value::Array(vec![
-            Value::from(0u32),           // engine_index
-            Value::Array(vec![]),        // outputs
-            Value::Nil,                  // scheduler_stats
-            Value::from(1.0f64),         // timestamp
-            Value::Nil,                  // utility_output
-            late,                        // late_capture_results (populated)
+            Value::from(0u32),                            // engine_index
+            Value::Array(vec![]),                         // outputs
+            Value::Nil,                                   // scheduler_stats
+            Value::from(1.0f64),                          // timestamp
+            Value::Nil,                                   // utility_output
+            late,                                         // late_capture_results (populated)
             Value::Array(vec![Value::from("cmpl-late")]), // finished_requests
         ]);
 
@@ -1096,16 +1275,16 @@ mod tests {
     #[test]
     fn decodes_engine_core_outputs_with_extra_trailing_field() {
         let outer = Value::Array(vec![
-            Value::from(0u32),          // engine_index
-            Value::Array(vec![]),       // outputs
-            Value::Nil,                 // scheduler_stats
-            Value::from(1.0f64),        // timestamp
-            Value::Nil,                 // utility_output
-            Value::Map(vec![]),         // late_capture_results
-            Value::Nil,                 // finished_requests
-            Value::Nil,                 // wave_complete
-            Value::Nil,                 // start_wave
-            Value::from(true),          // hypothetical future trailing field
+            Value::from(0u32),    // engine_index
+            Value::Array(vec![]), // outputs
+            Value::Nil,           // scheduler_stats
+            Value::from(1.0f64),  // timestamp
+            Value::Nil,           // utility_output
+            Value::Map(vec![]),   // late_capture_results
+            Value::Nil,           // finished_requests
+            Value::Nil,           // wave_complete
+            Value::Nil,           // start_wave
+            Value::from(true),    // hypothetical future trailing field
         ]);
 
         let mut bytes = Vec::new();

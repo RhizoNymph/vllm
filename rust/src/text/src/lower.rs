@@ -109,6 +109,9 @@ pub fn lower_sampling_params(
         capture,
         patch,
         patch_vectors,
+        steering_clamps,
+        prefill_steering_clamps,
+        decode_steering_clamps,
     } = sampling_params;
 
     validate_logprobs(
@@ -181,6 +184,9 @@ pub fn lower_sampling_params(
         capture,
         patch,
         patch_vectors,
+        steering_clamps,
+        prefill_steering_clamps,
+        decode_steering_clamps,
     };
     validate_vocab_range(&params, &sampling_limits)?;
     Ok(params)
@@ -432,6 +438,9 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                steering_clamps: None,
+                prefill_steering_clamps: None,
+                decode_steering_clamps: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -486,6 +495,9 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                steering_clamps: None,
+                prefill_steering_clamps: None,
+                decode_steering_clamps: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -627,6 +639,9 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                steering_clamps: None,
+                prefill_steering_clamps: None,
+                decode_steering_clamps: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -699,6 +714,9 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                steering_clamps: None,
+                prefill_steering_clamps: None,
+                decode_steering_clamps: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -764,6 +782,9 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                steering_clamps: None,
+                prefill_steering_clamps: None,
+                decode_steering_clamps: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -1003,6 +1024,9 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                steering_clamps: None,
+                prefill_steering_clamps: None,
+                decode_steering_clamps: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -1050,6 +1074,52 @@ mod tests {
             params.capture,
             Some(serde_json::json!({"filesystem": {"tag": "t"}}))
         );
+    }
+
+    #[test]
+    fn lower_sampling_params_threads_steering_clamps_verbatim() {
+        use std::collections::HashMap;
+
+        use vllm_engine_core_client::protocol::{ClampHookTable, SteeringClamps};
+
+        // Clamp tiers arrive already in the canonical form (the HTTP/gRPC
+        // layers packed them); lowering moves them through untouched.
+        let table = |layer: u32, lo: f64, hi: f64| ClampHookTable {
+            shape: vec![1, 2],
+            layer_indices: vec![layer],
+            data: [1.0f64, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            lo: vec![lo],
+            hi: vec![hi],
+            strength: vec![1.0],
+        };
+        let clamps = SteeringClamps {
+            hooks: HashMap::from([("post_attn".to_string(), table(5, -2.0, 2.0))]),
+        };
+        let prefill_clamps = SteeringClamps {
+            hooks: HashMap::from([("pre_attn".to_string(), table(2, 3.5, 3.5))]),
+        };
+        let decode_clamps = SteeringClamps {
+            hooks: HashMap::from([("post_block".to_string(), table(7, f64::NEG_INFINITY, 4.0))]),
+        };
+        let sampling_params = SamplingParams {
+            steering_clamps: Some(clamps.clone()),
+            prefill_steering_clamps: Some(prefill_clamps.clone()),
+            decode_steering_clamps: Some(decode_clamps.clone()),
+            ..SamplingParams::default()
+        };
+
+        let params = lower_sampling_params(
+            sampling_params,
+            sample_sampling_hints(),
+            sample_sampling_limits(),
+            3,
+            &stub_tokenizer(),
+        )
+        .unwrap();
+
+        assert_eq!(params.steering_clamps, Some(clamps));
+        assert_eq!(params.prefill_steering_clamps, Some(prefill_clamps));
+        assert_eq!(params.decode_steering_clamps, Some(decode_clamps));
     }
 
     #[test]

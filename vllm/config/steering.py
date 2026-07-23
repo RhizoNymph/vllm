@@ -29,6 +29,18 @@ class SteeringConfig:
     ``0`` disables per-request dynamic overrides. See
     docs/design/dynamic_steering.md §5.2."""
 
+    max_clamp_directions: int = Field(default=4, ge=0)
+    """Max directional-clamp directions per (steering row, hook site) — the K
+    dimension of the per-layer clamp buffers. Each steering config (global or
+    per-request) may carry up to K clamp entries per (hook, layer); requests
+    exceeding K are rejected at resolution. ``0`` disables clamping entirely
+    (no clamp buffers are attached and the apply path constant-folds out).
+
+    Memory: the dirs buffer is ``rows x K x hidden`` in the model dtype per
+    (hook, layer) — roughly 78 MB total at defaults on a gemma-3-4b-class
+    model (39 rows x K=4 x 2560 x 2 B x 3 hooks x 34 layers). Changes
+    captured buffer shapes, so it is part of ``compute_hash``."""
+
     enable_cross_layer_monitor: bool = Field(default=False)
     """Opt in to the cross-layer in-graph monitor (Phase 2, §8): a probe at
     layer L writes a per-token gate that steering at layers > L reads, same
@@ -89,6 +101,9 @@ class SteeringConfig:
         # Per-row monitor changes the per-row probe-table buffer shape, which
         # is baked into captured graphs.
         factors.append(self.enable_row_monitor)
+        # Clamp direction count changes the clamp buffer shapes (and 0 vs >0
+        # changes whether the clamp ops are emitted at all).
+        factors.append(self.max_clamp_directions)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str

@@ -197,6 +197,16 @@ pub struct CompletionRequest {
     /// by a patch entry's `source_inline` / mask `inline`, forwarded verbatim
     pub patch_vectors: Option<Value>,
 
+    /// Per-request steering clamps applied to both prefill and decode phases,
+    /// forwarded verbatim to engine-core
+    pub steering_clamps: Option<Value>,
+
+    /// Steering clamps applied during prefill only, forwarded verbatim
+    pub prefill_steering_clamps: Option<Value>,
+
+    /// Steering clamps applied during decode only, forwarded verbatim
+    pub decode_steering_clamps: Option<Value>,
+
     /// Additional fields
     #[serde(flatten)]
     pub other: Map<String, Value>,

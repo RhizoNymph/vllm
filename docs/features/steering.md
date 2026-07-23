@@ -79,6 +79,141 @@ Each vector entry can be written either as:
 
 Scaled entries are multiplied before addition.
 
+## Directional Clamps
+
+In addition to additive vectors, steering supports **directional
+projection clamps**: constrain the hidden state's scalar coordinate along
+a direction to an interval, per token, at any hook point:
+
+```text
+p  = h · v̂                      # current expression of the feature
+h' = h + strength · (clip(p, min, max) − p) · v̂
+```
+
+A token whose projection is already inside `[min, max]` is untouched, and
+everything orthogonal to the direction is always preserved — unlike an
+additive vector, which shifts every token by the same amount.
+
+Clamp entries live in `steering_clamps` / `prefill_steering_clamps` /
+`decode_steering_clamps` (per-request), the same tier names on
+`/v1/steering/set` (`clamps` / `prefill_clamps` / `decode_clamps`,
+global), and an optional clamps tier on named modules:
+
+```json
+"steering_clamps": {
+  "post_block": {
+    "20": [
+      {"vector": [/* hidden_size floats */], "max": 4.0},
+      {"vector": [/* ... */], "value": 8.0, "strength": 0.5}
+    ]
+  }
+}
+```
+
+Entry semantics:
+
+- `{"vector": v, "min": lo, "max": hi}` — clamp the projection to
+  `[lo, hi]`; either bound may be omitted (one-sided).
+- `{"vector": v, "value": c}` — sugar for `min = max = c` (pin the
+  feature to a constant expression; `c = 0` is directional ablation).
+- `strength` in `[0, 1]` applies a partial correction (default 1.0).
+- Directions are **unit-normalized server-side**, so bounds are in
+  unit-projection space and portable across vectors. Zero vectors are
+  rejected.
+- Unlike vectors, tiers merge by **concatenation** (base entries first,
+  then phase entries) — each direction is an independent constraint. Up
+  to `--steering-config.max_clamp_directions` (default 4) directions per
+  (hook, layer) site after composing global + per-request tiers.
+
+Clamps run **after** additive steering at each hook, so the bound holds on
+whatever leaves the site. They participate in the steering config hash,
+so prefix caching stays correct, and clamp-only requests are admitted
+exactly like vector requests.
+
+### Gating clamps with a probe ("clamp when a feature fires")
+
+Clamps can be **modulated by the in-graph monitor**: when the monitor's
+probe fires, every clamp's effective strength scales with the per-token
+gate value (`effective = strength × gate`, `gate ∈ [0, 1]`). This
+expresses "detect a condition at layer L, clamp a feature at layers ≥ L".
+The gate is row-level — it scales all of a token's clamp directions at a
+site uniformly, the same per-token gate the additive steering row term
+reads.
+
+**The working flow is server-side and global** (not per-request):
+
+1. Start the server with `--steering-config.enable_cross_layer_monitor`
+   (a.k.a. *monitor writes gates*): the monitor then materializes the
+   per-token gate into the shared row-gate buffer that both the additive
+   steering path and the clamp ops read.
+2. Install a **global** steering monitor with `gate_rows` at the probe site
+   (via a server-registered steering consumer emitting an untargeted
+   `SteeringMonitorUpdate`). All steered rows — and all clamps — at layers
+   ≥ the probe layer are then modulated by that probe.
+
+Without `enable_cross_layer_monitor` (the default fused mode) the gate is
+computed inside the additive steering kernel and never reaches the separate
+clamp op, so clamps always run ungated.
+
+**Per-request clamp gates are not supported.** The declarative gate wire
+schema reserves `apply.kind = "clamp"` for a future materializing per-row
+monitor, but requests carrying it are **rejected with HTTP 400** in every
+server mode: the shared row-gate buffer is written only by the global
+monitor, so a per-request probe could never reach the clamp op — the
+request's declared probe/threshold/scope would be silently ignored.
+`add` / `attenuate` gates (which target additive steering) are unaffected.
+
+Picking bounds: capture activations at the target site (the capture
+feature), compute `h · v̂` over representative traffic to see the
+projection's natural range, then set `min`/`max` relative to it.
+
+### Packed clamp submission format
+
+Each of the three per-request clamp fields (and the `clamps` /
+`prefill_clamps` / `decode_clamps` tiers of `/v1/steering/set` and named
+modules) also accepts a **binary packed** form that avoids re-sending clamp
+directions as JSON float lists and re-parsing/normalizing them per request.
+Per hook point, mirroring `SteeringHookPacked`:
+
+```json
+"steering_clamps": {
+  "post_block": {
+    "dtype": "float64",
+    "shape": [3, 4096],
+    "layer_indices": [20, 20, 21],
+    "data": "<base64 contiguous [n, hidden] tensor>",
+    "bounds": [[-2.0, 2.0], [null, 4.0], [0.0, 0.0]],
+    "strengths": [1.0, 0.5, 1.0]
+  }
+}
+```
+
+- Row `i` is the direction for `layer_indices[i]`; a layer may appear in
+  several rows (one per clamp direction). **Row order within a layer is
+  preserved** — it is the tier-concat order that the per-site `K` budget
+  applies to.
+- `bounds` is one `[lo, hi]` pair per row; `strengths` is one value per row
+  (both stay as small JSON lists — only the direction vectors are bulk). An
+  **infinite** bound is written as JSON `null` (`lo` null → `-inf`, `hi` null
+  → `+inf`); all present bounds must be finite.
+- Pack directions at **`float64`** for a bit-identical prefix-cache hash
+  versus the equivalent JSON submission. Narrower dtypes are accepted but may
+  cost a one-time cache miss when the same config is also sent as JSON
+  (same trade-off as the packed steering-vector path).
+- Both this packed form and the JSON entry-list form are **client input
+  shapes only**: ingestion normalizes every clamp tier into one canonical
+  in-process type (`SteeringClamps`, `vllm/config/steering_types.py` — raw
+  float64 rows + bounds/strengths per hook), which is also exactly what
+  crosses the APIServer→EngineCore wire (msgpack map with binary row data,
+  no base64). Directions are unit-normalized at consumption, so a packed
+  and a JSON submission of the same logical config are interchangeable.
+
+Legacy JSON and packed clamp tiers can be mixed across fields in the same
+request (e.g. `steering_clamps` packed, `prefill_steering_clamps` JSON). The
+gRPC API carries the same layout as a `ClampHookPacked` message (with
+`bounds` flattened to `[lo0, hi0, lo1, hi1, ...]` and infinities as native
+`±inf` doubles).
+
 ## Enabling Steering
 
 Global steering is always available for steerable models. Per-request
@@ -610,8 +745,8 @@ scaffolding a new tier reuses instead of hand-copying:
   the reserved-row constants, the single definition of the steering row
   space (row 0 sentinel, rows 1/2 global prefill/decode effective, then the
   static and dynamic pools). Every buffer family that rides the steering
-  rows (scales, row monitors; clamps on adoption) must be congruent with
-  it — kernels gather through the shared `steering_index`, so a size
+  rows (scales, row monitors, clamp dirs/bounds/strength) must be congruent
+  with it — kernels gather through the shared `steering_index`, so a size
   mismatch fails as silent garbage, not an error.
 
 The ops, kernels, and `register_*_buffers` bodies stay per-tier — payload

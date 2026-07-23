@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod clamps;
 pub mod logprobs;
 pub mod steering;
 pub mod structured_outputs;

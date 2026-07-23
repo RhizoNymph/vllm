@@ -181,6 +181,9 @@ class WorkerBase:
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
+        clamps: dict[str, dict[int, list[dict]]] | None = None,
+        prefill_clamps: dict[str, dict[int, list[dict]]] | None = None,
+        decode_clamps: dict[str, dict[int, list[dict]]] | None = None,
     ) -> tuple[int, int, list[int]]:
         raise NotImplementedError
 

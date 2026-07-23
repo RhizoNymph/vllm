@@ -68,6 +68,28 @@ message SteeringHookPacked {
   repeated float scales = 5;
 }
 
+// One hook point's directional-clamp blob in the packed wire format. Mirrors
+// SteeringHookPacked (a contiguous [num_rows, hidden_size] direction tensor,
+// row `i` for layer `layer_indices[i]`) plus per-row bounds and strengths.
+message ClampHookPacked {
+  // Numpy dtype string: "float64" | "float32" | "float16" | "bfloat16".
+  string dtype = 1;
+  // Tensor shape as [num_rows, hidden_size].
+  repeated uint32 shape = 2;
+  // Layer index for each row, in row order. Length must equal shape[0].
+  // Rows may repeat a layer (multiple clamp directions per layer); row order
+  // within a layer is preserved.
+  repeated uint32 layer_indices = 3;
+  // Contiguous little-endian direction tensor bytes (row-major).
+  bytes data = 4;
+  // Flattened per-row bounds [lo0, hi0, lo1, hi1, ...]. Length must equal
+  // 2 * shape[0]. Infinities are carried natively as +/-inf doubles and are
+  // encoded as JSON `null` when converted to the packed-JSON engine form.
+  repeated double bounds = 5;
+  // Per-row clamp strength in [0, 1]. Length must equal shape[0].
+  repeated double strengths = 6;
+}
+
 // Per-request activation steering. Each map is keyed by hook-point name.
 message Steering {
   // Base steering applied to both prefill and decode phases.
@@ -78,6 +100,12 @@ message Steering {
   map<string, SteeringHookPacked> decode_steering_vectors = 3;
   // Name of a pre-registered steering module to apply ("" means none).
   string name = 4;
+  // Base directional clamps applied to both prefill and decode phases.
+  map<string, ClampHookPacked> steering_clamps = 5;
+  // Clamps concatenated after the base during prefill only.
+  map<string, ClampHookPacked> prefill_steering_clamps = 6;
+  // Clamps concatenated after the base during decode only.
+  map<string, ClampHookPacked> decode_steering_clamps = 7;
 }
 
 message RandomSampling {

@@ -318,9 +318,15 @@ class OpenAIServingCompletion(OpenAIServing):
             if raw_request is None
             else getattr(raw_request.app.state, "steering_vector_registry", None)
         )
+        from vllm.entrypoints.openai.steering import (
+            monitor_writes_gates_from_request,
+        )
+
+        monitor_writes_gates = monitor_writes_gates_from_request(raw_request)
         try:
             req_metadata_channel = request.to_request_metadata(
-                vector_registry=steering_vector_registry
+                vector_registry=steering_vector_registry,
+                monitor_writes_gates=monitor_writes_gates,
             )
         except ValueError as exc:
             return self.create_error_response(
@@ -360,7 +366,6 @@ class OpenAIServingCompletion(OpenAIServing):
                 # vectors over multiprocessing.
                 if steering_module_ref is not None:
                     sampling_params.steering_module_ref = steering_module_ref
-
             request_id_item = f"{request_id}-{i}"
 
             # Per-request capture-consumer admission validation. Each

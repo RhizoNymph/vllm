@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Row-space layout of the shared steering tables.
 
-Every buffer family that rides the steering rows — the vector tables and
-scales today; clamps and row monitors on adopting tiers — shares one row
-space per layer::
+Every buffer family that rides the steering rows — the vector tables,
+scales, row-monitor tables, and clamp dirs/bounds/strength — shares one
+row space per layer::
 
     Row 0                    no-steering sentinel (always zeros)
     Row 1                    global prefill effective (base + prefill)
