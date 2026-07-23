@@ -615,7 +615,20 @@ GEMMs per opted-in token per hooked layer).
   with matching topology. Eager engines keep fully dynamic
   registration. Idle declared sites cost one device-gated op launch
   per site per step (the kernel short-circuits on the gate before any
-  table gather).
+  table gather). Two FR-specific consequences: the FR CUDA path
+  compacts active tokens with `torch.nonzero` (capture-illegal), so a
+  declared FR module registers
+  `vllm::apply_sae_full_reconstruction_out` as a graph-*splitting* op
+  — an out-variant mutating a caller-allocated buffer, like
+  `unified_attention_with_output` — that runs eagerly between
+  piecewise cudagraph segments, and full-graph capture modes downgrade
+  to `PIECEWISE` (logged at startup); `use_inductor_graph_partition`
+  is rejected with declared FR modules. The topology distiller reads
+  both module forms: safetensors dirs with `manifest.json` (Python
+  frontend) and `{kind, sae_manifest, sae_weights}` JSON files
+  (vllm-rs), so both frontends get pre-allocated buffers from the same
+  `--steering-modules` flag (vllm-rs re-emits it into the managed
+  engine's args).
 - **At most one full-reconstruction SAE module per (layer, hook)
   site**; double-registration raises by design — two residual
   replacements on one site are semantically ill-defined. Delta
