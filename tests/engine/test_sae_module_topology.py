@@ -71,6 +71,31 @@ class TestBuildTopology:
         f.write_text("{}")
         assert _build_sae_module_topology([("a", str(f))], _StubModelConfig()) == []
 
+    def test_rust_style_sae_json_file_is_distilled(self, tmp_path):
+        # vllm-rs declares SAE modules as {kind, sae_manifest, sae_weights}
+        # JSON files rather than safetensors dirs.
+        f = tmp_path / "rust_delta.json"
+        f.write_text(
+            json.dumps(
+                {
+                    "kind": "sae_delta",
+                    "sae_manifest": {
+                        "d_model": 64,
+                        "d_sae": 32,
+                        "activation": "relu",
+                        "layers": [[2, "post_block"]],
+                        "clampable_features": [0, 1],
+                        "activation_params": {},
+                    },
+                    "sae_weights": {"2:post_block": {}},
+                }
+            )
+        )
+        (topo,) = _build_sae_module_topology([("m", str(f))], _StubModelConfig())
+        assert topo.kind == "sae_delta"
+        assert topo.layers == ((2, "post_block"),)
+        assert topo.n_clamp == 2
+
     def test_missing_path_fails_fast(self, tmp_path):
         with pytest.raises(ValueError, match="does not exist"):
             _build_sae_module_topology(

@@ -464,28 +464,46 @@ def _build_sae_module_topology(
     for entry in steering_modules:
         name, path = _steering_module_name_path(entry)
         module_dir = Path(path)
-        if not module_dir.is_dir():
-            # Additive JSON file: no SAE buffers to pre-allocate.  A
-            # missing path fails fast here rather than at frontend load.
-            if not module_dir.is_file():
+        if module_dir.is_dir():
+            manifest_path = module_dir / "manifest.json"
+            try:
+                with manifest_path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except (OSError, json.JSONDecodeError) as exc:
                 raise ValueError(
-                    f"--steering-modules {name}={path}: path does not exist."
+                    f"--steering-modules {name}={path}: cannot read "
+                    f"manifest.json: {exc}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"--steering-modules {name}={path}: manifest.json must be "
+                    "a JSON object."
                 )
-            continue
-        manifest_path = module_dir / "manifest.json"
-        try:
-            with manifest_path.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                f"--steering-modules {name}={path}: cannot read manifest.json: {exc}"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise ValueError(
-                f"--steering-modules {name}={path}: manifest.json must be "
-                "a JSON object."
-            )
-        kind = payload.get("kind", "sae_delta")
+            kind = payload.get("kind", "sae_delta")
+        elif module_dir.is_file():
+            # JSON module file.  The vllm-rs frontend declares SAE
+            # modules as ``{kind, sae_manifest, sae_weights}`` JSON
+            # files; anything else (additive vector files) has no SAE
+            # buffers to pre-allocate and is skipped.
+            try:
+                with module_dir.open("r", encoding="utf-8") as fh:
+                    file_payload = json.load(fh)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"--steering-modules {name}={path}: cannot read module JSON: {exc}"
+                ) from exc
+            if not (
+                isinstance(file_payload, dict)
+                and isinstance(file_payload.get("sae_manifest"), dict)
+                and file_payload.get("kind", "additive")
+                in ("sae_delta", "sae_full_reconstruction")
+            ):
+                continue
+            kind = file_payload["kind"]
+            payload = file_payload["sae_manifest"]
+        else:
+            # Missing path fails fast here rather than at frontend load.
+            raise ValueError(f"--steering-modules {name}={path}: path does not exist.")
         if kind not in ("sae_delta", "sae_full_reconstruction"):
             raise ValueError(
                 f"--steering-modules {name}={path}: unsupported kind "
