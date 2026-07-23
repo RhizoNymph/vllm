@@ -17,6 +17,11 @@ import torch
 import torch.nn as nn
 
 from vllm.config.sae_steering_types import SAEActivation
+from vllm.config.steering import (
+    SAEModuleTopology,
+    is_steering_topology_frozen,
+    sae_topology_mismatch,
+)
 from vllm.config.steering_types import (
     SteeringVectorSpec,
     hash_steering_config,
@@ -45,11 +50,14 @@ from vllm.model_executor.layers.sae_full_reconstruction import (
     unregister_sae_full_recon_buffers,
 )
 from vllm.model_executor.layers.sae_steering import (
+    SAE_SPARE_NAME_PREFIX,
+    claim_sae_spare_slot,
     get_sae_slot_state,
     populate_sae_clamp_table,
     register_sae_buffers,
     register_sae_index_buffer,
     sae_buffers_attached,
+    sae_site_slots,
     share_sae_index_across_layers,
     unregister_sae_buffers,
 )
@@ -637,6 +645,18 @@ class SteeringModelRunnerMixin:
         self._pending_decode_sigs: dict[str, int] = {}
         # SAE feature-surgery tiers (delta + full-reconstruction), parallel
         # to the canonical additive lifecycle above.
+        # Frozen-topology mode: on a compiled engine the SAE buffer set
+        # fixed at init IS the topology — post-init registration may only
+        # refresh weights in place or claim a pre-allocated spare slot.
+        self._steering_topology_frozen = is_steering_topology_frozen(
+            getattr(self, "vllm_config", None)
+        )
+        # Startup-declared module topology (name -> SAEModuleTopology);
+        # never popped, so a declared name can always reclaim its slots.
+        self._sae_declared_topology: dict[str, SAEModuleTopology] = {}
+        # Layers holding pre-allocated spare delta slots, keyed by
+        # (layer_idx, hook_str) — included in sae_index sharing.
+        self._sae_spare_layers: dict[tuple[int, str], nn.Module] = {}
         self._sae_module_registry = {}
         self._req_sae_phase = {}
         self._req_sae_hash = {}
@@ -842,6 +862,150 @@ class SteeringModelRunnerMixin:
                 compute_dtype=compute_dtype,
                 device=table_device,
                 capture_sizes=list(capture_sizes) if capture_sizes else None,
+            )
+
+        # Pre-allocate SAE buffers for the startup-declared module
+        # topology (plus configured spare slots) so compiled graphs /
+        # CUDA-graph capture include the device-gated SAE ops.  Runs in
+        # eager mode too — one code path, and attach-time Triton warmup
+        # moves before any capture either way.  Buffers start zeroed and
+        # inert; the frontend's post-init broadcast fills weights in
+        # place.  Mirrors the row-monitor pre-compile sizing above.
+        self._preallocate_sae_topology(steering_config)
+
+    def _preallocate_sae_topology(self, steering_config) -> None:
+        """Attach zero-filled SAE buffers for startup-declared modules.
+
+        Reconstructs a weightless manifest per
+        :class:`SAEModuleTopology` entry (placeholder feature ids —
+        shape-only; the real ids land with the weight broadcast) and
+        routes through the normal attach helpers, then allocates any
+        configured spare delta slots.  Called from
+        ``_init_steering_state`` — i.e. end of ``load_model``, before
+        ``compile_or_warm_up_model`` — for both runners.
+        """
+        for topo in getattr(steering_config, "sae_module_topology", ()) or ():
+            manifest = SAEModuleManifest(
+                d_model=int(topo.d_model),
+                d_sae=int(topo.d_sae),
+                activation=SAEActivation(topo.activation),
+                layers=tuple(
+                    (int(layer_idx), str(hook_str))
+                    for layer_idx, hook_str in topo.layers
+                ),
+                clampable_features=tuple(range(int(topo.n_clamp))),
+                activation_params=dict(topo.activation_params),
+            )
+            # Record the declaration BEFORE attaching so the attach
+            # helper routes it as declared (fresh allocation here; reuse
+            # on any later re-registration).
+            self._sae_declared_topology[topo.name] = topo
+            if topo.kind == "sae_full_reconstruction":
+                self._attach_sae_full_recon_buffers(topo.name, manifest)
+            else:
+                self._attach_sae_buffers(topo.name, manifest)
+        self._preallocate_sae_spare_slots(steering_config)
+
+    def _preallocate_sae_spare_slots(self, steering_config) -> None:
+        """Allocate unclaimed spare SAE delta slots at configured sites.
+
+        Spares are baked as JumpReLU with an all-zero per-feature
+        threshold buffer — behaviourally exact ReLU — so ReLU and
+        JumpReLU modules can claim them via data alone (the activation
+        code is a trace-time constant that cannot change post-capture;
+        TopK is structurally different and cannot claim spares).
+        """
+        sites = list(getattr(steering_config, "sae_spare_slot_sites", ()) or ())
+        n_features = int(getattr(steering_config, "sae_spare_slot_features", 0) or 0)
+        per_site = int(getattr(steering_config, "sae_spare_slots_per_site", 1) or 1)
+        if not sites or n_features <= 0:
+            return
+        steerable = self._steerable_layers_cache or {}
+        if not steerable:
+            return
+        any_layer = next(iter(steerable.values()))
+        ref_dtype: torch.dtype | None = None
+        table_device: torch.device | None = None
+        hidden_size: int | None = None
+        for attr in HOOK_POINT_TABLE_ATTR.values():
+            if hasattr(any_layer, attr):
+                ref_buffer = getattr(any_layer, attr)
+                ref_dtype = ref_buffer.dtype
+                table_device = ref_buffer.device
+                hidden_size = int(ref_buffer.shape[1])
+                break
+        if ref_dtype is None or hidden_size is None:
+            ref_dtype = getattr(self.vllm_config.model_config, "dtype", torch.float32)
+            table_device = torch.device("cpu")
+            hidden_size = int(self.vllm_config.model_config.get_hidden_size())
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        max_tokens = (
+            int(scheduler_config.max_num_batched_tokens)
+            if scheduler_config is not None
+            else 0
+        )
+        max_sae_configs = int(steering_config.max_steering_configs)
+        spare_layers: list[nn.Module] = []
+        for site in sites:
+            layer_str, _, hook_str = site.partition(":")
+            try:
+                layer_idx = int(layer_str)
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError as exc:
+                raise SteeringVectorError(
+                    f"sae_spare_slot_sites entry {site!r} is not a valid "
+                    "'layer:hook' site."
+                ) from exc
+            if layer_idx not in self._locally_owned_layers:
+                continue
+            layer = steerable.get(layer_idx)
+            if layer is None:
+                continue
+            for _ in range(per_site):
+                register_sae_buffers(
+                    layer,
+                    hook_point=hook_point,
+                    module_name="",
+                    activation=SAEActivation.JUMPRELU,
+                    activation_params={},
+                    n_clamp=n_features,
+                    hidden_size=hidden_size,
+                    max_sae_configs=max_sae_configs,
+                    dtype=ref_dtype,
+                    device=table_device,
+                    spare=True,
+                )
+            register_sae_index_buffer(layer, max_tokens=max_tokens, device=table_device)
+            self._sae_spare_layers[(layer_idx, hook_str)] = layer
+            spare_layers.append(layer)
+        if not spare_layers:
+            return
+        # Re-share sae_index across every SAE-covered layer (declared
+        # sites + spare sites) so all sites gather through one tensor.
+        unique_layers: dict[int, nn.Module] = {}
+        for layer in self._sae_steerable_sites.values():
+            unique_layers.setdefault(id(layer), layer)
+        for layer in self._sae_spare_layers.values():
+            unique_layers.setdefault(id(layer), layer)
+        share_sae_index_across_layers(list(unique_layers.values()))
+        if table_device is not None and table_device.type == "cuda":
+            from vllm.model_executor.layers.sae_steering import (
+                _ACTIVATION_TO_CODE,
+                _activation_to_scalar,
+            )
+            from vllm.model_executor.layers.sae_steering_kernel import (
+                warmup_apply_sae_delta_kernel,
+            )
+
+            compute_dtype = getattr(self.vllm_config.model_config, "dtype", ref_dtype)
+            warmup_apply_sae_delta_kernel(
+                hidden_size=hidden_size,
+                n_clamp=n_features,
+                table_dtype=ref_dtype,
+                compute_dtype=compute_dtype,
+                device=table_device,
+                activation_code=_ACTIVATION_TO_CODE[SAEActivation.JUMPRELU],
+                activation_param=_activation_to_scalar(SAEActivation.JUMPRELU, {}),
             )
 
     # -----------------------------------------------------------------------
@@ -1382,6 +1546,10 @@ class SteeringModelRunnerMixin:
                         f"Steering module '{name}': invalid sae_manifest "
                         f"in broadcast payload: {exc}"
                     ) from exc
+                # Frozen-topology admission: reject before any registry
+                # mutation when this registration can't fit the compiled
+                # engine's pre-allocated buffer set.
+                self._check_frozen_sae_topology(name, "sae_delta", manifest)
                 # Replacement snapshot: capture both the prior SAE state
                 # *and* any prior additive entry under this name so a failed
                 # replacement can restore whichever one existed.
@@ -1393,6 +1561,11 @@ class SteeringModelRunnerMixin:
                 )
                 if prev_manifest is not None:
                     prev_weights = self._snapshot_sae_weights(name)
+                    self._detach_sae_buffers(name)
+                elif any(k[0] == name for k in self._sae_steerable_sites):
+                    # Pre-allocated at init but never weight-registered:
+                    # clear before the fresh attach (eager deletes; frozen
+                    # deactivates in place and the attach reuses the slot).
                     self._detach_sae_buffers(name)
                 # Re-registering a name as a different kind drops the FR
                 # entry (and buffers) so the registries stay disjoint.
@@ -1478,7 +1651,14 @@ class SteeringModelRunnerMixin:
                         "initialised via _init_steering_state before "
                         "registration."
                     )
-                if name in fr_registry:
+                self._check_frozen_sae_topology(
+                    name, "sae_full_reconstruction", manifest
+                )
+                if name in fr_registry or any(
+                    # Pre-allocated at init but never weight-registered.
+                    k[0] == name
+                    for k in getattr(self, "_sae_fr_steerable_sites", {})
+                ):
                     self._detach_sae_full_recon_buffers(name)
                 # Re-registering as a different kind drops the stale entry.
                 if name in self._sae_module_registry:
@@ -3309,7 +3489,17 @@ class SteeringModelRunnerMixin:
         Buffers default to zero; weights are populated separately via
         :meth:`attach_sae_weights` once a loader (or test fixture)
         provides them.
+
+        Under frozen topology (compiled engine), a declared module
+        reuses its pre-allocated slots in place (``allow_reuse``) and
+        an undeclared module claims pre-allocated spare slots instead
+        of registering new buffers — the graph-shape either way is
+        exactly what was traced at init.
         """
+        frozen = getattr(self, "_steering_topology_frozen", False)
+        if frozen and module_name not in getattr(self, "_sae_declared_topology", {}):
+            self._claim_sae_spare_sites(module_name, manifest)
+            return
         steerable = self._steerable_layers_cache or {}
         vllm_config = getattr(self, "vllm_config", None)
         steering_config = (
@@ -3366,6 +3556,7 @@ class SteeringModelRunnerMixin:
                 max_sae_configs=max_sae_configs,
                 dtype=ref_dtype,
                 device=table_device,
+                allow_reuse=frozen,
             )
             self._sae_steerable_sites[(module_name, layer_idx, hook_str)] = layer
             register_sae_index_buffer(layer, max_tokens=max_tokens, device=table_device)
@@ -3377,8 +3568,11 @@ class SteeringModelRunnerMixin:
             # picked from ``_sae_steerable_sites``; layers from a
             # previously-registered SAE module whose ``sae_index`` was
             # not rebound would gather row 0 and silently no-op.
+            # Spare-slot layers gather through the same tensor.
             unique_layers: dict[int, nn.Module] = {}
             for layer in self._sae_steerable_sites.values():
+                unique_layers.setdefault(id(layer), layer)
+            for layer in getattr(self, "_sae_spare_layers", {}).values():
                 unique_layers.setdefault(id(layer), layer)
             share_sae_index_across_layers(list(unique_layers.values()))
             self._warmup_sae_kernel_for_module(
@@ -3386,6 +3580,160 @@ class SteeringModelRunnerMixin:
                 attached_layers=attached_layers,
                 ref_dtype=ref_dtype,
             )
+
+    def _claim_sae_spare_sites(
+        self,
+        module_name: str,
+        manifest: SAEModuleManifest,
+    ) -> None:
+        """Claim pre-allocated spare delta slots for an undeclared module.
+
+        Frozen-topology path for a module that was not declared at
+        startup: every locally-owned manifest site must hold an
+        unclaimed spare slot (eligibility — site coverage, feature
+        capacity, activation — was checked by
+        :meth:`_check_frozen_sae_topology` before registry mutation).
+        Claiming renames the slot record in place; buffer identities
+        and the slot's trace-time JumpReLU constants are untouched, so
+        the compiled graph stays valid.  Weights land zero-padded via
+        :meth:`attach_sae_weights`.  No Triton warmup: the kernel runs
+        at the spare slot's reserved width, already warmed at init.
+        """
+        steerable = self._steerable_layers_cache or {}
+        try:
+            for layer_idx, hook_str in manifest.layers:
+                if layer_idx not in self._locally_owned_layers:
+                    continue
+                layer = steerable.get(layer_idx)
+                if layer is None:
+                    continue
+                try:
+                    hook_point = SteeringHookPoint(hook_str)
+                except ValueError as exc:
+                    raise SteeringVectorError(
+                        f"SAE module {module_name!r} declares unsupported "
+                        f"hook point {hook_str!r}."
+                    ) from exc
+                record = claim_sae_spare_slot(layer, hook_point, module_name)
+                if record is None:
+                    raise SteeringVectorError(
+                        f"SAE module {module_name!r}: no unclaimed spare "
+                        f"slot left at site (layer={layer_idx}, "
+                        f"hook={hook_str!r})."
+                    )
+                self._sae_steerable_sites[(module_name, layer_idx, hook_str)] = layer
+        except Exception:
+            # Release any slots claimed before the failure (frozen-mode
+            # detach renames claimed spares back to the pool).
+            self._detach_sae_buffers(module_name)
+            raise
+
+    def _check_frozen_sae_topology(
+        self,
+        name: str,
+        kind: str,
+        manifest: SAEModuleManifest,
+    ) -> None:
+        """Reject registrations that would change a frozen SAE topology.
+
+        No-op on eager engines.  On a compiled engine a registration is
+        admissible only as (a) a weight refresh of a startup-declared
+        module with the exact declared graph shape, or (b) an
+        undeclared *delta* module that fits the pre-allocated spare
+        slots (ReLU/JumpReLU, ``n_clamp`` within the reserve, every
+        site covered with a free spare).  Anything else raises before
+        any registry state is mutated.
+        """
+        if not getattr(self, "_steering_topology_frozen", False):
+            return
+        remedy = (
+            "The SAE topology is frozen on a compiled engine — declare "
+            "the module's final shape at startup via --steering-modules, "
+            "reserve spare slots (--sae-spare-slot-sites), or serve with "
+            "--enforce-eager."
+        )
+        topo = getattr(self, "_sae_declared_topology", {}).get(name)
+        if topo is not None:
+            mismatch = sae_topology_mismatch(
+                topo,
+                kind=kind,
+                layers=tuple((int(li), str(hs)) for li, hs in manifest.layers),
+                d_model=manifest.d_model,
+                d_sae=manifest.d_sae,
+                n_clamp=len(manifest.clampable_features),
+                activation=manifest.activation.value,
+                activation_params=dict(manifest.activation_params),
+            )
+            if mismatch is not None:
+                raise SteeringVectorError(
+                    f"Steering module {name!r} does not match its "
+                    f"startup-declared topology: {mismatch}. {remedy}"
+                )
+            return
+        # Undeclared module: spare-slot eligibility (delta only).
+        if kind != "sae_delta":
+            raise SteeringVectorError(
+                f"Steering module {name!r} (kind={kind!r}) was not "
+                f"declared at startup. {remedy}"
+            )
+        steering_config = getattr(
+            getattr(self, "vllm_config", None), "steering_config", None
+        )
+        spare_sites = set(getattr(steering_config, "sae_spare_slot_sites", ()) or ())
+        spare_features = int(
+            getattr(steering_config, "sae_spare_slot_features", 0) or 0
+        )
+        if not spare_sites or spare_features <= 0:
+            raise SteeringVectorError(
+                f"Steering module {name!r} was not declared at startup "
+                f"and no spare SAE slots are configured. {remedy}"
+            )
+        if manifest.activation not in (SAEActivation.RELU, SAEActivation.JUMPRELU):
+            raise SteeringVectorError(
+                f"Steering module {name!r} uses activation "
+                f"{manifest.activation.value!r}, but spare slots are baked "
+                f"as JumpReLU and only serve relu/jumprelu modules. {remedy}"
+            )
+        n_clamp = len(manifest.clampable_features)
+        if n_clamp > spare_features:
+            raise SteeringVectorError(
+                f"Steering module {name!r} clamps {n_clamp} features but "
+                f"spare slots reserve only {spare_features}. {remedy}"
+            )
+        steerable = self._steerable_layers_cache or {}
+        for layer_idx, hook_str in manifest.layers:
+            if f"{layer_idx}:{hook_str}" not in spare_sites:
+                raise SteeringVectorError(
+                    f"Steering module {name!r} targets site (layer="
+                    f"{layer_idx}, hook={hook_str!r}) which has no spare "
+                    f"slots reserved. {remedy}"
+                )
+            if layer_idx not in self._locally_owned_layers:
+                continue
+            layer = steerable.get(layer_idx)
+            if layer is None:
+                continue
+            try:
+                hook_point = SteeringHookPoint(hook_str)
+            except ValueError:
+                continue
+            free = sum(
+                1
+                for record in sae_site_slots(layer, hook_point)
+                if record.spare
+                and (
+                    record.module_name.startswith(SAE_SPARE_NAME_PREFIX)
+                    # A re-registration's own claim is released before
+                    # re-attach, so count it as available.
+                    or record.module_name == name
+                )
+            )
+            if free == 0:
+                raise SteeringVectorError(
+                    f"Steering module {name!r}: all spare slots at site "
+                    f"(layer={layer_idx}, hook={hook_str!r}) are claimed "
+                    f"by other modules. {remedy}"
+                )
 
     def _warmup_sae_kernel_for_module(
         self,
@@ -3438,7 +3786,13 @@ class SteeringModelRunnerMixin:
         Only ``module_name``'s buffer slots are removed; sibling
         modules sharing a (layer, hook) site keep their slots (and
         their stable attr names — slot ids are never reused).
+
+        Under frozen topology nothing is deleted: slots are zeroed in
+        place (declared modules keep their named slot for later reuse;
+        claimed spares return to the unclaimed pool), so compiled-graph
+        buffer references stay valid.
         """
+        deactivate_only = getattr(self, "_steering_topology_frozen", False)
         keys = [k for k in self._sae_steerable_sites if k[0] == module_name]
         for key in keys:
             _, _layer_idx, hook_str = key
@@ -3448,7 +3802,10 @@ class SteeringModelRunnerMixin:
             except ValueError:
                 continue
             unregister_sae_buffers(
-                layer, hook_point=hook_point, module_name=module_name
+                layer,
+                hook_point=hook_point,
+                module_name=module_name,
+                deactivate_only=deactivate_only,
             )
 
     def _snapshot_sae_weights(
@@ -3576,6 +3933,18 @@ class SteeringModelRunnerMixin:
                     )
                 src = raw.to(dtype=buf.dtype, device=buf.device)
                 if src.shape != buf.shape:
+                    # Claimed spare slots reserve a larger feature
+                    # capacity than the claiming module needs; the
+                    # weights land in the leading rows and the tail
+                    # stays zero (zero encoder/decoder rows contribute
+                    # zero delta; jumprelu(0, thr=0) == 0).
+                    if (
+                        state.slot.spare
+                        and src.shape[1:] == buf.shape[1:]
+                        and src.shape[0] <= buf.shape[0]
+                    ):
+                        copy_plan.append((buf[: src.shape[0]], src))
+                        continue
                     raise SteeringVectorError(
                         f"attach_sae_weights({module_name!r}): {tensor_key} "
                         f"shape {tuple(src.shape)} does not match buffer "
@@ -3773,6 +4142,7 @@ class SteeringModelRunnerMixin:
                 clampable_features=clampable_features,
                 dtype=ref_dtype,
                 device=table_device,
+                allow_reuse=getattr(self, "_steering_topology_frozen", False),
             )
             register_sae_recon_index_buffer(
                 layer, max_tokens=max_tokens, device=table_device
@@ -3826,7 +4196,14 @@ class SteeringModelRunnerMixin:
         )
 
     def _detach_sae_full_recon_buffers(self, module_name: str) -> None:
-        """Detach per-(layer, hook) full-reconstruction buffers for the module."""
+        """Detach per-(layer, hook) full-reconstruction buffers for the module.
+
+        Under frozen topology the site's buffers are zeroed in place
+        (``row_active`` all-False gates the site off) instead of
+        deleted, so compiled-graph references stay valid and the
+        declared owner can re-register into the same site.
+        """
+        deactivate_only = getattr(self, "_steering_topology_frozen", False)
         sites = getattr(self, "_sae_fr_steerable_sites", None)
         if sites is None:
             return
@@ -3838,7 +4215,9 @@ class SteeringModelRunnerMixin:
                 hook_point = SteeringHookPoint(hook_str)
             except ValueError:
                 continue
-            unregister_sae_full_recon_buffers(layer, hook_point=hook_point)
+            unregister_sae_full_recon_buffers(
+                layer, hook_point=hook_point, deactivate_only=deactivate_only
+            )
 
     def _snapshot_sae_full_recon_weights(
         self, module_name: str
