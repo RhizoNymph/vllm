@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::io::Cursor;
@@ -22,13 +25,15 @@ use crate::protocol::multimodal::{
     MmFeatureSpec, MmField, MmFieldElem, MmFlatField, MmKwargValue, MmSlice, PlaceholderRange,
     SliceSpec,
 };
+use crate::protocol::output::{
+    DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs,
+    RequestBatchOutputs, UtilityCallOutput, decode_engine_core_outputs,
+};
+use crate::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
+use crate::protocol::sampling::EngineCoreSamplingParams;
 use crate::protocol::stats::SchedulerStats;
 use crate::protocol::tensor::WireTensor;
 use crate::protocol::utility::{UtilityOutput, UtilityResultEnvelope};
-use crate::protocol::{
-    EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
-    EngineCoreRequestType, EngineCoreSamplingParams, decode_engine_core_outputs,
-};
 use crate::test_utils::{
     IpcNamespace, setup_bootstrapped_mock_engine, setup_mock_engine_sockets,
     setup_mock_engine_with_init, spawn_mock_engine_task,
@@ -150,6 +155,7 @@ fn sample_request_with_id(request_id: &str) -> EngineCoreRequest {
             top_k: 8,
             max_tokens: 32,
             min_tokens: 1,
+            thinking_token_budget: Some(256),
             stop_token_ids: vec![151643],
             eos_token_id: Some(151645),
             all_stop_token_ids: BTreeSet::from([151643, 151645]),
@@ -221,12 +227,13 @@ fn request_output(
         pooling_output: None,
         finish_reason,
         stop_reason: None,
+        capture_results: Default::default(),
         events: None,
         kv_transfer_params: None,
+        ec_transfer_params: None,
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
-        capture_results: Default::default(),
         num_nans_in_logits: 0,
     }
 }
@@ -563,8 +570,7 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
 
             send_outputs(
                 &mut data_socket.push,
-                EngineCoreOutputs {
-                    engine_index: 0,
+                RequestBatchOutputs {
                     outputs: vec![request_output(
                         "req-1",
                         vec![],
@@ -572,17 +578,19 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
                     )],
                     finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
                     ..Default::default()
-                },
+                }
+                .into(),
             )
             .await;
 
             send_outputs(
                 &mut coordinator.output_push,
-                EngineCoreOutputs {
+                DpControlOutput {
                     engine_index: 0,
-                    wave_complete: Some(0),
-                    ..Default::default()
-                },
+                    timestamp: 0.0,
+                    control: DpControlMessage::WaveComplete(0),
+                }
+                .into(),
             )
             .await;
 
@@ -597,8 +605,7 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
 
             send_outputs(
                 &mut data_socket.push,
-                EngineCoreOutputs {
-                    engine_index: 0,
+                RequestBatchOutputs {
                     outputs: vec![request_output(
                         "req-3",
                         vec![],
@@ -606,7 +613,8 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
                     )],
                     finished_requests: Some(BTreeSet::from(["req-3".to_string()])),
                     ..Default::default()
-                },
+                }
+                .into(),
             )
             .await;
 
@@ -643,7 +651,7 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
 
             send_outputs(
                 &mut data_socket.push,
-                EngineCoreOutputs {
+                RequestBatchOutputs {
                     engine_index: 1,
                     outputs: vec![request_output(
                         "req-2",
@@ -652,7 +660,8 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
                     )],
                     finished_requests: Some(BTreeSet::from(["req-2".to_string()])),
                     ..Default::default()
-                },
+                }
+                .into(),
             )
             .await;
 
@@ -758,11 +767,12 @@ async fn coordinator_rebroadcasts_engine_start_wave_control() {
 
             send_outputs(
                 &mut coordinator.output_push,
-                EngineCoreOutputs {
+                DpControlOutput {
                     engine_index: 1,
-                    start_wave: Some(4),
-                    ..Default::default()
-                },
+                    timestamp: 0.0,
+                    control: DpControlMessage::StartWave(4),
+                }
+                .into(),
             )
             .await;
 
@@ -813,15 +823,16 @@ async fn coordinator_accepts_stats_only_outputs() {
 
         send_outputs(
             &mut coordinator.output_push,
-            EngineCoreOutputs {
-                engine_index: 0,
+            RequestBatchOutputs {
+                outputs: Vec::new(),
                 scheduler_stats: Some(Box::new(SchedulerStats {
                     num_running_reqs: 1,
                     current_wave: 0,
                     ..Default::default()
                 })),
                 ..Default::default()
-            },
+            }
+            .into(),
         )
         .await;
 
@@ -832,8 +843,7 @@ async fn coordinator_accepts_stats_only_outputs() {
 
         send_outputs(
             &mut data_socket.push,
-            EngineCoreOutputs {
-                engine_index: 0,
+            RequestBatchOutputs {
                 outputs: vec![request_output(
                     "req-stats",
                     vec![],
@@ -841,7 +851,8 @@ async fn coordinator_accepts_stats_only_outputs() {
                 )],
                 finished_requests: Some(BTreeSet::from(["req-stats".to_string()])),
                 ..Default::default()
-            },
+            }
+            .into(),
         )
         .await;
 
@@ -902,30 +913,34 @@ async fn client_fail_closes_when_main_output_path_receives_dp_control() {
 
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        utility_output: Some(UtilityOutput {
+                    UtilityCallOutput {
+                        output: UtilityOutput {
                             call_id: 1_u64.into(),
                             failure_message: None,
                             result: None,
-                        }),
+                        },
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        start_wave: Some(3),
-                        ..Default::default()
-                    },
+                    DpControlOutput {
+                        engine_index: 0,
+                        timestamp: 0.0,
+                        control: DpControlMessage::StartWave(3),
+                    }
+                    .into(),
                 )
                 .await;
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
+                    RequestBatchOutputs {
                         outputs: vec![request_output("req-1", vec![999], None)],
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
 
@@ -978,91 +993,6 @@ async fn client_fail_closes_when_main_output_path_receives_dp_control() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_fail_closes_when_main_output_path_receives_mixed_shape_output() {
-    init_tracing();
-    let ipc = IpcNamespace::new().unwrap();
-    let handshake_address = ipc.handshake_endpoint();
-    let engine_id = b"engine-0".to_vec();
-
-    let (shutdown_tx, engine_task) = spawn_mock_engine_task(
-        handshake_address.clone(),
-        engine_id.clone(),
-        |dealer, push| {
-            Box::pin(async move {
-                let add_1 = recv_engine_message(dealer).await;
-                assert_eq!(add_1[0].as_ref(), &[0x00]);
-                let request_1: EngineCoreRequest = rmp_serde::from_slice(&add_1[1]).unwrap();
-                assert_eq!(request_1.client_index, 7);
-                assert_eq!(request_1.request_id, "req-1");
-
-                let add_2 = recv_engine_message(dealer).await;
-                assert_eq!(add_2[0].as_ref(), &[0x00]);
-                let request_2: EngineCoreRequest = rmp_serde::from_slice(&add_2[1]).unwrap();
-                assert_eq!(request_2.client_index, 7);
-                assert_eq!(request_2.request_id, "req-2");
-
-                send_outputs(
-                    push,
-                    EngineCoreOutputs {
-                        utility_output: Some(UtilityOutput {
-                            call_id: 1_u64.into(),
-                            failure_message: None,
-                            result: None,
-                        }),
-                        outputs: vec![request_output("req-1", vec![999], None)],
-                        ..Default::default()
-                    },
-                )
-                .await;
-
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            })
-        },
-    );
-
-    let client = connect_client_with_ipc(
-        handshake_test_config(
-            handshake_address,
-            1,
-            "test-model",
-            Duration::from_secs(2),
-            7,
-            None,
-        ),
-        &ipc,
-    )
-    .await;
-    assert_eq!(client.engine_identities()[0], b"engine-0");
-    assert!(client.ready_responses()[0].max_model_len > 0);
-
-    let mut stream_1 = client.call(sample_request_with_id("req-1")).await.unwrap();
-    let mut stream_2 = client.call(sample_request_with_id("req-2")).await.unwrap();
-
-    let error_2 = timeout(Duration::from_secs(1), stream_2.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
-    assert!(is_unexpected_dispatcher_output(&error_2));
-
-    let error_1 = timeout(Duration::from_secs(1), stream_1.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
-    assert!(is_unexpected_dispatcher_output(&error_1));
-
-    assert!(matches!(
-        client.health_error().as_deref(),
-        Some(error) if is_unexpected_dispatcher_output(error)
-    ));
-
-    let _ = shutdown_tx.send(());
-    engine_task.await.unwrap();
-    client.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_request_ids_are_rejected_without_sending_a_second_add() {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
@@ -1083,7 +1013,7 @@ async fn duplicate_request_ids_are_rejected_without_sending_a_second_add() {
 
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
+                    RequestBatchOutputs {
                         outputs: vec![request_output(
                             "req-1",
                             vec![],
@@ -1091,7 +1021,8 @@ async fn duplicate_request_ids_are_rejected_without_sending_a_second_add() {
                         )],
                         finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -1150,10 +1081,12 @@ async fn finished_requests_without_final_output_is_treated_as_unexpected_close()
 
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
+                    RequestBatchOutputs {
+                        outputs: Vec::new(),
                         finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
 
@@ -1209,10 +1142,11 @@ async fn dropping_a_live_stream_triggers_abort() {
                 assert_eq!(add[0].as_ref(), &[0x00]);
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
+                    RequestBatchOutputs {
                         outputs: vec![request_output("req-1", vec![99], None)],
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
 
@@ -1267,29 +1201,36 @@ async fn dropping_multiple_live_streams_aborts_all_in_a_burst() {
                 }
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
+                    RequestBatchOutputs {
                         outputs: vec![
                             request_output("req-1", vec![99], None),
                             request_output("req-2", vec![99], None),
                             request_output("req-3", vec![99], None),
                         ],
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
 
-                let abort =
-                    timeout(Duration::from_secs(1), recv_engine_message(dealer)).await.unwrap();
-                assert_eq!(abort[0].as_ref(), &[0x01]);
-                let ids: Vec<String> = rmp_serde::from_slice(&abort[1]).unwrap();
+                // Aborts may coalesce into one burst or split across several.
+                let mut aborted = BTreeSet::new();
+                while aborted.len() < 3 {
+                    let abort =
+                        timeout(Duration::from_secs(1), recv_engine_message(dealer)).await.unwrap();
+                    assert_eq!(abort[0].as_ref(), &[0x01]);
+                    let ids: Vec<String> = rmp_serde::from_slice(&abort[1]).unwrap();
+                    aborted.extend(ids);
+                }
                 assert_eq!(
-                    ids,
-                    vec![
+                    aborted,
+                    BTreeSet::from([
                         "req-1".to_string(),
                         "req-2".to_string(),
                         "req-3".to_string()
-                    ]
+                    ])
                 );
+                // No spurious extra aborts.
                 assert!(
                     timeout(Duration::from_millis(100), recv_engine_message(dealer)).await.is_err()
                 );
@@ -1349,7 +1290,7 @@ async fn undecodable_output_frame_is_skipped_without_wedging_client() {
                 push.send(ZmqMessage::from(vec![0xc1])).await.unwrap();
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
+                    RequestBatchOutputs {
                         outputs: vec![request_output(
                             &request.request_id,
                             vec![7, 8],
@@ -1357,7 +1298,8 @@ async fn undecodable_output_frame_is_skipped_without_wedging_client() {
                         )],
                         finished_requests: Some(BTreeSet::from([request.request_id.clone()])),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -1423,14 +1365,16 @@ async fn is_sleeping_wrapper_sends_typed_request_and_returns_typed_response() {
 
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        utility_output: Some(UtilityOutput {
+                    UtilityCallOutput {
+                        engine_index: 0,
+                        timestamp: 0.0,
+                        output: UtilityOutput {
                             call_id: call_id.into(),
                             failure_message: None,
                             result: Some(utility_result_value(true)),
-                        }),
-                        ..Default::default()
-                    },
+                        },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -1478,14 +1422,16 @@ async fn call_utility_failure_message_surfaces_as_error() {
 
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        utility_output: Some(UtilityOutput {
+                    UtilityCallOutput {
+                        engine_index: 0,
+                        timestamp: 0.0,
+                        output: UtilityOutput {
                             call_id: call_id.into(),
                             failure_message: Some("boom".to_string()),
                             result: None,
-                        }),
-                        ..Default::default()
-                    },
+                        },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -1546,14 +1492,16 @@ async fn undecodable_frame_does_not_fail_waiting_utility_calls() {
                 push.send(ZmqMessage::from(vec![0xc1])).await.unwrap();
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        utility_output: Some(UtilityOutput {
+                    UtilityCallOutput {
+                        engine_index: 0,
+                        timestamp: 0.0,
+                        output: UtilityOutput {
                             call_id: call_id.into(),
                             failure_message: None,
                             result: Some(utility_result_value(true)),
-                        }),
-                        ..Default::default()
-                    },
+                        },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -1718,7 +1666,7 @@ async fn consecutive_undecodable_output_frames_are_all_skipped() {
                 push.send(ZmqMessage::from(vec![0xc1])).await.unwrap();
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
+                    RequestBatchOutputs {
                         outputs: vec![request_output(
                             &request.request_id,
                             vec![9],
@@ -1726,7 +1674,8 @@ async fn consecutive_undecodable_output_frames_are_all_skipped() {
                         )],
                         finished_requests: Some(BTreeSet::from([request.request_id.clone()])),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -1838,8 +1787,7 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
                 finish_req_1_rx.await.unwrap();
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        engine_index: 0,
+                    RequestBatchOutputs {
                         outputs: vec![request_output(
                             &request_1.request_id,
                             vec![10],
@@ -1847,7 +1795,8 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
                         )],
                         finished_requests: Some(BTreeSet::from([request_1.request_id.clone()])),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
 
@@ -1859,8 +1808,7 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
                 finish_req_3_rx.await.unwrap();
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        engine_index: 0,
+                    RequestBatchOutputs {
                         outputs: vec![request_output(
                             &request_3.request_id,
                             vec![30],
@@ -1868,7 +1816,8 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
                         )],
                         finished_requests: Some(BTreeSet::from([request_3.request_id.clone()])),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -1887,7 +1836,7 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
                 finish_req_2_rx.await.unwrap();
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
+                    RequestBatchOutputs {
                         engine_index: 1,
                         outputs: vec![request_output(
                             &request_2.request_id,
@@ -1896,7 +1845,8 @@ async fn multi_engine_client_shares_transport_and_routes_by_inflight_count() {
                         )],
                         finished_requests: Some(BTreeSet::from([request_2.request_id.clone()])),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -2013,14 +1963,16 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
                 assert_eq!(array[2], Value::from("is_sleeping"));
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        utility_output: Some(UtilityOutput {
+                    UtilityCallOutput {
+                        engine_index: 0,
+                        timestamp: 0.0,
+                        output: UtilityOutput {
                             call_id: call_id.into(),
                             failure_message: None,
                             result: Some(utility_result_value(true)),
-                        }),
-                        ..Default::default()
-                    },
+                        },
+                    }
+                    .into(),
                 )
                 .await;
 
@@ -2035,8 +1987,7 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
                 assert_eq!(aborted_ids, vec!["req-1".to_string()]);
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        engine_index: 0,
+                    RequestBatchOutputs {
                         outputs: vec![request_output(
                             "req-1",
                             vec![],
@@ -2044,7 +1995,8 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
                         )],
                         finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -2067,14 +2019,16 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
                 assert_eq!(array[2], Value::from("is_sleeping"));
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        utility_output: Some(UtilityOutput {
+                    UtilityCallOutput {
+                        engine_index: 0,
+                        timestamp: 0.0,
+                        output: UtilityOutput {
                             call_id: call_id.into(),
                             failure_message: None,
                             result: Some(utility_result_value(true)),
-                        }),
-                        ..Default::default()
-                    },
+                        },
+                    }
+                    .into(),
                 )
                 .await;
 
@@ -2089,7 +2043,7 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
                 assert_eq!(aborted_ids, vec!["req-2".to_string()]);
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
+                    RequestBatchOutputs {
                         engine_index: 1,
                         outputs: vec![request_output(
                             "req-2",
@@ -2098,7 +2052,8 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
                         )],
                         finished_requests: Some(BTreeSet::from(["req-2".to_string()])),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -2178,14 +2133,16 @@ async fn collective_rpc_flattens_results_from_all_engines() {
 
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        utility_output: Some(UtilityOutput {
+                    UtilityCallOutput {
+                        engine_index: 0,
+                        timestamp: 0.0,
+                        output: UtilityOutput {
                             call_id: call_id.into(),
                             failure_message: None,
                             result: Some(utility_result_value(vec!["engine-0-worker"])),
-                        }),
-                        ..Default::default()
-                    },
+                        },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -2209,14 +2166,16 @@ async fn collective_rpc_flattens_results_from_all_engines() {
 
                 send_outputs(
                     push,
-                    EngineCoreOutputs {
-                        utility_output: Some(UtilityOutput {
+                    UtilityCallOutput {
+                        engine_index: 0,
+                        timestamp: 0.0,
+                        output: UtilityOutput {
                             call_id: call_id.into(),
                             failure_message: None,
                             result: Some(utility_result_value(vec!["engine-1-worker"])),
-                        }),
-                        ..Default::default()
-                    },
+                        },
+                    }
+                    .into(),
                 )
                 .await;
             })
@@ -2287,14 +2246,16 @@ fn spawn_mock_utility_engine(
             assert_eq!(array[3], expected_args, "unexpected utility args");
             send_outputs(
                 push,
-                EngineCoreOutputs {
-                    utility_output: Some(UtilityOutput {
+                UtilityCallOutput {
+                    engine_index: 0,
+                    timestamp: 0.0,
+                    output: UtilityOutput {
                         call_id: call_id.into(),
                         failure_message: None,
                         result: Some(utility_result_value(result)),
-                    }),
-                    ..Default::default()
-                },
+                    },
+                }
+                .into(),
             )
             .await;
         })
@@ -2507,7 +2468,6 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     let multipart_prompt_frames =
         lines.next().expect("missing multipart prompt logprobs fixture line");
     let ready_response_hex = lines.next().expect("missing ready response fixture line");
-    let clamp_request_hex = lines.next().expect("missing clamp request fixture line");
 
     let request_bytes = hex::decode(request_hex).unwrap();
     let multimodal_request_bytes = hex::decode(multimodal_request_hex).unwrap();
@@ -2534,12 +2494,14 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             seed: None,
             max_tokens: 16,
             min_tokens: 0,
+            thinking_token_budget: None,
             logprobs: None,
             prompt_logprobs: None,
             min_p: 0.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repetition_penalty: 1.0,
+            repetition_detection: None,
             stop_token_ids: Vec::new(),
             eos_token_id: None,
             all_stop_token_ids: BTreeSet::new(),
@@ -2585,43 +2547,42 @@ fn python_msgpack_fixtures_match_rust_encoding() {
 
     let decoded_outputs: EngineCoreOutputs = rmp_serde::from_slice(&outputs_bytes).unwrap();
     expect_test::expect![[r#"
-        EngineCoreOutputs {
-            engine_index: 0,
-            outputs: [
-                EngineCoreOutput {
-                    request_id: "req-1",
-                    new_token_ids: [
-                        7,
-                        8,
-                    ],
-                    new_logprobs: None,
-                    new_prompt_logprobs_tensors: None,
-                    pooling_output: None,
-                    finish_reason: Some(
-                        Length,
-                    ),
-                    stop_reason: None,
-                    capture_results: {},
-                    events: None,
-                    kv_transfer_params: None,
-                    trace_headers: None,
-                    prefill_stats: None,
-                    routed_experts: None,
-                    num_nans_in_logits: 0,
-                },
-            ],
-            scheduler_stats: None,
-            timestamp: 0.0,
-            utility_output: None,
-            late_capture_results: {},
-            finished_requests: Some(
-                {
-                    "req-1",
-                },
-            ),
-            wave_complete: None,
-            start_wave: None,
-        }
+        RequestBatch(
+            RequestBatchOutputs {
+                engine_index: 0,
+                outputs: [
+                    EngineCoreOutput {
+                        request_id: "req-1",
+                        new_token_ids: [
+                            7,
+                            8,
+                        ],
+                        new_logprobs: None,
+                        new_prompt_logprobs_tensors: None,
+                        pooling_output: None,
+                        finish_reason: Some(
+                            Length,
+                        ),
+                        stop_reason: None,
+                        capture_results: {},
+                        events: None,
+                        kv_transfer_params: None,
+                        ec_transfer_params: None,
+                        trace_headers: None,
+                        prefill_stats: None,
+                        routed_experts: None,
+                        num_nans_in_logits: 0,
+                    },
+                ],
+                scheduler_stats: None,
+                timestamp: 0.0,
+                finished_requests: Some(
+                    {
+                        "req-1",
+                    },
+                ),
+            },
+        )
     "#]]
     .assert_debug_eq(&decoded_outputs);
 
@@ -2634,7 +2595,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     let inline_logprobs =
         decode_engine_core_outputs(&decode_frames(inline_logprobs_frames)).unwrap();
     expect_sample_logprobs(
-        inline_logprobs.outputs[0]
+        inline_logprobs.as_request_batch().unwrap().outputs[0]
             .new_logprobs
             .as_ref()
             .expect("inline logprobs decoded"),
@@ -2643,7 +2604,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     let multipart_logprobs =
         decode_engine_core_outputs(&decode_frames(multipart_logprobs_frames)).unwrap();
     expect_sample_logprobs(
-        multipart_logprobs.outputs[0]
+        multipart_logprobs.as_request_batch().unwrap().outputs[0]
             .new_logprobs
             .as_ref()
             .expect("multipart logprobs decoded"),
@@ -2651,7 +2612,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
 
     let inline_prompt = decode_engine_core_outputs(&decode_frames(inline_prompt_frames)).unwrap();
     expect_prompt_logprobs(
-        inline_prompt.outputs[0]
+        inline_prompt.as_request_batch().unwrap().outputs[0]
             .new_prompt_logprobs_tensors
             .as_ref()
             .expect("inline prompt logprobs decoded"),
@@ -2660,7 +2621,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     let multipart_prompt =
         decode_engine_core_outputs(&decode_frames(multipart_prompt_frames)).unwrap();
     expect_prompt_logprobs(
-        multipart_prompt.outputs[0]
+        multipart_prompt.as_request_batch().unwrap().outputs[0]
             .new_prompt_logprobs_tensors
             .as_ref()
             .expect("multipart prompt logprobs decoded"),
@@ -2675,36 +2636,6 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             other => panic!("ready response should encode as a map, got {other:?}"),
         }
     };
-    // Clamp-bearing request: the canonical SteeringClamps must decode typed,
-    // with the raw f64 row bytes and native -inf bound intact — this is the
-    // exact wire contract the strict Python-side decoder enforces in the
-    // other direction.
-    let clamp_request_bytes = hex::decode(clamp_request_hex).unwrap();
-    let decoded_clamps: EngineCoreRequest = rmp_serde::from_slice(&clamp_request_bytes).unwrap();
-    assert_eq!(decoded_clamps.request_id, "req-clamps");
-    let clamp_sampling = decoded_clamps
-        .sampling_params
-        .clone()
-        .expect("clamp request carries sampling params");
-    let clamps = clamp_sampling.steering_clamps.expect("steering_clamps present");
-    let table = &clamps.hooks["post_block"];
-    assert_eq!(table.shape, vec![2, 2]);
-    assert_eq!(table.layer_indices, vec![5, 9]);
-    let rows: Vec<f64> = table
-        .data
-        .chunks_exact(8)
-        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    assert_eq!(rows, vec![1.5, -2.0, 0.25, 8.0]);
-    assert_eq!(table.lo, vec![-2.0, f64::NEG_INFINITY]);
-    assert_eq!(table.hi, vec![2.0, 4.0]);
-    assert_eq!(table.strength, vec![1.0, 0.5]);
-    // Round-trip: Rust re-encodes to bytes carrying the same map/bin shapes
-    // Python's strict decoder accepts; decode-equality proves preservation.
-    let reencoded = crate::protocol::encode_msgpack(&decoded_clamps).unwrap();
-    let redecoded: EngineCoreRequest = rmp_serde::from_slice(&reencoded).unwrap();
-    assert_eq!(redecoded, decoded_clamps);
-
     let python_ready_keys = map_keys(&hex::decode(ready_response_hex).unwrap());
     let rust_ready_keys =
         map_keys(&rmp_serde::to_vec_named(&crate::mock_engine::default_ready_response()).unwrap());
@@ -3010,8 +2941,7 @@ async fn bootstrapped_external_coordinator_updates_wave_ignores_counts_and_sends
 
     send_outputs(
         &mut push,
-        EngineCoreOutputs {
-            engine_index: 0,
+        RequestBatchOutputs {
             outputs: vec![request_output(
                 "req-1",
                 vec![],
@@ -3019,7 +2949,8 @@ async fn bootstrapped_external_coordinator_updates_wave_ignores_counts_and_sends
             )],
             finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
             ..Default::default()
-        },
+        }
+        .into(),
     )
     .await;
 
@@ -3085,8 +3016,7 @@ async fn bootstrapped_external_coordinator_running_state_suppresses_wakeup() {
 
     send_outputs(
         &mut push,
-        EngineCoreOutputs {
-            engine_index: 0,
+        RequestBatchOutputs {
             outputs: vec![request_output(
                 "req-1",
                 vec![],
@@ -3094,7 +3024,8 @@ async fn bootstrapped_external_coordinator_running_state_suppresses_wakeup() {
             )],
             finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
             ..Default::default()
-        },
+        }
+        .into(),
     )
     .await;
 

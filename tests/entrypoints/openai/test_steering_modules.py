@@ -557,6 +557,7 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
     engine_client.vllm_config = SimpleNamespace(
         lora_config=None,
         structured_outputs_config=SimpleNamespace(enable_in_reasoning=False),
+        model_config=SimpleNamespace(get_hidden_size=lambda: 1024),
     )
     engine_client.model_config = MagicMock()
     engine_client.renderer = MagicMock()
@@ -605,8 +606,9 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
             "vllm.entrypoints.openai.api_server.OpenAIServingModels",
             return_value=models,
         ),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+        patch("vllm.entrypoints.openai.api_server.OnlineRenderer"),
+        patch("vllm.entrypoints.openai.api_server.OnlineDerenderer"),
+        patch("vllm.entrypoints.openai.api_server.ServingTokenization"),
     ):
         await init_app_state(
             engine_client,
@@ -632,8 +634,9 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
             "vllm.entrypoints.openai.api_server.OpenAIServingModels",
             return_value=models,
         ),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+        patch("vllm.entrypoints.openai.api_server.OnlineRenderer"),
+        patch("vllm.entrypoints.openai.api_server.OnlineDerenderer"),
+        patch("vllm.entrypoints.openai.api_server.ServingTokenization"),
     ):
         await init_app_state(
             engine_client,

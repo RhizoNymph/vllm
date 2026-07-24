@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 pub(crate) mod convert;
 mod types;
 mod validate;
@@ -21,7 +24,7 @@ use vllm_chat::{
     AssistantBlockKind, AssistantMessageExt as _, ChatEvent, ChatEventStream, ChatEventStreamTrait,
     CollectedAssistantMessage, FinishReason,
 };
-use vllm_engine_core_client::protocol::StopReason;
+use vllm_engine_core_client::protocol::output::StopReason;
 
 use self::convert::{ResponseOptions, prepare_chat_request};
 use crate::config::ApiServerOptions;
@@ -33,7 +36,7 @@ use crate::routes::openai::chat_completions::types::{
 };
 use crate::routes::openai::utils::capture::build_capture_results_response;
 use crate::routes::openai::utils::logprobs::{
-    decoded_logprobs_to_openai_chat, decoded_prompt_logprobs_to_maps,
+    decoded_logprobs_to_openai_chat, prompt_logprobs_to_maps,
 };
 use crate::routes::openai::utils::types::{
     ChatLogProbs, FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta, Usage,
@@ -128,6 +131,7 @@ async fn collect_chat_completion(
         // Ignored: non-streaming responses are collected before usage is attached.
         include_continuous_usage: _,
         requested_logprobs,
+        output_top_logprobs,
         include_prompt_logprobs,
         include_reasoning,
         echo,
@@ -150,6 +154,7 @@ async fn collect_chat_completion(
         usage,
         finish_reason,
         kv_transfer_params,
+        ec_transfer_params,
         capture_results,
     } = collected;
     let stop_reason = finish_reason.as_stop_reason().map(stop_reason_to_json);
@@ -176,20 +181,18 @@ async fn collect_chat_completion(
             logprobs.as_ref().ok_or_else(|| {
                 server_error!("chat response requested logprobs but generation returned none")
             })?,
+            output_top_logprobs,
             return_tokens_as_token_ids,
         )?)
     } else {
         None
     };
     let prompt_logprobs = if include_prompt_logprobs {
-        Some(decoded_prompt_logprobs_to_maps(
-            prompt_logprobs.as_ref().ok_or_else(|| {
-                server_error!(
-                    "chat response requested prompt_logprobs but generation returned none"
-                )
-            })?,
+        Some(prompt_logprobs_to_maps(
+            prompt_logprobs.as_ref(),
+            &prompt_token_ids,
             return_tokens_as_token_ids,
-        ))
+        )?)
     } else {
         None
     };
@@ -218,7 +221,7 @@ async fn collect_chat_completion(
                     Some(prefix) => Some(format!("{prefix}{}", message.text())),
                     None => Some(message.text()).filter(|t| !t.is_empty()),
                 },
-                tool_calls: Some(tool_calls).filter(|calls| !calls.is_empty()),
+                tool_calls,
                 reasoning: if include_reasoning { reasoning } else { None },
             },
             logprobs,
@@ -231,6 +234,7 @@ async fn collect_chat_completion(
         prompt_logprobs,
         prompt_token_ids: return_token_ids.then(|| prompt_token_ids.to_vec()),
         kv_transfer_params,
+        ec_transfer_params,
         capture_results: build_capture_results_response(&capture_results),
     })
 }
@@ -251,6 +255,7 @@ async fn chat_completion_chunk_stream(
         include_usage,
         include_continuous_usage,
         requested_logprobs,
+        output_top_logprobs,
         // Ignored: chat streaming prompt logprobs are rejected for Python parity.
         include_prompt_logprobs: _,
         include_reasoning,
@@ -340,7 +345,13 @@ async fn chat_completion_chunk_stream(
                 let openai_logprobs = if include_metadata {
                     logprobs
                         .as_ref()
-                        .map(|lp| decoded_logprobs_to_openai_chat(lp, return_tokens_as_token_ids))
+                        .map(|lp| {
+                            decoded_logprobs_to_openai_chat(
+                                lp,
+                                output_top_logprobs,
+                                return_tokens_as_token_ids,
+                            )
+                        })
                         .transpose()?
                 } else {
                     None
@@ -813,7 +824,7 @@ fn chat_finish_reason_to_openai(
         FinishReason::Stop(_) => Ok("stop"),
         FinishReason::Length => Ok("length"),
         FinishReason::Abort => Ok("abort"),
-        FinishReason::Repetition => Ok("stop"),
+        FinishReason::Repetition(_) => Ok("repetition"),
         FinishReason::Error => {
             bail_server_error!("Internal server error");
         }
@@ -833,7 +844,7 @@ mod tests {
     use vllm_chat::{
         AssistantBlockKind, AssistantContentBlock, AssistantToolCall, ChatEvent, FinishReason,
     };
-    use vllm_engine_core_client::protocol::StopReason;
+    use vllm_engine_core_client::protocol::output::StopReason;
     use vllm_text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
 
     use super::{
@@ -959,6 +970,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
@@ -1040,6 +1052,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
@@ -1096,6 +1109,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
@@ -1178,6 +1192,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
@@ -1312,6 +1327,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
@@ -1394,6 +1410,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);

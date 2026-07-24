@@ -175,6 +175,7 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.num_cache_creation_tokens = 0
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -279,6 +280,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
         capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
@@ -336,6 +338,7 @@ class RequestState:
             outputs,
             finished,
             kv_transfer_params,
+            ec_transfer_params,
             capture_results=capture_results,
         )
 
@@ -345,6 +348,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
         capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
@@ -379,7 +383,9 @@ class RequestState:
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
             kv_transfer_params=kv_transfer_params,
+            ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
+            num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
             capture_results=dict(capture_results) if capture_results else {},
         )
@@ -514,6 +520,7 @@ class OutputProcessor:
                         finish_reason=FinishReason.ABORT,
                         stop_reason=None,
                         kv_transfer_params=None,
+                        ec_transfer_params=None,
                     )
                 ):
                     req_state.queue.put(request_output)
@@ -663,6 +670,7 @@ class OutputProcessor:
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
+            ec_transfer_params = engine_core_output.ec_transfer_params
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
@@ -672,6 +680,9 @@ class OutputProcessor:
                 if engine_core_output.prefill_stats is not None:
                     req_state.num_cached_tokens = (
                         engine_core_output.prefill_stats.num_cached_tokens
+                    )
+                    req_state.num_cache_creation_tokens = (
+                        engine_core_output.prefill_stats.num_cache_creation_tokens
                     )
                 req_state.is_prefilling = False
 
@@ -697,6 +708,7 @@ class OutputProcessor:
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                ec_transfer_params,
                 capture_results=engine_core_output.capture_results,
             ):
                 if req_state.streaming_input:

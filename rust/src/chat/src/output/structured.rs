@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 //! Adapts parsed assistant updates into structured chat events.
 //!
 //! This module remains the final assembly stage in `vllm-chat`. Token-to-text
@@ -149,6 +152,7 @@ impl StructuredEventState {
         usage: vllm_llm::TokenUsage,
         finish_reason: FinishReason,
         kv_transfer_params: Option<serde_json::Value>,
+        ec_transfer_params: Option<serde_json::Value>,
         capture_results: HashMap<String, CaptureResult>,
     ) -> Result<Vec<ChatEvent>> {
         let mut events = Vec::new();
@@ -159,6 +163,7 @@ impl StructuredEventState {
             usage,
             finish_reason,
             kv_transfer_params,
+            ec_transfer_params,
             capture_results,
         });
         Ok(events)
@@ -301,11 +306,16 @@ pub(crate) async fn structured_chat_event_stream(
                 usage,
                 finish_reason,
                 kv_transfer_params,
+                ec_transfer_params,
                 capture_results,
             } => {
-                for next in
-                    state.finish(usage, finish_reason, kv_transfer_params, capture_results)?
-                {
+                for next in state.finish(
+                    usage,
+                    finish_reason,
+                    kv_transfer_params,
+                    ec_transfer_params,
+                    capture_results,
+                )? {
                     y.yield_ok(next).await;
                 }
             }
@@ -342,6 +352,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
@@ -397,6 +408,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
@@ -449,6 +461,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
@@ -501,6 +514,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
@@ -569,6 +583,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }),
         ]);
