@@ -5,7 +5,6 @@ mod convert;
 mod types;
 mod validate;
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::result::Result;
 use std::sync::Arc;
@@ -608,6 +607,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    ec_transfer_params: None,
                     capture_results: HashMap::from([(
                         "filesystem".to_string(),
                         CaptureResult {

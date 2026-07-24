@@ -5733,7 +5733,7 @@ dependencies = [
  "openssl",
  "prost",
  "prost-types",
- "reqwest",
+ "reqwest 0.12.28",
  "rmp-serde",
  "rmpv",
  "serde",
@@ -5832,17 +5832,6 @@ dependencies = [
  "serde_json",
  "thiserror-ext",
  "vllm-parser",
-]
-
-[[package]]
-name = "vllm-tool-parser-py"
-version = "0.1.0"
-dependencies = [
- "pyo3",
- "pythonize",
- "serde_json",
- "thiserror-ext",
- "vllm-tool-parser",
 ]
 
 [[package]]
