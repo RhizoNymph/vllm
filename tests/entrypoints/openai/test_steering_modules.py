@@ -605,8 +605,9 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
             "vllm.entrypoints.openai.api_server.OpenAIServingModels",
             return_value=models,
         ),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+        patch("vllm.entrypoints.openai.api_server.OnlineRenderer"),
+        patch("vllm.entrypoints.openai.api_server.OnlineDerenderer"),
+        patch("vllm.entrypoints.openai.api_server.ServingTokenization"),
     ):
         await init_app_state(
             engine_client,
@@ -632,8 +633,9 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
             "vllm.entrypoints.openai.api_server.OpenAIServingModels",
             return_value=models,
         ),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingRender"),
-        patch("vllm.entrypoints.openai.api_server.OpenAIServingTokenization"),
+        patch("vllm.entrypoints.openai.api_server.OnlineRenderer"),
+        patch("vllm.entrypoints.openai.api_server.OnlineDerenderer"),
+        patch("vllm.entrypoints.openai.api_server.ServingTokenization"),
     ):
         await init_app_state(
             engine_client,

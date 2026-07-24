@@ -53,6 +53,7 @@ class EngineCoreSamplingParams(msgspec.Struct, dict=True, omit_defaults=True):
     seed: int | None = None
     max_tokens: int = 16
     min_tokens: int = 0
+    thinking_token_budget: int | None = None
     min_p: float = 0.0
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -107,6 +108,7 @@ class EngineCoreOutput(
     capture_results: dict = msgspec.field(default_factory=dict)
     events: object | None = None
     kv_transfer_params: object | None = None
+    ec_transfer_params: object | None = None
     trace_headers: object | None = None
     prefill_stats: object | None = None
     routed_experts: object | None = None
@@ -143,6 +145,7 @@ request = EngineCoreRequest(
         seed=None,
         max_tokens=32,
         min_tokens=1,
+        thinking_token_budget=256,
         min_p=0.0,
         frequency_penalty=0.0,
         presence_penalty=0.0,
@@ -382,6 +385,8 @@ class EngineCoreReadyResponse:
     dp_stats_address: str | None
     dtype: str
     vllm_version: str
+    world_size: int
+    data_parallel_size: int
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
 
@@ -421,6 +426,8 @@ ready_response = EngineCoreReadyResponse(
     dp_stats_address=None,
     dtype="float32",
     vllm_version="0.0.0",
+    data_parallel_size=1,
+    world_size=1,
 )
 
 print(msgspec.msgpack.encode(request).hex())

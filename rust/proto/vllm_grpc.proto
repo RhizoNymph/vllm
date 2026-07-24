@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 syntax = "proto3";
 package vllm;
 
@@ -9,6 +12,10 @@ service Generate {
   rpc Generate (GenerateRequest) returns (GenerateResponse) {}
   // Generates text given a prompt, streaming the outputs
   rpc GenerateStream (GenerateRequest) returns (stream GenerateResponse) {}
+}
+
+service Control {
+  rpc Abort (AbortRequest) returns (AbortResponse) {}
 }
 
 // ======================================================================================
@@ -171,6 +178,9 @@ message KVCacheParameters {
 
   // KV Connector transfer parameters
   google.protobuf.Struct kv_transfer_params = 3;
+
+  // Encoder cache connector transfer parameters
+  google.protobuf.Struct ec_transfer_params = 4;
 }
 
 // Controls which extra candidate tokens at each position should be returned
@@ -237,11 +247,12 @@ message FinishInfo {
 
   google.protobuf.Struct kv_transfer_params = 6;
   //uint64 seed = 7;
+  google.protobuf.Struct ec_transfer_params = 8;
 
   // Per-consumer activation-capture results, keyed by consumer name. Present
   // only when the request opted into capture. Each value is an object with
   // `status`, optional `error`, and a consumer-specific `payload` object.
-  google.protobuf.Struct capture_results = 8;
+  google.protobuf.Struct capture_results = 9;
 }
 
 // Info for candidate tokens other than the input/sampled
@@ -263,3 +274,12 @@ message TokenIds {
   repeated uint32 ids = 1;
 }
 
+// ======================================================================================
+// Control
+// ======================================================================================
+
+message AbortRequest {
+  repeated string request_ids = 1;
+}
+
+message AbortResponse {}

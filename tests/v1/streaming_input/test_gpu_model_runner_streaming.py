@@ -16,7 +16,8 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-pytestmark = pytest.mark.cpu_test
+# Not cpu_test: InputBatch allocates pinned (UVA) memory, which requires a
+# CUDA device even though the batch tensors live on the CPU.
 
 
 @pytest.fixture
@@ -28,13 +29,9 @@ def mock_model_runner_with_input_batch():
     runner.requests = {}
     runner.max_num_reqs = 10
     runner.max_model_len = 1024
-    # Mirrors gpu_model_runner.py:825 self.late_interaction_runner =
-    # LateInteractionRunner(); an instance attr the spec-based Mock lacks.
     runner.late_interaction_runner = Mock()
-    # Sync-consumer metadata stashes the runner inherits from
-    # CaptureRunnerMixin.__init__ (capture_runner_mixin.py:109 and :113);
-    # _update_streaming_request refreshes them, but Mock(spec=...) never runs
-    # __init__ so the instance attrs are absent.
+    # Sync-consumer metadata the runner inherits from CaptureRunnerMixin;
+    # Mock(spec=...) skips __init__ so these instance attrs are absent.
     runner._sync_conversation_ids = {}
     runner._sync_steering_gates = {}
 
@@ -44,10 +41,10 @@ def mock_model_runner_with_input_batch():
         max_model_len=1024,
         max_num_batched_tokens=1024,
         device="cpu",
-        pin_memory=False,
         vocab_size=32000,
         block_sizes=[16],
         kernel_block_sizes=[16],
+        max_num_blocks_per_req=[64],
         logitsprocs=None,
         is_pooling_model=False,
     )

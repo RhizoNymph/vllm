@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -204,6 +207,9 @@ pub enum ChatEvent {
         finish_reason: FinishReason,
         /// Connector-specific KV transfer parameters for disaggregated serving.
         kv_transfer_params: Option<serde_json::Value>,
+        /// Connector-specific encoder cache transfer parameters for
+        /// disaggregated serving.
+        ec_transfer_params: Option<serde_json::Value>,
         /// Per-consumer activation-capture results, keyed by consumer name.
         capture_results: HashMap<String, CaptureResult>,
     },

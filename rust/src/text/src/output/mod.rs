@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 //! Output processing helpers shared by text and chat layers.
 
 pub use decoded::{DecodedTextEvent, Finished, TextDecodeOptions, decoded_text_event_stream};
@@ -28,6 +31,9 @@ pub struct CollectedTextOutput {
     pub usage: vllm_llm::TokenUsage,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Connector-specific encoder cache transfer parameters for disaggregated
+    /// serving.
+    pub ec_transfer_params: Option<serde_json::Value>,
     /// Per-consumer activation-capture results, keyed by consumer name. Empty
     /// unless the request opted into capture.
     pub capture_results: HashMap<String, CaptureResult>,
@@ -82,6 +88,7 @@ impl<T: TextOutputStream> T {
                                 finish_reason: FinishReason::Error,
                                 usage: vllm_llm::TokenUsage::default(),
                                 kv_transfer_params: None,
+                                ec_transfer_params: None,
                                 capture_results: HashMap::new(),
                             })
                         };
@@ -91,6 +98,7 @@ impl<T: TextOutputStream> T {
                             collected.finish_reason = finished.finish_reason;
                             collected.usage = finished.usage;
                             collected.kv_transfer_params = finished.kv_transfer_params;
+                            collected.ec_transfer_params = finished.ec_transfer_params;
                             collected.capture_results = finished.capture_results;
                             return Ok(collected);
                         }
@@ -163,6 +171,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    ec_transfer_params: None,
                     capture_results: Default::default(),
                 }),
             }),
@@ -281,6 +290,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    ec_transfer_params: None,
                     capture_results: Default::default(),
                 }),
             }),
