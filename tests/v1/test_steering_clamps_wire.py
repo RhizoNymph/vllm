@@ -183,11 +183,11 @@ class TestCollectiveRpcHop:
 
 
 class TestPydanticEmbedding:
-    """SamplingParams is embedded in pydantic models (disagg protocol);
-    the Struct field must schema-generate and JSON round-trip."""
+    """SamplingParams is embedded in pydantic models (token-in-token-out
+    protocol); the Struct field must schema-generate and JSON round-trip."""
 
     def test_disagg_protocol_importable(self):
-        import vllm.entrypoints.serve.disagg.protocol  # noqa: F401
+        import vllm.entrypoints.scale_out.token_in_token_out.protocol  # noqa: F401
 
     def test_pydantic_json_round_trip(self):
         from pydantic import BaseModel

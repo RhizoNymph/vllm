@@ -557,6 +557,7 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
     engine_client.vllm_config = SimpleNamespace(
         lora_config=None,
         structured_outputs_config=SimpleNamespace(enable_in_reasoning=False),
+        model_config=SimpleNamespace(get_hidden_size=lambda: 1024),
     )
     engine_client.model_config = MagicMock()
     engine_client.renderer = MagicMock()
