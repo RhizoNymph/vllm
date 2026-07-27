@@ -11,18 +11,25 @@ In scope:
 
 - Wiring the runner-agnostic steering/capture subsystems into the v2 runner's
   lifecycle so both features behave identically to v1.
-- A v2-native control plane (new modules under `vllm/v1/worker/gpu/`) that keeps
-  its own per-request state, since v2 does not retain a `CachedRequestState`
-  dict the way v1 does.
+- A v2 control plane that keeps its own per-request state, since v2 does not
+  retain a `CachedRequestState` dict the way v1 does.
+- Dynamic steering on v2 (the dynamic tier, override pool, in-graph monitor,
+  and the APC decode-signature notification) — folded into the shared hot path
+  by the de-fork; see workstream 2 and
+  [Dynamic Steering](dynamic_steering.md) for the subsystem design.
 
 Out of scope:
 
 - The data plane (model-side custom ops, layer buffers, Triton kernels). These
   live in `vllm/model_executor/` and are **already shared** by both runners.
-- Refactoring the v1 mixins. The v1 path is validated/production; we leave it
-  untouched and write v2-native modules instead.
-- Dynamic-steering (steer-from-capture feedback) and routed-experts capture
-  (tracked separately).
+- Routed-experts capture (tracked separately).
+
+Superseded: this port originally planned v2-native control-plane modules
+alongside untouched v1 mixins. The de-fork (workstream 2, steps C–H) instead
+merged both onto shared runner-agnostic mixins
+(`SteeringModelRunnerMixin` / `CaptureRunnerMixin`), leaving each runner only
+thin batch-state accessors; `gpu/steering_runner_mixin.py` is deleted. The
+sections below are written against that end state.
 
 ## Key architectural fact
 
@@ -42,36 +49,36 @@ The split is therefore:
 | --- | --- | --- |
 | Data plane (ops, buffers, kernels, store, managers, gate, types) | `model_executor/`, `v1/capture/`, `v1/worker/steering_manager.py` | shared, reused unchanged |
 | Scheduler handoff (`NewRequestData.{prefill,decode}_steering_config_hash`, `capture_block_hashes`, `sampling_params.capture`; `ModelRunnerOutput.capture_results`) | `v1/core/sched/output.py`, `v1/outputs.py` | shared, already present |
-| Control plane (init, per-step buffer fill / plan build, force-eager, request lifecycle, output drain) | runner | **absent — this port** |
+| Control plane (init, per-step buffer fill / plan build, force-eager, request lifecycle, output drain) | runner | **this port** — now shared mixins + thin v2 accessors |
 
 ## V2 runner seams
 
 The v2 runner splits the monolithic v1 `execute_model` into discrete methods.
 The port attaches to these (all in `gpu/model_runner.py`):
 
-- `load_model` (266): construct managers/gate/store; init steerable-layer
+- `load_model`: construct managers/gate/store; init steerable-layer
   discovery. Buffers are already registered model-side.
-- `add_requests` (691): per `new_req_data` in `scheduled_new_reqs` — register
+- `add_requests`: per `new_req_data` in `scheduled_new_reqs` — register
   steering config + track phase; `gate.register` (all ranks) + capture
   `register_request` (TP0). Note `add_requests` calls `_remove_request` first
   for streaming re-adds, so refresh state accordingly.
-- `update_requests` (736): prefill→decode transition / resumption bookkeeping.
-- `finish_requests` (678): use `scheduler_output.finished_req_ids` for steering
+- `update_requests`: prefill→decode transition / resumption bookkeeping.
+- `finish_requests`: use `scheduler_output.finished_req_ids` for steering
   release + capture finalize + `gate.drop`; `preempted_req_ids` → steering
   reset, **not** capture finalize.
-- `execute_model` (1009):
-  - Force-eager seam at the `dispatch_cg_and_sync_dp(..., need_eager=...)` call
-    (1042–1050): OR in `capture_pending` (client-spec captures only; global
+- `execute_model`:
+    - Force-eager seam at the `dispatch_cg_and_sync_dp(..., need_eager=...)`
+    call: OR in `capture_pending` (client-spec captures only; global
     specs ride the cudagraph-safe persistent-buffer path). **Steering needs no
     force-eager** — its tables/index are persistent buffers written before the
     forward, so graph replay reads them correctly.
-  - After `prepare_inputs` (1060) and before the model forward (1167): build the
+    - After `prepare_inputs` and before the model forward: build the
     per-step view, `_update_steering_buffers(view)`, and
     `capture_manager.build_step_plan(view)` (TP0).
-  - After the forward (after 1210, before non-last-PP return at 1220):
+    - After the forward (before the non-last-PP early return):
     `_finalize_capture_step()` (consume plan, async dispatch).
-- `sample_tokens` (1229): attach drained `_pending_capture_results` to the
-  `ModelRunnerOutput` (1276); `_finalize_capture_for_request_async` results land
+- `sample_tokens`: attach drained `_pending_capture_results` to the
+  `ModelRunnerOutput`; `_finalize_capture_for_request_async` results land
   here, same as v1's `get_output`.
 
 ### Per-request state ownership
@@ -102,7 +109,8 @@ only rank-identical inputs.
 
 ## Workstreams
 
-1. **Capture control plane** — DONE (CPU-tested, GPU pending).
+1. **Capture control plane** — DONE (CPU-tested and GPU-validated; see
+   [Validation](#validation)).
    The runner-agnostic control plane is shared with the v1 runner in
    `vllm/v1/worker/capture_runner_mixin.py` (`CaptureRunnerMixin`):
    `_init_capture_state`, `_register_capture_request`, `_capture_add_request`,
@@ -119,7 +127,8 @@ only rank-identical inputs.
    `_capture_build_plan`), which must be built before v2's `InputBatch` exists,
    plus the two hooks above. Tests: `tests/v1/worker/test_gpu_v2_capture_glue.py`,
    `tests/v1/worker/test_sync_steering_integration.py`.
-2. **Steering control plane** — DONE (CPU-tested, GPU pending).
+2. **Steering control plane** — DONE (CPU-tested and GPU-validated; see
+   [Validation](#validation)).
    Fully shared on `SteeringModelRunnerMixin` (de-fork complete, step H): the
    v2 runner mixes it in directly
    (`GPUModelRunner(..., CaptureRunnerMixin, SteeringModelRunnerMixin)`) and the
@@ -165,9 +174,9 @@ only rank-identical inputs.
    `_reset_steering_for_resumption`, v2 via the `add_requests` new-request path.
    Previously v1 HELD its rows across preemption (releasing only at resume);
    that pinned pool rows for the duration of the preemption. The scheduler
-   already agrees: `_preempt_request` (`scheduler.py:1256`) resets
+   already agrees: `_preempt_request` (`scheduler.py`) resets
    `num_computed_tokens = 0` and drops the decode-signature tracking, and the
-   waiting-queue admission loop (`scheduler.py:705–718`, `:762–790`) reserves the
+   waiting-queue admission loop (`scheduler.py`) reserves the
    resumed request's prefill + decode steering rows before re-admitting it, so
    the re-registration's `register_config` cannot overflow (the same guarantee
    v2 already relied on). A request both preempted and finished in one step
@@ -198,8 +207,8 @@ only rank-identical inputs.
      admitted decode row; overrides drop on finish / preempt / streaming re-add.
      The shared `_apply_request_override` reads the decode-only phase guard
      through `_steering_req_position`, which the v2 runner overrides (on
-     `gpu/capture_runner_mixin.py`) to read v2's `req_states` (`req_id_to_index`
-     + `num_computed_tokens_np` / `prompt_len.np`).
+     `gpu/capture_runner_mixin.py`) to read v2's `req_states` —
+     `req_id_to_index` plus `num_computed_tokens_np` / `prompt_len.np`.
    - **Async transport** — drains the in-process `SteeringActionQueue` at the top
      (before the nothing-active short-circuit, so a drained update can activate
      steering) via the shared `_apply_steering_actions`.

@@ -35,7 +35,7 @@ Concrete uses:
 ## 2. Where the systems already meet (verified)
 
 The two systems intersect in a single line. Every steerable layer runs,
-per hook point (`vllm/model_executor/layers/steering.py:166`):
+per hook point (`vllm/model_executor/layers/steering.py`):
 
 ```python
 def apply_layer_steering(module, hidden_states, hook_point):
@@ -52,13 +52,13 @@ The per-step runtime anatomy both phases of this design build on:
 
 | Mechanism | Location | Property we exploit |
 | --- | --- | --- |
-| Steering tables | per-layer persistent GPU buffers `(max_configs+3, hidden)`; row 0 = zeros, rows 1/2 = global prefill/decode, rows 3+ = per-request (`steering.py:65-115`) | mutations between steps are visible to CUDA-graph replay |
-| `steering_index` | shared `(max_tokens,)` int64, token→row, rebuilt each step (`steering_model_runner_mixin.py:_update_steering_buffers`, called at `gpu_model_runner.py:4700` right before forward) | a per-step, host-controlled routing decision |
+| Steering tables | per-layer persistent GPU buffers `(3 + num_configs + num_dynamic, hidden)`; row 0 = zeros, rows 1/2 = global prefill/decode, then the admitted per-request pool and the dynamic-override pool (`steering.py`; row space defined in `steering_table_layout.py`) | mutations between steps are visible to CUDA-graph replay |
+| `steering_index` | shared `(max_tokens,)` int64, token→row, rebuilt each step (`steering_model_runner_mixin.py:_update_steering_buffers`, called at `gpu_model_runner.py` right before forward) | a per-step, host-controlled routing decision |
 | `SteeringManager` | `vllm/v1/worker/steering_manager.py`; `update_global_vectors()` / `register_config()` / `release_config()`, `_tables_dirty` → `populate_steering_tables()` | a complete in-process mutation API; no HTTP needed |
-| Global-spec capture | `CaptureManager.on_hook` (`vllm/v1/capture/manager.py:817-820`): fixed-shape `copy_` of the full `[num_tokens, hidden]` residual into a persistent buffer, **baked into CUDA graphs at warmup** | graph-safe, zero-eager-forcing observation of any fixed `(layer, hook)` set |
-| Client-spec capture | dynamic `index_select` (`manager.py:826-836`), forces eager via `CaptureStepGate` | why dynamic-steering monitors must *not* ride the client-spec path |
-| Dispatch pipeline | side-stream D2H → pinned CPU → dispatch thread → consumers (`manager.py:870+`, `1137+`) | per-step chunks reach a worker consumer ~ms after the forward |
-| Triton apply kernel | `steering_kernel.py:38-100`: one program per token, `row = index[pid]`, fused gather+cast+add | trivially extensible with scale multiplies |
+| Global-spec capture | `CaptureManager.on_hook` (`vllm/v1/capture/manager.py`): fixed-shape `copy_` of the full `[num_tokens, hidden]` residual into a persistent buffer, **baked into CUDA graphs at warmup** | graph-safe, zero-eager-forcing observation of any fixed `(layer, hook)` set |
+| Client-spec capture | dynamic `index_select` (`manager.py`), forces eager via `CaptureStepGate` | why dynamic-steering monitors must *not* ride the client-spec path |
+| Dispatch pipeline | side-stream D2H → pinned CPU → dispatch thread → consumers (`manager.py`, the dispatch/finalize paths) | per-step chunks reach a worker consumer ~ms after the forward |
+| Triton apply kernel | `steering_kernel.py`: one program per token, `row = index[pid]`, fused gather+cast+add | trivially extensible with scale multiplies |
 
 ## 3. Architecture: monitor → policy → actuate
 
@@ -183,7 +183,7 @@ decode-tier update through the queue, so it steers a subsequent request.
 
 **Timing** (one full loop):
 
-```
+```text
 step N    forward: graph-baked copy_ fills the monitor's persistent buffer
           post-forward: dispatch → (D2H, dispatch thread) → controller chunks
           controller: scores → policy → queue.submit(update)        [~ms after fwd]
@@ -233,7 +233,7 @@ class CaptureConsumer:
     execution: ClassVar[Literal["async", "sync"]] = "async"   # new
 ```
 
-|  | data delivery | thread | actuation latency | data form |
+| | data delivery | thread | actuation latency | data form |
 | --- | --- | --- | --- | --- |
 | `async` (today) | per-step chunks or finalize | dispatch/finalize thread | 1–3 steps via the action queue | CPU tensors, post-D2H |
 | `sync` (new) | per-step, immediately post-forward | model-runner step thread | exactly 1 step | GPU views of persistent capture buffers |
@@ -430,7 +430,7 @@ per-request), so it is cleanest on rows owned outright.
 Original sketch (superseded by the shared-buffer design above): add, per
 hook point, alongside each layer's table:
 
-```
+```text
 steering_scales_{hook}: float32[(max_configs + 3,)]   (persistent buffer)
 ```
 
@@ -597,6 +597,7 @@ read `conversation_id` off it at admission and stash it for the per-step
 view. Because it is pure host-side string metadata (no GPU work / D2H), it
 is surfaced identically on the v1 and v2 runners via
 `StepRequestView.conversation_id`.
+
 ### 5.7 Consumer-contract ABC and the controller base
 
 The sync-consumer contract — `on_step`, `global_capture_spec`, the fixed
@@ -650,7 +651,7 @@ was unsound. Verified facts:
   rank processes identical `register_config` sequences so row IDs agree,
   with no hot-path collectives (`steering_runtime.md`).
 - Capture consumers are constructed on **TP rank 0 only**
-  (`gpu_model_runner.py:571-572`); other ranks run the capture cold
+  (`gpu_model_runner.py`); other ranks run the capture cold
   path. So *any* consumer-originated steering mutation diverges TP
   ranks — there is no rank-replicated submitter to mirror it.
 
@@ -894,16 +895,16 @@ strides + warmup), `steering.py` (3 attr maps + dummy buffers +
 `resize_steering_row_monitor_buffers` + 15-arg op + eager per-row block),
 `steering_manager.py` (`_row_monitor` state + set/clear/has + populate +
 signature fold), `steering_action_queue.py` (targeting + validation),
-`steering_model_runner_mixin.py` (shared per-row apply branch + short-circuit
-+ transition deactivation + status; both runners drive it),
+`steering_model_runner_mixin.py` (shared per-row apply branch,
+short-circuit + transition deactivation + status; both runners drive it),
 `config/steering.py` (`enable_row_monitor`).
 
 **Wiring:** `vllm/model_executor/layers/steering_monitor_kernel.py`
 (Triton), `steering.py` (op + per-hook buffers + `apply_layer_steering`
 call + warmup), `steering_manager.py` (`set_monitor`/`clear_monitor`/
 `has_monitor` + populate writes the monitor buffers),
-`steering_model_runner_mixin.py` (short-circuit + transition deactivation
-+ `SteeringMonitorUpdate` dispatch + status + warmup),
+`steering_model_runner_mixin.py` (short-circuit, transition deactivation,
+`SteeringMonitorUpdate` dispatch, status, warmup),
 `steering_action_queue.py` (`SteeringMonitorUpdate` +
 `validate_steering_monitor`). The gemma4 taps are unchanged — the monitor
 rides the existing `apply_layer_steering` call at every hook.
@@ -1048,8 +1049,8 @@ gated by dev mode (`VLLM_SERVER_DEV_MODE`). Each register/unregister is
 **broadcast to every worker** via `engine.collective_rpc`
 (`register_steering_vector_name` / `unregister_steering_vector_name`, mirroring
 `/v1/steering/set`'s rank-replicated flow), so a `NamedVec` gate resolves
-worker-side; the frontend copy stays as the validating mirror (existence checks
-+ listing). Both sides store a sha256 content digest
+worker-side; the frontend copy stays as the validating mirror (existence
+checks and listing). Both sides store a sha256 content digest
 (`steering_vector_content_digest`) over the canonical packed serialization, so
 latch-by-reference digests match across the worker boundary. Registration stays
 dev-mode gated and, unlike the module registry / `/v1/steering/set`, is **not**
@@ -1159,7 +1160,7 @@ latched/bridged/evicted signal, and auto-registration of inline payloads
   pool mechanics + populate composition + indices-cache cycles;
   override apply/validate matrix incl. pool-exhaustion-keeps-prior;
   steering-index routing with admitted state untouched; cleanup hooks
-  + leak test; budget metric + bounded ring; status-RPC picklability;
+  and leak test; budget metric + bounded ring; status-RPC picklability;
   plugin policy/actuation/packed banks
   (`tests/v1/capture/test_sync_consumers.py`,
   `tests/v1/worker/test_sync_steering_integration.py`,
@@ -1277,7 +1278,7 @@ latched/bridged/evicted signal, and auto-registration of inline payloads
   `LLM` + a config-driven consumer; the two per-request paths use the
   within-run target-vs-control technique (robust to the batched-FP noise
   floor `NOISE_FLOOR=10`).
-  - **Row gating** (`test_steering_gating_e2e.py::test_row_gate_*`,
+    - **Row gating** (`test_steering_gating_e2e.py::test_row_gate_*`,
     `ConfigurableOverrideStub` mode `rowgate`): an override row plus a
     `gate_rows=True` monitor whose threshold is saturated (±1e6) to force
     the per-token gate fully on/off. Gate ON ⇒ the target's per-request
@@ -1285,13 +1286,13 @@ latched/bridged/evicted signal, and auto-registration of inline payloads
     suppressed (target tracks the control past the noise floor). Proves
     the in-graph monitor gates the **per-request row term**, not just the
     §5.4 tier, end to end.
-  - **req_id scale** (`..::test_req_id_scale_*`, mode `reqscale`): an
+    - **req_id scale** (`..::test_req_id_scale_*`, mode `reqscale`): an
     override row plus `SteeringScaleUpdate(req_id=, scale=0)` emitted in
     the same step (override first so the runner resolves the fresh
     `req_id → dyn_id`). `scale=0` suppresses exactly the target's row
     (≈control past the floor); the unscaled override diverges early.
     Proves the cheap per-request strength knob routes correctly.
-  - **Async transport** (`test_async_steering_e2e.py`, `AsyncTierExample`):
+    - **Async transport** (`test_async_steering_e2e.py`, `AsyncTierExample`):
     a global-tier `SteeringVectorUpdate` submitted through the action
     queue from `on_capture`. **Finding**: `on_capture` runs at request
     *finalize*, so the update never steers its own request — it steers a

@@ -24,6 +24,7 @@ append time (`_gen_steering_extra_hash_keys`). So per-block keying needs
 (never the retroactive `clear()` in `set_block_hash_steering_overrides`).
 
 Final mechanism:
+
 - **Signature (worker, `SteeringManager.effective_decode_signature`)**: a
   per-request `int` folding the admitted decode hash with the override-vec
   hash, the tier-vec hash + gain (no quantization), and the monitor-param
@@ -131,7 +132,7 @@ APC steering keys are **per-request-constant**: `decode_steering_config_hash`
 is a `cached_property` on `SamplingParams`, fixed at admission, and the
 block-hash path applies *one* decode hash uniformly to *all* of a
 request's decode blocks. `Request.set_block_hash_steering_overrides`
-(request.py:237) even `clear()`s and recomputes **all** block hashes when
+(request.py) even `clear()`s and recomputes **all** block hashes when
 the override changes.
 
 Dynamic steering changes **mid-stream**. If an override/tier/monitor
@@ -148,15 +149,15 @@ is the core change; the notification is necessary but not sufficient.
 ## 4. Existing substrate (anchors)
 
 - `Request.set_block_hash_steering_overrides(prefill, decode)` — overrides
-  the block-hash steering config and recomputes (request.py:237). Today
+  the block-hash steering config and recomputes (request.py). Today
   used only for the scheduler capacity-fallback case.
 - `Scheduler._set_request_block_hash_steering_overrides` — called per
-  running request each `schedule()` (scheduler.py:330, invoked at 660).
+  running request each `schedule()` (scheduler.py).
   The natural place to inject a dynamic decode signature.
 - `ModelRunnerOutput.capture_results` — precedent for worker→scheduler
   structured per-step data, consumed in `update_from_output`
-  (scheduler.py:1473). The notification rides the same channel.
-- `hash_steering_config(...)` (sampling_params.py:907/930 via the helper)
+  (scheduler.py). The notification rides the same channel.
+- `hash_steering_config(...)` (sampling_params.py, via the helper)
   — the deterministic effective-vector hasher to reuse for the signature.
 - Worker-side override state: `_req_dynamic_decode` (req_id→dyn_id),
   `_apply_request_override` / `_drop_request_dynamic_override`,
@@ -185,7 +186,7 @@ single-mutator contract holds — overrides remain worker-side routing).
 For a request in decode this step, the worker computes a deterministic
 `int` folding everything that shaped its decode KV:
 
-```
+```text
 sig = hash_steering_config(admitted_decode_effective_vectors)         # base
       ⊕ tier_signature        # hash(tier vectors) ⊕ quantized gain, or 0
       ⊕ override_signature     # hash(override vectors) for this req, or 0
@@ -331,7 +332,7 @@ loop — it does (caching happens during the next `schedule()`).
 
 - **Block-commit ordering** (§8) — the linchpin, and **non-trivial**:
   there are multiple `cache_blocks` paths (`kv_cache_manager`/coordinator,
-  the KV-connector remote paths at scheduler.py:2263/2273, and a separate
+  the KV-connector remote paths in scheduler.py, and a separate
   `async_scheduler.py` path). **Async scheduling is enabled by default** in
   the current build (observed in the engine boot log:
   "Asynchronous scheduling is enabled"), which decouples scheduling from
@@ -391,4 +392,3 @@ loop — it does (caching happens during the next `schedule()`).
 - `vllm/v1/core/kv_cache_utils.py` + `vllm/v1/request.py` — per-block
   decode steering signature (Strategy A); keep the admission-time path.
 - Tests as in §11.
-```
