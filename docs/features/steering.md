@@ -5,8 +5,22 @@ decoder layers during inference. It can be used to shift model behavior
 without fine-tuning, for example for tone/style changes, behavioral
 interventions, or SAE-derived steering vectors.
 
-This page is the user-facing guide to steering in vLLM. For internal
-runtime details, see [Steering Runtime Design](../design/steering_runtime.md).
+Alongside additive vectors, steering supports **directional clamps** that
+bound a feature's projection instead of shifting every token
+([below](#directional-clamps)).
+
+This page is the user-facing guide to *static* steering in vLLM — vectors and
+clamps a client or operator sets. For internal runtime details, see
+[Steering Runtime Design](../design/steering_runtime.md). Two neighboring
+pages cover the rest of the intervention stack:
+
+- [Dynamic Steering](../design/dynamic_steering.md) — activation-conditioned
+  steering (the model's own activations decide when/how much to steer), the
+  in-graph monitor, and the declarative per-request `when × scope × apply`
+  gates a client can attach to a request.
+- [Activation Patching](activation_patching.md) — overwrite/interpolate an
+  activation from a prior run at a `(layer, hook, position)` site, and the
+  `/v1/patch_sweep` causal-tracing endpoint.
 
 ## Supported Scope
 
@@ -53,15 +67,18 @@ Also supported:
 - Five hook points: `pre_attn`, `post_attn`, `post_block` (residual stream)
   plus `mlp_in`, `mlp_out` (MLP branch; wired on gemma3/gemma4 and the qwen3
   family)
+- Directional clamps on the same three tiers (see
+  [Directional Clamps](#directional-clamps))
 - Phase-aware scheduler admission for per-request steering
 - Prefix-cache separation for different prefill steering configs
 - Continuous batching
 - `torch.compile` and CUDA graph execution
-
-Not currently supported:
-
-- v2 model runner integration (dev-flag-gated in vllm main; steering
-  integration pending)
+- Both GPU model runners: the v1 runner and the v2 runner (the control plane
+  is shared via `SteeringModelRunnerMixin`; see
+  [Steering + Capture on the V2 Model Runner](../design/v2_runner_steering_capture.md))
+- Activation-conditioned (dynamic) steering, where the model's own activations
+  decide when and how much to steer — see
+  [Dynamic Steering](../design/dynamic_steering.md)
 
 ## Steering Model
 
@@ -685,7 +702,7 @@ as long as the model has been wired correctly.
 Steering is compatible with tensor and pipeline parallelism.
 
 | Configuration        | Supported | Notes                                                   |
-|----------------------|-----------|---------------------------------------------------------|
+| -------------------- | --------- | ------------------------------------------------------- |
 | `TP=1, PP=1`         | yes       | baseline                                                |
 | `TP>1, PP=1`         | yes       | vectors replicated on every TP rank                     |
 | `TP=1, PP>1`         | yes       | vectors sharded by layer ownership                      |
@@ -755,5 +772,10 @@ semantics (add vs. lerp vs. bound) differ by design.
 ## References
 
 - [Steering Runtime Design](../design/steering_runtime.md)
+- [Dynamic Steering](../design/dynamic_steering.md) — activation-conditioned
+  steering, the in-graph monitor, and declarative per-request gates
+- [Activation Patching](activation_patching.md)
+- [Capture Consumers](capture_consumers.md) — the tap side of the same hooks
+- [Steering + Capture on the V2 Model Runner](../design/v2_runner_steering_capture.md)
 - [Automatic Prefix Caching](automatic_prefix_caching.md)
 - [OpenAI-Compatible Server](../serving/openai_compatible_server.md)

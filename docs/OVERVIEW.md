@@ -80,9 +80,12 @@ Features Index:
     doc: docs/features/capture_consumers.md
   activation_steering:
     description: >
-      Per-request, per-token, CUDA-graph-safe additive intervention on the
-      residual stream (three tiers, five hook points).
-    entry_points: ["SamplingParams.steering_vectors", "--enable-steering"]
+      Per-request, per-token, CUDA-graph-safe intervention on the residual
+      stream (three tiers, five hook points): additive vectors, plus
+      directional clamps that bound a feature's projection along up to
+      max_clamp_directions unit directions per site and run after the add.
+    entry_points:
+      ["SamplingParams.steering_vectors", "SamplingParams.steering_clamps", "--enable-steering"]
     depends_on: [activation_capture]
     doc: docs/features/steering.md
   activation_patching:

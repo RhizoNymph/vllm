@@ -107,10 +107,18 @@ Each steerable layer owns a steering table per hook point. Conceptually:
 
 | Row | Meaning |
 | --- | --- |
-| 0 | no steering |
+| 0 | no steering (sentinel, always zeros) |
 | 1 | global effective prefill |
 | 2 | global effective decode |
-| 3+ | per-request rows |
+| `3 .. 3+C-1` | scheduler-admitted per-request config pool (`max_steering_configs`) |
+| `3+C .. 3+C+D-1` | dynamic-override pool (`max_dynamic_steering_configs`, runtime-allocated) |
+
+This row space is defined once, in
+`vllm/model_executor/layers/steering_table_layout.py` (`TableLayout`), and
+every buffer family that rides it — vector tables, per-row scales, row-monitor
+tables, clamp dirs/bounds/strength — must be sized congruently: kernels gather
+through the shared `steering_index`, so a mismatch fails as silent garbage
+rather than an error.
 
 All layers share the same token-to-row index for a step. Different hook
 points reuse the same row mapping but look up different per-hook tables.
@@ -354,12 +362,20 @@ To add steering to another model family, contributors need to wire:
 The extension work is model-specific, but the runtime invariants above do not
 change.
 
-## Current Boundaries
+## Scope Boundaries
 
-This design document reflects the v1 steering runtime. Known boundaries:
+This document describes the runner-agnostic steering runtime. What lives
+elsewhere:
 
-- no v2 model runner integration yet (v2 is dev-flag-gated in vllm; steering
-  integration is pending)
+- The control plane is shared by both GPU model runners
+  (`SteeringModelRunnerMixin`); each runner supplies only thin batch-state
+  accessors. See
+  [Steering + Capture on the V2 Model Runner](v2_runner_steering_capture.md)
+  for the v2 specifics and its validation matrix.
+- Activation-conditioned (dynamic) steering — the runtime tiers that mutate
+  steering state between steps, the dynamic-override row pool, and the
+  in-graph monitor — is specified separately in
+  [Dynamic Steering](dynamic_steering.md).
 - see [Activation Steering](../features/steering.md#supported-scope) for the
   current list of wired decoder architectures
 

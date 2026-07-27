@@ -31,6 +31,20 @@ The two modes compose: a single request can trigger a global consumer
 *and* a per-request consumer, and `RequestOutput.capture_results`
 returns a per-consumer result dict.
 
+Orthogonal to *what* triggers a consumer is *when* it runs:
+
+- **Async** (the default, `CaptureConsumer`): captured chunks are copied
+  device→host on a side stream and handed to the consumer on a dispatch
+  thread, off the critical path. Right for anything that writes to disk,
+  trains, or does I/O.
+- **Sync** (`SyncCaptureConsumer`): the consumer's `on_step` is called on
+  the step thread immediately after the forward, with a zero-copy
+  `StepCaptureView` over the GPU buffers, and may return steering actions
+  that apply before the next step. This is the substrate for
+  activation-conditioned steering — see
+  [Dynamic Steering](../design/dynamic_steering.md), which also covers the
+  `SteeringController` base class and the in-graph monitor.
+
 ### Hook points
 
 A `(layer, hook)` names where in the decoder layer an activation is read.
@@ -59,8 +73,20 @@ separately); `mlp_out` always captures the combined branch.
 
 ## Built-in Consumers
 
-vLLM ships two consumers, registered in its own `pyproject.toml` via
-the same entry-point group third-party plugins use.
+vLLM ships four consumers, registered in its own `pyproject.toml` via
+the same entry-point group third-party plugins use: `filesystem` and
+`logging` (below), plus two that back other features and are enabled for
+you rather than selected by hand —
+
+- `patch_source` — stores a clean run's activations for
+  [activation patching](activation_patching.md); auto-enabled by
+  `--enable-patching`.
+- `_declarative_steering` — maps a request's declarative
+  `when × scope × apply` steering gates onto the steering substrate.
+  Auto-registered whenever steering is on and
+  `--steering-config.enable_declarative_gates` is set (the default); it is a
+  sync consumer, so it is skipped under `pipeline_parallel_size > 1`. See
+  [Dynamic Steering](../design/dynamic_steering.md).
 
 ### `filesystem`
 
@@ -263,7 +289,7 @@ where overload grows memory without limit). When it fills,
 `--capture-overload-policy` decides what happens:
 
 | policy | behaviour | trade-off |
-|---|---|---|
+| --- | --- | --- |
 | `block` | stall the forward pass until the queue drains | no loss, bounded memory, serving slows |
 | `drop` | discard the step's captures (counted via `dropped_packets`) | serving never stalls; lossy |
 | `spill` *(default)* | serialize overflow to a local scratch dir and replay it, in order, when the queue drains | no loss, no stall, bounded RAM; uses local disk |
@@ -484,7 +510,12 @@ if result is not None and result.status == "ok":
   `"not_requested"`.
 - `error`: a human-readable message when `status != "ok"`.
 - `payload`: consumer-specific. Filesystem returns a `list[str]` of
-  written paths; other consumers return whatever they like.
+  written paths; other consumers return whatever they like. A request
+  that captured **more than one** `(layer, hook)` key gets the per-key
+  payloads merged into a dict keyed by
+  `(request_id, layer, hook)` — a single key passes its payload through
+  unchanged, as in the example above. `status` is the worst status across
+  keys, and `error` joins the per-key messages.
 
 On the OpenAI-compatible HTTP path, results are attached to the
 response body as `capture_results`, mirroring the structure above.

@@ -7,30 +7,45 @@
 </p>
 
 <h3 align="center">
-vLLM with activation steering and activation capture
+vLLM with activation steering, capture, and patching
 </h3>
 
 ---
 
 ## About This Fork
 
-This is a fork of [vLLM](https://github.com/vllm-project/vllm) that adds two
+This is a fork of [vLLM](https://github.com/vllm-project/vllm) that adds a set of
 interpretability subsystems wired directly into the model forward pass, built to
 the same production bar as the rest of the engine:
 
-- **Activation steering** — add precomputed vectors into the residual stream at
-  inference time to shift model behavior without fine-tuning (tone/style,
-  behavioral interventions, SAE-derived steering).
 - **Activation capture** — a pluggable consumer system that routes hidden-state
   activations out of the forward pass to disk, a training loop, a dashboard, or
   any third-party plugin. Ships with a built-in filesystem consumer.
+- **Activation steering** — add precomputed vectors into the residual stream at
+  inference time to shift model behavior without fine-tuning (tone/style,
+  behavioral interventions, SAE-derived steering), plus **directional clamps**
+  that bound a feature's projection (`h + strength·(clip(h·v̂, min, max) − h·v̂)·v̂`)
+  instead of shifting every token by the same amount.
+- **Activation patching** — overwrite or interpolate the activation at a
+  `(layer, hook, position)` site from a prior clean run, a named module, or a
+  client-supplied vector, plus a one-call `POST /v1/patch_sweep` that fans a
+  `(hooks × layers × positions)` causal-tracing grid through continuous batching.
+- **Dynamic steering** — the closed loop: the model's own activations decide
+  *when* and *how much* to steer, via async, sync, and in-graph controller tiers.
+  Clients can attach their own conditional steering declaratively
+  (`when × scope × apply` gates on the request) with no server-side consumer.
 
-Both hook the residual stream at three points — `pre_attn`, `post_attn`,
-`post_block` — across 100+ decoder architectures, and both run under continuous
-batching, `torch.compile`, CUDA graphs, and tensor/pipeline parallelism.
+They share one data plane — five hook points (`pre_attn`, `post_attn`,
+`post_block` on the carried residual across 100+ decoder architectures, plus
+`mlp_in`/`mlp_out` on the MLP branch for gemma3, gemma4, and the qwen3 family)
+— and all run under continuous batching, `torch.compile`, CUDA graphs, and
+tensor/pipeline parallelism.
 
-📖 **Full guides:** [Activation Steering](docs/features/steering.md) ·
-[Activation Capture](docs/features/capture_consumers.md)
+📖 **Full guides:** [Activation Capture](docs/features/capture_consumers.md) ·
+[Activation Steering](docs/features/steering.md) ·
+[Activation Patching](docs/features/activation_patching.md) ·
+[Dynamic Steering](docs/design/dynamic_steering.md) ·
+[subsystem index](docs/OVERVIEW.md)
 
 ## Design highlights
 
@@ -48,8 +63,10 @@ engineering:
 - **Prefix-cache correct.** Steering forks the APC cache key on prefill steering
   (but not decode-only steering, which must not fork prompt KV); capture
   re-forwards only the prompt suffix it needs when a tapped position was served
-  from cache. Steering correctness under APC is treated as a correctness
-  requirement, not a perf nicety.
+  from cache; dynamically-steered decode KV is notified so it isn't falsely
+  reused. Correctness under APC is treated as a correctness requirement, not a
+  perf nicety — and prefix caching is what makes patch sweeps fast, since each
+  cell recomputes only the suffix below its patch site.
 - **Distributed.** Global steering fans out to every worker via `collective_rpc`
   with lock-step row allocation and no hot-path coordination; capture merges
   per-stage results under pipeline parallelism. Both validated across TP, PP, and
@@ -58,6 +75,14 @@ engineering:
   plugins; the filesystem consumer offers `per_file` / `packed` / `sharded`
   layouts because on a network mount throughput is governed by file count
   (metadata RPCs), not bytes.
+- **One substrate, not four stacks.** Patching folds into the same persistent
+  buffers `register_steering_buffers` already attaches (so it works on every
+  steerable model with zero per-model changes) and sources its values from the
+  capture pipeline; clamps and the dynamic tier ride the same
+  persistent-buffer + opaque-op discipline. The in-graph monitor decides
+  *whether* to steer inside the replayed CUDA graph —
+  `sigmoid(sharpness · (residual · probe − threshold))` — so conditional
+  steering costs nothing over unconditional steering.
 
 ## Performance
 
@@ -72,7 +97,7 @@ Gemma-3-27B on A100 — 64–128 prompts, concurrency 8–16, `max_tokens=256`,
 vs. disabled baseline (TTFT 111 ms, TPOT 37.4 ms):
 
 | Mode | ΔTTFT | ΔTPOT | ΔE2E latency |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Enabled, no active configs | −6.6 ms | ±0.0% | −0.1% |
 | Named (pre-registered) vectors, all requests steered | +0.1 ms | +0.0% | +0.0% |
 | Inline shared vectors, all requests steered | +50.5 ms | +0.5% | +1.7% |
@@ -111,7 +136,7 @@ Fixed-clock A/B runs, Gemma-3 on RTX 3090s, NFS over a 20 GbE bond:
   not bytes — measured at 32 requests × 24 layers, fp32:
 
 | Layout | Files written | Throughput | Finalize p50 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `per_file` | 768 | 29 MB/s | 2.26 s |
 | `packed` | 32 | 142 MB/s | 469 ms |
 | `sharded` | 8 | 505 MB/s | 6.6 ms |
@@ -141,7 +166,7 @@ typically writes; "TL batched" is a hand-optimized baseline batching cells
 across positions, one forward per layer:
 
 | Prompt | Cells | TL naive | TL batched | `/v1/patch_sweep` | vs batched |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 5 tokens | 140 | 6.8 s | 1.46 s | **1.11 s** | 1.3× |
 | 40 tokens | 1,120 | 53.3 s | 2.55 s | **1.97 s** | 1.3× |
 | 204 tokens | 5,712 | ~10 min | 53.5 s | **24.0 s** | **2.2×** |
@@ -161,16 +186,15 @@ across positions, one forward per layer:
   produce the same recovered-heatmap argmax cell, and clean baselines agree to
   ~0.002 logprob on the short pair (−0.417 vs −0.419).
 
-### Dynamic steering (in-progress branch)
+### Dynamic steering
 
-The activation-conditioned steering stack (see Roadmap) is benchmarked on its
-own branch — 50-cell sweep, gemma-3-4b on an RTX 3090, CUDA graphs on, every
-cell verified at locked clocks (no thermal confound), single steered site.
-Overhead vs the same build with features off, essentially flat across batch
-1–32:
+The activation-conditioned steering stack — 50-cell sweep, gemma-3-4b on an
+RTX 3090, CUDA graphs on, every cell verified at locked clocks (no thermal
+confound), single steered site. Overhead vs the same build with features off,
+essentially flat across batch 1–32:
 
 | Configuration | Overhead (batch 1 → 32) |
-|---|---|
+| --- | --- |
 | Sync capture consumer (per-step GPU view) | +0.2–0.3% |
 | Global dynamic tier (sync-consumer driven) | ~+2% |
 | Global tier + in-graph monitor | ~+2% |
@@ -219,6 +243,23 @@ global and per-request level, supports named pre-registered modules, and exposes
 [steering guide](docs/features/steering.md) and the runnable
 [`examples/online_serving/openai_steering_client.py`](examples/online_serving/openai_steering_client.py).
 
+**Directional clamps** — bound a feature's expression instead of adding to it,
+on the same three tiers (`steering_clamps` / `prefill_steering_clamps` /
+`decode_steering_clamps`):
+
+```python
+params = SamplingParams(
+    max_tokens=64,
+    steering_clamps={"post_block": {20: [
+        {"vector": [...], "max": 4.0},            # cap the projection
+        {"vector": [...], "value": 0.0},          # directional ablation
+    ]}},
+)
+```
+
+Directions are unit-normalized server-side, tiers merge by concatenation, and
+clamps run after additive steering at each hook.
+
 **Capture** — enable a consumer, then opt requests in:
 
 ```bash
@@ -245,36 +286,77 @@ Consumers can be global (every request, e.g. a `logging` probe) or per-request
 tuning, backpressure policies, and the plugin-authoring path, plus example
 plugins under [`examples/capture_consumers/`](examples/capture_consumers/).
 
+**Patching / causal tracing** — start the server with `--enable-patching`
+(which implies the clean-run capture consumer), then sweep a whole grid in one
+call:
+
+```python
+from vllm.entrypoints.serve.patch.client import PatchStudy
+
+study = PatchStudy(model="google/gemma-3-4b-it")
+result = await study.sweep_layers_positions(
+    "The Colosseum is in the city of",
+    clean_prompt="The Eiffel Tower is in the city of",  # server auto-captures it
+    layers=range(0, 34, 4), positions="all_prompt",
+    answer_token=" Paris", metric="recovered", server_side=True,
+)
+print(result.argmax_cell())
+```
+
+Per-request patching is also a plain `SamplingParams.patch` field (a list of
+`{layer, hook, dest_position, source_run|source_module|source_inline, alpha}`
+entries). See the [patching guide](docs/features/activation_patching.md) and
+[`examples/online_serving/openai_patch_client.py`](examples/online_serving/openai_patch_client.py).
+
+**Dynamic steering** — a client can attach conditional steering to its own
+request as `when × scope × apply` gates (the `steering` field on
+`/v1/chat/completions` and `/v1/completions`), with no server-registered
+consumer:
+
+```json
+"steering": [{
+  "when": {"kind": "probe", "probe": {"kind": "name", "name": "refusal_probe"},
+           "threshold": 0.5},
+  "scope": "this_token",
+  "apply": {"kind": "add", "steer": {"kind": "name", "name": "calm"}, "strength": 1.0}
+}]
+```
+
+`probe × this_token` gates run in-graph (same forward pass); wider scopes
+(`next_step`, `rest_of_request`, `rest_of_conversation`) are host-latched.
+Operators can instead write a sync/async capture consumer that returns steering
+actions — see the [design doc](docs/design/dynamic_steering.md) and
+[`examples/capture_consumers/dynamic_steering_controller/`](examples/capture_consumers/dynamic_steering_controller/).
+
 ## Supported models
 
-Hooks are wired into the Llama, Qwen, Gemma, Mixtral/MoE, GLM, InternLM, Olmo,
-Exaone, Phi, Plamo, Step, Molmo, Falcon/Baichuan/Command/StableLM families and
-more — 100+ decoder architectures. Gemma 3 is the primary end-to-end test
-target; several MoE models are validated against real weights. See the full
-list in the [steering guide](docs/features/steering.md#supported-scope).
+Residual-stream hooks (`pre_attn`, `post_attn`, `post_block`) are wired into the
+Llama, Qwen, Gemma, Mixtral/MoE, GLM, InternLM, Olmo, Exaone, Phi, Plamo, Step,
+Molmo, Falcon/Baichuan/Command/StableLM families and more — 100+ decoder
+architectures. The MLP-branch hooks (`mlp_in`, `mlp_out`) are wired on gemma3,
+gemma4, and the qwen3 family (`qwen3`, `qwen3_moe`, `qwen3_next`/Qwen3.5); they
+are silent no-ops elsewhere. Gemma 3 is the primary end-to-end test target;
+several MoE models are validated against real weights, and patching is
+GPU-validated on Qwen3-0.6B and gemma3-4b across TP1/PP1, TP2/PP1, and TP1/PP2.
+See the full list in the
+[steering guide](docs/features/steering.md#supported-scope).
 
 ## Roadmap
 
 > In progress / planned; details **subject to change**.
 
-- **Dynamic steering** *(next; open draft [PR #180](https://github.com/RhizoNymph/vllm/pull/180))* —
-  activation-conditioned steering that ties capture to steering so the model's
-  own activations decide *when* and *how* to steer. A stack of three controller
-  tiers — async (steers a later request), sync (per-step, every TP rank), and an
-  in-graph monitor that gates a dynamic steering tier *within the same forward
-  pass* via `sigmoid(sharpness · (residual · probe − threshold))` — plus the
-  APC-correctness notification so dynamically-steered decode KV isn't falsely
-  reused. GPU-validated on gemma4-31B across TP=1, TP=2 (cross-node), and PP=2;
-  overhead measured under CUDA graphs — in-graph monitoring is free and
-  steering all layers costs ~1.5pp more than steering one
-  (see [Performance](#performance)).
-- **Activation patching at scale** *(after that)* — transplanting/overwriting
-  captured activations across runs as a first-class, high-throughput operation.
-  Direction marker; details not yet pinned down.
+- **SAE steering** *(open draft [PR #271](https://github.com/RhizoNymph/vllm/pull/271))* —
+  SAE-feature interventions on top of the clamp substrate: delta clamps and full
+  encode/decode reconstruction, so a feature can be pinned or ablated in SAE
+  space rather than by a single hand-picked direction.
+- **DeepSeek-V4 mHC targets** *(open [PR #181](https://github.com/RhizoNymph/vllm/pull/181))* —
+  capture and steering hook points for the mHC path.
+- **Live patching dashboard** *(open [PR #280](https://github.com/RhizoNymph/vllm/pull/280))* —
+  a Dash example that streams `/v1/patch_sweep` cells into a live heatmap.
 
 ## Upstream vLLM
 
-This README covers only the steering/capture additions. For installation,
+This README covers only the interpretability additions. For installation,
 supported-model details, the OpenAI-compatible server, quantization, distributed
 inference, and all other vLLM functionality, see the upstream project —
 installation is unchanged from upstream:
