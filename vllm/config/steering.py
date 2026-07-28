@@ -40,6 +40,11 @@ class SAEModuleTopology:
     activation: str
     """``SAEActivation`` value; baked into the graph per slot."""
     activation_params: dict[str, float] = field(default_factory=dict)
+    storage_dtype: str = "auto"
+    """Manifest ``storage_dtype``: ``"auto"`` (compute dtype) or
+    ``"fp8_e4m3"`` (fp8 weight tables + per-row fp32 scale buffers).
+    Buffer-dtype/graph-affecting, so it is part of the frozen
+    topology and the compute hash."""
 
 
 def is_steering_topology_frozen(vllm_config: "VllmConfig | None") -> bool:
@@ -77,6 +82,7 @@ def sae_topology_mismatch(
     n_clamp: int,
     activation: str,
     activation_params: dict[str, float],
+    storage_dtype: str = "auto",
 ) -> str | None:
     """Compare a declared topology against an incoming registration.
 
@@ -103,6 +109,8 @@ def sae_topology_mismatch(
             f"activation_params {dict(activation_params)} != declared "
             f"{topo.activation_params}"
         )
+    if storage_dtype != topo.storage_dtype:
+        return f"storage_dtype {storage_dtype!r} != declared {topo.storage_dtype!r}"
     return None
 
 

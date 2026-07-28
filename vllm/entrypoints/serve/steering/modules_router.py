@@ -78,6 +78,7 @@ def _check_frozen_sae_topology_frontend(
             n_clamp=len(manifest.clampable_features),
             activation=manifest.activation.value,
             activation_params=dict(manifest.activation_params),
+            storage_dtype=manifest.storage_dtype,
         )
         if mismatch is not None:
             raise ValueError(
@@ -85,6 +86,13 @@ def _check_frozen_sae_topology_frontend(
                 f"startup-declared topology: {mismatch}. {remedy}"
             )
         return
+    if manifest.storage_dtype != "auto":
+        raise ValueError(
+            f"Steering module {name!r} requests storage_dtype "
+            f"{manifest.storage_dtype!r}, but spare slots store weights "
+            "in compute dtype — fp8 modules must be declared at startup "
+            f"via --steering-modules. {remedy}"
+        )
     spare_sites = set(getattr(steering_config, "sae_spare_slot_sites", ()) or ())
     spare_features = int(getattr(steering_config, "sae_spare_slot_features", 0) or 0)
     per_site = int(getattr(steering_config, "sae_spare_slots_per_site", 1) or 1)
@@ -245,6 +253,7 @@ def _build_broadcast_payload_for_module(module: SteeringModule) -> dict:
             "clampable_features": list(manifest.clampable_features),
             "activation_params": dict(manifest.activation_params),
             "weights_uri": manifest.weights_uri,
+            "storage_dtype": manifest.storage_dtype,
         },
         "sae_weights": pack_sae_weights_for_broadcast(weights),
     }
@@ -401,6 +410,7 @@ async def register_steering_module(
                 clampable_features=clampable,
                 activation_params=dict(request.sae_manifest.activation_params),
                 weights_uri=request.sae_manifest.weights_uri,
+                storage_dtype=request.sae_manifest.storage_dtype,
             )
             # Validate shape/site invariants before touching checkpoint
             # files.  Registry.register repeats this check when it commits,
@@ -462,6 +472,7 @@ async def register_steering_module(
                     "clampable_features": list(manifest.clampable_features),
                     "activation_params": dict(manifest.activation_params),
                     "weights_uri": manifest.weights_uri,
+                    "storage_dtype": manifest.storage_dtype,
                 },
                 # Weights ride along with the manifest so the worker
                 # registers the module and attaches its encoder/decoder
