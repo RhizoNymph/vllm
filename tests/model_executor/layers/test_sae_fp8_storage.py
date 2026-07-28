@@ -53,6 +53,10 @@ from vllm.model_executor.layers.steering import SteeringHookPoint
 
 POST_BLOCK = SteeringHookPoint.POST_BLOCK
 
+cuda_required = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA for the Triton kernel"
+)
+
 # Error bounds for e4m3 round-to-nearest: 3 mantissa bits give a
 # relative half-ulp of 2^-4 for normal values; subnormal spacing is
 # 2^-9 in scaled units.
@@ -563,6 +567,70 @@ class TestFROpFp8Numerics:
                 torch.ones(2, dtype=torch.bool),
                 decoder_scale=s_dec,
             )
+
+    @cuda_required
+    def test_dense_kernel_fp8_matches_dequantized_eager(self):
+        # The dense masked Triton kernel's WEIGHTS_FP8 specialisation
+        # (uint8 view + bitwise decode + per-row scales) must match the
+        # eager body on explicitly dequantized weights.
+        from vllm.model_executor.layers.sae_full_reconstruction import (
+            _apply_sae_full_reconstruction_eager,
+        )
+        from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
+            apply_sae_full_recon_triton,
+        )
+
+        g = torch.Generator().manual_seed(11)
+        n_tokens, d_model, d_sae = 4, 48, 96
+        hidden = torch.randn(n_tokens, d_model, generator=g)
+        enc_w = torch.randn(d_sae, d_model, generator=g) * 0.1
+        enc_b = torch.randn(d_sae, generator=g) * 0.01
+        dec_w = torch.randn(d_sae, d_model, generator=g) * 0.1
+        dec_b = torch.randn(d_model, generator=g) * 0.01
+        threshold = torch.zeros(d_sae, dtype=torch.float32)
+        feats = torch.tensor([1, 5], dtype=torch.int64)
+        kind = torch.zeros(n_tokens, 2, dtype=torch.int8)
+        kind[:, 0] = 1
+        value = torch.full((n_tokens, 2), 3.0)
+        only = torch.zeros(n_tokens, 2, dtype=torch.bool)
+        mask = torch.tensor([True, False, True, True])
+
+        q_enc, s_enc = quantize_fp8_rowwise(enc_w)
+        q_dec, s_dec = quantize_fp8_rowwise(dec_w)
+        ref = _apply_sae_full_reconstruction_eager(
+            hidden,
+            dequantize_fp8_rowwise(q_enc, s_enc),
+            enc_b,
+            threshold,
+            dequantize_fp8_rowwise(q_dec, s_dec),
+            dec_b,
+            feats,
+            kind,
+            value,
+            only,
+            mask,
+            0,
+            0.0,
+        )
+        got = apply_sae_full_recon_triton(
+            hidden.cuda(),
+            q_enc.cuda(),
+            enc_b.cuda(),
+            threshold.cuda(),
+            q_dec.cuda(),
+            dec_b.cuda(),
+            feats.cuda(),
+            kind.cuda(),
+            value.cuda(),
+            only.cuda(),
+            mask.cuda(),
+            0,
+            0.0,
+            encoder_scale=s_enc.cuda(),
+            decoder_scale=s_dec.cuda(),
+        )
+        assert torch.allclose(got.cpu(), ref, atol=1e-4)
+        assert torch.equal(got.cpu()[1], hidden[1])
 
 
 class TestLayerDispatchFp8:

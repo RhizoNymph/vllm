@@ -39,11 +39,11 @@ Compared to the delta variant (:func:`apply_sae_delta`):
 
 The compute path dispatches via :func:`apply_sae_full_reconstruction_op`,
 registered as ``torch.ops.vllm.apply_sae_full_reconstruction`` so
-:mod:`torch.compile` treats the call as an opaque splitting point
+:mod:`torch.compile` treats the call as an opaque custom op
 (mirroring ``apply_steering`` and ``apply_sae_delta``).  CPU is
-served by the eager body; CUDA dispatches to the fused Triton
-kernel — wired in Stage 4.  Until then the CUDA path also routes to
-the eager body.
+served by the eager body; CUDA dispatches to the dense masked Triton
+kernel in :mod:`sae_full_reconstruction_kernel`, which is
+capture-safe and runs inside compiled / CUDA-graph-captured regions.
 
 Numeric dtype contract (matches ``docs/features/sae_steering.md``):
 
@@ -635,8 +635,8 @@ def apply_sae_full_reconstruction_op(
 ) -> torch.Tensor:
     """Tensor-only entry registered as ``torch.ops.vllm.apply_sae_full_reconstruction``.
 
-    On CUDA, will dispatch to the fused Triton kernel once Stage 4
-    lands; until then both CPU and CUDA route through
+    CUDA dispatches to the dense masked Triton kernel (capture-safe:
+    fixed shapes, no host sync); CPU routes through
     :func:`_apply_sae_full_reconstruction_eager`.  The output is
     always a freshly allocated tensor with the same shape and dtype
     as ``hidden_states``.
@@ -649,8 +649,8 @@ def apply_sae_full_reconstruction_op(
     without bespoke type adapters, mirroring the delta path.
     """
     if hidden_states.is_cuda:
-        # Stage-4 CUDA path: compaction-based per-token short-circuit.
-        # See :mod:`sae_full_reconstruction_kernel` for the rationale.
+        # Dense masked kernel: per-token gate on ``recon_mask``, no
+        # data-dependent shapes.  See :mod:`sae_full_reconstruction_kernel`.
         from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
             apply_sae_full_recon_triton,
         )
@@ -717,87 +717,6 @@ direct_register_custom_op(
     op_func=apply_sae_full_reconstruction_op,
     fake_impl=apply_sae_full_reconstruction_op_fake,
     mutates_args=[],
-    extra_dispatch_keys=("CPU",),
-)
-
-
-def apply_sae_full_reconstruction_out_op(
-    out: torch.Tensor,
-    hidden_states: torch.Tensor,
-    encoder_weight: torch.Tensor,
-    encoder_bias: torch.Tensor,
-    threshold: torch.Tensor,
-    decoder_weight: torch.Tensor,
-    decoder_bias: torch.Tensor,
-    clampable_features: torch.Tensor,
-    clamp_kind: torch.Tensor,
-    clamp_value: torch.Tensor,
-    clamp_only_if_active: torch.Tensor,
-    recon_mask: torch.Tensor,
-    activation_code: int,
-    activation_param: float,
-    encoder_scale: torch.Tensor | None = None,
-    decoder_scale: torch.Tensor | None = None,
-) -> None:
-    """Out-variant registered as ``torch.ops.vllm.apply_sae_full_reconstruction_out``.
-
-    The layer shim uses this variant (not the value-returning op)
-    because the FR CUDA path is data-dependent (``torch.nonzero``
-    compaction) and must run as a graph-*splitting* op, eagerly
-    between piecewise CUDA-graph segments.  Splitting ops must mutate
-    a caller-provided buffer — the surrounding captured pieces replay
-    against fixed addresses, so a fresh per-call return tensor would
-    leave the downstream piece reading the stale capture-time address.
-    Mirrors ``unified_attention_with_output``.
-    """
-    out.copy_(
-        apply_sae_full_reconstruction_op(
-            hidden_states,
-            encoder_weight,
-            encoder_bias,
-            threshold,
-            decoder_weight,
-            decoder_bias,
-            clampable_features,
-            clamp_kind,
-            clamp_value,
-            clamp_only_if_active,
-            recon_mask,
-            activation_code,
-            activation_param,
-            encoder_scale=encoder_scale,
-            decoder_scale=decoder_scale,
-        )
-    )
-
-
-def apply_sae_full_reconstruction_out_op_fake(
-    out: torch.Tensor,
-    hidden_states: torch.Tensor,
-    encoder_weight: torch.Tensor,
-    encoder_bias: torch.Tensor,
-    threshold: torch.Tensor,
-    decoder_weight: torch.Tensor,
-    decoder_bias: torch.Tensor,
-    clampable_features: torch.Tensor,
-    clamp_kind: torch.Tensor,
-    clamp_value: torch.Tensor,
-    clamp_only_if_active: torch.Tensor,
-    recon_mask: torch.Tensor,
-    activation_code: int,
-    activation_param: float,
-    encoder_scale: torch.Tensor | None = None,
-    decoder_scale: torch.Tensor | None = None,
-) -> None:
-    """FX-tracing fake — pure mutation, nothing to return."""
-    return None
-
-
-direct_register_custom_op(
-    op_name="apply_sae_full_reconstruction_out",
-    op_func=apply_sae_full_reconstruction_out_op,
-    fake_impl=apply_sae_full_reconstruction_out_op_fake,
-    mutates_args=["out"],
     extra_dispatch_keys=("CPU",),
 )
 
@@ -978,9 +897,9 @@ def apply_sae_full_reconstruction(
     # No token opted into full reconstruction: preserve value
     # semantics without paying the full encoder/decoder cost that
     # would just be discarded by the final ``where``.  CPU-only
-    # check; on CUDA, ``.item()`` would synchronize the stream and
-    # regress the common active-mask path — the CUDA kernel does its
-    # own per-token short-circuit via the compaction path.
+    # check; on CUDA, ``.item()`` would synchronize the stream (and
+    # be capture-illegal) — the dense masked kernel gates per token
+    # on its ``recon_mask`` scalar instead.
     if not recon_mask.is_cuda and not bool(torch.any(recon_mask).item()):
         return hidden_states.clone()
 
@@ -1031,9 +950,9 @@ def apply_layer_sae_full_reconstruction(
     by the shared ``sae_recon_index`` buffer), derives
     ``recon_mask`` from this site's active-row table so row 0 and
     rows owned by other modules are no-op sentinels, and dispatches to
-    ``torch.ops.vllm.apply_sae_full_reconstruction``.  The torch-op
-    indirection is what makes :mod:`torch.compile` treat the call as
-    an opaque splitting point.
+    ``torch.ops.vllm.apply_sae_full_reconstruction``.  The gathers and
+    the op are all fixed-shape device-side work, so the whole shim is
+    legal inside compiled / CUDA-graph-captured regions.
     """
     if not sae_full_recon_buffers_attached(module, hook_point):
         return hidden_states
@@ -1072,14 +991,7 @@ def apply_layer_sae_full_reconstruction(
 
     code = _ACTIVATION_TO_CODE[activation]
     param = _activation_to_scalar(activation, activation_params)
-    # Out-variant + caller-allocated output: the allocation is traced
-    # into the surrounding compiled piece (stable address across CUDA
-    # graph replays) while the data-dependent FR op itself runs eagerly
-    # as a splitting op writing into it.  See
-    # ``apply_sae_full_reconstruction_out_op``.
-    out = torch.empty_like(hidden_states)
-    torch.ops.vllm.apply_sae_full_reconstruction_out(
-        out,
+    return torch.ops.vllm.apply_sae_full_reconstruction(
         hidden_states,
         enc_w,
         enc_b,
@@ -1096,7 +1008,6 @@ def apply_layer_sae_full_reconstruction(
         encoder_scale=enc_scale,
         decoder_scale=dec_scale,
     )
-    return out
 
 
 def populate_sae_full_recon_clamp_table(
