@@ -1,7 +1,7 @@
 # SAE-Based Steering (Delta + Full Reconstruction)
 
 > **Status:** both variants shipped — delta (fused Triton kernel) and
-> full reconstruction (compaction-based CUDA path) — integrated with
+> full reconstruction (dense masked Triton kernel) — integrated with
 > the rebuilt steering framework (config-pool backpressure scheduler,
 > `_steering_register_request` runner lifecycle, `post_block` hook).
 > Companion to [`steering.md`](steering.md) and
@@ -62,8 +62,10 @@ are implemented:
    residual is discarded along with the SAE's reconstruction error.
    Cost: one full encoder GEMM and one full decoder GEMM per *opted-in*
    token at every hooked layer. Implemented as the full-reconstruction
-   kind; the compaction path restricts the GEMMs to the tokens whose
-   requests opted in, so uninvolved tokens pay nothing and keep zero
+   kind; the dense masked kernel launches over the whole padded batch
+   but gates per token, so FR cost is proportional to the active
+   tokens' work inside that dense launch — uninvolved tokens pay a
+   mask-scalar load plus a row copy-through and keep zero
    reconstruction error.
 
 2. **Delta / feature surgery** (most follow-up steering work,
@@ -355,10 +357,18 @@ no-reconstruction sentinel) and rows owned by *other* modules' sites
 are inactive here, so a shared `sae_recon_index` can never cause
 cross-module reconstruction. The CUDA path
 ([`sae_full_reconstruction_kernel.py`](../../vllm/model_executor/layers/sae_full_reconstruction_kernel.py),
-`apply_sae_full_recon_triton`) compacts active tokens into a dense
-subset, runs the full encoder/clamp/decoder math on that subset via
-cuBLAS-backed matmuls, and scatters the reconstructed rows back;
-inactive tokens keep their original residual bit-for-bit.
+`apply_sae_full_recon_triton`) is a dense masked Triton kernel, one
+program per token over the padded batch: each program loads its
+`recon_mask` scalar and either copies the residual row through
+(inactive — no `d_sae` work) or streams the full encoder / in-tile
+clamp / decoder math in feature tiles, accumulating in fp32. No
+`torch.nonzero`, no `.item()`, no data-dependent shapes — the op is
+capture-safe and runs *inside* compiled / CUDA-graph-captured
+regions, like the delta kernel. Inactive tokens keep their original
+residual bit-for-bit. TopK sites (global rank over all `d_sae`
+features, not expressible in a streaming per-token program) and clamp
+subsets past the kernel's `BLOCK_C` cap route to the dense eager body
+— equally capture-safe, but paying dense-batch cost.
 
 ## Row Layout and the Global Clamp Tier
 
@@ -452,9 +462,10 @@ Core implementation:
   populator `populate_sae_full_recon_clamp_table`, full-encoder
   helper `sae_encode_full`.
 - [`vllm/model_executor/layers/sae_full_reconstruction_kernel.py`](../../vllm/model_executor/layers/sae_full_reconstruction_kernel.py)
-  — compaction-based CUDA path `apply_sae_full_recon_triton` +
-  `warmup_apply_sae_full_recon_kernel` (cuBLAS-backed GEMMs on the
-  active-token subset; deliberately not a bespoke Triton GEMM).
+  — dense masked Triton FR kernel `apply_sae_full_recon_triton` +
+  `warmup_apply_sae_full_recon_kernel` (capture-safe per-token
+  mask gate; TopK / oversized clamp subsets fall back to the dense
+  eager body).
 - [`vllm/model_executor/layers/steering.py`](../../vllm/model_executor/layers/steering.py)
   — `SteeringHookPoint`, `VALID_HOOK_POINT_NAMES`, the SAE
   marker-attr dicts (`HOOK_POINT_SAE_CLAMP_KIND_ATTR`,
@@ -615,20 +626,16 @@ GEMMs per opted-in token per hooked layer).
   with matching topology. Eager engines keep fully dynamic
   registration. Idle declared sites cost one device-gated op launch
   per site per step (the kernel short-circuits on the gate before any
-  table gather). Two FR-specific consequences: the FR CUDA path
-  compacts active tokens with `torch.nonzero` (capture-illegal), so a
-  declared FR module registers
-  `vllm::apply_sae_full_reconstruction_out` as a graph-*splitting* op
-  — an out-variant mutating a caller-allocated buffer, like
-  `unified_attention_with_output` — that runs eagerly between
-  piecewise cudagraph segments, and full-graph capture modes downgrade
-  to `PIECEWISE` (logged at startup); `use_inductor_graph_partition`
-  is rejected with declared FR modules. The topology distiller reads
-  both module forms: safetensors dirs with `manifest.json` (Python
-  frontend) and `{kind, sae_manifest, sae_weights}` JSON files
-  (vllm-rs), so both frontends get pre-allocated buffers from the same
-  `--steering-modules` flag (vllm-rs re-emits it into the managed
-  engine's args).
+  table gather). The FR op is capture-safe like the delta op — the
+  dense masked kernel has no data-dependent shapes and no host sync —
+  so declared FR modules need no graph-splitting op, no cudagraph-mode
+  downgrade, and no `use_inductor_graph_partition` restriction: full
+  cudagraph modes are supported with FR declared. The topology
+  distiller reads both module forms: safetensors dirs with
+  `manifest.json` (Python frontend) and `{kind, sae_manifest,
+  sae_weights}` JSON files (vllm-rs), so both frontends get
+  pre-allocated buffers from the same `--steering-modules` flag
+  (vllm-rs re-emits it into the managed engine's args).
 - **At most one full-reconstruction SAE module per (layer, hook)
   site**; double-registration raises by design — two residual
   replacements on one site are semantically ill-defined. Delta
