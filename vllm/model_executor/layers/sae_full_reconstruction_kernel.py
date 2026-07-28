@@ -128,9 +128,7 @@ def apply_sae_full_recon_triton(
 
         idx_2d = clampable_features.unsqueeze(0).expand(n_active, -1)
         f_subset = f.gather(1, idx_2d)
-        active_flag = (
-            f_subset != 0.0 if activation_code == 2 else f_subset > 0.0
-        )
+        active_flag = f_subset != 0.0 if activation_code == 2 else f_subset > 0.0
         new_f_absolute = value_active
         new_f_additive = f_subset + value_active
         new_f = torch.where(
@@ -141,9 +139,7 @@ def apply_sae_full_recon_triton(
         apply_clamp = (kind_active != 0) & (~only_active | active_flag)
         new_f_subset = torch.where(apply_clamp, new_f, f_subset)
         if clamp_row_gated is not None and row_gate is not None:
-            gated_active = clamp_row_gated.index_select(0, active_idx).to(
-                torch.float32
-            )
+            gated_active = clamp_row_gated.index_select(0, active_idx).to(torch.float32)
             rgate_active = row_gate.index_select(0, active_idx).to(torch.float32)
             g = 1.0 - gated_active * (1.0 - rgate_active)
             new_f_subset = f_subset + g.unsqueeze(1) * (new_f_subset - f_subset)

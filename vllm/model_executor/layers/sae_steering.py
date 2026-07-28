@@ -810,9 +810,7 @@ def _apply_sae_delta_eager(
     delta = torch.where(apply_clamp, new_f - f, torch.zeros_like(f))
 
     if clamp_row_gated is not None and row_gate is not None:
-        g = 1.0 - clamp_row_gated.to(torch.float32) * (
-            1.0 - row_gate.to(torch.float32)
-        )
+        g = 1.0 - clamp_row_gated.to(torch.float32) * (1.0 - row_gate.to(torch.float32))
         delta = delta * g.unsqueeze(1)
 
     delta_compute = delta.to(hidden_states.dtype)
@@ -976,9 +974,7 @@ def apply_sae_delta_indexed_op(
     clamp_row_gated = (
         clamp_row_gated_table[idx] if clamp_row_gated_table is not None else None
     )
-    row_gate = (
-        steering_row_gate[:n_tokens] if steering_row_gate is not None else None
-    )
+    row_gate = steering_row_gate[:n_tokens] if steering_row_gate is not None else None
     return _apply_sae_delta_eager(
         hidden_states,
         encoder_weight,
@@ -1154,8 +1150,7 @@ def apply_sae_delta(
             continue
         if tuple(t.shape) != (n_tokens,):
             raise ValueError(
-                f"{name} must be (n_tokens,) = ({n_tokens},); "
-                f"got {tuple(t.shape)}."
+                f"{name} must be (n_tokens,) = ({n_tokens},); got {tuple(t.shape)}."
             )
         if t.dtype != torch.float32:
             raise ValueError(f"{name} must be torch.float32; got {t.dtype}.")

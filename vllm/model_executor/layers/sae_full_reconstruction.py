@@ -951,8 +951,7 @@ def apply_sae_full_reconstruction(
             continue
         if tuple(t.shape) != (n_tokens,):
             raise ValueError(
-                f"{name} must be (n_tokens,) = ({n_tokens},); "
-                f"got {tuple(t.shape)}."
+                f"{name} must be (n_tokens,) = ({n_tokens},); got {tuple(t.shape)}."
             )
         if t.dtype != torch.float32:
             raise ValueError(f"{name} must be torch.float32; got {t.dtype}.")

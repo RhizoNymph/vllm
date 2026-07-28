@@ -209,9 +209,7 @@ class TestWireRoundTrip:
         assert sp_out.sae_clamp_specs[0].gated is True
         assert sp_out.sae_full_reconstruction_specs[0].gated is True
         assert sp_out.sae_clamp_specs == sp_in.sae_clamp_specs
-        assert (
-            sp_out.prefill_steering_config_hash == sp_in.prefill_steering_config_hash
-        )
+        assert sp_out.prefill_steering_config_hash == sp_in.prefill_steering_config_hash
         assert sp_out.decode_steering_config_hash == sp_in.decode_steering_config_hash
 
     def test_gated_survives_collective_rpc_revive(self):

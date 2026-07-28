@@ -624,9 +624,7 @@ def apply_sae_delta_indexed_triton(
         fallback_idx = raw_idx.clamp(0, clamp_kind_table.shape[0] - 1)
         idx = torch.where(any_active.to(torch.bool).view(1), raw_idx, fallback_idx)
         clamp_row_gated = (
-            clamp_row_gated_table[idx]
-            if clamp_row_gated_table is not None
-            else None
+            clamp_row_gated_table[idx] if clamp_row_gated_table is not None else None
         )
         row_gate = (
             steering_row_gate[:n_tokens] if steering_row_gate is not None else None

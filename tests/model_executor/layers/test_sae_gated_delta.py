@@ -192,9 +192,7 @@ class TestGatedOpNumerics:
         out = self._delta_out(h, gated=torch.ones(4), row_gate=gates)
         base_delta = base - h
         out_delta = out - h
-        assert torch.allclose(
-            out_delta, gates.unsqueeze(1) * base_delta, atol=1e-6
-        )
+        assert torch.allclose(out_delta, gates.unsqueeze(1) * base_delta, atol=1e-6)
 
     def test_zero_row_gate_removes_clamp_entirely(self):
         h = torch.randn(2, 4)
@@ -219,9 +217,7 @@ class TestGatedLayerDispatch:
         _arm_slot(state, row=3)
         m.sae_index[:2] = 3
         if with_row_gate:
-            m.register_buffer(
-                "steering_row_gate", torch.ones(4, dtype=torch.float32)
-            )
+            m.register_buffer("steering_row_gate", torch.ones(4, dtype=torch.float32))
         return m
 
     def test_gated_row_scaled_by_shared_row_gate(self):

@@ -168,8 +168,7 @@ class SAEClampSpec:
             )
         if not isinstance(self.gated, bool):
             raise ValueError(
-                "SAEClampSpec.gated must be a bool, "
-                f"got {type(self.gated).__name__}."
+                f"SAEClampSpec.gated must be a bool, got {type(self.gated).__name__}."
             )
         if not isinstance(self.clamps, dict) or not self.clamps:
             raise ValueError(

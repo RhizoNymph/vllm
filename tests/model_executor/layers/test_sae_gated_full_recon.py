@@ -103,9 +103,7 @@ class TestGatedFrOpNumerics:
         # reconstructed (never equal to the raw residual).
         h = torch.randn(2, HIDDEN)
         kind, value, clamped, unclamped = self._clamped_unclamped(h)
-        out = _fr_out(
-            h, kind, value, gated=torch.ones(2), row_gate=torch.zeros(2)
-        )
+        out = _fr_out(h, kind, value, gated=torch.ones(2), row_gate=torch.zeros(2))
         assert torch.allclose(out, unclamped, atol=1e-5)
         assert not torch.allclose(out, h)
 
@@ -245,9 +243,7 @@ class TestFrGatedLayerDispatch:
         active_table[1] = True
         m.sae_recon_index[:2] = 1
         if with_row_gate:
-            m.register_buffer(
-                "steering_row_gate", torch.ones(8, dtype=torch.float32)
-            )
+            m.register_buffer("steering_row_gate", torch.ones(8, dtype=torch.float32))
         return m
 
     def test_gated_row_blends_by_row_gate(self):
