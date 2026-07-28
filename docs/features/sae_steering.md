@@ -124,6 +124,7 @@ class SAEModuleManifest:
     clampable_features: tuple[int, ...]       # row order for loaded weights
     activation_params: dict[str, float] = field(default_factory=dict)
     weights_uri: str | None = None
+    storage_dtype: str = "auto"               # "auto" | "fp8_e4m3"
 ```
 
 `kind="absolute"` means `f_i := value`; `kind="additive"` means
@@ -545,7 +546,62 @@ every existing hook site picks it up without per-model edits.
   `delta = clamp(f, target) − f`) promote to fp32 and cast back before
   the decoder add. TopK tie-breaks keep the lowest feature indices
   (deterministic), and `only_if_active` under TopK treats selected
-  negative features as active (`f != 0`).
+  negative features as active (`f != 0`). Modules with
+  `storage_dtype="fp8_e4m3"` additionally dequantize their weight
+  tables row-wise (`q.to(fp32) * scale[row]`) before this math — see
+  [fp8 Weight Storage](#fp8-weight-storage-storage_dtype).
+
+## fp8 Weight Storage (`storage_dtype`)
+
+A module may opt into storing its **large per-feature weight
+matrices** — the encoder-row and decoder-row tables for `sae_delta`,
+the full `W_enc` / `W_dec` for `sae_full_reconstruction` — as
+`torch.float8_e4m3fn` with per-row (per-feature) fp32 scales, by
+setting the manifest field `storage_dtype: "fp8_e4m3"` (`"auto"`, the
+default, keeps the engine's compute dtype).  Biases, JumpReLU
+thresholds, clamp tables, and index buffers keep their standard
+dtypes.  Unknown values fail registration loudly, on every surface
+(manifest.json, `sae_manifest` payloads, the vllm-rs JSON module
+form, and the HTTP register endpoint).
+
+- **Memory.** fp8 halves the weight tables versus bf16.  A
+  full-reconstruction Gemma-Scope-sized module
+  (`d_sae=16384 × d_model=2304`, W_enc + W_dec) drops from ~151 MB
+  (bf16) to ~76 MB; a 65k × 4k pair drops from ~2.1 GB to ~1.07 GB.
+  The scale buffers add `2 × n_rows × 4` bytes (≤ 512 KB at
+  `d_sae=65536`) — always present per fp8 module.
+- **Scheme.** Quantization happens **worker-side at attach time**
+  (`attach_sae_weights` / `attach_sae_full_recon_weights`); weights
+  travel over the wire as bf16/fp32 exactly as before.  Per row:
+  `scale = max(amax(|row|) / 448, tiny)` (448 = e4m3 finite max; the
+  clamp keeps zero rows dequantizing to exact zero with no division
+  hazard), values stored as `float8_e4m3fn` after clamping to ±448
+  (torch's e4m3 cast does not saturate).  Dequantization everywhere
+  is `q.to(fp32) * scale[row]`: the Triton delta kernels load the fp8
+  block, convert to fp32, and multiply by the row scale under a
+  `WEIGHTS_FP8` constexpr specialisation; the FR CUDA path and the
+  CPU fallbacks dequantize with plain torch before the existing math.
+  Slot refresh re-quantizes; deactivation zeroes the scale buffers
+  alongside the weights (zero q × zero scale = exact zero).
+- **Accuracy caveat.** e4m3 has 3 mantissa bits: elementwise relative
+  error up to ~6% (half-ulp 2^-4) against the bf16/fp32 source, with
+  the per-row scale keeping error proportional to each feature's own
+  magnitude.  Encoder pre-activations and decoder directions inherit
+  that error, so clamp semantics are preserved but exact numerical
+  parity with `"auto"` storage is not — treat fp8 as a
+  memory/fidelity trade-off and validate steering strength per
+  module.
+- **Spare slots are excluded.** Spares are allocated at compute dtype;
+  an undeclared fp8 module cannot claim them and is rejected with a
+  message stating fp8 modules must be declared at startup
+  (`--steering-modules`).
+- **Frozen topology.** `storage_dtype` determines buffer dtypes baked
+  into the compiled graph, so it is part of `SAEModuleTopology`, the
+  `SteeringConfig` compute hash, and `sae_topology_mismatch`:
+  re-registering a declared module with a different `storage_dtype`
+  is a clean 400 (frontend) / `SteeringVectorError` (worker), and the
+  slot-level `allow_reuse` check backstops with a storage-dtype
+  comparison.
 
 ## Encoder Footprint
 
