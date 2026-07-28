@@ -45,12 +45,14 @@ class SAEClampSpec(msgspec.Struct):
     module_name: str
     clamps: dict[str, dict[int, list[SAEClampEntry]]]
     phase: str = "both"
+    gated: bool = False
 
 
 class SAEFullReconstructionSpec(msgspec.Struct):
     module_name: str
     clamps: dict[str, dict[int, list[SAEClampEntry]]] = {}
     phase: str = "both"
+    gated: bool = False
 
 
 # Mirror of real SamplingParams; omit_defaults makes fixtures match real maps.
@@ -420,6 +422,7 @@ sae_request = EngineCoreRequest(
                     }
                 },
                 phase="decode",
+                gated=True,
             )
         ],
         sae_full_reconstruction_specs=[SAEFullReconstructionSpec(module_name="fr_mod")],

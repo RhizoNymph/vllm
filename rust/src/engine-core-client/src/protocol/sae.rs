@@ -73,6 +73,11 @@ pub struct SaeClampSpec {
     /// Phase tier the clamps apply to.
     #[serde(default)]
     pub phase: SaePhase,
+    /// Opt the spec's clamp rows into the shared in-graph monitor row
+    /// gate (decode-only; prefill rows are never gated). Skipped on the
+    /// wire when `false` so ungated specs keep the legacy encoding.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub gated: bool,
 }
 
 /// Per-request directive for the SAE full-reconstruction path (residual
@@ -89,6 +94,11 @@ pub struct SaeFullReconstructionSpec {
     /// Phase tier the reconstruction applies to.
     #[serde(default)]
     pub phase: SaePhase,
+    /// Opt the spec's clamp rows into the shared in-graph monitor row
+    /// gate; the reconstruction itself is never gated. Skipped on the
+    /// wire when `false` so ungated specs keep the legacy encoding.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub gated: bool,
 }
 
 /// Layer-map key that tolerates every inbound key encoding while always
