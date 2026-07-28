@@ -71,6 +71,10 @@ from torch import nn
 
 from vllm.config.sae_steering_types import SAEActivation
 from vllm.model_executor.layers.intervention_common import hook_attrs
+from vllm.model_executor.layers.sae_fp8 import (
+    FP8_STORAGE_DTYPE,
+    maybe_dequantize_rowwise,
+)
 from vllm.model_executor.layers.sae_steering import (
     _ACTIVATION_TO_CODE,
     _CODE_TO_ACTIVATION,
@@ -106,6 +110,12 @@ HOOK_POINT_FR_DECODER_BIAS_ATTR = hook_attrs("sae_fr_decoder_bias", _FR_HOOKS)
 # axis.  Registered for every site (zero-filled for ReLU/TopK) so the
 # op arity stays fixed across activations.
 HOOK_POINT_FR_THRESHOLD_ATTR = hook_attrs("sae_fr_threshold", _FR_HOOKS)
+# Per-row fp32 dequantization scales for fp8-stored W_enc / W_dec
+# (``storage_dtype="fp8_e4m3"``), ``(d_sae,)`` each.  Registered for
+# every site — zero-filled and never read for compute-dtype sites — so
+# the op arity stays fixed across storage dtypes.
+HOOK_POINT_FR_ENCODER_SCALE_ATTR = hook_attrs("sae_fr_encoder_scale", _FR_HOOKS)
+HOOK_POINT_FR_DECODER_SCALE_ATTR = hook_attrs("sae_fr_decoder_scale", _FR_HOOKS)
 # Per-row clamp tables: row ``r`` carries the clamp state for tokens
 # whose ``sae_recon_index`` selects ``r``.  Row 0 is reserved as the
 # "no reconstruction" sentinel — a token that maps to row 0 passes
@@ -134,6 +144,8 @@ _FR_BUFFER_ATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
     HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
     HOOK_POINT_FR_ENCODER_BIAS_ATTR,
     HOOK_POINT_FR_THRESHOLD_ATTR,
+    HOOK_POINT_FR_ENCODER_SCALE_ATTR,
+    HOOK_POINT_FR_DECODER_SCALE_ATTR,
     HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
     HOOK_POINT_FR_DECODER_BIAS_ATTR,
     HOOK_POINT_FR_CLAMP_KIND_ATTR,
@@ -160,13 +172,14 @@ def _fr_reuse_mismatch(
     n_clamp: int,
     hidden_size: int,
     n_rows: int,
+    weight_dtype: torch.dtype | None = None,
 ) -> str | None:
     """Why this site's existing FR buffers can't serve a registration.
 
     Returns ``None`` when the site's owner, trace-time activation
-    constants, and buffer shapes match the incoming registration
-    exactly, i.e. an in-place zero-and-refill is behaviourally
-    equivalent to a fresh registration.
+    constants, buffer shapes, and weight storage dtype match the
+    incoming registration exactly, i.e. an in-place zero-and-refill is
+    behaviourally equivalent to a fresh registration.
     """
     owner = getattr(module, HOOK_POINT_FR_MODULE_NAME_ATTR[hook_point], None)
     if owner != module_name:
@@ -185,6 +198,8 @@ def _fr_reuse_mismatch(
             f"activation_params {dict(activation_params)} != existing {existing_params}"
         )
     encoder = getattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
+    if weight_dtype is not None and encoder.dtype != weight_dtype:
+        return f"storage dtype {weight_dtype} != existing {encoder.dtype}"
     if tuple(encoder.shape) != (d_sae, hidden_size):
         return (
             f"weight shape ({d_sae}, {hidden_size}) != existing {tuple(encoder.shape)}"
@@ -213,6 +228,7 @@ def register_sae_full_recon_buffers(
     dtype: torch.dtype,
     device: torch.device | None = None,
     allow_reuse: bool = False,
+    storage_dtype: torch.dtype | None = None,
 ) -> None:
     """Attach full-reconstruction SAE buffers for one ``(layer, hook)`` site.
 
@@ -254,9 +270,14 @@ def register_sae_full_recon_buffers(
         device: device for runtime buffers. Runtime registrations happen
             after layers may have moved to their worker device, so callers
             should pass the device of an existing layer buffer.
+        storage_dtype: optional storage dtype override for W_enc / W_dec
+            (``torch.float8_e4m3fn`` for ``storage_dtype="fp8_e4m3"``
+            manifests).  ``None`` stores them in ``dtype``.  Biases,
+            thresholds, and clamp tables keep their standard dtypes.
     """
     if max_recon_configs == 0:
         return
+    weight_dtype = storage_dtype if storage_dtype is not None else dtype
     if d_sae <= 0:
         raise ValueError(f"d_sae must be positive; got {d_sae}.")
     if n_clamp < 0:
@@ -287,6 +308,7 @@ def register_sae_full_recon_buffers(
                 n_clamp=n_clamp,
                 hidden_size=hidden_size,
                 n_rows=n_rows,
+                weight_dtype=weight_dtype,
             )
             if mismatch is None:
                 for table in _FR_BUFFER_ATTR_TABLES:
@@ -313,7 +335,7 @@ def register_sae_full_recon_buffers(
         )
     module.register_buffer(
         enc_w_attr,
-        torch.zeros(d_sae, hidden_size, dtype=dtype, device=device),
+        torch.zeros(d_sae, hidden_size, dtype=weight_dtype, device=device),
         persistent=False,
     )
     module.register_buffer(
@@ -329,9 +351,21 @@ def register_sae_full_recon_buffers(
         torch.zeros(d_sae, dtype=torch.float32, device=device),
         persistent=False,
     )
+    # Per-row fp8 dequantization scales.  Always registered (zero-
+    # filled, never read for compute-dtype sites) so the op call keeps
+    # a fixed argument set.
+    for scale_attr in (
+        HOOK_POINT_FR_ENCODER_SCALE_ATTR[hook_point],
+        HOOK_POINT_FR_DECODER_SCALE_ATTR[hook_point],
+    ):
+        module.register_buffer(
+            scale_attr,
+            torch.zeros(d_sae, dtype=torch.float32, device=device),
+            persistent=False,
+        )
     module.register_buffer(
         HOOK_POINT_FR_DECODER_WEIGHT_ATTR[hook_point],
-        torch.zeros(d_sae, hidden_size, dtype=dtype, device=device),
+        torch.zeros(d_sae, hidden_size, dtype=weight_dtype, device=device),
         persistent=False,
     )
     module.register_buffer(
@@ -521,6 +555,8 @@ def _apply_sae_full_reconstruction_eager(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized PyTorch eager body for the full-reconstruction op.
 
@@ -529,7 +565,8 @@ def _apply_sae_full_reconstruction_eager(
     (the activation enum is encoded as ``activation_code`` /
     ``activation_param`` for the registered torch op; JumpReLU's
     per-feature thresholds ride the ``(d_sae,)`` ``threshold``
-    tensor, ignored otherwise).
+    tensor, ignored otherwise).  fp8-stored W_enc / W_dec are
+    dequantized up front with their per-row scales.
     """
     n_tokens = hidden_states.shape[0]
     n_clamp = clampable_features.shape[0]
@@ -538,6 +575,9 @@ def _apply_sae_full_reconstruction_eager(
 
     activation = _CODE_TO_ACTIVATION[int(activation_code)]
     activation_params = _scalar_to_activation_params(activation, activation_param)
+
+    encoder_weight = maybe_dequantize_rowwise(encoder_weight, encoder_scale)
+    decoder_weight = maybe_dequantize_rowwise(decoder_weight, decoder_scale)
 
     f = sae_encode_full(
         hidden_states,
@@ -590,6 +630,8 @@ def apply_sae_full_reconstruction_op(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Tensor-only entry registered as ``torch.ops.vllm.apply_sae_full_reconstruction``.
 
@@ -627,6 +669,8 @@ def apply_sae_full_reconstruction_op(
             recon_mask,
             int(activation_code),
             float(activation_param),
+            encoder_scale=encoder_scale,
+            decoder_scale=decoder_scale,
         )
     return _apply_sae_full_reconstruction_eager(
         hidden_states,
@@ -642,6 +686,8 @@ def apply_sae_full_reconstruction_op(
         recon_mask,
         int(activation_code),
         float(activation_param),
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -659,6 +705,8 @@ def apply_sae_full_reconstruction_op_fake(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)
@@ -687,6 +735,8 @@ def apply_sae_full_reconstruction(
     clamp_only_if_active: torch.Tensor,
     recon_mask: torch.Tensor,
     threshold: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Public Python API for the SAE full-reconstruction op.
 
@@ -718,6 +768,10 @@ def apply_sae_full_reconstruction(
             Required for JumpReLU; for ReLU/TopK a zero-filled vector
             is synthesized when omitted (the op reads it only under
             the JumpReLU branch).
+        encoder_scale: ``(d_sae,)`` fp32 per-row dequantization
+            scales; required when ``encoder_weight`` is fp8-stored
+            (``torch.float8_e4m3fn``), ignored otherwise.
+        decoder_scale: same, for ``decoder_weight``.
 
     Returns:
         ``(n_tokens, d_model)`` tensor in the same dtype as
@@ -807,6 +861,24 @@ def apply_sae_full_reconstruction(
             )
         if threshold.dtype != torch.float32:
             raise ValueError(f"threshold must be torch.float32; got {threshold.dtype}.")
+    for scale_name, weight, scale in (
+        ("encoder_scale", encoder_weight, encoder_scale),
+        ("decoder_scale", decoder_weight, decoder_scale),
+    ):
+        if weight.dtype == FP8_STORAGE_DTYPE and scale is None:
+            raise ValueError(
+                f"fp8-stored weights require a per-row {scale_name} tensor."
+            )
+        if scale is not None:
+            if tuple(scale.shape) != (d_sae,):
+                raise ValueError(
+                    f"{scale_name} must be (d_sae,) = ({d_sae},); "
+                    f"got {tuple(scale.shape)}."
+                )
+            if scale.dtype != torch.float32:
+                raise ValueError(
+                    f"{scale_name} must be torch.float32; got {scale.dtype}."
+                )
 
     if n_clamp > 0 and not clampable_features.is_cuda:
         min_feature = int(clampable_features.min().item())
@@ -852,6 +924,8 @@ def apply_sae_full_reconstruction(
         recon_mask,
         code,
         param,
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -893,6 +967,8 @@ def apply_layer_sae_full_reconstruction(
     enc_w = getattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
     enc_b = getattr(module, HOOK_POINT_FR_ENCODER_BIAS_ATTR[hook_point])
     threshold = getattr(module, HOOK_POINT_FR_THRESHOLD_ATTR[hook_point])
+    enc_scale = getattr(module, HOOK_POINT_FR_ENCODER_SCALE_ATTR[hook_point])
+    dec_scale = getattr(module, HOOK_POINT_FR_DECODER_SCALE_ATTR[hook_point])
     dec_w = getattr(module, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[hook_point])
     dec_b = getattr(module, HOOK_POINT_FR_DECODER_BIAS_ATTR[hook_point])
     kind_table = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
@@ -929,6 +1005,8 @@ def apply_layer_sae_full_reconstruction(
         recon_mask,
         code,
         param,
+        encoder_scale=enc_scale,
+        decoder_scale=dec_scale,
     )
 
 
@@ -1072,8 +1150,10 @@ __all__ = [
     "HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR",
     "HOOK_POINT_FR_CLAMP_VALUE_ATTR",
     "HOOK_POINT_FR_DECODER_BIAS_ATTR",
+    "HOOK_POINT_FR_DECODER_SCALE_ATTR",
     "HOOK_POINT_FR_DECODER_WEIGHT_ATTR",
     "HOOK_POINT_FR_ENCODER_BIAS_ATTR",
+    "HOOK_POINT_FR_ENCODER_SCALE_ATTR",
     "HOOK_POINT_FR_ENCODER_WEIGHT_ATTR",
     "HOOK_POINT_FR_MODULE_NAME_ATTR",
     "HOOK_POINT_FR_ROW_ACTIVE_ATTR",

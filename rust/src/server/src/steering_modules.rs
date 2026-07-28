@@ -86,7 +86,17 @@ pub struct SaeManifest {
     /// frontend (weights always travel inline as `sae_weights`).
     #[serde(default)]
     pub weights_uri: Option<String>,
+    /// Weight-table storage dtype: `"auto"` (engine compute dtype, the
+    /// default when absent) or `"fp8_e4m3"` (fp8 with per-row fp32
+    /// scales, quantized worker-side at attach time). Absent values
+    /// stay absent on the wire so the Python decoder applies its own
+    /// default.
+    #[serde(default)]
+    pub storage_dtype: Option<String>,
 }
+
+/// `storage_dtype` values the Python worker accepts.
+const VALID_SAE_STORAGE_DTYPES: &[&str] = &["auto", "fp8_e4m3"];
 
 /// One tensor in the wire-safe packed form: base64-encoded little-endian
 /// bytes plus dtype/shape metadata. Torch tensors do not survive the
@@ -258,6 +268,16 @@ pub fn parse_module(
         if hook.is_empty() {
             return Err(SteeringModuleLoadError::SaeManifest {
                 message: format!("layers entry [{layer}, ...] has an empty hook name"),
+            });
+        }
+    }
+    if let Some(storage_dtype) = &manifest.storage_dtype {
+        if !VALID_SAE_STORAGE_DTYPES.contains(&storage_dtype.as_str()) {
+            return Err(SteeringModuleLoadError::SaeManifest {
+                message: format!(
+                    "unknown storage_dtype `{storage_dtype}` (expected one of {:?})",
+                    VALID_SAE_STORAGE_DTYPES
+                ),
             });
         }
     }
@@ -906,6 +926,52 @@ mod tests {
             matches!(&err, SteeringModuleLoadError::SaeWeights { site, .. }
                 if site == "post_block"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_dtype_round_trips_into_broadcast() {
+        let mut value: Value = serde_json::from_str(&sae_delta_module_json()).unwrap();
+        value["sae_manifest"]["storage_dtype"] = Value::from("fp8_e4m3");
+        let module = parse_module(value.as_object().unwrap()).expect("parse");
+        assert_eq!(
+            module.sae_manifest.as_ref().unwrap().storage_dtype.as_deref(),
+            Some("fp8_e4m3")
+        );
+        let json = serde_json::to_value(&module).expect("serialize");
+        assert_eq!(json["sae_manifest"]["storage_dtype"], "fp8_e4m3");
+    }
+
+    #[test]
+    fn absent_storage_dtype_is_omitted_from_broadcast() {
+        let file = write_temp(&sae_delta_module_json());
+        let module = load_steering_module(file.path().to_str().unwrap()).expect("load");
+        assert!(module.sae_manifest.as_ref().unwrap().storage_dtype.is_none());
+        let json = serde_json::to_value(&module).expect("serialize");
+        // Absent on the wire so Python's decoder applies its "auto" default.
+        assert!(json["sae_manifest"].get("storage_dtype").is_none());
+    }
+
+    #[test]
+    fn unknown_storage_dtype_is_rejected() {
+        let mut value: Value = serde_json::from_str(&sae_delta_module_json()).unwrap();
+        value["sae_manifest"]["storage_dtype"] = Value::from("fp4");
+        let err = parse_module(value.as_object().unwrap()).unwrap_err();
+        assert!(
+            matches!(&err, SteeringModuleLoadError::SaeManifest { message }
+                if message.contains("storage_dtype")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_auto_storage_dtype_is_accepted() {
+        let mut value: Value = serde_json::from_str(&sae_delta_module_json()).unwrap();
+        value["sae_manifest"]["storage_dtype"] = Value::from("auto");
+        let module = parse_module(value.as_object().unwrap()).expect("parse");
+        assert_eq!(
+            module.sae_manifest.as_ref().unwrap().storage_dtype.as_deref(),
+            Some("auto")
         );
     }
 

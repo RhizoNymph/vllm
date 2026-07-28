@@ -44,6 +44,31 @@ SAEClampPhase = Literal["both", "prefill", "decode"]
 ``steering_vectors`` / ``prefill_steering_vectors`` /
 ``decode_steering_vectors`` triplet."""
 
+SAE_STORAGE_DTYPE_AUTO = "auto"
+"""Manifest ``storage_dtype`` value: store weight tables in the
+engine's compute dtype (the historical behaviour, and the default)."""
+
+SAE_STORAGE_DTYPE_FP8_E4M3 = "fp8_e4m3"
+"""Manifest ``storage_dtype`` value: store the large per-feature
+weight matrices as ``torch.float8_e4m3fn`` with per-row fp32 scales,
+halving their GPU memory versus bf16.  Weights still travel over the
+wire as bf16/fp32; quantization happens worker-side at attach time."""
+
+VALID_SAE_STORAGE_DTYPES: tuple[str, ...] = (
+    SAE_STORAGE_DTYPE_AUTO,
+    SAE_STORAGE_DTYPE_FP8_E4M3,
+)
+
+
+def validate_sae_storage_dtype(value: Any, *, prefix: str) -> str:
+    """Validate a manifest ``storage_dtype`` value, failing loudly."""
+    if not isinstance(value, str) or value not in VALID_SAE_STORAGE_DTYPES:
+        raise ValueError(
+            f"{prefix}: storage_dtype must be one of "
+            f"{list(VALID_SAE_STORAGE_DTYPES)}, got {value!r}."
+        )
+    return value
+
 
 class SteeringModuleKind(str, Enum):
     """Discriminator on entries in the named steering-module registry.

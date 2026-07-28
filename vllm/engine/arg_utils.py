@@ -541,6 +541,7 @@ def _build_sae_module_topology(
                 n_clamp=n_clamp,
                 activation=manifest.activation.value,
                 activation_params=dict(manifest.activation_params),
+                storage_dtype=manifest.storage_dtype,
             )
         )
     return topologies
