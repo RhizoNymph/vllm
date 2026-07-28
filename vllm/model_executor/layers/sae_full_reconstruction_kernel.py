@@ -48,6 +48,10 @@ from vllm.model_executor.layers.intervention_kernel_common import run_kernel_war
 from vllm.model_executor.layers.sae_steering import (
     ACTIVATION_CODE_TOPK,
 )
+from vllm.model_executor.layers.sae_steering_kernel import (
+    _decode_fp8_e4m3,
+    _resolve_fp8_scales,
+)
 from vllm.triton_utils import tl, triton
 
 # Feature-axis tile width.  Together with ``BLOCK_H`` this bounds the
@@ -73,6 +77,8 @@ def _apply_sae_full_recon_kernel(
     threshold_ptr,
     dec_w_ptr,
     dec_b_ptr,
+    enc_scale_ptr,
+    dec_scale_ptr,
     feat_ptr,
     kind_ptr,
     value_ptr,
@@ -94,6 +100,8 @@ def _apply_sae_full_recon_kernel(
     dec_stride_s,
     dec_stride_h,
     dec_b_stride,
+    enc_scale_stride,
+    dec_scale_stride,
     feat_stride,
     kind_stride_n,
     kind_stride_c,
@@ -108,6 +116,7 @@ def _apply_sae_full_recon_kernel(
     out_stride_n,
     out_stride_h,
     ACTIVATION_CODE: tl.constexpr,
+    WEIGHTS_FP8: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -167,6 +176,17 @@ def _apply_sae_full_recon_kernel(
         s_idx = s_off + s_range
         s_mask = s_idx < D_SAE
 
+        # Per-row dequant scales for this feature tile.  WEIGHTS_FP8 is
+        # a constexpr, so the compute-dtype specialisation prunes these
+        # loads entirely (the dummy scale pointers are never read).
+        if WEIGHTS_FP8:
+            enc_scale = tl.load(
+                enc_scale_ptr + s_idx * enc_scale_stride, mask=s_mask, other=0.0
+            )
+            dec_scale = tl.load(
+                dec_scale_ptr + s_idx * dec_scale_stride, mask=s_mask, other=0.0
+            )
+
         # Encoder pass for this feature tile.
         pre = tl.load(enc_b_ptr + s_idx * enc_b_stride, mask=s_mask, other=0.0).to(
             tl.float32
@@ -179,9 +199,16 @@ def _apply_sae_full_recon_kernel(
             )
             enc_off = s_idx[:, None] * enc_stride_s + h_idx[None, :] * enc_stride_h
             enc_mask = s_mask[:, None] & h_mask[None, :]
-            enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
-                tl.float32
-            )
+            if WEIGHTS_FP8:
+                # fp8 weights arrive viewed as uint8; decode in-register.
+                enc_raw = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0).to(
+                    tl.int32
+                )
+                enc_block = _decode_fp8_e4m3(enc_raw) * enc_scale[:, None]
+            else:
+                enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
+                    tl.float32
+                )
             pre += tl.sum(enc_block * h_vals[None, :], axis=1)
 
         if ACTIVATION_CODE == 0:  # ReLU
@@ -216,9 +243,15 @@ def _apply_sae_full_recon_kernel(
             h_mask = h_idx < H
             dec_off = s_idx[:, None] * dec_stride_s + h_idx[None, :] * dec_stride_h
             dec_mask = s_mask[:, None] & h_mask[None, :]
-            dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
-                tl.float32
-            )
+            if WEIGHTS_FP8:
+                dec_raw = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0).to(
+                    tl.int32
+                )
+                dec_block = _decode_fp8_e4m3(dec_raw) * dec_scale[:, None]
+            else:
+                dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
+                    tl.float32
+                )
             partial = tl.sum(dec_block * f_tile[:, None], axis=0)
             acc_vals = tl.load(
                 acc_row_ptr + h_idx * acc_stride_h, mask=h_mask, other=0.0
@@ -289,6 +322,8 @@ def apply_sae_full_recon_triton(
     activation_param: float,
     clamp_row_gated: torch.Tensor | None = None,
     row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """CUDA path for the SAE full-reconstruction op (capture-safe).
 
@@ -304,6 +339,12 @@ def apply_sae_full_recon_triton(
     inactive tokens cost a row copy-through and active tokens run the
     full encode / clamp / decode.  Everything is fixed-shape and
     device-side — legal inside CUDA-graph capture.
+
+    fp8-stored weights (``float8_e4m3fn``) launch the ``WEIGHTS_FP8``
+    specialisation: the weight tensors are viewed as uint8 and decoded
+    in-register via the shared bitwise e4m3 decode (Triton rejects the
+    fp8e4nv dtype on pre-sm89 archs), then multiplied by the per-row
+    ``encoder_scale`` / ``decoder_scale`` fp32 tensors.
 
     TopK sites and clampable subsets beyond ``_MAX_BLOCK_C`` route to
     :func:`vllm.model_executor.layers.sae_full_reconstruction._apply_sae_full_reconstruction_eager`
@@ -335,6 +376,8 @@ def apply_sae_full_recon_triton(
             activation_param,
             clamp_row_gated,
             row_gate,
+            encoder_scale=encoder_scale,
+            decoder_scale=decoder_scale,
         )
 
     h_size = hidden_states.shape[1]
@@ -349,6 +392,15 @@ def apply_sae_full_recon_triton(
         )
     else:
         gate = torch.ones(n_tokens, dtype=torch.float32, device=hidden_states.device)
+    (
+        weights_fp8,
+        encoder_weight,
+        decoder_weight,
+        encoder_scale,
+        decoder_scale,
+    ) = _resolve_fp8_scales(
+        encoder_weight, decoder_weight, encoder_scale, decoder_scale
+    )
     acc = torch.empty(
         n_tokens, h_size, dtype=torch.float32, device=hidden_states.device
     )
@@ -360,6 +412,8 @@ def apply_sae_full_recon_triton(
         threshold,
         decoder_weight,
         decoder_bias,
+        encoder_scale,
+        decoder_scale,
         clampable_features,
         clamp_kind,
         clamp_value,
@@ -381,6 +435,8 @@ def apply_sae_full_recon_triton(
         decoder_weight.stride(0),
         decoder_weight.stride(1),
         decoder_bias.stride(0),
+        encoder_scale.stride(0),
+        decoder_scale.stride(0),
         clampable_features.stride(0),
         clamp_kind.stride(0),
         clamp_kind.stride(1),
@@ -395,6 +451,7 @@ def apply_sae_full_recon_triton(
         out.stride(0),
         out.stride(1),
         ACTIVATION_CODE=int(activation_code),
+        WEIGHTS_FP8=weights_fp8,
         BLOCK_H=block_h,
         BLOCK_S=_FR_BLOCK_S,
         BLOCK_C=block_c,
@@ -412,6 +469,7 @@ def warmup_apply_sae_full_recon_kernel(
     device: torch.device,
     activation_code: int = 0,
     activation_param: float = 0.0,
+    storage_dtype: torch.dtype | None = None,
 ) -> None:
     """JIT-compile the FR kernel ahead of CUDA-graph capture.
 
@@ -430,12 +488,17 @@ def warmup_apply_sae_full_recon_kernel(
     if d_sae <= 0 or hidden_size <= 0:
         return
     n_tokens = 1
+    weight_dtype = storage_dtype if storage_dtype is not None else table_dtype
+    weights_fp8 = weight_dtype == torch.float8_e4m3fn
     dummy_h = torch.zeros(n_tokens, hidden_size, dtype=compute_dtype, device=device)
-    dummy_enc_w = torch.zeros(d_sae, hidden_size, dtype=table_dtype, device=device)
+    dummy_enc_w = torch.zeros(d_sae, hidden_size, dtype=weight_dtype, device=device)
     dummy_enc_b = torch.zeros(d_sae, dtype=table_dtype, device=device)
     dummy_threshold = torch.zeros(d_sae, dtype=torch.float32, device=device)
-    dummy_dec_w = torch.zeros(d_sae, hidden_size, dtype=table_dtype, device=device)
+    dummy_dec_w = torch.zeros(d_sae, hidden_size, dtype=weight_dtype, device=device)
     dummy_dec_b = torch.zeros(hidden_size, dtype=table_dtype, device=device)
+    dummy_scale = (
+        torch.ones(d_sae, dtype=torch.float32, device=device) if weights_fp8 else None
+    )
     feats = torch.arange(max(n_clamp, 0), dtype=torch.int64, device=device)
     dummy_kind = torch.zeros(n_tokens, max(n_clamp, 0), dtype=torch.int8, device=device)
     dummy_value = torch.zeros(
@@ -459,6 +522,8 @@ def warmup_apply_sae_full_recon_kernel(
             mask[:n],
             int(activation_code),
             float(activation_param),
+            encoder_scale=dummy_scale,
+            decoder_scale=dummy_scale,
         )
 
     if not _fr_kernel_supports(n_clamp, activation_code):

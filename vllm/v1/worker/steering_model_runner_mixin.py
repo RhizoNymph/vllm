@@ -16,7 +16,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config.sae_steering_types import SAEActivation
+from vllm.config.sae_steering_types import (
+    SAE_STORAGE_DTYPE_AUTO,
+    SAEActivation,
+    validate_sae_storage_dtype,
+)
 from vllm.config.steering import (
     SAEModuleTopology,
     is_steering_topology_frozen,
@@ -36,10 +40,18 @@ from vllm.entrypoints.openai.steering.registry import (
 )
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
+from vllm.model_executor.layers.sae_fp8 import (
+    FP8_STORAGE_DTYPE,
+    dequantize_fp8_rowwise,
+    quantize_fp8_rowwise,
+    resolve_sae_storage_dtype,
+)
 from vllm.model_executor.layers.sae_full_reconstruction import (
     HOOK_POINT_FR_DECODER_BIAS_ATTR,
+    HOOK_POINT_FR_DECODER_SCALE_ATTR,
     HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
     HOOK_POINT_FR_ENCODER_BIAS_ATTR,
+    HOOK_POINT_FR_ENCODER_SCALE_ATTR,
     HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
     HOOK_POINT_FR_THRESHOLD_ATTR,
     populate_sae_full_recon_clamp_table,
@@ -895,6 +907,7 @@ class SteeringModelRunnerMixin:
                 ),
                 clampable_features=tuple(range(int(topo.n_clamp))),
                 activation_params=dict(topo.activation_params),
+                storage_dtype=getattr(topo, "storage_dtype", SAE_STORAGE_DTYPE_AUTO),
             )
             # Record the declaration BEFORE attaching so the attach
             # helper routes it as declared (fresh allocation here; reuse
@@ -3444,6 +3457,7 @@ class SteeringModelRunnerMixin:
             raise ValueError(
                 f"{prefix}: unsupported activation {manifest.activation!r}."
             )
+        validate_sae_storage_dtype(manifest.storage_dtype, prefix=prefix)
         if not manifest.layers:
             raise ValueError(f"{prefix}: layers must not be empty.")
         seen_sites: set[tuple[int, str]] = set()
@@ -3532,6 +3546,7 @@ class SteeringModelRunnerMixin:
             else 0
         )
         n_clamp = len(manifest.clampable_features)
+        storage_dtype = resolve_sae_storage_dtype(manifest.storage_dtype, ref_dtype)
         attached_layers: list[nn.Module] = []
         for layer_idx, hook_str in manifest.layers:
             if layer_idx not in self._locally_owned_layers:
@@ -3558,6 +3573,7 @@ class SteeringModelRunnerMixin:
                 dtype=ref_dtype,
                 device=table_device,
                 allow_reuse=frozen,
+                storage_dtype=storage_dtype,
             )
             self._sae_steerable_sites[(module_name, layer_idx, hook_str)] = layer
             register_sae_index_buffer(layer, max_tokens=max_tokens, device=table_device)
@@ -3664,6 +3680,7 @@ class SteeringModelRunnerMixin:
                 n_clamp=len(manifest.clampable_features),
                 activation=manifest.activation.value,
                 activation_params=dict(manifest.activation_params),
+                storage_dtype=manifest.storage_dtype,
             )
             if mismatch is not None:
                 raise SteeringVectorError(
@@ -3676,6 +3693,13 @@ class SteeringModelRunnerMixin:
             raise SteeringVectorError(
                 f"Steering module {name!r} (kind={kind!r}) was not "
                 f"declared at startup. {remedy}"
+            )
+        if manifest.storage_dtype != SAE_STORAGE_DTYPE_AUTO:
+            raise SteeringVectorError(
+                f"Steering module {name!r} requests storage_dtype "
+                f"{manifest.storage_dtype!r}, but spare slots store "
+                "weights in compute dtype — fp8 modules must be declared "
+                f"at startup via --steering-modules. {remedy}"
             )
         steering_config = getattr(
             getattr(self, "vllm_config", None), "steering_config", None
@@ -3779,6 +3803,7 @@ class SteeringModelRunnerMixin:
             activation_param=_activation_to_scalar(
                 manifest.activation, manifest.activation_params
             ),
+            storage_dtype=resolve_sae_storage_dtype(manifest.storage_dtype, ref_dtype),
         )
 
     def _detach_sae_buffers(self, module_name: str) -> None:
@@ -3830,10 +3855,24 @@ class SteeringModelRunnerMixin:
             state = get_sae_slot_state(site, hook_point, module_name)
             if state is None:
                 continue
+
+            def _weight_snapshot(
+                buf: torch.Tensor, scale: torch.Tensor
+            ) -> torch.Tensor:
+                # fp8 slots snapshot *dequantized* so the restore path
+                # (attach_sae_weights) re-quantizes like any wire load.
+                if buf.dtype == FP8_STORAGE_DTYPE:
+                    return dequantize_fp8_rowwise(buf.detach(), scale.detach())
+                return buf.detach().clone()
+
             snapshot[(layer_idx, hook_str)] = {
-                "encoder_weight": state.encoder_weight.detach().clone(),
+                "encoder_weight": _weight_snapshot(
+                    state.encoder_weight, state.encoder_scale
+                ),
                 "encoder_bias": state.encoder_bias.detach().clone(),
-                "decoder_weight": state.decoder_weight.detach().clone(),
+                "decoder_weight": _weight_snapshot(
+                    state.decoder_weight, state.decoder_scale
+                ),
                 "threshold": state.threshold.detach().clone(),
             }
         return snapshot
@@ -3932,6 +3971,28 @@ class SteeringModelRunnerMixin:
                         "must contain only finite values at "
                         f"site (layer={layer_idx}, hook={hook_str!r})."
                     )
+                if buf.dtype == FP8_STORAGE_DTYPE:
+                    # fp8-stored slot: quantize on copy — per-row fp32
+                    # scale from the incoming bf16/fp32 tensor, values
+                    # stored as float8_e4m3fn.  fp8 modules are never
+                    # spare-eligible, so no zero-padding path here.
+                    src32 = raw.detach().to(dtype=torch.float32, device=buf.device)
+                    if src32.shape != buf.shape:
+                        raise SteeringVectorError(
+                            f"attach_sae_weights({module_name!r}): "
+                            f"{tensor_key} shape {tuple(src32.shape)} does "
+                            f"not match buffer shape {tuple(buf.shape)} at "
+                            f"site (layer={layer_idx}, hook={hook_str!r})."
+                        )
+                    q, scale = quantize_fp8_rowwise(src32)
+                    scale_buf = (
+                        state.encoder_scale
+                        if tensor_key == "encoder_weight"
+                        else state.decoder_scale
+                    )
+                    copy_plan.append((buf, q))
+                    copy_plan.append((scale_buf, scale))
+                    continue
                 src = raw.to(dtype=buf.dtype, device=buf.device)
                 if src.shape != buf.shape:
                     # Claimed spare slots reserve a larger feature
@@ -4113,6 +4174,7 @@ class SteeringModelRunnerMixin:
             else 0
         )
         n_clamp = len(manifest.clampable_features)
+        storage_dtype = resolve_sae_storage_dtype(manifest.storage_dtype, ref_dtype)
         clampable_features = torch.tensor(
             list(manifest.clampable_features), dtype=torch.int64, device=table_device
         )
@@ -4144,6 +4206,7 @@ class SteeringModelRunnerMixin:
                 dtype=ref_dtype,
                 device=table_device,
                 allow_reuse=getattr(self, "_steering_topology_frozen", False),
+                storage_dtype=storage_dtype,
             )
             register_sae_recon_index_buffer(
                 layer, max_tokens=max_tokens, device=table_device
@@ -4194,6 +4257,7 @@ class SteeringModelRunnerMixin:
             activation_param=_activation_to_scalar(
                 manifest.activation, manifest.activation_params
             ),
+            storage_dtype=resolve_sae_storage_dtype(manifest.storage_dtype, ref_dtype),
         )
 
     def _detach_sae_full_recon_buffers(self, module_name: str) -> None:
@@ -4236,15 +4300,30 @@ class SteeringModelRunnerMixin:
             except ValueError:
                 continue
             tensors: dict[str, torch.Tensor] = {}
-            for tensor_key, attr_table in (
-                ("encoder_weight", HOOK_POINT_FR_ENCODER_WEIGHT_ATTR),
-                ("encoder_bias", HOOK_POINT_FR_ENCODER_BIAS_ATTR),
-                ("decoder_weight", HOOK_POINT_FR_DECODER_WEIGHT_ATTR),
-                ("decoder_bias", HOOK_POINT_FR_DECODER_BIAS_ATTR),
-                ("threshold", HOOK_POINT_FR_THRESHOLD_ATTR),
+            for tensor_key, attr_table, scale_table in (
+                (
+                    "encoder_weight",
+                    HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
+                    HOOK_POINT_FR_ENCODER_SCALE_ATTR,
+                ),
+                ("encoder_bias", HOOK_POINT_FR_ENCODER_BIAS_ATTR, None),
+                (
+                    "decoder_weight",
+                    HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
+                    HOOK_POINT_FR_DECODER_SCALE_ATTR,
+                ),
+                ("decoder_bias", HOOK_POINT_FR_DECODER_BIAS_ATTR, None),
+                ("threshold", HOOK_POINT_FR_THRESHOLD_ATTR, None),
             ):
                 buf = getattr(site, attr_table[hook_point], None)
                 if buf is None:
+                    continue
+                if buf.dtype == FP8_STORAGE_DTYPE and scale_table is not None:
+                    # Snapshot dequantized so a restore re-quantizes.
+                    scale = getattr(site, scale_table[hook_point])
+                    tensors[tensor_key] = dequantize_fp8_rowwise(
+                        buf.detach(), scale.detach()
+                    )
                     continue
                 tensors[tensor_key] = buf.detach().clone()
             if tensors:
@@ -4305,6 +4384,30 @@ class SteeringModelRunnerMixin:
                         f"{layer_idx}, hook={hook_str!r})."
                     )
                 buf = getattr(site, attr_table[hook_point])
+                if buf.dtype == FP8_STORAGE_DTYPE:
+                    # fp8-stored site: quantize on copy with per-row
+                    # fp32 scales written alongside.
+                    src32 = (
+                        tensors[tensor_key]
+                        .detach()
+                        .to(dtype=torch.float32, device=buf.device)
+                    )
+                    if src32.shape != buf.shape:
+                        raise SteeringVectorError(
+                            f"attach_sae_full_recon_weights({module_name!r}): "
+                            f"{tensor_key} shape {tuple(src32.shape)} does "
+                            f"not match buffer shape {tuple(buf.shape)} at "
+                            f"site (layer={layer_idx}, hook={hook_str!r})."
+                        )
+                    q, scale = quantize_fp8_rowwise(src32)
+                    scale_attr = (
+                        HOOK_POINT_FR_ENCODER_SCALE_ATTR
+                        if tensor_key == "encoder_weight"
+                        else HOOK_POINT_FR_DECODER_SCALE_ATTR
+                    )
+                    getattr(site, scale_attr[hook_point]).copy_(scale)
+                    buf.copy_(q)
+                    continue
                 src = tensors[tensor_key].to(dtype=buf.dtype, device=buf.device)
                 if src.shape != buf.shape:
                     raise SteeringVectorError(

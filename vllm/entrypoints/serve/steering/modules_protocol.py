@@ -47,6 +47,15 @@ class SAEModuleManifestRequest(BaseModel):
             "manifest."
         ),
     )
+    storage_dtype: Literal["auto", "fp8_e4m3"] = Field(
+        default="auto",
+        description=(
+            "Storage dtype for the SAE weight tables: 'auto' keeps the "
+            "engine compute dtype; 'fp8_e4m3' stores the large "
+            "encoder/decoder matrices as float8_e4m3fn with per-row "
+            "fp32 scales (quantized worker-side at attach time)."
+        ),
+    )
 
     @field_validator("activation_params", mode="before")
     @classmethod

@@ -60,12 +60,49 @@ ACTIVATION_CODE_TOPK = 2
 
 
 @triton.jit
+def _decode_fp8_e4m3(v):
+    """Bitwise e4m3fn → fp32 decode of weight bytes loaded as uint8.
+
+    Universal fp8 path: Triton rejects the fp8e4nv dtype at JIT time on
+    pre-sm89 CUDA archs, so instead of an arch branch the wrappers view
+    fp8 weights as uint8 and every ``WEIGHTS_FP8`` specialisation
+    decodes in-register (the kernels are memory-bound; the extra ALU
+    ops are free).  Layout ``s eeee mmm`` (bias 7): normal (``e > 0``)
+    is ``±2^(e-7) · (1 + m/8)``; subnormal (``e == 0``) is
+    ``±2^-6 · (m/8)``.  The NaN encodings (``e == 15, m == 7``) need no
+    handling — they can never occur because ``quantize_fp8_rowwise``
+    clamps to ±448 before the fp8 cast.  Mirrored by the pure-torch
+    reference ``sae_fp8.decode_fp8_e4m3_bitwise``, which the test
+    suite pins exhaustively against torch's native conversion.
+
+    Args:
+        v: int32 tensor of raw e4m3fn bytes.
+
+    Returns:
+        fp32 tensor of the decoded values.
+    """
+    s = (v >> 7) & 1
+    e = (v >> 3) & 0xF
+    m = v & 0x7
+    ef = e.to(tl.float32)
+    mf = m.to(tl.float32)
+    val = tl.where(
+        e > 0,
+        tl.exp2(ef - 7.0) * (1.0 + mf * 0.125),
+        0.015625 * (mf * 0.125),
+    )
+    return tl.where(s != 0, -val, val)
+
+
+@triton.jit
 def _apply_sae_delta_kernel(
     hidden_ptr,
     enc_w_ptr,
     enc_b_ptr,
     threshold_ptr,
     dec_w_ptr,
+    enc_scale_ptr,
+    dec_scale_ptr,
     kind_ptr,
     value_ptr,
     only_ptr,
@@ -84,6 +121,8 @@ def _apply_sae_delta_kernel(
     thr_stride,
     dec_stride_c,
     dec_stride_h,
+    enc_scale_stride,
+    dec_scale_stride,
     kind_stride_n,
     kind_stride_c,
     value_stride_n,
@@ -96,6 +135,7 @@ def _apply_sae_delta_kernel(
     out_stride_h,
     activation_param,
     ACTIVATION_CODE: tl.constexpr,
+    WEIGHTS_FP8: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -144,6 +184,17 @@ def _apply_sae_delta_kernel(
             tl.store(out_row_ptr + h_idx * out_stride_h, h_vals, mask=h_mask)
         return
 
+    # Per-row fp8 dequantization scales, loaded once per program.
+    # WEIGHTS_FP8 is a constexpr, so the compute-dtype specialisation
+    # prunes these loads (and the multiplies below) entirely.
+    if WEIGHTS_FP8:
+        enc_scale = tl.load(
+            enc_scale_ptr + c_idx * enc_scale_stride, mask=c_mask, other=0.0
+        ).to(tl.float32)
+        dec_scale = tl.load(
+            dec_scale_ptr + c_idx * dec_scale_stride, mask=c_mask, other=0.0
+        ).to(tl.float32)
+
     # Pass 1: accumulate encoder dot products.  The hidden row is
     # streamed through in BLOCK_H tiles; for each tile we load the
     # corresponding (BLOCK_C, BLOCK_H) slice of the encoder weights and
@@ -156,9 +207,14 @@ def _apply_sae_delta_kernel(
         )
         enc_off = c_idx[:, None] * enc_stride_c + h_idx[None, :] * enc_stride_h
         enc_mask = c_mask[:, None] & h_mask[None, :]
-        enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
-            tl.float32
-        )
+        if WEIGHTS_FP8:
+            # fp8 weights arrive viewed as uint8; decode in-register.
+            enc_raw = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0).to(tl.int32)
+            enc_block = _decode_fp8_e4m3(enc_raw) * enc_scale[:, None]
+        else:
+            enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
+                tl.float32
+            )
         pre_acts += tl.sum(enc_block * h_vals[None, :], axis=1)
 
     # Apply activation function to obtain f.
@@ -229,9 +285,14 @@ def _apply_sae_delta_kernel(
 
         dec_off = c_idx[:, None] * dec_stride_c + h_idx[None, :] * dec_stride_h
         dec_mask = c_mask[:, None] & h_mask[None, :]
-        dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
-            tl.float32
-        )
+        if WEIGHTS_FP8:
+            # fp8 weights arrive viewed as uint8; decode in-register.
+            dec_raw = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0).to(tl.int32)
+            dec_block = _decode_fp8_e4m3(dec_raw) * dec_scale[:, None]
+        else:
+            dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
+                tl.float32
+            )
 
         residual_delta = tl.sum(dec_block * delta[:, None], axis=0)
         result = h_vals.to(tl.float32) + residual_delta
@@ -249,6 +310,8 @@ def _apply_sae_delta_indexed_kernel(
     enc_b_ptr,
     threshold_ptr,
     dec_w_ptr,
+    enc_scale_ptr,
+    dec_scale_ptr,
     kind_table_ptr,
     value_table_ptr,
     only_table_ptr,
@@ -268,6 +331,8 @@ def _apply_sae_delta_indexed_kernel(
     thr_stride,
     dec_stride_c,
     dec_stride_h,
+    enc_scale_stride,
+    dec_scale_stride,
     kind_stride_r,
     kind_stride_c,
     value_stride_r,
@@ -281,6 +346,7 @@ def _apply_sae_delta_indexed_kernel(
     out_stride_h,
     activation_param,
     ACTIVATION_CODE: tl.constexpr,
+    WEIGHTS_FP8: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -327,6 +393,14 @@ def _apply_sae_delta_indexed_kernel(
             tl.store(out_row_ptr + h_idx * out_stride_h, h_vals, mask=h_mask)
         return
 
+    if WEIGHTS_FP8:
+        enc_scale = tl.load(
+            enc_scale_ptr + c_idx * enc_scale_stride, mask=c_mask, other=0.0
+        ).to(tl.float32)
+        dec_scale = tl.load(
+            dec_scale_ptr + c_idx * dec_scale_stride, mask=c_mask, other=0.0
+        ).to(tl.float32)
+
     pre_acts = tl.load(enc_b_ptr + c_idx * enc_b_stride, mask=c_mask, other=0.0).to(
         tl.float32
     )
@@ -338,9 +412,14 @@ def _apply_sae_delta_indexed_kernel(
         )
         enc_off = c_idx[:, None] * enc_stride_c + h_idx[None, :] * enc_stride_h
         enc_mask = c_mask[:, None] & h_mask[None, :]
-        enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
-            tl.float32
-        )
+        if WEIGHTS_FP8:
+            # fp8 weights arrive viewed as uint8; decode in-register.
+            enc_raw = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0).to(tl.int32)
+            enc_block = _decode_fp8_e4m3(enc_raw) * enc_scale[:, None]
+        else:
+            enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
+                tl.float32
+            )
         pre_acts += tl.sum(enc_block * h_vals[None, :], axis=1)
 
     if ACTIVATION_CODE == 0:
@@ -395,9 +474,14 @@ def _apply_sae_delta_indexed_kernel(
         h_vals = tl.load(h_row_ptr + h_idx * h_stride_h, mask=h_mask, other=0.0)
         dec_off = c_idx[:, None] * dec_stride_c + h_idx[None, :] * dec_stride_h
         dec_mask = c_mask[:, None] & h_mask[None, :]
-        dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
-            tl.float32
-        )
+        if WEIGHTS_FP8:
+            # fp8 weights arrive viewed as uint8; decode in-register.
+            dec_raw = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0).to(tl.int32)
+            dec_block = _decode_fp8_e4m3(dec_raw) * dec_scale[:, None]
+        else:
+            dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
+                tl.float32
+            )
         residual_delta = tl.sum(dec_block * delta[:, None], axis=0)
         result = h_vals.to(tl.float32) + residual_delta
         tl.store(
@@ -456,6 +540,38 @@ def _kernel_supports(n_clamp: int) -> bool:
     return _choose_block_c(n_clamp) <= _MAX_BLOCK_C
 
 
+def _resolve_fp8_scales(
+    encoder_weight: torch.Tensor,
+    decoder_weight: torch.Tensor,
+    encoder_scale: torch.Tensor | None,
+    decoder_scale: torch.Tensor | None,
+) -> tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Resolve the fp8 specialisation flag, weight views, and scales.
+
+    fp8 launches hand the kernels the weight tensors viewed as uint8
+    (zero-copy) so the ``WEIGHTS_FP8`` specialisation can load raw
+    bytes and decode via :func:`_decode_fp8_e4m3` — Triton rejects the
+    fp8e4nv dtype outright on pre-sm89 archs, so the bitwise decode is
+    the universal fp8 path.  Non-fp8 launches substitute empty fp32
+    tensors for the scale pointers — the ``WEIGHTS_FP8=False``
+    specialisation prunes every scale load, so the dummies are never
+    dereferenced.
+    """
+    weights_fp8 = encoder_weight.dtype == torch.float8_e4m3fn
+    if weights_fp8 and (encoder_scale is None or decoder_scale is None):
+        raise ValueError(
+            "fp8-stored SAE weights require per-row scale tensors; got None."
+        )
+    if weights_fp8:
+        encoder_weight = encoder_weight.view(torch.uint8)
+        decoder_weight = decoder_weight.view(torch.uint8)
+    if encoder_scale is None:
+        encoder_scale = encoder_weight.new_empty(0, dtype=torch.float32)
+    if decoder_scale is None:
+        decoder_scale = decoder_weight.new_empty(0, dtype=torch.float32)
+    return weights_fp8, encoder_weight, decoder_weight, encoder_scale, decoder_scale
+
+
 def apply_sae_delta_triton(
     hidden_states: torch.Tensor,
     encoder_weight: torch.Tensor,
@@ -470,6 +586,8 @@ def apply_sae_delta_triton(
     activation_param: float,
     clamp_row_gated: torch.Tensor | None = None,
     row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute the SAE feature-surgery delta on CUDA via a Triton kernel.
 
@@ -481,8 +599,14 @@ def apply_sae_delta_triton(
     specialisation.  ``clamp_row_gated`` / ``row_gate`` are optional
     per-token fp32 ``(n_tokens,)`` monitor-gating inputs; ``None``
     synthesizes the no-op values (participation 0 / gate 1), keeping
-    ungated launches bit-identical.  The output is a freshly allocated
-    tensor with the same shape and dtype as ``hidden_states``.
+    ungated launches bit-identical.  ``encoder_scale`` /
+    ``decoder_scale`` carry the
+    per-row dequantization scales for fp8-stored weights; the launch
+    views the fp8 tensors as uint8 and the kernel decodes them
+    bitwise (:func:`_decode_fp8_e4m3`) and multiplies by the row
+    scale (only under the ``WEIGHTS_FP8`` specialisation).  The output
+    is a freshly allocated tensor with the same shape and dtype as
+    ``hidden_states``.
 
     Empty token batches and empty clamp sets short-circuit before the
     kernel launch — Triton can fail on zero-sized grids and the math is
@@ -516,8 +640,13 @@ def apply_sae_delta_triton(
             activation_param,
             clamp_row_gated,
             row_gate,
+            encoder_scale=encoder_scale,
+            decoder_scale=decoder_scale,
         )
 
+    weights_fp8, enc_w, dec_w, enc_scale, dec_scale = _resolve_fp8_scales(
+        encoder_weight, decoder_weight, encoder_scale, decoder_scale
+    )
     h_size = hidden_states.shape[1]
     block_h = _choose_block_h(h_size)
     block_c = _choose_block_c(n_clamp)
@@ -538,10 +667,12 @@ def apply_sae_delta_triton(
 
     _apply_sae_delta_kernel[(n_tokens,)](
         hidden_states,
-        encoder_weight,
+        enc_w,
         encoder_bias,
         threshold,
-        decoder_weight,
+        dec_w,
+        enc_scale,
+        dec_scale,
         clamp_kind,
         clamp_value,
         only_int,
@@ -554,12 +685,14 @@ def apply_sae_delta_triton(
         n_clamp,
         hidden_states.stride(0),
         hidden_states.stride(1),
-        encoder_weight.stride(0),
-        encoder_weight.stride(1),
+        enc_w.stride(0),
+        enc_w.stride(1),
         encoder_bias.stride(0),
         threshold.stride(0),
-        decoder_weight.stride(0),
-        decoder_weight.stride(1),
+        dec_w.stride(0),
+        dec_w.stride(1),
+        enc_scale.stride(0) if enc_scale.numel() else 0,
+        dec_scale.stride(0) if dec_scale.numel() else 0,
         clamp_kind.stride(0),
         clamp_kind.stride(1),
         clamp_value.stride(0),
@@ -572,6 +705,7 @@ def apply_sae_delta_triton(
         out.stride(1),
         float(activation_param),
         ACTIVATION_CODE=int(activation_code),
+        WEIGHTS_FP8=weights_fp8,
         BLOCK_H=block_h,
         BLOCK_C=block_c,
     )
@@ -593,6 +727,8 @@ def apply_sae_delta_indexed_triton(
     activation_param: float,
     clamp_row_gated_table: torch.Tensor | None = None,
     steering_row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """CUDA layer-hook path that gathers clamp rows inside the kernel.
 
@@ -643,8 +779,13 @@ def apply_sae_delta_indexed_triton(
             activation_param,
             clamp_row_gated,
             row_gate,
+            encoder_scale=encoder_scale,
+            decoder_scale=decoder_scale,
         )
 
+    weights_fp8, enc_w, dec_w, enc_scale, dec_scale = _resolve_fp8_scales(
+        encoder_weight, decoder_weight, encoder_scale, decoder_scale
+    )
     h_size = hidden_states.shape[1]
     block_h = _choose_block_h(h_size)
     block_c = _choose_block_c(n_clamp)
@@ -663,10 +804,12 @@ def apply_sae_delta_indexed_triton(
 
     _apply_sae_delta_indexed_kernel[(n_tokens,)](
         hidden_states,
-        encoder_weight,
+        enc_w,
         encoder_bias,
         threshold,
-        decoder_weight,
+        dec_w,
+        enc_scale,
+        dec_scale,
         clamp_kind_table,
         clamp_value_table,
         only_int,
@@ -680,12 +823,14 @@ def apply_sae_delta_indexed_triton(
         n_clamp,
         hidden_states.stride(0),
         hidden_states.stride(1),
-        encoder_weight.stride(0),
-        encoder_weight.stride(1),
+        enc_w.stride(0),
+        enc_w.stride(1),
         encoder_bias.stride(0),
         threshold.stride(0),
-        decoder_weight.stride(0),
-        decoder_weight.stride(1),
+        dec_w.stride(0),
+        dec_w.stride(1),
+        enc_scale.stride(0) if enc_scale.numel() else 0,
+        dec_scale.stride(0) if dec_scale.numel() else 0,
         clamp_kind_table.stride(0),
         clamp_kind_table.stride(1),
         clamp_value_table.stride(0),
@@ -699,6 +844,7 @@ def apply_sae_delta_indexed_triton(
         out.stride(1),
         float(activation_param),
         ACTIVATION_CODE=int(activation_code),
+        WEIGHTS_FP8=weights_fp8,
         BLOCK_H=block_h,
         BLOCK_C=block_c,
     )
@@ -714,6 +860,7 @@ def warmup_apply_sae_delta_kernel(
     device: torch.device,
     activation_code: int = ACTIVATION_CODE_RELU,
     activation_param: float = 0.0,
+    storage_dtype: torch.dtype | None = None,
 ) -> None:
     """JIT-compile the SAE kernel ahead of CUDA-graph capture.
 
@@ -734,11 +881,18 @@ def warmup_apply_sae_delta_kernel(
         return
     if n_clamp <= 0 or not _kernel_supports(n_clamp):
         return
+    weight_dtype = storage_dtype if storage_dtype is not None else table_dtype
+    weights_fp8 = weight_dtype == torch.float8_e4m3fn
     dummy_hidden = torch.zeros(1, hidden_size, dtype=compute_dtype, device=device)
-    dummy_enc_w = torch.zeros(n_clamp, hidden_size, dtype=table_dtype, device=device)
+    dummy_enc_w = torch.zeros(n_clamp, hidden_size, dtype=weight_dtype, device=device)
     dummy_enc_b = torch.zeros(n_clamp, dtype=table_dtype, device=device)
     dummy_threshold = torch.zeros(n_clamp, dtype=torch.float32, device=device)
-    dummy_dec_w = torch.zeros(n_clamp, hidden_size, dtype=table_dtype, device=device)
+    dummy_dec_w = torch.zeros(n_clamp, hidden_size, dtype=weight_dtype, device=device)
+    dummy_scale = (
+        torch.zeros(n_clamp, dtype=torch.float32, device=device)
+        if weights_fp8
+        else None
+    )
     dummy_kind = torch.zeros(1, n_clamp, dtype=torch.int8, device=device)
     dummy_value = torch.zeros(1, n_clamp, dtype=torch.float32, device=device)
     dummy_only = torch.zeros(1, n_clamp, dtype=torch.bool, device=device)
@@ -762,6 +916,8 @@ def warmup_apply_sae_delta_kernel(
             activation_param,
             dummy_gated[:n],
             dummy_rgate[:n],
+            encoder_scale=dummy_scale,
+            decoder_scale=dummy_scale,
         )
         apply_sae_delta_indexed_triton(
             dummy_hidden[:n],
@@ -778,6 +934,8 @@ def warmup_apply_sae_delta_kernel(
             activation_param,
             dummy_gated,
             dummy_rgate[:n],
+            encoder_scale=dummy_scale,
+            decoder_scale=dummy_scale,
         )
 
     # Single-token drive by design: the binaries specialise on
