@@ -1,7 +1,7 @@
 # SAE-Based Steering (Delta + Full Reconstruction)
 
 > **Status:** both variants shipped — delta (fused Triton kernel) and
-> full reconstruction (compaction-based CUDA path) — integrated with
+> full reconstruction (dense masked Triton kernel) — integrated with
 > the rebuilt steering framework (config-pool backpressure scheduler,
 > `_steering_register_request` runner lifecycle, `post_block` hook).
 > Companion to [`steering.md`](steering.md) and
@@ -62,8 +62,10 @@ are implemented:
    residual is discarded along with the SAE's reconstruction error.
    Cost: one full encoder GEMM and one full decoder GEMM per *opted-in*
    token at every hooked layer. Implemented as the full-reconstruction
-   kind; the compaction path restricts the GEMMs to the tokens whose
-   requests opted in, so uninvolved tokens pay nothing and keep zero
+   kind; the dense masked kernel launches over the whole padded batch
+   but gates per token, so FR cost is proportional to the active
+   tokens' work inside that dense launch — uninvolved tokens pay a
+   mask-scalar load plus a row copy-through and keep zero
    reconstruction error.
 
 2. **Delta / feature surgery** (most follow-up steering work,
@@ -106,6 +108,7 @@ class SAEClampSpec:
     module_name: str
     clamps: dict[str, dict[int, tuple[SAEClampEntry, ...]]]  # hook -> layer -> entries
     phase: Literal["both", "prefill", "decode"] = "both"
+    gated: bool = False   # opt into the shared monitor row gate
 
 @dataclass(frozen=True)
 class SAEFullReconstructionSpec:
@@ -113,6 +116,7 @@ class SAEFullReconstructionSpec:
     module_name: str
     clamps: dict[str, dict[int, tuple[SAEClampEntry, ...]]] = ...
     phase: Literal["both", "prefill", "decode"] = "both"
+    gated: bool = False   # gates the clamp effect only, never the recon
 
 # vllm/entrypoints/openai/steering/registry.py
 @dataclass
@@ -124,6 +128,7 @@ class SAEModuleManifest:
     clampable_features: tuple[int, ...]       # row order for loaded weights
     activation_params: dict[str, float] = field(default_factory=dict)
     weights_uri: str | None = None
+    storage_dtype: str = "auto"               # "auto" | "fp8_e4m3"
 ```
 
 `kind="absolute"` means `f_i := value`; `kind="additive"` means
@@ -355,10 +360,18 @@ no-reconstruction sentinel) and rows owned by *other* modules' sites
 are inactive here, so a shared `sae_recon_index` can never cause
 cross-module reconstruction. The CUDA path
 ([`sae_full_reconstruction_kernel.py`](../../vllm/model_executor/layers/sae_full_reconstruction_kernel.py),
-`apply_sae_full_recon_triton`) compacts active tokens into a dense
-subset, runs the full encoder/clamp/decoder math on that subset via
-cuBLAS-backed matmuls, and scatters the reconstructed rows back;
-inactive tokens keep their original residual bit-for-bit.
+`apply_sae_full_recon_triton`) is a dense masked Triton kernel, one
+program per token over the padded batch: each program loads its
+`recon_mask` scalar and either copies the residual row through
+(inactive — no `d_sae` work) or streams the full encoder / in-tile
+clamp / decoder math in feature tiles, accumulating in fp32. No
+`torch.nonzero`, no `.item()`, no data-dependent shapes — the op is
+capture-safe and runs *inside* compiled / CUDA-graph-captured
+regions, like the delta kernel. Inactive tokens keep their original
+residual bit-for-bit. TopK sites (global rank over all `d_sae`
+features, not expressible in a streaming per-token program) and clamp
+subsets past the kernel's `BLOCK_C` cap route to the dense eager body
+— equally capture-safe, but paying dense-batch cost.
 
 ## Row Layout and the Global Clamp Tier
 
@@ -431,6 +444,68 @@ no-reconstruction sentinel and rows `1..max` are per-request. Its
 per-site active-row table is what distinguishes "row allocated" from
 "row applies at this site".
 
+## Monitor-Gated Clamps (`gated`)
+
+Both spec types — per-request and global, delta and FR — carry an
+optional boolean `gated` (default `False`, wire- and hash-back-compat:
+an ungated spec hashes and encodes exactly as before the field
+existed; `gated=True` folds a domain marker into the spec hashes so a
+gated spec never shares a manager row with its ungated twin). A gated
+spec's clamp effect is conditioned on the additive tier's **in-graph
+monitor**: the SAE ops consume the shared per-token
+`steering_row_gate` buffer (fp32 `(max_tokens,)`, default 1.0) that
+the runner resets to 1.0 every step and the cross-layer
+`steering_monitor` op reduces for decode tokens whose probe fires
+("clamp feature X only when the probe fires"). SAE never writes the
+gate — it is maintained entirely by the runner/monitor machinery in
+`steering.py` / `steering_monitor_kernel.py` /
+`steering_model_runner_mixin.py`.
+
+Mechanics:
+
+- **Per-row participation buffers.** Each delta slot registers a
+  `(n_rows,)` fp32 `sae_clamp_row_gated` buffer (part of
+  `_SAE_SLOT_BUFFER_BASES`, so spares, `_zero_slot_buffers`,
+  deactivate-only unregister and spare claiming all cover it); each FR
+  site registers `sae_fr_clamp_row_gated` (in
+  `_FR_BUFFER_ATTR_TABLES`). Always registered, zero-filled (ungated)
+  by default — graph topology is independent of whether any gated spec
+  is live. The populators write `1.0` into a row when any spec that
+  contributed clamp content to that row at that site set
+  `gated=True`; with a single per-row gate, mixing gated and ungated
+  specs in one row (e.g. an ungated global merged into a gated
+  request's row) scales both — use disjoint features/phases when that
+  matters.
+- **Delta kernel semantics.** Per token, `row = sae_index[token]`,
+  `g = 1 - gated[row] * (1 - row_gate[token])` (branchless: exactly
+  `row_gate[token]` for gated rows, exactly `1.0` for ungated rows),
+  and the decoder-direction delta is scaled: `h += g * (delta @
+  W_dec)`. The custom ops take the participation table and the row
+  gate as trailing optional tensor args (`None` = ungated, bit-for-bit
+  legacy behaviour); fake impls and the CPU fallback mirror this.
+- **FR semantics.** Gating blends the CLAMP effect only, never the
+  reconstruction: `f_used = f + g * (f_clamped - f)` before the
+  decoder pass, so `g = 0` yields the pure reconstruction (an
+  opted-in token is still fully reconstructed). `gated` on a
+  pure-reconstruction spec (empty clamps) is inert.
+- **Prefill is never gated, by construction.** The runner resets
+  `steering_row_gate` to 1.0 each step
+  (`_update_steering_buffers`), and the monitor multiplies it by
+  `mask·gate + (1 − mask)` with `steering_decode_mask = 0` for
+  prefill tokens — so prefill positions always read 1.0 and gated
+  clamps apply at full strength during prefill. Multiplying by
+  `row_gate[token]` therefore inherits the additive tier's
+  prefill-cache-safety invariant unchanged: prefix-cache keys (which
+  fold the spec hashes, including `gated`) stay deterministic.
+  Deployments without the additive monitor leave the buffer at its
+  default 1.0, so gated specs simply behave as ungated.
+- **Composition.** Gating rides the same shared buffer as additive
+  row gating, so one cross-layer monitor probe ("detect at layer L")
+  conditions additive rows and SAE clamps at all later layers/hooks
+  in the same forward. The fused same-hook monitor variant gates only
+  the additive op locally (it never writes the shared buffer) and
+  does not affect SAE clamps.
+
 ## Files
 
 Core implementation:
@@ -452,9 +527,10 @@ Core implementation:
   populator `populate_sae_full_recon_clamp_table`, full-encoder
   helper `sae_encode_full`.
 - [`vllm/model_executor/layers/sae_full_reconstruction_kernel.py`](../../vllm/model_executor/layers/sae_full_reconstruction_kernel.py)
-  — compaction-based CUDA path `apply_sae_full_recon_triton` +
-  `warmup_apply_sae_full_recon_kernel` (cuBLAS-backed GEMMs on the
-  active-token subset; deliberately not a bespoke Triton GEMM).
+  — dense masked Triton FR kernel `apply_sae_full_recon_triton` +
+  `warmup_apply_sae_full_recon_kernel` (capture-safe per-token
+  mask gate; TopK / oversized clamp subsets fall back to the dense
+  eager body).
 - [`vllm/model_executor/layers/steering.py`](../../vllm/model_executor/layers/steering.py)
   — `SteeringHookPoint`, `VALID_HOOK_POINT_NAMES`, the SAE
   marker-attr dicts (`HOOK_POINT_SAE_CLAMP_KIND_ATTR`,
@@ -545,7 +621,70 @@ every existing hook site picks it up without per-model edits.
   `delta = clamp(f, target) − f`) promote to fp32 and cast back before
   the decoder add. TopK tie-breaks keep the lowest feature indices
   (deterministic), and `only_if_active` under TopK treats selected
-  negative features as active (`f != 0`).
+  negative features as active (`f != 0`). Modules with
+  `storage_dtype="fp8_e4m3"` additionally dequantize their weight
+  tables row-wise (`q.to(fp32) * scale[row]`) before this math — see
+  [fp8 Weight Storage](#fp8-weight-storage-storage_dtype).
+
+## fp8 Weight Storage (`storage_dtype`)
+
+A module may opt into storing its **large per-feature weight
+matrices** — the encoder-row and decoder-row tables for `sae_delta`,
+the full `W_enc` / `W_dec` for `sae_full_reconstruction` — as
+`torch.float8_e4m3fn` with per-row (per-feature) fp32 scales, by
+setting the manifest field `storage_dtype: "fp8_e4m3"` (`"auto"`, the
+default, keeps the engine's compute dtype).  Biases, JumpReLU
+thresholds, clamp tables, and index buffers keep their standard
+dtypes.  Unknown values fail registration loudly, on every surface
+(manifest.json, `sae_manifest` payloads, the vllm-rs JSON module
+form, and the HTTP register endpoint).
+
+- **Memory.** fp8 halves the weight tables versus bf16.  A
+  full-reconstruction Gemma-Scope-sized module
+  (`d_sae=16384 × d_model=2304`, W_enc + W_dec) drops from ~151 MB
+  (bf16) to ~76 MB; a 65k × 4k pair drops from ~2.1 GB to ~1.07 GB.
+  The scale buffers add `2 × n_rows × 4` bytes (≤ 512 KB at
+  `d_sae=65536`) — always present per fp8 module.
+- **Scheme.** Quantization happens **worker-side at attach time**
+  (`attach_sae_weights` / `attach_sae_full_recon_weights`); weights
+  travel over the wire as bf16/fp32 exactly as before.  Per row:
+  `scale = max(amax(|row|) / 448, tiny)` (448 = e4m3 finite max; the
+  clamp keeps zero rows dequantizing to exact zero with no division
+  hazard), values stored as `float8_e4m3fn` after clamping to ±448
+  (torch's e4m3 cast does not saturate).  Dequantization everywhere
+  is `q.to(fp32) * scale[row]`: the Triton kernels (delta and the
+  dense FR kernel alike) receive the fp8 weights viewed as uint8 and
+  decode the e4m3 bytes bitwise in-register (`_decode_fp8_e4m3`,
+  exact by construction and pinned exhaustively against torch's
+  native conversion by `decode_fp8_e4m3_bitwise`), then multiply by
+  the row scale — all under a `WEIGHTS_FP8` constexpr specialisation.
+  The bitwise decode is the universal fp8 path (no arch branch):
+  Triton rejects the fp8e4nv dtype at JIT time on pre-sm89 CUDA archs
+  (e.g. sm86), and the kernels are memory-bound so the extra ALU ops
+  are free.  The FR dense-fallback route (TopK, oversized clamp
+  subsets) and the CPU fallbacks dequantize with plain torch (native
+  fp8→fp32 cast, arch-independent) before the existing math.  Slot
+  refresh re-quantizes; deactivation zeroes the scale buffers
+  alongside the weights (zero q × zero scale = exact zero).
+- **Accuracy caveat.** e4m3 has 3 mantissa bits: elementwise relative
+  error up to ~6% (half-ulp 2^-4) against the bf16/fp32 source, with
+  the per-row scale keeping error proportional to each feature's own
+  magnitude.  Encoder pre-activations and decoder directions inherit
+  that error, so clamp semantics are preserved but exact numerical
+  parity with `"auto"` storage is not — treat fp8 as a
+  memory/fidelity trade-off and validate steering strength per
+  module.
+- **Spare slots are excluded.** Spares are allocated at compute dtype;
+  an undeclared fp8 module cannot claim them and is rejected with a
+  message stating fp8 modules must be declared at startup
+  (`--steering-modules`).
+- **Frozen topology.** `storage_dtype` determines buffer dtypes baked
+  into the compiled graph, so it is part of `SAEModuleTopology`, the
+  `SteeringConfig` compute hash, and `sae_topology_mismatch`:
+  re-registering a declared module with a different `storage_dtype`
+  is a clean 400 (frontend) / `SteeringVectorError` (worker), and the
+  slot-level `allow_reuse` check backstops with a storage-dtype
+  comparison.
 
 ## Encoder Footprint
 
@@ -615,20 +754,16 @@ GEMMs per opted-in token per hooked layer).
   with matching topology. Eager engines keep fully dynamic
   registration. Idle declared sites cost one device-gated op launch
   per site per step (the kernel short-circuits on the gate before any
-  table gather). Two FR-specific consequences: the FR CUDA path
-  compacts active tokens with `torch.nonzero` (capture-illegal), so a
-  declared FR module registers
-  `vllm::apply_sae_full_reconstruction_out` as a graph-*splitting* op
-  — an out-variant mutating a caller-allocated buffer, like
-  `unified_attention_with_output` — that runs eagerly between
-  piecewise cudagraph segments, and full-graph capture modes downgrade
-  to `PIECEWISE` (logged at startup); `use_inductor_graph_partition`
-  is rejected with declared FR modules. The topology distiller reads
-  both module forms: safetensors dirs with `manifest.json` (Python
-  frontend) and `{kind, sae_manifest, sae_weights}` JSON files
-  (vllm-rs), so both frontends get pre-allocated buffers from the same
-  `--steering-modules` flag (vllm-rs re-emits it into the managed
-  engine's args).
+  table gather). The FR op is capture-safe like the delta op — the
+  dense masked kernel has no data-dependent shapes and no host sync —
+  so declared FR modules need no graph-splitting op, no cudagraph-mode
+  downgrade, and no `use_inductor_graph_partition` restriction: full
+  cudagraph modes are supported with FR declared. The topology
+  distiller reads both module forms: safetensors dirs with
+  `manifest.json` (Python frontend) and `{kind, sae_manifest,
+  sae_weights}` JSON files (vllm-rs), so both frontends get
+  pre-allocated buffers from the same `--steering-modules` flag
+  (vllm-rs re-emits it into the managed engine's args).
 - **At most one full-reconstruction SAE module per (layer, hook)
   site**; double-registration raises by design — two residual
   replacements on one site are semantically ill-defined. Delta

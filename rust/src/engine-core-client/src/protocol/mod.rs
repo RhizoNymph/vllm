@@ -909,6 +909,7 @@ mod tests {
                 )]),
             )]),
             phase: SaePhase::Both,
+            gated: false,
         }
     }
 
@@ -920,6 +921,7 @@ mod tests {
                 module_name: "golden_gate_full".to_string(),
                 clamps: HashMap::new(),
                 phase: SaePhase::Decode,
+                gated: false,
             }]),
             ..EngineCoreSamplingParams::for_test()
         };

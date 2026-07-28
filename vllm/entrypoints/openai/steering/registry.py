@@ -19,12 +19,14 @@ from typing import Any
 import torch
 
 from vllm.config.sae_steering_types import (
+    SAE_STORAGE_DTYPE_AUTO,
     SAEActivation,
     SAEClampSpec,
     SAEFullReconstructionSpec,
     SteeringModuleKind,
     coerce_sae_clamp_specs,
     coerce_sae_full_reconstruction_specs,
+    validate_sae_storage_dtype,
 )
 from vllm.config.steering_types import (
     SteeringVectorSpec,
@@ -62,6 +64,10 @@ class SAEModuleManifest:
     clampable_features: tuple[int, ...]
     activation_params: dict[str, float] = field(default_factory=dict)
     weights_uri: str | None = None
+    storage_dtype: str = SAE_STORAGE_DTYPE_AUTO
+    """Weight-table storage dtype: ``"auto"`` (compute dtype) or
+    ``"fp8_e4m3"`` (fp8 with per-row fp32 scales, quantized at
+    worker attach time)."""
 
 
 @dataclass
@@ -840,6 +846,7 @@ class SteeringModuleRegistry:
             activation=manifest.activation,
             activation_params=manifest.activation_params,
         )
+        validate_sae_storage_dtype(manifest.storage_dtype, prefix=prefix)
         if not isinstance(manifest.layers, tuple) or not manifest.layers:
             raise ValueError(
                 f"{prefix}: layers must be a non-empty tuple of "
@@ -989,6 +996,7 @@ def _sae_manifest_to_dict(manifest: SAEModuleManifest | None) -> dict[str, Any]:
         "clampable_features": list(manifest.clampable_features),
         "activation_params": dict(manifest.activation_params),
         "weights_uri": manifest.weights_uri,
+        "storage_dtype": manifest.storage_dtype,
     }
 
 
@@ -1061,6 +1069,10 @@ def sae_manifest_from_dict(payload: dict[str, Any]) -> SAEModuleManifest:
         ),
         activation_params=dict(payload.get("activation_params") or {}),
         weights_uri=payload.get("weights_uri"),
+        storage_dtype=validate_sae_storage_dtype(
+            payload.get("storage_dtype", SAE_STORAGE_DTYPE_AUTO),
+            prefix="sae_manifest",
+        ),
     )
 
 

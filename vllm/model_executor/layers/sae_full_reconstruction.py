@@ -39,11 +39,11 @@ Compared to the delta variant (:func:`apply_sae_delta`):
 
 The compute path dispatches via :func:`apply_sae_full_reconstruction_op`,
 registered as ``torch.ops.vllm.apply_sae_full_reconstruction`` so
-:mod:`torch.compile` treats the call as an opaque splitting point
+:mod:`torch.compile` treats the call as an opaque custom op
 (mirroring ``apply_steering`` and ``apply_sae_delta``).  CPU is
-served by the eager body; CUDA dispatches to the fused Triton
-kernel — wired in Stage 4.  Until then the CUDA path also routes to
-the eager body.
+served by the eager body; CUDA dispatches to the dense masked Triton
+kernel in :mod:`sae_full_reconstruction_kernel`, which is
+capture-safe and runs inside compiled / CUDA-graph-captured regions.
 
 Numeric dtype contract (matches ``docs/features/sae_steering.md``):
 
@@ -71,6 +71,10 @@ from torch import nn
 
 from vllm.config.sae_steering_types import SAEActivation
 from vllm.model_executor.layers.intervention_common import hook_attrs
+from vllm.model_executor.layers.sae_fp8 import (
+    FP8_STORAGE_DTYPE,
+    maybe_dequantize_rowwise,
+)
 from vllm.model_executor.layers.sae_steering import (
     _ACTIVATION_TO_CODE,
     _CODE_TO_ACTIVATION,
@@ -106,6 +110,12 @@ HOOK_POINT_FR_DECODER_BIAS_ATTR = hook_attrs("sae_fr_decoder_bias", _FR_HOOKS)
 # axis.  Registered for every site (zero-filled for ReLU/TopK) so the
 # op arity stays fixed across activations.
 HOOK_POINT_FR_THRESHOLD_ATTR = hook_attrs("sae_fr_threshold", _FR_HOOKS)
+# Per-row fp32 dequantization scales for fp8-stored W_enc / W_dec
+# (``storage_dtype="fp8_e4m3"``), ``(d_sae,)`` each.  Registered for
+# every site — zero-filled and never read for compute-dtype sites — so
+# the op arity stays fixed across storage dtypes.
+HOOK_POINT_FR_ENCODER_SCALE_ATTR = hook_attrs("sae_fr_encoder_scale", _FR_HOOKS)
+HOOK_POINT_FR_DECODER_SCALE_ATTR = hook_attrs("sae_fr_decoder_scale", _FR_HOOKS)
 # Per-row clamp tables: row ``r`` carries the clamp state for tokens
 # whose ``sae_recon_index`` selects ``r``.  Row 0 is reserved as the
 # "no reconstruction" sentinel — a token that maps to row 0 passes
@@ -116,6 +126,11 @@ HOOK_POINT_FR_CLAMP_VALUE_ATTR = hook_attrs("sae_fr_clamp_value", _FR_HOOKS)
 HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR = hook_attrs(
     "sae_fr_clamp_only_if_active", _FR_HOOKS
 )
+# Per-row monitor-gate participation, ``(n_rows,)`` fp32: 1.0 = the
+# row's CLAMP-induced feature delta scales by the shared
+# ``steering_row_gate[token]`` (a ``gated=True`` spec fed the row),
+# 0.0 = ungated.  The reconstruction itself is never gated.
+HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR = hook_attrs("sae_fr_clamp_row_gated", _FR_HOOKS)
 HOOK_POINT_FR_ROW_ACTIVE_ATTR = hook_attrs("sae_fr_row_active", _FR_HOOKS)
 # Clampable global feature indices for this site (constant per
 # manifest registration).
@@ -134,11 +149,14 @@ _FR_BUFFER_ATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
     HOOK_POINT_FR_ENCODER_WEIGHT_ATTR,
     HOOK_POINT_FR_ENCODER_BIAS_ATTR,
     HOOK_POINT_FR_THRESHOLD_ATTR,
+    HOOK_POINT_FR_ENCODER_SCALE_ATTR,
+    HOOK_POINT_FR_DECODER_SCALE_ATTR,
     HOOK_POINT_FR_DECODER_WEIGHT_ATTR,
     HOOK_POINT_FR_DECODER_BIAS_ATTR,
     HOOK_POINT_FR_CLAMP_KIND_ATTR,
     HOOK_POINT_FR_CLAMP_VALUE_ATTR,
     HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR,
+    HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR,
     HOOK_POINT_FR_ROW_ACTIVE_ATTR,
     HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR,
 )
@@ -160,13 +178,14 @@ def _fr_reuse_mismatch(
     n_clamp: int,
     hidden_size: int,
     n_rows: int,
+    weight_dtype: torch.dtype | None = None,
 ) -> str | None:
     """Why this site's existing FR buffers can't serve a registration.
 
     Returns ``None`` when the site's owner, trace-time activation
-    constants, and buffer shapes match the incoming registration
-    exactly, i.e. an in-place zero-and-refill is behaviourally
-    equivalent to a fresh registration.
+    constants, buffer shapes, and weight storage dtype match the
+    incoming registration exactly, i.e. an in-place zero-and-refill is
+    behaviourally equivalent to a fresh registration.
     """
     owner = getattr(module, HOOK_POINT_FR_MODULE_NAME_ATTR[hook_point], None)
     if owner != module_name:
@@ -185,6 +204,8 @@ def _fr_reuse_mismatch(
             f"activation_params {dict(activation_params)} != existing {existing_params}"
         )
     encoder = getattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
+    if weight_dtype is not None and encoder.dtype != weight_dtype:
+        return f"storage dtype {weight_dtype} != existing {encoder.dtype}"
     if tuple(encoder.shape) != (d_sae, hidden_size):
         return (
             f"weight shape ({d_sae}, {hidden_size}) != existing {tuple(encoder.shape)}"
@@ -213,6 +234,7 @@ def register_sae_full_recon_buffers(
     dtype: torch.dtype,
     device: torch.device | None = None,
     allow_reuse: bool = False,
+    storage_dtype: torch.dtype | None = None,
 ) -> None:
     """Attach full-reconstruction SAE buffers for one ``(layer, hook)`` site.
 
@@ -254,9 +276,14 @@ def register_sae_full_recon_buffers(
         device: device for runtime buffers. Runtime registrations happen
             after layers may have moved to their worker device, so callers
             should pass the device of an existing layer buffer.
+        storage_dtype: optional storage dtype override for W_enc / W_dec
+            (``torch.float8_e4m3fn`` for ``storage_dtype="fp8_e4m3"``
+            manifests).  ``None`` stores them in ``dtype``.  Biases,
+            thresholds, and clamp tables keep their standard dtypes.
     """
     if max_recon_configs == 0:
         return
+    weight_dtype = storage_dtype if storage_dtype is not None else dtype
     if d_sae <= 0:
         raise ValueError(f"d_sae must be positive; got {d_sae}.")
     if n_clamp < 0:
@@ -287,6 +314,7 @@ def register_sae_full_recon_buffers(
                 n_clamp=n_clamp,
                 hidden_size=hidden_size,
                 n_rows=n_rows,
+                weight_dtype=weight_dtype,
             )
             if mismatch is None:
                 for table in _FR_BUFFER_ATTR_TABLES:
@@ -313,7 +341,7 @@ def register_sae_full_recon_buffers(
         )
     module.register_buffer(
         enc_w_attr,
-        torch.zeros(d_sae, hidden_size, dtype=dtype, device=device),
+        torch.zeros(d_sae, hidden_size, dtype=weight_dtype, device=device),
         persistent=False,
     )
     module.register_buffer(
@@ -329,9 +357,21 @@ def register_sae_full_recon_buffers(
         torch.zeros(d_sae, dtype=torch.float32, device=device),
         persistent=False,
     )
+    # Per-row fp8 dequantization scales.  Always registered (zero-
+    # filled, never read for compute-dtype sites) so the op call keeps
+    # a fixed argument set.
+    for scale_attr in (
+        HOOK_POINT_FR_ENCODER_SCALE_ATTR[hook_point],
+        HOOK_POINT_FR_DECODER_SCALE_ATTR[hook_point],
+    ):
+        module.register_buffer(
+            scale_attr,
+            torch.zeros(d_sae, dtype=torch.float32, device=device),
+            persistent=False,
+        )
     module.register_buffer(
         HOOK_POINT_FR_DECODER_WEIGHT_ATTR[hook_point],
-        torch.zeros(d_sae, hidden_size, dtype=dtype, device=device),
+        torch.zeros(d_sae, hidden_size, dtype=weight_dtype, device=device),
         persistent=False,
     )
     module.register_buffer(
@@ -352,6 +392,13 @@ def register_sae_full_recon_buffers(
     module.register_buffer(
         HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point],
         torch.zeros(n_rows, n_clamp, dtype=torch.bool, device=device),
+        persistent=False,
+    )
+    # Per-row monitor-gate participation (0.0 = ungated).  Always
+    # registered so the op arity / graph topology stays fixed.
+    module.register_buffer(
+        HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR[hook_point],
+        torch.zeros(n_rows, dtype=torch.float32, device=device),
         persistent=False,
     )
     module.register_buffer(
@@ -521,6 +568,10 @@ def _apply_sae_full_reconstruction_eager(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized PyTorch eager body for the full-reconstruction op.
 
@@ -530,6 +581,15 @@ def _apply_sae_full_reconstruction_eager(
     ``activation_param`` for the registered torch op; JumpReLU's
     per-feature thresholds ride the ``(d_sae,)`` ``threshold``
     tensor, ignored otherwise).
+
+    ``clamp_row_gated`` / ``row_gate`` are optional per-token fp32
+    ``(n_tokens,)`` monitor-gating tensors.  They blend the CLAMP
+    effect only — ``f_used = f + g * (f_clamped - f)`` with ``g = 1 -
+    gated[t] * (1 - row_gate[t])`` — while the reconstruction itself
+    always applies to opted-in tokens.  ``None`` (either) means
+    ungated, bit-identical to the pre-``gated`` behaviour.
+    tensor, ignored otherwise).  fp8-stored W_enc / W_dec are
+    dequantized up front with their per-row scales.
     """
     n_tokens = hidden_states.shape[0]
     n_clamp = clampable_features.shape[0]
@@ -538,6 +598,9 @@ def _apply_sae_full_reconstruction_eager(
 
     activation = _CODE_TO_ACTIVATION[int(activation_code)]
     activation_params = _scalar_to_activation_params(activation, activation_param)
+
+    encoder_weight = maybe_dequantize_rowwise(encoder_weight, encoder_scale)
+    decoder_weight = maybe_dequantize_rowwise(decoder_weight, decoder_scale)
 
     f = sae_encode_full(
         hidden_states,
@@ -567,6 +630,12 @@ def _apply_sae_full_reconstruction_eager(
         apply_clamp = (kind != CLAMP_KIND_NONE) & (~gated | active)
         new_f_subset = torch.where(apply_clamp, new_f, f_subset)
 
+        if clamp_row_gated is not None and row_gate is not None:
+            g = 1.0 - clamp_row_gated.to(torch.float32) * (
+                1.0 - row_gate.to(torch.float32)
+            )
+            new_f_subset = f_subset + g.unsqueeze(1) * (new_f_subset - f_subset)
+
         f = f.scatter(1, idx_2d, new_f_subset)
 
     f_compute = f.to(hidden_states.dtype)
@@ -590,14 +659,22 @@ def apply_sae_full_reconstruction_op(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Tensor-only entry registered as ``torch.ops.vllm.apply_sae_full_reconstruction``.
 
-    On CUDA, will dispatch to the fused Triton kernel once Stage 4
-    lands; until then both CPU and CUDA route through
+    CUDA dispatches to the dense masked Triton kernel (capture-safe:
+    fixed shapes, no host sync); CPU routes through
     :func:`_apply_sae_full_reconstruction_eager`.  The output is
     always a freshly allocated tensor with the same shape and dtype
     as ``hidden_states``.
+
+    ``clamp_row_gated`` / ``row_gate`` are optional per-token fp32
+    monitor-gating tensors blending the clamp effect only (see
+    :func:`_apply_sae_full_reconstruction_eager`).
 
     No shape validation is performed here — callers in this module
     (:func:`apply_sae_full_reconstruction`,
@@ -607,8 +684,8 @@ def apply_sae_full_reconstruction_op(
     without bespoke type adapters, mirroring the delta path.
     """
     if hidden_states.is_cuda:
-        # Stage-4 CUDA path: compaction-based per-token short-circuit.
-        # See :mod:`sae_full_reconstruction_kernel` for the rationale.
+        # Dense masked kernel: per-token gate on ``recon_mask``, no
+        # data-dependent shapes.  See :mod:`sae_full_reconstruction_kernel`.
         from vllm.model_executor.layers.sae_full_reconstruction_kernel import (
             apply_sae_full_recon_triton,
         )
@@ -627,6 +704,10 @@ def apply_sae_full_reconstruction_op(
             recon_mask,
             int(activation_code),
             float(activation_param),
+            clamp_row_gated,
+            row_gate,
+            encoder_scale=encoder_scale,
+            decoder_scale=decoder_scale,
         )
     return _apply_sae_full_reconstruction_eager(
         hidden_states,
@@ -642,6 +723,10 @@ def apply_sae_full_reconstruction_op(
         recon_mask,
         int(activation_code),
         float(activation_param),
+        clamp_row_gated,
+        row_gate,
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -659,6 +744,10 @@ def apply_sae_full_reconstruction_op_fake(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)
@@ -669,81 +758,6 @@ direct_register_custom_op(
     op_func=apply_sae_full_reconstruction_op,
     fake_impl=apply_sae_full_reconstruction_op_fake,
     mutates_args=[],
-    extra_dispatch_keys=("CPU",),
-)
-
-
-def apply_sae_full_reconstruction_out_op(
-    out: torch.Tensor,
-    hidden_states: torch.Tensor,
-    encoder_weight: torch.Tensor,
-    encoder_bias: torch.Tensor,
-    threshold: torch.Tensor,
-    decoder_weight: torch.Tensor,
-    decoder_bias: torch.Tensor,
-    clampable_features: torch.Tensor,
-    clamp_kind: torch.Tensor,
-    clamp_value: torch.Tensor,
-    clamp_only_if_active: torch.Tensor,
-    recon_mask: torch.Tensor,
-    activation_code: int,
-    activation_param: float,
-) -> None:
-    """Out-variant registered as ``torch.ops.vllm.apply_sae_full_reconstruction_out``.
-
-    The layer shim uses this variant (not the value-returning op)
-    because the FR CUDA path is data-dependent (``torch.nonzero``
-    compaction) and must run as a graph-*splitting* op, eagerly
-    between piecewise CUDA-graph segments.  Splitting ops must mutate
-    a caller-provided buffer — the surrounding captured pieces replay
-    against fixed addresses, so a fresh per-call return tensor would
-    leave the downstream piece reading the stale capture-time address.
-    Mirrors ``unified_attention_with_output``.
-    """
-    out.copy_(
-        apply_sae_full_reconstruction_op(
-            hidden_states,
-            encoder_weight,
-            encoder_bias,
-            threshold,
-            decoder_weight,
-            decoder_bias,
-            clampable_features,
-            clamp_kind,
-            clamp_value,
-            clamp_only_if_active,
-            recon_mask,
-            activation_code,
-            activation_param,
-        )
-    )
-
-
-def apply_sae_full_reconstruction_out_op_fake(
-    out: torch.Tensor,
-    hidden_states: torch.Tensor,
-    encoder_weight: torch.Tensor,
-    encoder_bias: torch.Tensor,
-    threshold: torch.Tensor,
-    decoder_weight: torch.Tensor,
-    decoder_bias: torch.Tensor,
-    clampable_features: torch.Tensor,
-    clamp_kind: torch.Tensor,
-    clamp_value: torch.Tensor,
-    clamp_only_if_active: torch.Tensor,
-    recon_mask: torch.Tensor,
-    activation_code: int,
-    activation_param: float,
-) -> None:
-    """FX-tracing fake — pure mutation, nothing to return."""
-    return None
-
-
-direct_register_custom_op(
-    op_name="apply_sae_full_reconstruction_out",
-    op_func=apply_sae_full_reconstruction_out_op,
-    fake_impl=apply_sae_full_reconstruction_out_op_fake,
-    mutates_args=["out"],
     extra_dispatch_keys=("CPU",),
 )
 
@@ -762,6 +776,10 @@ def apply_sae_full_reconstruction(
     clamp_only_if_active: torch.Tensor,
     recon_mask: torch.Tensor,
     threshold: torch.Tensor | None = None,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Public Python API for the SAE full-reconstruction op.
 
@@ -793,6 +811,19 @@ def apply_sae_full_reconstruction(
             Required for JumpReLU; for ReLU/TopK a zero-filled vector
             is synthesized when omitted (the op reads it only under
             the JumpReLU branch).
+        clamp_row_gated: Optional ``(n_tokens,)`` fp32 monitor-gate
+            participation per token (1.0 = the token's clamp effect
+            blends by ``row_gate``, 0.0 = full strength).
+        row_gate: Optional ``(n_tokens,)`` fp32 shared per-token row
+            gate.  The clamp-induced feature delta blends as ``f_used
+            = f + g * (f_clamped - f)`` with ``g = 1 -
+            clamp_row_gated[t] * (1 - row_gate[t])``; the
+            reconstruction itself is never gated.  ``None`` (either)
+            means ungated.
+        encoder_scale: ``(d_sae,)`` fp32 per-row dequantization
+            scales; required when ``encoder_weight`` is fp8-stored
+            (``torch.float8_e4m3fn``), ignored otherwise.
+        decoder_scale: same, for ``decoder_weight``.
 
     Returns:
         ``(n_tokens, d_model)`` tensor in the same dtype as
@@ -882,6 +913,36 @@ def apply_sae_full_reconstruction(
             )
         if threshold.dtype != torch.float32:
             raise ValueError(f"threshold must be torch.float32; got {threshold.dtype}.")
+    for name, t in (
+        ("clamp_row_gated", clamp_row_gated),
+        ("row_gate", row_gate),
+    ):
+        if t is None:
+            continue
+        if tuple(t.shape) != (n_tokens,):
+            raise ValueError(
+                f"{name} must be (n_tokens,) = ({n_tokens},); got {tuple(t.shape)}."
+            )
+        if t.dtype != torch.float32:
+            raise ValueError(f"{name} must be torch.float32; got {t.dtype}.")
+    for scale_name, weight, scale in (
+        ("encoder_scale", encoder_weight, encoder_scale),
+        ("decoder_scale", decoder_weight, decoder_scale),
+    ):
+        if weight.dtype == FP8_STORAGE_DTYPE and scale is None:
+            raise ValueError(
+                f"fp8-stored weights require a per-row {scale_name} tensor."
+            )
+        if scale is not None:
+            if tuple(scale.shape) != (d_sae,):
+                raise ValueError(
+                    f"{scale_name} must be (d_sae,) = ({d_sae},); "
+                    f"got {tuple(scale.shape)}."
+                )
+            if scale.dtype != torch.float32:
+                raise ValueError(
+                    f"{scale_name} must be torch.float32; got {scale.dtype}."
+                )
 
     if n_clamp > 0 and not clampable_features.is_cuda:
         min_feature = int(clampable_features.min().item())
@@ -900,9 +961,9 @@ def apply_sae_full_reconstruction(
     # No token opted into full reconstruction: preserve value
     # semantics without paying the full encoder/decoder cost that
     # would just be discarded by the final ``where``.  CPU-only
-    # check; on CUDA, ``.item()`` would synchronize the stream and
-    # regress the common active-mask path — the CUDA kernel does its
-    # own per-token short-circuit via the compaction path.
+    # check; on CUDA, ``.item()`` would synchronize the stream (and
+    # be capture-illegal) — the dense masked kernel gates per token
+    # on its ``recon_mask`` scalar instead.
     if not recon_mask.is_cuda and not bool(torch.any(recon_mask).item()):
         return hidden_states.clone()
 
@@ -927,6 +988,10 @@ def apply_sae_full_reconstruction(
         recon_mask,
         code,
         param,
+        clamp_row_gated,
+        row_gate,
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -951,9 +1016,9 @@ def apply_layer_sae_full_reconstruction(
     by the shared ``sae_recon_index`` buffer), derives
     ``recon_mask`` from this site's active-row table so row 0 and
     rows owned by other modules are no-op sentinels, and dispatches to
-    ``torch.ops.vllm.apply_sae_full_reconstruction``.  The torch-op
-    indirection is what makes :mod:`torch.compile` treat the call as
-    an opaque splitting point.
+    ``torch.ops.vllm.apply_sae_full_reconstruction``.  The gathers and
+    the op are all fixed-shape device-side work, so the whole shim is
+    legal inside compiled / CUDA-graph-captured regions.
     """
     if not sae_full_recon_buffers_attached(module, hook_point):
         return hidden_states
@@ -964,10 +1029,27 @@ def apply_layer_sae_full_reconstruction(
     recon_index = recon_index_full[:n_tokens]
     active_table = getattr(module, HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point])
     recon_mask = active_table[recon_index]
+    # Monitor gating inputs: per-token gate participation gathered from
+    # this site's per-row table, plus the shared row gate maintained by
+    # the runner / in-graph monitor (SAE only consumes it).  Row-gate
+    # buffer presence is static per process (traced as a constant
+    # branch); harnesses without steering buffers fall back to an
+    # all-ones gate (ungated behaviour).
+    gated_table = getattr(module, HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR[hook_point])
+    clamp_row_gated = gated_table[recon_index]
+    row_gate_buf = getattr(module, "steering_row_gate", None)
+    if row_gate_buf is None:
+        row_gate = torch.ones(
+            n_tokens, dtype=torch.float32, device=hidden_states.device
+        )
+    else:
+        row_gate = row_gate_buf[:n_tokens]
 
     enc_w = getattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
     enc_b = getattr(module, HOOK_POINT_FR_ENCODER_BIAS_ATTR[hook_point])
     threshold = getattr(module, HOOK_POINT_FR_THRESHOLD_ATTR[hook_point])
+    enc_scale = getattr(module, HOOK_POINT_FR_ENCODER_SCALE_ATTR[hook_point])
+    dec_scale = getattr(module, HOOK_POINT_FR_DECODER_SCALE_ATTR[hook_point])
     dec_w = getattr(module, HOOK_POINT_FR_DECODER_WEIGHT_ATTR[hook_point])
     dec_b = getattr(module, HOOK_POINT_FR_DECODER_BIAS_ATTR[hook_point])
     kind_table = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
@@ -990,14 +1072,7 @@ def apply_layer_sae_full_reconstruction(
 
     code = _ACTIVATION_TO_CODE[activation]
     param = _activation_to_scalar(activation, activation_params)
-    # Out-variant + caller-allocated output: the allocation is traced
-    # into the surrounding compiled piece (stable address across CUDA
-    # graph replays) while the data-dependent FR op itself runs eagerly
-    # as a splitting op writing into it.  See
-    # ``apply_sae_full_reconstruction_out_op``.
-    out = torch.empty_like(hidden_states)
-    torch.ops.vllm.apply_sae_full_reconstruction_out(
-        out,
+    return torch.ops.vllm.apply_sae_full_reconstruction(
         hidden_states,
         enc_w,
         enc_b,
@@ -1011,8 +1086,11 @@ def apply_layer_sae_full_reconstruction(
         recon_mask,
         code,
         param,
+        clamp_row_gated,
+        row_gate,
+        encoder_scale=enc_scale,
+        decoder_scale=dec_scale,
     )
-    return out
 
 
 def populate_sae_full_recon_clamp_table(
@@ -1074,6 +1152,7 @@ def populate_sae_full_recon_clamp_table(
     kind_table = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
     value_table = getattr(module, HOOK_POINT_FR_CLAMP_VALUE_ATTR[hook_point])
     only_table = getattr(module, HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
+    gated_table = getattr(module, HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR[hook_point])
     active_table = getattr(module, HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point])
     n_clamp = kind_table.shape[1]
     if len(clampable_features) != n_clamp:
@@ -1087,6 +1166,7 @@ def populate_sae_full_recon_clamp_table(
     kind_table[0].zero_()
     value_table[0].zero_()
     only_table[0].zero_()
+    gated_table[0].zero_()
     active_table[0].zero_()
     hook_name = hook_point.value
     for row, _config_hash, row_phase, specs in manager.active_rows():
@@ -1095,6 +1175,7 @@ def populate_sae_full_recon_clamp_table(
         kind_table[row].zero_()
         value_table[row].zero_()
         only_table[row].zero_()
+        gated_table[row].zero_()
         active_table[row].zero_()
         for spec in specs:
             if spec.module_name != module_name:
@@ -1102,6 +1183,12 @@ def populate_sae_full_recon_clamp_table(
             if spec.phase != "both" and spec.phase != row_phase:
                 continue
             active_table[row].fill_(True)
+            if spec.gated:
+                # Row participates in monitor gating: the clamp-induced
+                # feature delta scales by the shared row gate.  A
+                # pure-reconstruction spec's ``gated`` is inert (no
+                # clamp effect to gate).
+                gated_table[row] = 1.0
             layer_map = spec.clamps.get(hook_name)
             if layer_map is None:
                 # Empty clamps for this hook — row stays zeroed; the
@@ -1153,10 +1240,13 @@ __all__ = [
     "HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR",
     "HOOK_POINT_FR_CLAMP_KIND_ATTR",
     "HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR",
+    "HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR",
     "HOOK_POINT_FR_CLAMP_VALUE_ATTR",
     "HOOK_POINT_FR_DECODER_BIAS_ATTR",
+    "HOOK_POINT_FR_DECODER_SCALE_ATTR",
     "HOOK_POINT_FR_DECODER_WEIGHT_ATTR",
     "HOOK_POINT_FR_ENCODER_BIAS_ATTR",
+    "HOOK_POINT_FR_ENCODER_SCALE_ATTR",
     "HOOK_POINT_FR_ENCODER_WEIGHT_ATTR",
     "HOOK_POINT_FR_MODULE_NAME_ATTR",
     "HOOK_POINT_FR_ROW_ACTIVE_ATTR",

@@ -59,6 +59,10 @@ import torch
 from torch import nn
 
 from vllm.config.sae_steering_types import SAEActivation
+from vllm.model_executor.layers.sae_fp8 import (
+    FP8_STORAGE_DTYPE,
+    maybe_dequantize_rowwise,
+)
 from vllm.model_executor.layers.steering import SteeringHookPoint
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -156,6 +160,12 @@ def _scalar_to_activation_params(
 SAE_CLAMP_KIND_BASE = "sae_clamp_kind"
 SAE_CLAMP_VALUE_BASE = "sae_clamp_value"
 SAE_CLAMP_ONLY_IF_ACTIVE_BASE = "sae_clamp_only_if_active"
+# Per-row monitor-gate participation, ``(n_rows,)`` fp32: 1.0 = the
+# row's clamp delta scales by the shared ``steering_row_gate[token]``
+# (a ``gated=True`` spec fed the row), 0.0 = ungated (full strength).
+# Always registered with a slot so the op arity / graph topology stays
+# fixed whether or not any gated spec is active.
+SAE_CLAMP_ROW_GATED_BASE = "sae_clamp_row_gated"
 SAE_ANY_ACTIVE_BASE = "sae_any_active"
 SAE_ENCODER_WEIGHT_BASE = "sae_encoder_weight"
 SAE_ENCODER_BIAS_BASE = "sae_encoder_bias"
@@ -164,17 +174,26 @@ SAE_DECODER_WEIGHT_BASE = "sae_decoder_weight"
 # clampable-features order.  Registered for every slot (zero-filled for
 # ReLU/TopK) so the op arity stays fixed across activations.
 SAE_THRESHOLD_BASE = "sae_threshold"
+# Per-row fp32 dequantization scales for fp8-stored weight tables
+# (``storage_dtype="fp8_e4m3"``), ``(n_clamp,)`` each.  Registered for
+# every slot — zero-filled and never read for compute-dtype slots — so
+# the op arity stays fixed across storage dtypes.
+SAE_ENCODER_SCALE_BASE = "sae_encoder_scale"
+SAE_DECODER_SCALE_BASE = "sae_decoder_scale"
 
 # All slot-suffixed buffer bases; used for registration and cleanup.
 _SAE_SLOT_BUFFER_BASES: tuple[str, ...] = (
     SAE_CLAMP_KIND_BASE,
     SAE_CLAMP_VALUE_BASE,
     SAE_CLAMP_ONLY_IF_ACTIVE_BASE,
+    SAE_CLAMP_ROW_GATED_BASE,
     SAE_ANY_ACTIVE_BASE,
     SAE_ENCODER_WEIGHT_BASE,
     SAE_ENCODER_BIAS_BASE,
     SAE_DECODER_WEIGHT_BASE,
     SAE_THRESHOLD_BASE,
+    SAE_ENCODER_SCALE_BASE,
+    SAE_DECODER_SCALE_BASE,
 )
 
 
@@ -222,11 +241,14 @@ class SAESlotState:
     clamp_kind: torch.Tensor
     clamp_value: torch.Tensor
     clamp_only_if_active: torch.Tensor
+    clamp_row_gated: torch.Tensor
     any_active: torch.Tensor
     encoder_weight: torch.Tensor
     encoder_bias: torch.Tensor
     decoder_weight: torch.Tensor
     threshold: torch.Tensor
+    encoder_scale: torch.Tensor
+    decoder_scale: torch.Tensor
 
 
 def sae_site_slots(
@@ -247,11 +269,14 @@ def _sae_slot_state(
         clamp_kind=_buf(SAE_CLAMP_KIND_BASE),
         clamp_value=_buf(SAE_CLAMP_VALUE_BASE),
         clamp_only_if_active=_buf(SAE_CLAMP_ONLY_IF_ACTIVE_BASE),
+        clamp_row_gated=_buf(SAE_CLAMP_ROW_GATED_BASE),
         any_active=_buf(SAE_ANY_ACTIVE_BASE),
         encoder_weight=_buf(SAE_ENCODER_WEIGHT_BASE),
         encoder_bias=_buf(SAE_ENCODER_BIAS_BASE),
         decoder_weight=_buf(SAE_DECODER_WEIGHT_BASE),
         threshold=_buf(SAE_THRESHOLD_BASE),
+        encoder_scale=_buf(SAE_ENCODER_SCALE_BASE),
+        decoder_scale=_buf(SAE_DECODER_SCALE_BASE),
     )
 
 
@@ -305,13 +330,15 @@ def _slot_reuse_mismatch(
     n_clamp: int,
     hidden_size: int,
     max_sae_configs: int,
+    weight_dtype: torch.dtype | None = None,
 ) -> str | None:
     """Why ``record``'s existing slot can't serve this registration.
 
     Returns ``None`` when the slot's trace-time constants (activation
-    code/param, baked into the compiled graph per slot) and buffer
-    shapes match the incoming registration exactly, i.e. an in-place
-    zero-and-refill is behaviourally equivalent to a fresh slot.
+    code/param, baked into the compiled graph per slot), buffer shapes,
+    and weight storage dtype match the incoming registration exactly,
+    i.e. an in-place zero-and-refill is behaviourally equivalent to a
+    fresh slot.
     """
     if record.activation != activation:
         return (
@@ -334,6 +361,8 @@ def _slot_reuse_mismatch(
     )
     if encoder is None or clamp_kind is None:
         return "existing slot is missing its buffers"
+    if weight_dtype is not None and encoder.dtype != weight_dtype:
+        return f"storage dtype {weight_dtype} != existing {encoder.dtype}"
     if tuple(encoder.shape) != (n_clamp, hidden_size):
         return (
             f"weight shape ({n_clamp}, {hidden_size}) != existing "
@@ -362,6 +391,7 @@ def register_sae_buffers(
     device: torch.device | None = None,
     allow_reuse: bool = False,
     spare: bool = False,
+    storage_dtype: torch.dtype | None = None,
 ) -> None:
     """Attach one SAE module's buffer slot at a ``(layer, hook)`` site.
 
@@ -395,9 +425,15 @@ def register_sae_buffers(
             happen after the model layer has already moved to its worker
             device, so callers should pass the device of an existing layer
             buffer to avoid attaching CPU SAE buffers to CUDA layers.
+        storage_dtype: optional storage dtype override for the big
+            weight tables (``torch.float8_e4m3fn`` for
+            ``storage_dtype="fp8_e4m3"`` manifests).  ``None`` stores
+            them in ``dtype``.  Biases, thresholds, and clamp tables
+            always keep their standard dtypes.
     """
     if max_sae_configs == 0:
         return
+    weight_dtype = storage_dtype if storage_dtype is not None else dtype
     slots_attr = _sae_slots_attr(hook_point)
     slots: list[SAESlotInfo] = list(getattr(module, slots_attr, ()))
     for record in slots:
@@ -413,6 +449,7 @@ def register_sae_buffers(
                 n_clamp=n_clamp,
                 hidden_size=hidden_size,
                 max_sae_configs=max_sae_configs,
+                weight_dtype=weight_dtype,
             )
             if mismatch is None:
                 _zero_slot_buffers(module, hook_point, record.slot_id)
@@ -459,6 +496,14 @@ def register_sae_buffers(
             torch.zeros(n_rows, n_clamp, dtype=torch.bool, device=device),
             persistent=False,
         )
+        # Per-row monitor-gate participation (0.0 = ungated).  Zeroed
+        # by default so the shared row gate cannot scale any clamp
+        # until a ``gated=True`` spec marks its row.
+        module.register_buffer(
+            _sae_slot_attr(SAE_CLAMP_ROW_GATED_BASE, hook_point, slot_id),
+            torch.zeros(n_rows, dtype=torch.float32, device=device),
+            persistent=False,
+        )
         module.register_buffer(
             _sae_slot_attr(SAE_ANY_ACTIVE_BASE, hook_point, slot_id),
             torch.zeros(1, dtype=torch.bool, device=device),
@@ -470,7 +515,7 @@ def register_sae_buffers(
         # produces zero delta (safe default, fail-quiet).
         module.register_buffer(
             _sae_slot_attr(SAE_ENCODER_WEIGHT_BASE, hook_point, slot_id),
-            torch.zeros(n_clamp, hidden_size, dtype=dtype, device=device),
+            torch.zeros(n_clamp, hidden_size, dtype=weight_dtype, device=device),
             persistent=False,
         )
         module.register_buffer(
@@ -488,9 +533,18 @@ def register_sae_buffers(
         )
         module.register_buffer(
             _sae_slot_attr(SAE_DECODER_WEIGHT_BASE, hook_point, slot_id),
-            torch.zeros(n_clamp, hidden_size, dtype=dtype, device=device),
+            torch.zeros(n_clamp, hidden_size, dtype=weight_dtype, device=device),
             persistent=False,
         )
+        # Per-row dequantization scales for fp8-stored weights.  Always
+        # registered (zero-filled, never read for compute-dtype slots)
+        # so the layer-hook op call keeps a fixed argument set.
+        for scale_base in (SAE_ENCODER_SCALE_BASE, SAE_DECODER_SCALE_BASE):
+            module.register_buffer(
+                _sae_slot_attr(scale_base, hook_point, slot_id),
+                torch.zeros(n_clamp, dtype=torch.float32, device=device),
+                persistent=False,
+            )
     except Exception:
         # Partial failure: delete only the new slot's attrs.  Sibling
         # slots (other modules on this site) are untouched.
@@ -736,6 +790,10 @@ def _apply_sae_delta_eager(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized PyTorch eager body for the SAE feature-surgery op.
 
@@ -744,6 +802,16 @@ def _apply_sae_delta_eager(
     enum is encoded as ``activation_code`` / ``activation_param`` for
     the registered torch op; JumpReLU's per-feature thresholds ride
     the ``(n_clamp,)`` ``threshold`` tensor, ignored otherwise).
+
+    ``clamp_row_gated`` / ``row_gate`` are optional per-token fp32
+    ``(n_tokens,)`` tensors for monitor-gated rows: the clamp delta is
+    scaled by ``g = 1 - gated[t] * (1 - row_gate[t])`` — ``row_gate[t]``
+    when the token's row is gated, 1.0 otherwise (branchless).  When
+    either is ``None`` the delta is untouched (bit-identical to the
+    pre-``gated`` behaviour).
+    fp8-stored weights are dequantized up front with their per-row
+    scales (``q.to(fp32) * scale[row]``); the downstream math is
+    dtype-agnostic.
     """
     activation = _CODE_TO_ACTIVATION[int(activation_code)]
     activation_params = _scalar_to_activation_params(activation, activation_param)
@@ -754,6 +822,9 @@ def _apply_sae_delta_eager(
         or not bool(torch.any(clamp_kind != CLAMP_KIND_NONE))
     ):
         return hidden_states.clone()
+
+    encoder_weight = maybe_dequantize_rowwise(encoder_weight, encoder_scale)
+    decoder_weight = maybe_dequantize_rowwise(decoder_weight, decoder_scale)
 
     f = sae_encode(
         hidden_states,
@@ -783,6 +854,10 @@ def _apply_sae_delta_eager(
         apply_clamp = apply_clamp & any_active.to(torch.bool).view(1, 1)
     delta = torch.where(apply_clamp, new_f - f, torch.zeros_like(f))
 
+    if clamp_row_gated is not None and row_gate is not None:
+        g = 1.0 - clamp_row_gated.to(torch.float32) * (1.0 - row_gate.to(torch.float32))
+        delta = delta * g.unsqueeze(1)
+
     delta_compute = delta.to(hidden_states.dtype)
     decoder_compute = decoder_weight.to(hidden_states.dtype)
     residual_delta = delta_compute @ decoder_compute
@@ -801,6 +876,10 @@ def apply_sae_delta_op(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Tensor-only entry point registered as ``torch.ops.vllm.apply_sae_delta``.
 
@@ -810,6 +889,10 @@ def apply_sae_delta_op(
     allocated tensor with the same shape and dtype as
     ``hidden_states`` so the ``torch.compile`` graph keeps value
     semantics — never in place.
+
+    ``clamp_row_gated`` / ``row_gate`` are optional per-token fp32
+    ``(n_tokens,)`` monitor-gating tensors (see
+    :func:`_apply_sae_delta_eager`); ``None`` means ungated.
 
     No shape validation is performed here: callers in this module
     (:func:`apply_sae_delta`, :func:`apply_layer_sae_delta`) validate
@@ -834,6 +917,10 @@ def apply_sae_delta_op(
             any_active,
             int(activation_code),
             float(activation_param),
+            clamp_row_gated,
+            row_gate,
+            encoder_scale=encoder_scale,
+            decoder_scale=decoder_scale,
         )
     return _apply_sae_delta_eager(
         hidden_states,
@@ -847,6 +934,10 @@ def apply_sae_delta_op(
         any_active,
         int(activation_code),
         float(activation_param),
+        clamp_row_gated,
+        row_gate,
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -862,6 +953,10 @@ def apply_sae_delta_op_fake(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)
@@ -889,12 +984,22 @@ def apply_sae_delta_indexed_op(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated_table: torch.Tensor | None = None,
+    steering_row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Layer-hook op that indexes clamp tables inside the backend.
 
     Keeping the row-index gather inside the custom op lets the CUDA kernel
     check ``any_active`` before loading clamp tables, so registered-but-idle
     SAE modules avoid per-token gather work.
+
+    ``clamp_row_gated_table`` is the slot's per-row ``(n_rows,)`` fp32
+    monitor-gate participation table and ``steering_row_gate`` the
+    shared per-token row gate; the kernel scales each token's clamp
+    delta by ``g = 1 - gated[row] * (1 - row_gate[token])``.  ``None``
+    (either) means ungated, preserving the pre-``gated`` behaviour.
     """
     if hidden_states.is_cuda:
         from vllm.model_executor.layers.sae_steering_kernel import (
@@ -914,11 +1019,19 @@ def apply_sae_delta_indexed_op(
             any_active,
             int(activation_code),
             float(activation_param),
+            clamp_row_gated_table,
+            steering_row_gate,
+            encoder_scale=encoder_scale,
+            decoder_scale=decoder_scale,
         )
     if not any_active.is_cuda and not bool(any_active.item()):
         return hidden_states.clone()
     n_tokens = hidden_states.shape[0]
     idx = sae_index[:n_tokens]
+    clamp_row_gated = (
+        clamp_row_gated_table[idx] if clamp_row_gated_table is not None else None
+    )
+    row_gate = steering_row_gate[:n_tokens] if steering_row_gate is not None else None
     return _apply_sae_delta_eager(
         hidden_states,
         encoder_weight,
@@ -931,6 +1044,10 @@ def apply_sae_delta_indexed_op(
         any_active,
         int(activation_code),
         float(activation_param),
+        clamp_row_gated,
+        row_gate,
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -947,6 +1064,10 @@ def apply_sae_delta_indexed_op_fake(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated_table: torch.Tensor | None = None,
+    steering_row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)
@@ -973,6 +1094,10 @@ def apply_sae_delta(
     clamp_only_if_active: torch.Tensor,
     any_active: torch.Tensor | None = None,
     threshold: torch.Tensor | None = None,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Public Python API for the SAE feature-surgery delta op.
 
@@ -1007,6 +1132,19 @@ def apply_sae_delta(
             aligned with the encoder rows.  Required for JumpReLU;
             for ReLU/TopK a zero-filled vector is synthesized when
             omitted (the op reads it only under the JumpReLU branch).
+        clamp_row_gated: Optional ``(n_tokens,)`` fp32 monitor-gate
+            participation per token (1.0 = the token's clamps scale by
+            ``row_gate``, 0.0 = full strength).  ``None`` means ungated.
+        row_gate: Optional ``(n_tokens,)`` fp32 shared per-token row
+            gate.  The clamp delta is scaled by ``g = 1 -
+            clamp_row_gated[t] * (1 - row_gate[t])``.  When either
+            gating tensor is ``None`` the missing one defaults to the
+            no-op value (participation 0 / gate 1), so the output is
+            bit-identical to the pre-``gated`` behaviour.
+        encoder_scale: ``(n_clamp,)`` fp32 per-row dequantization
+            scales; required when ``encoder_weight`` is fp8-stored
+            (``torch.float8_e4m3fn``), ignored otherwise.
+        decoder_scale: same, for ``decoder_weight``.
 
     Returns:
         ``hidden_states + Σ_i delta_i · W_dec[i]`` in the same dtype
@@ -1071,6 +1209,36 @@ def apply_sae_delta(
             )
         if threshold.dtype != torch.float32:
             raise ValueError(f"threshold must be torch.float32; got {threshold.dtype}.")
+    for name, t in (
+        ("clamp_row_gated", clamp_row_gated),
+        ("row_gate", row_gate),
+    ):
+        if t is None:
+            continue
+        if tuple(t.shape) != (n_tokens,):
+            raise ValueError(
+                f"{name} must be (n_tokens,) = ({n_tokens},); got {tuple(t.shape)}."
+            )
+        if t.dtype != torch.float32:
+            raise ValueError(f"{name} must be torch.float32; got {t.dtype}.")
+    for scale_name, weight, scale in (
+        ("encoder_scale", encoder_weight, encoder_scale),
+        ("decoder_scale", decoder_weight, decoder_scale),
+    ):
+        if weight.dtype == FP8_STORAGE_DTYPE and scale is None:
+            raise ValueError(
+                f"fp8-stored weights require a per-row {scale_name} tensor."
+            )
+        if scale is not None:
+            if tuple(scale.shape) != (n_clamp,):
+                raise ValueError(
+                    f"{scale_name} must be (n_clamp,) = ({n_clamp},); "
+                    f"got {tuple(scale.shape)}."
+                )
+            if scale.dtype != torch.float32:
+                raise ValueError(
+                    f"{scale_name} must be torch.float32; got {scale.dtype}."
+                )
 
     # n_clamp == 0 short-circuit: no features to clamp, no work to do.
     if n_clamp == 0:
@@ -1098,6 +1266,10 @@ def apply_sae_delta(
         any_active,
         code,
         param,
+        clamp_row_gated,
+        row_gate,
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -1141,6 +1313,18 @@ def apply_layer_sae_delta(
         return hidden_states
     n_tokens = hidden_states.shape[0]
     sae_index = module.sae_index[:n_tokens]  # type: ignore[union-attr]
+    # Shared per-token monitor row gate (maintained by the runner /
+    # in-graph monitor for the additive tier; SAE only consumes it).
+    # Buffer presence is static per process, so ``torch.compile``
+    # traces this as a constant branch; harnesses without steering
+    # buffers fall back to an all-ones gate (ungated behaviour).
+    row_gate_buf = getattr(module, "steering_row_gate", None)
+    if row_gate_buf is None:
+        row_gate = torch.ones(
+            n_tokens, dtype=torch.float32, device=hidden_states.device
+        )
+    else:
+        row_gate = row_gate_buf[:n_tokens]
     for record in tuple(slots):
         state = _sae_slot_state(module, hook_point, record)
         if state.encoder_weight.shape[0] == 0:
@@ -1160,6 +1344,10 @@ def apply_layer_sae_delta(
             state.any_active,
             code,
             param,
+            state.clamp_row_gated,
+            row_gate,
+            encoder_scale=state.encoder_scale,
+            decoder_scale=state.decoder_scale,
         )
     return hidden_states
 
@@ -1240,6 +1428,7 @@ def populate_sae_clamp_table(
     kind_table = state.clamp_kind
     value_table = state.clamp_value
     only_table = state.clamp_only_if_active
+    gated_table = state.clamp_row_gated
     any_active: torch.Tensor | None = state.any_active
     n_clamp = kind_table.shape[1]
     # Claimed spare slots reserve a wider table than the claiming
@@ -1257,14 +1446,17 @@ def populate_sae_clamp_table(
     kind_table[0].zero_()
     value_table[0].zero_()
     only_table[0].zero_()
+    gated_table[0].zero_()
     if worker_phase is None or worker_phase == "prefill":
         kind_table[1].zero_()
         value_table[1].zero_()
         only_table[1].zero_()
+        gated_table[1].zero_()
     if worker_phase is None or worker_phase == "decode":
         kind_table[2].zero_()
         value_table[2].zero_()
         only_table[2].zero_()
+        gated_table[2].zero_()
     if any_active is not None and worker_phase is None:
         any_active.zero_()
     hook_name = hook_point.value
@@ -1315,9 +1507,15 @@ def populate_sae_clamp_table(
     def _gather_entries_for_specs(
         specs_iter,
         row_phase: str,
-    ) -> list:
-        """Gather clamp entries for this site from the given specs tuple."""
+    ) -> tuple[list, bool]:
+        """Gather clamp entries for this site from the given specs tuple.
+
+        Returns ``(entries, any_gated)`` where ``any_gated`` is True
+        when at least one spec that contributed entries at this site
+        opted into monitor gating (``gated=True``).
+        """
         out: list = []
+        any_gated = False
         for spec in specs_iter:
             if spec.module_name != module_name:
                 continue
@@ -1327,21 +1525,28 @@ def populate_sae_clamp_table(
             if layer_map is None:
                 continue
             if layer_idx is None:
+                spec_entries: list = []
                 for entries in layer_map.values():
-                    out.extend(entries)
+                    spec_entries.extend(entries)
             else:
-                out.extend(layer_map.get(layer_idx, ()))
-        return out
+                spec_entries = list(layer_map.get(layer_idx, ()))
+            if spec_entries:
+                out.extend(spec_entries)
+                any_gated = any_gated or spec.gated
+        return out, any_gated
 
     def _apply_globals_to_row(row: int, row_phase: str) -> bool:
         """Write the global clamps for ``row_phase`` into ``row``."""
         global_specs = manager.global_specs_for_phase(row_phase)
         if not global_specs:
             return False
-        entries = _gather_entries_for_specs(global_specs, row_phase)
+        entries, any_gated = _gather_entries_for_specs(global_specs, row_phase)
         if not entries:
             return False
-        return _write_entries_to_row(row, entries)
+        written = _write_entries_to_row(row, entries)
+        if written and any_gated:
+            gated_table[row] = 1.0
+        return written
 
     global_rows = {"prefill": 1, "decode": 2}
     for global_phase, global_row in global_rows.items():
@@ -1356,13 +1561,20 @@ def populate_sae_clamp_table(
         # Default: zero this row at this site.  Then accumulate
         # globals first, followed by the request's own clamps.  Any
         # global/request collision is rejected instead of overwritten.
+        # Gate participation is per row: a row counts as gated when ANY
+        # spec that contributed clamp content to it (global or
+        # per-request) set ``gated=True`` — with a single per-row gate,
+        # mixing gated and ungated content in one row scales both.
         kind_table[row].zero_()
         value_table[row].zero_()
         only_table[row].zero_()
+        gated_table[row].zero_()
         if _apply_globals_to_row(row, row_phase):
             _mark_any_active()
-        entries = _gather_entries_for_specs(specs, row_phase)
+        entries, any_gated = _gather_entries_for_specs(specs, row_phase)
         if entries and _write_entries_to_row(row, entries, reject_existing=True):
+            if any_gated:
+                gated_table[row] = 1.0
             _mark_any_active()
 
 

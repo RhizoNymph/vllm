@@ -157,7 +157,15 @@ Features Index:
       are gated per-site by an active-row table and keyed by FR-only phase
       hashes. Both variants compose with the additive tier and reuse its
       admission, scheduler-capacity, TP/PP, and prefix-cache machinery, with
-      independent capacity pools per manager.
+      independent capacity pools per manager. Specs may opt into monitor
+      gating (gated=True): per-row gate-participation buffers scale the
+      clamp effect (delta scaled, FR clamp-blend; never the reconstruction)
+      by the shared steering_row_gate the in-graph monitor writes —
+      decode-only, prefill row gates stay 1.0.
+      independent capacity pools per manager. Modules can opt into fp8
+      (e4m3) weight-table storage with per-row fp32 scales via the manifest
+      field storage_dtype, halving weight memory versus bf16; quantization
+      happens worker-side at attach time.
     entry_points:
       - vllm/model_executor/layers/sae_steering.py (apply_layer_sae_delta)
       - vllm/model_executor/layers/sae_full_reconstruction.py (apply_layer_sae_full_reconstruction)
