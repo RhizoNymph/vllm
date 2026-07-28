@@ -53,6 +53,8 @@ def apply_sae_full_recon_triton(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """CUDA path for the SAE full-reconstruction op.
 
@@ -60,6 +62,12 @@ def apply_sae_full_recon_triton(
     on the active subset, and scatters the reconstructed rows back
     into a fresh output tensor.  Inactive tokens keep their original
     residual.
+
+    ``clamp_row_gated`` / ``row_gate`` are optional per-token fp32
+    ``(n_tokens,)`` monitor-gating tensors: the clamp-induced feature
+    delta blends as ``f_used = f + g * (f_clamped - f)`` with ``g = 1
+    - gated[t] * (1 - row_gate[t])``.  The reconstruction itself is
+    never gated.  ``None`` (either) means ungated.
 
     The math is identical to
     :func:`vllm.model_executor.layers.sae_full_reconstruction._apply_sae_full_reconstruction_eager`
@@ -132,6 +140,13 @@ def apply_sae_full_recon_triton(
         )
         apply_clamp = (kind_active != 0) & (~only_active | active_flag)
         new_f_subset = torch.where(apply_clamp, new_f, f_subset)
+        if clamp_row_gated is not None and row_gate is not None:
+            gated_active = clamp_row_gated.index_select(0, active_idx).to(
+                torch.float32
+            )
+            rgate_active = row_gate.index_select(0, active_idx).to(torch.float32)
+            g = 1.0 - gated_active * (1.0 - rgate_active)
+            new_f_subset = f_subset + g.unsqueeze(1) * (new_f_subset - f_subset)
         f = f.scatter(1, idx_2d, new_f_subset)
 
     # Decoder pass — back to compute dtype so cuBLAS dispatches to
@@ -196,6 +211,8 @@ def warmup_apply_sae_full_recon_kernel(
     )
     dummy_only = torch.zeros(n_active, max(n_clamp, 0), dtype=torch.bool, device=device)
     mask = torch.ones(n_active, dtype=torch.bool, device=device)
+    dummy_gated = torch.zeros(n_active, dtype=torch.float32, device=device)
+    dummy_rgate = torch.ones(n_active, dtype=torch.float32, device=device)
     apply_sae_full_recon_triton(
         dummy_h,
         dummy_W_enc,
@@ -210,4 +227,6 @@ def warmup_apply_sae_full_recon_kernel(
         mask,
         int(activation_code),
         float(activation_param),
+        dummy_gated,
+        dummy_rgate,
     )

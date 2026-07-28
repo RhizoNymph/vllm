@@ -116,6 +116,11 @@ HOOK_POINT_FR_CLAMP_VALUE_ATTR = hook_attrs("sae_fr_clamp_value", _FR_HOOKS)
 HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR = hook_attrs(
     "sae_fr_clamp_only_if_active", _FR_HOOKS
 )
+# Per-row monitor-gate participation, ``(n_rows,)`` fp32: 1.0 = the
+# row's CLAMP-induced feature delta scales by the shared
+# ``steering_row_gate[token]`` (a ``gated=True`` spec fed the row),
+# 0.0 = ungated.  The reconstruction itself is never gated.
+HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR = hook_attrs("sae_fr_clamp_row_gated", _FR_HOOKS)
 HOOK_POINT_FR_ROW_ACTIVE_ATTR = hook_attrs("sae_fr_row_active", _FR_HOOKS)
 # Clampable global feature indices for this site (constant per
 # manifest registration).
@@ -139,6 +144,7 @@ _FR_BUFFER_ATTR_TABLES: tuple[dict[SteeringHookPoint, str], ...] = (
     HOOK_POINT_FR_CLAMP_KIND_ATTR,
     HOOK_POINT_FR_CLAMP_VALUE_ATTR,
     HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR,
+    HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR,
     HOOK_POINT_FR_ROW_ACTIVE_ATTR,
     HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR,
 )
@@ -354,6 +360,13 @@ def register_sae_full_recon_buffers(
         torch.zeros(n_rows, n_clamp, dtype=torch.bool, device=device),
         persistent=False,
     )
+    # Per-row monitor-gate participation (0.0 = ungated).  Always
+    # registered so the op arity / graph topology stays fixed.
+    module.register_buffer(
+        HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR[hook_point],
+        torch.zeros(n_rows, dtype=torch.float32, device=device),
+        persistent=False,
+    )
     module.register_buffer(
         HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point],
         torch.zeros(n_rows, dtype=torch.bool, device=device),
@@ -521,6 +534,8 @@ def _apply_sae_full_reconstruction_eager(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized PyTorch eager body for the full-reconstruction op.
 
@@ -530,6 +545,13 @@ def _apply_sae_full_reconstruction_eager(
     ``activation_param`` for the registered torch op; JumpReLU's
     per-feature thresholds ride the ``(d_sae,)`` ``threshold``
     tensor, ignored otherwise).
+
+    ``clamp_row_gated`` / ``row_gate`` are optional per-token fp32
+    ``(n_tokens,)`` monitor-gating tensors.  They blend the CLAMP
+    effect only — ``f_used = f + g * (f_clamped - f)`` with ``g = 1 -
+    gated[t] * (1 - row_gate[t])`` — while the reconstruction itself
+    always applies to opted-in tokens.  ``None`` (either) means
+    ungated, bit-identical to the pre-``gated`` behaviour.
     """
     n_tokens = hidden_states.shape[0]
     n_clamp = clampable_features.shape[0]
@@ -567,6 +589,12 @@ def _apply_sae_full_reconstruction_eager(
         apply_clamp = (kind != CLAMP_KIND_NONE) & (~gated | active)
         new_f_subset = torch.where(apply_clamp, new_f, f_subset)
 
+        if clamp_row_gated is not None and row_gate is not None:
+            g = 1.0 - clamp_row_gated.to(torch.float32) * (
+                1.0 - row_gate.to(torch.float32)
+            )
+            new_f_subset = f_subset + g.unsqueeze(1) * (new_f_subset - f_subset)
+
         f = f.scatter(1, idx_2d, new_f_subset)
 
     f_compute = f.to(hidden_states.dtype)
@@ -590,6 +618,8 @@ def apply_sae_full_reconstruction_op(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Tensor-only entry registered as ``torch.ops.vllm.apply_sae_full_reconstruction``.
 
@@ -598,6 +628,10 @@ def apply_sae_full_reconstruction_op(
     :func:`_apply_sae_full_reconstruction_eager`.  The output is
     always a freshly allocated tensor with the same shape and dtype
     as ``hidden_states``.
+
+    ``clamp_row_gated`` / ``row_gate`` are optional per-token fp32
+    monitor-gating tensors blending the clamp effect only (see
+    :func:`_apply_sae_full_reconstruction_eager`).
 
     No shape validation is performed here — callers in this module
     (:func:`apply_sae_full_reconstruction`,
@@ -627,6 +661,8 @@ def apply_sae_full_reconstruction_op(
             recon_mask,
             int(activation_code),
             float(activation_param),
+            clamp_row_gated,
+            row_gate,
         )
     return _apply_sae_full_reconstruction_eager(
         hidden_states,
@@ -642,6 +678,8 @@ def apply_sae_full_reconstruction_op(
         recon_mask,
         int(activation_code),
         float(activation_param),
+        clamp_row_gated,
+        row_gate,
     )
 
 
@@ -659,6 +697,8 @@ def apply_sae_full_reconstruction_op_fake(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)
@@ -688,6 +728,8 @@ def apply_sae_full_reconstruction_out_op(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
 ) -> None:
     """Out-variant registered as ``torch.ops.vllm.apply_sae_full_reconstruction_out``.
 
@@ -715,6 +757,8 @@ def apply_sae_full_reconstruction_out_op(
             recon_mask,
             activation_code,
             activation_param,
+            clamp_row_gated,
+            row_gate,
         )
     )
 
@@ -734,6 +778,8 @@ def apply_sae_full_reconstruction_out_op_fake(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
 ) -> None:
     """FX-tracing fake — pure mutation, nothing to return."""
     return None
@@ -762,6 +808,8 @@ def apply_sae_full_reconstruction(
     clamp_only_if_active: torch.Tensor,
     recon_mask: torch.Tensor,
     threshold: torch.Tensor | None = None,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Public Python API for the SAE full-reconstruction op.
 
@@ -793,6 +841,15 @@ def apply_sae_full_reconstruction(
             Required for JumpReLU; for ReLU/TopK a zero-filled vector
             is synthesized when omitted (the op reads it only under
             the JumpReLU branch).
+        clamp_row_gated: Optional ``(n_tokens,)`` fp32 monitor-gate
+            participation per token (1.0 = the token's clamp effect
+            blends by ``row_gate``, 0.0 = full strength).
+        row_gate: Optional ``(n_tokens,)`` fp32 shared per-token row
+            gate.  The clamp-induced feature delta blends as ``f_used
+            = f + g * (f_clamped - f)`` with ``g = 1 -
+            clamp_row_gated[t] * (1 - row_gate[t])``; the
+            reconstruction itself is never gated.  ``None`` (either)
+            means ungated.
 
     Returns:
         ``(n_tokens, d_model)`` tensor in the same dtype as
@@ -882,6 +939,19 @@ def apply_sae_full_reconstruction(
             )
         if threshold.dtype != torch.float32:
             raise ValueError(f"threshold must be torch.float32; got {threshold.dtype}.")
+    for name, t in (
+        ("clamp_row_gated", clamp_row_gated),
+        ("row_gate", row_gate),
+    ):
+        if t is None:
+            continue
+        if tuple(t.shape) != (n_tokens,):
+            raise ValueError(
+                f"{name} must be (n_tokens,) = ({n_tokens},); "
+                f"got {tuple(t.shape)}."
+            )
+        if t.dtype != torch.float32:
+            raise ValueError(f"{name} must be torch.float32; got {t.dtype}.")
 
     if n_clamp > 0 and not clampable_features.is_cuda:
         min_feature = int(clampable_features.min().item())
@@ -927,6 +997,8 @@ def apply_sae_full_reconstruction(
         recon_mask,
         code,
         param,
+        clamp_row_gated,
+        row_gate,
     )
 
 
@@ -964,6 +1036,21 @@ def apply_layer_sae_full_reconstruction(
     recon_index = recon_index_full[:n_tokens]
     active_table = getattr(module, HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point])
     recon_mask = active_table[recon_index]
+    # Monitor gating inputs: per-token gate participation gathered from
+    # this site's per-row table, plus the shared row gate maintained by
+    # the runner / in-graph monitor (SAE only consumes it).  Row-gate
+    # buffer presence is static per process (traced as a constant
+    # branch); harnesses without steering buffers fall back to an
+    # all-ones gate (ungated behaviour).
+    gated_table = getattr(module, HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR[hook_point])
+    clamp_row_gated = gated_table[recon_index]
+    row_gate_buf = getattr(module, "steering_row_gate", None)
+    if row_gate_buf is None:
+        row_gate = torch.ones(
+            n_tokens, dtype=torch.float32, device=hidden_states.device
+        )
+    else:
+        row_gate = row_gate_buf[:n_tokens]
 
     enc_w = getattr(module, HOOK_POINT_FR_ENCODER_WEIGHT_ATTR[hook_point])
     enc_b = getattr(module, HOOK_POINT_FR_ENCODER_BIAS_ATTR[hook_point])
@@ -1011,6 +1098,8 @@ def apply_layer_sae_full_reconstruction(
         recon_mask,
         code,
         param,
+        clamp_row_gated,
+        row_gate,
     )
     return out
 
@@ -1074,6 +1163,7 @@ def populate_sae_full_recon_clamp_table(
     kind_table = getattr(module, HOOK_POINT_FR_CLAMP_KIND_ATTR[hook_point])
     value_table = getattr(module, HOOK_POINT_FR_CLAMP_VALUE_ATTR[hook_point])
     only_table = getattr(module, HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR[hook_point])
+    gated_table = getattr(module, HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR[hook_point])
     active_table = getattr(module, HOOK_POINT_FR_ROW_ACTIVE_ATTR[hook_point])
     n_clamp = kind_table.shape[1]
     if len(clampable_features) != n_clamp:
@@ -1087,6 +1177,7 @@ def populate_sae_full_recon_clamp_table(
     kind_table[0].zero_()
     value_table[0].zero_()
     only_table[0].zero_()
+    gated_table[0].zero_()
     active_table[0].zero_()
     hook_name = hook_point.value
     for row, _config_hash, row_phase, specs in manager.active_rows():
@@ -1095,6 +1186,7 @@ def populate_sae_full_recon_clamp_table(
         kind_table[row].zero_()
         value_table[row].zero_()
         only_table[row].zero_()
+        gated_table[row].zero_()
         active_table[row].zero_()
         for spec in specs:
             if spec.module_name != module_name:
@@ -1102,6 +1194,12 @@ def populate_sae_full_recon_clamp_table(
             if spec.phase != "both" and spec.phase != row_phase:
                 continue
             active_table[row].fill_(True)
+            if spec.gated:
+                # Row participates in monitor gating: the clamp-induced
+                # feature delta scales by the shared row gate.  A
+                # pure-reconstruction spec's ``gated`` is inert (no
+                # clamp effect to gate).
+                gated_table[row] = 1.0
             layer_map = spec.clamps.get(hook_name)
             if layer_map is None:
                 # Empty clamps for this hook — row stays zeroed; the
@@ -1153,6 +1251,7 @@ __all__ = [
     "HOOK_POINT_FR_CLAMPABLE_FEATURES_ATTR",
     "HOOK_POINT_FR_CLAMP_KIND_ATTR",
     "HOOK_POINT_FR_CLAMP_ONLY_IF_ACTIVE_ATTR",
+    "HOOK_POINT_FR_CLAMP_ROW_GATED_ATTR",
     "HOOK_POINT_FR_CLAMP_VALUE_ATTR",
     "HOOK_POINT_FR_DECODER_BIAS_ATTR",
     "HOOK_POINT_FR_DECODER_WEIGHT_ATTR",
