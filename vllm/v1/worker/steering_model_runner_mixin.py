@@ -3390,6 +3390,7 @@ class SteeringModelRunnerMixin:
             return {
                 "module_name": spec.module_name,
                 "phase": spec.phase,
+                "gated": spec.gated,
                 "clamps": {
                     hook_name: {
                         str(layer_idx): [

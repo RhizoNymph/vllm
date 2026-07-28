@@ -106,6 +106,8 @@ def _apply_sae_delta_kernel(
     kind_ptr,
     value_ptr,
     only_ptr,
+    gated_ptr,
+    rgate_ptr,
     any_active_ptr,
     out_ptr,
     N,
@@ -127,6 +129,8 @@ def _apply_sae_delta_kernel(
     value_stride_c,
     only_stride_n,
     only_stride_c,
+    gated_stride_n,
+    rgate_stride_n,
     out_stride_n,
     out_stride_h,
     activation_param,
@@ -135,7 +139,13 @@ def _apply_sae_delta_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    """Compute one token row of the SAE feature-surgery delta op."""
+    """Compute one token row of the SAE feature-surgery delta op.
+
+    ``gated_ptr`` / ``rgate_ptr`` are per-token fp32 monitor-gating
+    inputs: the clamp delta is scaled by ``g = 1 - gated[t] * (1 -
+    row_gate[t])`` — branchless, so ungated tokens (``gated == 0``)
+    keep full strength regardless of the shared row gate.
+    """
     pid = tl.program_id(axis=0)
     if pid >= N:
         return
@@ -258,6 +268,12 @@ def _apply_sae_delta_kernel(
     apply_clamp = (kind_t != 0) & ((only_t == 0) | active_for_gate) & c_mask
     delta = tl.where(apply_clamp, new_f - f, 0.0)
 
+    # Monitor gating: scale the clamp delta by the effective per-token
+    # gate. gated == 0 ⇒ g == 1 exactly (full strength).
+    gated_v = tl.load(gated_ptr + pid * gated_stride_n).to(tl.float32)
+    rgate_v = tl.load(rgate_ptr + pid * rgate_stride_n).to(tl.float32)
+    delta = delta * (1.0 - gated_v * (1.0 - rgate_v))
+
     # Pass 2: write hidden + (delta @ W_dec).  The decoder rows are
     # streamed in the same BLOCK_H tiles as the encoder pass; each tile
     # contracts the BLOCK_C clamp axis so the per-token output row is
@@ -299,6 +315,8 @@ def _apply_sae_delta_indexed_kernel(
     kind_table_ptr,
     value_table_ptr,
     only_table_ptr,
+    gated_table_ptr,
+    rgate_ptr,
     index_ptr,
     any_active_ptr,
     out_ptr,
@@ -321,6 +339,8 @@ def _apply_sae_delta_indexed_kernel(
     value_stride_c,
     only_stride_r,
     only_stride_c,
+    gated_stride_r,
+    rgate_stride_n,
     index_stride,
     out_stride_n,
     out_stride_h,
@@ -335,6 +355,11 @@ def _apply_sae_delta_indexed_kernel(
     The first operation is the ``any_active`` check.  In the common
     registered-but-idle case this copies the residual and returns without
     loading the clamp tables or the row-index buffer.
+
+    ``gated_table_ptr`` is the per-row ``(n_rows,)`` fp32 monitor-gate
+    participation table; ``rgate_ptr`` the shared per-token row gate.
+    The clamp delta scales by ``g = 1 - gated[row] * (1 -
+    row_gate[token])`` — branchless, gated rows only.
     """
     pid = tl.program_id(axis=0)
     if pid >= N:
@@ -437,6 +462,11 @@ def _apply_sae_delta_indexed_kernel(
     active_for_gate = tl.where(ACTIVATION_CODE == 2, f != 0.0, f > 0.0)
     apply_clamp = (kind_t != 0) & ((only_t == 0) | active_for_gate) & c_mask
     delta = tl.where(apply_clamp, new_f - f, 0.0)
+
+    # Monitor gating: g == 1 exactly for ungated rows (gated == 0).
+    gated_v = tl.load(gated_table_ptr + row * gated_stride_r).to(tl.float32)
+    rgate_v = tl.load(rgate_ptr + pid * rgate_stride_n).to(tl.float32)
+    delta = delta * (1.0 - gated_v * (1.0 - rgate_v))
 
     for h_off in range(0, H, BLOCK_H):
         h_idx = h_off + tl.arange(0, BLOCK_H)
@@ -554,6 +584,8 @@ def apply_sae_delta_triton(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
     encoder_scale: torch.Tensor | None = None,
     decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -564,7 +596,11 @@ def apply_sae_delta_triton(
     float parameter; see :mod:`sae_steering` for the encoding).
     ``threshold`` carries the per-feature JumpReLU thresholds
     (``(n_clamp,)`` fp32); it is loaded only under the JumpReLU
-    specialisation.  ``encoder_scale`` / ``decoder_scale`` carry the
+    specialisation.  ``clamp_row_gated`` / ``row_gate`` are optional
+    per-token fp32 ``(n_tokens,)`` monitor-gating inputs; ``None``
+    synthesizes the no-op values (participation 0 / gate 1), keeping
+    ungated launches bit-identical.  ``encoder_scale`` /
+    ``decoder_scale`` carry the
     per-row dequantization scales for fp8-stored weights; the launch
     views the fp8 tensors as uint8 and the kernel decodes them
     bitwise (:func:`_decode_fp8_e4m3`) and multiplies by the row
@@ -602,6 +638,8 @@ def apply_sae_delta_triton(
             any_active,
             activation_code,
             activation_param,
+            clamp_row_gated,
+            row_gate,
             encoder_scale=encoder_scale,
             decoder_scale=decoder_scale,
         )
@@ -612,6 +650,15 @@ def apply_sae_delta_triton(
     h_size = hidden_states.shape[1]
     block_h = _choose_block_h(h_size)
     block_c = _choose_block_c(n_clamp)
+
+    if clamp_row_gated is None:
+        clamp_row_gated = torch.zeros(
+            n_tokens, dtype=torch.float32, device=hidden_states.device
+        )
+    if row_gate is None:
+        row_gate = torch.ones(
+            n_tokens, dtype=torch.float32, device=hidden_states.device
+        )
 
     # Bool tensors map to 1-byte storage; ``view(int8)`` is zero-copy
     # and lets Triton load into an int8 register (operands cast to int32
@@ -629,6 +676,8 @@ def apply_sae_delta_triton(
         clamp_kind,
         clamp_value,
         only_int,
+        clamp_row_gated,
+        row_gate,
         any_active,
         out,
         n_tokens,
@@ -650,6 +699,8 @@ def apply_sae_delta_triton(
         clamp_value.stride(1),
         only_int.stride(0),
         only_int.stride(1),
+        clamp_row_gated.stride(0),
+        row_gate.stride(0),
         out.stride(0),
         out.stride(1),
         float(activation_param),
@@ -674,10 +725,18 @@ def apply_sae_delta_indexed_triton(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated_table: torch.Tensor | None = None,
+    steering_row_gate: torch.Tensor | None = None,
     encoder_scale: torch.Tensor | None = None,
     decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """CUDA layer-hook path that gathers clamp rows inside the kernel."""
+    """CUDA layer-hook path that gathers clamp rows inside the kernel.
+
+    ``clamp_row_gated_table`` (per-row ``(n_rows,)`` fp32) and
+    ``steering_row_gate`` (shared per-token fp32) drive monitor gating;
+    ``None`` synthesizes the no-op values so ungated launches stay
+    bit-identical.
+    """
     out = torch.empty_like(hidden_states)
     n_tokens = hidden_states.shape[0]
     if n_tokens == 0:
@@ -700,6 +759,12 @@ def apply_sae_delta_indexed_triton(
         raw_idx = sae_index[:n_tokens]
         fallback_idx = raw_idx.clamp(0, clamp_kind_table.shape[0] - 1)
         idx = torch.where(any_active.to(torch.bool).view(1), raw_idx, fallback_idx)
+        clamp_row_gated = (
+            clamp_row_gated_table[idx] if clamp_row_gated_table is not None else None
+        )
+        row_gate = (
+            steering_row_gate[:n_tokens] if steering_row_gate is not None else None
+        )
         return _apply_sae_delta_eager(
             hidden_states,
             encoder_weight,
@@ -712,6 +777,8 @@ def apply_sae_delta_indexed_triton(
             any_active,
             activation_code,
             activation_param,
+            clamp_row_gated,
+            row_gate,
             encoder_scale=encoder_scale,
             decoder_scale=decoder_scale,
         )
@@ -724,6 +791,17 @@ def apply_sae_delta_indexed_triton(
     block_c = _choose_block_c(n_clamp)
     only_int = clamp_only_if_active_table.view(torch.int8)
 
+    if clamp_row_gated_table is None:
+        clamp_row_gated_table = torch.zeros(
+            clamp_kind_table.shape[0],
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+    if steering_row_gate is None:
+        steering_row_gate = torch.ones(
+            n_tokens, dtype=torch.float32, device=hidden_states.device
+        )
+
     _apply_sae_delta_indexed_kernel[(n_tokens,)](
         hidden_states,
         enc_w,
@@ -735,6 +813,8 @@ def apply_sae_delta_indexed_triton(
         clamp_kind_table,
         clamp_value_table,
         only_int,
+        clamp_row_gated_table,
+        steering_row_gate,
         sae_index,
         any_active,
         out,
@@ -757,6 +837,8 @@ def apply_sae_delta_indexed_triton(
         clamp_value_table.stride(1),
         only_int.stride(0),
         only_int.stride(1),
+        clamp_row_gated_table.stride(0),
+        steering_row_gate.stride(0),
         sae_index.stride(0),
         out.stride(0),
         out.stride(1),
@@ -816,6 +898,8 @@ def warmup_apply_sae_delta_kernel(
     dummy_only = torch.zeros(1, n_clamp, dtype=torch.bool, device=device)
     dummy_any_active = torch.zeros(1, dtype=torch.bool, device=device)
     dummy_index = torch.zeros(1, dtype=torch.long, device=device)
+    dummy_gated = torch.zeros(1, dtype=torch.float32, device=device)
+    dummy_rgate = torch.ones(1, dtype=torch.float32, device=device)
 
     def drive(n: int) -> None:
         apply_sae_delta_triton(
@@ -830,6 +914,8 @@ def warmup_apply_sae_delta_kernel(
             dummy_any_active,
             activation_code,
             activation_param,
+            dummy_gated[:n],
+            dummy_rgate[:n],
             encoder_scale=dummy_scale,
             decoder_scale=dummy_scale,
         )
@@ -846,6 +932,8 @@ def warmup_apply_sae_delta_kernel(
             dummy_any_active,
             activation_code,
             activation_param,
+            dummy_gated,
+            dummy_rgate[:n],
             encoder_scale=dummy_scale,
             decoder_scale=dummy_scale,
         )

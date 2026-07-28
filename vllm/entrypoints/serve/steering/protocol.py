@@ -63,7 +63,7 @@ class SetSAEGlobalClampsRequest(BaseModel):
         default=None,
         description="JSON-shape SAE clamp specs installed into the "
         "global prefill tier (applied to every prefill token). Each "
-        "entry is {module_name, phase?, clamps: {hook: {layer: "
+        "entry is {module_name, phase?, gated?, clamps: {hook: {layer: "
         "[{feature_idx, kind, value, only_if_active?}]}}}. None "
         "leaves the existing prefill globals untouched.",
     )

@@ -84,6 +84,7 @@ def _apply_sae_full_recon_kernel(
     value_ptr,
     only_ptr,
     mask_ptr,
+    gate_ptr,
     acc_ptr,
     out_ptr,
     N,
@@ -109,6 +110,7 @@ def _apply_sae_full_recon_kernel(
     only_stride_n,
     only_stride_c,
     mask_stride,
+    gate_stride,
     acc_stride_n,
     acc_stride_h,
     out_stride_n,
@@ -144,6 +146,10 @@ def _apply_sae_full_recon_kernel(
             tl.float32
         )
         tl.store(acc_row_ptr + h_idx * acc_stride_h, b_vals, mask=h_mask)
+
+    # Per-token monitor gate (1.0 = full clamp strength).  Scales only
+    # the clamp-induced feature delta below — never the reconstruction.
+    g_tok = tl.load(gate_ptr + pid * gate_stride).to(tl.float32)
 
     # Per-token clamp state, register-resident across the feature sweep.
     c_idx = tl.arange(0, BLOCK_C)
@@ -227,7 +233,7 @@ def _apply_sae_full_recon_kernel(
             tl.where(kind_t == 2, f_at + value_t, f_at),
         )
         apply_c = in_tile & (kind_t != 0) & ((only_t == 0) | active_for_gate)
-        delta_c = tl.where(apply_c, new_f - f_at, 0.0)
+        delta_c = tl.where(apply_c, (new_f - f_at) * g_tok, 0.0)
         f_tile += tl.sum(tl.where(sel, delta_c[:, None], 0.0), axis=0)
 
         # Decoder pass: accumulate this tile's contribution into the
@@ -314,10 +320,19 @@ def apply_sae_full_recon_triton(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    clamp_row_gated: torch.Tensor | None = None,
+    row_gate: torch.Tensor | None = None,
     encoder_scale: torch.Tensor | None = None,
     decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """CUDA path for the SAE full-reconstruction op (capture-safe).
+
+    ``clamp_row_gated`` / ``row_gate`` are optional per-token fp32
+    ``(n_tokens,)`` monitor-gating tensors; the clamp-induced feature
+    delta is scaled by ``g = 1 - gated[t] * (1 - row_gate[t])``.  The
+    reconstruction itself is never gated.  ``None`` (either) means
+    ungated — the kernel receives an all-ones gate, which is exactly
+    the legacy math.
 
     Launches the dense masked Triton kernel over the padded token
     batch; each program gates on its own ``recon_mask`` scalar, so
@@ -359,6 +374,8 @@ def apply_sae_full_recon_triton(
             recon_mask,
             activation_code,
             activation_param,
+            clamp_row_gated,
+            row_gate,
             encoder_scale=encoder_scale,
             decoder_scale=decoder_scale,
         )
@@ -369,6 +386,12 @@ def apply_sae_full_recon_triton(
     block_c = _choose_block_c(n_clamp)
     only_int = clamp_only_if_active.view(torch.int8)
     mask_int = recon_mask.view(torch.int8)
+    if clamp_row_gated is not None and row_gate is not None:
+        gate = 1.0 - clamp_row_gated.to(torch.float32) * (
+            1.0 - row_gate.to(torch.float32)
+        )
+    else:
+        gate = torch.ones(n_tokens, dtype=torch.float32, device=hidden_states.device)
     (
         weights_fp8,
         encoder_weight,
@@ -396,6 +419,7 @@ def apply_sae_full_recon_triton(
         clamp_value,
         only_int,
         mask_int,
+        gate,
         acc,
         out,
         n_tokens,
@@ -421,6 +445,7 @@ def apply_sae_full_recon_triton(
         only_int.stride(0),
         only_int.stride(1),
         mask_int.stride(0),
+        gate.stride(0),
         acc.stride(0),
         acc.stride(1),
         out.stride(0),

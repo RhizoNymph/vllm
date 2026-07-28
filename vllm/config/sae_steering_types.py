@@ -166,11 +166,19 @@ class SAEClampSpec:
     clamps can be limited to prefill or decode, mirroring the
     additive three-tier model.  Phase ``"both"`` applies the clamps
     in both phases.
+
+    ``gated`` opts the spec's clamp rows into the shared in-graph
+    monitor row gate: the worker scales the clamp's decoder-direction
+    delta by ``steering_row_gate[token]`` (decode tokens only — the
+    runner keeps prefill row gates at 1.0 so prefill rows, which feed
+    prefix-cache keys, are never gated).  Default ``False`` keeps the
+    pre-``gated`` behaviour bit-for-bit.
     """
 
     module_name: str
     clamps: SAEClampHookMap
     phase: SAEClampPhase = "both"
+    gated: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.module_name, str) or not self.module_name:
@@ -182,6 +190,10 @@ class SAEClampSpec:
             raise ValueError(
                 "SAEClampSpec.phase must be 'both', 'prefill', or 'decode', "
                 f"got {self.phase!r}."
+            )
+        if not isinstance(self.gated, bool):
+            raise ValueError(
+                f"SAEClampSpec.gated must be a bool, got {type(self.gated).__name__}."
             )
         if not isinstance(self.clamps, dict) or not self.clamps:
             raise ValueError(
@@ -297,6 +309,12 @@ def coerce_sae_clamp_specs(
             )
         module_name: str = module_name_raw
         phase = item.get("phase", "both")
+        gated = item.get("gated", False)
+        if not isinstance(gated, bool):
+            raise ValueError(
+                f"sae_clamp_specs[{i}]['gated'] must be a bool, got "
+                f"{type(gated).__name__}."
+            )
         clamps_raw = item.get("clamps")
         if clamps_raw is None:
             raise ValueError(f"sae_clamp_specs[{i}] missing required 'clamps' field.")
@@ -351,7 +369,11 @@ def coerce_sae_clamp_specs(
                 entries = tuple(_coerce_clamp_entry(e) for e in entries_raw)
                 layer_map[layer_idx] = entries
             clamps[hook_name] = layer_map
-        out.append(SAEClampSpec(module_name=module_name, phase=phase, clamps=clamps))
+        out.append(
+            SAEClampSpec(
+                module_name=module_name, phase=phase, clamps=clamps, gated=gated
+            )
+        )
     validate_sae_clamp_specs_no_overlap(tuple(out))
     return tuple(out)
 
@@ -459,6 +481,10 @@ def _hash_sae_clamp_specs_with_phase(
         h.update(b"\x01module\x01")
         h.update(spec.module_name.encode("utf-8"))
         h.update((phase_override or spec.phase).encode("utf-8"))
+        # Fold ``gated`` only when set so ungated specs keep the exact
+        # pre-``gated`` digests (prefix-cache back-compat).
+        if spec.gated:
+            h.update(b"\x05gated\x05")
         for hook_name in sorted(spec.clamps.keys()):
             h.update(b"\x02hook\x02")
             h.update(hook_name.encode("utf-8"))
@@ -517,7 +543,7 @@ def _sae_spec_sort_key(
     spec: SAEClampSpec,
     *,
     phase_override: Literal["prefill", "decode"] | None = None,
-) -> tuple[str, str, tuple[Any, ...]]:
+) -> tuple[str, str, bool, tuple[Any, ...]]:
     """Canonical ordering key for SAE specs.
 
     Requests may carry multiple non-overlapping specs for the same
@@ -547,7 +573,12 @@ def _sae_spec_sort_key(
             )
             layer_items.append((layer_idx, entries))
         hook_items.append((hook_name, tuple(layer_items)))
-    return (spec.module_name, phase_override or spec.phase, tuple(hook_items))
+    return (
+        spec.module_name,
+        phase_override or spec.phase,
+        spec.gated,
+        tuple(hook_items),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +624,12 @@ class SAEFullReconstructionSpec:
     module_name: str
     clamps: SAEClampHookMap = field(default_factory=dict)
     phase: SAEClampPhase = "both"
+    gated: bool = False
+    """Opt the spec's clamp rows into the shared monitor row gate: the
+    clamp-induced feature delta is scaled by ``steering_row_gate[token]``
+    before the decoder pass (decode-only; prefill row gates stay 1.0).
+    The reconstruction itself is never gated — ``gated`` on a
+    pure-reconstruction spec (empty ``clamps``) has no effect."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.module_name, str) or not self.module_name:
@@ -604,6 +641,11 @@ class SAEFullReconstructionSpec:
             raise ValueError(
                 "SAEFullReconstructionSpec.phase must be 'both', 'prefill', "
                 f"or 'decode', got {self.phase!r}."
+            )
+        if not isinstance(self.gated, bool):
+            raise ValueError(
+                "SAEFullReconstructionSpec.gated must be a bool, "
+                f"got {type(self.gated).__name__}."
             )
         if not isinstance(self.clamps, dict):
             raise ValueError(
@@ -697,6 +739,12 @@ def coerce_sae_full_reconstruction_specs(
             )
         module_name: str = module_name_raw
         phase = item.get("phase", "both")
+        gated = item.get("gated", False)
+        if not isinstance(gated, bool):
+            raise ValueError(
+                f"sae_full_reconstruction_specs[{i}]['gated'] must be a "
+                f"bool, got {type(gated).__name__}."
+            )
         clamps_raw = item.get("clamps") or {}
         if not isinstance(clamps_raw, dict):
             raise ValueError(
@@ -777,6 +825,7 @@ def coerce_sae_full_reconstruction_specs(
                 module_name=module_name,
                 clamps=clamps,
                 phase=phase,
+                gated=gated,
             )
         )
     return tuple(out)
@@ -809,10 +858,17 @@ def _hash_sae_full_reconstruction_specs_with_phase(
     """Hash *specs*, optionally replacing each spec phase in the digest."""
     h = hashlib.sha256()
     h.update(b"\x00sae_full_recon\x00")
-    for spec in sorted(specs, key=lambda s: (s.module_name, phase_override or s.phase)):
+    for spec in sorted(
+        specs,
+        key=lambda s: (s.module_name, phase_override or s.phase, s.gated),
+    ):
         h.update(b"\x01module\x01")
         h.update(spec.module_name.encode("utf-8"))
         h.update((phase_override or spec.phase).encode("utf-8"))
+        # Fold ``gated`` only when set so ungated specs keep the exact
+        # pre-``gated`` digests (prefix-cache back-compat).
+        if spec.gated:
+            h.update(b"\x05gated\x05")
         for hook_name in sorted(spec.clamps.keys()):
             h.update(b"\x02hook\x02")
             h.update(hook_name.encode("utf-8"))

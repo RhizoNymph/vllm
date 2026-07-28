@@ -1089,11 +1089,13 @@ mod tests {
                 )]),
             )]),
             phase: SaePhase::Both,
+            gated: false,
         };
         let recon_spec = SaeFullReconstructionSpec {
             module_name: "golden_gate_full".to_string(),
             clamps: HashMap::new(),
             phase: SaePhase::Decode,
+            gated: false,
         };
         let sampling_params = SamplingParams {
             sae_clamp_specs: Some(vec![clamp_spec.clone()]),

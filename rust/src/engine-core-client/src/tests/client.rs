@@ -2698,9 +2698,11 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     assert_eq!(entries[0].value, 5.0);
     assert!(!entries[0].only_if_active);
     assert!(entries[1].only_if_active);
+    assert!(spec.gated);
     let fr_specs = sae_sampling.sae_full_reconstruction_specs.expect("FR specs present");
     assert_eq!(fr_specs[0].module_name, "fr_mod");
     assert!(fr_specs[0].clamps.is_empty());
+    assert!(!fr_specs[0].gated);
     // Round-trip: Rust re-encodes to the same typed shape.
     let reencoded = crate::protocol::encode_msgpack(&decoded_sae).unwrap();
     let redecoded: EngineCoreRequest = rmp_serde::from_slice(&reencoded).unwrap();
