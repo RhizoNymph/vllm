@@ -741,9 +741,13 @@ def apply_sae_full_reconstruction_out_op(
     against fixed addresses, so a fresh per-call return tensor would
     leave the downstream piece reading the stale capture-time address.
     Mirrors ``unified_attention_with_output``.
+
+    The body routes through ``torch.ops.vllm.apply_sae_full_reconstruction``
+    (not the raw Python function) so the value op remains the single
+    dispatch surface for the FR math.
     """
     out.copy_(
-        apply_sae_full_reconstruction_op(
+        torch.ops.vllm.apply_sae_full_reconstruction(
             hidden_states,
             encoder_weight,
             encoder_bias,
