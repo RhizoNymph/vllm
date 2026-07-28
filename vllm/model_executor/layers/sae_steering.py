@@ -59,6 +59,10 @@ import torch
 from torch import nn
 
 from vllm.config.sae_steering_types import SAEActivation
+from vllm.model_executor.layers.sae_fp8 import (
+    FP8_STORAGE_DTYPE,
+    maybe_dequantize_rowwise,
+)
 from vllm.model_executor.layers.steering import SteeringHookPoint
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -164,6 +168,12 @@ SAE_DECODER_WEIGHT_BASE = "sae_decoder_weight"
 # clampable-features order.  Registered for every slot (zero-filled for
 # ReLU/TopK) so the op arity stays fixed across activations.
 SAE_THRESHOLD_BASE = "sae_threshold"
+# Per-row fp32 dequantization scales for fp8-stored weight tables
+# (``storage_dtype="fp8_e4m3"``), ``(n_clamp,)`` each.  Registered for
+# every slot — zero-filled and never read for compute-dtype slots — so
+# the op arity stays fixed across storage dtypes.
+SAE_ENCODER_SCALE_BASE = "sae_encoder_scale"
+SAE_DECODER_SCALE_BASE = "sae_decoder_scale"
 
 # All slot-suffixed buffer bases; used for registration and cleanup.
 _SAE_SLOT_BUFFER_BASES: tuple[str, ...] = (
@@ -175,6 +185,8 @@ _SAE_SLOT_BUFFER_BASES: tuple[str, ...] = (
     SAE_ENCODER_BIAS_BASE,
     SAE_DECODER_WEIGHT_BASE,
     SAE_THRESHOLD_BASE,
+    SAE_ENCODER_SCALE_BASE,
+    SAE_DECODER_SCALE_BASE,
 )
 
 
@@ -227,6 +239,8 @@ class SAESlotState:
     encoder_bias: torch.Tensor
     decoder_weight: torch.Tensor
     threshold: torch.Tensor
+    encoder_scale: torch.Tensor
+    decoder_scale: torch.Tensor
 
 
 def sae_site_slots(
@@ -252,6 +266,8 @@ def _sae_slot_state(
         encoder_bias=_buf(SAE_ENCODER_BIAS_BASE),
         decoder_weight=_buf(SAE_DECODER_WEIGHT_BASE),
         threshold=_buf(SAE_THRESHOLD_BASE),
+        encoder_scale=_buf(SAE_ENCODER_SCALE_BASE),
+        decoder_scale=_buf(SAE_DECODER_SCALE_BASE),
     )
 
 
@@ -305,13 +321,15 @@ def _slot_reuse_mismatch(
     n_clamp: int,
     hidden_size: int,
     max_sae_configs: int,
+    weight_dtype: torch.dtype | None = None,
 ) -> str | None:
     """Why ``record``'s existing slot can't serve this registration.
 
     Returns ``None`` when the slot's trace-time constants (activation
-    code/param, baked into the compiled graph per slot) and buffer
-    shapes match the incoming registration exactly, i.e. an in-place
-    zero-and-refill is behaviourally equivalent to a fresh slot.
+    code/param, baked into the compiled graph per slot), buffer shapes,
+    and weight storage dtype match the incoming registration exactly,
+    i.e. an in-place zero-and-refill is behaviourally equivalent to a
+    fresh slot.
     """
     if record.activation != activation:
         return (
@@ -334,6 +352,8 @@ def _slot_reuse_mismatch(
     )
     if encoder is None or clamp_kind is None:
         return "existing slot is missing its buffers"
+    if weight_dtype is not None and encoder.dtype != weight_dtype:
+        return f"storage dtype {weight_dtype} != existing {encoder.dtype}"
     if tuple(encoder.shape) != (n_clamp, hidden_size):
         return (
             f"weight shape ({n_clamp}, {hidden_size}) != existing "
@@ -362,6 +382,7 @@ def register_sae_buffers(
     device: torch.device | None = None,
     allow_reuse: bool = False,
     spare: bool = False,
+    storage_dtype: torch.dtype | None = None,
 ) -> None:
     """Attach one SAE module's buffer slot at a ``(layer, hook)`` site.
 
@@ -395,9 +416,15 @@ def register_sae_buffers(
             happen after the model layer has already moved to its worker
             device, so callers should pass the device of an existing layer
             buffer to avoid attaching CPU SAE buffers to CUDA layers.
+        storage_dtype: optional storage dtype override for the big
+            weight tables (``torch.float8_e4m3fn`` for
+            ``storage_dtype="fp8_e4m3"`` manifests).  ``None`` stores
+            them in ``dtype``.  Biases, thresholds, and clamp tables
+            always keep their standard dtypes.
     """
     if max_sae_configs == 0:
         return
+    weight_dtype = storage_dtype if storage_dtype is not None else dtype
     slots_attr = _sae_slots_attr(hook_point)
     slots: list[SAESlotInfo] = list(getattr(module, slots_attr, ()))
     for record in slots:
@@ -413,6 +440,7 @@ def register_sae_buffers(
                 n_clamp=n_clamp,
                 hidden_size=hidden_size,
                 max_sae_configs=max_sae_configs,
+                weight_dtype=weight_dtype,
             )
             if mismatch is None:
                 _zero_slot_buffers(module, hook_point, record.slot_id)
@@ -470,7 +498,7 @@ def register_sae_buffers(
         # produces zero delta (safe default, fail-quiet).
         module.register_buffer(
             _sae_slot_attr(SAE_ENCODER_WEIGHT_BASE, hook_point, slot_id),
-            torch.zeros(n_clamp, hidden_size, dtype=dtype, device=device),
+            torch.zeros(n_clamp, hidden_size, dtype=weight_dtype, device=device),
             persistent=False,
         )
         module.register_buffer(
@@ -488,9 +516,18 @@ def register_sae_buffers(
         )
         module.register_buffer(
             _sae_slot_attr(SAE_DECODER_WEIGHT_BASE, hook_point, slot_id),
-            torch.zeros(n_clamp, hidden_size, dtype=dtype, device=device),
+            torch.zeros(n_clamp, hidden_size, dtype=weight_dtype, device=device),
             persistent=False,
         )
+        # Per-row dequantization scales for fp8-stored weights.  Always
+        # registered (zero-filled, never read for compute-dtype slots)
+        # so the layer-hook op call keeps a fixed argument set.
+        for scale_base in (SAE_ENCODER_SCALE_BASE, SAE_DECODER_SCALE_BASE):
+            module.register_buffer(
+                _sae_slot_attr(scale_base, hook_point, slot_id),
+                torch.zeros(n_clamp, dtype=torch.float32, device=device),
+                persistent=False,
+            )
     except Exception:
         # Partial failure: delete only the new slot's attrs.  Sibling
         # slots (other modules on this site) are untouched.
@@ -736,6 +773,8 @@ def _apply_sae_delta_eager(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized PyTorch eager body for the SAE feature-surgery op.
 
@@ -744,6 +783,9 @@ def _apply_sae_delta_eager(
     enum is encoded as ``activation_code`` / ``activation_param`` for
     the registered torch op; JumpReLU's per-feature thresholds ride
     the ``(n_clamp,)`` ``threshold`` tensor, ignored otherwise).
+    fp8-stored weights are dequantized up front with their per-row
+    scales (``q.to(fp32) * scale[row]``); the downstream math is
+    dtype-agnostic.
     """
     activation = _CODE_TO_ACTIVATION[int(activation_code)]
     activation_params = _scalar_to_activation_params(activation, activation_param)
@@ -754,6 +796,9 @@ def _apply_sae_delta_eager(
         or not bool(torch.any(clamp_kind != CLAMP_KIND_NONE))
     ):
         return hidden_states.clone()
+
+    encoder_weight = maybe_dequantize_rowwise(encoder_weight, encoder_scale)
+    decoder_weight = maybe_dequantize_rowwise(decoder_weight, decoder_scale)
 
     f = sae_encode(
         hidden_states,
@@ -801,6 +846,8 @@ def apply_sae_delta_op(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Tensor-only entry point registered as ``torch.ops.vllm.apply_sae_delta``.
 
@@ -834,6 +881,8 @@ def apply_sae_delta_op(
             any_active,
             int(activation_code),
             float(activation_param),
+            encoder_scale=encoder_scale,
+            decoder_scale=decoder_scale,
         )
     return _apply_sae_delta_eager(
         hidden_states,
@@ -847,6 +896,8 @@ def apply_sae_delta_op(
         any_active,
         int(activation_code),
         float(activation_param),
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -862,6 +913,8 @@ def apply_sae_delta_op_fake(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)
@@ -889,6 +942,8 @@ def apply_sae_delta_indexed_op(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Layer-hook op that indexes clamp tables inside the backend.
 
@@ -914,6 +969,8 @@ def apply_sae_delta_indexed_op(
             any_active,
             int(activation_code),
             float(activation_param),
+            encoder_scale=encoder_scale,
+            decoder_scale=decoder_scale,
         )
     if not any_active.is_cuda and not bool(any_active.item()):
         return hidden_states.clone()
@@ -931,6 +988,8 @@ def apply_sae_delta_indexed_op(
         any_active,
         int(activation_code),
         float(activation_param),
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -947,6 +1006,8 @@ def apply_sae_delta_indexed_op_fake(
     any_active: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FX-tracing fake — correct shape, no computation."""
     return torch.empty_like(hidden_states)
@@ -973,6 +1034,8 @@ def apply_sae_delta(
     clamp_only_if_active: torch.Tensor,
     any_active: torch.Tensor | None = None,
     threshold: torch.Tensor | None = None,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Public Python API for the SAE feature-surgery delta op.
 
@@ -1007,6 +1070,10 @@ def apply_sae_delta(
             aligned with the encoder rows.  Required for JumpReLU;
             for ReLU/TopK a zero-filled vector is synthesized when
             omitted (the op reads it only under the JumpReLU branch).
+        encoder_scale: ``(n_clamp,)`` fp32 per-row dequantization
+            scales; required when ``encoder_weight`` is fp8-stored
+            (``torch.float8_e4m3fn``), ignored otherwise.
+        decoder_scale: same, for ``decoder_weight``.
 
     Returns:
         ``hidden_states + Σ_i delta_i · W_dec[i]`` in the same dtype
@@ -1071,6 +1138,24 @@ def apply_sae_delta(
             )
         if threshold.dtype != torch.float32:
             raise ValueError(f"threshold must be torch.float32; got {threshold.dtype}.")
+    for scale_name, weight, scale in (
+        ("encoder_scale", encoder_weight, encoder_scale),
+        ("decoder_scale", decoder_weight, decoder_scale),
+    ):
+        if weight.dtype == FP8_STORAGE_DTYPE and scale is None:
+            raise ValueError(
+                f"fp8-stored weights require a per-row {scale_name} tensor."
+            )
+        if scale is not None:
+            if tuple(scale.shape) != (n_clamp,):
+                raise ValueError(
+                    f"{scale_name} must be (n_clamp,) = ({n_clamp},); "
+                    f"got {tuple(scale.shape)}."
+                )
+            if scale.dtype != torch.float32:
+                raise ValueError(
+                    f"{scale_name} must be torch.float32; got {scale.dtype}."
+                )
 
     # n_clamp == 0 short-circuit: no features to clamp, no work to do.
     if n_clamp == 0:
@@ -1098,6 +1183,8 @@ def apply_sae_delta(
         any_active,
         code,
         param,
+        encoder_scale=encoder_scale,
+        decoder_scale=decoder_scale,
     )
 
 
@@ -1160,6 +1247,8 @@ def apply_layer_sae_delta(
             state.any_active,
             code,
             param,
+            encoder_scale=state.encoder_scale,
+            decoder_scale=state.decoder_scale,
         )
     return hidden_states
 

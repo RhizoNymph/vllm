@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import torch
 
+from vllm.model_executor.layers.sae_fp8 import maybe_dequantize_rowwise
 from vllm.model_executor.layers.sae_steering import _topk_mask_lowest_indices
 
 
@@ -53,6 +54,8 @@ def apply_sae_full_recon_triton(
     recon_mask: torch.Tensor,
     activation_code: int,
     activation_param: float,
+    encoder_scale: torch.Tensor | None = None,
+    decoder_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """CUDA path for the SAE full-reconstruction op.
 
@@ -87,7 +90,10 @@ def apply_sae_full_recon_triton(
     # Encoder pass on the active subset.  Promote to fp32 for the
     # activation + clamp arithmetic so the numerics match the eager
     # body bit-identically (modulo the cuBLAS tile differences that
-    # affect the eager path too).
+    # affect the eager path too).  fp8-stored weights dequantize with
+    # their per-row scales first (``q.to(fp32) * scale[row]``).
+    encoder_weight = maybe_dequantize_rowwise(encoder_weight, encoder_scale)
+    decoder_weight = maybe_dequantize_rowwise(decoder_weight, decoder_scale)
     h_fp32 = h_active.to(torch.float32)
     enc_w_fp32 = encoder_weight.to(torch.float32)
     enc_b_fp32 = encoder_bias.to(torch.float32)
@@ -159,6 +165,7 @@ def warmup_apply_sae_full_recon_kernel(
     device: torch.device,
     activation_code: int = 0,
     activation_param: float = 0.0,
+    storage_dtype: torch.dtype | None = None,
 ) -> None:
     """Pre-warm the CUDA path so its first call lands outside any captured forward.
 
@@ -182,12 +189,17 @@ def warmup_apply_sae_full_recon_kernel(
         return
     if d_sae <= 0 or hidden_size <= 0:
         return
+    weight_dtype = storage_dtype if storage_dtype is not None else table_dtype
+    weights_fp8 = weight_dtype == torch.float8_e4m3fn
     n_active = 1
     dummy_h = torch.zeros(n_active, hidden_size, dtype=compute_dtype, device=device)
-    dummy_W_enc = torch.zeros(d_sae, hidden_size, dtype=table_dtype, device=device)
+    dummy_W_enc = torch.zeros(d_sae, hidden_size, dtype=weight_dtype, device=device)
     dummy_b_enc = torch.zeros(d_sae, dtype=table_dtype, device=device)
     dummy_threshold = torch.zeros(d_sae, dtype=torch.float32, device=device)
-    dummy_W_dec = torch.zeros(d_sae, hidden_size, dtype=table_dtype, device=device)
+    dummy_scale = (
+        torch.zeros(d_sae, dtype=torch.float32, device=device) if weights_fp8 else None
+    )
+    dummy_W_dec = torch.zeros(d_sae, hidden_size, dtype=weight_dtype, device=device)
     dummy_b_dec = torch.zeros(hidden_size, dtype=table_dtype, device=device)
     feats = torch.zeros(max(n_clamp, 0), dtype=torch.int64, device=device)
     dummy_kind = torch.zeros(n_active, max(n_clamp, 0), dtype=torch.int8, device=device)
@@ -210,4 +222,6 @@ def warmup_apply_sae_full_recon_kernel(
         mask,
         int(activation_code),
         float(activation_param),
+        encoder_scale=dummy_scale,
+        decoder_scale=dummy_scale,
     )
