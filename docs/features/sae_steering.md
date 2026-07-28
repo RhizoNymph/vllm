@@ -106,6 +106,7 @@ class SAEClampSpec:
     module_name: str
     clamps: dict[str, dict[int, tuple[SAEClampEntry, ...]]]  # hook -> layer -> entries
     phase: Literal["both", "prefill", "decode"] = "both"
+    gated: bool = False   # opt into the shared monitor row gate
 
 @dataclass(frozen=True)
 class SAEFullReconstructionSpec:
@@ -113,6 +114,7 @@ class SAEFullReconstructionSpec:
     module_name: str
     clamps: dict[str, dict[int, tuple[SAEClampEntry, ...]]] = ...
     phase: Literal["both", "prefill", "decode"] = "both"
+    gated: bool = False   # gates the clamp effect only, never the recon
 
 # vllm/entrypoints/openai/steering/registry.py
 @dataclass
@@ -430,6 +432,68 @@ workers report identical global state (500 on divergence).
 no-reconstruction sentinel and rows `1..max` are per-request. Its
 per-site active-row table is what distinguishes "row allocated" from
 "row applies at this site".
+
+## Monitor-Gated Clamps (`gated`)
+
+Both spec types — per-request and global, delta and FR — carry an
+optional boolean `gated` (default `False`, wire- and hash-back-compat:
+an ungated spec hashes and encodes exactly as before the field
+existed; `gated=True` folds a domain marker into the spec hashes so a
+gated spec never shares a manager row with its ungated twin). A gated
+spec's clamp effect is conditioned on the additive tier's **in-graph
+monitor**: the SAE ops consume the shared per-token
+`steering_row_gate` buffer (fp32 `(max_tokens,)`, default 1.0) that
+the runner resets to 1.0 every step and the cross-layer
+`steering_monitor` op reduces for decode tokens whose probe fires
+("clamp feature X only when the probe fires"). SAE never writes the
+gate — it is maintained entirely by the runner/monitor machinery in
+`steering.py` / `steering_monitor_kernel.py` /
+`steering_model_runner_mixin.py`.
+
+Mechanics:
+
+- **Per-row participation buffers.** Each delta slot registers a
+  `(n_rows,)` fp32 `sae_clamp_row_gated` buffer (part of
+  `_SAE_SLOT_BUFFER_BASES`, so spares, `_zero_slot_buffers`,
+  deactivate-only unregister and spare claiming all cover it); each FR
+  site registers `sae_fr_clamp_row_gated` (in
+  `_FR_BUFFER_ATTR_TABLES`). Always registered, zero-filled (ungated)
+  by default — graph topology is independent of whether any gated spec
+  is live. The populators write `1.0` into a row when any spec that
+  contributed clamp content to that row at that site set
+  `gated=True`; with a single per-row gate, mixing gated and ungated
+  specs in one row (e.g. an ungated global merged into a gated
+  request's row) scales both — use disjoint features/phases when that
+  matters.
+- **Delta kernel semantics.** Per token, `row = sae_index[token]`,
+  `g = 1 - gated[row] * (1 - row_gate[token])` (branchless: exactly
+  `row_gate[token]` for gated rows, exactly `1.0` for ungated rows),
+  and the decoder-direction delta is scaled: `h += g * (delta @
+  W_dec)`. The custom ops take the participation table and the row
+  gate as trailing optional tensor args (`None` = ungated, bit-for-bit
+  legacy behaviour); fake impls and the CPU fallback mirror this.
+- **FR semantics.** Gating blends the CLAMP effect only, never the
+  reconstruction: `f_used = f + g * (f_clamped - f)` before the
+  decoder pass, so `g = 0` yields the pure reconstruction (an
+  opted-in token is still fully reconstructed). `gated` on a
+  pure-reconstruction spec (empty clamps) is inert.
+- **Prefill is never gated, by construction.** The runner resets
+  `steering_row_gate` to 1.0 each step
+  (`_update_steering_buffers`), and the monitor multiplies it by
+  `mask·gate + (1 − mask)` with `steering_decode_mask = 0` for
+  prefill tokens — so prefill positions always read 1.0 and gated
+  clamps apply at full strength during prefill. Multiplying by
+  `row_gate[token]` therefore inherits the additive tier's
+  prefill-cache-safety invariant unchanged: prefix-cache keys (which
+  fold the spec hashes, including `gated`) stay deterministic.
+  Deployments without the additive monitor leave the buffer at its
+  default 1.0, so gated specs simply behave as ungated.
+- **Composition.** Gating rides the same shared buffer as additive
+  row gating, so one cross-layer monitor probe ("detect at layer L")
+  conditions additive rows and SAE clamps at all later layers/hooks
+  in the same forward. The fused same-hook monitor variant gates only
+  the additive op locally (it never writes the shared buffer) and
+  does not affect SAE clamps.
 
 ## Files
 
