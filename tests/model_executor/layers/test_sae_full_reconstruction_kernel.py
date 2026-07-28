@@ -588,10 +588,33 @@ class TestCudaParity:
             seed=42,
             dtype=torch.bfloat16,
         )
+        # Pre-activations here have std ~sqrt(d_model) >> the random
+        # thresholds, so bf16 input rounding alone can flip JumpReLU on
+        # borderline features between the two accumulation orders.  Push
+        # any threshold within 0.5 of a pre-activation safely below all
+        # of them so the comparison is deterministic.
+        pre = (
+            cpu_inputs["hidden_states"].float()
+            @ cpu_inputs["encoder_weight"].float().T
+            + cpu_inputs["encoder_bias"].float()
+        )
+        thr = cpu_inputs["threshold"]
+        margin = (pre - thr).abs().amin(dim=0)
+        cpu_inputs["threshold"] = torch.where(
+            margin < 0.5, pre.amin(dim=0) - 1.0, thr
+        )
         cpu_clamps = _random_clamps(n_tokens, n_clamp)
         recon_mask = torch.tensor([True, False, True, False])
+        # Reference in fp32 from the same bf16 inputs: the kernel
+        # accumulates fp32 end-to-end with a single output cast, while
+        # the eager body on bf16 tensors rounds every intermediate to
+        # bf16 — comparing against the latter measures the reference's
+        # rounding, not the kernel's.
         ref = apply_sae_full_reconstruction(
-            **cpu_inputs,
+            **{
+                k: v.float() if torch.is_floating_point(v) else v
+                for k, v in cpu_inputs.items()
+            },
             activation=SAEActivation.JUMPRELU,
             activation_params={},
             **cpu_clamps,
@@ -607,7 +630,7 @@ class TestCudaParity:
             activation_param=0.0,
         )
         assert got.dtype is torch.bfloat16
-        assert torch.allclose(got.cpu().float(), ref.float(), atol=5e-2, rtol=5e-2)
+        assert torch.allclose(got.cpu().float(), ref, atol=5e-2, rtol=1e-2)
         assert torch.equal(got.cpu()[1], cpu_inputs["hidden_states"][1])
 
 
