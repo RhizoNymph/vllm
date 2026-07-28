@@ -28,6 +28,7 @@ from vllm.config.sae_steering_types import (
 from vllm.model_executor.layers.sae_fp8 import (
     FP8_E4M3_MAX,
     FP8_STORAGE_DTYPE,
+    decode_fp8_e4m3_bitwise,
     dequantize_fp8_rowwise,
     maybe_dequantize_rowwise,
     quantize_fp8_rowwise,
@@ -133,6 +134,48 @@ class TestQuantizeRoundTrip:
             maybe_dequantize_rowwise(q, None)
         out = maybe_dequantize_rowwise(q, scale)
         assert out.dtype == torch.float32
+
+
+class TestBitwiseDecodeReference:
+    """Pin the bitwise e4m3 decode the Triton kernels use in-register.
+
+    Triton rejects the fp8e4nv dtype at JIT time on pre-sm89 CUDA
+    archs, so the kernels load fp8 weight bytes as uint8 and decode
+    bitwise; ``decode_fp8_e4m3_bitwise`` is the pure-torch mirror of
+    that decode.  Exhaustive over all 256 byte values against torch's
+    native conversion — this pins the decode once and for all.
+    """
+
+    def test_exhaustive_all_byte_values_match_native_cast(self):
+        v = torch.arange(256, dtype=torch.uint8)
+        q = v.view(FP8_STORAGE_DTYPE)
+        ref = q.to(torch.float32)
+        dec = decode_fp8_e4m3_bitwise(q)
+        # e4m3fn has exactly two NaN encodings (0x7F, 0xFF); the SAE
+        # quantizer clamps to ±448 so they never occur in storage, and
+        # the bitwise decode intentionally does not model them.
+        nan_mask = torch.isnan(ref)
+        assert nan_mask.sum().item() == 2
+        assert bool(nan_mask[0x7F]) and bool(nan_mask[0xFF])
+        torch.testing.assert_close(dec[~nan_mask], ref[~nan_mask], rtol=0, atol=0)
+
+    def test_accepts_uint8_input(self):
+        v = torch.arange(256, dtype=torch.uint8)
+        ref = v.view(FP8_STORAGE_DTYPE).to(torch.float32)
+        dec = decode_fp8_e4m3_bitwise(v)
+        nan_mask = torch.isnan(ref)
+        torch.testing.assert_close(dec[~nan_mask], ref[~nan_mask], rtol=0, atol=0)
+
+    def test_quantized_weights_never_hit_nan_encodings(self):
+        torch.manual_seed(5)
+        w = torch.randn(16, 32) * torch.logspace(-6, 6, 16).unsqueeze(1)
+        q, _ = quantize_fp8_rowwise(w)
+        raw = q.view(torch.uint8)
+        assert not bool(((raw == 0x7F) | (raw == 0xFF)).any())
+        # Decode therefore matches the native cast on every element.
+        torch.testing.assert_close(
+            decode_fp8_e4m3_bitwise(q), q.to(torch.float32), rtol=0, atol=0
+        )
 
 
 class TestResolveStorageDtype:

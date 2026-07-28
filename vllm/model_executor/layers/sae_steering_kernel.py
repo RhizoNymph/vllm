@@ -60,6 +60,41 @@ ACTIVATION_CODE_TOPK = 2
 
 
 @triton.jit
+def _decode_fp8_e4m3(v):
+    """Bitwise e4m3fn → fp32 decode of weight bytes loaded as uint8.
+
+    Universal fp8 path: Triton rejects the fp8e4nv dtype at JIT time on
+    pre-sm89 CUDA archs, so instead of an arch branch the wrappers view
+    fp8 weights as uint8 and every ``WEIGHTS_FP8`` specialisation
+    decodes in-register (the kernels are memory-bound; the extra ALU
+    ops are free).  Layout ``s eeee mmm`` (bias 7): normal (``e > 0``)
+    is ``±2^(e-7) · (1 + m/8)``; subnormal (``e == 0``) is
+    ``±2^-6 · (m/8)``.  The NaN encodings (``e == 15, m == 7``) need no
+    handling — they can never occur because ``quantize_fp8_rowwise``
+    clamps to ±448 before the fp8 cast.  Mirrored by the pure-torch
+    reference ``sae_fp8.decode_fp8_e4m3_bitwise``, which the test
+    suite pins exhaustively against torch's native conversion.
+
+    Args:
+        v: int32 tensor of raw e4m3fn bytes.
+
+    Returns:
+        fp32 tensor of the decoded values.
+    """
+    s = (v >> 7) & 1
+    e = (v >> 3) & 0xF
+    m = v & 0x7
+    ef = e.to(tl.float32)
+    mf = m.to(tl.float32)
+    val = tl.where(
+        e > 0,
+        tl.exp2(ef - 7.0) * (1.0 + mf * 0.125),
+        0.015625 * (mf * 0.125),
+    )
+    return tl.where(s != 0, -val, val)
+
+
+@triton.jit
 def _apply_sae_delta_kernel(
     hidden_ptr,
     enc_w_ptr,
@@ -162,11 +197,14 @@ def _apply_sae_delta_kernel(
         )
         enc_off = c_idx[:, None] * enc_stride_c + h_idx[None, :] * enc_stride_h
         enc_mask = c_mask[:, None] & h_mask[None, :]
-        enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
-            tl.float32
-        )
         if WEIGHTS_FP8:
-            enc_block = enc_block * enc_scale[:, None]
+            # fp8 weights arrive viewed as uint8; decode in-register.
+            enc_raw = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0).to(tl.int32)
+            enc_block = _decode_fp8_e4m3(enc_raw) * enc_scale[:, None]
+        else:
+            enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
+                tl.float32
+            )
         pre_acts += tl.sum(enc_block * h_vals[None, :], axis=1)
 
     # Apply activation function to obtain f.
@@ -231,11 +269,14 @@ def _apply_sae_delta_kernel(
 
         dec_off = c_idx[:, None] * dec_stride_c + h_idx[None, :] * dec_stride_h
         dec_mask = c_mask[:, None] & h_mask[None, :]
-        dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
-            tl.float32
-        )
         if WEIGHTS_FP8:
-            dec_block = dec_block * dec_scale[:, None]
+            # fp8 weights arrive viewed as uint8; decode in-register.
+            dec_raw = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0).to(tl.int32)
+            dec_block = _decode_fp8_e4m3(dec_raw) * dec_scale[:, None]
+        else:
+            dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
+                tl.float32
+            )
 
         residual_delta = tl.sum(dec_block * delta[:, None], axis=0)
         result = h_vals.to(tl.float32) + residual_delta
@@ -346,11 +387,14 @@ def _apply_sae_delta_indexed_kernel(
         )
         enc_off = c_idx[:, None] * enc_stride_c + h_idx[None, :] * enc_stride_h
         enc_mask = c_mask[:, None] & h_mask[None, :]
-        enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
-            tl.float32
-        )
         if WEIGHTS_FP8:
-            enc_block = enc_block * enc_scale[:, None]
+            # fp8 weights arrive viewed as uint8; decode in-register.
+            enc_raw = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0).to(tl.int32)
+            enc_block = _decode_fp8_e4m3(enc_raw) * enc_scale[:, None]
+        else:
+            enc_block = tl.load(enc_w_ptr + enc_off, mask=enc_mask, other=0.0).to(
+                tl.float32
+            )
         pre_acts += tl.sum(enc_block * h_vals[None, :], axis=1)
 
     if ACTIVATION_CODE == 0:
@@ -400,11 +444,14 @@ def _apply_sae_delta_indexed_kernel(
         h_vals = tl.load(h_row_ptr + h_idx * h_stride_h, mask=h_mask, other=0.0)
         dec_off = c_idx[:, None] * dec_stride_c + h_idx[None, :] * dec_stride_h
         dec_mask = c_mask[:, None] & h_mask[None, :]
-        dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
-            tl.float32
-        )
         if WEIGHTS_FP8:
-            dec_block = dec_block * dec_scale[:, None]
+            # fp8 weights arrive viewed as uint8; decode in-register.
+            dec_raw = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0).to(tl.int32)
+            dec_block = _decode_fp8_e4m3(dec_raw) * dec_scale[:, None]
+        else:
+            dec_block = tl.load(dec_w_ptr + dec_off, mask=dec_mask, other=0.0).to(
+                tl.float32
+            )
         residual_delta = tl.sum(dec_block * delta[:, None], axis=0)
         result = h_vals.to(tl.float32) + residual_delta
         tl.store(
@@ -468,23 +515,31 @@ def _resolve_fp8_scales(
     decoder_weight: torch.Tensor,
     encoder_scale: torch.Tensor | None,
     decoder_scale: torch.Tensor | None,
-) -> tuple[bool, torch.Tensor, torch.Tensor]:
-    """Resolve the fp8 specialisation flag and concrete scale tensors.
+) -> tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Resolve the fp8 specialisation flag, weight views, and scales.
 
-    Non-fp8 launches substitute empty fp32 tensors for the scale
-    pointers — the ``WEIGHTS_FP8=False`` specialisation prunes every
-    scale load, so the dummies are never dereferenced.
+    fp8 launches hand the kernels the weight tensors viewed as uint8
+    (zero-copy) so the ``WEIGHTS_FP8`` specialisation can load raw
+    bytes and decode via :func:`_decode_fp8_e4m3` — Triton rejects the
+    fp8e4nv dtype outright on pre-sm89 archs, so the bitwise decode is
+    the universal fp8 path.  Non-fp8 launches substitute empty fp32
+    tensors for the scale pointers — the ``WEIGHTS_FP8=False``
+    specialisation prunes every scale load, so the dummies are never
+    dereferenced.
     """
     weights_fp8 = encoder_weight.dtype == torch.float8_e4m3fn
     if weights_fp8 and (encoder_scale is None or decoder_scale is None):
         raise ValueError(
             "fp8-stored SAE weights require per-row scale tensors; got None."
         )
+    if weights_fp8:
+        encoder_weight = encoder_weight.view(torch.uint8)
+        decoder_weight = decoder_weight.view(torch.uint8)
     if encoder_scale is None:
         encoder_scale = encoder_weight.new_empty(0, dtype=torch.float32)
     if decoder_scale is None:
         decoder_scale = decoder_weight.new_empty(0, dtype=torch.float32)
-    return weights_fp8, encoder_scale, decoder_scale
+    return weights_fp8, encoder_weight, decoder_weight, encoder_scale, decoder_scale
 
 
 def apply_sae_delta_triton(
@@ -510,8 +565,9 @@ def apply_sae_delta_triton(
     ``threshold`` carries the per-feature JumpReLU thresholds
     (``(n_clamp,)`` fp32); it is loaded only under the JumpReLU
     specialisation.  ``encoder_scale`` / ``decoder_scale`` carry the
-    per-row dequantization scales for fp8-stored weights; the kernel
-    loads the fp8 tensor, converts to fp32, and multiplies by the row
+    per-row dequantization scales for fp8-stored weights; the launch
+    views the fp8 tensors as uint8 and the kernel decodes them
+    bitwise (:func:`_decode_fp8_e4m3`) and multiplies by the row
     scale (only under the ``WEIGHTS_FP8`` specialisation).  The output
     is a freshly allocated tensor with the same shape and dtype as
     ``hidden_states``.
@@ -550,7 +606,7 @@ def apply_sae_delta_triton(
             decoder_scale=decoder_scale,
         )
 
-    weights_fp8, enc_scale, dec_scale = _resolve_fp8_scales(
+    weights_fp8, enc_w, dec_w, enc_scale, dec_scale = _resolve_fp8_scales(
         encoder_weight, decoder_weight, encoder_scale, decoder_scale
     )
     h_size = hidden_states.shape[1]
@@ -564,10 +620,10 @@ def apply_sae_delta_triton(
 
     _apply_sae_delta_kernel[(n_tokens,)](
         hidden_states,
-        encoder_weight,
+        enc_w,
         encoder_bias,
         threshold,
-        decoder_weight,
+        dec_w,
         enc_scale,
         dec_scale,
         clamp_kind,
@@ -580,12 +636,12 @@ def apply_sae_delta_triton(
         n_clamp,
         hidden_states.stride(0),
         hidden_states.stride(1),
-        encoder_weight.stride(0),
-        encoder_weight.stride(1),
+        enc_w.stride(0),
+        enc_w.stride(1),
         encoder_bias.stride(0),
         threshold.stride(0),
-        decoder_weight.stride(0),
-        decoder_weight.stride(1),
+        dec_w.stride(0),
+        dec_w.stride(1),
         enc_scale.stride(0) if enc_scale.numel() else 0,
         dec_scale.stride(0) if dec_scale.numel() else 0,
         clamp_kind.stride(0),
@@ -660,7 +716,7 @@ def apply_sae_delta_indexed_triton(
             decoder_scale=decoder_scale,
         )
 
-    weights_fp8, enc_scale, dec_scale = _resolve_fp8_scales(
+    weights_fp8, enc_w, dec_w, enc_scale, dec_scale = _resolve_fp8_scales(
         encoder_weight, decoder_weight, encoder_scale, decoder_scale
     )
     h_size = hidden_states.shape[1]
@@ -670,10 +726,10 @@ def apply_sae_delta_indexed_triton(
 
     _apply_sae_delta_indexed_kernel[(n_tokens,)](
         hidden_states,
-        encoder_weight,
+        enc_w,
         encoder_bias,
         threshold,
-        decoder_weight,
+        dec_w,
         enc_scale,
         dec_scale,
         clamp_kind_table,
@@ -687,12 +743,12 @@ def apply_sae_delta_indexed_triton(
         n_clamp,
         hidden_states.stride(0),
         hidden_states.stride(1),
-        encoder_weight.stride(0),
-        encoder_weight.stride(1),
+        enc_w.stride(0),
+        enc_w.stride(1),
         encoder_bias.stride(0),
         threshold.stride(0),
-        decoder_weight.stride(0),
-        decoder_weight.stride(1),
+        dec_w.stride(0),
+        dec_w.stride(1),
         enc_scale.stride(0) if enc_scale.numel() else 0,
         dec_scale.stride(0) if dec_scale.numel() else 0,
         clamp_kind_table.stride(0),

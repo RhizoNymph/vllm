@@ -577,11 +577,18 @@ form, and the HTTP register endpoint).
   clamp keeps zero rows dequantizing to exact zero with no division
   hazard), values stored as `float8_e4m3fn` after clamping to ±448
   (torch's e4m3 cast does not saturate).  Dequantization everywhere
-  is `q.to(fp32) * scale[row]`: the Triton delta kernels load the fp8
-  block, convert to fp32, and multiply by the row scale under a
-  `WEIGHTS_FP8` constexpr specialisation; the FR CUDA path and the
-  CPU fallbacks dequantize with plain torch before the existing math.
-  Slot refresh re-quantizes; deactivation zeroes the scale buffers
+  is `q.to(fp32) * scale[row]`: the Triton delta kernels receive the
+  fp8 weights viewed as uint8 and decode the e4m3 bytes bitwise
+  in-register (`_decode_fp8_e4m3`, exact by construction and pinned
+  exhaustively against torch's native conversion by
+  `decode_fp8_e4m3_bitwise`), then multiply by the row scale — all
+  under a `WEIGHTS_FP8` constexpr specialisation.  The bitwise decode
+  is the universal fp8 path (no arch branch): Triton rejects the
+  fp8e4nv dtype at JIT time on pre-sm89 CUDA archs (e.g. sm86), and
+  the kernels are memory-bound so the extra ALU ops are free.  The FR
+  CUDA path and the CPU fallbacks dequantize with plain torch (native
+  fp8→fp32 cast, arch-independent) before the existing math.  Slot
+  refresh re-quantizes; deactivation zeroes the scale buffers
   alongside the weights (zero q × zero scale = exact zero).
 - **Accuracy caveat.** e4m3 has 3 mantissa bits: elementwise relative
   error up to ~6% (half-ulp 2^-4) against the bf16/fp32 source, with

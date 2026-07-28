@@ -91,7 +91,12 @@ def apply_sae_full_recon_triton(
     # activation + clamp arithmetic so the numerics match the eager
     # body bit-identically (modulo the cuBLAS tile differences that
     # affect the eager path too).  fp8-stored weights dequantize with
-    # their per-row scales first (``q.to(fp32) * scale[row]``).
+    # their per-row scales first (``q.to(fp32) * scale[row]``).  Unlike
+    # the Triton delta kernels — which must decode e4m3 bytes bitwise
+    # because Triton rejects the fp8e4nv dtype on pre-sm89 archs — this
+    # path uses torch's native fp8→fp32 cast, which is arch-independent
+    # and bit-identical to the bitwise decode (pinned exhaustively by
+    # the ``decode_fp8_e4m3_bitwise`` test).
     encoder_weight = maybe_dequantize_rowwise(encoder_weight, encoder_scale)
     decoder_weight = maybe_dequantize_rowwise(decoder_weight, decoder_scale)
     h_fp32 = h_active.to(torch.float32)

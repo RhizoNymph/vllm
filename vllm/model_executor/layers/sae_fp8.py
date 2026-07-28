@@ -92,6 +92,35 @@ def dequantize_fp8_rowwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return q.to(torch.float32) * scale.unsqueeze(1)
 
 
+def decode_fp8_e4m3_bitwise(q: torch.Tensor) -> torch.Tensor:
+    """Bitwise e4m3fn → fp32 decode; reference for the Triton kernels.
+
+    Triton cannot express an fp8e4nv load on every CUDA arch (pre-sm89
+    rejects the dtype at JIT time), so the SAE delta kernels load the
+    weight bytes as uint8 and decode in-register.  This is the
+    pure-torch mirror of that decode, pinned exhaustively against
+    torch's native conversion by the test suite.
+
+    Layout ``s eeee mmm`` (bias 7): normal (``e > 0``) decodes to
+    ``±2^(e-7) · (1 + m/8)``; subnormal (``e == 0``) to
+    ``±2^-6 · (m/8)``.  The NaN encodings (``e == 15, m == 7``) decode
+    to ±480 here — they can never occur in SAE fp8 storage because
+    :func:`quantize_fp8_rowwise` clamps to ±448 before the cast.
+    """
+    v = q.view(torch.uint8).to(torch.int32)
+    s = (v >> 7) & 1
+    e = (v >> 3) & 0xF
+    m = v & 0x7
+    ef = e.to(torch.float32)
+    mf = m.to(torch.float32)
+    val = torch.where(
+        e > 0,
+        torch.exp2(ef - 7.0) * (1.0 + mf * 0.125),
+        0.015625 * (mf * 0.125),
+    )
+    return torch.where(s != 0, -val, val)
+
+
 def maybe_dequantize_rowwise(
     weight: torch.Tensor, scale: torch.Tensor | None
 ) -> torch.Tensor:
