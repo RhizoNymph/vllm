@@ -9,13 +9,14 @@ reconstruction itself always applies for opted-in tokens:
 
 Because the decoder is linear, ``out(g) = out_unclamped + g *
 (out_clamped - out_unclamped)`` is the reference identity the tests
-check.  Also covers the per-row gate table's buffer lifecycle, the
-compaction (CUDA-path body, runs on CPU tensors here) parity, layer
-dispatch through the shared ``steering_row_gate``, and the populator.
+check.  Also covers the per-row gate table's buffer lifecycle, dense
+Triton-kernel parity with gates (CUDA only), layer dispatch through
+the shared ``steering_row_gate``, and the populator.
 """
 
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
@@ -46,6 +47,10 @@ from vllm.v1.worker.sae_full_reconstruction_manager import (
 HOOK = SteeringHookPoint.POST_BLOCK
 D_SAE = 3
 HIDDEN = 4
+
+cuda_required = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA for the Triton kernel"
+)
 
 
 def _weights():
@@ -141,11 +146,12 @@ class TestGatedFrOpNumerics:
         assert torch.equal(clamped, again)
 
 
-class TestCompactionPathParity:
-    """The CUDA-path body (compaction) must match the eager body with
-    gating; it runs fine on CPU tensors."""
+@cuda_required
+class TestDenseKernelGateParity:
+    """The dense masked Triton kernel must match the eager body with
+    gating (mixed gated/ungated rows, partial and zero row gates)."""
 
-    def test_compaction_matches_eager_with_gates(self):
+    def test_dense_kernel_matches_eager_with_gates(self):
         from vllm.model_executor.layers.sae_full_reconstruction import (
             _apply_sae_full_reconstruction_eager,
         )
@@ -181,10 +187,13 @@ class TestCompactionPathParity:
         eager = _apply_sae_full_reconstruction_eager(
             *args, clamp_row_gated=gated, row_gate=row_gate
         )
-        compacted = apply_sae_full_recon_triton(
-            *args, clamp_row_gated=gated, row_gate=row_gate
+        cuda_args = tuple(a.cuda() if isinstance(a, torch.Tensor) else a for a in args)
+        got = apply_sae_full_recon_triton(
+            *cuda_args, clamp_row_gated=gated.cuda(), row_gate=row_gate.cuda()
         )
-        assert torch.allclose(compacted, eager, atol=1e-5)
+        assert torch.allclose(got.cpu(), eager, atol=1e-4)
+        # Inactive row passes through bit-identically.
+        assert torch.equal(got.cpu()[1], h[1])
 
 
 def _fr_layer(*, max_recon_configs: int = 2, max_tokens: int = 8) -> nn.Module:
