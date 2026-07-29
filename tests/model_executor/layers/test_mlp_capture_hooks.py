@@ -196,6 +196,8 @@ def test_qwen3_next_mlp_hooks(monkeypatch):
     layer = _new(qwen3_next_mod.Qwen3NextDecoderLayer)
     layer.layer_type = "full_attention"
     layer.layer_scale = False
+    # Single-rank stub: no sequence-parallel all-gather around the MLP.
+    layer.use_attn_reduce_scatter_for_moe = False
 
     x = torch.randn(T, H)
     attn_out = torch.randn(T, H)
@@ -203,8 +205,8 @@ def test_qwen3_next_mlp_hooks(monkeypatch):
     residual_after = torch.randn(T, H)
     mlp_out = torch.randn(T, H)
 
-    def _attn(hidden_states, output, positions=None):
-        output.copy_(attn_out)
+    def _attn(hidden_states, positions=None):
+        return attn_out
 
     seen: dict = {}
     layer.input_layernorm = lambda h: h
