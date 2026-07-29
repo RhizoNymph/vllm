@@ -408,64 +408,6 @@ def get_peer_zmq_from_request_id(request_id: str, is_producer: bool) -> str:
     return m.group(1)
 
 
-# The router embeds both zmq_addresses in the request_id (similar to P2pNcclConnector):
-#   "___prefill_addr_{zmq}___decode_addr_{zmq}_{32-hex-uuid}"
-# MoRIIO zmq_address format: "host:IP,handshake:PORT,notify:PORT"
-#
-# This lets each connector side parse the peer's connection info without
-# requiring the router to pass it explicitly in kv_transfer_params.
-_PREFILL_ZMQ_RE = re.compile(r"___prefill_addr_(.+?)___decode_addr_")
-# vLLM wraps the router's X-Request-Id as "cmpl-<id>-<seq>-<hex>" so there may
-# be a trailing "-<seq>-<hex>" suffix after the 32-char UUID.  Allow it.
-_DECODE_ZMQ_RE = re.compile(r"___decode_addr_(.+)_[0-9a-f]{32}(?:-.*)?$")
-
-
-def parse_moriio_zmq_address(
-    zmq_address: str,
-) -> tuple[str, int, int]:
-    """Parse the MoRI-IO zmq address into its components.
-
-    Parses ``"host:IP,handshake:PORT,notify:PORT"`` into
-        (host, handshake_port, notify_port).
-
-    Each key-value pair is split on the *first* colon so that IPv6 addresses
-    (e.g. ``host:::1``) are handled correctly.  Raises ``ValueError`` if any
-    of ``host``, ``handshake``, or ``notify`` keys are absent or if the port
-    values are non-numeric.
-    """
-    parts: dict[str, str] = {}
-    for segment in zmq_address.split(","):
-        key, _, val = segment.partition(":")
-        parts[key.strip()] = val.strip()
-    try:
-        host = parts["host"]
-        handshake_port = int(parts["handshake"])
-        notify_port = int(parts["notify"])
-    except (KeyError, ValueError) as e:
-        raise ValueError(
-            f"Malformed zmq_address {zmq_address!r}: expected "
-            f"'host:IP,handshake:PORT,notify:PORT' format"
-        ) from e
-    return host, handshake_port, notify_port
-
-
-def get_peer_zmq_from_request_id(request_id: str, is_producer: bool) -> str:
-    """Extract the *peer's* zmq_address from the vLLM router request_id.
-
-    The producer (prefill) needs the decode's address; the consumer (decode)
-    needs the prefill's address.
-    """
-    if is_producer:
-        m = _DECODE_ZMQ_RE.search(request_id)
-    else:
-        m = _PREFILL_ZMQ_RE.search(request_id)
-    if m is None:
-        raise ValueError(
-            f"Cannot parse peer zmq_address from request_id: {request_id!r}"
-        )
-    return m.group(1)
-
-
 @dataclass
 class ReqMeta:
     """Metadata for a single request."""
@@ -480,6 +422,10 @@ class ReqMeta:
     remote_engine_id: str
     tp_size: int
     remote_dp_size: int
+    # Prefill DP rank that owns this request's KV (forwarded by the proxy). The
+    # read must target this rank's memory registration; the default 0 preserves
+    # the symmetric single-DP behaviour.
+    remote_dp_rank: int = 0
 
 
 class MoRIIOConnectorMetadata(KVConnectorMetadata):
@@ -531,8 +477,17 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             remote_port=int(remote_handshake_port),
             remote_handshake_port=int(remote_handshake_port),
             remote_notify_port=int(remote_notify_port),
-            tp_size=kv_transfer_params.get("tp_size", 1),
+            # Remote peer TP degree (used as remote_tp_size downstream). The
+            # proxy advertises it under "remote_tp_size"; #46332 read "tp_size"
+            # which is absent on WRITE producer requests -> defaulted to 1 ->
+            # rank collapse. Read the right key; 0 == unknown (== homogeneous).
+            tp_size=int(
+                kv_transfer_params.get("remote_tp_size")
+                or kv_transfer_params.get("tp_size")
+                or 0
+            ),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
+            remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
         )
         if write_mode:
             self.reqs_to_save[request_id] = _req

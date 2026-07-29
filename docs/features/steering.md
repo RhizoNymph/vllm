@@ -41,12 +41,12 @@ Steering is wired into the following decoder architectures:
 - Olmo family: `olmo`, `olmo2`, `olmo_hybrid`
 - Exaone family: `exaone`, `exaone4`
 - Phi family: `phi`
-- Plamo family: `plamo2`, `plamo3`
+- Plamo family: `plamo3`
 - Step family: `step1`, `step3_text`, `step3p5`
 - Molmo family: `molmo`, `molmo2`
 - Falcon / Baichuan / Command / StableLM: `falcon`, `baichuan`, `commandr`,
   `stablelm`
-- Other: `AXK1`, `gpt_neox`, `hyperclovax`, `opt`, `orion`, `ouro`,
+- Other: `AXK1`, `gpt_neox`, `hyperclovax`, `opt`, `orion`,
   `persimmon`, `seed_oss`, `starcoder2`, `hunyuan_v1`, `mimo_v2_flash`
 
 End-to-end tested with real weights:

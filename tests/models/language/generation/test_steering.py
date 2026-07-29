@@ -362,12 +362,6 @@ PHASE1_DISCOVERY_CASES = [
         id="qwen3-moe",
     ),
     pytest.param(
-        "ByteDance/Ouro-1.4B",
-        _SMALL_DECODER_OVERRIDES,
-        {"enforce_eager": True},
-        id="ouro",
-    ),
-    pytest.param(
         "ByteDance-Seed/Seed-OSS-36B-Instruct",
         _SMALL_DECODER_OVERRIDES,
         {"enforce_eager": True},
@@ -406,12 +400,6 @@ PHASE1_GENERATION_CASES = [
         _SMALL_DECODER_OVERRIDES,
         {"enforce_eager": True},
         id="seed-oss",
-    ),
-    pytest.param(
-        "ByteDance/Ouro-1.4B",
-        _SMALL_DECODER_OVERRIDES,
-        {"enforce_eager": True},
-        id="ouro",
     ),
     pytest.param(
         "IQuestLab/IQuest-Coder-V1-40B-Loop-Instruct",
