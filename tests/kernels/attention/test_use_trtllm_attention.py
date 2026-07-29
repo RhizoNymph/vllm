@@ -69,7 +69,7 @@ def test_supports_batch_invariant_disables():
 
 @patch("vllm.envs.VLLM_BATCH_INVARIANT", False)
 @patch(
-    "vllm.utils.flashinfer.current_platform.is_device_capability_family",
+    "vllm.utils.flashinfer.current_platform.is_device_capability",
     return_value=True,
 )
 @patch("vllm.utils.flashinfer.has_nvidia_artifactory", return_value=True)
@@ -103,7 +103,7 @@ def test_supports_sm90_decode_only(_art, _family, _cap):
 
 @patch("vllm.envs.VLLM_BATCH_INVARIANT", False)
 @patch(
-    "vllm.utils.flashinfer.current_platform.is_device_capability_family",
+    "vllm.utils.flashinfer.current_platform.is_device_capability",
     return_value=True,
 )
 @patch("vllm.utils.flashinfer.has_nvidia_artifactory", return_value=False)

@@ -179,6 +179,11 @@ class InputProcessor:
             params.steering_vectors is not None
             or params.prefill_steering_vectors is not None
             or params.decode_steering_vectors is not None
+            or params.steering_module_ref is not None
+            or params.sae_clamp_specs is not None
+            or params.sae_full_reconstruction_specs is not None
+            or params._effective_prefill_steering_packed is not None
+            or params._effective_decode_steering_packed is not None
         )
         has_clamps = (
             params.steering_clamps is not None
@@ -189,9 +194,10 @@ class InputProcessor:
             return
         if not self.steering_config:
             raise ValueError(
-                "Per-request steering vectors/clamps were provided but "
-                "steering is not enabled. Start the server with "
-                "--enable-steering to use per-request steering."
+                "Per-request steering vectors/clamps, named-module "
+                "references, or SAE clamp specs were provided but steering "
+                "is not enabled. Start the server with --enable-steering "
+                "to use per-request steering."
             )
         # Width gate: SamplingParams validation is model-blind, and a
         # wrong-width row shape-crashes the worker's steering table

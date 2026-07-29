@@ -6,7 +6,7 @@
 i.e. HF's ``hidden_states[L + 1]`` -- not the bare post-attention residual.
 vLLM defers each branch-add into the next layer's fused add+norm, so at the
 end of a decoder layer ``residual`` does not yet include this layer's MLP
-output. The old ``post_mlp`` hook captured bare ``residual``, which is
+output. The old ``post_block`` hook captured bare ``residual``, which is
 byte-identical to ``post_attn`` -- a footgun. ``apply_block_steering`` fixes
 the captured value while leaving steering propagation unchanged (the delta
 still rides the residual stream into the next layer's fused add).

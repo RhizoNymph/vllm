@@ -13,6 +13,10 @@ from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnota
 from pydantic import Field, PrivateAttr, model_serializer, model_validator
 
 from vllm.config import ModelConfig
+from vllm.config.sae_steering_types import (
+    coerce_sae_clamp_specs,
+    coerce_sae_full_reconstruction_specs,
+)
 from vllm.config.steering_types import (
     SteeringVectorSpecPacked,
     unpack_steering_vectors,
@@ -678,6 +682,31 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "composed with any inline steering vector fields.",
     )
 
+    sae_clamp_specs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of SAE feature-surgery clamp directives.  Each entry "
+            "references a named SAE-kind module (registered via "
+            "POST /v1/steering/modules/register with kind='sae_delta') "
+            "and declares which feature activations to clamp on which "
+            "(hook, layer) pairs.  See docs/features/sae_steering.md "
+            "for the schema."
+        ),
+    )
+
+    sae_full_reconstruction_specs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of SAE full-reconstruction directives.  Each entry "
+            "references a named SAE module of kind "
+            "'sae_full_reconstruction' (loaded at startup via "
+            "--steering-modules) and optionally clamps features inside "
+            "the reconstruction.  An entry with no 'clamps' applies the "
+            "pure reconstruction.  See docs/features/sae_steering.md "
+            "for the schema."
+        ),
+    )
+
     # --8<-- [end:chat-completion-extra-params]
 
     @model_validator(mode="before")
@@ -907,6 +936,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             ),
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
+            ),
+            sae_clamp_specs=coerce_sae_clamp_specs(self.sae_clamp_specs),
+            sae_full_reconstruction_specs=coerce_sae_full_reconstruction_specs(
+                self.sae_full_reconstruction_specs
             ),
             # SamplingParams' own validation normalizes every accepted
             # clamp shape via SteeringClamps.from_obj (400 on malformed).
@@ -1322,6 +1355,12 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
     # matching ChatCompletionRequest.return_tokens_as_token_ids.
     return_tokens_as_token_ids: bool | None = None
     return_token_ids: bool = False
+    steering_vectors: SteeringVectorSpecPacked | None = None
+    prefill_steering_vectors: SteeringVectorSpecPacked | None = None
+    decode_steering_vectors: SteeringVectorSpecPacked | None = None
+    steering_name: str | None = None
+    sae_clamp_specs: list[dict[str, Any]] | None = None
+    sae_full_reconstruction_specs: list[dict[str, Any]] | None = None
 
     @model_validator(mode="before")
     @classmethod

@@ -739,11 +739,11 @@ class TestGlobalCaptureSpec:
             _make_consumer(tmp_path, global_hooks={"bogus": [0]})
 
     def test_renamed_hook_old_name_rejected(self, tmp_path: pathlib.Path) -> None:
-        # ``post_mlp`` was renamed to ``post_block``; the global validator
+        # ``post_block`` was renamed to ``post_block``; the global validator
         # must reject the old name (it previously accepted it, silently
-        # capturing nothing since no model fires ``post_mlp``).
+        # capturing nothing since no model fires ``post_block``).
         with pytest.raises(ValueError, match="not a valid hook point"):
-            _make_consumer(tmp_path, global_hooks={"post_mlp": [0]})
+            _make_consumer(tmp_path, global_hooks={"post_block": [0]})
 
     def test_non_dict_global_hooks_rejected(self, tmp_path: pathlib.Path) -> None:
         with pytest.raises(ValueError, match="must be a dict"):

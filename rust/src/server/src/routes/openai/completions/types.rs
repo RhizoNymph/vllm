@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
+use vllm_engine_core_client::protocol::{SaeClampSpec, SaeFullReconstructionSpec};
 use vllm_engine_core_client::protocol::sampling::RepetitionDetectionParams;
 use vllm_text::Prompt;
 
@@ -212,6 +213,14 @@ pub struct CompletionRequest {
     /// by a patch entry's `source_inline` / mask `inline`, forwarded verbatim
     pub patch_vectors: Option<Value>,
 
+    /// Per-request SAE feature-surgery clamps referencing pre-registered
+    /// named SAE modules. Typed at the boundary (malformed shapes → 400);
+    /// engine-core performs semantic validation at admission
+    pub sae_clamp_specs: Option<Vec<SaeClampSpec>>,
+
+    /// Per-request SAE full-reconstruction directives (residual replacement).
+    /// Typed like `sae_clamp_specs`; `clamps` may be empty
+    pub sae_full_reconstruction_specs: Option<Vec<SaeFullReconstructionSpec>>,
     /// Per-request steering clamps applied to both prefill and decode phases,
     /// forwarded verbatim to engine-core
     pub steering_clamps: Option<Value>,

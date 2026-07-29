@@ -31,6 +31,7 @@ pub mod lora;
 pub mod multimodal;
 pub mod output;
 pub mod request;
+pub mod sae;
 pub mod sampling;
 pub mod stats;
 pub mod steering;
@@ -40,6 +41,9 @@ pub mod utility;
 
 pub use capture::CaptureResult;
 pub use clamps::{ClampHookTable, SteeringClamps};
+pub use sae::{
+    SaeClampEntry, SaeClampHookMap, SaeClampKind, SaeClampSpec, SaeFullReconstructionSpec, SaePhase,
+};
 pub use steering::{SteeringLayerEntry, SteeringVectorSpec};
 
 /// Encode a Rust value into msgpack using the protocol crate's serde model.
