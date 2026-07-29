@@ -915,11 +915,11 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
-                sae_clamp_specs: None,
-                sae_full_reconstruction_specs: None,
                 steering_clamps: None,
                 prefill_steering_clamps: None,
                 decode_steering_clamps: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
