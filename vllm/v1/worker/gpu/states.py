@@ -123,16 +123,6 @@ class RequestState:
             ]
         self.draft_tokens[req_idx].zero_()
 
-        if 0 < num_computed_tokens <= prefill_len:
-            # For PD disagg or resumed requests: set last_sampled to the last
-            # computed token so the first decode step gets the right input_id.
-            # For fresh prefill requests (num_computed_tokens == 0) the tensor
-            # is not read by combine_sampled_and_draft_tokens so we skip the
-            # write. Use a slice assignment rather than scalar indexing so the
-            # write is dispatched through fill_ without a host/device sync.
-            self.last_sampled_tokens[req_idx : req_idx + 1] = all_token_ids[
-                num_computed_tokens - 1
-            ]
         self.draft_tokens[req_idx].zero_()
 
     def apply_staged_writes(self) -> None:

@@ -372,12 +372,21 @@ async def register_steering_module(
                 vectors=vectors,
                 prefill_vectors=prefill_vectors,
                 decode_vectors=decode_vectors,
+                clamps=request.clamps,
+                prefill_clamps=request.prefill_clamps,
+                decode_clamps=request.decode_clamps,
             )
+            # Clamp tiers are read back from the registry so the broadcast
+            # carries the canonical SteeringClamps form it validated.
+            registered = registry.get(request.name)
             payload: dict = {
                 "kind": kind.value,
                 "vectors": vectors,
                 "prefill_vectors": prefill_vectors,
                 "decode_vectors": decode_vectors,
+                "clamps": registered.clamps if registered else None,
+                "prefill_clamps": registered.prefill_clamps if registered else None,
+                "decode_clamps": registered.decode_clamps if registered else None,
             }
         else:  # SAE_DELTA
             if request.sae_manifest is None:

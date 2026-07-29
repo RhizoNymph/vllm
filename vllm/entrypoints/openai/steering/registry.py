@@ -29,12 +29,14 @@ from vllm.config.sae_steering_types import (
     validate_sae_storage_dtype,
 )
 from vllm.config.steering_types import (
+    SteeringClamps,
     SteeringVectorSpec,
     _looks_packed,
     coerce_steering_spec,
     hash_steering_config,
     merge_steering_specs,
     normalize_layer_entry,
+    resolve_effective_clamps,
     resolve_effective_vectors,
     scale_steering_spec,
     validate_spec_row_widths,
@@ -97,6 +99,9 @@ class SteeringModule:
     sae_manifest: SAEModuleManifest | None = None
     prefill_additive_hash: int = 0
     decode_additive_hash: int = 0
+    clamps: SteeringClamps | None = None
+    prefill_clamps: SteeringClamps | None = None
+    decode_clamps: SteeringClamps | None = None
 
 
 class SteeringModuleRegistry:
@@ -122,23 +127,30 @@ class SteeringModuleRegistry:
         vectors: SteeringVectorSpec | dict | None = None,
         prefill_vectors: SteeringVectorSpec | dict | None = None,
         decode_vectors: SteeringVectorSpec | dict | None = None,
+        clamps: SteeringClamps | dict | None = None,
+        prefill_clamps: SteeringClamps | dict | None = None,
+        decode_clamps: SteeringClamps | dict | None = None,
         *,
         kind: SteeringModuleKind = SteeringModuleKind.ADDITIVE,
         sae_manifest: SAEModuleManifest | None = None,
     ) -> None:
         """Register a named steering module. Overwrites if name exists.
 
-        For ``kind=ADDITIVE`` (default) the additive vector tiers are
-        validated as before; passing a non-empty ``sae_manifest`` is
-        an error.  For ``kind=SAE_DELTA`` the manifest is required and
-        all additive vector fields must be empty.
+        For ``kind=ADDITIVE`` (default) the additive vector and clamp
+        tiers are validated as before; passing a non-empty
+        ``sae_manifest`` is an error.  For ``kind=SAE_DELTA`` the
+        manifest is required and all additive vector/clamp fields must
+        be empty.
 
         Each additive tier may be either the legacy ``SteeringVectorSpec``
         shape or the binary-wire ``SteeringVectorSpecPacked`` shape; the
         latter is normalized to the former via :func:`coerce_steering_spec`
         so the stored ``SteeringModule`` always carries the legacy shape and
         ``dump_for_broadcast`` continues to emit pickle-friendly plain
-        Python collections.
+        Python collections.  Clamp tiers are normalized to canonical
+        :class:`SteeringClamps` via ``from_obj`` (accepting entry-list
+        JSON, the type's own wire/JSON form, or legacy base64 blobs) with
+        full row validation at ingestion.
         """
         if kind is SteeringModuleKind.ADDITIVE:
             if sae_manifest is not None:
@@ -152,10 +164,29 @@ class SteeringModuleRegistry:
             vectors = coerce_steering_spec(vectors)
             prefill_vectors = coerce_steering_spec(prefill_vectors)
             decode_vectors = coerce_steering_spec(decode_vectors)
+            clamps = SteeringClamps.from_obj(clamps, field_name="clamps")
+            prefill_clamps = SteeringClamps.from_obj(
+                prefill_clamps, field_name="prefill_clamps"
+            )
+            decode_clamps = SteeringClamps.from_obj(
+                decode_clamps, field_name="decode_clamps"
+            )
 
-            # Validate that at least one tier has vectors
-            if not vectors and not prefill_vectors and not decode_vectors:
-                raise ValueError(f"Steering module '{name}' has no vectors in any tier")
+            # Validate that at least one tier has vectors or clamps
+            if not any(
+                (
+                    vectors,
+                    prefill_vectors,
+                    decode_vectors,
+                    clamps,
+                    prefill_clamps,
+                    decode_clamps,
+                )
+            ):
+                raise ValueError(
+                    f"Steering module '{name}' has no vectors in any tier "
+                    "(and no clamps)"
+                )
 
             # Validate hook point names and entry format
             for tier_name, spec in [
@@ -188,18 +219,52 @@ class SteeringModuleRegistry:
                             field_name=f"module {name!r} {tier_name}",
                         )
 
+            # Validate clamp tiers: hook points, layer indices and direction
+            # widths (row structure was fully validated by from_obj above).
+            for tier_name, cspec in [
+                ("clamps", clamps),
+                ("prefill_clamps", prefill_clamps),
+                ("decode_clamps", decode_clamps),
+            ]:
+                if not cspec:
+                    continue
+                invalid = set(cspec.hooks.keys()) - VALID_HOOK_POINT_NAMES
+                if invalid:
+                    raise ValueError(
+                        f"Invalid hook point name(s) in module '{name}': "
+                        f"{sorted(invalid)}. "
+                        f"Valid: {sorted(VALID_HOOK_POINT_NAMES)}"
+                    )
+                for table in cspec.hooks.values():
+                    for layer_idx in table.site_counts():
+                        self._validate_layer_index(name=name, layer_idx=layer_idx)
+                if self._expected_row_width is not None:
+                    cspec.validate_row_width(
+                        self._expected_row_width,
+                        field_name=f"module {name!r} {tier_name}",
+                    )
+
             module = SteeringModule(
                 name=name,
                 kind=kind,
                 vectors=vectors,
                 prefill_vectors=prefill_vectors,
                 decode_vectors=decode_vectors,
+                clamps=clamps,
+                prefill_clamps=prefill_clamps,
+                decode_clamps=decode_clamps,
             )
+            # Clamp tiers fold into the stored per-phase hashes so the
+            # fast-path hash override in
+            # ``apply_sampling_params_hash_overrides`` keeps clamp-bearing
+            # modules distinct (and cache-correct) without recomputation.
             module.prefill_additive_hash = hash_steering_config(
-                resolve_effective_vectors(vectors, prefill_vectors)
+                resolve_effective_vectors(vectors, prefill_vectors),
+                clamps=resolve_effective_clamps(clamps, prefill_clamps),
             )
             module.decode_additive_hash = hash_steering_config(
-                resolve_effective_vectors(vectors, decode_vectors)
+                resolve_effective_vectors(vectors, decode_vectors),
+                clamps=resolve_effective_clamps(clamps, decode_clamps),
             )
         elif kind is SteeringModuleKind.SAE_DELTA:
             if (
@@ -210,6 +275,11 @@ class SteeringModuleRegistry:
                 raise ValueError(
                     f"Steering module '{name}': additive vector fields are "
                     "not valid for kind=SAE_DELTA."
+                )
+            if clamps or prefill_clamps or decode_clamps:
+                raise ValueError(
+                    f"Steering module '{name}': clamp tiers are only valid "
+                    "for kind=ADDITIVE."
                 )
             if sae_manifest is None:
                 raise ValueError(
@@ -227,6 +297,11 @@ class SteeringModuleRegistry:
                 raise ValueError(
                     f"Steering module '{name}': additive vector fields are "
                     "not valid for kind=SAE_FULL_RECONSTRUCTION."
+                )
+            if clamps or prefill_clamps or decode_clamps:
+                raise ValueError(
+                    f"Steering module '{name}': clamp tiers are only valid "
+                    "for kind=ADDITIVE."
                 )
             if sae_manifest is None:
                 raise ValueError(
@@ -593,6 +668,9 @@ class SteeringModuleRegistry:
                 payload["vectors"] = module.vectors
                 payload["prefill_vectors"] = module.prefill_vectors
                 payload["decode_vectors"] = module.decode_vectors
+                payload["clamps"] = module.clamps
+                payload["prefill_clamps"] = module.prefill_clamps
+                payload["decode_clamps"] = module.decode_clamps
             else:
                 assert module.sae_manifest is not None
                 manifest = module.sae_manifest
@@ -702,6 +780,9 @@ class SteeringModuleRegistry:
             vectors=vectors,
             prefill_vectors=prefill_vectors,
             decode_vectors=decode_vectors,
+            clamps=data.get("clamps"),
+            prefill_clamps=data.get("prefill_clamps"),
+            decode_clamps=data.get("decode_clamps"),
         )
 
     def resolve_for_request(

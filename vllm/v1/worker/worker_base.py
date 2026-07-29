@@ -181,6 +181,9 @@ class WorkerBase:
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
+        clamps: dict[str, dict[int, list[dict]]] | None = None,
+        prefill_clamps: dict[str, dict[int, list[dict]]] | None = None,
+        decode_clamps: dict[str, dict[int, list[dict]]] | None = None,
     ) -> tuple[int, int, list[int]]:
         raise NotImplementedError
 
@@ -365,6 +368,12 @@ class WorkerWrapperBase:
                     worker_class,
                     extended_calls,
                 )
+
+        assigned_physical_gpu_ids = kwargs.pop("assigned_physical_gpu_ids", None)
+        if assigned_physical_gpu_ids is not None:
+            vllm_config.parallel_config.assigned_physical_gpu_ids = (
+                assigned_physical_gpu_ids
+            )
 
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
         if shared_worker_lock is None:

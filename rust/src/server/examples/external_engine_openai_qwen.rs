@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -72,11 +75,14 @@ async fn main() -> Result<()> {
         max_logprobs: None,
         api_server_options: ApiServerOptions::default(),
         cors: CorsConfig::default(),
+        tls: None,
         api_keys: Vec::new(),
         steering_api_keys: Vec::new(),
         disable_log_stats: false,
         grpc_port: None,
         shutdown_timeout: Duration::ZERO,
+        keep_alive_timeout: Duration::from_secs(5),
+        profiler: None,
         steering_modules: Vec::new(),
         patch_sidecar_url: None,
     };

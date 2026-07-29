@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -45,6 +48,24 @@ pub fn merge_kv_transfer_params(
     xargs
 }
 
+/// Merge `ec_transfer_params` into the `vllm_xargs` map, mirroring the Python
+/// vLLM behavior where `ec_transfer_params` is injected into `extra_args` for
+/// engine-core consumption.
+pub fn merge_ec_transfer_params(
+    mut xargs: Option<HashMap<String, Value>>,
+    ec_transfer_params: Option<&HashMap<String, Value>>,
+) -> Option<HashMap<String, Value>> {
+    if let Some(ec_params) = ec_transfer_params {
+        let map = xargs.get_or_insert_with(HashMap::new);
+        map.insert(
+            "ec_transfer_params".to_string(),
+            // This is safe because we know that `ec_params` is already valid JSON.
+            serde_json::to_value(ec_params).unwrap(),
+        );
+    }
+    xargs
+}
+
 /// Convert OpenAI-style `logit_bias` with string token-ID keys into the
 /// internal `HashMap<u32, f32>` representation, validating that every key
 /// parses as a `u32`.
@@ -84,6 +105,18 @@ pub fn unpack_steering_field(
                 .map_err(|err| ApiError::invalid_request(format!("{err}"), Some(field_name)))
         })
         .transpose()
+}
+
+/// Parse one optional clamp-tier field (`steering_clamps`,
+/// `prefill_steering_clamps`, or `decode_steering_clamps`) into the canonical
+/// [`SteeringClamps`] forwarded southbound, mapping parse failures to an
+/// invalid-request error tagged with the offending field name.
+pub fn parse_clamp_field(
+    field: Option<serde_json::Value>,
+    field_name: &'static str,
+) -> Result<Option<vllm_engine_core_client::protocol::SteeringClamps>, ApiError> {
+    crate::routes::openai::utils::clamps::parse_clamp_tier(field.as_ref())
+        .map_err(|err| ApiError::invalid_request(format!("{field_name}{err}"), Some(field_name)))
 }
 
 /// Extract common request metadata from HTTP headers: the external request ID

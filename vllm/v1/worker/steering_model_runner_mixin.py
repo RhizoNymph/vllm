@@ -27,9 +27,11 @@ from vllm.config.steering import (
     sae_topology_mismatch,
 )
 from vllm.config.steering_types import (
+    SteeringClamps,
     SteeringVectorSpec,
     hash_steering_config,
     merge_steering_specs,
+    resolve_effective_clamps,
     resolve_effective_vectors,
     scale_steering_spec,
     validate_steering_index,
@@ -40,6 +42,7 @@ from vllm.entrypoints.openai.steering.registry import (
 )
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
+from vllm.model_executor.layers.clamp import CLAMP_ANY_ACTIVE_ATTR
 from vllm.model_executor.layers.sae_fp8 import (
     FP8_STORAGE_DTYPE,
     dequantize_fp8_rowwise,
@@ -184,6 +187,42 @@ def _vectors_digest(vectors: "dict | None") -> bytes:
     return b"@".join(parts)
 
 
+def _clamps_digest(clamps: "SteeringClamps | None") -> bytes:
+    """Deterministic digest of a :class:`SteeringClamps` tier.
+
+    Rows are digested as stored (raw float64 bytes) — ``value`` sugar and
+    defaults are already resolved at ingestion, so logically-equal
+    submissions are byte-equal. ``None`` and empty map to distinct
+    sentinels (``keep`` vs ``clear`` carry different meaning on a
+    re-emit). Only folded into a :class:`RequestSteeringOverride` digest
+    when the override carries clamps, so clamp-free overrides keep their
+    pre-clamp digest bytes.
+    """
+    if clamps is None:
+        return b"none"
+    if not clamps:
+        return b"empty"
+    parts: list[bytes] = []
+    for hook in sorted(clamps.hooks):
+        table = clamps.hooks[hook]
+        for layer, dirs, lo, hi, strength in table.by_layer():
+            for i in range(dirs.shape[0]):
+                arr = np.ascontiguousarray(dirs[i], dtype=np.float64)
+                parts.append(
+                    b"%b|%d|%d|%d|%b%b%b"
+                    % (
+                        hook.encode(),
+                        layer,
+                        i,
+                        zlib.crc32(arr.tobytes()) & 0xFFFFFFFF,
+                        struct.pack("<d", lo[i]),
+                        struct.pack("<d", hi[i]),
+                        struct.pack("<d", strength[i]),
+                    )
+                )
+    return b"@".join(parts)
+
+
 def _steering_action_digest(action) -> bytes:
     """Order-independent, PYTHONHASHSEED-free digest of one action's content.
 
@@ -203,15 +242,22 @@ def _steering_action_digest(action) -> bytes:
             )
         )
     if isinstance(action, RequestSteeringOverride):
-        return b";".join(
-            (
-                name,
-                action.req_id.encode(),
-                b"1" if action.compose_admitted else b"0",
-                action.source.encode(),
-                _vectors_digest(action.vectors),
-            )
+        parts = [
+            name,
+            action.req_id.encode(),
+            b"1" if action.compose_admitted else b"0",
+            action.source.encode(),
+            _vectors_digest(action.vectors),
+        ]
+        # Gate the clamp segment so a clamp-free override keeps its exact
+        # pre-clamp digest bytes (the pinned-checksum determinism test).
+        # from_obj revives dict-shaped clamps from duck-typed producers.
+        clamps = SteeringClamps.from_obj(
+            getattr(action, "clamps", None), preserve_empty=True
         )
+        if clamps:
+            parts.append(_clamps_digest(clamps))
+        return b";".join(parts)
     if isinstance(action, SteeringScaleUpdate):
         return b";".join(
             (
@@ -618,6 +664,8 @@ class SteeringModelRunnerMixin:
         self._steering_index_dirty = False
         self._steering_module_registry = {}
         self._steering_module_resolved_cache = {}
+        self._steering_module_clamps = {}
+        self._steering_module_clamps_effective = {}
         self._steering_module_pinned_rows = {}
         # Worker-resident named probe/steer vector registry (rank-replicated
         # via ``collective_rpc``). Installed as a process-global so the sync
@@ -698,8 +746,23 @@ class SteeringModelRunnerMixin:
         cross_layer = bool(
             getattr(steering_config, "enable_cross_layer_monitor", False)
         )
+        from vllm.model_executor.layers.clamp import CLAMP_GATE_ACTIVE_ATTR
+
         for mod in steerable.values():
             mod._cross_layer_monitor = cross_layer
+            # Directional clamps honor the shared ``steering_row_gate`` only in
+            # the materialized (cross-layer) monitor mode: there the standalone
+            # ``steering_monitor`` op WRITES the per-token gate into the shared
+            # buffer that layers >= L read, so a clamp at those layers reads the
+            # same gate the additive row term reads ("detect at L, clamp at
+            # layers >= L"). In the default fused mode the gate is recomputed in
+            # the steering kernel and never materialized, so clamps stay ungated
+            # (and a declarative gate targeting clamps is rejected at admission).
+            # Set once here, constant for the model's lifetime.
+            for hp in SteeringHookPoint:
+                gate_flag = getattr(mod, CLAMP_GATE_ACTIVE_ATTR[hp], None)
+                if gate_flag is not None:
+                    gate_flag.fill_(cross_layer)
 
         # Per-row (per-request) monitor: opt-in. When enabled, resize the
         # dummy ``(1, 1)`` probe/params buffers to full per-row tables across
@@ -731,12 +794,16 @@ class SteeringModelRunnerMixin:
             if table_device is not None:
                 break
 
+        self._max_clamp_directions = int(
+            getattr(steering_config, "max_clamp_directions", 0)
+        )
         self._steering_manager = SteeringManager(
             steering_config.max_steering_configs,
             device=table_device,
             max_dynamic_steering_configs=getattr(
                 steering_config, "max_dynamic_steering_configs", 0
             ),
+            max_clamp_directions=self._max_clamp_directions,
         )
         # SAE manager shares the additive ``max_steering_configs``
         # admission budget per the design doc: a request that uses both
@@ -875,6 +942,27 @@ class SteeringModelRunnerMixin:
                 device=table_device,
                 capture_sizes=list(capture_sizes) if capture_sizes else None,
             )
+
+            # Warm the directional-clamp kernels when clamping is enabled —
+            # the clamp ops are emitted at every steered hook once buffers
+            # exist, so their Triton JIT must retire before CUDA-graph
+            # capture even when no clamp is configured yet.
+            if self._max_clamp_directions > 0:
+                from vllm.model_executor.layers.clamp_kernel import (
+                    warmup_apply_clamp_kernel,
+                )
+
+                warmup_apply_clamp_kernel(
+                    hidden_size=hidden_size,
+                    table_rows=TableLayout.from_steering_config(
+                        steering_config
+                    ).num_rows,
+                    max_directions=self._max_clamp_directions,
+                    table_dtype=table_dtype,
+                    compute_dtype=compute_dtype,
+                    device=table_device,
+                    capture_sizes=list(capture_sizes) if capture_sizes else None,
+                )
 
         # Pre-allocate SAE buffers for the startup-declared module
         # topology (plus configured spare slots) so compiled graphs /
@@ -1088,6 +1176,60 @@ class SteeringModelRunnerMixin:
             vectors_data, steerable, self._VECTORS_SPEC_STYLE
         )
 
+    def _validate_clamps_spec(
+        self,
+        clamps_data: "SteeringClamps",
+        steerable: dict,
+    ) -> set[int]:
+        """Validate a global clamp tier against this worker's layers.
+
+        Clamp sibling of :meth:`_validate_vectors_spec`: checks hook
+        points, direction width against the layer's table hidden size,
+        and the per-site K cap (row structure was already validated at
+        ingestion by ``SteeringClamps.from_obj``). Returns the set of
+        valid layer indices on this worker; raises
+        ``SteeringVectorError`` on any invalid input.
+        """
+        max_dirs = getattr(self, "_max_clamp_directions", 0)
+        valid_indices: set[int] = set()
+        for hook_point_str, table in clamps_data.hooks.items():
+            try:
+                hp_enum = SteeringHookPoint(hook_point_str)
+            except ValueError as exc:
+                raise SteeringVectorError(
+                    f"Invalid hook point: {hook_point_str!r}"
+                ) from exc
+            table_attr = HOOK_POINT_TABLE_ATTR[hp_enum]
+
+            for idx, count in sorted(table.site_counts().items()):
+                if idx not in steerable:
+                    continue
+                mod = steerable[idx]
+                if not hasattr(mod, table_attr):
+                    raise SteeringVectorError(
+                        f"Hook point {hook_point_str!r} not active on layer {idx}"
+                    )
+                if max_dirs <= 0:
+                    raise SteeringVectorError(
+                        "Clamping is disabled on this engine "
+                        "(steering_config.max_clamp_directions=0)"
+                    )
+                if count > max_dirs:
+                    raise SteeringVectorError(
+                        f"Layer {idx} ({hook_point_str}): {count} "
+                        f"clamp directions exceed max_clamp_directions="
+                        f"{max_dirs}"
+                    )
+                expected_size = getattr(mod, table_attr).shape[1]
+                if table.width != expected_size:
+                    raise SteeringVectorError(
+                        f"Layer {idx} ({hook_point_str}): expected clamp "
+                        f"directions of size {expected_size}, got "
+                        f"{table.width}"
+                    )
+                valid_indices.add(idx)
+        return valid_indices
+
     def list_steerable_layers(self) -> dict[int, list[str]]:
         """Return steerable layers on this worker with their hook points.
 
@@ -1147,6 +1289,30 @@ class SteeringModelRunnerMixin:
     # Public steering API (mirrored by thin passthroughs on the worker)
     # -----------------------------------------------------------------------
 
+    def _notify_manager_clamps(
+        self,
+        clamps_data: "SteeringClamps",
+        steerable: dict,
+        valid_indices: set[int],
+        phase: str,
+    ) -> None:
+        """Notify SteeringManager of global clamp changes for a phase."""
+        mgr = self._steering_manager
+        if mgr is None:
+            return
+        locally_owned = getattr(self, "_locally_owned_layers", None)
+        for hook_point_str, table in clamps_data.hooks.items():
+            for idx, dirs, lo, hi, strength in table.by_layer():
+                if idx not in valid_indices or idx not in steerable:
+                    continue
+                mgr.update_global_clamps(
+                    hook_point_str,
+                    idx,
+                    (dirs, lo, hi, strength),
+                    phase=phase,
+                    locally_owned_layers=locally_owned,
+                )
+
     def set_steering_vectors(
         self,
         vectors: dict[str, dict[int, list[float]]] | None = None,
@@ -1154,6 +1320,9 @@ class SteeringModelRunnerMixin:
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
+        clamps: "SteeringClamps | dict | None" = None,
+        prefill_clamps: "SteeringClamps | dict | None" = None,
+        decode_clamps: "SteeringClamps | dict | None" = None,
     ) -> tuple[int, int, list[int]]:
         """Set activation steering vectors from plain Python data.
 
@@ -1198,8 +1367,22 @@ class SteeringModelRunnerMixin:
             all_tiers.append(("prefill", prefill_vectors))
         if decode_vectors:
             all_tiers.append(("decode", decode_vectors))
+        # Revive clamp tiers: collective_rpc flattens SteeringClamps to
+        # its plain wire-map dict, and legacy callers pass entry-lists.
+        clamp_tiers: list[tuple[str, SteeringClamps]] = []
+        for tier_phase, tier_obj, tier_field in (
+            ("base", clamps, "clamps"),
+            ("prefill", prefill_clamps, "prefill_clamps"),
+            ("decode", decode_clamps, "decode_clamps"),
+        ):
+            try:
+                tier_spec = SteeringClamps.from_obj(tier_obj, field_name=tier_field)
+            except (TypeError, ValueError) as exc:
+                raise SteeringVectorError(str(exc)) from exc
+            if tier_spec:
+                clamp_tiers.append((tier_phase, tier_spec))
 
-        if not all_tiers:
+        if not all_tiers and not clamp_tiers:
             if replace:
                 self.clear_steering_vectors()
             return (tp_rank, pp_rank, [])
@@ -1208,6 +1391,8 @@ class SteeringModelRunnerMixin:
         valid_indices: set[int] = set()
         for _phase, tier_data in all_tiers:
             valid_indices.update(self._validate_vectors_spec(tier_data, steerable))
+        for _phase, tier_clamps in clamp_tiers:
+            valid_indices.update(self._validate_clamps_spec(tier_clamps, steerable))
 
         if not valid_indices:
             return (tp_rank, pp_rank, [])
@@ -1236,13 +1421,21 @@ class SteeringModelRunnerMixin:
                 decode_vectors, steerable, valid_indices, "decode"
             )
 
+        # Clamp tiers ride the same call; the manager stores them in the
+        # parallel global clamp dicts and populate concatenates them into
+        # rows 1/2 and every config row.
+        for phase, tier_clamps in clamp_tiers:
+            self._notify_manager_clamps(tier_clamps, steerable, valid_indices, phase)
+
         return (tp_rank, pp_rank, sorted(valid_indices))
 
     def clear_steering_vectors(self) -> None:
-        """Clear all tiers (base, prefill, decode) in the SteeringManager."""
+        """Clear all tiers (base, prefill, decode) in the SteeringManager,
+        including the global clamp tiers."""
         mgr = self._steering_manager
         if mgr is not None:
             mgr.clear_global_vectors()
+            mgr.clear_global_clamps()
 
     def get_steering_status(self) -> dict:
         """Return per-hook-point status for active layers.
@@ -1467,6 +1660,32 @@ class SteeringModelRunnerMixin:
             _coerce(payload.get("decode_vectors")),
         )
 
+    @staticmethod
+    def _module_payload_to_clamps(
+        payload: dict,
+    ) -> tuple[
+        SteeringClamps | None,
+        SteeringClamps | None,
+        SteeringClamps | None,
+    ]:
+        """Normalize a broadcast payload's optional clamp tiers.
+
+        Each tier is revived through :meth:`SteeringClamps.from_obj`, so
+        a payload arriving as canonical Structs (flattened to wire maps
+        by the RPC hop), legacy entry-lists with string layer keys (the
+        Rust module route forwards JSON verbatim), or the legacy base64
+        packed shape all normalize identically here.
+        """
+        return (
+            SteeringClamps.from_obj(payload.get("clamps"), field_name="clamps"),
+            SteeringClamps.from_obj(
+                payload.get("prefill_clamps"), field_name="prefill_clamps"
+            ),
+            SteeringClamps.from_obj(
+                payload.get("decode_clamps"), field_name="decode_clamps"
+            ),
+        )
+
     def register_steering_modules(
         self,
         modules: dict[str, dict],
@@ -1529,6 +1748,19 @@ class SteeringModelRunnerMixin:
                     resolve_effective_vectors(base_spec, prefill_spec),
                     resolve_effective_vectors(base_spec, decode_spec),
                 )
+                # Optional clamps tier: stored in a parallel registry (the
+                # 3-tuple registry shape is consumed by the vector resolve
+                # path) with a pre-concatenated per-phase effective cache.
+                base_c, prefill_c, decode_c = self._module_payload_to_clamps(payload)
+                if base_c or prefill_c or decode_c:
+                    self._module_clamps_store()[name] = (base_c, prefill_c, decode_c)
+                    self._module_clamps_effective_store()[name] = (
+                        resolve_effective_clamps(base_c, prefill_c),
+                        resolve_effective_clamps(base_c, decode_c),
+                    )
+                else:
+                    self._module_clamps_store().pop(name, None)
+                    self._module_clamps_effective_store().pop(name, None)
                 # If a name is being re-registered as additive, drop any
                 # stale SAE entry (and its buffers) so the registries
                 # stay disjoint.
@@ -1593,6 +1825,8 @@ class SteeringModelRunnerMixin:
                 self._sae_module_registry[name] = manifest
                 self._steering_module_registry.pop(name, None)
                 self._steering_module_resolved_cache.pop(name, None)
+                self._module_clamps_store().pop(name, None)
+                self._module_clamps_effective_store().pop(name, None)
                 # Atomic register-and-attach: when the payload carries
                 # ``sae_weights`` the buffers are attached *and* the weights
                 # copied in one indivisible step.  On failure the entry and
@@ -1682,6 +1916,8 @@ class SteeringModelRunnerMixin:
                 fr_registry[name] = manifest
                 self._steering_module_registry.pop(name, None)
                 self._steering_module_resolved_cache.pop(name, None)
+                self._module_clamps_store().pop(name, None)
+                self._module_clamps_effective_store().pop(name, None)
                 sae_weights = payload.get("sae_weights")
                 try:
                     self._attach_sae_full_recon_buffers(name, manifest)
@@ -1728,6 +1964,8 @@ class SteeringModelRunnerMixin:
         prev_fr_weights = {
             name: self._snapshot_sae_full_recon_weights(name) for name in prev_fr
         }
+        prev_clamps = dict(self._module_clamps_store())
+        prev_clamps_effective = dict(self._module_clamps_effective_store())
 
         # Releasing pre-materialized pins before clearing the registry
         # preserves the refcount invariant.  Without this, a startup
@@ -1747,6 +1985,8 @@ class SteeringModelRunnerMixin:
                 prev_fr_registry.clear()
             self._steering_module_registry.clear()
             self._steering_module_resolved_cache.clear()
+            self._module_clamps_store().clear()
+            self._module_clamps_effective_store().clear()
             self._sae_module_registry.clear()
             self.register_steering_modules(modules, replace=False)
         except Exception:
@@ -1758,10 +1998,14 @@ class SteeringModelRunnerMixin:
                 prev_fr_registry.clear()
             self._steering_module_registry.clear()
             self._steering_module_resolved_cache.clear()
+            self._module_clamps_store().clear()
+            self._module_clamps_effective_store().clear()
             self._sae_module_registry.clear()
 
             self._steering_module_registry.update(prev_additive)
             self._steering_module_resolved_cache.update(prev_cache)
+            self._module_clamps_store().update(prev_clamps)
+            self._module_clamps_effective_store().update(prev_clamps_effective)
             for name, manifest in prev_sae.items():
                 self._sae_module_registry[name] = manifest
                 try:
@@ -1801,6 +2045,8 @@ class SteeringModelRunnerMixin:
             self.release_pre_materialized_steering_module(name)
             self._steering_module_registry.pop(name, None)
             self._steering_module_resolved_cache.pop(name, None)
+            self._module_clamps_store().pop(name, None)
+            self._module_clamps_effective_store().pop(name, None)
             # A name might exist in either the additive registry or an SAE
             # registry; remove from both (detaching SAE buffers) so a
             # re-registration with a different kind lands in a clean slot.
@@ -1813,6 +2059,8 @@ class SteeringModelRunnerMixin:
             if fr_registry is not None and name in fr_registry:
                 self._detach_sae_full_recon_buffers(name)
                 fr_registry.pop(name, None)
+            self._module_clamps_store().pop(name, None)
+            self._module_clamps_effective_store().pop(name, None)
         if names:
             logger.debug(
                 "Worker unregistered %d steering module(s)",
@@ -1888,17 +2136,21 @@ class SteeringModelRunnerMixin:
         # only request.  The (hash, phase) tuple still distinguishes
         # them because ``register_config`` keys on (hash, phase).
         named_only_hash = hash_steering_config(None, module_ref=module_ref)
-        for phase, resolved in (
-            ("prefill", prefill_resolved),
-            ("decode", decode_resolved),
+        clamps_cached = self._module_clamps_effective_store().get(name)
+        prefill_clamps = clamps_cached[0] if clamps_cached else None
+        decode_clamps = clamps_cached[1] if clamps_cached else None
+        for phase, resolved, phase_clamps in (
+            ("prefill", prefill_resolved, prefill_clamps),
+            ("decode", decode_resolved, decode_clamps),
         ):
-            if not resolved:
+            if not resolved and not phase_clamps:
                 continue
             mgr.register_config(
                 named_only_hash,
-                resolved,
+                resolved or {},
                 phase=phase,
                 locally_owned_layers=locally_owned,
+                **({"clamps": phase_clamps} if phase_clamps else {}),
             )
             pinned.append((named_only_hash, phase))
         self._steering_module_pinned_rows[name] = pinned
@@ -2067,6 +2319,65 @@ class SteeringModelRunnerMixin:
         merged_base = merge_steering_specs(scaled_base, sp.steering_vectors)
         merged_phase = merge_steering_specs(phase_module_spec, inline_phase_spec)
         return resolve_effective_vectors(merged_base, merged_phase)
+
+    def _resolve_request_clamps(
+        self,
+        sp: SamplingParams,
+        phase: str,
+    ) -> SteeringClamps | None:
+        """Resolve the effective clamps for a request in the given *phase*.
+
+        Clamp sibling of :meth:`_resolve_request_steering`: inline tiers
+        come from the ``effective_*_clamps`` cached properties; a named
+        module's clamps tier (when the module carries one) is concatenated
+        BEFORE the inline entries, mirroring the tier-merge order.  The
+        module-level scale does NOT apply to clamps (bounds are absolute
+        constraints in unit-projection space, not scalable magnitudes).
+
+        The per-site K cap (``max_clamp_directions``) is enforced here so
+        an over-budget request rejects before any manager row is touched.
+        Missing-module errors are raised by :meth:`_resolve_request_steering`,
+        which every caller invokes alongside this helper.
+        """
+        if phase not in ("prefill", "decode"):
+            raise ValueError(f"phase must be 'prefill' or 'decode', got {phase!r}")
+
+        # getattr-tolerant reads: several worker tests drive this mixin with
+        # duck-typed SamplingParams stand-ins that predate the clamp fields.
+        inline = getattr(
+            sp,
+            "effective_prefill_clamps"
+            if phase == "prefill"
+            else "effective_decode_clamps",
+            None,
+        )
+        module_clamps = None
+        ref = getattr(sp, "steering_module_ref", None)
+        if ref is not None:
+            cached = self._module_clamps_effective_store().get(ref[0])
+            if cached is not None:
+                module_clamps = cached[0] if phase == "prefill" else cached[1]
+        if inline is None and module_clamps is None:
+            return None
+        max_dirs = getattr(self, "_max_clamp_directions", 0)
+        return resolve_effective_clamps(
+            module_clamps,
+            inline,
+            max_directions=max_dirs if max_dirs > 0 else None,
+        )
+
+    def _module_clamps_store(self) -> dict:
+        """Named-module clamp registry, lazily created.
+
+        ``__dict__.setdefault`` (rather than an ``_init_steering_state``
+        attribute alone) keeps duck-typed test hosts that skip init
+        working, and avoids a shared class-level mutable default.
+        """
+        return self.__dict__.setdefault("_steering_module_clamps", {})
+
+    def _module_clamps_effective_store(self) -> dict:
+        """Per-phase pre-concatenated module clamp cache, lazily created."""
+        return self.__dict__.setdefault("_steering_module_clamps_effective", {})
 
     # -----------------------------------------------------------------------
     # Per-step buffer / index maintenance
@@ -2307,6 +2618,23 @@ class SteeringModelRunnerMixin:
                 "prefill steering feeds prefix-cache keys)"
             )
 
+        # Per-override clamps (optional). REPLACE semantics on update:
+        # ``None`` keeps the override's previous clamps, an empty spec
+        # clears them, a non-empty spec replaces them. Revive defensively
+        # (in-process producers may pass legacy dicts) and validate the
+        # override's own spec (hooks / width / K cap) before touching the
+        # manager; the global-decode composition overflow is caught loudly
+        # at populate, naming the dynamic id (same trap as config rows).
+        try:
+            clamps = SteeringClamps.from_obj(action.clamps, preserve_empty=True)
+        except (TypeError, ValueError) as exc:
+            return _reject(str(exc))
+        if clamps:
+            try:
+                self._validate_clamps_spec(clamps, self._steerable_layers_cache)
+            except SteeringVectorError as exc:
+                return _reject(str(exc))
+
         # Compose-on-top: fold the request's admitted decode steering delta
         # into the override so ``action.vectors`` adds to (rather than
         # replaces) the client's static decode steering. Resolving the admitted
@@ -2323,17 +2651,41 @@ class SteeringModelRunnerMixin:
                     return _reject(str(exc))
                 if admitted:
                     vectors = merge_steering_specs(admitted, action.vectors)
+                # Concat the admitted decode clamps BEFORE the override's
+                # own (mirrors the vector merge; clamps concat, not add).
+                if clamps:
+                    try:
+                        admitted_clamps = self._resolve_request_clamps(sp, "decode")
+                    except (RuntimeError, ValueError) as exc:
+                        return _reject(str(exc))
+                    if admitted_clamps:
+                        max_dirs = getattr(self, "_max_clamp_directions", 0)
+                        try:
+                            clamps = resolve_effective_clamps(
+                                admitted_clamps,
+                                clamps,
+                                max_directions=max_dirs if max_dirs > 0 else None,
+                            )
+                        except ValueError as exc:
+                            return _reject(str(exc))
 
         try:
             validate_steering_vectors(vectors, self._steerable_layers_cache)
         except SteeringVectorError as exc:
             return _reject(str(exc))
 
+        # Conditional ``clamps`` kwarg: forwarded only when the override
+        # specifies clamps (``None`` ⇒ keep, so it is omitted). This keeps
+        # duck-typed fake managers in tests — whose register/update
+        # signatures predate the clamp kwarg — working unchanged, while
+        # still forwarding an empty ``{}`` (clear) to real managers.
+        clamp_kw = {"clamps": clamps} if clamps is not None else {}
         if existing_dyn_id is not None:
             mgr.update_dynamic_config(
                 existing_dyn_id,
                 vectors,
                 locally_owned_layers=self._locally_owned_layers,
+                **clamp_kw,
             )
             self._req_override_source[req_id] = source
             return True
@@ -2341,6 +2693,7 @@ class SteeringModelRunnerMixin:
             dyn_id, _row = mgr.register_dynamic_config(
                 vectors,
                 locally_owned_layers=self._locally_owned_layers,
+                **clamp_kw,
             )
         except RuntimeError as exc:
             # Pool exhausted: previous state (admitted routing) kept.
@@ -2706,6 +3059,8 @@ class SteeringModelRunnerMixin:
             and not self._steering_manager.global_base_vectors
             and not self._steering_manager.global_prefill_vectors
             and not self._steering_manager.global_decode_vectors
+            # getattr-tolerant: duck-typed test managers predate clamps.
+            and not getattr(self._steering_manager, "has_global_clamps", False)
         ):
             if self._steering_index_dirty:
                 any_layer = next(iter(self._steerable_layers_cache.values()))
@@ -2746,6 +3101,12 @@ class SteeringModelRunnerMixin:
                         row_buf = getattr(mod, HOOK_POINT_ROW_ACTIVE_ATTR[hp], None)
                         if row_buf is not None:
                             row_buf.zero_()
+                        # And the directional-clamp active flag, so stale
+                        # clamp rows never fire after the last clamp state
+                        # is removed.
+                        clamp_buf = getattr(mod, CLAMP_ANY_ACTIVE_ATTR[hp], None)
+                        if clamp_buf is not None:
+                            clamp_buf.zero_()
                 self._steering_index_dirty = False
             # Nothing dynamic is active; revert any request still reported as
             # dynamically steered back to its admitted decode key.
@@ -3125,14 +3486,21 @@ class SteeringModelRunnerMixin:
         additive_registered: tuple[int, str] | None = None
         if num_computed_tokens >= num_prompt_tokens:
             # Already past prefill — register the decode config now.
+            # Clamp-only configs (nonzero hash, empty effective vectors)
+            # must still register: the hash reserved a scheduler row, and
+            # skipping here would crash get_row_for_config downstream.
             effective_decode = self._resolve_request_steering(sp, "decode")
-            if decode_hash != 0 and effective_decode:
+            decode_clamps = self._resolve_request_clamps(sp, "decode")
+            if decode_hash != 0 and (effective_decode or decode_clamps):
+                # ``clamps=`` only when present: clamp-free requests keep the
+                # original call shape (duck-typed test managers rely on it).
                 mgr.register_config(
                     decode_hash,
-                    effective_decode,
+                    effective_decode or {},
                     phase="decode",
                     locally_owned_layers=self._locally_owned_layers,
                     **self._content_hash_kwargs(sp, "decode"),
+                    **({"clamps": decode_clamps} if decode_clamps else {}),
                 )
                 additive_registered = (decode_hash, "decode")
             rs.phase = "decode"
@@ -3140,13 +3508,15 @@ class SteeringModelRunnerMixin:
             # Normal: start in prefill; the decode config is registered lazily
             # at the prefill->decode boundary in _update_steering_buffers.
             effective_prefill = self._resolve_request_steering(sp, "prefill")
-            if prefill_hash != 0 and effective_prefill:
+            prefill_clamps = self._resolve_request_clamps(sp, "prefill")
+            if prefill_hash != 0 and (effective_prefill or prefill_clamps):
                 mgr.register_config(
                     prefill_hash,
-                    effective_prefill,
+                    effective_prefill or {},
                     phase="prefill",
                     locally_owned_layers=self._locally_owned_layers,
                     **self._content_hash_kwargs(sp, "prefill"),
+                    **({"clamps": prefill_clamps} if prefill_clamps else {}),
                 )
                 additive_registered = (prefill_hash, "prefill")
             rs.phase = "prefill"
@@ -3254,13 +3624,15 @@ class SteeringModelRunnerMixin:
             effective_decode = self._resolve_request_steering(
                 rs.sampling_params, "decode"
             )
-            if effective_decode:
+            decode_clamps = self._resolve_request_clamps(rs.sampling_params, "decode")
+            if effective_decode or decode_clamps:
                 mgr.register_config(
                     rs.decode_hash,
-                    effective_decode,
+                    effective_decode or {},
                     phase="decode",
                     locally_owned_layers=self._locally_owned_layers,
                     **self._content_hash_kwargs(rs.sampling_params, "decode"),
+                    **({"clamps": decode_clamps} if decode_clamps else {}),
                 )
         rs.phase = "decode"
 

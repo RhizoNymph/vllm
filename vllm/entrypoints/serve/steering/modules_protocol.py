@@ -120,6 +120,21 @@ class RegisterSteeringModuleRequest(BaseModel):
             "rejected for ``additive``."
         ),
     )
+    clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Base directional clamps (both phases): {hook: {layer: "
+        "[{'vector': [...], 'min': float?, 'max': float?, 'strength': "
+        "float=1.0} | {'vector': [...], 'value': c}]}}. Same shape as the "
+        "/v1/steering/set clamps field.",
+    )
+    prefill_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Prefill-phase clamps, concatenated after base.",
+    )
+    decode_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Decode-phase clamps, concatenated after base.",
+    )
 
 
 class UnregisterSteeringModuleRequest(BaseModel):

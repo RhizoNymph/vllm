@@ -53,6 +53,18 @@ class SAEFullReconstructionSpec(msgspec.Struct):
     clamps: dict[str, dict[int, list[SAEClampEntry]]] = {}
     phase: str = "both"
     gated: bool = False
+# Mirrors of the canonical clamp Structs (vllm.config.steering_types).
+class ClampHookTable(msgspec.Struct, forbid_unknown_fields=True):
+    shape: list[int]
+    layer_indices: list[int]
+    data: bytes
+    lo: list[float]
+    hi: list[float]
+    strength: list[float]
+
+
+class SteeringClamps(msgspec.Struct, omit_defaults=True, forbid_unknown_fields=True):
+    hooks: dict[str, ClampHookTable] = {}
 
 
 # Mirror of real SamplingParams; omit_defaults makes fixtures match real maps.
@@ -63,6 +75,7 @@ class EngineCoreSamplingParams(msgspec.Struct, dict=True, omit_defaults=True):
     seed: int | None = None
     max_tokens: int = 16
     min_tokens: int = 0
+    thinking_token_budget: int | None = None
     min_p: float = 0.0
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -73,6 +86,7 @@ class EngineCoreSamplingParams(msgspec.Struct, dict=True, omit_defaults=True):
     output_kind: RequestOutputKind = RequestOutputKind.DELTA
     sae_clamp_specs: list[SAEClampSpec] | None = None
     sae_full_reconstruction_specs: list[SAEFullReconstructionSpec] | None = None
+    steering_clamps: SteeringClamps | None = None
 
 
 class EngineCoreRequest(
@@ -118,6 +132,7 @@ class EngineCoreOutput(
     capture_results: dict = msgspec.field(default_factory=dict)
     events: object | None = None
     kv_transfer_params: object | None = None
+    ec_transfer_params: object | None = None
     trace_headers: object | None = None
     prefill_stats: object | None = None
     routed_experts: object | None = None
@@ -154,6 +169,7 @@ request = EngineCoreRequest(
         seed=None,
         max_tokens=32,
         min_tokens=1,
+        thinking_token_budget=256,
         min_p=0.0,
         frequency_penalty=0.0,
         presence_penalty=0.0,
@@ -393,6 +409,8 @@ class EngineCoreReadyResponse:
     dp_stats_address: str | None
     dtype: str
     vllm_version: str
+    world_size: int
+    data_parallel_size: int
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
 
@@ -432,6 +450,34 @@ sae_request = EngineCoreRequest(
 )
 
 
+# Clamp-bearing request: proves the canonical clamp Struct crosses the wire
+# with the row bytes as msgpack bin and native ±inf bounds.
+clamp_request = EngineCoreRequest(
+    request_id="req-clamps",
+    prompt_token_ids=[1, 2],
+    mm_features=None,
+    sampling_params=EngineCoreSamplingParams(
+        temperature=0.0,
+        steering_clamps=SteeringClamps(
+            hooks={
+                "post_block": ClampHookTable(
+                    shape=[2, 2],
+                    layer_indices=[5, 9],
+                    data=np.array(
+                        [[1.5, -2.0], [0.25, 8.0]], dtype=np.float64
+                    ).tobytes(),
+                    lo=[-2.0, float("-inf")],
+                    hi=[2.0, 4.0],
+                    strength=[1.0, 0.5],
+                )
+            }
+        ),
+    ),
+    pooling_params=None,
+    arrival_time=7.5,
+)
+
+
 ready_response = EngineCoreReadyResponse(
     max_model_len=32768,
     num_gpu_blocks=1000,
@@ -439,6 +485,8 @@ ready_response = EngineCoreReadyResponse(
     dp_stats_address=None,
     dtype="float32",
     vllm_version="0.0.0",
+    data_parallel_size=1,
+    world_size=1,
 )
 
 print(msgspec.msgpack.encode(request).hex())
@@ -461,3 +509,4 @@ print(
 )
 print(msgspec.msgpack.encode(ready_response).hex())
 print(msgspec.msgpack.encode(sae_request).hex())
+print(msgspec.msgpack.encode(clamp_request).hex())

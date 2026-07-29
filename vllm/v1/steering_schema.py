@@ -10,7 +10,10 @@ A request can declare its own conditional steering in the request payload
 - ``scope`` (extent): ``this_token`` | ``next_step`` | ``rest_of_request`` |
   ``rest_of_conversation``.
 - ``apply`` (action): ``add`` (vector × strength, composed *on top* of the
-  request's static decode steering) | ``attenuate`` (damp existing steering).
+  request's static decode steering) | ``attenuate`` (damp existing steering) |
+  ``clamp`` (FORWARD-COMPAT, currently rejected at validation — see
+  :class:`ClampApply`; clamp gating is server-side via the global
+  cross-layer monitor today).
 
 The wire schema (:class:`SteeringGate` and friends) are msgspec tagged
 unions so the nested list rides on :class:`vllm.v1.request_metadata.
@@ -152,7 +155,37 @@ class AttenuateApply(
     strength: float
 
 
-Apply = AddApply | AttenuateApply
+class ClampApply(
+    msgspec.Struct, tag="clamp", tag_field="kind", frozen=True, omit_defaults=True
+):
+    """FORWARD-COMPAT: modulate the request's directional CLAMPS by the gate.
+
+    Reserved wire-schema member — **currently rejected at validation**
+    (:func:`_validate_gate_semantics` / :func:`validate_clamp_gate_support`)
+    because no substrate can honor a *per-request* clamp gate today. The
+    intended semantics: when the gate fires, the clamp's effective strength
+    is scaled via the shared per-token row gate (``effective =
+    clamp_strength * gate``), row-level — all K clamp entries of the
+    request's row scaled uniformly, congruent with how the row gate treats
+    additive steering. No vector source: the clamps themselves are declared
+    statically in ``steering_clamps`` (the gate only modulates them).
+
+    Why rejected: the clamp ops read the shared ``steering_row_gate``
+    buffer, which is only *written* by the GLOBAL cross-layer monitor
+    (``enable_cross_layer_monitor``). The per-request (per-row) monitor is
+    fused into the steering kernel — non-mutating, same-hook — so a
+    per-request probe can never materialize gate values the clamp op sees.
+    Until a materializing per-row monitor exists, clamp gating is available
+    only server-side: enable the cross-layer monitor and install a global
+    monitor with ``gate_rows`` — every clamp at layers >= the probe layer is
+    then modulated. The member is kept so the tagged union stays stable when
+    per-request support lands.
+    """
+
+    strength: float = 1.0
+
+
+Apply = AddApply | AttenuateApply | ClampApply
 
 
 class SteeringGate(msgspec.Struct, frozen=True, omit_defaults=True):
@@ -182,7 +215,7 @@ class ResolvedGate:
     threshold: float | None
     sharpness: float | None
     # apply
-    apply_kind: str  # "add" | "attenuate"
+    apply_kind: str  # "add" | "attenuate" | "clamp"
     steer_vectors: dict[str, dict[int, np.ndarray]] | None  # add override (×strength)
     strength: float
     # Source provenance for an ``add`` gate whose steer vector is a
@@ -299,6 +332,11 @@ def resolve_gates(
             )
             steer = _scale_vectors(vecs, float(gate.apply.strength))
             apply_kind = "add"
+            strength = float(gate.apply.strength)
+        elif isinstance(gate.apply, ClampApply):
+            # Modulates the request's static clamps (no vector source).
+            apply_kind = "clamp"
+            steer = None
             strength = float(gate.apply.strength)
         else:
             apply_kind = "attenuate"
@@ -449,8 +487,25 @@ def _validate_gate_semantics(gates: list[SteeringGate]) -> None:
       server memory indefinitely (see docs/design/dynamic_steering.md §8.3).
       Latching by reference to a registered name requires the source to be a
       name — inline is rejected here. Ephemeral scopes keep inline support.
+    - ``clamp`` (:class:`ClampApply`) is rejected outright: no substrate can
+      honor a *per-request* clamp gate today (the clamp op reads the shared
+      row-gate buffer, written only by the GLOBAL cross-layer monitor; the
+      per-row monitor is fused/non-mutating and cannot materialize gate
+      values). Accepting it would either silently do nothing (no global
+      monitor) or silently follow the global monitor's probe instead of the
+      declared one. Server-side clamp gating remains available.
     """
     for gate in gates:
+        if isinstance(gate.apply, ClampApply):
+            raise ValueError(
+                "per-request clamp gates (apply.kind='clamp') are not "
+                "supported yet: clamp gating currently follows the server's "
+                "GLOBAL cross-layer monitor, not a per-request probe. "
+                "Configure it server-side instead: set "
+                "steering_config.enable_cross_layer_monitor=true and install "
+                "a global steering monitor with gate_rows — all clamps at "
+                "layers >= the probe layer are then modulated."
+            )
         if (
             isinstance(gate.apply, AttenuateApply)
             and isinstance(gate.when, ProbeWhen)
@@ -484,9 +539,77 @@ def _validate_gate_semantics(gates: list[SteeringGate]) -> None:
                 )
 
 
+def validate_clamp_gate_support(
+    gates: list[SteeringGate] | None,
+    *,
+    monitor_writes_gates: bool,
+) -> None:
+    """Reject clamp-target gates — no engine mode can honor them today.
+
+    A gate with ``apply.kind == "clamp"`` would modulate the request's
+    directional clamps through the SHARED ``steering_row_gate`` buffer. That
+    buffer is only *written* by the GLOBAL cross-layer monitor
+    (``steering_config.enable_cross_layer_monitor``, "monitor writes gates");
+    the per-request (per-row) monitor is fused into the steering kernel —
+    non-mutating, same-hook — so a per-request probe can never materialize
+    gate values the clamp op reads. Consequently:
+
+    - **fused mode** (``monitor_writes_gates=False``): the gate never reaches
+      the clamp op at all — reject, naming the missing flag AND the
+      per-request limitation.
+    - **materialized mode** (``True``): the clamp op does read the shared
+      gate, but the values come from the server's GLOBAL monitor probe —
+      the request's declared probe/threshold/scope would be silently
+      ignored (or, with no global monitor installed, the gate would
+      silently do nothing). Reject rather than mislead; point at the
+      server-side global-monitor flow that actually works.
+
+    Kept as a separate seam (rather than only ``_validate_gate_semantics``)
+    so that when a materializing per-row monitor lands, the materialized-mode
+    branch can start accepting without touching the semantics validator's
+    contract.
+
+    Args:
+        gates: The parsed gates, or ``None``.
+        monitor_writes_gates: Whether the engine materializes gates into the
+            shared row-gate buffer (``enable_cross_layer_monitor``).
+
+    Raises:
+        ValueError: A clamp-target gate is present. The message is
+            actionable for the given mode.
+    """
+    if not gates:
+        return
+    if not any(isinstance(gate.apply, ClampApply) for gate in gates):
+        return
+    if not monitor_writes_gates:
+        raise ValueError(
+            "declarative gate targets clamps (apply.kind='clamp') but this "
+            "engine does not materialize gates: directional clamps read the "
+            "shared row-gate buffer, which is only written when the "
+            "cross-layer monitor is enabled "
+            "(steering_config.enable_cross_layer_monitor=true, "
+            "monitor_writes_gates). Note that per-request clamp gates are "
+            "not supported in any mode yet — clamp gating follows the "
+            "server's GLOBAL monitor (install one with gate_rows); drop the "
+            "clamp gate from the request."
+        )
+    raise ValueError(
+        "per-request clamp gates (apply.kind='clamp') are not supported "
+        "yet: this engine materializes gates, but the values written to the "
+        "shared row-gate buffer come from the server's GLOBAL cross-layer "
+        "monitor — the request's declared probe/threshold/scope would be "
+        "ignored. Install a global steering monitor with gate_rows to "
+        "modulate all clamps at layers >= the probe layer, and drop the "
+        "clamp gate from the request."
+    )
+
+
 def build_steering_gates(
     raw: list[dict] | None,
     registry: _VectorRegistry | None,
+    *,
+    monitor_writes_gates: bool | None = None,
 ) -> list[SteeringGate] | None:
     """Validate raw JSON gates for the wire (no name inflation).
 
@@ -497,6 +620,16 @@ def build_steering_gates(
     on malformed gates, unknown names, invalid hooks, or an inline steer on a
     ``rest_of_conversation`` gate (which must latch by name) — callers surface
     this as HTTP 400.
+
+    Clamp-target gates (``apply.kind == "clamp"``) are rejected
+    unconditionally by ``_validate_gate_semantics`` — no engine mode honors
+    per-request clamp gates today (see :class:`ClampApply`).
+    ``monitor_writes_gates`` (when supplied by the caller) is the engine's
+    ``enable_cross_layer_monitor`` setting, threaded to
+    :func:`validate_clamp_gate_support` so its error can be mode-tailored
+    and so materialized-mode acceptance can be enabled there later without
+    changing this signature. ``None`` ⇒ mode unknown; the unconditional
+    semantics rejection still applies.
     """
     if not raw:
         return None
@@ -519,6 +652,11 @@ def build_steering_gates(
     # (unsupported combos, non-finite/negative probe params, an inline steer
     # on a persisted rest_of_conversation gate).
     _validate_gate_semantics(gates)
+    # Reject clamp-target gates the engine cannot materialize (HTTP 400 here
+    # rather than silently ungated clamps at the worker). Skipped when the
+    # caller did not supply the mode.
+    if monitor_writes_gates is not None:
+        validate_clamp_gate_support(gates, monitor_writes_gates=monitor_writes_gates)
     # Fail fast on structural problems the consumer would otherwise hit
     # (probe must name exactly one site; add must carry vectors). Resolve
     # against the frontend registry so named sources are validated too;
@@ -542,10 +680,12 @@ __all__ = [
     "GateScope",
     "AddApply",
     "AttenuateApply",
+    "ClampApply",
     "Apply",
     "SteeringGate",
     "ResolvedGate",
     "resolve_gates",
     "resolve_gates_safe",
     "build_steering_gates",
+    "validate_clamp_gate_support",
 ]

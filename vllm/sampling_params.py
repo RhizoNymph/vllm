@@ -26,10 +26,12 @@ from vllm.config.sae_steering_types import (
     hash_sae_full_reconstruction_specs_for_phase,
 )
 from vllm.config.steering_types import (
+    SteeringClamps,
     SteeringLayerEntry,
     SteeringVectorSpec,
     hash_steering_config,
     normalize_layer_entry,
+    resolve_effective_clamps,
     resolve_effective_vectors,
     validate_steering_index,
 )
@@ -473,6 +475,36 @@ class SamplingParams(
     """Phase-specific steering vectors added to base during decode only.
     Same format as ``steering_vectors``."""
 
+    steering_clamps: SteeringClamps | None = None
+    """Base directional clamps applied to both prefill and decode phases.
+
+    Post-ingestion this is always the canonical
+    :class:`vllm.config.steering_types.SteeringClamps` — per-hook packed
+    tables of raw float64 direction rows plus bounds/strengths, which is
+    also exactly what crosses the engine-core wire (msgpack map with
+    binary ``data``), so the strict typed decoder on the engine side
+    accepts precisely what the API server sends.  Constructor callers may
+    pass any shape ``SteeringClamps.from_obj`` accepts — JSON entry-lists
+    keyed by hook point then layer index with entries ``{"vector": [...],
+    "min": float|None, "max": float|None, "strength": float = 1.0}``
+    (sugar: ``{"vector", "value": c}`` pins ``min = max = c``), the
+    type's own JSON form, or the legacy base64-packed hook blobs —
+    ``__post_init__`` normalizes the field in place.  Each row constrains
+    the hidden state's scalar projection along its direction
+    (unit-normalized at consumption, so bounds live in unit-projection
+    space) to ``[min, max]``:
+    ``h' = h + strength * (clip(h @ v_hat, min, max) - h @ v_hat) * v_hat``.
+    Unlike ``steering_vectors``, tier merging concatenates rows
+    (independent constraints, not addable vectors)."""
+
+    prefill_steering_clamps: SteeringClamps | None = None
+    """Phase-specific clamps concatenated after base during prefill only.
+    Same format as ``steering_clamps``."""
+
+    decode_steering_clamps: SteeringClamps | None = None
+    """Phase-specific clamps concatenated after base during decode only.
+    Same format as ``steering_clamps``."""
+
     _effective_prefill_steering_packed: dict[str, dict[int, np.ndarray]] | None = None
     """In-process pre-resolved + packed prefill-phase steering, in the
     model's compute dtype.  Equivalent to
@@ -604,14 +636,36 @@ class SamplingParams(
         steering_module_ref: tuple[str, float] | None = None,
         sae_clamp_specs: object = None,
         sae_full_reconstruction_specs: object = None,
+        steering_clamps: SteeringClamps | dict | None = None,
+        prefill_steering_clamps: SteeringClamps | dict | None = None,
+        decode_steering_clamps: SteeringClamps | dict | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
-            # Convert token_id to integer
-            # Clamp the bias between -100 and 100 per OpenAI API spec
-            logit_bias = {
-                int(token): min(100.0, max(-100.0, bias))
-                for token, bias in logit_bias.items()
-            }
+            # Fast path uses a dict comprehension; on failure we iterate once
+            # to identify the exact offending entry for the error message.
+            try:
+                logit_bias = {
+                    int(token): min(100.0, max(-100.0, bias))
+                    for token, bias in logit_bias.items()
+                }
+            except (ValueError, TypeError):
+                invalid_keys = []
+                converted_logit_bias = {}
+                for token, bias in logit_bias.items():
+                    try:
+                        token_id = int(token)
+                    except (ValueError, TypeError):
+                        invalid_keys.append(token)
+                        continue
+                    converted_logit_bias[token_id] = min(100.0, max(-100.0, bias))
+                if invalid_keys:
+                    raise VLLMValidationError(
+                        f"logit_bias contains key(s) that cannot be "
+                        f"converted to integer token IDs: {invalid_keys!r}",
+                        parameter="logit_bias",
+                        value=invalid_keys,
+                    ) from None
+                logit_bias = converted_logit_bias
 
         return SamplingParams(
             n=1 if n is None else n,
@@ -657,6 +711,9 @@ class SamplingParams(
             sae_full_reconstruction_specs=coerce_sae_full_reconstruction_specs(
                 sae_full_reconstruction_specs
             ),
+            steering_clamps=steering_clamps,
+            prefill_steering_clamps=prefill_steering_clamps,
+            decode_steering_clamps=decode_steering_clamps,
         )
 
     def __post_init__(self) -> None:
@@ -1029,197 +1086,36 @@ class SamplingParams(
 
         self._validate_steering_vectors()
 
-    def _validate_steering_vectors(self) -> None:
-        """Validate all steering vector fields if provided.
+    def _validate_steering_clamps(self) -> None:
+        """Normalize the clamp fields to canonical SteeringClamps in place.
 
-        Expected format per field:
-        ``{hook_point: {layer_idx: SteeringLayerEntry}}``
-        where ``SteeringLayerEntry`` is either ``list[float]`` (scale=1.0)
-        or ``{"vector": list[float], "scale": float}``.
+        ``SteeringClamps.from_obj`` accepts every submission shape (JSON
+        entry-lists with int or string layer keys, ``value`` sugar and
+        omitted bounds resolved; the type's own wire/JSON form; the
+        legacy base64-packed blobs) and fully validates row content.
+        Running in ``__post_init__`` makes this the single ingestion seam
+        for every frontend: msgspec runs it on decode, so the Python HTTP
+        path, the offline ``LLM`` path, and the Rust msgpack path all
+        cross it.  Hook-point names are checked here — ``from_obj`` is
+        deliberately model-layer-agnostic.
         """
-        if self.steering_module_ref is not None:
-            ref = self.steering_module_ref
-            # Accept tuple or list (msgspec / JSON round-trips may emit
-            # the latter); coerce to tuple post-validation.
-            if (
-                not isinstance(ref, (tuple, list))
-                or len(ref) != 2
-                or not isinstance(ref[0], str)
-                or not isinstance(ref[1], (int, float))
-                or not math.isfinite(float(ref[1]))
-            ):
-                raise ValueError(
-                    "steering_module_ref must be a "
-                    "(name: str, scale: finite float) tuple, got "
-                    f"{ref!r}."
-                )
-            if not isinstance(ref, tuple):
-                self.steering_module_ref = (ref[0], float(ref[1]))
-
-        fields_to_check: list[tuple[str, SteeringVectorSpec | None]] = [
-            ("steering_vectors", self.steering_vectors),
-            ("prefill_steering_vectors", self.prefill_steering_vectors),
-            ("decode_steering_vectors", self.decode_steering_vectors),
-        ]
-        for field_name, spec in fields_to_check:
+        for field_name in (
+            "steering_clamps",
+            "prefill_steering_clamps",
+            "decode_steering_clamps",
+        ):
+            spec = SteeringClamps.from_obj(
+                getattr(self, field_name), field_name=field_name
+            )
             if spec is not None:
-                self._validate_single_steering_spec(field_name, spec)
-
-        # Cross-validate overlapping dimensions between base and phase specs.
-        if self.steering_vectors:
-            for phase_name, phase_spec in [
-                ("prefill_steering_vectors", self.prefill_steering_vectors),
-                ("decode_steering_vectors", self.decode_steering_vectors),
-            ]:
-                if phase_spec is None:
-                    continue
-                for hook, layers in self.steering_vectors.items():
-                    if hook not in phase_spec:
-                        continue
-                    for layer_idx, base_entry in layers.items():
-                        if layer_idx not in phase_spec[hook]:
-                            continue
-                        base_vec, _ = normalize_layer_entry(base_entry)
-                        phase_vec, _ = normalize_layer_entry(
-                            phase_spec[hook][layer_idx]
-                        )
-                        if len(base_vec) != len(phase_vec):
-                            raise ValueError(
-                                f"steering_vectors[{hook!r}]"
-                                f"[{layer_idx}] has "
-                                f"dimension {len(base_vec)} but "
-                                f"{phase_name}[{hook!r}]"
-                                f"[{layer_idx}] has "
-                                f"dimension {len(phase_vec)}. "
-                                f"Overlapping entries must have "
-                                f"matching dimensions."
-                            )
-
-        # Cross-validate overlapping dimensions between prefill and decode
-        # phase specs (caught even when no base ``steering_vectors`` is set).
-        if self.prefill_steering_vectors and self.decode_steering_vectors:
-            for hook, prefill_layers in self.prefill_steering_vectors.items():
-                if hook not in self.decode_steering_vectors:
-                    continue
-                decode_layers = self.decode_steering_vectors[hook]
-                for layer_idx, prefill_entry in prefill_layers.items():
-                    if layer_idx not in decode_layers:
-                        continue
-                    prefill_vec, _ = normalize_layer_entry(prefill_entry)
-                    decode_vec, _ = normalize_layer_entry(decode_layers[layer_idx])
-                    if len(prefill_vec) != len(decode_vec):
+                for hook_name in spec.hooks:
+                    if hook_name not in VALID_HOOK_POINT_NAMES:
                         raise ValueError(
-                            f"prefill_steering_vectors[{hook!r}]"
-                            f"[{layer_idx}] has "
-                            f"dimension {len(prefill_vec)} but "
-                            f"decode_steering_vectors[{hook!r}]"
-                            f"[{layer_idx}] has "
-                            f"dimension {len(decode_vec)}. "
-                            f"Overlapping entries must have "
-                            f"matching dimensions."
+                            f"{field_name} key {hook_name!r} is not a "
+                            f"valid hook point. Valid values: "
+                            f"{sorted(VALID_HOOK_POINT_NAMES)}."
                         )
-
-    def _validate_single_steering_spec(
-        self, field_name: str, spec: SteeringVectorSpec
-    ) -> None:
-        """Validate a single steering vector spec."""
-        if not isinstance(spec, dict):
-            raise ValueError(
-                f"{field_name} must be a dict mapping hook point "
-                "names to dicts of layer vectors."
-            )
-        for hook_name, layer_vecs in spec.items():
-            if hook_name not in VALID_HOOK_POINT_NAMES:
-                raise ValueError(
-                    f"{field_name} key {hook_name!r} is not a "
-                    f"valid hook point. Valid values: "
-                    f"{sorted(VALID_HOOK_POINT_NAMES)}."
-                )
-            if not isinstance(layer_vecs, dict):
-                raise ValueError(
-                    f"{field_name}[{hook_name!r}] must be a dict "
-                    f"mapping layer indices to layer entries."
-                )
-            for key, value in layer_vecs.items():
-                if not isinstance(key, int) or key < 0:
-                    raise ValueError(
-                        f"{field_name}[{hook_name!r}] keys must be "
-                        f"non-negative integers, got {key!r}."
-                    )
-                self._validate_layer_entry(field_name, hook_name, key, value)
-
-    def _validate_layer_entry(
-        self,
-        field_name: str,
-        hook_name: str,
-        layer_idx: int,
-        entry: SteeringLayerEntry,
-    ) -> None:
-        """Validate a single layer entry (bare list or dict with scale)."""
-        prefix = f"{field_name}[{hook_name!r}][{layer_idx}]"
-        if isinstance(entry, dict):
-            allowed = {"vector", "scale"}
-            extra = set(entry.keys()) - allowed
-            if extra:
-                raise ValueError(
-                    f"{prefix} dict entry has unexpected keys: {sorted(extra)}; "
-                    f"allowed keys: ['scale', 'vector']"
-                )
-            if "vector" not in entry or "scale" not in entry:
-                raise ValueError(
-                    f"{prefix} dict entries must have 'vector' "
-                    f"and 'scale' keys, got {sorted(entry.keys())}."
-                )
-            if not isinstance(entry["scale"], (int, float)):
-                raise ValueError(
-                    f"{prefix}['scale'] must be a finite float, got "
-                    f"{type(entry['scale']).__name__}."
-                )
-            if not math.isfinite(entry["scale"]):
-                raise ValueError(
-                    f"{prefix}['scale'] must be finite, got {entry['scale']}."
-                )
-            self._validate_float_list(prefix + "['vector']", entry["vector"])
-        elif isinstance(entry, list):
-            self._validate_float_list(prefix, entry)
-        else:
-            # ndarray entries arrive from the binary-wire decode path
-            # (``unpack_steering_vectors``).  The downstream resolver
-            # already accepts ndarrays — ``np.asarray`` is a no-op on
-            # them — so we just sanity-check shape/dtype here rather
-            # than rejecting outright.
-            import numpy as _np
-
-            if isinstance(entry, _np.ndarray):
-                if entry.ndim != 1:
-                    raise ValueError(
-                        f"{prefix} ndarray must be 1-D, got shape {entry.shape}."
-                    )
-                if entry.dtype.kind != "f":
-                    raise ValueError(
-                        f"{prefix} ndarray must be a floating dtype, got {entry.dtype}."
-                    )
-                return
-            raise ValueError(
-                f"{prefix} must be a list of floats or a dict with "
-                f"'vector' and 'scale' keys, got "
-                f"{type(entry).__name__}."
-            )
-
-    @staticmethod
-    def _validate_float_list(prefix: str, values: Any) -> None:
-        """Validate that *values* is a list of finite floats."""
-        if not isinstance(values, list):
-            raise ValueError(
-                f"{prefix} must be a list of floats, got {type(values).__name__}."
-            )
-        for i, v in enumerate(values):
-            if not isinstance(v, (int, float)):
-                raise ValueError(
-                    f"{prefix}[{i}] must be a finite float, got {type(v).__name__}."
-                )
-            if not math.isfinite(v):
-                raise ValueError(f"{prefix}[{i}] must be finite, got {v}.")
+            setattr(self, field_name, spec)
 
     @cached_property
     def effective_prefill_steering(
@@ -1252,6 +1148,25 @@ class SamplingParams(
             return self._effective_decode_steering_packed
         return resolve_effective_vectors(
             self.steering_vectors, self.decode_steering_vectors
+        )
+
+    @cached_property
+    def effective_prefill_clamps(self) -> SteeringClamps | None:
+        """Resolved prefill clamps: base + prefill-specific, concatenated.
+
+        The per-site K cap is NOT enforced here —
+        ``max_clamp_directions`` is an engine knob unknown at
+        request-construction time; the entrypoint and worker enforce it.
+        """
+        return resolve_effective_clamps(
+            self.steering_clamps, self.prefill_steering_clamps
+        )
+
+    @cached_property
+    def effective_decode_clamps(self) -> SteeringClamps | None:
+        """Resolved decode clamps: base + decode-specific, concatenated."""
+        return resolve_effective_clamps(
+            self.steering_clamps, self.decode_steering_clamps
         )
 
     @cached_property
@@ -1315,34 +1230,6 @@ class SamplingParams(
         digest = hashlib.sha256(payload.encode()).digest()
         return min(e[2] for e in entries), int.from_bytes(digest[:8], "big")
 
-        self._validate_steering_vectors()
-        self._validate_capture()
-
-    def _validate_capture(self) -> None:
-        """Structural check on ``capture``.
-
-        Only verifies the shape at construction time (``dict[str, Any]``
-        with string keys). Per-consumer validation — against the active
-        consumer registry, with access to the request context — happens
-        in the OpenAI entrypoint (``_admit_capture``). Leaving full
-        validation out of ``SamplingParams`` keeps the module free of
-        any capture-framework imports.
-        """
-        capture = self.capture
-        if capture is None:
-            return
-        if not isinstance(capture, dict):
-            raise ValueError(
-                "capture must be a dict keyed by consumer name, got "
-                f"{type(capture).__name__}"
-            )
-        for key in capture:
-            if not isinstance(key, str):
-                raise ValueError(
-                    "capture keys must be strings (consumer names), got "
-                    f"{type(key).__name__} ({key!r})"
-                )
-
     def _validate_steering_vectors(self) -> None:
         """Validate all steering vector fields if provided.
 
@@ -1379,6 +1266,8 @@ class SamplingParams(
         for field_name, spec in fields_to_check:
             if spec is not None:
                 self._validate_single_steering_spec(field_name, spec)
+
+        self._validate_steering_clamps()
 
         # Cross-validate overlapping dimensions between base and phase specs.
         if self.steering_vectors:
@@ -1607,6 +1496,7 @@ class SamplingParams(
         return hash_steering_config(
             self.effective_prefill_steering,
             module_ref=self.steering_module_ref,
+            clamps=self.effective_prefill_clamps,
             sae_clamp_specs=self._phase_filtered_sae_specs("prefill"),
             sae_full_reconstruction_specs=(
                 self._phase_filtered_sae_full_recon_specs("prefill")
@@ -1621,6 +1511,7 @@ class SamplingParams(
         return hash_steering_config(
             self.effective_decode_steering,
             module_ref=self.steering_module_ref,
+            clamps=self.effective_decode_clamps,
             sae_clamp_specs=self._phase_filtered_sae_specs("decode"),
             sae_full_reconstruction_specs=(
                 self._phase_filtered_sae_full_recon_specs("decode")
@@ -1810,6 +1701,11 @@ class SamplingParams(
             self._effective_decode_steering_packed,
             self.sae_clamp_specs,
             self.sae_full_reconstruction_specs,
+            # SteeringClamps are immutable post-ingestion, so clones share
+            # them by reference too.
+            self.steering_clamps,
+            self.prefill_steering_clamps,
+            self.decode_steering_clamps,
         ):
             if attr is not None:
                 memo[id(attr)] = attr
@@ -1834,6 +1730,8 @@ class SamplingParams(
             "decode_sae_full_recon_config_hash",
             "effective_prefill_steering",
             "effective_decode_steering",
+            "effective_prefill_clamps",
+            "effective_decode_clamps",
         ):
             if key in self.__dict__:
                 new_sp.__dict__[key] = self.__dict__[key]
@@ -1852,6 +1750,7 @@ class SamplingParams(
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(tokenizer)
         self._validate_spec_decode(speculative_config)
+        self._validate_diffusion(model_config)
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
         )
@@ -1985,6 +1884,28 @@ class SamplingParams(
                 "are not yet supported with speculative decoding."
             )
 
+    def _validate_diffusion(self, model_config: ModelConfig) -> None:
+        if not model_config.is_diffusion:
+            return
+
+        # Diffusion models denoise a whole canvas per step with a fixed
+        # temperature schedule, so per-request sampling parameters are not
+        # supported. Penalties are ignored by the sampler with a warning.
+        if (
+            self.temperature != 1.0
+            or self.min_p > _SAMPLING_EPS
+            or self.seed is not None
+            or self.min_tokens > 0
+            or self.logit_bias
+            or self.bad_words
+            or self.allowed_token_ids
+        ):
+            raise ValueError(
+                "The temperature, min_p, seed, min_tokens, logit_bias, "
+                "bad_words, and allowed_token_ids sampling parameters "
+                "are not yet supported with diffusion models."
+            )
+
     def _validate_structured_outputs(
         self,
         model_config: ModelConfig,
@@ -2045,6 +1966,18 @@ class SamplingParams(
             and self.structured_outputs.grammar.strip() == ""
         ):
             raise ValueError("structured_outputs.grammar cannot be an empty string")
+        # Reject empty string json schema early to avoid engine-side crashes
+        if (
+            isinstance(self.structured_outputs.json, str)
+            and self.structured_outputs.json.strip() == ""
+        ):
+            raise ValueError("structured_outputs.json cannot be an empty string")
+        # Reject json_object=False early to avoid engine-side crashes
+        if self.structured_outputs.json_object is False:
+            raise ValueError(
+                "structured_outputs.json_object must be True if set; omit "
+                "structured_outputs to disable structured outputs"
+            )
 
         from vllm.v1.structured_output.backend_guidance import (
             has_guidance_unsupported_json_features,

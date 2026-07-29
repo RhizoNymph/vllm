@@ -738,3 +738,36 @@ class TestSetSteeringPacked:
         )
         assert kwargs.get("vectors") is None
         assert kwargs.get("prefill_vectors") is None
+
+
+class TestSetSteeringClamps:
+    """Clamp tiers through /v1/steering/set (canonical SteeringClamps)."""
+
+    def test_set_clamps_only_full_response(self, client, engine):
+        engine.collective_rpc.side_effect = [[(0, 0, [3])], [(0, 0, [3])]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={"clamps": {_HP: {"3": [{"vector": [1.0, 0.0], "value": 2.0}]}}},
+        )
+        assert resp.status_code == 200, resp.json()
+        body = resp.json()
+        assert body["status"] == "ok"
+        # Regression: the response's hook_points listing iterates the
+        # canonical SteeringClamps (was a 500 via ctier.keys()).
+        assert body["hook_points"] == [_HP]
+        assert body["layers_updated"] == [3]
+        # Workers receive the canonical Struct.
+        from vllm.config.steering_types import SteeringClamps
+
+        apply_call = engine.collective_rpc.call_args_list[1]
+        kwargs = apply_call.kwargs.get("kwargs", {})
+        assert isinstance(kwargs["clamps"], SteeringClamps)
+        assert engine.reset_prefix_cache.await_count == 1
+
+    def test_set_malformed_clamps_400(self, client, engine):
+        resp = client.post(
+            "/v1/steering/set",
+            json={"clamps": {_HP: {"3": [{"vector": [0.0, 0.0], "value": 1.0}]}}},
+        )
+        assert resp.status_code == 400
+        assert "non-zero" in resp.json()["error"]

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,6 +27,9 @@ pub struct CollectedAssistantMessage {
     pub finish_reason: FinishReason,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Connector-specific encoder cache transfer parameters for disaggregated
+    /// serving.
+    pub ec_transfer_params: Option<serde_json::Value>,
     /// Per-consumer activation-capture results, keyed by consumer name.
     pub capture_results: HashMap<String, CaptureResult>,
 }
@@ -81,6 +87,7 @@ impl ChatEventStream {
                     usage,
                     finish_reason,
                     kv_transfer_params,
+                    ec_transfer_params,
                     capture_results,
                 } => {
                     return Ok(CollectedAssistantMessage {
@@ -94,6 +101,7 @@ impl ChatEventStream {
                         usage,
                         finish_reason,
                         kv_transfer_params,
+                        ec_transfer_params,
                         capture_results,
                     });
                 }
@@ -200,6 +208,7 @@ mod tests {
                     },
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
+                    ec_transfer_params: None,
                     capture_results: Default::default(),
                 }),
             ]),
@@ -241,6 +250,7 @@ mod tests {
                 },
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,
+                ec_transfer_params: None,
                 capture_results: Default::default(),
             }
         );
