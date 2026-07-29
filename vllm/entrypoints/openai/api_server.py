@@ -252,12 +252,6 @@ def build_app(
 
         elastic_ep_attach_router(app)
 
-        from vllm.entrypoints.openai.generative_scoring.api_router import (
-            register_generative_scoring_api_router,
-        )
-
-        register_generative_scoring_api_router(app)
-
     if "generate" in supported_tasks or "render" in supported_tasks:
         from vllm.entrypoints.scale_out.factories import register_scale_out_api_routers
 
@@ -275,12 +269,6 @@ def build_app(
 
         register_pooling_api_routers(app, supported_tasks, model_config)
 
-    if "generate" in supported_tasks:
-        from vllm.entrypoints.openai.generative_scoring.api_router import (
-            register_generative_scoring_api_router,
-        )
-
-        register_generative_scoring_api_router(app)
     # Endpoint plugins are attached last so their routes are registered after all core
     # routers. This runs even for the CPU only render server. A plugin eligible for
     # the `render` task still gets its routes registered. It receives
@@ -562,12 +550,6 @@ async def init_app_state(
 
         init_pooling_state(engine_client, state, args, request_logger, supported_tasks)
 
-    if "generate" in supported_tasks:
-        from vllm.entrypoints.openai.generative_scoring.api_router import (
-            init_generative_scoring_state,
-        )
-
-        await init_generative_scoring_state(engine_client, state, args, request_logger)
     await _init_endpoint_plugins_state(engine_client, state, args)
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
