@@ -16,7 +16,9 @@
 # limitations under the License.
 """Transformers modeling backend utilities."""
 
+from collections.abc import Iterator
 from contextlib import contextmanager
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -209,32 +211,9 @@ def recursive_replace_linear(
     _recursive_replace(model, prefix=prefix)
 
 
-def recursive_replace_linear(
-    model: nn.Module,
-    quant_config: "QuantizationConfig | None",
-    prefix: str = "",
-):
-    """Recursively replace linear modules in the model as needed."""
-
-    def _recursive_replace(module: nn.Module, prefix: str):
-        for child_name, child_module in module.named_children():
-            new_module = child_module
-            qual_name = maybe_prefix(prefix, child_name)
-            # Replace modules as needed
-            if isinstance(child_module, nn.Linear):
-                style = "replicate"
-                new_module = replace_linear_class(
-                    child_module,
-                    style,
-                    quant_config,
-                    prefix=qual_name,
-                )
-            else:
-                _recursive_replace(child_module, prefix=qual_name)
-            if new_module is not child_module:
-                setattr(module, child_name, new_module)
-
-    _recursive_replace(model, prefix=prefix)
+def named_state(module: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+    """`module`'s own state (i.e. named parameters and buffers)."""
+    return chain(module.named_parameters(), module.named_buffers())
 
 
 def log_replacement(name: str, old_module: nn.Module, new_module: nn.Module):
