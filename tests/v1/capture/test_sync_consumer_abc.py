@@ -22,7 +22,7 @@ from vllm.v1.capture.types import CaptureSpec
 
 class _GoodConsumer(SyncCaptureConsumer):
     def global_capture_spec(self) -> CaptureSpec:
-        return CaptureSpec(hooks={"post_mlp": [0]}, positions="all_generated")
+        return CaptureSpec(hooks={"post_block": [0]}, positions="all_generated")
 
     def on_step(self, view):
         return None
@@ -38,7 +38,7 @@ def test_complete_subclass_constructs_and_has_fixed_metadata():
 def test_missing_on_step_fails_clearly_at_construction():
     class _MissingOnStep(SyncCaptureConsumer):
         def global_capture_spec(self) -> CaptureSpec:
-            return CaptureSpec(hooks={"post_mlp": [0]}, positions="all_generated")
+            return CaptureSpec(hooks={"post_block": [0]}, positions="all_generated")
 
     with pytest.raises(TypeError, match="on_step"):
         _MissingOnStep(MagicMock(), {})  # type: ignore[abstract]
@@ -64,9 +64,9 @@ def test_declared_graphsafe_keys_is_overridable():
     class _WithKeys(_GoodConsumer):
         @classmethod
         def declared_graphsafe_keys(cls, params):
-            return [f"{params['layer']}:post_mlp"]
+            return [f"{params['layer']}:post_block"]
 
-    assert _WithKeys.declared_graphsafe_keys({"layer": 3}) == ["3:post_mlp"]
+    assert _WithKeys.declared_graphsafe_keys({"layer": 3}) == ["3:post_block"]
 
 
 def test_shutdown_default_is_noop():

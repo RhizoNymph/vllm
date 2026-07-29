@@ -128,6 +128,10 @@ EXCLUDE = [
     r"vllm/model_executor/models/[vV]",
     r"vllm/model_executor/models/[wW]",
     r"vllm/model_executor/models/[zZ]",
+    "vllm/model_executor/layers/fla/ops",
+    # TODO: Remove these entries after fixing mypy errors.
+    "vllm/benchmarks",
+    "vllm/model_executor/layers/fused_moe/runner/moe_runner_base.py",
 ]
 
 

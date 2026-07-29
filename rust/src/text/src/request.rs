@@ -11,7 +11,9 @@ use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 use vllm_engine_core_client::protocol::request::ReasoningParserKwargs;
 use vllm_engine_core_client::protocol::sampling::RepetitionDetectionParams;
 use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams;
-use vllm_engine_core_client::protocol::{SteeringClamps, SteeringVectorSpec};
+use vllm_engine_core_client::protocol::{
+    SaeClampSpec, SaeFullReconstructionSpec, SteeringClamps, SteeringVectorSpec,
+};
 
 use crate::error::{Error, Result};
 use crate::output::TextDecodeOptions;
@@ -139,6 +141,13 @@ pub struct SamplingParams {
     /// Request-level packed table of client-provided patch vectors referenced
     /// by a patch entry's `source_inline` / mask `inline`. Forwarded verbatim.
     pub patch_vectors: Option<Value>,
+    /// Per-request SAE feature-surgery clamps (delta intervention),
+    /// referencing pre-registered named SAE modules. Typed passthrough;
+    /// engine-core validates semantics at admission.
+    pub sae_clamp_specs: Option<Vec<SaeClampSpec>>,
+    /// Per-request SAE full-reconstruction directives (residual replacement).
+    /// Typed passthrough like `sae_clamp_specs`.
+    pub sae_full_reconstruction_specs: Option<Vec<SaeFullReconstructionSpec>>,
     /// Per-request steering clamps applied to both prefill and decode
     /// phases, already packed into the canonical form engine-core's strict
     /// decoder expects (the HTTP/gRPC layers parse client input).
@@ -185,6 +194,8 @@ impl Default for SamplingParams {
             capture: None,
             patch: None,
             patch_vectors: None,
+            sae_clamp_specs: None,
+            sae_full_reconstruction_specs: None,
             steering_clamps: None,
             prefill_steering_clamps: None,
             decode_steering_clamps: None,

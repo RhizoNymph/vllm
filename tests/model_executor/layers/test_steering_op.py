@@ -20,12 +20,18 @@ rather than going through the registered custom op (which requires the
 full vllm build).
 """
 
+import builtins
+
 import pytest
 import torch
+from torch import nn
 
 from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
     SteeringOpArgs,
+    apply_layer_steering,
     apply_steering,
+    register_steering_buffers,
     steering_monitor,
 )
 
@@ -457,3 +463,51 @@ class TestMonitorParamsGuard:
                 torch.zeros(1),
                 torch.ones(1),
             )
+
+
+class TestApplyLayerSteeringHotPath:
+    """The no-SAE steering hot path must never import the SAE modules.
+
+    ``apply_layer_steering`` short-circuits SAE feature-surgery on a marker-
+    buffer presence check (:func:`_maybe_apply_layer_sae`), so a layer with
+    no SAE buffers attached must return without importing ``sae_steering`` —
+    keeping the additive-only / disabled forward free of the SAE import cost.
+    """
+
+    def test_no_buffers_does_not_import_sae_steering(self, monkeypatch):
+        module = nn.Module()
+        module.layer_idx = 0
+        hidden = torch.randn(2, 4)
+
+        self._forbid_sae_import(monkeypatch)
+
+        out = apply_layer_steering(module, hidden, SteeringHookPoint.POST_BLOCK)
+        assert out is hidden
+
+    def test_additive_only_does_not_import_sae_steering(self, monkeypatch):
+        module = nn.Module()
+        module.layer_idx = 0
+        register_steering_buffers(
+            module,
+            hidden_size=4,
+            max_steering_tokens=8,
+            max_steering_configs=1,
+            dtype=torch.float32,
+        )
+        hidden = torch.randn(2, 4)
+
+        self._forbid_sae_import(monkeypatch)
+
+        out = apply_layer_steering(module, hidden, SteeringHookPoint.POST_BLOCK)
+        assert torch.allclose(out, hidden)
+
+    @staticmethod
+    def _forbid_sae_import(monkeypatch):
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "vllm.model_executor.layers.sae_steering":
+                raise AssertionError("no-SAE hot path imported sae_steering")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)

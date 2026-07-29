@@ -118,6 +118,8 @@ pub fn lower_sampling_params(
         capture,
         patch,
         patch_vectors,
+        sae_clamp_specs,
+        sae_full_reconstruction_specs,
         steering_clamps,
         prefill_steering_clamps,
         decode_steering_clamps,
@@ -204,6 +206,8 @@ pub fn lower_sampling_params(
         capture,
         patch,
         patch_vectors,
+        sae_clamp_specs,
+        sae_full_reconstruction_specs,
         steering_clamps,
         prefill_steering_clamps,
         decode_steering_clamps,
@@ -559,6 +563,8 @@ mod tests {
                 steering_clamps: None,
                 prefill_steering_clamps: None,
                 decode_steering_clamps: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -618,6 +624,8 @@ mod tests {
                 steering_clamps: None,
                 prefill_steering_clamps: None,
                 decode_steering_clamps: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -790,6 +798,8 @@ mod tests {
                 capture: None,
                 patch: None,
                 patch_vectors: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
                 steering_clamps: None,
                 prefill_steering_clamps: None,
                 decode_steering_clamps: None,
@@ -870,6 +880,8 @@ mod tests {
                 steering_clamps: None,
                 prefill_steering_clamps: None,
                 decode_steering_clamps: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -940,6 +952,8 @@ mod tests {
                 steering_clamps: None,
                 prefill_steering_clamps: None,
                 decode_steering_clamps: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -1199,6 +1213,8 @@ mod tests {
                 steering_clamps: None,
                 prefill_steering_clamps: None,
                 decode_steering_clamps: None,
+                sae_clamp_specs: None,
+                sae_full_reconstruction_specs: None,
             }
         "#]]
         .assert_debug_eq(&params);
@@ -1249,11 +1265,35 @@ mod tests {
     }
 
     #[test]
-    fn lower_sampling_params_threads_steering_clamps_verbatim() {
-        use std::collections::HashMap;
+    fn lower_sampling_params_threads_sae_specs_and_clamps() {
+        use vllm_engine_core_client::protocol::{
+            ClampHookTable, SaeClampEntry, SaeClampKind, SaeClampSpec,
+            SaeFullReconstructionSpec, SaePhase, SteeringClamps,
+        };
 
-        use vllm_engine_core_client::protocol::{ClampHookTable, SteeringClamps};
-
+        let clamp_spec = SaeClampSpec {
+            module_name: "golden_gate".to_string(),
+            clamps: HashMap::from([(
+                "post_block".to_string(),
+                std::collections::BTreeMap::from([(
+                    20u32,
+                    vec![SaeClampEntry {
+                        feature_idx: 34,
+                        kind: SaeClampKind::Absolute,
+                        value: 5.0,
+                        only_if_active: false,
+                    }],
+                )]),
+            )]),
+            phase: SaePhase::Both,
+            gated: false,
+        };
+        let recon_spec = SaeFullReconstructionSpec {
+            module_name: "golden_gate_full".to_string(),
+            clamps: HashMap::new(),
+            phase: SaePhase::Decode,
+            gated: false,
+        };
         // Clamp tiers arrive already in the canonical form (the HTTP/gRPC
         // layers packed them); lowering moves them through untouched.
         let table = |layer: u32, lo: f64, hi: f64| ClampHookTable {
@@ -1274,6 +1314,8 @@ mod tests {
             hooks: HashMap::from([("post_block".to_string(), table(7, f64::NEG_INFINITY, 4.0))]),
         };
         let sampling_params = SamplingParams {
+            sae_clamp_specs: Some(vec![clamp_spec.clone()]),
+            sae_full_reconstruction_specs: Some(vec![recon_spec.clone()]),
             steering_clamps: Some(clamps.clone()),
             prefill_steering_clamps: Some(prefill_clamps.clone()),
             decode_steering_clamps: Some(decode_clamps.clone()),
@@ -1289,6 +1331,8 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(params.sae_clamp_specs, Some(vec![clamp_spec]));
+        assert_eq!(params.sae_full_reconstruction_specs, Some(vec![recon_spec]));
         assert_eq!(params.steering_clamps, Some(clamps));
         assert_eq!(params.prefill_steering_clamps, Some(prefill_clamps));
         assert_eq!(params.decode_steering_clamps, Some(decode_clamps));
