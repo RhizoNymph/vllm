@@ -31,19 +31,22 @@ Skipped unless run manually against such a model:
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+from tests.v1.worker.steering_e2e_utils import (  # isort: skip
+    IS_LOCAL,
+    MAX_TOKENS,
+    PROMPT,
+    build_llm,
+    common_prefix_len,
+    env_layer,
+    requires_consumer_plugin,
+    requires_cuda,
+    requires_model_path,
+)
 
 import pytest
-import torch
 
-MODEL = os.environ.get("DYNSTEER_E2E_MODEL", "google/gemma-4-E2B-it")
-LAYER = int(os.environ.get("DYNSTEER_E2E_LAYER", "8"))
-IS_LOCAL = MODEL.endswith(".gguf") or os.path.exists(MODEL)
+LAYER = env_layer(8)
 
-PROMPT = "The capital of France is"
-MAX_TOKENS = 24
 # Repeats of the prompt within one engine. The first is the baseline; the
 # tier is submitted when an earlier request finalizes (on the finalize
 # thread, possibly after generate() returns), so allow a couple of repeats
@@ -51,47 +54,9 @@ MAX_TOKENS = 24
 REPEATS = 5
 
 
-def _common_prefix_len(a: list[int], b: list[int]) -> int:
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n
-
-
-def _build_llm():
-    from vllm import LLM
-
-    kwargs: dict = dict(
-        model=MODEL,
-        enable_steering=True,
-        max_dynamic_steering_configs=4,
-        max_model_len=256,
-        enforce_eager=True,
-        gpu_memory_utilization=0.92,
-        seed=0,
-        capture_consumers=[
-            {
-                "name": "steering_ex_async_tier",
-                "params": {
-                    "steer_layer": LAYER,
-                    "steer_hook": "post_block",
-                    "steer_norm": 24.0,
-                },
-            }
-        ],
-    )
-    if not IS_LOCAL:
-        kwargs["load_format"] = "dummy"
-    return LLM(**kwargs)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.skipif(
-    IS_LOCAL and not os.path.exists(MODEL),
-    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
-)
+@requires_cuda
+@requires_model_path
+@requires_consumer_plugin("steering_ex_async_tier")
 @pytest.mark.skipif(
     not IS_LOCAL,
     # Unlike the other e2e tests here, this one asserts that a generation
@@ -110,7 +75,18 @@ def test_async_queue_global_tier_steers_later_request():
     request steers a SUBSEQUENT request (not itself)."""
     from vllm import SamplingParams
 
-    llm = _build_llm()
+    llm = build_llm(
+        [
+            {
+                "name": "steering_ex_async_tier",
+                "params": {
+                    "steer_layer": LAYER,
+                    "steer_hook": "post_block",
+                    "steer_norm": 24.0,
+                },
+            }
+        ]
+    )
     try:
         sp = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0, seed=0)
         outs = [
@@ -125,7 +101,7 @@ def test_async_queue_global_tier_steers_later_request():
         print(f"gen[{i}]={o}")
 
     steered = [o for o in outs[1:] if o != base]
-    first_diff = _common_prefix_len(base, steered[0]) if steered else None
+    first_diff = common_prefix_len(base, steered[0]) if steered else None
     print(f"baseline={base}\n steered ={steered[0] if steered else None}"
           f"\n first_diff={first_diff}")
     # The only thing this proves — and all it needs to — is that the tier a

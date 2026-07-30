@@ -33,15 +33,19 @@ import os
 # Direct-manager access (below) needs the in-process engine.
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
+from tests.v1.worker.steering_e2e_utils import (  # isort: skip
+    IS_LOCAL,
+    MODEL,
+    PROMPT,
+    env_layer,
+)
+
 import numpy as np
 import pytest
 import torch
 
-MODEL = os.environ.get("DYNSTEER_E2E_MODEL", "google/gemma-4-E2B-it")
-TIER_LAYER = int(os.environ.get("DYNSTEER_E2E_LAYER", "40"))
-IS_LOCAL = MODEL.endswith(".gguf") or os.path.exists(MODEL)
+TIER_LAYER = env_layer(40)
 HOOK = "post_block"
-PROMPT = "The capital of France is"
 MAX_TOKENS = 32
 
 pytestmark = pytest.mark.skipif(

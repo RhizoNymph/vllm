@@ -8,6 +8,9 @@ capture taps the residual, steering adds to it, patching overwrites it, the
 patch source store reuses the capture pipeline, and the dynamic-steering
 control plane closes the capture → steering feedback loop in-process.
 
+GPU/e2e validation for all of these is mapped in
+[docs/testing/interpretability_e2e.md](testing/interpretability_e2e.md).
+
 ```yaml
 Overview:
   description: >

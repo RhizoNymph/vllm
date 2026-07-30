@@ -24,16 +24,17 @@ Skipped unless run manually against such a model:
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+from tests.v1.worker.steering_e2e_utils import (  # isort: skip
+    build_llm,
+    env_layer,
+    requires_consumer_plugin,
+    requires_cuda,
+    requires_model_path,
+)
 
 import pytest
-import torch
 
-MODEL = os.environ.get("DYNSTEER_E2E_MODEL", "google/gemma-4-E2B-it")
-LAYER = int(os.environ.get("DYNSTEER_E2E_LAYER", "8"))
-IS_LOCAL = MODEL.endswith(".gguf") or os.path.exists(MODEL)
+LAYER = env_layer(8)
 
 PROMPT = (
     "Write a detailed paragraph about the history of the city of Paris, "
@@ -42,9 +43,11 @@ PROMPT = (
 GEN = 48  # ~3 decode blocks at block_size 16
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@requires_cuda
+@requires_model_path
+@requires_consumer_plugin("dynamic_steering_e2e")
 def test_steered_continuation_does_not_reuse_steered_decode_kv():
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
 
     consumers = [
         {
@@ -57,20 +60,10 @@ def test_steered_continuation_does_not_reuse_steered_decode_kv():
             },
         }
     ]
-    kwargs = dict(
-        model=MODEL,
-        enable_steering=True,
-        max_dynamic_steering_configs=4,
-        enable_prefix_caching=True,
-        enforce_eager=True,
-        gpu_memory_utilization=0.92,
-        max_model_len=2048,
-        seed=0,
-        capture_consumers=consumers,
+    llm = build_llm(
+        consumers,
+        extra=dict(enable_prefix_caching=True, max_model_len=2048),
     )
-    if not IS_LOCAL:
-        kwargs["load_format"] = "dummy"
-    llm = LLM(**kwargs)
     try:
         greedy = SamplingParams(temperature=0.0, max_tokens=GEN)
         one = SamplingParams(temperature=0.0, max_tokens=1)
