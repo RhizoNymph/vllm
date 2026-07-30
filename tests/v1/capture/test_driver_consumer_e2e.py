@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """End-to-end test for driver-side capture consumers via ``LLM``.
 
-This test requires CUDA and a full vLLM install with a small model
-(e.g. ``facebook/opt-125m``).  It is unconditionally skipped in CI
-and unit-test runs; use it locally to verify the full pipeline.
+Drives a real engine with a pre-constructed ``location="driver"``
+consumer instance (``LLM(capture_consumers=[instance])``). The engine
+runs in-process (``VLLM_ENABLE_V1_MULTIPROCESSING=0``) so the driver
+bridge's receiver delivers captures back to the caller's instance —
+under engine-core multiprocessing the caller-side instance is a pickled
+copy and never sees them.
+
+Run: ``pytest tests/v1/capture/test_driver_consumer_e2e.py -v``
 """
 
 from __future__ import annotations
@@ -15,7 +20,9 @@ import pytest
 import torch
 
 from vllm.v1.capture.consumer import CaptureConsumer
-from vllm.v1.capture.types import CaptureKey
+from vllm.v1.capture.types import CaptureKey, CaptureSpec
+
+MODEL = "facebook/opt-125m"
 
 
 class _E2ERecordingConsumer(CaptureConsumer):
@@ -26,6 +33,9 @@ class _E2ERecordingConsumer(CaptureConsumer):
     def __init__(self) -> None:
         self.captures: list[tuple[CaptureKey, torch.Tensor, dict[str, Any]]] = []
 
+    def global_capture_spec(self) -> CaptureSpec:
+        return CaptureSpec(hooks={"post_block": [0]}, positions="last_prompt")
+
     def on_capture(
         self,
         key: CaptureKey,
@@ -35,35 +45,44 @@ class _E2ERecordingConsumer(CaptureConsumer):
         self.captures.append((key, tensor.clone(), dict(sidecar)))
 
 
-@pytest.mark.skip(reason="requires CUDA and full vLLM install")
-def test_llm_with_driver_capture_consumer():
-    """Verify that ``LLM(capture_consumers=[instance])`` properly
-    wires a driver-side consumer so that ``on_capture`` fires for
-    each request.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_llm_with_driver_capture_consumer(monkeypatch):
+    """``LLM(capture_consumers=[instance])`` wires a driver-side consumer
+    so ``on_capture`` fires for each request."""
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
-    To run locally::
-
-        .venv/bin/python -m pytest tests/v1/capture/test_driver_consumer_e2e.py \
-            -v -k test_llm_with_driver_capture_consumer --no-header
-    """
     from vllm import LLM, SamplingParams
+    from vllm.distributed import cleanup_dist_env_and_memory
 
     consumer = _E2ERecordingConsumer()
-    llm = LLM(
-        model="facebook/opt-125m",
-        enforce_eager=True,
-        capture_consumers=[consumer],
-    )
+    try:
+        llm = LLM(
+            model=MODEL,
+            enforce_eager=True,
+            gpu_memory_utilization=0.25,
+            capture_consumers=[consumer],
+        )
+    except OSError as exc:
+        msg = str(exc).lower()
+        if "connection error" in msg or "read timeout" in msg:
+            pytest.skip(f"{MODEL} unavailable: {exc}")
+        raise
+    try:
+        outputs = llm.generate(
+            ["Hello world"],
+            SamplingParams(max_tokens=8),
+            use_tqdm=False,
+        )
+        assert len(outputs) == 1
 
-    outputs = llm.generate(
-        ["Hello world"],
-        SamplingParams(max_tokens=8),
-    )
-
-    assert len(outputs) == 1
-    # The consumer should have received at least one on_capture call.
-    assert len(consumer.captures) > 0
-
-    for captured_key, tensor, _sidecar in consumer.captures:
-        assert tensor.ndim == 2
-        assert tensor.shape[1] > 0  # hidden_size
+        assert len(consumer.captures) > 0
+        for captured_key, tensor, _sidecar in consumer.captures:
+            _request_id, layer, hook = captured_key
+            assert layer == 0
+            assert hook == "post_block"
+            assert tensor.ndim == 2
+            assert tensor.shape[0] >= 1  # last_prompt: one row
+            assert tensor.shape[1] > 0  # hidden_size
+    finally:
+        del llm
+        cleanup_dist_env_and_memory()
