@@ -2247,8 +2247,10 @@ class EngineArgs:
         # BEFORE creating ModelConfig, so the config is created with the target model
         # Skip speculator detection for cloud storage models (eg: S3, GCS) since
         # HuggingFace cannot load configs directly from S3 URLs. S3 models can still
-        # use speculators with explicit --speculative-config.
-        if not is_cloud_storage(self.model):
+        # use speculators with explicit --speculative-config. Likewise for GGUF
+        # files: their config is resolved by the gguf plugin's config parser, and
+        # PretrainedConfig.get_config_dict cannot read the binary file.
+        if not (is_cloud_storage(self.model) or self.model.endswith(".gguf")):
             (self.model, self.tokenizer, self.speculative_config) = (
                 maybe_override_with_speculators(
                     model=self.model,
