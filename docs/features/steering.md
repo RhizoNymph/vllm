@@ -59,6 +59,13 @@ End-to-end tested with real weights:
 Other listed architectures have hook wiring and pass small-decoder fixture
 tests but have not been validated against released checkpoints.
 
+The full HTTP surface (packed per-request vectors, clamps and their
+exactness edges, `/v1/steering/set|clear`, named modules, request-level
+400s) is exercised against a live `vllm serve` process by the collected,
+CUDA-gated suite in
+`tests/entrypoints/serve/e2e/test_server_steering_e2e.py`; the manual
+`tests/gpu_clamp_validate.py` script remains for ad-hoc runs.
+
 Also supported:
 
 - Global steering through HTTP endpoints

@@ -670,6 +670,11 @@ and [Backpressure & overload](#backpressure--overload).
   surface as `partial_error` / `error` on the corresponding
   `CaptureResult`; text generation always completes.
 
+The served path (`capture` + `capture_wait` on `/v1/completions`, the
+filesystem consumer's on-disk output, and admission 400s) is exercised
+against a live `vllm serve` process by the collected, CUDA-gated suite
+in `tests/entrypoints/serve/e2e/test_server_capture_e2e.py`.
+
 ## Writing a Consumer Plugin
 
 Third-party consumers ship as separate Python packages. See
