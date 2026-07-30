@@ -166,12 +166,26 @@ class PatchModelRunnerMixin:
     ``InputBatch`` / ``req_states`` projection and the request lifecycle.
     """
 
-    # Populated by _init_patch_state.
-    _patchable_layers: dict[int, nn.Module]
+    # Populated by ``_init_patch_state`` at the end of
+    # ``GPUModelRunner.load_model``. The class-level defaults below cover the
+    # pre-init window — unit tests that construct a runner without going
+    # through ``load_model``, and backends whose ``load_model`` override does
+    # not call the hook — so plain attribute access is safe without
+    # ``hasattr`` guards. This mirrors the steering mixin's documented
+    # approach; see ``steering_model_runner_mixin`` for the rationale.
+    #
+    # Only immutable values (and ``_patchable_layers``, which is always
+    # *rebound* by ``_init_patch_state`` and never mutated in place) get a
+    # class-level default. ``_patch_specs`` and ``_patch_touched_sites`` ARE
+    # mutated in place, so they deliberately have no shared default: every
+    # entry point guards on ``_patchable_layers`` / ``_patch_max_slots``
+    # before touching them.
+    _patchable_layers: dict[int, nn.Module] = {}
     _patch_specs: dict[str, list[PatchEntry]]
-    _patch_max_slots: int
+    _patch_max_slots: int = 0
     _patch_touched_sites: set[tuple[int, SteeringHookPoint]]
-    _patch_index_dirty: bool
+    _patch_index_dirty: bool = False
+    _locally_owned_patch_layers: frozenset[int] = frozenset()
 
     if TYPE_CHECKING:
         vllm_config: VllmConfig
@@ -311,7 +325,11 @@ class PatchModelRunnerMixin:
         Preempted requests re-enter via the add path on resume, which
         re-resolves their spec; recomputation re-fires the patch automatically.
         """
-        if not self._patch_specs:
+        # Guard on ``_patchable_layers`` (class-defaulted) before touching
+        # ``_patch_specs``, which has no default — otherwise this raises
+        # AttributeError on any runner whose ``load_model`` skipped
+        # ``_init_patch_state``.
+        if not self._patchable_layers:
             return
         for req_id in req_ids:
             self._patch_specs.pop(req_id, None)
