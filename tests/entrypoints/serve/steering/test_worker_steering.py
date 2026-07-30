@@ -480,8 +480,10 @@ class TestGetSteeringStatus:
     def test_norm_values(self, worker_with_manager):
         worker_with_manager.set_steering_vectors(vectors={_HP: {0: [3.0] * 8}})
         status = worker_with_manager.get_steering_status()
-        expected_norm = round(math.sqrt(8 * 9.0), 6)
-        assert status[0][_HP]["norm"] == expected_norm
+        # The reported norm is computed on the stored vector, whose dtype
+        # follows the layer buffers — compare with a tolerance wide enough for
+        # any of bf16/fp16/fp32 rather than exact float64 equality.
+        assert status[0][_HP]["norm"] == pytest.approx(math.sqrt(8 * 9.0), rel=1e-2)
 
     def test_cleared_after_set(self, worker_with_manager):
         worker_with_manager.set_steering_vectors(vectors={_HP: {0: [1.0] * 8}})

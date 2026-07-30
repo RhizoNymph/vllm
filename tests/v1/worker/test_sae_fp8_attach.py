@@ -296,7 +296,7 @@ class TestFp8AttachDelta:
                 "encoder_bias": {
                     "dtype": "float32",
                     "shape": [2],
-                    "data": torch.zeros(2).numpy().tobytes(),
+                    "data": torch.zeros(2, dtype=torch.float32).numpy().tobytes(),
                 },
                 "decoder_weight": _pack(dec),
             }
