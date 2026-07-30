@@ -681,3 +681,6 @@ python -m vllm.entrypoints.openai.api_server \
   `alignment.py`; runnable demo:
   `examples/online_serving/openai_patch_client.py`).
 - GPU validation: `tests/gpu_patch_validate.py`.
+- Live-server e2e (collected, CUDA-gated): patch requests, auto-capture
+  `recovered` sweeps, SSE parity, and source-run lifecycle in
+  `tests/entrypoints/serve/e2e/test_server_patch_e2e.py`.

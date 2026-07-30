@@ -579,8 +579,11 @@ admission, end-to-end per-step pipeline),
 `tests/v1/test_sae_*` (types and SamplingParams),
 `tests/v1/core/test_steering_scheduler.py` (pool separation),
 `tests/entrypoints/**/test_sae_*` + `test_modules_router_sae.py`
-(loader, registry, router), and the CUDA + HF-gated real-weights
-generation tests in `tests/models/language/generation/`.
+(loader, registry, router), the CUDA + HF-gated real-weights
+generation tests in `tests/models/language/generation/`, and the
+live-server HTTP flow (register → `sae_clamp_specs` → global tier,
+spare-slot hot registration on a compiled engine) in
+`tests/entrypoints/serve/e2e/test_server_sae_e2e.py`.
 
 Decoder `*.py` model files: **no changes** — SAE dispatch is
 centralized inside `apply_layer_steering` / `apply_block_steering`, so

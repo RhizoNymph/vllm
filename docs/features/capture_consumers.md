@@ -683,6 +683,11 @@ and [Backpressure & overload](#backpressure--overload).
 - Entry-point plugin loading (CPU, un-mocked; needs
   `uv pip install -e tests/plugins/vllm_add_dummy_capture_consumer`):
   `tests/plugins_tests/test_capture_consumer_plugins.py`.
+- Live-server e2e (GPU, `vllm serve`): the served path (`capture` +
+  `capture_wait` on `/v1/completions`, the filesystem consumer's
+  on-disk output, and admission 400s) is exercised by the collected,
+  CUDA-gated suite in
+  `tests/entrypoints/serve/e2e/test_server_capture_e2e.py`.
 - Unit / integration tier: `tests/v1/capture/` (admission, manager,
   dispatch, overload, store, registry, step gate, prefix-cache gating)
   and `tests/v1/capture/consumers/filesystem/` (writer/reader/layouts).
