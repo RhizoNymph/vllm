@@ -88,7 +88,9 @@ def _clamps(layer: int, entries: list[dict]) -> dict:
 
 
 def _sampling(max_tokens: int = 10, **extra) -> SamplingParams:
-    return SamplingParams(max_tokens=max_tokens, temperature=0.0, **extra)
+    return SamplingParams(
+        max_tokens=max_tokens, temperature=0.0, logprobs=5, **extra
+    )
 
 
 def _runner_kwargs(**extra) -> dict:
