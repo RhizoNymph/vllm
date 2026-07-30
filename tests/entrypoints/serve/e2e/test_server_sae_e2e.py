@@ -157,14 +157,21 @@ def test_unknown_sae_module_in_spec_rejected(http, sae_module):
     assert r.status_code == 400, r.text
 
 
-def test_wrong_dmodel_registration_rejected(http, tmp_path_factory):
+def test_mismatched_weights_registration_rejected(http, tmp_path_factory):
+    """Weight tensors whose width disagrees with the manifest d_model are
+    rejected by the frontend loader with a 400, before any broadcast.
+
+    (A self-consistent wrong d_model would only fail worker-side during
+    attach, surfacing as a 500 — the frontend never compares d_model to
+    the model's hidden size — so the deterministic 400 contract to pin
+    is the manifest/weights shape check.)"""
     sae_dir = _write_sae_dir(tmp_path_factory.mktemp("sae_bad"), 8)
     r = http.post(
         "/v1/steering/modules/register",
         json={
             "name": "e2e_sae_bad",
             "kind": "sae_delta",
-            "sae_manifest": _manifest(str(sae_dir), d_model=8),
+            "sae_manifest": _manifest(str(sae_dir)),
         },
     )
     assert r.status_code == 400, r.text

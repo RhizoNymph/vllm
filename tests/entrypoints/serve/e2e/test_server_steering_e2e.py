@@ -129,7 +129,7 @@ def test_global_set_shifts_and_clear_restores(http, baseline_lp):
     assert restored == pytest.approx(baseline_lp, abs=1e-6)
     assert r_status.status_code == 200
     assert r_layers.status_code == 200
-    assert LAYER in r_layers.json()["layers"]
+    assert str(LAYER) in r_layers.json()["layers"]
 
 
 def test_named_module_matches_inline_and_unregister_rejects(http):
