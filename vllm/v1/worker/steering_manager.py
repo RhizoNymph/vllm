@@ -579,8 +579,15 @@ class SteeringManager:
         # A different logical config whose additive content matches an
         # already-registered physical row aliases onto that row instead of
         # consuming a fresh one.  This keeps physical-row usage bounded by the
-        # number of distinct additive contents (what the scheduler reserves),
-        # even when many logical (clamp-varying) hashes are active at once.
+        # number of distinct additive contents (what the scheduler reserves).
+        #
+        # NOTE: ``row_hash`` (the additive hash) folds in clamps precisely so
+        # that clamp-varying configs do NOT alias.  Clamps are written per row
+        # *position* in ``populate_steering_tables`` while aliased positions
+        # resolve to one physical row, so sharing a row across differing
+        # clamps would let the last write win — and the alias branch below
+        # never populates ``config_clamps`` for the aliased key, dropping its
+        # clamps outright.  Aliasing is only sound when clamps match too.
         if content_key in self._content_to_row:
             row = self._content_to_row[content_key]
             self.config_to_row[key] = row
@@ -1630,7 +1637,11 @@ class SteeringManager:
             if scales_buf is None or id(scales_buf) in written:
                 continue
             scales_vec = self._build_scales_vector(scales_buf.device)
-            scales_buf.index_copy_(0, indices, scales_vec)
+            scales_buf.index_copy_(
+                0,
+                indices,
+                scales_vec.to(device=scales_buf.device, dtype=scales_buf.dtype),
+            )
             written.add(id(scales_buf))
         self._dirty.scales = False
 
@@ -1986,9 +1997,10 @@ class SteeringManager:
             # per-row scale / monitor owners (keyed by logical ``config_hash``)
             # line up position-for-position.  Aliased logical configs share a
             # physical row, so ``_cached_indices`` may repeat a row id; the
-            # ``index_copy_`` scatters below tolerate the duplicate (aliased
-            # configs carry identical additive content, so whichever write
-            # wins is correct).
+            # ``index_copy_`` scatters below tolerate the duplicate: aliasing
+            # requires an identical additive hash, which covers vectors,
+            # module_ref *and* clamps, so every write targeting a shared row
+            # carries the same content and whichever one wins is correct.
             new_ordered_configs: list[tuple[tuple[int, str], int]] = list(
                 self.config_to_row.items()
             )
@@ -2246,8 +2258,16 @@ class SteeringManager:
             if not any_cfg:
                 row_active_buf.fill_(False)
                 continue
-            probe_tbl.index_copy_(0, indices, probe_mat.to(probe_tbl.dtype))
-            row_params_buf.index_copy_(0, indices, params_mat.to(row_params_buf.dtype))
+            probe_tbl.index_copy_(
+                0, indices, probe_mat.to(device=probe_tbl.device, dtype=probe_tbl.dtype)
+            )
+            row_params_buf.index_copy_(
+                0,
+                indices,
+                params_mat.to(
+                    device=row_params_buf.device, dtype=row_params_buf.dtype
+                ),
+            )
             row_active_buf.fill_(True)
 
         # Write each (hook, layer)'s directional-clamp dirs/bounds/strength
@@ -2287,9 +2307,26 @@ class SteeringManager:
             if not any_clamp:
                 clamp_active_buf.fill_(False)
                 continue
-            dirs_buf.index_copy_(0, indices, dirs_mat.to(dirs_buf.dtype))
-            bounds_buf.index_copy_(0, indices, bounds_mat.to(bounds_buf.device))
-            strength_buf.index_copy_(0, indices, strength_mat.to(strength_buf.device))
+            # ``index_copy_`` is strict about dtype (unlike ``copy_``), so match
+            # both device and dtype of the destination rather than relying on
+            # the builders above to happen to produce the right one: ``dirs`` is
+            # built on-device in the compute dtype while ``bounds``/``strength``
+            # are built on CPU in fp32. ``.to()`` is a no-op when both already
+            # agree, so this costs nothing and stops a future dtype change in
+            # ``clamp.py`` from raising on every clamped fp16/bf16 request.
+            dirs_buf.index_copy_(
+                0, indices, dirs_mat.to(device=dirs_buf.device, dtype=dirs_buf.dtype)
+            )
+            bounds_buf.index_copy_(
+                0,
+                indices,
+                bounds_mat.to(device=bounds_buf.device, dtype=bounds_buf.dtype),
+            )
+            strength_buf.index_copy_(
+                0,
+                indices,
+                strength_mat.to(device=strength_buf.device, dtype=strength_buf.dtype),
+            )
             clamp_active_buf.fill_(True)
 
         # Write the per-row strength scales (§5.3) alongside the tables.
@@ -2302,7 +2339,11 @@ class SteeringManager:
             if scales_buf is None or id(scales_buf) in scales_written:
                 continue
             scales_vec = self._build_scales_vector(scales_buf.device)
-            scales_buf.index_copy_(0, indices, scales_vec)
+            scales_buf.index_copy_(
+                0,
+                indices,
+                scales_vec.to(device=scales_buf.device, dtype=scales_buf.dtype),
+            )
             scales_written.add(id(scales_buf))
 
         # All per-layer table buffers now reflect current state. Subsequent

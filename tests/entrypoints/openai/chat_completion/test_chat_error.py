@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import UserDict
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -82,6 +83,16 @@ class MockVllmConfig:
     parallel_config: MockParallelConfig
 
 
+class _DummyEncoding(UserDict):
+    """Minimal stand-in for ``transformers.BatchEncoding``."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self.data[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
 @dataclass
 class DummyTokenizer:
     max_chars_per_token: int = 1
@@ -93,7 +104,13 @@ class DummyTokenizer:
         return list(range(len(text)))
 
     def __call__(self, text: str, **kwargs):
-        return type("Tokenized", (), {"input_ids": self.encode(text, **kwargs)})()
+        # Real HF tokenizers return a ``BatchEncoding`` (a ``UserDict``), which
+        # supports both mapping and attribute access; renderers subscript it.
+        input_ids = self.encode(text, **kwargs)
+        return _DummyEncoding(
+            input_ids=input_ids,
+            offset_mapping=[(i, i + 1) for i in range(len(input_ids))],
+        )
 
 
 def _build_renderer(model_config: MockModelConfig):

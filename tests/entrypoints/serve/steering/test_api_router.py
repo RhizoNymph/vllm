@@ -217,7 +217,7 @@ class TestSetSteeringBase:
         """No tiers provided -> immediate 400."""
         resp = client.post("/v1/steering/set", json={})
         assert resp.status_code == 400
-        assert "No vectors provided" in resp.json()["error"]
+        assert "No vectors or clamps provided" in resp.json()["error"]
         engine.collective_rpc.assert_not_called()
 
     def test_set_empty_vectors(self, client, engine):
@@ -227,7 +227,7 @@ class TestSetSteeringBase:
             json={"vectors": {}},
         )
         assert resp.status_code == 400
-        assert "No vectors provided" in resp.json()["error"]
+        assert "No vectors or clamps provided" in resp.json()["error"]
         engine.collective_rpc.assert_not_called()
 
     def test_set_invalid_hook_point(self, client, engine):

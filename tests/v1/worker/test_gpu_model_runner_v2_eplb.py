@@ -85,6 +85,12 @@ def _make_runner(**overrides: Any) -> Any:
     runner.eplb = eplb.EPLBController(runner.parallel_config, runner.device)
     runner.pooling_runner = None
     runner.execute_model_state = None
+    # These tests cover EPLB registration only. The fork control-plane hooks
+    # ``load_model`` runs at the end need a real ``VllmConfig`` and an
+    # ``nn.Module``; stub them out so this suite stays scoped to EPLB.
+    runner._init_capture_state = lambda: None
+    runner._init_steering_state = lambda: None
+    runner._init_patch_state = lambda: None
     for key, value in overrides.items():
         setattr(runner, key, value)
     return runner

@@ -137,6 +137,16 @@ class CPUModelRunner(GPUModelRunner):
 
         self._setup_eagle3_aux_hidden_state_outputs()
 
+        # This override replaces GPUModelRunner.load_model wholesale rather
+        # than calling super(), so the post-load control-plane hooks have to be
+        # repeated here. Without them steering and patching are silently
+        # inactive on the CPU backend, and the inherited ``_update_states``
+        # touches patch state that was never initialised. Both are no-ops when
+        # the corresponding feature is disabled, and ``_init_patch_state``
+        # already gates its kernel warmup on a CUDA table device.
+        self._init_steering_state()
+        self._init_patch_state()
+
     def get_model(self) -> nn.Module:
         return self.model
 
