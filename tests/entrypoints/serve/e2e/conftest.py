@@ -32,6 +32,8 @@ def server(capture_root: str):
     args = [
         "--max-model-len",
         "512",
+        "--gpu-memory-utilization",
+        "0.75",
         "--enable-steering",
         "--max-steering-configs",
         "8",
