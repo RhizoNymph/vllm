@@ -43,42 +43,30 @@ Skipped unless run manually against such a model:
 
 from __future__ import annotations
 
+from tests.v1.worker.steering_e2e_utils import (  # isort: skip
+    MAX_TOKENS,
+    NOISE_FLOOR,
+    PROMPT,
+    build_async_llm,
+    common_prefix_len as _common_prefix_len,
+    env_layer,
+    requires_cuda,
+    requires_model_path,
+)
+
 import asyncio
 import base64
 import itertools
-import os
-
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import numpy as np
 import pytest
-import torch
 
-MODEL = os.environ.get("DYNSTEER_E2E_MODEL", "google/gemma-4-E2B-it")
-LAYER = int(os.environ.get("DYNSTEER_E2E_LAYER", "8"))
-IS_LOCAL = MODEL.endswith(".gguf") or os.path.exists(MODEL)
+LAYER = env_layer(8)
 
 HOOK = "post_block"
-PROMPT = "The capital of France is"
-MAX_TOKENS = 24
 STEER_NORM = 24.0
 
-# Real per-request steering forces an EARLY divergence between the tagged
-# request and its in-batch control; two identical prompts left unsteered
-# only diverge much later from batched-FP noise. NOISE_FLOOR separates the
-# two regimes (see test_dynamic_steering_e2e.py).
-NOISE_FLOOR = 10
-
 _rid = itertools.count()
-
-
-def _common_prefix_len(a: list[int], b: list[int]) -> int:
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n
 
 
 def _packed(vec: np.ndarray, layer: int) -> dict:
@@ -144,21 +132,7 @@ def _probe_this_token_gate(
 
 
 def _engine():
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.v1.engine.async_llm import AsyncLLM
-
-    kwargs: dict = dict(
-        model=MODEL,
-        enable_steering=True,
-        max_dynamic_steering_configs=4,
-        max_model_len=256,
-        enforce_eager=True,
-        gpu_memory_utilization=0.92,
-        seed=0,
-    )
-    if not IS_LOCAL:
-        kwargs["load_format"] = "dummy"
-    return AsyncLLM.from_engine_args(AsyncEngineArgs(**kwargs))
+    return build_async_llm()
 
 
 async def _gen(engine, prompt: str, gates) -> list[int]:
@@ -213,11 +187,8 @@ async def _run_all() -> dict:
         engine.shutdown()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.skipif(
-    IS_LOCAL and not os.path.exists(MODEL),
-    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
-)
+@requires_cuda
+@requires_model_path
 def test_declarative_gates_steer_target_only_and_clean_up():
     results = asyncio.run(_run_all())
 
