@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 
 import pytest
+
 from vllm import SamplingParams
 from vllm.config.sae_steering_types import SAEClampEntry, SAEClampSpec
 from vllm.entrypoints.openai.steering.registry import (

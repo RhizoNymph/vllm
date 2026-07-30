@@ -182,7 +182,9 @@ class TestAdmissionValidation:
         core = self._mirrored_core()
         with pytest.raises(SteeringVectorError, match="unknown sae_delta"):
             _validate(core, _params(clamp_specs=(_clamp_spec(module="f"),)))
-        with pytest.raises(SteeringVectorError, match="unknown sae_full_reconstruction"):
+        with pytest.raises(
+            SteeringVectorError, match="unknown sae_full_reconstruction"
+        ):
             _validate(
                 core,
                 _params(fr_specs=(SAEFullReconstructionSpec(module_name="d"),)),
@@ -196,9 +198,7 @@ class TestAdmissionValidation:
     def test_unclampable_feature_raises(self):
         core = self._mirrored_core()
         with pytest.raises(SteeringVectorError, match="clampable set"):
-            _validate(
-                core, _params(clamp_specs=(_clamp_spec(module="d", feature=99),))
-            )
+            _validate(core, _params(clamp_specs=(_clamp_spec(module="d", feature=99),)))
 
     def test_error_is_request_scoped_validation_error(self):
         """The whole point of the guard: the raise must be a
