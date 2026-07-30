@@ -177,10 +177,11 @@ def test_mismatched_weights_registration_rejected(http, tmp_path_factory):
     assert r.status_code == 400, r.text
 
 
-def test_full_reconstruction_kind_over_http_is_rejected_today(http):
-    """``kind=sae_full_reconstruction`` is not accepted by the register
-    endpoint yet (pydantic literal) — pinned here so extending the
-    endpoint (feat/sae-fr-http) consciously flips this test."""
+def test_full_reconstruction_kind_over_http_requires_declared_topology(http):
+    """``kind=sae_full_reconstruction`` is accepted by the register
+    endpoint's protocol, but on a compiled (frozen-topology) server an
+    undeclared FR module is rejected with a clean 400 — spare slots are
+    delta-only, so FR must be declared via ``--steering-modules``."""
     r = http.post(
         "/v1/steering/modules/register",
         json={
@@ -189,4 +190,5 @@ def test_full_reconstruction_kind_over_http_is_rejected_today(http):
             "sae_manifest": _manifest("/nonexistent"),
         },
     )
-    assert r.status_code == 422, r.text
+    assert r.status_code == 400, r.text
+    assert "was not declared at startup" in r.text
