@@ -406,6 +406,121 @@ def test_invalid_layer_error_under_pp(vllm_runner) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Directional-clamp equivalence across TP / PP
+# ---------------------------------------------------------------------------
+
+
+def _clamp_direction(hidden_size: int) -> list[float]:
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    v = rng.standard_normal(hidden_size)
+    return (v / np.linalg.norm(v)).tolist()
+
+
+def _apply_global_clamp(llm, target_layer: int, hidden_size: int) -> None:
+    llm.llm.collective_rpc(
+        "set_steering_vectors",
+        kwargs={
+            "clamps": {
+                _HP: {
+                    target_layer: [
+                        {"vector": _clamp_direction(hidden_size), "value": 50.0}
+                    ]
+                }
+            }
+        },
+    )
+
+
+@pytest.fixture(scope="module")
+def single_rank_clamp_reference(vllm_runner):
+    """TP=1 PP=1 token IDs with a fixed global clamp applied.
+
+    The clamp buffers (dirs / bounds / strength / index) must replicate
+    across TP ranks and shard with layer ownership under PP exactly like
+    the additive tables; any divergence shows up as a token mismatch.
+    """
+    if not torch.accelerator.is_available():
+        pytest.skip("Distributed steering tests require CUDA.")
+    with vllm_runner(MODEL, **_runner_kwargs()) as llm:
+        target_layer, hidden_size = _discover_layers(llm)
+        _apply_global_clamp(llm, target_layer, hidden_size)
+        assert llm.llm.reset_prefix_cache()
+        clamped = _gen_tokens(llm, _PROMPT, _SAMPLING)
+        _clear_global_steering(llm)
+    return clamped, target_layer, hidden_size
+
+
+def test_global_clamp_equivalence_tp(vllm_runner, single_rank_clamp_reference):
+    """Clamped token IDs must match the single-rank reference under TP=2."""
+    _skip_if_not_enough_gpus(2)
+    clamped_ref, target_layer, hidden_size = single_rank_clamp_reference
+
+    with vllm_runner(MODEL, **_runner_kwargs(tensor_parallel_size=2)) as llm:
+        _apply_global_clamp(llm, target_layer, hidden_size)
+        assert llm.llm.reset_prefix_cache()
+        tokens = _gen_tokens(llm, _PROMPT, _SAMPLING)
+        _clear_global_steering(llm)
+
+    assert tokens == clamped_ref, (
+        f"TP=2 clamped tokens {tokens} diverge from single-rank reference {clamped_ref}"
+    )
+
+
+def test_global_clamp_equivalence_pp(vllm_runner, single_rank_clamp_reference):
+    """Clamped token IDs must match the single-rank reference under PP=2."""
+    _skip_if_not_enough_gpus(2)
+    clamped_ref, target_layer, hidden_size = single_rank_clamp_reference
+
+    with vllm_runner(MODEL, **_runner_kwargs(pipeline_parallel_size=2)) as llm:
+        _apply_global_clamp(llm, target_layer, hidden_size)
+        assert llm.llm.reset_prefix_cache()
+        tokens = _gen_tokens(llm, _PROMPT, _SAMPLING)
+        _clear_global_steering(llm)
+
+    assert tokens == clamped_ref, (
+        f"PP=2 clamped tokens {tokens} diverge from single-rank reference {clamped_ref}"
+    )
+
+
+def test_per_request_clamp_equivalence_tp(vllm_runner) -> None:
+    """Per-request clamp specs must reproduce single-rank outputs under
+    TP=2 (clamp rows are gathered by the shared steering row index)."""
+    _skip_if_not_enough_gpus(2)
+
+    def _sp(target_layer: int, hidden_size: int, value: float) -> SamplingParams:
+        return SamplingParams(
+            max_tokens=8,
+            temperature=0.0,
+            steering_clamps={
+                _HP: {
+                    target_layer: [
+                        {"vector": _clamp_direction(hidden_size), "value": value}
+                    ]
+                }
+            },
+        )
+
+    references: list[list[int]] = []
+    with vllm_runner(MODEL, **_runner_kwargs()) as llm:
+        target_layer, hidden_size = _discover_layers(llm)
+        for value in (25.0, 50.0):
+            references.append(
+                _gen_tokens(llm, _PROMPT, _sp(target_layer, hidden_size, value))
+            )
+
+    with vllm_runner(MODEL, **_runner_kwargs(tensor_parallel_size=2)) as llm:
+        target_layer, hidden_size = _discover_layers(llm)
+        for i, value in enumerate((25.0, 50.0)):
+            tokens = _gen_tokens(llm, _PROMPT, _sp(target_layer, hidden_size, value))
+            assert tokens == references[i], (
+                f"Per-request clamp (value={value}) diverged under TP=2: "
+                f"reference={references[i]}, distributed={tokens}"
+            )
+
+
 def test_mismatched_vector_size_under_tp(vllm_runner) -> None:
     """A vector with the wrong size raises SteeringVectorError on every
     TP rank. Each rank owns the same layers under TP so either all
