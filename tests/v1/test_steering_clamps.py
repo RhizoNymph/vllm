@@ -346,3 +346,60 @@ class TestSamplingParamsClamps:
         )
         assert sp.steering_clamps is not None
         assert sp.decode_steering_clamps is not None
+
+
+class TestAdditiveRowHashIncludesClamps:
+    """Clamps are part of the *physical additive row* identity.
+
+    The worker writes a request's clamps into the same table row as its
+    vectors, and ``SteeringManager.register_config`` aliases configs whose
+    additive hash matches onto one shared row. So if clamps were excluded from
+    the additive hash, two requests with identical vectors but different clamp
+    bounds would alias onto one row — where clamps are filled per row
+    *position* and the last write wins, and the alias branch never populates
+    ``config_clamps`` for the aliased key at all, silently dropping them.
+    A clamp-only request must likewise hash nonzero so the scheduler reserves
+    it a row instead of over-admitting past ``max_steering_configs``.
+    """
+
+    _VEC = {"post_block": {0: [1.0, 0.0]}}
+
+    def _sp(self, **kw):
+        return SamplingParams(steering_vectors=self._VEC, **kw)
+
+    def test_same_vectors_different_clamps_get_distinct_row_hashes(self):
+        a = self._sp(steering_clamps={"post_block": {0: [_entry([1.0, 0.0], 1.0)]}})
+        b = self._sp(steering_clamps={"post_block": {0: [_entry([1.0, 0.0], 9.0)]}})
+        assert (
+            a.prefill_additive_steering_config_hash
+            != b.prefill_additive_steering_config_hash
+        )
+        assert (
+            a.decode_additive_steering_config_hash
+            != b.decode_additive_steering_config_hash
+        )
+
+    def test_same_vectors_same_clamps_still_alias(self):
+        clamps = {"post_block": {0: [_entry([1.0, 0.0], 1.0)]}}
+        a = self._sp(steering_clamps=clamps)
+        b = self._sp(steering_clamps=clamps)
+        assert (
+            a.prefill_additive_steering_config_hash
+            == b.prefill_additive_steering_config_hash
+        )
+
+    def test_vector_only_hash_unchanged_by_the_clamp_fold(self):
+        """Requests with no clamps must hash exactly as before, so prefix-cache
+        reuse and row aliasing for the common case are untouched."""
+        sp = self._sp()
+        assert sp.prefill_additive_steering_config_hash == hash_steering_config(
+            sp.effective_prefill_steering, module_ref=sp.steering_module_ref
+        )
+
+    def test_clamp_only_request_reserves_a_row(self):
+        sp = SamplingParams(
+            steering_clamps={"post_block": {0: [_entry([1.0, 0.0], 1.0)]}}
+        )
+        assert not sp.effective_prefill_steering
+        assert sp.prefill_additive_steering_config_hash != 0
+        assert sp.decode_additive_steering_config_hash != 0
