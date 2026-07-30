@@ -92,6 +92,19 @@ def _build_llm():
     IS_LOCAL and not os.path.exists(MODEL),
     reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
 )
+@pytest.mark.skipif(
+    not IS_LOCAL,
+    # Unlike the other e2e tests here, this one asserts that a generation
+    # *diverges* under steering. Without a local model we fall back to
+    # ``load_format="dummy"``, and random weights produce a saturated,
+    # degenerate generation (one token repeated) whose argmax steering cannot
+    # move — so the assertion is unsatisfiable rather than merely weak. Point
+    # DYNSTEER_E2E_MODEL at a real checkpoint to exercise it.
+    reason=(
+        "needs real weights: divergence cannot be observed under "
+        "load_format=dummy — set DYNSTEER_E2E_MODEL to a real model"
+    ),
+)
 def test_async_queue_global_tier_steers_later_request():
     """A tier update submitted via the action queue from a finalizing
     request steers a SUBSEQUENT request (not itself)."""

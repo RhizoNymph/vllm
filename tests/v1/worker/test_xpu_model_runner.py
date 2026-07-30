@@ -3,11 +3,12 @@
 
 """Unit tests for ``vllm.v1.worker.xpu_model_runner`` (XPU worker / CUDA shims)."""
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
-from torch._dynamo.variables.torch import TorchInGraphFunctionVariable
-
-from vllm.v1.worker.xpu_model_runner import _torch_cuda_wrapper
 
 # XPU-only: needs distinct torch.cuda vs torch.xpu current_stream symbols.
 pytestmark = pytest.mark.skipif(
@@ -15,9 +16,37 @@ pytestmark = pytest.mark.skipif(
     reason="torch.xpu.current_stream is required",
 )
 
+# The body runs in a child interpreter because ``_torch_cuda_wrapper`` patches
+# ``torch.cuda`` permanently and must not leak into the rest of the session.
+#
+# This used to use ``@pytest.mark.forked``, but ``pytest_forked``'s
+# ``pytest_runtest_protocol`` hook is ``tryfirst`` and returns ``True``, so
+# pytest's own protocol — and with it the parent's ``SetupState`` bookkeeping —
+# never runs for the item. The parent is left holding stale ``Package``
+# collectors, and the first test of the *next* package then dies on
+# ``assert col in needed_collectors`` inside ``_pytest/runner.py`` with
+# "previous item was not torn down properly". An explicit subprocess gives the
+# same isolation without hijacking the protocol.
+_CHILD_SCRIPT = textwrap.dedent(
+    """
+    from torch._dynamo.variables.torch import TorchInGraphFunctionVariable
 
-# Child process: patched torch.cuda must not leak to other tests in the session.
-@pytest.mark.forked
+    from vllm.v1.worker.xpu_model_runner import _torch_cuda_wrapper
+
+    # Same entry point as XPUModelRunner.__init__ (patches persist after exit).
+    with _torch_cuda_wrapper():
+        pass
+
+    # Fresh handler table build, as on first torch.compile / AOT in the worker.
+    # Registers torch.cuda.current_stream and torch.xpu.current_stream
+    # separately; if they are the same object (pre-fix alias), this raises
+    # "Handler already registered".
+    TorchInGraphFunctionVariable._get_handlers.cache_clear()
+    TorchInGraphFunctionVariable._get_handlers()
+    """
+)
+
+
 def test_torch_cuda_wrapper_allows_dynamo_handler_registration() -> None:
     """Guard against XPU CUDA shim breaking Torch Dynamo during AOT compile.
 
@@ -35,12 +64,12 @@ def test_torch_cuda_wrapper_allows_dynamo_handler_registration() -> None:
     This test replays the post-init state (wrapper applied, patches left on
     ``torch.cuda``) and checks that Dynamo's real ``_get_handlers()`` succeeds.
     """
-    # Same entry point as XPUModelRunner.__init__ (patches persist after exit).
-    with _torch_cuda_wrapper():
-        pass
-
-    # Fresh handler table build, as on first torch.compile / AOT in the worker.
-    # Registers torch.cuda.current_stream and torch.xpu.current_stream separately;
-    # if they are the same object (pre-fix alias), raises Handler already registered.
-    TorchInGraphFunctionVariable._get_handlers.cache_clear()
-    TorchInGraphFunctionVariable._get_handlers()
+    proc = subprocess.run(
+        [sys.executable, "-c", _CHILD_SCRIPT],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        "XPU CUDA shim broke Dynamo handler registration:\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
