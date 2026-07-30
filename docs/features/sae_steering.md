@@ -578,9 +578,16 @@ buffer / dispatch / populator contracts),
 admission, end-to-end per-step pipeline),
 `tests/v1/test_sae_*` (types and SamplingParams),
 `tests/v1/core/test_steering_scheduler.py` (pool separation),
+`tests/v1/engine/test_sae_admission_guard.py` (EngineCore admission
+mirror for frontends that skip API-server pre-validation),
 `tests/entrypoints/**/test_sae_*` + `test_modules_router_sae.py`
-(loader, registry, router), and the CUDA + HF-gated real-weights
-generation tests in `tests/models/language/generation/`.
+(loader, registry, router — both SAE kinds), and the CUDA + HF-gated
+real-weights generation tests in `tests/models/language/generation/`
+(`test_sae_steering_real_weights.py`,
+`test_sae_full_reconstruction_real_weights.py`, and
+`test_sae_steering_breadth_real_weights.py` — fp8 storage, the global
+clamp tier, gated-spec neutrality without a monitor, and prefix-cache
+isolation).
 
 Decoder `*.py` model files: **no changes** — SAE dispatch is
 centralized inside `apply_layer_steering` / `apply_block_steering`, so
