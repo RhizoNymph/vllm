@@ -43,9 +43,15 @@ from tests.v1.worker.steering_e2e_utils import (  # isort: skip
     requires_model_path,
 )
 
+import os
+
 import pytest
 
 LAYER = env_layer(8)
+# Tier magnitude: enough to flip greedy tokens on the target model. 24
+# suits small/dummy models; large local checkpoints (gemma-4-31B) need
+# ~200 to move any of the first MAX_TOKENS greedy picks.
+STEER_NORM = float(os.environ.get("DYNSTEER_E2E_STEER_NORM", "24.0"))
 
 # Repeats of the prompt within one engine. The first is the baseline; the
 # tier is submitted when an earlier request finalizes (on the finalize
@@ -82,7 +88,7 @@ def test_async_queue_global_tier_steers_later_request():
                 "params": {
                     "steer_layer": LAYER,
                     "steer_hook": "post_block",
-                    "steer_norm": 24.0,
+                    "steer_norm": STEER_NORM,
                 },
             }
         ]
@@ -102,8 +108,10 @@ def test_async_queue_global_tier_steers_later_request():
 
     steered = [o for o in outs[1:] if o != base]
     first_diff = common_prefix_len(base, steered[0]) if steered else None
-    print(f"baseline={base}\n steered ={steered[0] if steered else None}"
-          f"\n first_diff={first_diff}")
+    print(
+        f"baseline={base}\n steered ={steered[0] if steered else None}"
+        f"\n first_diff={first_diff}"
+    )
     # The only thing this proves — and all it needs to — is that the tier a
     # finalizing request submitted through the queue reached a LATER
     # request's steering tables. (Unlike the in-request latency case, the

@@ -53,6 +53,9 @@ Notes:
   The row-gate `cudagraph` leg is a strict `xfail`: the fused-monitor
   row gate is inert under FULL cudagraph replay (engine-level, kernel
   replay itself is clean) — see `docs/design/dynamic_steering.md` §9.
+- `test_async_steering_e2e.py` asserts a *divergence*; on gemma-4-31B set
+  `DYNSTEER_E2E_STEER_NORM=200` (the default 24 cannot flip any greedy
+  token on a model this size) and `DYNSTEER_E2E_LAYER=30`.
 - On a 24 GiB card the 31B GGUF leaves too little KV headroom for
   `test_apc_steering_e2e.py` / `test_cross_layer_monitor_e2e.py` at the
   default `gpu_memory_utilization=0.92`; set
