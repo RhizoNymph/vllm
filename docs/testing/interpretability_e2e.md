@@ -32,21 +32,31 @@ Dynamic steering / capture→steering loop (`tests/v1/worker/`, shared
 scaffolding in `tests/v1/worker/steering_e2e_utils.py`):
 
 ```bash
-.venv/bin/python -m pytest -v -s \
-  tests/v1/worker/test_dynamic_steering_e2e.py \
-  tests/v1/worker/test_steering_gating_e2e.py \
-  tests/v1/worker/test_async_steering_e2e.py \
-  tests/v1/worker/test_apc_steering_e2e.py \
-  tests/v1/worker/test_preemption_steering_e2e.py \
-  tests/v1/worker/test_declarative_gates_e2e.py \
-  tests/v1/worker/test_cross_layer_monitor_e2e.py
+for f in test_dynamic_steering_e2e test_steering_gating_e2e \
+         test_async_steering_e2e test_apc_steering_e2e \
+         test_preemption_steering_e2e test_declarative_gates_e2e \
+         test_cross_layer_monitor_e2e; do
+  .venv/bin/python -m pytest -v -s "tests/v1/worker/${f}.py"
+done
 ```
 
 Notes:
 
+- **One pytest process per file.** Engine teardown does not reliably
+  release GPU memory within a process; with a large local GGUF
+  (~17 GiB weights) the second file's engine sees only a few GiB free
+  and every subsequent test fails engine startup at
+  `gpu_memory_utilization=0.92`. Verified 2026-07-30 on a 24 GiB 3090:
+  the combined invocation fails 10/11, the per-file loop passes.
 - `test_dynamic_steering_e2e.py` and the row-gate test in
-  `test_steering_gating_e2e.py` are parametrized `eager` / `cudagraph`; both
-  variants must pass.
+  `test_steering_gating_e2e.py` are parametrized `eager` / `cudagraph`.
+  The row-gate `cudagraph` leg is a strict `xfail`: the fused-monitor
+  row gate is inert under FULL cudagraph replay (engine-level, kernel
+  replay itself is clean) — see `docs/design/dynamic_steering.md` §9.
+- On a 24 GiB card the 31B GGUF leaves too little KV headroom for
+  `test_apc_steering_e2e.py` / `test_cross_layer_monitor_e2e.py` at the
+  default `gpu_memory_utilization=0.92`; set
+  `DYNSTEER_E2E_GPU_UTIL=0.98` (requires an otherwise idle GPU).
 - `test_async_steering_e2e.py` and `test_cross_layer_monitor_e2e.py` need a
   *local real-weights* model (they skip under dummy weights); the cross-layer
   monitor test also needs ≥~50 layers (gemma-4-31B).

@@ -34,6 +34,7 @@ import requests
 import torch
 
 MODEL = os.environ.get("DYNSTEER_E2E_MODEL", "google/gemma-4-E2B-it")
+GPU_UTIL = float(os.environ.get("DYNSTEER_E2E_GPU_UTIL", "0.92"))
 IS_LOCAL = MODEL.endswith(".gguf") or os.path.exists(MODEL)
 
 PROMPT = "The capital of France is"
@@ -124,7 +125,7 @@ def _engine_kwargs(
         max_dynamic_steering_configs=4,
         max_model_len=256,
         enforce_eager=enforce_eager,
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=GPU_UTIL,
         seed=0,
     )
     if not IS_LOCAL:

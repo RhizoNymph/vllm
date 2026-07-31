@@ -34,6 +34,7 @@ import os
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 from tests.v1.worker.steering_e2e_utils import (  # isort: skip
+    GPU_UTIL,
     IS_LOCAL,
     MODEL,
     PROMPT,
@@ -68,7 +69,7 @@ def test_cross_layer_monitor_gates_later_layers_only():
         enable_cross_layer_monitor=True,
         max_model_len=3072,
         max_num_seqs=32,
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=GPU_UTIL,
         seed=0,
     )
     mr = _runner(llm)

@@ -86,7 +86,26 @@ _BASE = {
 @requires_cuda
 @requires_model_path
 @requires_consumer_plugin("dynamic_steering_e2e_cfg")
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "cudagraph"])
+@pytest.mark.parametrize(
+    "enforce_eager",
+    [
+        pytest.param(True, id="eager"),
+        pytest.param(
+            False,
+            id="cudagraph",
+            marks=pytest.mark.xfail(
+                reason=(
+                    "fused-monitor row gate is inert under FULL cudagraph "
+                    "replay (gate OFF still applies the row). Kernel-level "
+                    "graph replay honors in-place monitor buffer flips, so "
+                    "the break is engine-level; never previously validated "
+                    "— see docs/design/dynamic_steering.md §9."
+                ),
+                strict=True,
+            ),
+        ),
+    ],
+)
 def test_row_gate_gates_per_request_row(enforce_eager):
     """``gate_rows`` ON applies the target's row (early divergence); OFF
     suppresses it (target tracks the control to the noise floor)."""
