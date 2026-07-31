@@ -8,7 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 
 class SAEModuleManifestRequest(BaseModel):
-    """Wire-format manifest for a kind=``sae_delta`` module."""
+    """Wire-format manifest for an SAE-kind module.
+
+    Shared by ``kind=sae_delta`` and ``kind=sae_full_reconstruction``;
+    the register endpoint picks the matching weight loader (clampable
+    subset vs. full ``d_sae`` rows) from the request ``kind``.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -85,12 +90,13 @@ class RegisterSteeringModuleRequest(BaseModel):
     name: str = Field(
         description="Unique name for the steering module.",
     )
-    kind: Literal["additive", "sae_delta"] = Field(
+    kind: Literal["additive", "sae_delta", "sae_full_reconstruction"] = Field(
         default="additive",
         description=(
             "Module kind discriminator.  ``additive`` (default) accepts "
-            "the precomputed-vector tier fields; ``sae_delta`` requires "
-            "``sae_manifest`` and rejects the additive fields."
+            "the precomputed-vector tier fields; ``sae_delta`` and "
+            "``sae_full_reconstruction`` require ``sae_manifest`` and "
+            "reject the additive fields."
         ),
     )
     # Each additive tier accepts either the legacy ``SteeringVectorSpec``
@@ -116,8 +122,9 @@ class RegisterSteeringModuleRequest(BaseModel):
     sae_manifest: SAEModuleManifestRequest | None = Field(
         default=None,
         description=(
-            "SAE shape manifest.  Required when ``kind=sae_delta``, "
-            "rejected for ``additive``."
+            "SAE shape manifest.  Required for the SAE kinds "
+            "(``sae_delta`` / ``sae_full_reconstruction``), rejected "
+            "for ``additive``."
         ),
     )
     clamps: dict[str, Any] | None = Field(

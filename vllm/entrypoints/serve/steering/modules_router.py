@@ -21,6 +21,7 @@ from vllm.entrypoints.openai.steering.registry import (
     pack_sae_weights_for_broadcast,
 )
 from vllm.entrypoints.openai.steering.sae_loader import (
+    _load_fr_weights_for_manifest,
     _load_weights_for_manifest,
 )
 from vllm.entrypoints.serve.steering.api_router import (
@@ -42,6 +43,7 @@ def _check_frozen_sae_topology_frontend(
     registry,
     *,
     name: str,
+    kind: str,
     manifest: SAEModuleManifest,
 ) -> None:
     """Reject frozen-topology-violating SAE registrations with a 400.
@@ -51,9 +53,11 @@ def _check_frozen_sae_topology_frontend(
     :func:`sae_topology_mismatch`, so they cannot diverge.  Raising
     ``ValueError`` here (before any weight I/O or broadcast) maps to a
     clean 400; the worker check remains the backstop for direct
-    ``collective_rpc`` callers.  Spare availability is estimated from
-    the registry (undeclared delta modules hold one spare per site);
-    the worker's slot records are ground truth.
+    ``collective_rpc`` callers.  Spare slots serve undeclared *delta*
+    modules only — an undeclared full-reconstruction module is always
+    rejected, mirroring the worker.  Spare availability is estimated
+    from the registry (undeclared delta modules hold one spare per
+    site); the worker's slot records are ground truth.
     """
     if not is_steering_topology_frozen(vllm_config):
         return
@@ -71,7 +75,7 @@ def _check_frozen_sae_topology_frontend(
     if topo is not None:
         mismatch = sae_topology_mismatch(
             topo,
-            kind="sae_delta",
+            kind=kind,
             layers=tuple((int(li), str(hs)) for li, hs in manifest.layers),
             d_model=manifest.d_model,
             d_sae=manifest.d_sae,
@@ -86,6 +90,11 @@ def _check_frozen_sae_topology_frontend(
                 f"startup-declared topology: {mismatch}. {remedy}"
             )
         return
+    if kind != "sae_delta":
+        raise ValueError(
+            f"Steering module {name!r} (kind={kind!r}) was not declared "
+            f"at startup. {remedy}"
+        )
     if manifest.storage_dtype != "auto":
         raise ValueError(
             f"Steering module {name!r} requests storage_dtype "
@@ -242,7 +251,12 @@ def _build_broadcast_payload_for_module(module: SteeringModule) -> dict:
             f"{module.name!r}: manifest has no 'weights_uri' to re-load "
             "weights from."
         )
-    weights = _load_weights_for_manifest(manifest, Path(manifest.weights_uri))
+    loader = (
+        _load_fr_weights_for_manifest
+        if module.kind is SteeringModuleKind.SAE_FULL_RECONSTRUCTION
+        else _load_weights_for_manifest
+    )
+    weights = loader(manifest, Path(manifest.weights_uri))
     return {
         "kind": module.kind.value,
         "sae_manifest": {
@@ -388,9 +402,11 @@ async def register_steering_module(
                 "prefill_clamps": registered.prefill_clamps if registered else None,
                 "decode_clamps": registered.decode_clamps if registered else None,
             }
-        else:  # SAE_DELTA
+        else:  # SAE_DELTA / SAE_FULL_RECONSTRUCTION
             if request.sae_manifest is None:
-                raise ValueError("kind='sae_delta' requires a 'sae_manifest' payload.")
+                raise ValueError(
+                    f"kind={kind.value!r} requires a 'sae_manifest' payload."
+                )
             if (
                 request.vectors is not None
                 or request.prefill_vectors is not None
@@ -398,7 +414,16 @@ async def register_steering_module(
             ):
                 raise ValueError(
                     f"Steering module {request.name!r}: additive vector fields "
-                    "are not valid for kind='sae_delta'."
+                    f"are not valid for kind={kind.value!r}."
+                )
+            if (
+                request.clamps is not None
+                or request.prefill_clamps is not None
+                or request.decode_clamps is not None
+            ):
+                raise ValueError(
+                    f"Steering module {request.name!r}: clamp tiers are "
+                    f"not valid for kind={kind.value!r}."
                 )
             # ``clampable_features`` order is significant — the safetensors
             # loader aligns each weight row to ``manifest.clampable_features[i]``,
@@ -426,14 +451,22 @@ async def register_steering_module(
             # but doing it here keeps malformed manifests from triggering
             # expensive SAE weight I/O.
             registry._validate_sae_manifest(name=request.name, manifest=manifest)
+            if kind is SteeringModuleKind.SAE_FULL_RECONSTRUCTION:
+                # FR site exclusivity is also re-checked by
+                # registry.register; running it here fails overlapping
+                # manifests before weight I/O.
+                registry._validate_sae_fr_site_overlap(
+                    name=request.name, manifest=manifest
+                )
             # Frozen-topology precheck: on a compiled engine this
             # registration must fit the pre-allocated buffer set
-            # (declared shape or a spare slot).  Fails as a 400 here,
-            # before weight I/O and broadcast.
+            # (declared shape, or a spare slot for delta modules).
+            # Fails as a 400 here, before weight I/O and broadcast.
             _check_frozen_sae_topology_frontend(
                 getattr(raw_request.app.state, "vllm_config", None),
                 registry,
                 name=request.name,
+                kind=kind.value,
                 manifest=manifest,
             )
             if not manifest.weights_uri:
@@ -443,7 +476,7 @@ async def register_steering_module(
                 # so callers see a 400 instead of an opaque runtime
                 # mis-behaviour.
                 raise ValueError(
-                    f"Steering module {request.name!r}: kind='sae_delta' "
+                    f"Steering module {request.name!r}: kind={kind.value!r} "
                     "requires 'sae_manifest.weights_uri' to point to a "
                     "local SAE checkpoint directory containing per-(layer, "
                     "hook) safetensors files.  Without weights the worker "
@@ -454,10 +487,18 @@ async def register_steering_module(
             # SAE checkpoint doesn't block other API traffic.  Use the
             # caller-provided manifest as the source of truth for shapes;
             # this lets the loader read only the weight files (the disk
-            # ``manifest.json`` is irrelevant on this path).
+            # ``manifest.json`` is irrelevant on this path).  Delta
+            # modules load only the clampable-subset rows; full
+            # reconstruction loads the complete d_sae matrices plus the
+            # decoder bias.
+            loader = (
+                _load_fr_weights_for_manifest
+                if kind is SteeringModuleKind.SAE_FULL_RECONSTRUCTION
+                else _load_weights_for_manifest
+            )
             try:
                 weights = await asyncio.to_thread(
-                    _load_weights_for_manifest,
+                    loader,
                     manifest,
                     Path(manifest.weights_uri),
                 )
@@ -495,8 +536,9 @@ async def register_steering_module(
                 "sae_weights": pack_sae_weights_for_broadcast(weights),
             }
         # Push the freshly-registered module to every worker so requests
-        # carrying ``SamplingParams.steering_module_ref`` (additive) or
-        # ``SamplingParams.sae_clamp_specs`` (sae_delta) resolve names
+        # carrying ``SamplingParams.steering_module_ref`` (additive),
+        # ``SamplingParams.sae_clamp_specs`` (sae_delta), or
+        # ``SamplingParams.sae_full_reconstruction_specs`` resolve names
         # locally without crossing the multiprocessing boundary with
         # the full payload.  If the broadcast raises, restore the
         # pre-call entry so a failed replacement does not destroy the

@@ -1870,9 +1870,18 @@ class SteeringManager:
             or self._stack_pinned_numel[slot] < numel
         ):
             try:
-                self._stack_pinned_ring[slot] = torch.empty(
-                    numel, dtype=torch.float32, pin_memory=True
-                )
+                # Allocate with inference mode locally disabled: a slot
+                # allocated on the step thread inside
+                # ``torch.inference_mode()`` would be an inference tensor,
+                # and the ``copy_`` below raises "Inplace update to
+                # inference tensor outside InferenceMode" when a
+                # control-plane RPC (module register, global set) later
+                # reuses that slot. A normal tensor accepts ``copy_``
+                # from both contexts.
+                with torch.inference_mode(False):
+                    self._stack_pinned_ring[slot] = torch.empty(
+                        numel, dtype=torch.float32, pin_memory=True
+                    )
                 self._stack_pinned_numel[slot] = numel
             except RuntimeError:
                 # Pinned allocation failed (e.g. CPU-only test env, or

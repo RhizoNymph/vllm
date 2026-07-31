@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from safetensors.torch import save_file
 
 import vllm.entrypoints.serve.steering.modules_router as modules_router
+from vllm.config.steering import SAEModuleTopology
 from vllm.entrypoints.openai.steering.registry import SteeringModuleRegistry
 from vllm.entrypoints.serve.steering.modules_router import router
 
@@ -140,6 +141,49 @@ def _sae_request_body(
             "weights_uri": weights_uri,
         },
     }
+
+
+def _fr_dir(
+    tmp_path: Path,
+    *,
+    d_model: int = 4,
+    d_sae: int = 8,
+    layers: tuple[tuple[int, str], ...] = ((0, "post_block"),),
+) -> Path:
+    """Write full-reconstruction safetensors: complete ``d_sae`` rows
+    plus the decoder bias (unlike the delta layout's clampable subset)."""
+    for layer_idx, hook_str in layers:
+        save_file(
+            {
+                "encoder_weight": torch.ones(d_sae, d_model),
+                "encoder_bias": torch.zeros(d_sae),
+                "decoder_weight": torch.ones(d_sae, d_model),
+                "decoder_bias": torch.zeros(d_model),
+            },
+            str(tmp_path / f"layer_{layer_idx}_{hook_str}.safetensors"),
+        )
+    return tmp_path
+
+
+def _fr_request_body(
+    *,
+    name: str = "fr",
+    weights_uri: str | None,
+    d_model: int = 4,
+    d_sae: int = 8,
+    clampable: tuple[int, ...] = (0, 1),
+    layers: tuple[tuple[int, str], ...] = ((0, "post_block"),),
+) -> dict:
+    body = _sae_request_body(
+        name=name,
+        weights_uri=weights_uri,
+        d_model=d_model,
+        clampable=clampable,
+        layers=layers,
+    )
+    body["kind"] = "sae_full_reconstruction"
+    body["sae_manifest"]["d_sae"] = d_sae
+    return body
 
 
 class TestSaeRegistrationRejectsMissingWeightsUri:
@@ -587,3 +631,277 @@ class TestUnregisterRollbackOnPartialFailure:
         engine.reset_prefix_cache.assert_awaited_once_with(
             reset_running_requests=True
         )
+
+
+class TestFullReconstructionRegistration:
+    """``kind="sae_full_reconstruction"`` over the register endpoint.
+
+    Mirrors the delta-path coverage: FR modules load the *complete*
+    ``d_sae`` matrices (plus the decoder bias) and broadcast them in the
+    same atomic register-and-attach RPC the worker's FR branch consumes.
+    """
+
+    def test_register_emits_one_atomic_rpc_with_full_weights(
+        self, client, engine, registry, tmp_path
+    ):
+        fr_dir = _fr_dir(tmp_path)
+        body = _fr_request_body(weights_uri=str(fr_dir))
+        resp = client.post("/v1/steering/modules/register", json=body)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["kind"] == "sae_full_reconstruction"
+        assert registry.list_modules() == ["fr"]
+
+        calls = engine.collective_rpc.await_args_list
+        assert len(calls) == 1
+        assert calls[0].args[0] == "register_steering_modules"
+        payload = calls[0].kwargs["kwargs"]["modules"]["fr"]
+        assert payload["kind"] == "sae_full_reconstruction"
+        weights = payload["sae_weights"]
+        assert set(weights.keys()) == {"0:post_block"}
+        tensors = weights["0:post_block"]
+        # Full-recon tensors: complete d_sae rows and the decoder bias.
+        assert set(tensors.keys()) == {
+            "encoder_weight",
+            "encoder_bias",
+            "decoder_weight",
+            "decoder_bias",
+        }
+        assert tuple(tensors["encoder_weight"]["shape"]) == (8, 4)
+        assert tuple(tensors["decoder_bias"]["shape"]) == (4,)
+        engine.reset_prefix_cache.assert_awaited_once_with(
+            reset_running_requests=True
+        )
+
+    def test_missing_weights_uri_returns_400(self, client, engine, registry):
+        body = _fr_request_body(weights_uri=None)
+        resp = client.post("/v1/steering/modules/register", json=body)
+        assert resp.status_code == 400
+        error = resp.json()["error"]
+        assert "weights_uri" in error
+        assert "sae_full_reconstruction" in error
+        engine.collective_rpc.assert_not_called()
+        assert registry.list_modules() == []
+
+    def test_delta_layout_weights_rejected_for_fr(
+        self, client, engine, registry, tmp_path
+    ):
+        """A delta-layout directory (clampable-subset rows, no decoder
+        bias) must fail FR shape validation with a 400, not attach."""
+        sae_dir = _sae_dir(tmp_path)
+        body = _fr_request_body(weights_uri=str(sae_dir))
+        resp = client.post("/v1/steering/modules/register", json=body)
+        assert resp.status_code == 400
+        engine.collective_rpc.assert_not_called()
+        assert registry.list_modules() == []
+
+    def test_additive_fields_reject_before_loading(
+        self, client, engine, registry, tmp_path, monkeypatch
+    ):
+        fr_dir = _fr_dir(tmp_path)
+
+        def fail_load(*args, **kwargs):
+            raise AssertionError("FR weights should not be loaded")
+
+        monkeypatch.setattr(
+            modules_router, "_load_fr_weights_for_manifest", fail_load
+        )
+        body = _fr_request_body(weights_uri=str(fr_dir))
+        body["vectors"] = {"post_block": {"0": [0.1, 0.2, 0.3, 0.4]}}
+
+        resp = client.post("/v1/steering/modules/register", json=body)
+
+        assert resp.status_code == 400
+        assert "additive vector fields" in resp.json()["error"]
+        assert registry.get("fr") is None
+        engine.collective_rpc.assert_not_called()
+
+    def test_clamp_tiers_reject_before_loading(
+        self, client, engine, registry, tmp_path, monkeypatch
+    ):
+        fr_dir = _fr_dir(tmp_path)
+
+        def fail_load(*args, **kwargs):
+            raise AssertionError("FR weights should not be loaded")
+
+        monkeypatch.setattr(
+            modules_router, "_load_fr_weights_for_manifest", fail_load
+        )
+        body = _fr_request_body(weights_uri=str(fr_dir))
+        body["clamps"] = {"post_block": {"0": [{"vector": [1, 0, 0, 0], "value": 1}]}}
+
+        resp = client.post("/v1/steering/modules/register", json=body)
+
+        assert resp.status_code == 400
+        assert "clamp tiers" in resp.json()["error"]
+        assert registry.get("fr") is None
+        engine.collective_rpc.assert_not_called()
+
+    def test_fr_site_overlap_rejects_before_loading(
+        self, client, engine, registry, tmp_path, monkeypatch
+    ):
+        """Two FR modules on one site are semantically ill-defined; the
+        overlap check must fire before the second module's weight I/O."""
+        fr_dir = _fr_dir(tmp_path)
+        first = _fr_request_body(name="fr_a", weights_uri=str(fr_dir))
+        ok = client.post("/v1/steering/modules/register", json=first)
+        assert ok.status_code == 200, ok.text
+
+        def fail_load(*args, **kwargs):
+            raise AssertionError("FR weights should not be loaded")
+
+        monkeypatch.setattr(
+            modules_router, "_load_fr_weights_for_manifest", fail_load
+        )
+        second = _fr_request_body(name="fr_b", weights_uri=str(fr_dir))
+        resp = client.post("/v1/steering/modules/register", json=second)
+
+        assert resp.status_code == 400
+        assert registry.get("fr_b") is None
+
+    def test_replacement_preserves_previous_module_on_rpc_failure(
+        self, engine, registry, tmp_path
+    ):
+        fr_dir = _fr_dir(tmp_path)
+        client = _SyncASGIClient(_make_app(engine, registry))
+        body = _fr_request_body(weights_uri=str(fr_dir))
+        ok = client.post("/v1/steering/modules/register", json=body)
+        assert ok.status_code == 200, ok.text
+        good_module = registry.get("fr")
+        assert good_module is not None
+
+        engine.collective_rpc.side_effect = [RuntimeError("worker exploded"), None]
+        resp = client.post("/v1/steering/modules/register", json=body)
+        assert resp.status_code == 500
+        assert registry.get("fr") is good_module
+
+        # Compensating broadcast re-sends the prior FR payload with the
+        # full-recon weights (decoder bias included) reloaded from disk.
+        calls = engine.collective_rpc.await_args_list
+        assert calls[-1].args[0] == "register_steering_modules"
+        comp_payload = calls[-1].kwargs["kwargs"]["modules"]["fr"]
+        assert comp_payload["kind"] == "sae_full_reconstruction"
+        assert "decoder_bias" in comp_payload["sae_weights"]["0:post_block"]
+
+    def test_unregister_failure_compensates_with_fr_payload(
+        self, engine, registry, tmp_path
+    ):
+        fr_dir = _fr_dir(tmp_path)
+        client = _SyncASGIClient(_make_app(engine, registry))
+        body = _fr_request_body(weights_uri=str(fr_dir))
+        ok = client.post("/v1/steering/modules/register", json=body)
+        assert ok.status_code == 200, ok.text
+        prior_module = registry.get("fr")
+
+        engine.collective_rpc.side_effect = [
+            None,
+            RuntimeError("worker exploded"),
+            None,
+        ]
+        resp = client.post("/v1/steering/modules/unregister", json={"name": "fr"})
+        assert resp.status_code == 500
+        assert registry.get("fr") is prior_module
+
+        calls = engine.collective_rpc.await_args_list
+        assert calls[-1].args[0] == "register_steering_modules"
+        comp_payload = calls[-1].kwargs["kwargs"]["modules"]["fr"]
+        assert comp_payload["kind"] == "sae_full_reconstruction"
+        assert "decoder_bias" in comp_payload["sae_weights"]["0:post_block"]
+
+
+def _frozen_vllm_config(*, topology: tuple[SAEModuleTopology, ...] = ()):
+    """Minimal stand-in whose compilation mode freezes SAE topology."""
+    from types import SimpleNamespace
+
+    from vllm.config.compilation import CompilationMode
+
+    return SimpleNamespace(
+        compilation_config=SimpleNamespace(mode=CompilationMode.VLLM_COMPILE),
+        model_config=SimpleNamespace(enforce_eager=False),
+        steering_config=SimpleNamespace(
+            sae_module_topology=topology,
+            sae_spare_slot_sites=(),
+            sae_spare_slot_features=0,
+            sae_spare_slots_per_site=1,
+        ),
+    )
+
+
+class TestFullReconstructionFrozenTopology:
+    """FR modules never fit spare slots — on a frozen topology they are
+    admissible only as weight refreshes of a startup-declared FR shape,
+    mirroring the worker's ``_check_frozen_sae_topology``."""
+
+    def _client(self, engine, registry, vllm_config):
+        app = _make_app(engine, registry)
+        app.state.vllm_config = vllm_config
+        return _SyncASGIClient(app)
+
+    def test_undeclared_fr_module_rejected_on_frozen_topology(
+        self, engine, registry, tmp_path
+    ):
+        client = self._client(engine, registry, _frozen_vllm_config())
+        fr_dir = _fr_dir(tmp_path)
+        body = _fr_request_body(weights_uri=str(fr_dir))
+        resp = client.post("/v1/steering/modules/register", json=body)
+        assert resp.status_code == 400
+        assert "not declared at startup" in resp.json()["error"]
+        engine.collective_rpc.assert_not_called()
+
+    def test_declared_fr_module_accepted_on_frozen_topology(
+        self, engine, registry, tmp_path
+    ):
+        topo = SAEModuleTopology(
+            name="fr",
+            kind="sae_full_reconstruction",
+            layers=((0, "post_block"),),
+            d_model=4,
+            d_sae=8,
+            n_clamp=2,
+            activation="relu",
+        )
+        client = self._client(engine, registry, _frozen_vllm_config(topology=(topo,)))
+        fr_dir = _fr_dir(tmp_path)
+        body = _fr_request_body(weights_uri=str(fr_dir))
+        resp = client.post("/v1/steering/modules/register", json=body)
+        assert resp.status_code == 200, resp.text
+
+    def test_declared_kind_mismatch_rejected(self, engine, registry, tmp_path):
+        """Registering FR under a name declared as delta is a shape
+        violation, not a refresh."""
+        topo = SAEModuleTopology(
+            name="fr",
+            kind="sae_delta",
+            layers=((0, "post_block"),),
+            d_model=4,
+            d_sae=8,
+            n_clamp=2,
+            activation="relu",
+        )
+        client = self._client(engine, registry, _frozen_vllm_config(topology=(topo,)))
+        fr_dir = _fr_dir(tmp_path)
+        body = _fr_request_body(weights_uri=str(fr_dir))
+        resp = client.post("/v1/steering/modules/register", json=body)
+        assert resp.status_code == 400
+        assert "does not match its startup-declared topology" in resp.json()["error"]
+        engine.collective_rpc.assert_not_called()
+
+
+class TestRegisterRequestKindWire:
+    """Protocol-level acceptance of the widened kind literal."""
+
+    def test_unknown_kind_is_422(self, client, engine):
+        body = {"name": "x", "kind": "sae_delta_v2"}
+        resp = client.post("/v1/steering/modules/register", json=body)
+        assert resp.status_code == 422
+        engine.collective_rpc.assert_not_called()
+
+    def test_fr_kind_parses_on_the_wire(self):
+        from vllm.entrypoints.serve.steering.modules_protocol import (
+            RegisterSteeringModuleRequest,
+        )
+
+        request = RegisterSteeringModuleRequest.model_validate(
+            _fr_request_body(weights_uri="/tmp/x")
+        )
+        assert request.kind == "sae_full_reconstruction"
+        assert request.sae_manifest is not None

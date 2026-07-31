@@ -59,6 +59,13 @@ End-to-end tested with real weights:
 Other listed architectures have hook wiring and pass small-decoder fixture
 tests but have not been validated against released checkpoints.
 
+The full HTTP surface (packed per-request vectors, clamps and their
+exactness edges, `/v1/steering/set|clear`, named modules, request-level
+400s) is exercised against a live `vllm serve` process by the collected,
+CUDA-gated suite in
+`tests/entrypoints/serve/e2e/test_server_steering_e2e.py`; the manual
+`tests/gpu_clamp_validate.py` script remains for ad-hoc runs.
+
 Also supported:
 
 - Global steering through HTTP endpoints
@@ -146,6 +153,15 @@ Clamps run **after** additive steering at each hook, so the bound holds on
 whatever leaves the site. They participate in the steering config hash,
 so prefix caching stays correct, and clamp-only requests are admitted
 exactly like vector requests.
+
+Test anchors: clamp math in
+`tests/model_executor/layers/test_clamp_op.py` (eager) and
+`test_clamp_gpu.py` (Triton parity, CUDA); engine-level behavior
+(exactness edges, clamp-after-add ordering, decode-only phase, global
+RPC tier, prefix-cache separation, CUDA-graph batching, packed-vs-JSON)
+in `tests/models/language/generation/test_steering_clamps.py`; TP/PP
+equivalence in `test_steering_distributed.py`; live-server HTTP checks
+in the manual `tests/gpu_clamp_validate.py` script.
 
 ### Gating clamps with a probe ("clamp when a feature fires")
 

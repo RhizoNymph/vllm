@@ -21,6 +21,9 @@ companion action in the same step:
   ``scale=0`` suppresses the target's row (target ≈ control); the no-scale
   override run diverges. The contrast isolates the req_id→dyn_id scale path.
 
+The row-gate case also runs in CUDA-graph mode: the in-graph gate write
+must be visible to the replayed graph.
+
 Requires CUDA + a tapped gemma4 (only gemma4 carries the steering hooks).
 Skipped unless run manually against such a model:
 
@@ -31,62 +34,39 @@ Skipped unless run manually against such a model:
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+from tests.v1.worker.steering_e2e_utils import (  # isort: skip
+    MAX_TOKENS,
+    NOISE_FLOOR,
+    PROMPT,
+    build_llm,
+    common_prefix_len,
+    env_layer,
+    requires_consumer_plugin,
+    requires_cuda,
+    requires_model_path,
+)
 
 import pytest
-import torch
 
-MODEL = os.environ.get("DYNSTEER_E2E_MODEL", "google/gemma-4-E2B-it")
-LAYER = int(os.environ.get("DYNSTEER_E2E_LAYER", "8"))
-IS_LOCAL = MODEL.endswith(".gguf") or os.path.exists(MODEL)
-
-PROMPT = "The capital of France is"
-MAX_TOKENS = 24
-
-# Real per-request steering forces an EARLY divergence between the target
-# and the in-batch control; two identical prompts left unsteered only
-# diverge much later from batched-FP noise. NOISE_FLOOR separates the two
-# regimes (see test_dynamic_steering_e2e.py).
-NOISE_FLOOR = 10
-
-
-def _common_prefix_len(a: list[int], b: list[int]) -> int:
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n
-
-
-def _build_llm(params: dict, *, enable_row_monitor: bool = False):
-    from vllm import LLM
-
-    kwargs: dict = dict(
-        model=MODEL,
-        enable_steering=True,
-        max_dynamic_steering_configs=4,
-        max_model_len=256,
-        enforce_eager=True,
-        gpu_memory_utilization=0.92,
-        seed=0,
-        capture_consumers=[{"name": "dynamic_steering_e2e_cfg", "params": params}],
-    )
-    if enable_row_monitor:
-        kwargs["enable_row_monitor"] = True
-    if not IS_LOCAL:
-        kwargs["load_format"] = "dummy"
-    return LLM(**kwargs)
+LAYER = env_layer(8)
 
 
 def _two_outputs(
-    params: dict, *, enable_row_monitor: bool = False
+    params: dict,
+    *,
+    enable_row_monitor: bool = False,
+    enforce_eager: bool = True,
 ) -> tuple[list[int], list[int]]:
     from vllm import SamplingParams
 
-    llm = _build_llm(params, enable_row_monitor=enable_row_monitor)
+    extra: dict = {}
+    if enable_row_monitor:
+        extra["enable_row_monitor"] = True
+    llm = build_llm(
+        [{"name": "dynamic_steering_e2e_cfg", "params": params}],
+        extra=extra,
+        enforce_eager=enforce_eager,
+    )
     try:
         sp = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0, seed=0)
         outs = llm.generate([PROMPT, PROMPT], sp)
@@ -103,16 +83,36 @@ _BASE = {
 }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.skipif(
-    IS_LOCAL and not os.path.exists(MODEL),
-    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
+@requires_cuda
+@requires_model_path
+@requires_consumer_plugin("dynamic_steering_e2e_cfg")
+@pytest.mark.parametrize(
+    "enforce_eager",
+    [
+        pytest.param(True, id="eager"),
+        pytest.param(
+            False,
+            id="cudagraph",
+            marks=pytest.mark.xfail(
+                reason=(
+                    "fused-monitor row gate is inert under FULL cudagraph "
+                    "replay (gate OFF still applies the row). Kernel-level "
+                    "graph replay honors in-place monitor buffer flips, so "
+                    "the break is engine-level; never previously validated "
+                    "— see docs/design/dynamic_steering.md §9."
+                ),
+                strict=True,
+            ),
+        ),
+    ],
 )
-def test_row_gate_gates_per_request_row():
+def test_row_gate_gates_per_request_row(enforce_eager):
     """``gate_rows`` ON applies the target's row (early divergence); OFF
     suppresses it (target tracks the control to the noise floor)."""
-    on_a, on_b = _two_outputs({**_BASE, "mode": "rowgate", "gate_on": True})
-    on_diff = _common_prefix_len(on_a, on_b)
+    on_a, on_b = _two_outputs(
+        {**_BASE, "mode": "rowgate", "gate_on": True}, enforce_eager=enforce_eager
+    )
+    on_diff = common_prefix_len(on_a, on_b)
     print(f"[gate ON]  first_diff={on_diff} a={on_a}\n           b={on_b}")
     assert on_a != on_b, "gate ON steered neither/both — row never applied"
     assert 1 <= on_diff <= NOISE_FLOOR, (
@@ -120,8 +120,10 @@ def test_row_gate_gates_per_request_row():
         f"got {on_diff}"
     )
 
-    off_a, off_b = _two_outputs({**_BASE, "mode": "rowgate", "gate_on": False})
-    off_diff = _common_prefix_len(off_a, off_b)
+    off_a, off_b = _two_outputs(
+        {**_BASE, "mode": "rowgate", "gate_on": False}, enforce_eager=enforce_eager
+    )
+    off_diff = common_prefix_len(off_a, off_b)
     print(f"[gate OFF] first_diff={off_diff} a={off_a}\n           b={off_b}")
     assert off_diff > NOISE_FLOOR, (
         f"gate OFF: row not suppressed — target diverged at {off_diff} "
@@ -129,16 +131,14 @@ def test_row_gate_gates_per_request_row():
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.skipif(
-    IS_LOCAL and not os.path.exists(MODEL),
-    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
-)
+@requires_cuda
+@requires_model_path
+@requires_consumer_plugin("dynamic_steering_e2e_cfg")
 def test_req_id_scale_modulates_override_row():
     """``SteeringScaleUpdate(req_id=, scale=0)`` suppresses exactly the
     target's override row; the unscaled override run diverges early."""
     z_a, z_b = _two_outputs({**_BASE, "mode": "reqscale", "scale": 0.0})
-    z_diff = _common_prefix_len(z_a, z_b)
+    z_diff = common_prefix_len(z_a, z_b)
     print(f"[scale 0] first_diff={z_diff} a={z_a}\n          b={z_b}")
     assert z_diff > NOISE_FLOOR, (
         f"scale=0 did not suppress the row — target diverged at {z_diff} "
@@ -146,18 +146,16 @@ def test_req_id_scale_modulates_override_row():
     )
 
     o_a, o_b = _two_outputs({**_BASE, "mode": "override"})
-    o_diff = _common_prefix_len(o_a, o_b)
+    o_diff = common_prefix_len(o_a, o_b)
     print(f"[no scale] first_diff={o_diff} a={o_a}\n           b={o_b}")
     assert o_a != o_b and 1 <= o_diff <= NOISE_FLOOR, (
         f"unscaled override did not steer early: first_diff={o_diff}"
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.skipif(
-    IS_LOCAL and not os.path.exists(MODEL),
-    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
-)
+@requires_cuda
+@requires_model_path
+@requires_consumer_plugin("dynamic_steering_e2e_cfg")
 def test_per_row_monitor_gates_per_request_row():
     """The PER-ROW monitor (``SteeringMonitorUpdate(req_id=...)``,
     ``enable_row_monitor``) gates ONLY the target's override row by its own
@@ -168,7 +166,7 @@ def test_per_row_monitor_gates_per_request_row():
     on_a, on_b = _two_outputs(
         {**_BASE, "mode": "perrow", "gate_on": True}, enable_row_monitor=True
     )
-    on_diff = _common_prefix_len(on_a, on_b)
+    on_diff = common_prefix_len(on_a, on_b)
     print(f"[perrow ON]  first_diff={on_diff} a={on_a}\n             b={on_b}")
     assert on_a != on_b, "per-row gate ON steered neither/both — row never applied"
     assert 1 <= on_diff <= NOISE_FLOOR, (
@@ -179,7 +177,7 @@ def test_per_row_monitor_gates_per_request_row():
     off_a, off_b = _two_outputs(
         {**_BASE, "mode": "perrow", "gate_on": False}, enable_row_monitor=True
     )
-    off_diff = _common_prefix_len(off_a, off_b)
+    off_diff = common_prefix_len(off_a, off_b)
     print(f"[perrow OFF] first_diff={off_diff} a={off_a}\n             b={off_b}")
     assert off_diff > NOISE_FLOOR, (
         f"per-row gate OFF: row not suppressed — target diverged at "
