@@ -1286,19 +1286,20 @@ latched/bridged/evicted signal, and auto-registration of inline payloads
     suppressed (target tracks the control past the noise floor). Proves
     the in-graph monitor gates the **per-request row term**, not just the
     §5.4 tier, end to end.
-    **Known gap (2026-07-30, 3090)**: the `cudagraph` leg of this test
-    is `xfail` — with `enforce_eager=False` the gate-OFF case fails
-    (the row still applies; divergence at 3), i.e. the fused monitor is
-    inert under FULL cudagraph replay in the live engine. A kernel-level
-    experiment (capture `apply_steering` in a raw CUDA graph, flip
-    `mactive`/`mparams` in place, replay) proves replay *does* honor
-    the buffer flips, so the break is engine-level — somewhere between
-    the runner's monitor populate and the compiled graph's bound
-    buffers. The eager leg and the `[cudagraph]` leg of
-    `test_dynamic_steering_e2e` (override table path) both pass, so the
-    gap is specific to the fused-monitor buffers under compiled serving.
-    Until fixed, treat "monitor params host-tunable without recapture"
-    as eager-only.
+    **Resolved false alarm (2026-07-31)**: the `cudagraph` leg was
+    briefly `xfail`'d as "fused monitor inert under FULL replay"
+    (2026-07-30, 3090). Instrumented replication (gemma-4-12b GGUF,
+    layer 30) showed the mechanism is fully sound under FULL cudagraph:
+    populate lands `mactive`/`mparams`/decode-mask in the module
+    buffers, every capture-time kernel launch binds exactly those
+    buffers, decode steps replay FULL graphs, and gate OFF suppresses
+    the row (`first_diff=14`). The original "failure" was a test
+    artifact: on gemma-4-31B the compiled-kernel greedy path EOSes at
+    token 3, so both outputs were *identical* 3-token sequences and
+    `first_diff > NOISE_FLOOR` was unsatisfiable regardless of gating
+    (eager followed a longer near-tie path, masking the hazard). Fixed
+    by `ignore_eos=True` in the harness; monitor params remain
+    host-tunable without recapture in compiled serving.
     - **req_id scale** (`..::test_req_id_scale_*`, mode `reqscale`): an
     override row plus `SteeringScaleUpdate(req_id=, scale=0)` emitted in
     the same step (override first so the runner resolves the fresh
