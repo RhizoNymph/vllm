@@ -68,7 +68,14 @@ def _two_outputs(
         enforce_eager=enforce_eager,
     )
     try:
-        sp = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0, seed=0)
+        # ignore_eos: the suppressed-row assertions require first_diff >
+        # NOISE_FLOOR, which is unsatisfiable if the greedy generation ends
+        # before NOISE_FLOOR tokens (observed on gemma-4-31B under compiled
+        # kernels: both outputs EOS at token 3, indistinguishable from an
+        # early divergence). Forcing MAX_TOKENS keeps the full window.
+        sp = SamplingParams(
+            max_tokens=MAX_TOKENS, temperature=0.0, seed=0, ignore_eos=True
+        )
         outs = llm.generate([PROMPT, PROMPT], sp)
         return list(outs[0].outputs[0].token_ids), list(outs[1].outputs[0].token_ids)
     finally:
@@ -88,23 +95,7 @@ _BASE = {
 @requires_consumer_plugin("dynamic_steering_e2e_cfg")
 @pytest.mark.parametrize(
     "enforce_eager",
-    [
-        pytest.param(True, id="eager"),
-        pytest.param(
-            False,
-            id="cudagraph",
-            marks=pytest.mark.xfail(
-                reason=(
-                    "fused-monitor row gate is inert under FULL cudagraph "
-                    "replay (gate OFF still applies the row). Kernel-level "
-                    "graph replay honors in-place monitor buffer flips, so "
-                    "the break is engine-level; never previously validated "
-                    "— see docs/design/dynamic_steering.md §9."
-                ),
-                strict=True,
-            ),
-        ),
-    ],
+    [pytest.param(True, id="eager"), pytest.param(False, id="cudagraph")],
 )
 def test_row_gate_gates_per_request_row(enforce_eager):
     """``gate_rows`` ON applies the target's row (early divergence); OFF

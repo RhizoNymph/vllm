@@ -49,10 +49,10 @@ Notes:
   `gpu_memory_utilization=0.92`. Verified 2026-07-30 on a 24 GiB 3090:
   the combined invocation fails 10/11, the per-file loop passes.
 - `test_dynamic_steering_e2e.py` and the row-gate test in
-  `test_steering_gating_e2e.py` are parametrized `eager` / `cudagraph`.
-  The row-gate `cudagraph` leg is a strict `xfail`: the fused-monitor
-  row gate is inert under FULL cudagraph replay (engine-level, kernel
-  replay itself is clean) — see `docs/design/dynamic_steering.md` §9.
+  `test_steering_gating_e2e.py` are parametrized `eager` / `cudagraph`;
+  both legs pass. (The row-gate `cudagraph` leg was briefly `xfail`'d as
+  a fused-monitor gap; that was a short-generation test artifact, fixed
+  with `ignore_eos` — see `docs/design/dynamic_steering.md` §9.)
 - `test_async_steering_e2e.py` asserts a *divergence*; on gemma-4-31B set
   `DYNSTEER_E2E_STEER_NORM=200` (the default 24 cannot flip any greedy
   token on a model this size) and `DYNSTEER_E2E_LAYER=30`.
