@@ -180,9 +180,7 @@ class CaptureRunnerMixin:
                     extra_global_specs=tuple(
                         c.global_capture_spec() for _, c in self._sync_consumers
                     ),
-                    num_hidden_layers=(
-                        self.model_config.get_total_num_hidden_layers()
-                    ),
+                    num_hidden_layers=(self.model_config.get_total_num_hidden_layers()),
                     local_layer_range=self.model_config.get_layers_start_end_indices(
                         self.parallel_config
                     ),
@@ -303,6 +301,13 @@ class CaptureRunnerMixin:
 
     # ---- request lifecycle -------------------------------------------------
 
+    # Synthetic requests the kernel-warmup harness drives through the real
+    # step path at engine init (vllm/v1/worker/gpu/warmup.py). They must not
+    # reach capture consumers: their activations are garbage, and a consumer
+    # acting on them (e.g. a steering policy) mutates state before the first
+    # real request.
+    _WARMUP_REQ_PREFIXES = ("_warmup", "_v2_mixed_warmup")
+
     def _capture_add_request(
         self, new_req_data: NewRequestData, was_present: bool
     ) -> None:
@@ -330,6 +335,8 @@ class CaptureRunnerMixin:
         if not self._capture_feature_enabled:
             return
         req_id = new_req_data.req_id
+        if req_id.startswith(self._WARMUP_REQ_PREFIXES):
+            return
         # Stash the conversation id for the per-step view (host-side metadata,
         # survives the streaming re-add / preemption-resume branches below).
         rmeta = new_req_data.request_metadata
@@ -365,6 +372,8 @@ class CaptureRunnerMixin:
     def _capture_finish_request(self, req_id: str) -> None:
         """Drop a finished request from the gate and finalize its capture."""
         if not self._capture_feature_enabled:
+            return
+        if req_id.startswith(self._WARMUP_REQ_PREFIXES):
             return
         self._sync_conversation_ids.pop(req_id, None)
         self._sync_steering_gates.pop(req_id, None)

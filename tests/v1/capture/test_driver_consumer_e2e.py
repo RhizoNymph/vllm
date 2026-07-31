@@ -14,6 +14,7 @@ Run: ``pytest tests/v1/capture/test_driver_consumer_e2e.py -v``
 
 from __future__ import annotations
 
+import time
 from typing import Any, ClassVar, Literal
 
 import pytest
@@ -75,7 +76,23 @@ def test_llm_with_driver_capture_consumer(monkeypatch):
         )
         assert len(outputs) == 1
 
+        # A request's capture finalize is processed on a subsequent engine
+        # step; the in-process engine idles once generate() returns, so pump
+        # one throwaway generation to flush it. (Warmup traffic used to
+        # provide this pumping as a side effect — and its garbage captures
+        # satisfied this assertion — before warmup requests were excluded
+        # from the capture pipeline.)
+        llm.generate(["ping"], SamplingParams(max_tokens=1), use_tqdm=False)
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if consumer.captures:
+                break
+            time.sleep(0.2)
         assert len(consumer.captures) > 0
+        assert all(
+            not key[0].startswith("_warmup") for key, _t, _s in consumer.captures
+        ), "warmup requests must not reach capture consumers"
         for captured_key, tensor, _sidecar in consumer.captures:
             _request_id, layer, hook = captured_key
             assert layer == 0

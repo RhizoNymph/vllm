@@ -99,9 +99,7 @@ def _fs_request(request_id, tag, hooks, positions, layout=None):
 
 
 def _generate(llm, prompt_ids, capture, max_tokens=4):
-    sampling = SamplingParams(
-        max_tokens=max_tokens, temperature=0.0, capture=capture
-    )
+    sampling = SamplingParams(max_tokens=max_tokens, temperature=0.0, capture=capture)
     [output] = llm.generate(
         [{"prompt_token_ids": prompt_ids}], sampling, use_tqdm=False
     )
@@ -145,8 +143,11 @@ def test_per_file_layout_shapes_and_sidecars(fs_llm, fs_root):
     _generate(
         fs_llm,
         ids,
-        {"filesystem": _fs_request("perfile-req", "e2e", {"post_block": layers},
-                                   "all_prompt")},
+        {
+            "filesystem": _fs_request(
+                "perfile-req", "e2e", {"post_block": layers}, "all_prompt"
+            )
+        },
     )
 
     req_dir = fs_root / "e2e" / "perfile-req"
@@ -176,8 +177,11 @@ def test_all_generated_rows_span_decode_steps(fs_llm, fs_root):
     output = _generate(
         fs_llm,
         _prompt_ids(16),
-        {"filesystem": _fs_request("gen-req", "e2e", {"post_block": [1]},
-                                   "all_generated")},
+        {
+            "filesystem": _fs_request(
+                "gen-req", "e2e", {"post_block": [1]}, "all_generated"
+            )
+        },
         max_tokens=num_tokens,
     )
     assert len(output.outputs[0].token_ids) == num_tokens
@@ -197,9 +201,15 @@ def test_packed_layout_roundtrip(fs_llm, fs_root):
     _generate(
         fs_llm,
         ids,
-        {"filesystem": _fs_request("packed-req", "e2e",
-                                   {"post_block": layers, "pre_attn": [1]},
-                                   "all_prompt", layout="packed")},
+        {
+            "filesystem": _fs_request(
+                "packed-req",
+                "e2e",
+                {"post_block": layers, "pre_attn": [1]},
+                "all_prompt",
+                layout="packed",
+            )
+        },
     )
 
     req_dir = fs_root / "e2e" / "packed-req"
@@ -221,8 +231,11 @@ def test_capture_results_best_effort(fs_llm, fs_root):
     output = _generate(
         fs_llm,
         _prompt_ids(16),
-        {"filesystem": _fs_request("result-req", "e2e", {"post_block": [1]},
-                                   "last_prompt")},
+        {
+            "filesystem": _fs_request(
+                "result-req", "e2e", {"post_block": [1]}, "last_prompt"
+            )
+        },
     )
 
     bin_path = fs_root / "e2e" / "result-req" / "1_post_block.bin"
@@ -245,21 +258,21 @@ def test_post_block_matches_hf_hidden_states(fs_llm, fs_root):
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL)
-    ids = tok("The capital of France is Paris, and the capital of "
-              "Germany is").input_ids
+    ids = tok("The capital of France is Paris, and the capital of Germany is").input_ids
     _generate(
         fs_llm,
         ids,
-        {"filesystem": _fs_request("hfref-req", "e2e", {"post_block": [layer]},
-                                   "all_prompt")},
+        {
+            "filesystem": _fs_request(
+                "hfref-req", "e2e", {"post_block": [layer]}, "all_prompt"
+            )
+        },
         max_tokens=1,
     )
     bin_path = fs_root / "e2e" / "hfref-req" / f"{layer}_post_block.bin"
     _wait_for_files([bin_path, bin_path.with_suffix(".json")])
     entry = read_per_file(bin_path)
-    captured = (
-        torch.from_numpy(entry.array.copy()).view(torch.bfloat16).float()
-    )
+    captured = torch.from_numpy(entry.array.copy()).view(torch.bfloat16).float()
 
     from transformers import AutoModelForCausalLM
 
@@ -272,9 +285,7 @@ def test_post_block_matches_hf_hidden_states(fs_llm, fs_root):
         raise
     try:
         with torch.no_grad():
-            hf_out = hf_model(
-                torch.tensor([ids]), output_hidden_states=True
-            )
+            hf_out = hf_model(torch.tensor([ids]), output_hidden_states=True)
         reference = hf_out.hidden_states[layer + 1][0]
     finally:
         del hf_model
@@ -304,8 +315,11 @@ def test_prefix_cache_floor_all_prompt_reforwards(fs_llm, fs_root):
         _generate(
             fs_llm,
             ids,
-            {"filesystem": _fs_request(req_id, "floor", {"post_block": [1]},
-                                       positions)},
+            {
+                "filesystem": _fs_request(
+                    req_id, "floor", {"post_block": [1]}, positions
+                )
+            },
         )
         bin_path = fs_root / "floor" / req_id / "1_post_block.bin"
         _wait_for_files([bin_path, bin_path.with_suffix(".json")])
@@ -355,6 +369,16 @@ def test_logging_global_consumer_emits(monkeypatch):
         )
         assert len(output.outputs[0].token_ids) == 4
 
+        # Finalize is processed on a later engine step; pump a throwaway
+        # generation so the idle in-process engine flushes it (warmup
+        # traffic no longer reaches capture, so it can't pump — or emit —
+        # for us).
+        llm.generate(
+            [{"prompt_token_ids": _prompt_ids(8)}],
+            SamplingParams(max_tokens=1, temperature=0.0),
+            use_tqdm=False,
+        )
+
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             if any("capture key=" in r.getMessage() for r in records):
@@ -383,9 +407,7 @@ def test_overload_block_policy_no_loss(tmp_path):
             seed=0,
             capture_dispatch_queue_size=2,
             capture_overload_policy="block",
-            capture_consumers=[
-                {"name": "filesystem", "params": {"root": str(root)}}
-            ],
+            capture_consumers=[{"name": "filesystem", "params": {"root": str(root)}}],
         )
     except Exception as exc:
         _skip_on_model_access_failure(exc)
@@ -399,7 +421,9 @@ def test_overload_block_policy_no_loss(tmp_path):
                 temperature=0.0,
                 capture={
                     "filesystem": _fs_request(
-                        f"flood-{i}", "flood", {"post_block": "all"},
+                        f"flood-{i}",
+                        "flood",
+                        {"post_block": "all"},
                         "all_prompt",
                     )
                 },
