@@ -36,6 +36,13 @@ Two modes:
         matches the inline-clamp equivalent, unregister restores 400.
 
 Prints one PASS/FAIL line per check and exits non-zero on any FAIL.
+
+Pytest-collected counterparts (no hand-started server needed):
+``tests/models/language/generation/test_steering_clamps.py`` covers the
+engine-level behaviors above via the offline ``LLM`` path, and
+``tests/model_executor/layers/test_clamp_gpu.py`` covers ``--mode
+kernel``. This script remains the live-HTTP validation (checks 8-10
+exercise the real server surface).
 """
 
 from __future__ import annotations

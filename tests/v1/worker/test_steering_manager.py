@@ -1630,6 +1630,34 @@ class TestStackVectorsAsyncH2D:
             )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_ring_slots_survive_inference_mode_boundary(self):
+        """Slots lazily allocated on the step thread run inside
+        ``torch.inference_mode()``; a control-plane RPC (module register,
+        global set) later reuses them from outside that context. The
+        allocation must therefore never produce inference tensors, or the
+        RPC-side ``copy_`` raises "Inplace update to inference tensor
+        outside InferenceMode" — round-robin slot reuse made this fail
+        only every few calls."""
+        cuda_device = torch.device("cuda:0")
+        mgr = _make_manager(device=cuda_device)
+        n, hidden = 4, 128
+        ring_size = len(mgr._stack_pinned_ring)
+
+        with torch.inference_mode():
+            for _ in range(ring_size):
+                mgr._stack_vectors_to_device(
+                    [[1.0] * hidden for _ in range(n)]
+                )
+
+        for k in range(ring_size):
+            host = torch.full((n, hidden), float(k + 2), dtype=torch.float32)
+            out = mgr._stack_vectors_to_device(
+                [host[i].tolist() for i in range(n)]
+            )
+            torch.accelerator.synchronize()
+            assert torch.allclose(out.cpu(), host, atol=0, rtol=0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_call_returns_before_h2d_completes(self):
         """Microbench: call wall-time should be << time-to-content-ready.
 

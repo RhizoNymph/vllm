@@ -216,6 +216,47 @@ AUDIO_ASSETS = AudioTestAssets()
 
 
 @pytest.fixture(autouse=True)
+def restore_default_dtype():
+    """Keep ``torch.set_default_dtype`` from leaking between tests.
+
+    Several tests set a non-float32 default so their layers construct in that
+    dtype (e.g. ``test_gpu_model_runner.py`` uses float16 for flex-attn) and
+    never restore it. The default is process-global, so every later test in
+    the session then allocates tensors in the leaked dtype — which shows up
+    far away as ``index_copy_(): ... (self) Half and (source) Float`` in the
+    steering/patch/SAE suites, whose fake buffers are built without an
+    explicit ``dtype=``. Snapshot and restore around every test so ordering
+    cannot change results.
+    """
+    saved = torch.get_default_dtype()
+    yield
+    if torch.get_default_dtype() is not saved:
+        torch.set_default_dtype(saved)
+
+
+@pytest.fixture(autouse=True)
+def reset_active_capture_manager():
+    """Keep an installed capture manager from leaking between tests.
+
+    ``set_active_capture_manager`` writes a module-level global that gates
+    ``maybe_capture_residual``. A test that installs one and then fails (or
+    otherwise skips its cleanup) leaves the gate open for the rest of the
+    session, so every later test calling ``apply_layer_steering`` dispatches
+    into ``torch.ops.vllm.capture_residual`` — which is CUDA-only, and so
+    blows up with a confusing "Could not run 'vllm::capture_residual' with
+    arguments from the 'CPU' backend" in unrelated CPU-tensor unit tests.
+    """
+    yield
+    from vllm.model_executor.layers.activation_capture import (
+        get_active_capture_manager,
+        set_active_capture_manager,
+    )
+
+    if get_active_capture_manager() is not None:
+        set_active_capture_manager(None)
+
+
+@pytest.fixture(autouse=True)
 def init_test_http_connection():
     # pytest_asyncio may use a different event loop per test
     # so we need to make sure the async client is created anew

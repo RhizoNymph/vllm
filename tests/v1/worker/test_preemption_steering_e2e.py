@@ -42,14 +42,19 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+from tests.v1.worker.steering_e2e_utils import (  # isort: skip
+    NOISE_FLOOR,
+    build_llm,
+    common_prefix_len,
+    env_layer,
+    requires_consumer_plugin,
+    requires_cuda,
+    requires_model_path,
+)
 
 import pytest
-import torch
 
-MODEL = os.environ.get("DYNSTEER_E2E_MODEL", "google/gemma-4-E2B-it")
-LAYER = int(os.environ.get("DYNSTEER_E2E_LAYER", "8"))
-IS_LOCAL = MODEL.endswith(".gguf") or os.path.exists(MODEL)
+LAYER = env_layer(8)
 
 # Small KV budget (in blocks) forces preemption; override via env to tune the
 # pressure on a given card.
@@ -67,25 +72,13 @@ FILLERS = [
     "Give a thorough overview of how the TCP/IP networking stack",
 ]
 MAX_TOKENS = 160
-NOISE_FLOOR = 10
 
 
-def _common_prefix_len(a: list[int], b: list[int]) -> int:
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.skipif(
-    IS_LOCAL and not os.path.exists(MODEL),
-    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
-)
+@requires_cuda
+@requires_model_path
+@requires_consumer_plugin("dynamic_steering_e2e")
 def test_steering_survives_preemption_and_pool_drains():
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
 
     consumers = [
         {
@@ -98,28 +91,21 @@ def test_steering_survives_preemption_and_pool_drains():
             },
         }
     ]
-    kwargs = dict(
-        model=MODEL,
-        enable_steering=True,
-        max_dynamic_steering_configs=4,
-        enforce_eager=True,
-        gpu_memory_utilization=0.92,
-        max_model_len=512,
-        num_gpu_blocks_override=KV_BLOCKS,
-        enable_prefix_caching=False,
-        disable_log_stats=False,
-        seed=0,
-        capture_consumers=consumers,
-    )
-    if not IS_LOCAL:
-        kwargs["load_format"] = "dummy"
 
     # Prompt 0 = stub target (steered), prompt 1 = in-batch control; the rest
     # are long fillers that create the KV pressure. All generate MAX_TOKENS to
     # keep many sequences alive at once.
     prompts = [TARGET_PROMPT, TARGET_PROMPT, *FILLERS]
 
-    llm = LLM(**kwargs)
+    llm = build_llm(
+        consumers,
+        extra=dict(
+            max_model_len=512,
+            num_gpu_blocks_override=KV_BLOCKS,
+            enable_prefix_caching=False,
+            disable_log_stats=False,
+        ),
+    )
     try:
         sp = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0, seed=0)
         outs = llm.generate(prompts, sp)
@@ -145,7 +131,7 @@ def test_steering_survives_preemption_and_pool_drains():
     # 3) Steering stayed in effect through the pressure: the stub-targeted
     # request (0) diverges early from the in-batch control (1).
     target, control = token_ids[0], token_ids[1]
-    diff = _common_prefix_len(target, control)
+    diff = common_prefix_len(target, control)
     print(
         f"steered first_diff={diff}\n  target ={target[:12]}"
         f"\n  control={control[:12]}"

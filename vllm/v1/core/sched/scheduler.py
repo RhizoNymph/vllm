@@ -450,11 +450,21 @@ class Scheduler(SchedulerInterface):
             return True
         if sp.steering_vectors:
             return True
+        # Clamps occupy an additive row too (the worker writes them into the
+        # same row as the vectors), so a clamp-only request must reserve one.
+        # Without this it reserves nothing and can push the worker past
+        # max_steering_configs, which raises "No free steering table rows".
         if phase == "prefill":
             return bool(
-                sp.prefill_steering_vectors or sp._effective_prefill_steering_packed
+                sp.prefill_steering_vectors
+                or sp._effective_prefill_steering_packed
+                or sp.effective_prefill_clamps
             )
-        return bool(sp.decode_steering_vectors or sp._effective_decode_steering_packed)
+        return bool(
+            sp.decode_steering_vectors
+            or sp._effective_decode_steering_packed
+            or sp.effective_decode_clamps
+        )
 
     def _request_steering_config_pairs(
         self,

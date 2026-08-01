@@ -728,6 +728,28 @@ and [Backpressure & overload](#backpressure--overload).
   surface as `partial_error` / `error` on the corresponding
   `CaptureResult`; text generation always completes.
 
+## Test Anchors
+
+- Real-engine e2e (GPU, real weights; `CAPTURE_E2E_MODEL` overrides the
+  default `Qwen/Qwen3-0.6B`): `tests/v1/capture/test_capture_engine_e2e.py`
+  — filesystem consumer file layouts/shapes/dtypes from a live forward,
+  `capture_results` round-trip, hook placement vs. a HuggingFace
+  reference, the prefix-cache capture floor, a global-spec (`logging`)
+  consumer, and the `block` overload policy.
+- Driver-location consumer e2e (GPU, in-process engine):
+  `tests/v1/capture/test_driver_consumer_e2e.py`.
+- Entry-point plugin loading (CPU, un-mocked; needs
+  `uv pip install -e tests/plugins/vllm_add_dummy_capture_consumer`):
+  `tests/plugins_tests/test_capture_consumer_plugins.py`.
+- Live-server e2e (GPU, `vllm serve`): the served path (`capture` +
+  `capture_wait` on `/v1/completions`, the filesystem consumer's
+  on-disk output, and admission 400s) is exercised by the collected,
+  CUDA-gated suite in
+  `tests/entrypoints/serve/e2e/test_server_capture_e2e.py`.
+- Unit / integration tier: `tests/v1/capture/` (admission, manager,
+  dispatch, overload, store, registry, step gate, prefix-cache gating)
+  and `tests/v1/capture/consumers/filesystem/` (writer/reader/layouts).
+
 ## Writing a Consumer Plugin
 
 Third-party consumers ship as separate Python packages. See
