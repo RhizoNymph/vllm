@@ -40,7 +40,7 @@ from vllm.v1.capture.types import (
 # ---------------------------------------------------------------------------
 
 
-def _key(req_id: str = "req-1", layer: int = 3, hook: str = "post_mlp") -> CaptureKey:
+def _key(req_id: str = "req-1", layer: int = 3, hook: str = "post_block") -> CaptureKey:
     return (VllmInternalRequestId(req_id), layer, hook)
 
 
@@ -158,7 +158,7 @@ def test_multiple_keys_finalize_independently():
     shim = _DriverQueueShim(event_q, result_q, timeout=5.0)
 
     key_a = _key("req-a", layer=1, hook="pre_attn")
-    key_b = _key("req-b", layer=5, hook="post_mlp")
+    key_b = _key("req-b", layer=5, hook="post_block")
 
     shim.submit_chunk(
         CaptureChunk(

@@ -66,7 +66,7 @@ class TestCapturePositionEntry:
         entry = CapturePositionEntry(
             request_id="r1",
             layer=0,
-            hook="post_mlp",
+            hook="post_block",
             logical_pos=9,
             scratch_row=0,
             step_index=0,
@@ -79,7 +79,7 @@ class TestCapturePositionEntry:
         entry = CapturePositionEntry(
             request_id="r1",
             layer=0,
-            hook="post_mlp",
+            hook="post_block",
             logical_pos=9,
             scratch_row=0,
             step_index=0,
@@ -111,7 +111,7 @@ class TestCapturePositionEntry:
         entry = CapturePositionEntry(
             request_id="r1",
             layer=0,
-            hook="post_mlp",
+            hook="post_block",
             logical_pos=0,
             scratch_row=0,
             step_index=0,
@@ -131,14 +131,14 @@ class TestStepCapturePlan:
         indices = torch.tensor([0, 3, 7], dtype=torch.int64)
         scratch = torch.empty((3, 16), dtype=torch.float32)
         plan = StepCapturePlan(
-            gather_indices={(0, "post_mlp"): indices},
-            scratch_gpu={(0, "post_mlp"): scratch},
-            scratch_dtype={(0, "post_mlp"): torch.float32},
+            gather_indices={(0, "post_block"): indices},
+            scratch_gpu={(0, "post_block"): scratch},
+            scratch_dtype={(0, "post_block"): torch.float32},
             entries=[],
         )
-        assert plan.gather_indices[(0, "post_mlp")].dtype == torch.int64
-        assert plan.gather_indices[(0, "post_mlp")].shape == (3,)
-        assert plan.scratch_gpu[(0, "post_mlp")].shape == (3, 16)
+        assert plan.gather_indices[(0, "post_block")].dtype == torch.int64
+        assert plan.gather_indices[(0, "post_block")].shape == (3,)
+        assert plan.scratch_gpu[(0, "post_block")].shape == (3, 16)
 
     def test_empty_plan(self):
         plan = StepCapturePlan(
@@ -155,23 +155,23 @@ class TestStepCapturePlan:
         plan = StepCapturePlan(
             gather_indices={
                 (0, "pre_attn"): torch.tensor([0], dtype=torch.int64),
-                (0, "post_mlp"): torch.tensor([0, 1], dtype=torch.int64),
-                (1, "post_mlp"): torch.tensor([2], dtype=torch.int64),
+                (0, "post_block"): torch.tensor([0, 1], dtype=torch.int64),
+                (1, "post_block"): torch.tensor([2], dtype=torch.int64),
             },
             scratch_gpu={
                 (0, "pre_attn"): torch.empty((1, 8)),
-                (0, "post_mlp"): torch.empty((2, 8)),
-                (1, "post_mlp"): torch.empty((1, 8)),
+                (0, "post_block"): torch.empty((2, 8)),
+                (1, "post_block"): torch.empty((1, 8)),
             },
             scratch_dtype={
                 (0, "pre_attn"): torch.float32,
-                (0, "post_mlp"): torch.float32,
-                (1, "post_mlp"): torch.float32,
+                (0, "post_block"): torch.float32,
+                (1, "post_block"): torch.float32,
             },
             entries=[],
         )
         assert len(plan.gather_indices) == 3
-        assert plan.scratch_gpu[(0, "post_mlp")].shape[0] == 2
+        assert plan.scratch_gpu[(0, "post_block")].shape[0] == 2
 
     def test_request_errors_default_empty(self):
         plan = StepCapturePlan(

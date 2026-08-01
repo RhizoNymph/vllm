@@ -107,10 +107,18 @@ Each steerable layer owns a steering table per hook point. Conceptually:
 
 | Row | Meaning |
 | --- | --- |
-| 0 | no steering |
+| 0 | no steering (sentinel, always zeros) |
 | 1 | global effective prefill |
 | 2 | global effective decode |
-| 3+ | per-request rows |
+| `3 .. 3+C-1` | scheduler-admitted per-request config pool (`max_steering_configs`) |
+| `3+C .. 3+C+D-1` | dynamic-override pool (`max_dynamic_steering_configs`, runtime-allocated) |
+
+This row space is defined once, in
+`vllm/model_executor/layers/steering_table_layout.py` (`TableLayout`), and
+every buffer family that rides it — vector tables, per-row scales, row-monitor
+tables, clamp dirs/bounds/strength — must be sized congruently: kernels gather
+through the shared `steering_index`, so a mismatch fails as silent garbage
+rather than an error.
 
 All layers share the same token-to-row index for a step. Different hook
 points reuse the same row mapping but look up different per-hook tables.
@@ -120,27 +128,159 @@ per-token bookkeeping cost.
 
 ### Per-hook table width
 
-A hook point's table is `(max_configs + 3, width)`. Standard decoder
-layers register exactly the three single-stream hooks (`pre_attn`,
-`post_attn`, `post_mlp`), all `width = hidden_size`. mHC models
-(DeepSeek-V4) instead pass an explicit `hook_widths` map to
+A hook point's table is `(NUM_RESERVED_ROWS + max_configs, width)`. Standard
+decoder layers register exactly the `STANDARD_STEERING_HOOKS` (`pre_attn`,
+`post_attn`, `post_block`, `mlp_in`, `mlp_out`), all `width = hidden_size`.
+mHC models (DeepSeek-V4) instead pass an explicit `hook_widths` map to
 `register_steering_buffers`, registering single-stream sublayer hooks at
 `hidden_size` and multi-stream residual hooks at `hc_mult * hidden_size`
 on the same layer.
 
+`hook_widths` governs *every* buffer family at a hook, not just the vector
+table: the dynamic-tier vector, the global and per-row monitor probes, the
+patch table/alpha, and the clamp dirs are all registered at the hook's own
+width, so an mHC stream hook supports the full intervention stack in the
+`hc_mult * hidden` stream space. Note the memory consequence — clamp dirs
+are `(rows, K, width)` per hook per layer, so the multi-stream hooks cost
+`hc_mult x` a single-stream hook.
+
 The apply path stays uniform: `apply_layer_steering_streams` flattens a
-`(tokens, hc_mult, hidden)` residual to 2-D, runs the same indexed
-`apply_steering` gather/add (the kernel's hidden dim is a runtime arg), and
-reshapes back. The per-token row index, the row layout, and the
-`any_active` short-circuit are all width-agnostic. `SteeringManager`'s
-table population groups active tables by `(width, dtype)` so each width is
-stacked and cast in one launch — a single group in the non-mHC case.
+`(tokens, hc_mult, hidden)` residual to 2-D, runs the same
+capture → patch → steer → sae → clamp pipeline as `apply_layer_steering`
+(every op's hidden dim is a runtime arg), and reshapes back. The per-token
+row index, the row layout, and the `any_active` short-circuit are all
+width-agnostic. `SteeringManager`'s table population groups active tables
+by `(width, dtype)` so each width is stacked and cast in one launch — a
+single group in the non-mHC case. Kernel warmup likewise iterates the
+distinct registered widths.
 
 Because a multi-stream row is just the per-stream vectors concatenated,
 the wire format (`(num_layers, width)` packed blob; `SamplingParams`
 list-of-floats) needs no change: the row is simply `hc_mult * hidden` long.
 `mhc_streams_final` is model-level — it is registered only on the last
 decoder layer and keyed to that layer's index.
+
+## Directional Clamps
+
+Clamping is a third intervention methodology (alongside additive steering
+and patch/replace) that constrains the hidden state's scalar projection
+along up to K unit directions per steering row:
+
+```text
+p     = h · v̂                       # fp32 accumulate
+delta = strength · (clip(p, lo, hi) − p)
+h'    = h + delta · v̂               # orthogonal complement untouched
+```
+
+`lo == hi` pins a feature, `lo == hi == 0` is directional ablation,
+one-sided bounds suppress only over/under-expression. It is the first
+*state-dependent* intervention: the delta depends on `h` itself, so a
+token already in bounds is untouched.
+
+Runtime design decisions:
+
+- **Clamps ride the steering row machinery.** They are part of a request's
+  steering config identity: folded into the prefill/decode config hashes
+  (behind a domain separator; vector-only hashes are bit-for-bit
+  unchanged), so scheduler admission, row allocation, refcounting, and
+  prefix-cache keys all work unchanged. A clamp-only request has a nonzero
+  hash and registers a (possibly vector-empty) manager row.
+- **Per-layer per-hook buffers**, row-congruent with the steering tables
+  and gathered via the shared `steering_index`:
+  `steering_clamp_dirs_{hook}` `(rows, K, hidden)` in model dtype (row 0 is
+  the all-zero no-op sentinel), `steering_clamp_bounds_{hook}`
+  `(rows, K, 2)` fp32 (default `[-inf, +inf]`),
+  `steering_clamp_strength_{hook}` `(rows, K)` fp32, plus a per-hook
+  `any_active` flag. `K = steering_config.max_clamp_directions` (part of
+  `compute_hash`; 0 disables clamping and no buffers attach).
+- **Row composition is concatenation, not addition** — clamps are
+  independent constraints. Row 1 = concat(global base, global prefill);
+  row 2 = concat(global base, global decode); config rows =
+  concat(global base, global phase, per-request), capped at K with a loud
+  error naming the site; dynamic-override rows =
+  concat(global base, global decode, that override's own clamps) — a live
+  override can carry per-override bounds so a closed-loop controller
+  tightens/loosens them mid-decode without free-list churn. The K-cap
+  error names the offending `(hook, layer)` site and the row owner
+  (`dynamic id=…` for override rows). A re-emit that changes only the
+  override's vectors keeps its clamps (`clamps=None`); an empty spec
+  (`clamps={}`) clears them.
+- **Two custom ops**, `apply_clamp` and `apply_clamp_block`
+  (non-mutating, fresh output — cudagraph-safe; Triton on CUDA, eager
+  reference on CPU). The `post_block` variant reconstructs the true block
+  output `residual + hidden` and folds the correction into `residual`,
+  because clamping (like replace) does not commute through the deferred
+  MLP add.
+- **Emission order** at every hook: capture → patch → steer (add) →
+  **clamp last**, so the additive term cannot push the projection back
+  out of bounds. Emission is a `hasattr` static branch — servers without
+  clamping trace no clamp ops.
+- **Directions are unit-normalized at ingestion**
+  (`SamplingParams.__post_init__`, which msgspec runs on decode, so one
+  seam covers the Python HTTP, offline LLM, and Rust msgpack paths).
+  Bounds live in unit-projection space.
+- Named modules may carry a clamps tier (concatenated before inline
+  entries at worker resolution; the module-level scale does NOT apply to
+  clamps). Global clamps ride `/v1/steering/set` (`clamps` /
+  `prefill_clamps` / `decode_clamps`) and share its prefix-cache reset.
+- **Canonical clamp type + accepted input shapes.** Post-ingestion every
+  clamp tier is one canonical msgspec Struct, `SteeringClamps`
+  (`{hook: ClampHookTable}`; each table = raw float64 LE rows as `bytes` +
+  `layer_indices`/`lo`/`hi`/`strength` lists, true `±inf` bounds). Clients
+  may submit either the JSON entry-list shape or the legacy base64-packed
+  shape (`ClampHookPacked`: `{dtype, shape:[n,hidden], layer_indices:[n],
+  data:<base64>, bounds:[[lo,hi]×n], strengths:[n]}`, `null` = `±inf`);
+  `SteeringClamps.from_obj` is the single decoder at every boundary
+  (SamplingParams `__post_init__`, global set, module register, dynamic
+  overrides, worker RPC receivers) and fully validates rows at ingestion.
+  The canonical Struct itself rides the APIServer→EngineCore hop (msgpack
+  map, row data as native `bin` — no base64, no repack), so the strict
+  engine-side decoder accepts exactly what the API server sends;
+  `forbid_unknown_fields` makes any legacy verbatim dict fail decode
+  loudly rather than silently dropping clamps. collective_rpc's type-less
+  decode flattens the Struct to its plain wire map (bytes preserved);
+  receivers revive via `from_obj`. The gRPC path (`ClampHookPacked`
+  proto) still converts to the packed-JSON input shape in
+  `grpc/convert.rs`. **Hash invariant:** rows are stored as submitted and
+  unit-normalized (float64) only at the consumption boundaries (config
+  hash, worker materialization), so packed and JSON submissions of the
+  same logical config produce bit-identical prefill/decode hashes.
+- **Materialized (`enable_cross_layer_monitor = true`)** — the standalone
+  mutating `steering_monitor` op writes the per-token gate into the shared
+  `steering_row_gate` buffer at the probe layer L, and every layer ≥ L reads
+  it ("detect at L, clamp at layers ≥ L"). The runner stamps each hook's
+  clamp `gate_active` flag `True` once at steering init, so clamps at those
+  layers honor the same materialized gate the additive term honors. This is
+  the only mode in which anything can modulate clamps — and the writer is
+  the **global** monitor (installed untargeted, with `gate_rows`); the
+  mutating op has no per-row form.
+- **Fused (default)** — the gate is recomputed inside the `apply_steering`
+  kernel and folded into the additive row term in registers, never written
+  to the shared buffer. Clamps are a separate op and cannot see it, so
+  `gate_active` stays `False` and clamps run ungated. The fused probe
+  machinery is deliberately NOT duplicated into the clamp kernel.
+
+**Per-request clamp gates are rejected outright** (`ClampApply` in
+`vllm/v1/steering_schema.py` is a forward-compat wire member only). The
+per-row (per-request) monitor is itself fused — non-mutating, same-hook,
+gating the additive row term in registers — so a per-request probe can
+never materialize gate values into `steering_row_gate` for the clamp op to
+read. Accepting a per-request clamp gate would therefore either silently do
+nothing (no global monitor installed) or silently follow the global
+monitor's probe instead of the declared one. `_validate_gate_semantics`
+rejects it unconditionally at the frontend (HTTP 400, both engine modes;
+`validate_clamp_gate_support` carries the mode-tailored messages), and the
+declarative consumer skip-and-warns once as the backstop for non-frontend
+producers. When a materializing per-row monitor lands, acceptance can be
+enabled in `validate_clamp_gate_support` without a wire change.
+
+Because `row_gate` is per-**token**, the materialized global gate modulates
+each token's row — per-request rows 3+ and, for tokens mapped to the global
+rows 1/2, those too — uniformly under one global probe condition.
+Declarative gate specs do not participate in `hash_steering_config` (they
+ride `RequestMetadata`, not the config-row identity), and monitor state is
+runtime state outside any config hash, so gated clamps do not change the
+clamp hash segment — identical to how gated additive steering behaves.
 
 ## Phase Semantics
 
@@ -267,12 +407,20 @@ coefficients remain capture-only.
 The extension work is model-specific, but the runtime invariants above do not
 change.
 
-## Current Boundaries
+## Scope Boundaries
 
-This design document reflects the v1 steering runtime. Known boundaries:
+This document describes the runner-agnostic steering runtime. What lives
+elsewhere:
 
-- no v2 model runner integration yet (v2 is dev-flag-gated in vllm; steering
-  integration is pending)
+- The control plane is shared by both GPU model runners
+  (`SteeringModelRunnerMixin`); each runner supplies only thin batch-state
+  accessors. See
+  [Steering + Capture on the V2 Model Runner](v2_runner_steering_capture.md)
+  for the v2 specifics and its validation matrix.
+- Activation-conditioned (dynamic) steering — the runtime tiers that mutate
+  steering state between steps, the dynamic-override row pool, and the
+  in-graph monitor — is specified separately in
+  [Dynamic Steering](dynamic_steering.md).
 - see [Activation Steering](../features/steering.md#supported-scope) for the
   current list of wired decoder architectures
 

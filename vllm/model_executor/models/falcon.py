@@ -384,7 +384,7 @@ class FalconDecoderLayer(nn.Module):
                 mlp_output += mlp_bias
 
         output = mlp_output + residual
-        output = apply_layer_steering(self, output, SteeringHookPoint.POST_MLP)
+        output = apply_layer_steering(self, output, SteeringHookPoint.POST_BLOCK)
         return output
 
 

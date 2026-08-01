@@ -40,19 +40,113 @@ Supports phase-aware (prefill vs decode) steering with separate global
 effective vectors for each phase.
 """
 
+import hashlib
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 import torch
 
+from vllm.config.steering_types import (
+    SteeringClamps,
+    _clamp_unit_rows,
+    hash_steering_config,
+)
 from vllm.logger import init_logger
+from vllm.model_executor.layers.clamp import (
+    CLAMP_ANY_ACTIVE_ATTR,
+    CLAMP_BOUNDS_ATTR,
+    CLAMP_DIRS_ATTR,
+    CLAMP_STRENGTH_ATTR,
+)
 from vllm.model_executor.layers.steering import (
+    _ROW_MONITOR_DEFAULT_PARAMS,
     HOOK_POINT_ANY_ACTIVE_ATTR,
+    HOOK_POINT_DYNVEC_ATTR,
+    HOOK_POINT_MONITOR_ACTIVE_ATTR,
+    HOOK_POINT_MONITOR_PARAMS_ATTR,
+    HOOK_POINT_MONITOR_PROBE_ATTR,
+    HOOK_POINT_ROW_ACTIVE_ATTR,
+    HOOK_POINT_ROW_PARAMS_ATTR,
+    HOOK_POINT_ROW_PROBE_ATTR,
     HOOK_POINT_TABLE_ATTR,
     SteeringHookPoint,
 )
+from vllm.model_executor.layers.steering_table_layout import (
+    NUM_RESERVED_ROWS,
+    TableLayout,
+    global_row_for_phase,
+)
+from vllm.v1.worker.phase_tiers import PhaseTiers
+from vllm.v1.worker.steering_owner import OwnerStore, RowOwner
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _DirtyState:
+    """Populate-scheduling flags with the implication rules encoded in code.
+
+    Three orthogonal reasons a populate is owed, with the invariants that used
+    to live in scattered comments made explicit:
+
+    * ``content`` (was ``_tables_dirty``): the per-layer table buffers need a
+      full recompose + H2D.
+    * ``membership`` (was ``_indices_dirty``): the row set changed, so the
+      cached ``indices`` / ordered-config scratch must be rebuilt. Membership
+      always implies content (a new/dropped row must be written), so
+      :meth:`mark_membership` sets both.
+    * ``scales`` (was ``_scales_dirty``): only the cheap per-row scale buffers
+      need rewriting.
+
+    A full table populate clears all three (it writes scales alongside the
+    tables); the cheap scales-only path is eligible only when scales are dirty
+    and neither content nor membership is (:attr:`scales_only_eligible`).
+    """
+
+    content: bool = True
+    membership: bool = True
+    scales: bool = True
+
+    def mark_content(self) -> None:
+        """A content mutator ran: a full table populate is owed."""
+        self.content = True
+
+    def mark_membership(self) -> None:
+        """The row set changed: rebuild indices scratch (implies content)."""
+        self.membership = True
+        self.content = True
+
+    def mark_scales(self) -> None:
+        """A scale mutator ran: the cheap scale-buffer write is owed."""
+        self.scales = True
+
+    def clear_after_full_populate(self) -> None:
+        """A full ``populate_steering_tables`` brought every buffer in sync."""
+        self.content = False
+        self.membership = False
+        self.scales = False
+
+    @property
+    def scales_only_eligible(self) -> bool:
+        """True when only scales are dirty (the cheap populate path applies)."""
+        return self.scales and not (self.content or self.membership)
+
+
+class ClampSitePayload(NamedTuple):
+    """Materialized clamp entries for one (hook, layer) site.
+
+    ``dirs`` is ``(k, hidden)`` fp32 on the manager's device (unit rows);
+    ``bounds`` is ``(k, 2)`` fp32 CPU ``[lo, hi]``; ``strength`` is ``(k,)``
+    fp32 CPU.  ``bounds``/``strength`` stay host-side — they are tiny and
+    are shipped as part of the per-site matrix build at populate time, so
+    materialization never pays a synchronous H2D for them.
+    """
+
+    dirs: torch.Tensor
+    bounds: torch.Tensor
+    strength: torch.Tensor
 
 
 class SteeringManager:
@@ -66,17 +160,28 @@ class SteeringManager:
     Table layout (per hook point):
         Row 0: zeros sentinel (no steering)
         Row 1: global prefill effective (global_base + global_prefill)
-        Row 2: global decode effective (global_base + global_decode)
+        Row 2: global decode effective (global_base + global_decode).
         Rows 3..max_steering_configs+2: phase-appropriate global
             + per_request combined
+        Rows max_steering_configs+3..+2+max_dynamic_steering_configs:
+            dynamic-override pool — runtime-registered decode rows
+            (global decode effective + override vectors), allocated by
+            dynamic steering and never by request admission. The two
+            pools share nothing: dynamic registrations can never
+            exhaust rows the scheduler reserved for admitted requests.
+            See docs/design/dynamic_steering.md §5.2.
     """
 
     def __init__(
         self,
         max_steering_configs: int,
         device: torch.device | None = None,
+        max_dynamic_steering_configs: int = 0,
+        max_clamp_directions: int = 0,
     ):
         self.max_steering_configs = max_steering_configs
+        self.max_dynamic_steering_configs = max_dynamic_steering_configs
+        self.max_clamp_directions = max_clamp_directions
         self.device = device
         # (config_hash, phase) -> assigned table row index (3-based)
         self.config_to_row: dict[tuple[int, str], int] = {}
@@ -87,25 +192,145 @@ class SteeringManager:
         ] = {}
         # (config_hash, phase) -> number of active requests using this config
         self.config_refcounts: dict[tuple[int, str], int] = defaultdict(int)
-        # Available row indices (rows 3 through max_steering_configs + 2)
-        # Reversed so pop() gives lowest
-        self.free_rows: list[int] = list(range(max_steering_configs + 2, 2, -1))
+        # SAE clamp state is folded into the *logical* request hash
+        # (``config_hash``) so prefix-cache keys stay isolated, but the
+        # physical additive table row only depends on the additive vector
+        # content (``content_hash``, the additive-only identity the scheduler
+        # uses for capacity accounting).  Multiple logical hashes may therefore
+        # alias one physical row.  These maps track that logical->physical
+        # indirection; when ``content_hash`` is not supplied it defaults to
+        # ``config_hash`` so non-SAE callers keep the historical 1:1 mapping
+        # (and theirs' per-row scale/monitor identity) unchanged.
+        self._config_to_content: dict[tuple[int, str], tuple[int, str]] = {}
+        self._content_to_row: dict[tuple[int, str], int] = {}
+        self._content_vectors: dict[
+            tuple[int, str], dict[str, dict[int, torch.Tensor]]
+        ] = {}
+        self._content_refcounts: dict[tuple[int, str], int] = defaultdict(int)
+        self._layout = TableLayout(
+            num_configs=max_steering_configs,
+            num_dynamic=max_dynamic_steering_configs,
+        )
+        # Available static-pool rows, reversed so pop() gives lowest.
+        self.free_rows: list[int] = list(reversed(self._layout.config_rows))
+
+        # Dynamic-override pool (rows above the static pool). Allocated
+        # and released only by the dynamic steering path; deterministic
+        # monotonically increasing ids keep ranks in lock-step because
+        # the register/release call sequence is identical on every rank
+        # (rank-replicated sync consumers). Ids are never reused.
+        self._dynamic_free_rows: list[int] = list(reversed(self._layout.dynamic_rows))
+        # dyn_id -> {hook_point_str: {layer_idx: tensor}} (override
+        # vectors only, not combined). Insertion-ordered.
+        self._dynamic_vectors: dict[int, dict[str, dict[int, torch.Tensor]]] = {}
+        self._dynamic_to_row: dict[int, int] = {}
+        self._next_dynamic_id: int = 1
 
         # Global vectors split into three tiers:
         #   base:    both-phases vectors (from global API)
         #   prefill: prefill-specific global vectors
         #   decode:  decode-specific global vectors
-        self.global_base_vectors: dict[str, dict[int, torch.Tensor]] = {}
-        self.global_prefill_vectors: dict[str, dict[int, torch.Tensor]] = {}
-        self.global_decode_vectors: dict[str, dict[int, torch.Tensor]] = {}
+        # Exposed per-tier via the ``global_*_vectors`` properties (their
+        # names are read by the mixin and asserted on by tests).
+        self._global_vectors: PhaseTiers[dict[str, dict[int, torch.Tensor]]] = (
+            PhaseTiers(base={}, prefill={}, decode={}, label="global vector")
+        )
 
-        # When True, populate_steering_tables() needs to run to bring the
-        # per-layer table buffers in sync with current state. Set by every
-        # state mutator (register_config new-row path, release_config
-        # refcount->0 path, update_global_vectors, clear_global_vectors);
-        # cleared at the end of populate_steering_tables. Initialized True
-        # so the first populate call always runs.
-        self._tables_dirty: bool = True
+        # Directional-clamp state (mirrors the vector tiers). Per-config
+        # payloads parallel ``config_vectors``; global clamps parallel the
+        # three global tiers. Row composition at populate is CONCATENATION
+        # (independent constraints), not addition: a config row carries
+        # ``concat(global base, global phase, per-request)`` capped at K.
+        self.config_clamps: dict[
+            tuple[int, str], dict[str, dict[int, ClampSitePayload]]
+        ] = {}
+        self._global_clamps: PhaseTiers[dict[str, dict[int, ClampSitePayload]]] = (
+            PhaseTiers(base={}, prefill={}, decode={}, label="global clamp")
+        )
+
+        # Per-dynamic-override clamps (parallel to ``_dynamic_vectors``):
+        # dyn_id -> {hook: {layer: ClampSitePayload}}. A dynamic-override row
+        # composes ``concat(global base, global decode, override)`` at
+        # populate (see :meth:`_build_clamp_site_rows`), so a controller can
+        # carry per-override bounds on top of the inherited global-decode
+        # clamps. ``_dynamic_clamp_specs`` keeps the RAW (unfiltered) spec so
+        # the rank-identical APC decode signature (``_dynamic_sig``) can fold
+        # clamps in even on a keep-update (materialized payloads are
+        # PP-filtered and would diverge; the raw spec never does).
+        self._dynamic_clamps: dict[int, dict[str, dict[int, ClampSitePayload]]] = {}
+        self._dynamic_clamp_specs: dict[int, SteeringClamps] = {}
+
+        # Dynamic additive tier (decode-only): a global steering
+        # contribution owned by dynamic consumers, held in a dedicated
+        # per-hook vector and added by the kernel rather than overwriting
+        # ``global_decode_vectors``. This is what lets dynamic
+        # global steering compose with operator-set (``/v1/steering/set``)
+        # decode steering instead of clobbering it. Decode-only by
+        # construction (§7): ``steering_token_scales`` is zero for prefill,
+        # so the tier never reaches prefill tokens or prefix-cache keys.
+        # See docs/design/dynamic_steering.md §5.4.
+        self.dynamic_tier_vectors: dict[str, dict[int, torch.Tensor]] = {}
+        # Scalar strength for the dedicated dynamic tier (§5.4). The runner
+        # folds it into the per-token gate (``steering_token_scales``) each
+        # step, so changing it is free (no buffer rewrite of its own).
+        self.dynamic_tier_gain: float = 1.0
+
+        # In-graph monitor configs (Phase 2, §8), keyed hook -> layer ->
+        # {"probe": fp32 (hidden,) tensor, "threshold": float,
+        # "sharpness": float}. At a probe site the runner's flat decode
+        # gain in ``steering_token_scales`` is modulated per token by
+        # ``sigmoid(sharpness*(residual@probe - threshold))``, conditioning
+        # the §5.4 dynamic tier at this and later hooks/layers within the
+        # same forward. Written into the per-layer monitor buffers at
+        # populate time (gated by ``_tables_dirty``); policy params then
+        # live in the persistent buffers, host-tunable without recapture.
+        self.monitor_configs: dict[str, dict[int, dict]] = {}
+
+        # PER-ROW (per-request) in-graph monitor configs. Keyed
+        # hook -> layer -> RowOwner -> {"probe", "threshold", "sharpness"},
+        # where the :class:`RowOwner` is the LOGICAL row owner so configs
+        # survive row reassignment (like ``_row_scales``):
+        #   RowOwner.global_("decode")       -> row 2 (global decode)
+        #   RowOwner.config(hash, "decode")  -> a static decode config row
+        #   RowOwner.dyn(dyn_id)             -> a dynamic-override row
+        # Unlike ``monitor_configs`` (one global probe per site), each row is
+        # gated by ITS OWN probe, so concurrent requests at a site can carry
+        # different probes. Written into the per-row probe-table buffers at
+        # populate; gates the row term only, decode-only. Opt-in via
+        # ``enable_row_monitor`` (else the buffers stay dummy and this is
+        # never activated). See docs/design/dynamic_steering.md.
+        self._row_monitor: dict[str, dict[int, dict[RowOwner, dict]]] = {}
+        # Lazy per-owner signature cache for APC (None ⇒ stale, rebuild).
+        self._row_monitor_sig_cache: dict[RowOwner, int] | None = None
+
+        # APC steering-signature caches (see
+        # docs/design/dynamic_steering_apc_notification.md). The worker
+        # reports a per-request *effective decode steering signature* to the
+        # scheduler so steered decode KV blocks are keyed by the steering
+        # that produced them (not the admitted config). Component hashes are
+        # cached and only recomputed when their source state mutates:
+        # per-dyn_id override-vector hash, and lazily-recomputed global
+        # tier / monitor hashes (``None`` ⇒ stale, recompute on next read).
+        self._dynamic_sig: dict[int, int] = {}
+        self._tier_sig_cache: int | None = None
+        self._monitor_sig_cache: int | None = None
+
+        # Per-row strength scales (the §5.3 "how much" knob), keyed by the
+        # LOGICAL :class:`RowOwner` so they survive row reassignment:
+        # ``RowOwner.global_(phase)`` for rows 1/2, ``RowOwner.config(hash,
+        # phase)`` for static per-request rows, ``RowOwner.dyn(dyn_id)`` for
+        # dynamic-override rows. A missing key means the default 1.0
+        # (unscaled). Decode-only by policy (prefill rows are forced to 1.0 at
+        # populate time, §7); the scale never enters config hashes (runtime
+        # state, not identity). See docs/design/dynamic_steering.md §5.3.
+        self._row_scales: dict[RowOwner, float] = {}
+
+        # Populate-scheduling flags (``content`` / ``membership`` / ``scales``)
+        # with the implication rules encoded in :class:`_DirtyState`. Every
+        # state mutator marks the appropriate flag; a full populate clears all
+        # three, the cheap scales-only path clears just ``scales``. Initialized
+        # all-dirty so the first populate call always runs.
+        self._dirty = _DirtyState()
 
         # Cached scratch tensors for populate_steering_tables. ``indices``
         # is the GPU int64 tensor of target row positions
@@ -117,9 +342,9 @@ class SteeringManager:
         # in register_config / release_config (the two paths that mutate
         # ``config_to_row``).
         #
-        # ``_indices_dirty`` is independent of ``_tables_dirty``: every
-        # global-vector update sets ``_tables_dirty`` (forcing a populate)
-        # but does NOT need to rebuild the scratch tensors.
+        # ``_dirty.membership`` is independent of ``_dirty.content``: every
+        # global-vector update marks content (forcing a populate) but does NOT
+        # need to rebuild the scratch tensors.
         self._cached_indices: torch.Tensor | None = None
         # Zero-row sentinel per table width. mHC models register tables of
         # more than one width on a single layer (single-stream hooks at
@@ -129,7 +354,7 @@ class SteeringManager:
         # never need invalidation.
         self._cached_zero_rows: dict[int, torch.Tensor] = {}
         self._cached_ordered_configs: list[tuple[tuple[int, str], int]] | None = None
-        self._indices_dirty: bool = True
+        self._cached_ordered_dynamic: list[tuple[int, int]] | None = None
 
         # Reusable pinned-CPU staging ring for ``_stack_vectors_to_device``.
         #
@@ -150,14 +375,132 @@ class SteeringManager:
         #
         # The ring size needs to cover the longest plausible burst of
         # back-to-back ``_stack_vectors_to_device`` calls inside one
-        # ``register_config``: one per hook point. With a typical
-        # ``HOOK_POINT_TABLE_ATTR`` of ~3 entries plus a small safety
-        # margin, 4 slots is enough that under steady state every reuse
+        # ``register_config``: one per hook point. With
+        # ``HOOK_POINT_TABLE_ATTR`` at 5 entries plus a small safety
+        # margin, 6 slots is enough that under steady state every reuse
         # finds the H2D already complete (event wait is a no-op).
-        self._stack_pinned_ring: list[torch.Tensor | None] = [None] * 4
-        self._stack_pinned_events: list[torch.cuda.Event | None] = [None] * 4
-        self._stack_pinned_numel: list[int] = [0] * 4
+        self._stack_pinned_ring: list[torch.Tensor | None] = [None] * 6
+        self._stack_pinned_events: list[torch.cuda.Event | None] = [None] * 6
+        self._stack_pinned_numel: list[int] = [0] * 6
         self._stack_pinned_next: int = 0
+
+    # ------------------------------------------------------------------
+    # Dirty-flag adapters (thin views over ``self._dirty``) — kept so the
+    # runner-mixin dispatch ladder and existing tests can read/reset the
+    # three historical flag names unchanged.
+    # ------------------------------------------------------------------
+
+    @property
+    def _tables_dirty(self) -> bool:
+        return self._dirty.content
+
+    @_tables_dirty.setter
+    def _tables_dirty(self, value: bool) -> None:
+        self._dirty.content = bool(value)
+
+    @property
+    def _scales_dirty(self) -> bool:
+        return self._dirty.scales
+
+    @_scales_dirty.setter
+    def _scales_dirty(self, value: bool) -> None:
+        self._dirty.scales = bool(value)
+
+    @property
+    def _indices_dirty(self) -> bool:
+        return self._dirty.membership
+
+    @_indices_dirty.setter
+    def _indices_dirty(self, value: bool) -> None:
+        self._dirty.membership = bool(value)
+
+    # ------------------------------------------------------------------
+    # Per-owner scale adapters — legacy-shaped read views over
+    # ``self._row_scales`` for the ``/v1/steering/dynamic`` status payload.
+    # ------------------------------------------------------------------
+
+    @property
+    def _global_scales(self) -> dict[str, float]:
+        return {o.phase: s for o, s in self._row_scales.items() if o.kind == "global"}
+
+    @property
+    def _config_scales(self) -> dict[tuple[int, str], float]:
+        return {
+            (o.config_hash, o.phase): s
+            for o, s in self._row_scales.items()
+            if o.kind == "config"
+        }
+
+    @property
+    def _dynamic_scales(self) -> dict[int, float]:
+        return {o.dyn_id: s for o, s in self._row_scales.items() if o.kind == "dyn"}
+
+    # ------------------------------------------------------------------
+    # Owner-keyed store registry + single purge path
+    # ------------------------------------------------------------------
+
+    def _owner_stores(self) -> list[OwnerStore]:
+        """Every owner-keyed runtime store, described uniformly.
+
+        Central registry so :meth:`_purge_owner` drops all of an owner's
+        state in one place and a parametrized test asserts each store is
+        purged (a future owner-keyed store added here without a working
+        ``purge`` fails that test). ``install_dummy`` exists only so the
+        test can populate each store generically.
+        """
+        return [
+            OwnerStore(
+                "row_scales",
+                contains=lambda o: o in self._row_scales,
+                purge=lambda o: self._row_scales.pop(o, None) is not None,
+                install_dummy=lambda o: self._row_scales.__setitem__(o, 0.5),
+            ),
+            OwnerStore(
+                "row_monitor",
+                contains=self._row_monitor_has_owner,
+                purge=self._row_monitor_purge_owner,
+                install_dummy=self._row_monitor_install_dummy,
+            ),
+        ]
+
+    def _row_monitor_has_owner(self, owner: RowOwner) -> bool:
+        return any(
+            owner in owners
+            for layers in self._row_monitor.values()
+            for owners in layers.values()
+        )
+
+    def _row_monitor_purge_owner(self, owner: RowOwner) -> bool:
+        removed = False
+        for layers in self._row_monitor.values():
+            for owners in layers.values():
+                if owners.pop(owner, None) is not None:
+                    removed = True
+        return removed
+
+    def _row_monitor_install_dummy(self, owner: RowOwner) -> None:
+        """Attach a throwaway per-row monitor for ``owner`` (test helper)."""
+        self._row_monitor.setdefault("post_block", {}).setdefault(0, {})[owner] = {
+            "probe": torch.zeros(1, dtype=torch.float32),
+            "threshold": 0.0,
+            "sharpness": 1.0,
+        }
+
+    def _purge_owner(self, owner: RowOwner) -> None:
+        """Drop every owner-keyed runtime store entry for ``owner``.
+
+        The single cleanup path shared by both release routes
+        (:meth:`release_dynamic_config` and the refcount-0 branch of
+        :meth:`release_config`). Purges per-row scales and per-row monitors
+        and invalidates the affected signature caches / dirty flags. Freeing
+        the owner's table row (and the resulting membership/content dirty) is
+        the caller's responsibility.
+        """
+        purged = {store.name: store.purge(owner) for store in self._owner_stores()}
+        if purged.get("row_scales"):
+            self._dirty.mark_scales()
+        if purged.get("row_monitor"):
+            self._row_monitor_sig_cache = None
 
     def register_config(
         self,
@@ -165,7 +508,9 @@ class SteeringManager:
         vectors: dict[str, dict[int, list[float] | np.ndarray]],
         phase: str = "prefill",
         *,
+        content_hash: int | None = None,
         locally_owned_layers: frozenset[int] | None = None,
+        clamps: SteeringClamps | dict | None = None,
     ) -> int:
         """Register a steering config, return its table row index.
 
@@ -174,8 +519,18 @@ class SteeringManager:
             vectors: ``{hook_point_str: {layer_idx: vec}}`` where ``vec`` is
                 either a ``list[float]`` (legacy) or a 1-D ``np.ndarray``
                 (the float64 arrays produced by
-                :func:`resolve_effective_vectors`).
+                :func:`resolve_effective_vectors`).  May be empty for a
+                clamp-only config — the row is still allocated (the shared
+                ``steering_index`` routes the request's tokens to it and
+                the clamp buffers are gathered by the same row).
             phase: ``"prefill"`` or ``"decode"``
+            content_hash: Optional additive-only identity used for physical
+                row sharing.  Scheduler capacity accounting uses the same
+                value, while ``config_hash`` remains the logical request hash
+                used for lookup and prefix-cache isolation.  When ``None`` it
+                defaults to ``config_hash`` so non-SAE callers keep the
+                historical 1:1 config->row mapping (and per-row scale/monitor
+                identity) unchanged.
             locally_owned_layers: If provided, only layers in this set
                 have tensors materialized on this worker.  Layers
                 outside the set are skipped at tensor-construction time
@@ -183,6 +538,13 @@ class SteeringManager:
                 identical across ranks (distributed-steering
                 determinism contract).  When ``None`` (default), no
                 filtering — all layers in ``vectors`` get tensors.
+            clamps: Optional per-request clamp tier — a
+                :class:`SteeringClamps` (or any shape its ``from_obj``
+                accepts, e.g. the plain-dict wire form a collective_rpc
+                hop produces).  Directions are materialized as device
+                tensors like ``vectors``; the clamp content is already
+                part of ``config_hash``, so a refcount hit implies
+                identical clamps.
 
         If the ``(config_hash, phase)`` pair is already registered,
         increments refcount and returns the existing row. Otherwise
@@ -194,30 +556,99 @@ class SteeringManager:
         key = (config_hash, phase)
         if key in self.config_to_row:
             self.config_refcounts[key] += 1
+            self._content_refcounts[self._config_to_content[key]] += 1
             return self.config_to_row[key]
+
+        # Physical row identity: an explicit ``content_hash`` (the additive-
+        # only identity the scheduler reserves against) when provided —
+        # this is what the SAE-aware admission path always supplies, for
+        # both phases.  Two logical configs that share this identity alias
+        # onto one physical row.
+        #
+        # Without an explicit ``content_hash``, implicit content-based
+        # aliasing applies to PREFILL rows only.  Prefill rows are pinned
+        # to default scale / never row-gated (cache safety), so sharing a
+        # physical row between logical configs with identical additive
+        # content is unobservable.  Decode rows are the target of the
+        # per-row scale / monitor / dynamic-override machinery — all keyed
+        # by the logical ``config_hash`` — so implicitly aliasing them
+        # would let one config's runtime state bleed onto another's row.
+        # Decode rows therefore keep the historical 1:1 logical->physical
+        # mapping unless the caller explicitly opts in via ``content_hash``.
+        if content_hash is not None:
+            row_hash = content_hash
+        elif phase == "prefill":
+            row_hash = hash_steering_config(vectors)
+        else:
+            row_hash = config_hash
+        content_key = (row_hash, phase)
+        # A different logical config whose additive content matches an
+        # already-registered physical row aliases onto that row instead of
+        # consuming a fresh one.  This keeps physical-row usage bounded by the
+        # number of distinct additive contents (what the scheduler reserves),
+        # even when many logical (clamp-varying) hashes are active at once.
+        if content_key in self._content_to_row:
+            row = self._content_to_row[content_key]
+            self.config_to_row[key] = row
+            self.config_vectors[key] = self._content_vectors[content_key]
+            self.config_refcounts[key] = 1
+            self._config_to_content[key] = content_key
+            self._content_refcounts[content_key] += 1
+            self._dirty.mark_membership()
+            return row
 
         if not self.free_rows:
             raise RuntimeError(
                 f"No free steering table rows. max_steering_configs="
-                f"{self.max_steering_configs}, active configs="
-                f"{len(self.config_to_row)}"
+                f"{self.max_steering_configs}, active physical configs="
+                f"{len(self._content_to_row)}"
             )
+
+        # Materialize clamps BEFORE allocating the row so a malformed /
+        # over-K clamp spec rejects without leaking a row.
+        clamp_spec = SteeringClamps.from_obj(clamps)
+        stored_clamps = (
+            self._store_clamps(clamp_spec, locally_owned_layers) if clamp_spec else None
+        )
 
         row = self.free_rows.pop()
         self.config_to_row[key] = row
         self.config_refcounts[key] = 1
+        self._config_to_content[key] = content_key
         # Store per-request vectors as tensors, keyed by hook point.
         # Under PP, each rank only owns a subset of decoder layers, so
         # materializing tensors for non-local layers is pure waste.
         # Row allocation above is unconditional — the filter only
         # affects what tensors get constructed, not which row is
         # assigned.
-        # Per-layer vectors are batched into ONE stacked H2D copy per hook
-        # point. Building each row as its own ``torch.tensor(list,
-        # device=cuda)`` triggers a synchronous ``cudaMemcpy`` per layer,
-        # which dominates the phase-transition cost when many configs are
-        # registered at the start of a decode step. Stacking up front and
-        # transferring once amortizes the sync to a single cost per hook.
+        stored = self._store_vectors(vectors, locally_owned_layers)
+        self.config_vectors[key] = stored
+        if stored_clamps:
+            self.config_clamps[key] = stored_clamps
+        self._content_to_row[content_key] = row
+        self._content_vectors[content_key] = stored
+        self._content_refcounts[content_key] = 1
+        # New row content + a changed row set: rebuild indices scratch and
+        # recompose the tables on the next populate (membership implies
+        # content). (Refcount-hit path doesn't mark dirty because the row's
+        # contents are already in the table.)
+        self._dirty.mark_membership()
+        return row
+
+    def _store_vectors(
+        self,
+        vectors: dict[str, dict[int, list[float] | np.ndarray]],
+        locally_owned_layers: frozenset[int] | None,
+    ) -> dict[str, dict[int, torch.Tensor]]:
+        """Materialize per-layer vectors as device tensors.
+
+        Per-layer vectors are batched into ONE stacked H2D copy per hook
+        point. Building each row as its own ``torch.tensor(list,
+        device=cuda)`` triggers a synchronous ``cudaMemcpy`` per layer,
+        which dominates the phase-transition cost when many configs are
+        registered at the start of a decode step. Stacking up front and
+        transferring once amortizes the sync to a single cost per hook.
+        """
         stored: dict[str, dict[int, torch.Tensor]] = {}
         for hook_point, layer_vecs in vectors.items():
             items = [
@@ -237,36 +668,270 @@ class SteeringManager:
             stored[hook_point] = {
                 layer_idx: stacked[i : i + 1] for i, layer_idx in enumerate(layer_idxs)
             }
-        self.config_vectors[key] = stored
-        # New row content needs to be written into the per-layer tables on
-        # the next populate call. (Refcount-hit path doesn't set this flag
-        # because the row's contents are already in the table.)
-        self._tables_dirty = True
-        # config_to_row changed; the cached indices/ordered_configs scratch
-        # is now stale and must be rebuilt on the next populate.
-        self._indices_dirty = True
+        return stored
+
+    def _store_clamps(
+        self,
+        clamps: SteeringClamps,
+        locally_owned_layers: frozenset[int] | None,
+    ) -> dict[str, dict[int, ClampSitePayload]]:
+        """Materialize a clamp tier's per-site payloads.
+
+        Mirrors :meth:`_store_vectors`: non-local layers are skipped at
+        materialization time only (row allocation is caller-side and
+        unconditional).  Raises ``ValueError`` when a site carries more
+        than ``max_clamp_directions`` rows or clamping is disabled.
+        """
+        stored: dict[str, dict[int, ClampSitePayload]] = {}
+        for hook_point, table in clamps.hooks.items():
+            site_map: dict[int, ClampSitePayload] = {}
+            for layer_idx, dirs, lo, hi, strength in table.by_layer():
+                if (
+                    locally_owned_layers is not None
+                    and layer_idx not in locally_owned_layers
+                ):
+                    continue
+                site_map[layer_idx] = self._materialize_clamp_site(
+                    dirs,
+                    lo,
+                    hi,
+                    strength,
+                    site=f"[{hook_point!r}][{layer_idx}]",
+                )
+            if site_map:
+                stored[hook_point] = site_map
+        return stored
+
+    def _materialize_clamp_site(
+        self,
+        dirs: np.ndarray,
+        lo: np.ndarray,
+        hi: np.ndarray,
+        strength: np.ndarray,
+        *,
+        site: str,
+    ) -> ClampSitePayload:
+        """Convert one site's clamp rows into a :class:`ClampSitePayload`.
+
+        Rows arrive raw (as submitted) and are unit-normalized here via
+        :func:`_clamp_unit_rows` — bounds live in unit-projection space.
+        Directions land on ``self.device`` as a fresh tensor, deliberately
+        NOT via the pinned staging ring of
+        :meth:`_stack_vectors_to_device`: the ring's slots are lazily
+        allocated on the step thread inside ``torch.inference_mode()``, so
+        an in-place ``copy_`` into them from a control-plane RPC thread
+        (global clamp set, module-register broadcast) raises "Inplace
+        update to inference tensor outside InferenceMode".  Clamp payloads
+        are tiny (≤ K x hidden floats), so a plain blocking H2D is fine on
+        every path.  Bounds/strength stay on CPU (see
+        :class:`ClampSitePayload`).
+        """
+        if self.max_clamp_directions <= 0:
+            raise ValueError(
+                f"Clamp spec {site} present but clamping is disabled "
+                "(steering_config.max_clamp_directions=0)"
+            )
+        n = int(dirs.shape[0])
+        if n > self.max_clamp_directions:
+            raise ValueError(
+                f"Clamp spec {site} has {n} directions, "
+                f"exceeding max_clamp_directions={self.max_clamp_directions}"
+            )
+        unit = _clamp_unit_rows(np.asarray(dirs, dtype=np.float64))
+        stacked = np.ascontiguousarray(unit.astype(np.float32))
+        dirs_t = torch.from_numpy(stacked)
+        if self.device is not None:
+            dirs_t = dirs_t.to(self.device)
+        bounds = np.stack(
+            [np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)],
+            axis=1,
+        )
+        return ClampSitePayload(
+            dirs=dirs_t,
+            bounds=torch.tensor(bounds, dtype=torch.float32),
+            strength=torch.tensor(
+                np.asarray(strength, dtype=np.float64), dtype=torch.float32
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Dynamic-override pool (docs/design/dynamic_steering.md §5.2)
+    # ------------------------------------------------------------------
+
+    @property
+    def has_dynamic(self) -> bool:
+        """True if any dynamic-override row is live."""
+        return bool(self._dynamic_to_row)
+
+    @property
+    def num_active_dynamic_configs(self) -> int:
+        return len(self._dynamic_to_row)
+
+    def register_dynamic_config(
+        self,
+        vectors: dict[str, dict[int, list[float] | np.ndarray]],
+        *,
+        clamps: SteeringClamps | dict | None = None,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> tuple[int, int]:
+        """Allocate a dynamic-override row; returns ``(dyn_id, row)``.
+
+        Rows come from the dedicated dynamic pool, never the
+        scheduler-reserved static pool. ``dyn_id`` is a monotonically
+        increasing id, never reused — identical across ranks because the
+        dynamic register/release sequence is rank-replicated. Raises
+        ``RuntimeError`` when the pool is exhausted (callers reject the
+        triggering action and keep previous state).
+
+        ``clamps`` is an optional per-override :class:`SteeringClamps`
+        (any ``from_obj``-accepted shape); the dynamic row then carries
+        ``concat(global base, global decode, override)``. Materialized
+        BEFORE the row is allocated so a malformed / over-K spec rejects
+        with ``ValueError`` without leaking a pool row (mirrors
+        :meth:`register_config`).
+        """
+        if not self._dynamic_free_rows:
+            raise RuntimeError(
+                f"No free dynamic steering rows. "
+                f"max_dynamic_steering_configs="
+                f"{self.max_dynamic_steering_configs}, active="
+                f"{len(self._dynamic_to_row)}"
+            )
+        # Materialize clamps BEFORE allocating the row (validation may raise).
+        clamp_spec = SteeringClamps.from_obj(clamps)
+        stored_clamps = (
+            self._store_clamps(clamp_spec, locally_owned_layers) if clamp_spec else None
+        )
+        dyn_id = self._next_dynamic_id
+        self._next_dynamic_id += 1
+        row = self._dynamic_free_rows.pop()
+        self._dynamic_to_row[dyn_id] = row
+        self._dynamic_vectors[dyn_id] = self._store_vectors(
+            vectors, locally_owned_layers
+        )
+        if stored_clamps:
+            self._dynamic_clamps[dyn_id] = stored_clamps
+            self._dynamic_clamp_specs[dyn_id] = clamp_spec
+        # Cache the override-vector+clamp hash for the APC decode signature.
+        # Hash the raw input (np/list/spec) — no device sync, rank-identical.
+        self._dynamic_sig[dyn_id] = hash_steering_config(vectors, clamps=clamp_spec)
+        self._dirty.mark_membership()
+        return dyn_id, row
+
+    def update_dynamic_config(
+        self,
+        dyn_id: int,
+        vectors: dict[str, dict[int, list[float] | np.ndarray]],
+        *,
+        clamps: SteeringClamps | dict | None = None,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Replace a live dynamic config's vectors in place (same row).
+
+        The common re-emit path: gain/vector changes for an existing
+        override rewrite the row's content without free-list churn, so
+        the cached populate indices stay valid (``_tables_dirty`` only).
+
+        ``clamps`` follows REPLACE semantics for the override's own clamps:
+        ``None`` KEEPS the previous clamp set (the common vectors-only
+        re-emit), an empty spec (``SteeringClamps.empty()`` / ``{}``)
+        CLEARS it, and a non-empty spec replaces it. The clamp change only
+        marks content dirty (never membership), so the cached populate
+        indices stay valid.
+        """
+        if dyn_id not in self._dynamic_to_row:
+            raise KeyError(f"dynamic steering config {dyn_id} is not registered")
+        self._dynamic_vectors[dyn_id] = self._store_vectors(
+            vectors, locally_owned_layers
+        )
+        clamp_spec = SteeringClamps.from_obj(clamps, preserve_empty=True)
+        if clamp_spec is not None:
+            # Replace (empty spec clears).
+            if clamp_spec:
+                self._dynamic_clamps[dyn_id] = self._store_clamps(
+                    clamp_spec, locally_owned_layers
+                )
+                self._dynamic_clamp_specs[dyn_id] = clamp_spec
+            else:
+                self._dynamic_clamps.pop(dyn_id, None)
+                self._dynamic_clamp_specs.pop(dyn_id, None)
+        # ``clamps is None`` ⇒ keep the previous clamp set untouched.
+        self._dynamic_sig[dyn_id] = hash_steering_config(
+            vectors, clamps=self._dynamic_clamp_specs.get(dyn_id)
+        )
+        self._dirty.mark_content()
+
+    def release_dynamic_config(self, dyn_id: int) -> None:
+        """Free a dynamic-override row. No-op for unknown ids.
+
+        Also drops every owner-keyed runtime store for this row's owner
+        (``RowOwner.dyn(dyn_id)``) via :meth:`_purge_owner` — the per-row
+        monitor and strength scale. Without this, per-request monitors
+        installed via ``SteeringMonitorUpdate(req_id=...)`` (and scales) would
+        accumulate for the lifetime of the process, since dyn_ids are
+        monotonic and never reused.
+        """
+        row = self._dynamic_to_row.pop(dyn_id, None)
+        if row is None:
+            return
+        self._dynamic_vectors.pop(dyn_id, None)
+        self._dynamic_clamps.pop(dyn_id, None)
+        self._dynamic_clamp_specs.pop(dyn_id, None)
+        self._dynamic_sig.pop(dyn_id, None)
+        self._dynamic_free_rows.append(row)
+        # Purge the row's owner-keyed runtime state (scale + per-row monitors).
+        self._purge_owner(RowOwner.dyn(dyn_id))
+        self._dirty.mark_membership()
+
+    def get_dynamic_row(self, dyn_id: int) -> int:
+        """Return the table row for a live dynamic config."""
+        row = self._dynamic_to_row.get(dyn_id)
+        if row is None:
+            raise RuntimeError(
+                f"dynamic steering config {dyn_id} is not registered; "
+                f"the mixin's override bookkeeping must release stale "
+                f"ids before routing to them."
+            )
         return row
 
     def release_config(self, config_hash: int, phase: str) -> None:
         """Decrement refcount for ``(config_hash, phase)``.
 
-        Free the row when it reaches 0.
+        Free the row when it reaches 0. On that live->0 transition, also purge
+        every owner-keyed runtime store for this config's owner
+        (``RowOwner.config(config_hash, phase)``) via :meth:`_purge_owner` —
+        its per-config strength scale and any per-row monitors. Without this,
+        a scale or monitor set for content hash H would silently re-apply to a
+        *future* request that re-registers H (content hashes collide by
+        design). A scale pre-armed for a not-yet-registered hash is untouched:
+        purge fires only on this live->0 transition.
         """
         key = (config_hash, phase)
         if key not in self.config_to_row:
             return
+        content_key = self._config_to_content[key]
         self.config_refcounts[key] -= 1
+        self._content_refcounts[content_key] -= 1
         if self.config_refcounts[key] <= 0:
-            row = self.config_to_row.pop(key)
+            self.config_to_row.pop(key)
             self.config_vectors.pop(key, None)
+            self.config_clamps.pop(key, None)
             del self.config_refcounts[key]
+            self._config_to_content.pop(key, None)
+            # Last live registration of this logical hash released: drop its
+            # owner-keyed runtime state so a re-registration of the same hash
+            # starts clean.
+            self._purge_owner(RowOwner.config(config_hash, phase))
+        if self._content_refcounts[content_key] <= 0:
+            # No logical config aliases this physical row any more: free it.
+            row = self._content_to_row.pop(content_key)
+            self._content_vectors.pop(content_key, None)
+            del self._content_refcounts[content_key]
             self.free_rows.append(row)
-            # The row is now stale (no one references it), but mark dirty so
-            # if another config gets assigned to this row before the next
-            # populate, the populate runs and overwrites the stale content.
-            self._tables_dirty = True
-            # config_to_row shrunk; cached indices scratch is stale.
-            self._indices_dirty = True
+            # content_to_row shrunk; rebuild indices scratch and recompose the
+            # tables on the next populate (membership implies content) so a
+            # config later assigned to this row overwrites the stale content.
+            self._dirty.mark_membership()
 
     def get_row_for_config(self, config_hash: int, is_prefill: bool = False) -> int:
         """Return table row for a config.
@@ -287,7 +952,7 @@ class SteeringManager:
         output of requests that asked for per-request steering.
         """
         if config_hash == 0:
-            return 1 if is_prefill else 2
+            return global_row_for_phase(is_prefill)
         phase = "prefill" if is_prefill else "decode"
         row = self.config_to_row.get((config_hash, phase))
         if row is not None:
@@ -311,7 +976,7 @@ class SteeringManager:
         """Update cached global vector for a hook point and layer.
 
         Args:
-            hook_point: Hook point string (e.g. ``"post_mlp"``).
+            hook_point: Hook point string (e.g. ``"post_block"``).
             layer_idx: Layer index.
             vector: The global vector tensor.
             phase: ``"base"``, ``"prefill"``, or ``"decode"``.
@@ -327,30 +992,657 @@ class SteeringManager:
         target = self._global_dict_for_phase(phase)
         if hook_point not in target:
             target[hook_point] = {}
-        target[hook_point][layer_idx] = vector.clone()
+        stored = vector.clone()
+        # Global vectors are produced on the CONTROL-PLANE thread (the HTTP
+        # ``set_steering_vectors`` RPC) but consumed by
+        # ``populate_steering_tables`` on the STEP thread. Under the classic
+        # Ray executor those are different threads with distinct default CUDA
+        # streams (the compiled DAG runs the model on its own background
+        # thread), and CUDA only orders work within a stream. The producing
+        # H2D + this ``clone()`` are enqueued on the RPC thread's stream; the
+        # step thread's ``index_copy_`` into the layer table can otherwise run
+        # before that copy drains, baking a stale/garbage row and silently
+        # no-op'ing base-tier steering. Per-request configs never hit this
+        # because they are both produced and consumed on the step thread (see
+        # ``_stack_vectors_to_device``'s same-stream invariant). Synchronize
+        # here so the tensor's memory is fully materialized before the manager
+        # exposes it for cross-thread reads. This is a rare control-plane op,
+        # so the sync cost is irrelevant; the single-rank / non-CUDA paths are
+        # unaffected.
+        if stored.is_cuda:
+            torch.cuda.synchronize(stored.device)
+        target[hook_point][layer_idx] = stored
         # Global rows 1, 2 and all per-request rows depend on this state.
-        self._tables_dirty = True
+        self._dirty.mark_content()
+
+    @property
+    def global_base_vectors(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._global_vectors.base
+
+    @property
+    def global_prefill_vectors(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._global_vectors.prefill
+
+    @property
+    def global_decode_vectors(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._global_vectors.decode
 
     def clear_global_vectors(self) -> None:
         """Clear all cached global vectors across all phases and hook points."""
-        self.global_base_vectors.clear()
-        self.global_prefill_vectors.clear()
-        self.global_decode_vectors.clear()
-        self._tables_dirty = True
+        self._global_vectors.clear_all()
+        self._dirty.mark_content()
+
+    def update_global_clamps(
+        self,
+        hook_point: str,
+        layer_idx: int,
+        site_rows: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None,
+        phase: str = "base",
+        *,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Update the cached global clamps for a hook point and layer.
+
+        ``site_rows`` is one site's ``(dirs, lo, hi, strength)`` row
+        group as produced by :meth:`ClampHookTable.by_layer` (directions
+        raw float64; normalized at materialization); ``None`` or an empty
+        group removes the site.  Mirrors :meth:`update_global_vectors`,
+        including the cross-thread synchronize: the payload's direction
+        tensors are produced on the control-plane thread but consumed by
+        ``populate_steering_tables`` on the step thread, so the H2D must
+        be fully drained before the manager exposes them (see the
+        ``update_global_vectors`` comment for the full stream-ordering
+        rationale).
+        """
+        if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
+            return
+        target = self._global_clamp_dict_for_phase(phase)
+        if site_rows is None or len(site_rows[0]) == 0:
+            hook_map = target.get(hook_point)
+            if hook_map is not None:
+                hook_map.pop(layer_idx, None)
+                if not hook_map:
+                    target.pop(hook_point, None)
+            self._dirty.mark_content()
+            return
+        dirs, lo, hi, strength = site_rows
+        payload = self._materialize_clamp_site(
+            dirs,
+            lo,
+            hi,
+            strength,
+            site=f"global {phase} [{hook_point!r}][{layer_idx}]",
+        )
+        if payload.dirs.is_cuda:
+            torch.cuda.synchronize(payload.dirs.device)
+        target.setdefault(hook_point, {})[layer_idx] = payload
+        # Global rows 1, 2 and all per-request rows depend on this state.
+        self._dirty.mark_content()
+
+    def clear_global_clamps(self) -> None:
+        """Clear all cached global clamps across all phases and hook points."""
+        self._global_clamps.clear_all()
+        self._dirty.mark_content()
+
+    # Tier dict names are tested contract (and read across the populate
+    # path); expose the PhaseTiers fields under the historical names.
+    @property
+    def global_clamp_base(self) -> dict[str, dict[int, ClampSitePayload]]:
+        return self._global_clamps.base
+
+    @property
+    def global_clamp_prefill(self) -> dict[str, dict[int, ClampSitePayload]]:
+        return self._global_clamps.prefill
+
+    @property
+    def global_clamp_decode(self) -> dict[str, dict[int, ClampSitePayload]]:
+        return self._global_clamps.decode
+
+    def _global_clamp_dict_for_phase(
+        self, phase: str
+    ) -> dict[str, dict[int, ClampSitePayload]]:
+        """Return the global clamp dict for the given phase."""
+        return self._global_clamps.for_phase(phase)
+
+    @property
+    def has_global_clamps(self) -> bool:
+        """True when any global clamp tier has at least one site."""
+        return bool(self._global_clamps)
+
+    @property
+    def has_any_clamps(self) -> bool:
+        """True when any clamp exists.
+
+        Global tiers, per-request configs, OR a dynamic override's own
+        clamps — the dynamic case must count so a dynamic-only clamp
+        (no global, no per-request) still populates its buffers rather
+        than short-circuiting to never-written state.
+        """
+        return (
+            self.has_global_clamps
+            or any(self.config_clamps.values())
+            or any(self._dynamic_clamps.values())
+        )
+
+    def update_dynamic_tier(
+        self,
+        hook_point: str,
+        layer_idx: int,
+        vector: torch.Tensor,
+        *,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Set the dynamic additive-tier vector for a hook point and layer.
+
+        The tier is copied into a dedicated per-hook vector buffer and added
+        by the steering kernel on top of the selected row. This lets dynamic
+        global steering compose with operator-set decode steering rather than
+        overwriting ``global_decode_vectors``. Decode-only (§7): the runner
+        writes a zero token scale for prefill, so it never feeds prefix-cache
+        keys.
+
+        Args:
+            hook_point: Hook point string (e.g. ``"post_block"``).
+            layer_idx: Layer index.
+            vector: The (already gain-scaled) tier vector.
+            locally_owned_layers: If provided and ``layer_idx`` is not in
+                the set, this call is a no-op — the same
+                distributed-determinism guard as
+                :meth:`update_global_vectors`.
+        """
+        if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
+            return
+        if hook_point not in self.dynamic_tier_vectors:
+            self.dynamic_tier_vectors[hook_point] = {}
+        self.dynamic_tier_vectors[hook_point][layer_idx] = vector.clone()
+        self._tier_sig_cache = None  # tier changed → APC signature stale
+        self._dirty.mark_content()
+
+    def clear_dynamic_tier(self) -> None:
+        """Clear all dynamic additive-tier vectors."""
+        if self.dynamic_tier_vectors:
+            self.dynamic_tier_vectors.clear()
+            self._tier_sig_cache = None
+            self._dirty.mark_content()
+
+    @property
+    def has_dynamic_tier(self) -> bool:
+        """True if any dynamic additive-tier vector is set."""
+        return bool(self.dynamic_tier_vectors)
+
+    def set_dynamic_tier_gain(self, gain: float) -> None:
+        """Set the scalar strength of the dedicated dynamic tier (§5.4).
+
+        Cheap: the runner reads this when it rebuilds the per-token gate
+        each step, so no buffer write happens here.
+        """
+        self.dynamic_tier_gain = float(gain)
+
+    # ------------------------------------------------------------------
+    # In-graph monitor (Phase 2, §8)
+    # ------------------------------------------------------------------
+
+    def set_monitor(
+        self,
+        hook_point: str,
+        layer_idx: int,
+        probe: torch.Tensor,
+        threshold: float,
+        sharpness: float,
+        gate_rows: bool = False,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Configure the in-graph monitor at ``(hook_point, layer_idx)``.
+
+        The probe is a 1-D detector vector; ``threshold``/``sharpness``
+        parameterize the fixed elementwise gate
+        ``sigmoid(sharpness*(residual@probe - threshold))`` the monitor op
+        writes into ``steering_token_scales``. Stored here and written to
+        the per-layer monitor buffers at the next populate; the policy
+        params then live host-tunable in the buffers (no recapture).
+
+        ``locally_owned_layers`` (TP/PP): if provided and ``layer_idx`` is
+        not owned by this worker, the call is a no-op so rank-replicated
+        callers stay in lock-step.
+        """
+        if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
+            return
+        self.monitor_configs.setdefault(hook_point, {})[layer_idx] = {
+            "probe": probe.detach().to(torch.float32).clone().reshape(-1),
+            "threshold": float(threshold),
+            "sharpness": float(sharpness),
+            "gate_rows": bool(gate_rows),
+        }
+        self._monitor_sig_cache = None  # monitor changed → APC signature stale
+        self._dirty.mark_content()
+
+    def clear_monitor(
+        self,
+        hook_point: str | None = None,
+        layer_idx: int | None = None,
+    ) -> None:
+        """Remove monitor configs.
+
+        No arguments clears every site; a ``hook_point`` clears that
+        hook's sites; both clear a single ``(hook, layer)`` site. Marks
+        tables dirty so the next populate deactivates the cleared buffers.
+        """
+        if not self.monitor_configs:
+            return
+        if hook_point is None:
+            self.monitor_configs.clear()
+            self._monitor_sig_cache = None
+            self._dirty.mark_content()
+            return
+        layers = self.monitor_configs.get(hook_point)
+        if layers is None:
+            return
+        if layer_idx is None:
+            del self.monitor_configs[hook_point]
+            self._monitor_sig_cache = None
+            self._dirty.mark_content()
+            return
+        if layer_idx in layers:
+            del layers[layer_idx]
+            if not layers:
+                del self.monitor_configs[hook_point]
+            self._monitor_sig_cache = None
+            self._dirty.mark_content()
+
+    @property
+    def has_monitor(self) -> bool:
+        """True if any in-graph monitor site is configured."""
+        return any(layers for layers in self.monitor_configs.values())
+
+    # ------------------------------------------------------------------
+    # Per-row (per-request) in-graph monitor
+    # ------------------------------------------------------------------
+
+    def set_row_monitor(
+        self,
+        hook_point: str,
+        layer_idx: int,
+        owner: RowOwner,
+        probe: torch.Tensor,
+        threshold: float,
+        sharpness: float,
+        locally_owned_layers: frozenset[int] | None = None,
+    ) -> None:
+        """Configure the per-row monitor for one logical row owner at a site.
+
+        ``owner`` is a :class:`RowOwner` — ``RowOwner.global_("decode")``,
+        ``RowOwner.config(config_hash, "decode")`` or ``RowOwner.dyn(dyn_id)``
+        — the gate ``sigmoid(sharpness*(residual@probe - threshold))`` is
+        applied to that owner's row term only, decode-only. Stored keyed by
+        owner so it survives row reassignment; written into the per-row probe
+        table at the next populate.
+
+        ``locally_owned_layers`` (TP/PP): a no-op when ``layer_idx`` is not
+        owned by this worker (rank-replicated callers stay in lock-step).
+        """
+        if locally_owned_layers is not None and layer_idx not in locally_owned_layers:
+            return
+        self._row_monitor.setdefault(hook_point, {}).setdefault(layer_idx, {})[
+            owner
+        ] = {
+            "probe": probe.detach().to(torch.float32).clone().reshape(-1),
+            "threshold": float(threshold),
+            "sharpness": float(sharpness),
+        }
+        self._row_monitor_sig_cache = None
+        self._dirty.mark_content()
+
+    def clear_row_monitor(
+        self,
+        hook_point: str | None = None,
+        layer_idx: int | None = None,
+        owner: RowOwner | None = None,
+    ) -> None:
+        """Remove per-row monitor configs.
+
+        No args clears everything; progressively narrower args clear a hook,
+        a ``(hook, layer)`` site, or a single ``(hook, layer, owner)`` entry.
+        """
+        if not self._row_monitor:
+            return
+        if hook_point is None:
+            self._row_monitor.clear()
+            self._row_monitor_sig_cache = None
+            self._dirty.mark_content()
+            return
+        layers = self._row_monitor.get(hook_point)
+        if layers is None:
+            return
+        if layer_idx is None:
+            del self._row_monitor[hook_point]
+        elif owner is None:
+            layers.pop(layer_idx, None)
+            if not layers:
+                del self._row_monitor[hook_point]
+        else:
+            owners = layers.get(layer_idx)
+            if owners is None:
+                return
+            owners.pop(owner, None)
+            if not owners:
+                layers.pop(layer_idx, None)
+            if not layers:
+                del self._row_monitor[hook_point]
+        self._row_monitor_sig_cache = None
+        self._dirty.mark_content()
+
+    @property
+    def has_row_monitor(self) -> bool:
+        """True if any per-row monitor entry is configured."""
+        return any(
+            owners
+            for layers in self._row_monitor.values()
+            for owners in layers.values()
+        )
+
+    def _build_row_probe_and_params(
+        self,
+        hp_str: str,
+        layer_idx: int,
+        device: torch.device,
+        hidden_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Build the per-row probe table + ``[threshold, sharpness]`` params in
+        populate (row-position) order ``[0, 1, 2, *config_rows,
+        *dynamic_rows]`` — matching ``_cached_indices`` — for one ``(hook,
+        layer)`` site.
+
+        Unconfigured rows (and rows 0/1, and all prefill rows) get a zero
+        probe + the default ``[-1e30, 1.0]`` params ⇒ ``sigmoid → 1.0`` ⇒
+        ungated pass-through. Returns ``(probe_mat, params_mat,
+        any_configured)``.
+        """
+        site = self._row_monitor.get(hp_str, {}).get(layer_idx, {})
+        ordered_configs = self._cached_ordered_configs or list(
+            self.config_to_row.items()
+        )
+        ordered_dynamic = self._cached_ordered_dynamic or list(
+            self._dynamic_to_row.items()
+        )
+        num_rows = NUM_RESERVED_ROWS + len(ordered_configs) + len(ordered_dynamic)
+        thr0, sharp0 = _ROW_MONITOR_DEFAULT_PARAMS
+        probe_mat = torch.zeros(
+            num_rows, hidden_size, dtype=torch.float32, device=device
+        )
+        params_mat = (
+            torch.tensor([thr0, sharp0], dtype=torch.float32, device=device)
+            .expand(num_rows, 2)
+            .clone()
+        )
+        any_configured = False
+
+        def _apply(pos: int, owner: RowOwner) -> None:
+            nonlocal any_configured
+            cfg = site.get(owner)
+            if cfg is None:
+                return
+            probe = cfg["probe"]
+            if probe.numel() != hidden_size:
+                return
+            probe_mat[pos].copy_(probe.to(device))
+            params_mat[pos, 0] = cfg["threshold"]
+            params_mat[pos, 1] = cfg["sharpness"]
+            any_configured = True
+
+        # Row 2 = global decode; rows 0/1 (sentinel/prefill) stay default.
+        _apply(2, RowOwner.global_("decode"))
+        pos = 3
+        for (config_hash, phase), _row in ordered_configs:
+            if phase == "decode":
+                _apply(pos, RowOwner.config(config_hash, "decode"))
+            pos += 1
+        for dyn_id, _row in ordered_dynamic:
+            _apply(pos, RowOwner.dyn(dyn_id))
+            pos += 1
+        return probe_mat, params_mat, any_configured
+
+    def _row_monitor_signature_for(
+        self, owner_keys: tuple[RowOwner, ...]
+    ) -> int | None:
+        """Cached hash of every per-row monitor entry matching any of
+        ``owner_keys`` (probe + threshold + sharpness + site), or ``None`` when
+        none match. Used to fold a request's effective row monitor into its APC
+        decode signature."""
+        if self._row_monitor_sig_cache is None:
+            cache: dict[RowOwner, int] = {}
+            for hook in sorted(self._row_monitor.keys()):
+                layers = self._row_monitor[hook]
+                for layer_idx in sorted(layers.keys()):
+                    # Sort by the RowOwner total order so the fold is
+                    # insertion-order independent (free determinism insurance).
+                    for owner_key in sorted(layers[layer_idx].keys()):
+                        cfg = layers[layer_idx][owner_key]
+                        h = cache.get(owner_key)
+                        acc = hashlib.sha256(b"dynsteer-rowmon")
+                        if h is not None:
+                            acc.update(int(h).to_bytes(8, "little"))
+                        acc.update(hook.encode())
+                        acc.update(int(layer_idx).to_bytes(4, "little", signed=True))
+                        acc.update(
+                            cfg["probe"]
+                            .detach()
+                            .cpu()
+                            .to(torch.float32)
+                            .numpy()
+                            .tobytes()
+                        )
+                        acc.update(np.float64(cfg["threshold"]).tobytes())
+                        acc.update(np.float64(cfg["sharpness"]).tobytes())
+                        cache[owner_key] = (
+                            int(acc.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+                        )
+            self._row_monitor_sig_cache = cache
+        out: int | None = None
+        for key in owner_keys:
+            sig = self._row_monitor_sig_cache.get(key)
+            if sig is not None:
+                out = sig if out is None else (out ^ sig)
+        return out
+
+    # ------------------------------------------------------------------
+    # APC effective-decode-steering signature (see
+    # docs/design/dynamic_steering_apc_notification.md)
+    # ------------------------------------------------------------------
+
+    def _tier_signature(self) -> int:
+        """Cached hash of the global dynamic-tier vectors (gain excluded —
+        the gain is folded per-call since it is a cheap scalar that the
+        caller reads fresh)."""
+        if self._tier_sig_cache is None:
+            self._tier_sig_cache = self._hash_tensor_vectors(self.dynamic_tier_vectors)
+        return self._tier_sig_cache
+
+    def _monitor_signature(self) -> int:
+        """Cached hash of the global monitor configs (probe + params)."""
+        if self._monitor_sig_cache is None:
+            h = hashlib.sha256(b"dynsteer-monitor")
+            for hook in sorted(self.monitor_configs.keys()):
+                layers = self.monitor_configs[hook]
+                for layer_idx in sorted(layers.keys()):
+                    cfg = layers[layer_idx]
+                    h.update(hook.encode())
+                    h.update(int(layer_idx).to_bytes(4, "little", signed=True))
+                    h.update(
+                        cfg["probe"].detach().cpu().to(torch.float32).numpy().tobytes()
+                    )
+                    h.update(np.float64(cfg["threshold"]).tobytes())
+                    h.update(np.float64(cfg["sharpness"]).tobytes())
+                    h.update(b"\x01" if cfg.get("gate_rows") else b"\x00")
+            self._monitor_sig_cache = int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+        return self._monitor_sig_cache
+
+    @staticmethod
+    def _hash_tensor_vectors(
+        vectors: dict[str, dict[int, torch.Tensor]],
+    ) -> int:
+        """Deterministic, rank-identical hash of a hook→layer→tensor dict,
+        routed through :func:`hash_steering_config` (fp32 ``tobytes``)."""
+        if not vectors:
+            return 0
+        converted = {
+            hook: {
+                layer: t.detach().cpu().to(torch.float32).numpy()
+                for layer, t in layers.items()
+            }
+            for hook, layers in vectors.items()
+        }
+        return hash_steering_config(converted)
+
+    def effective_decode_signature(
+        self, dyn_id: int | None, base_decode_hash: int
+    ) -> int | None:
+        """Per-request effective decode steering signature, or ``None``.
+
+        Returns ``None`` when no dynamic decode steering applies to the
+        request (admitted ``base_decode_hash`` already identifies the KV).
+        Otherwise returns a deterministic hash folding the admitted decode
+        config with whatever dynamic steering shaped the decode KV — a
+        per-request override, the global dynamic tier (+ gain), and/or the
+        global in-graph monitor — so steered decode blocks are keyed by the
+        steering that produced them (and only reused by requests under the
+        identical effective steering). Rank-identical: all inputs are
+        rank-replicated, hashed with the same ``hash_steering_config``.
+        """
+        has_override = dyn_id is not None and dyn_id in self._dynamic_sig
+        has_tier = self.has_dynamic_tier
+        has_monitor = self.has_monitor
+        # Per-row monitor on THIS request's decode row: keyed by its dyn
+        # override (if any) else its static decode config, plus the global
+        # decode row (row 2) a no-config decode request routes through. The
+        # probe/params are runtime state not in ``base_decode_hash``, so fold
+        # them in — else a temporal probe change reuses stale steered KV.
+        if dyn_id is not None:
+            row_owner_keys: tuple[RowOwner, ...] = (RowOwner.dyn(dyn_id),)
+        else:
+            row_owner_keys = (
+                RowOwner.config(base_decode_hash, "decode"),
+                RowOwner.global_("decode"),
+            )
+        row_mon_sig = self._row_monitor_signature_for(row_owner_keys)
+        has_row_mon = row_mon_sig is not None
+        if not (has_override or has_tier or has_monitor or has_row_mon):
+            return None
+        h = hashlib.sha256(b"dynsteer-decode-sig")
+        h.update(int(base_decode_hash).to_bytes(8, "little", signed=False))
+        if has_override:
+            h.update(b"\x01ovr")
+            h.update(int(self._dynamic_sig[dyn_id]).to_bytes(8, "little"))
+        if has_tier:
+            h.update(b"\x02tier")
+            h.update(int(self._tier_signature()).to_bytes(8, "little"))
+            # No quantization (decision locked): any gain change ⇒ new key.
+            h.update(np.float64(self.dynamic_tier_gain).tobytes())
+        if has_monitor:
+            h.update(b"\x03mon")
+            h.update(int(self._monitor_signature()).to_bytes(8, "little"))
+        if has_row_mon:
+            h.update(b"\x04rowmon")
+            h.update(int(row_mon_sig).to_bytes(8, "little"))
+        return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+
+    # ------------------------------------------------------------------
+    # Per-row strength scales (§5.3) — cheap "how much" knob
+    # ------------------------------------------------------------------
+
+    def set_global_scale(self, phase: str, scale: float) -> None:
+        """Set the strength scale for the global prefill/decode row.
+
+        ``phase`` is ``"prefill"`` or ``"decode"`` (rows 1 / 2). Decode is
+        the cache-safe knob; a prefill scale is accepted and stored but
+        forced to 1.0 at populate time (§7) so it never takes effect —
+        callers should use decode.
+        """
+        if phase not in ("prefill", "decode"):
+            raise ValueError(
+                f"global scale phase must be prefill/decode, got {phase!r}"
+            )
+        self._row_scales[RowOwner.global_(phase)] = float(scale)
+        self._dirty.mark_scales()
+
+    def set_row_scale(self, config_hash: int, phase: str, scale: float) -> None:
+        """Set the strength scale for a static per-request config row."""
+        if phase not in ("prefill", "decode"):
+            raise ValueError(f"row scale phase must be prefill/decode, got {phase!r}")
+        self._row_scales[RowOwner.config(config_hash, phase)] = float(scale)
+        self._dirty.mark_scales()
+
+    def set_dynamic_scale(self, dyn_id: int, scale: float) -> None:
+        """Set the strength scale for a dynamic-override row (by dyn_id)."""
+        self._row_scales[RowOwner.dyn(dyn_id)] = float(scale)
+        self._dirty.mark_scales()
+
+    def clear_scales(self) -> None:
+        """Reset every row's scale to the 1.0 default."""
+        if self._row_scales:
+            self._row_scales.clear()
+            self._dirty.mark_scales()
+
+    def _build_scales_vector(self, device: torch.device) -> torch.Tensor:
+        """Assemble the per-row scale vector in populate (row-position)
+        order ``[0, 1, 2, *config_rows, *dynamic_rows]`` — matching
+        ``_cached_indices`` — so it can be scattered with the same index
+        tensor the table write uses.
+
+        Row 0 (sentinel) and any prefill row are pinned to 1.0: scaling
+        them is meaningless (row 0) or cache-unsafe (prefill, §7).
+        """
+        ordered_configs = self._cached_ordered_configs or list(
+            self.config_to_row.items()
+        )
+        ordered_dynamic = self._cached_ordered_dynamic or list(
+            self._dynamic_to_row.items()
+        )
+        scales: list[float] = [
+            1.0,  # row 0 sentinel
+            1.0,  # row 1 global prefill — never scaled (cache safety)
+            self._row_scales.get(RowOwner.global_("decode"), 1.0),  # row 2 decode
+        ]
+        for (config_hash, phase), _row in ordered_configs:
+            # Prefill rows pinned to 1.0; decode rows take their scale.
+            scale = (
+                self._row_scales.get(RowOwner.config(config_hash, phase), 1.0)
+                if phase == "decode"
+                else 1.0
+            )
+            scales.append(scale)
+        for dyn_id, _row in ordered_dynamic:
+            scales.append(self._row_scales.get(RowOwner.dyn(dyn_id), 1.0))
+        return torch.tensor(scales, dtype=torch.float32, device=device)
+
+    def populate_steering_scales(
+        self, steerable_layers: dict[int, "torch.nn.Module"]
+    ) -> None:
+        """Cheap path: write ONLY the per-row scale buffers, no table
+        recompose. Called when ``_scales_dirty`` but not ``_tables_dirty``.
+
+        Writes the same per-row scale vector into every layer's
+        ``steering_scales`` buffer (each is tiny — ``num_rows`` floats).
+        """
+        if self._indices_dirty or self._cached_indices is None:
+            # Indices stale (config/dynamic membership changed) — fall back
+            # to a full populate which rebuilds indices and writes scales.
+            self._dirty.mark_content()
+            self.populate_steering_tables(steerable_layers)
+            return
+        indices = self._cached_indices
+        written: set[int] = set()
+        for layer_idx, mod in steerable_layers.items():
+            scales_buf = getattr(mod, "steering_scales", None)
+            if scales_buf is None or id(scales_buf) in written:
+                continue
+            scales_vec = self._build_scales_vector(scales_buf.device)
+            scales_buf.index_copy_(0, indices, scales_vec)
+            written.add(id(scales_buf))
+        self._dirty.scales = False
 
     def _global_dict_for_phase(self, phase: str) -> dict[str, dict[int, torch.Tensor]]:
         """Return the global vector dict for the given phase."""
-        if phase == "base":
-            return self.global_base_vectors
-        elif phase == "prefill":
-            return self.global_prefill_vectors
-        elif phase == "decode":
-            return self.global_decode_vectors
-        else:
-            raise ValueError(
-                f"Invalid global vector phase: {phase!r}. "
-                f"Must be 'base', 'prefill', or 'decode'."
-            )
+        return self._global_vectors.for_phase(phase)
 
     def _get_global_vec(
         self,
@@ -373,6 +1665,114 @@ class SteeringManager:
             squeezed = v.squeeze(0)
             result = squeezed.clone() if result is None else result + squeezed
         return result
+
+    def _site_has_clamps(self, hp_str: str, layer_idx: int) -> bool:
+        """True when any clamp (global tier, config, or dynamic override)
+        targets this site."""
+        for tier in (
+            self.global_clamp_base,
+            self.global_clamp_prefill,
+            self.global_clamp_decode,
+        ):
+            if layer_idx in tier.get(hp_str, {}):
+                return True
+        if any(
+            layer_idx in per_config.get(hp_str, {})
+            for per_config in self.config_clamps.values()
+        ):
+            return True
+        return any(
+            layer_idx in per_dyn.get(hp_str, {})
+            for per_dyn in self._dynamic_clamps.values()
+        )
+
+    def _build_clamp_site_rows(
+        self,
+        hp_str: str,
+        layer_idx: int,
+        ordered_configs: list[tuple[tuple[int, str], int]],
+        ordered_dynamic: list[tuple[int, int]],
+        *,
+        k_cap: int,
+        hidden_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        """Assemble one site's clamp matrices in row-position order.
+
+        Returns ``(dirs (num_rows, K, hidden) fp32 on *device*,
+        bounds (num_rows, K, 2) fp32 CPU, strength (num_rows, K) fp32 CPU,
+        any_clamp)``.  Row positions match ``_cached_indices``:
+        ``[0, 1, 2, *config_rows, *dynamic_rows]``.  Row 0 keeps the no-op
+        defaults (zero dirs); row 1 = concat(global base, global prefill);
+        row 2 = concat(global base, global decode); config rows =
+        concat(global base, global phase, per-request); dynamic-override
+        rows = concat(global base, global decode, that override's own
+        clamps).  A concat exceeding ``k_cap`` raises with the offending
+        site and row owner named — the per-payload cap can pass while a
+        LATER global-clamp set overflows an already-registered config or
+        dynamic-override row.
+        """
+        num_rows = 3 + len(ordered_configs) + len(ordered_dynamic)
+        dirs_mat = torch.zeros(
+            num_rows, k_cap, hidden_size, dtype=torch.float32, device=device
+        )
+        bounds_mat = torch.empty(num_rows, k_cap, 2, dtype=torch.float32)
+        bounds_mat[..., 0] = -float("inf")
+        bounds_mat[..., 1] = float("inf")
+        strength_mat = torch.ones(num_rows, k_cap, dtype=torch.float32)
+        any_clamp = False
+
+        g_base = self.global_clamp_base.get(hp_str, {}).get(layer_idx)
+        g_prefill = self.global_clamp_prefill.get(hp_str, {}).get(layer_idx)
+        g_decode = self.global_clamp_decode.get(hp_str, {}).get(layer_idx)
+
+        def _fill(pos: int, payloads: list[ClampSitePayload], owner: str) -> None:
+            nonlocal any_clamp
+            k_total = sum(int(p.dirs.shape[0]) for p in payloads)
+            if k_total > k_cap:
+                raise ValueError(
+                    f"Clamp row for {owner} at [{hp_str!r}][{layer_idx}] "
+                    f"needs {k_total} directions after composing global + "
+                    f"per-request tiers, exceeding max_clamp_directions="
+                    f"{k_cap}"
+                )
+            offset = 0
+            for p in payloads:
+                k = int(p.dirs.shape[0])
+                dirs_mat[pos, offset : offset + k] = p.dirs.to(device)
+                bounds_mat[pos, offset : offset + k] = p.bounds
+                strength_mat[pos, offset : offset + k] = p.strength
+                offset += k
+            if k_total > 0:
+                any_clamp = True
+
+        prefill_payloads = [p for p in (g_base, g_prefill) if p is not None]
+        decode_payloads = [p for p in (g_base, g_decode) if p is not None]
+        _fill(1, prefill_payloads, "global prefill")
+        _fill(2, decode_payloads, "global decode")
+
+        for i, ((config_hash, phase), _row_idx) in enumerate(ordered_configs):
+            per_req = (
+                self.config_clamps.get((config_hash, phase), {})
+                .get(hp_str, {})
+                .get(layer_idx)
+            )
+            payloads = list(prefill_payloads if phase == "prefill" else decode_payloads)
+            if per_req is not None:
+                payloads.append(per_req)
+            _fill(3 + i, payloads, f"config hash={config_hash} phase={phase}")
+
+        dyn_base = 3 + len(ordered_configs)
+        for j, (dyn_id, _row_idx) in enumerate(ordered_dynamic):
+            per_dyn = (
+                self._dynamic_clamps.get(dyn_id, {}).get(hp_str, {}).get(layer_idx)
+            )
+            payloads = list(decode_payloads)
+            if per_dyn is not None:
+                payloads.append(per_dyn)
+            _fill(dyn_base + j, payloads, f"dynamic id={dyn_id}")
+
+        return dirs_mat, bounds_mat, strength_mat, any_clamp
 
     def _stack_vectors_to_device(
         self, vecs: list[list[float] | np.ndarray]
@@ -515,11 +1915,14 @@ class SteeringManager:
         """Write current state into each layer's per-hook steering_table
         buffers.
 
-        For each hook point that has a table buffer on a layer:
+        For each hook point that has a table buffer on a layer
+        (``global_decode`` below = global_base + global_decode +
+        dynamic_tier, the decode-effective vector):
             Row 0 = zeros (always)
             Row 1 = global_base + global_prefill (or zeros)
-            Row 2 = global_base + global_decode (or zeros)
+            Row 2 = global_decode effective (or zeros)
             Rows 3+ = phase-appropriate global + per_request
+            Dynamic-override rows = global_decode effective + override
 
         Optimizations vs. the naive per-(hook, layer) loop:
 
@@ -552,7 +1955,7 @@ class SteeringManager:
                 active_tables.append((table, hp_str, layer_idx, mod))
 
         if not active_tables:
-            self._tables_dirty = False
+            self._dirty.content = False
             return
 
         # Derive device from the first active table; all tables share one
@@ -570,28 +1973,49 @@ class SteeringManager:
         # zero sentinel.  When the flag is False, the apply_steering
         # kernel skips the gather + add and just emits hidden_states.
         per_table_any_active: list[bool] = []
+        # Per active-table dynamic-tier vector (or None), captured during
+        # row assembly and written into each layer's ``dynamic_vec`` buffer
+        # at the end (dedicated-gather, §5.4).
+        per_table_tier_vec: list[torch.Tensor | None] = []
 
         # Snapshot config_to_row ordering. This is ALWAYS needed for the
         # row-assembly loop below, but ``indices`` only needs rebuilding
         # when this ordering changed (register/release).
         if (
-            self._indices_dirty
+            self._dirty.membership
             or self._cached_indices is None
             or self._cached_ordered_configs is None
+            or self._cached_ordered_dynamic is None
         ):
+            # Ordering is keyed by the logical ``config_to_row`` so the
+            # per-row scale / monitor owners (keyed by logical ``config_hash``)
+            # line up position-for-position.  Aliased logical configs share a
+            # physical row, so ``_cached_indices`` may repeat a row id; the
+            # ``index_copy_`` scatters below tolerate the duplicate (aliased
+            # configs carry identical additive content, so whichever write
+            # wins is correct).
             new_ordered_configs: list[tuple[tuple[int, str], int]] = list(
                 self.config_to_row.items()
             )
-            target_indices_list = [0, 1, 2] + [row for _, row in new_ordered_configs]
+            new_ordered_dynamic: list[tuple[int, int]] = list(
+                self._dynamic_to_row.items()
+            )
+            target_indices_list = (
+                list(range(NUM_RESERVED_ROWS))
+                + [row for _, row in new_ordered_configs]
+                + [row for _, row in new_ordered_dynamic]
+            )
             self._cached_indices = torch.tensor(
                 target_indices_list, dtype=torch.long, device=device
             )
             self._cached_ordered_configs = new_ordered_configs
-            self._indices_dirty = False
+            self._cached_ordered_dynamic = new_ordered_dynamic
+            self._dirty.membership = False
         indices: torch.Tensor = self._cached_indices
         ordered_configs: list[tuple[tuple[int, str], int]] = (
             self._cached_ordered_configs
         )
+        ordered_dynamic: list[tuple[int, int]] = self._cached_ordered_dynamic
 
         def zero_row_for(width: int) -> torch.Tensor:
             """Return a cached fp32 zero sentinel row of the given width."""
@@ -605,7 +2029,7 @@ class SteeringManager:
         # up shape ``(num_active_tables, num_rows, hidden)``. We do ONE
         # ``.to(dtype=table.dtype)`` cast on the whole stack instead of
         # per-(hook, layer), then index_copy_ each layer's slice.
-        num_rows = 3 + len(ordered_configs)
+        num_rows = NUM_RESERVED_ROWS + len(ordered_configs) + len(ordered_dynamic)
         per_table_rows: list[list[torch.Tensor]] = []
         for table, hp_str, layer_idx, _mod in active_tables:
             zero_row = zero_row_for(table.shape[1])
@@ -616,14 +2040,25 @@ class SteeringManager:
             decode_vec = self._get_global_vec(
                 hp_str, layer_idx, self.global_decode_vectors
             )
+            # Dynamic additive tier (§5.4, dedicated-gather): NOT folded
+            # into the rows. It lives in a per-(layer, hook) ``dynamic_vec``
+            # buffer the kernel adds on top of the row gather, gated
+            # per-token (decode-only). Captured here to write that buffer
+            # below and to flag ``any_active``.
+            tier_vec = self._get_global_vec(
+                hp_str, layer_idx, self.dynamic_tier_vectors
+            )
+            per_table_tier_vec.append(tier_vec)
 
             global_prefill = self._add_vecs(base_vec, prefill_vec)
             global_decode = self._add_vecs(base_vec, decode_vec)
 
             # ``any_active`` is True iff at least one row >= 1 carries a
             # non-zero contribution — equivalent to "not every row >= 1 is
-            # the ``zero_row`` sentinel".  Tracked as we append rows.
-            any_active = False
+            # the ``zero_row`` sentinel".  Tracked as we append rows. The
+            # dedicated tier also counts: the kernel must run to apply it
+            # even when no table row is active.
+            any_active = tier_vec is not None
 
             rows: list[torch.Tensor] = [zero_row]  # row 0: always zero
             if global_prefill is not None:
@@ -665,6 +2100,28 @@ class SteeringManager:
                     any_active = True
                 elif per_req is not None:
                     row_content = per_req.squeeze(0)
+                    any_active = True
+                else:
+                    row_content = zero_row
+                rows.append(row_content)
+
+            # Dynamic-override rows: composed exactly like a decode
+            # per-request row — global decode effective + override
+            # vectors. (Dynamic overrides are decode-only by design;
+            # see docs/design/dynamic_steering.md §7.)
+            for dyn_id, _row_idx in ordered_dynamic:
+                dyn_vec = (
+                    self._dynamic_vectors.get(dyn_id, {}).get(hp_str, {}).get(layer_idx)
+                )
+                if global_decode is not None and dyn_vec is not None:
+                    dyn_aligned = dyn_vec.squeeze(0).to(global_decode.device)
+                    row_content = global_decode + dyn_aligned
+                    any_active = True
+                elif global_decode is not None:
+                    row_content = global_decode
+                    any_active = True
+                elif dyn_vec is not None:
+                    row_content = dyn_vec.squeeze(0)
                     any_active = True
                 else:
                     row_content = zero_row
@@ -715,9 +2172,158 @@ class SteeringManager:
                 continue
             flag_buf.fill_(per_table_any_active[active_pos])
 
+        # Write each (hook, layer)'s dedicated dynamic-tier vector (§5.4)
+        # into its ``dynamic_vec`` buffer (or zero it when no tier is set).
+        for active_pos, (_table, hp_str, _layer_idx, mod) in enumerate(active_tables):
+            try:
+                hp_enum = SteeringHookPoint(hp_str)
+            except ValueError:
+                continue
+            dvec_buf = getattr(mod, HOOK_POINT_DYNVEC_ATTR[hp_enum], None)
+            if dvec_buf is None:
+                continue
+            tier_vec = per_table_tier_vec[active_pos]
+            if tier_vec is None:
+                dvec_buf.zero_()
+            else:
+                dvec_buf.copy_(tier_vec.squeeze(0).to(dvec_buf.device))
+
+        # Write each (hook, layer)'s in-graph monitor config (Phase 2, §8)
+        # into its probe / params / active buffers. A configured site sets
+        # the probe + [threshold, sharpness] and flips ``active`` True; an
+        # unconfigured site is deactivated (``active`` False ⇒ the monitor
+        # op is a no-op there, leaving the runner's flat gate intact). The
+        # site can move at runtime without recapture because the op is
+        # emitted at every hook and gated by this tensor flag.
+        for active_pos, (_table, hp_str, layer_idx, mod) in enumerate(active_tables):
+            try:
+                hp_enum = SteeringHookPoint(hp_str)
+            except ValueError:
+                continue
+            active_buf = getattr(mod, HOOK_POINT_MONITOR_ACTIVE_ATTR[hp_enum], None)
+            if active_buf is None:
+                continue
+            cfg = self.monitor_configs.get(hp_str, {}).get(layer_idx)
+            if cfg is None:
+                active_buf.fill_(False)
+                continue
+            probe_buf = getattr(mod, HOOK_POINT_MONITOR_PROBE_ATTR[hp_enum], None)
+            params_buf = getattr(mod, HOOK_POINT_MONITOR_PARAMS_ATTR[hp_enum], None)
+            if probe_buf is None or params_buf is None:
+                active_buf.fill_(False)
+                continue
+            probe_buf.copy_(cfg["probe"].to(probe_buf.device))
+            params_buf.copy_(
+                torch.tensor(
+                    [
+                        cfg["threshold"],
+                        cfg["sharpness"],
+                        1.0 if cfg.get("gate_rows") else 0.0,
+                    ],
+                    dtype=torch.float32,
+                    device=params_buf.device,
+                )
+            )
+            active_buf.fill_(True)
+
+        # Write each (hook, layer)'s PER-ROW monitor probe table + params
+        # (per-request in-graph monitor). Built in row-position order and
+        # scattered with the same ``indices`` as the table write; the
+        # ``row_active`` flag is set iff some row at this site carries a probe.
+        # Layers whose row-monitor buffers are still the ``(1, 1)`` dummies
+        # (engine did not enable the row monitor, or a test fake) are skipped.
+        for active_pos, (_table, hp_str, layer_idx, mod) in enumerate(active_tables):
+            try:
+                hp_enum = SteeringHookPoint(hp_str)
+            except ValueError:
+                continue
+            row_active_buf = getattr(mod, HOOK_POINT_ROW_ACTIVE_ATTR[hp_enum], None)
+            if row_active_buf is None:
+                continue
+            probe_tbl = getattr(mod, HOOK_POINT_ROW_PROBE_ATTR[hp_enum], None)
+            row_params_buf = getattr(mod, HOOK_POINT_ROW_PARAMS_ATTR[hp_enum], None)
+            if (
+                probe_tbl is None
+                or row_params_buf is None
+                or probe_tbl.shape[0] != _table.shape[0]
+            ):
+                # Disabled (dummy buffers) — never activate the per-row path.
+                row_active_buf.fill_(False)
+                continue
+            probe_mat, params_mat, any_cfg = self._build_row_probe_and_params(
+                hp_str, layer_idx, probe_tbl.device, int(_table.shape[1])
+            )
+            if not any_cfg:
+                row_active_buf.fill_(False)
+                continue
+            probe_tbl.index_copy_(0, indices, probe_mat.to(probe_tbl.dtype))
+            row_params_buf.index_copy_(0, indices, params_mat.to(row_params_buf.dtype))
+            row_active_buf.fill_(True)
+
+        # Write each (hook, layer)'s directional-clamp dirs/bounds/strength
+        # buffers, in the same row-position order (and with the same scatter
+        # ``indices``) as the table write. Modeled on the per-row-monitor
+        # block above, not the fp32 mega-stack — the 3-D ``(rows, K,
+        # hidden)`` dirs shape opts out of the batched cast. Sites with no
+        # clamps configured anywhere skip the matrix build entirely (the
+        # flag write keeps the kernel's short-circuit correct on clamp
+        # active->inactive transitions).
+        for active_pos, (_table, hp_str, layer_idx, mod) in enumerate(active_tables):
+            try:
+                hp_enum = SteeringHookPoint(hp_str)
+            except ValueError:
+                continue
+            clamp_active_buf = getattr(mod, CLAMP_ANY_ACTIVE_ATTR[hp_enum], None)
+            if clamp_active_buf is None:
+                continue
+            if not self.has_any_clamps or not self._site_has_clamps(hp_str, layer_idx):
+                clamp_active_buf.fill_(False)
+                continue
+            dirs_buf = getattr(mod, CLAMP_DIRS_ATTR[hp_enum], None)
+            bounds_buf = getattr(mod, CLAMP_BOUNDS_ATTR[hp_enum], None)
+            strength_buf = getattr(mod, CLAMP_STRENGTH_ATTR[hp_enum], None)
+            if dirs_buf is None or bounds_buf is None or strength_buf is None:
+                clamp_active_buf.fill_(False)
+                continue
+            dirs_mat, bounds_mat, strength_mat, any_clamp = self._build_clamp_site_rows(
+                hp_str,
+                layer_idx,
+                ordered_configs,
+                ordered_dynamic,
+                k_cap=int(dirs_buf.shape[1]),
+                # Per-site width, read off the site's own buffer: mHC models
+                # register multi-stream hooks at ``hc_mult * hidden``, so
+                # ``dirs`` is ``(rows, K, width)`` with width varying by hook.
+                hidden_size=int(dirs_buf.shape[2]),
+                device=dirs_buf.device,
+            )
+            if not any_clamp:
+                clamp_active_buf.fill_(False)
+                continue
+            dirs_buf.index_copy_(0, indices, dirs_mat.to(dirs_buf.dtype))
+            bounds_buf.index_copy_(0, indices, bounds_mat.to(bounds_buf.device))
+            strength_buf.index_copy_(0, indices, strength_mat.to(strength_buf.device))
+            clamp_active_buf.fill_(True)
+
+        # Write the per-row strength scales (§5.3) alongside the tables.
+        # The scale vector is hook/layer-independent, so build it once and
+        # scatter into each distinct layer's ``steering_scales`` buffer with
+        # the same ``indices`` used for the table write.
+        scales_written: set[int] = set()
+        for _table, _hp_str, _layer_idx, mod in active_tables:
+            scales_buf = getattr(mod, "steering_scales", None)
+            if scales_buf is None or id(scales_buf) in scales_written:
+                continue
+            scales_vec = self._build_scales_vector(scales_buf.device)
+            scales_buf.index_copy_(0, indices, scales_vec)
+            scales_written.add(id(scales_buf))
+
         # All per-layer table buffers now reflect current state. Subsequent
         # calls can be skipped by the caller until a mutator sets dirty again.
-        self._tables_dirty = False
+        # A full populate writes scales alongside the tables, so it clears
+        # every dirty flag (membership was cleared in the indices-rebuild block
+        # above; clearing it again is a no-op).
+        self._dirty.clear_after_full_populate()
 
     @property
     def num_active_configs(self) -> int:

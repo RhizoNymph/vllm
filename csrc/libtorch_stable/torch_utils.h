@@ -6,11 +6,7 @@
 #include <torch/csrc/stable/tensor.h>
 #include <torch/headeronly/util/shim_utils.h>
 
-#ifndef USE_ROCM
-  #include <cuda_runtime.h>
-#else
-  #include <hip/hip_runtime.h>
-#endif
+#include <cuda_runtime.h>
 #include <cublas_v2.h>
 
 #include <deque>
@@ -74,6 +70,10 @@ inline cudaDeviceProp* get_device_prop() {
   std::call_once(device_flags[device_index], initDeviceProperty, device_index);
   return &device_properties[device_index];
 }
+
+// Stable ABI equivalent of TORCH_CHECK_NOT_IMPLEMENTED.
+#define STD_TORCH_CHECK_NOT_IMPLEMENTED(cond, ...) \
+  STD_TORCH_CHECK(cond, "NotImplementedError: ", __VA_ARGS__)
 
 // Utility to get the current CUDA stream for a given device using stable APIs.
 // Returns a cudaStream_t for use in kernel launches.

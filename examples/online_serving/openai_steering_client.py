@@ -80,7 +80,7 @@ def main() -> None:
 
     # Base steering applied to both prefill and decode.
     base = {
-        "post_mlp": pack_hook(
+        "post_block": pack_hook(
             {15: rng.standard_normal(HIDDEN_SIZE).astype(PACK_DTYPE)},
             # Per-layer scales: the server multiplies row-by-row without
             # re-encoding the bytes, so the same vector can be reused at

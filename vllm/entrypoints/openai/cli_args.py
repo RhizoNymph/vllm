@@ -20,19 +20,16 @@ from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     validate_chat_template,
 )
-from vllm.entrypoints.constants import (
-    H11_MAX_HEADER_COUNT_DEFAULT,
-    H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
-)
 from vllm.entrypoints.openai.models.protocol import (
     LoRAModulePath,
     SteeringModulePath,
 )
-from vllm.logger import init_logger
+from vllm.entrypoints.serve.utils.constants import (
+    H11_MAX_HEADER_COUNT_DEFAULT,
+    H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
+)
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-logger = init_logger(__name__)
 
 
 class LoRAParserAction(argparse.Action):
@@ -119,10 +116,12 @@ class BaseFrontendArgs:
     \"base_model_name\": \"id\"}`"""
     steering_modules: list[SteeringModulePath] | None = None
     """Named steering module configurations in either 'name=path' format or
-    JSON format. Each module is a JSON file containing steering vector
-    specifications. Example (simple): `'creativity=/path/to/creativity.json'`
-    Example (JSON): `{\"name\": \"creativity\",
-    \"path\": \"/path/to/creativity.json\"}`"""
+    JSON format. Additive modules point to JSON files containing steering
+    vector specifications; SAE delta modules point to directories containing
+    a manifest.json plus per-site safetensors. Example (additive):
+    `'creativity=/path/to/creativity.json'` Example (SAE):
+    `'golden_gate=/path/to/sae_dir'` Example (JSON):
+    `{\"name\": \"creativity\", \"path\": \"/path/to/creativity.json\"}`"""
     chat_template: str | None = None
     """The file path to the chat template, or the template in single-line form
     for the specified model."""
@@ -177,6 +176,8 @@ class BaseFrontendArgs:
     log. The default of None means unlimited."""
     enable_prompt_tokens_details: bool = False
     """If set to True, enable prompt_tokens_details in usage."""
+    enable_per_request_metrics: bool = False
+    """If set to True, include per-request timing metrics in API responses."""
     enable_server_load_tracking: bool = False
     """If set to True, enable tracking server_load_metrics in the app state."""
     enable_force_include_usage: bool = False
@@ -420,6 +421,15 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "Defaults to data_parallel_size if not specified.",
     )
     parser.add_argument(
+        "--patch-sidecar-port",
+        type=int,
+        default=0,
+        help="Loopback port for the internal activation-patching sidecar "
+        "api_server spawned when the Rust frontend is used with "
+        "--enable-patching. 0 (default) auto-picks a free port. Ignored "
+        "without the Rust frontend or when VLLM_RUST_PATCH_SIDECAR=0.",
+    )
+    parser.add_argument(
         "--config",
         help="Read CLI options from a config file. "
         "Must be a YAML with the following options: "
@@ -451,6 +461,14 @@ def validate_parsed_serve_args(args: argparse.Namespace):
         raise TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
     if args.enable_log_outputs and not args.enable_log_requests:
         raise TypeError("Error: --enable-log-outputs requires --enable-log-requests")
+
+    if getattr(args, "enable_per_request_metrics", False) and getattr(
+        args, "disable_log_stats", False
+    ):
+        raise ValueError(
+            "Error: --enable-per-request-metrics requires engine statistics "
+            "logging; remove --disable-log-stats to enable per-request metrics."
+        )
 
     if args.data_parallel_multi_port_external_lb:
         from vllm.entrypoints.openai.dp_supervisor import (

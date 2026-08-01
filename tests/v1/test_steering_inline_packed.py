@@ -16,6 +16,7 @@ Covers:
 import numpy as np
 import torch
 
+from vllm.config.sae_steering_types import SAEClampEntry, SAEClampSpec
 from vllm.config.steering_types import (
     _torch_dtype_to_pack_dtype,
     maybe_pack_inline_steering_for_request,
@@ -40,37 +41,37 @@ class TestPackHelpers:
         assert _torch_dtype_to_pack_dtype(torch.bfloat16) == np.dtype(np.float32)
 
     def test_pack_steering_for_dtype_bare_list(self):
-        spec = {"post_mlp": {0: [1.0, 2.0, 3.0]}}
+        spec = {"post_block": {0: [1.0, 2.0, 3.0]}}
         out = pack_steering_for_dtype(spec, np.float32)
         assert out is not None
-        arr = out["post_mlp"][0]
+        arr = out["post_block"][0]
         assert arr.dtype == np.float32
         assert arr.tolist() == [1.0, 2.0, 3.0]
 
     def test_pack_steering_for_dtype_with_scale(self):
-        spec = {"post_mlp": {0: {"vector": [1.0, 2.0], "scale": 3.0}}}
+        spec = {"post_block": {0: {"vector": [1.0, 2.0], "scale": 3.0}}}
         out = pack_steering_for_dtype(spec, np.float32)
         assert out is not None
-        assert out["post_mlp"][0].tolist() == [3.0, 6.0]
+        assert out["post_block"][0].tolist() == [3.0, 6.0]
 
     def test_pack_effective_steering_resolves_then_casts(self):
-        base = {"post_mlp": {0: [1.0, 2.0]}}
-        prefill = {"post_mlp": {0: [10.0, 20.0]}}
+        base = {"post_block": {0: [1.0, 2.0]}}
+        prefill = {"post_block": {0: [10.0, 20.0]}}
         out = pack_effective_steering(base, prefill, np.float32)
         assert out is not None
         # 1.0+10.0=11.0, 2.0+20.0=22.0
-        assert out["post_mlp"][0].dtype == np.float32
-        assert out["post_mlp"][0].tolist() == [11.0, 22.0]
+        assert out["post_block"][0].dtype == np.float32
+        assert out["post_block"][0].tolist() == [11.0, 22.0]
 
     def test_pack_effective_steering_handles_none(self):
         assert pack_effective_steering(None, None, np.float32) is None
         assert pack_effective_steering({}, {}, np.float32) is None
 
     def test_pack_dtype_fp16_loses_some_precision_but_preserves_shape(self):
-        spec = {"post_mlp": {0: list(range(16))}}
+        spec = {"post_block": {0: list(range(16))}}
         out = pack_steering_for_dtype(spec, np.float16)
         assert out is not None
-        arr = out["post_mlp"][0]
+        arr = out["post_block"][0]
         assert arr.dtype == np.float16
         assert arr.shape == (16,)
         # fp16 represents small ints exactly.
@@ -99,7 +100,7 @@ class TestMaybePack:
     def test_inline_packs_and_clears_originals(self):
         sp = SamplingParams(
             max_tokens=1,
-            steering_vectors={"post_mlp": {0: [1.0, 2.0]}},
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
         )
         maybe_pack_inline_steering_for_request(sp, torch.float32)
         assert sp.steering_vectors is None
@@ -108,11 +109,11 @@ class TestMaybePack:
         assert sp._effective_prefill_steering_packed is not None
         assert sp._effective_decode_steering_packed is not None
         # Both phases resolve to the same result when only base is set.
-        assert sp._effective_prefill_steering_packed["post_mlp"][0].tolist() == [
+        assert sp._effective_prefill_steering_packed["post_block"][0].tolist() == [
             1.0,
             2.0,
         ]
-        assert sp._effective_decode_steering_packed["post_mlp"][0].tolist() == [
+        assert sp._effective_decode_steering_packed["post_block"][0].tolist() == [
             1.0,
             2.0,
         ]
@@ -120,24 +121,76 @@ class TestMaybePack:
     def test_phase_specific_resolves_per_phase(self):
         sp = SamplingParams(
             max_tokens=1,
-            steering_vectors={"post_mlp": {0: [1.0, 2.0]}},
-            prefill_steering_vectors={"post_mlp": {0: [10.0, 20.0]}},
-            decode_steering_vectors={"post_mlp": {0: [100.0, 200.0]}},
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
+            prefill_steering_vectors={"post_block": {0: [10.0, 20.0]}},
+            decode_steering_vectors={"post_block": {0: [100.0, 200.0]}},
         )
         maybe_pack_inline_steering_for_request(sp, torch.float32)
-        assert sp._effective_prefill_steering_packed["post_mlp"][0].tolist() == [
+        assert sp._effective_prefill_steering_packed["post_block"][0].tolist() == [
             11.0,
             22.0,
         ]
-        assert sp._effective_decode_steering_packed["post_mlp"][0].tolist() == [
+        assert sp._effective_decode_steering_packed["post_block"][0].tolist() == [
             101.0,
             202.0,
         ]
 
+    def test_wrong_width_rejected_before_packing(self):
+        # The packer clears the inline fields, so it is the ONE seam every
+        # inline-steering request crosses before the multiprocessing
+        # boundary — wrong-width rows must be rejected here or they
+        # shape-crash the worker's steering table population.
+        import pytest
+
+        sp = SamplingParams(
+            max_tokens=1,
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
+        )
+        with pytest.raises(ValueError, match="width 2 != expected"):
+            maybe_pack_inline_steering_for_request(
+                sp, torch.float32, expected_row_width=8
+            )
+        # Nothing was packed or cleared: the request never leaves admission.
+        assert sp.steering_vectors is not None
+        assert sp._effective_prefill_steering_packed is None
+
+    def test_wrong_width_phase_tier_rejected(self):
+        import pytest
+
+        sp = SamplingParams(
+            max_tokens=1,
+            prefill_steering_vectors={"pre_attn": {3: [1.0, 2.0, 3.0]}},
+        )
+        with pytest.raises(
+            ValueError, match=r"prefill_steering_vectors\['pre_attn'\]\[3\]"
+        ):
+            maybe_pack_inline_steering_for_request(
+                sp, torch.float32, expected_row_width=8
+            )
+
+    def test_matching_width_packs(self):
+        sp = SamplingParams(
+            max_tokens=1,
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
+        )
+        maybe_pack_inline_steering_for_request(
+            sp, torch.float32, expected_row_width=2
+        )
+        assert sp.steering_vectors is None
+        assert sp._effective_prefill_steering_packed is not None
+
+    def test_no_width_configured_is_permissive(self):
+        sp = SamplingParams(
+            max_tokens=1,
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
+        )
+        maybe_pack_inline_steering_for_request(sp, torch.float32)
+        assert sp._effective_prefill_steering_packed is not None
+
     def test_idempotent_when_already_packed(self):
         sp = SamplingParams(
             max_tokens=1,
-            steering_vectors={"post_mlp": {0: [1.0, 2.0]}},
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
         )
         maybe_pack_inline_steering_for_request(sp, torch.float32)
         first = sp._effective_prefill_steering_packed
@@ -148,12 +201,12 @@ class TestMaybePack:
     def test_effective_steering_returns_packed_after_pack(self):
         sp = SamplingParams(
             max_tokens=1,
-            steering_vectors={"post_mlp": {0: [1.0, 2.0]}},
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
         )
         maybe_pack_inline_steering_for_request(sp, torch.float32)
         # The cached_property fallback should now return packed values.
         assert sp.effective_prefill_steering is not None
-        assert sp.effective_prefill_steering["post_mlp"][0].tolist() == [1.0, 2.0]
+        assert sp.effective_prefill_steering["post_block"][0].tolist() == [1.0, 2.0]
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +218,7 @@ class TestHashDeterminism:
     def test_packed_request_hash_matches_unpacked(self):
         """A packed and unpacked submission of the same logical request
         must produce the same prefix-cache hash."""
-        vectors = {"post_mlp": {0: [1.0, 2.0, 3.0]}}
+        vectors = {"post_block": {0: [1.0, 2.0, 3.0]}}
         sp_unpacked = SamplingParams(max_tokens=1, steering_vectors=vectors)
         unpacked_hash = sp_unpacked.prefill_steering_config_hash
 
@@ -177,10 +230,10 @@ class TestHashDeterminism:
 
     def test_different_vectors_different_hash(self):
         sp_a = SamplingParams(
-            max_tokens=1, steering_vectors={"post_mlp": {0: [1.0, 2.0]}}
+            max_tokens=1, steering_vectors={"post_block": {0: [1.0, 2.0]}}
         )
         sp_b = SamplingParams(
-            max_tokens=1, steering_vectors={"post_mlp": {0: [1.0, 3.0]}}
+            max_tokens=1, steering_vectors={"post_block": {0: [1.0, 3.0]}}
         )
         maybe_pack_inline_steering_for_request(sp_a, torch.float32)
         maybe_pack_inline_steering_for_request(sp_b, torch.float32)
@@ -197,7 +250,7 @@ class TestMsgspecRoundtrip:
         """Packed ndarrays survive msgspec encode/decode with dtype + values."""
         sp_in = SamplingParams(
             max_tokens=1,
-            steering_vectors={"post_mlp": {0: [1.0, 2.0, 3.0]}},
+            steering_vectors={"post_block": {0: [1.0, 2.0, 3.0]}},
         )
         maybe_pack_inline_steering_for_request(sp_in, torch.float32)
         assert sp_in._effective_prefill_steering_packed is not None
@@ -208,15 +261,17 @@ class TestMsgspecRoundtrip:
         sp_out = dec.decode(bufs)
 
         assert sp_out._effective_prefill_steering_packed is not None
-        out_arr = sp_out._effective_prefill_steering_packed["post_mlp"][0]
-        in_arr = sp_in._effective_prefill_steering_packed["post_mlp"][0]
+        out_arr = sp_out._effective_prefill_steering_packed["post_block"][0]
+        in_arr = sp_in._effective_prefill_steering_packed["post_block"][0]
         assert isinstance(out_arr, np.ndarray)
         assert out_arr.dtype == in_arr.dtype
         assert np.array_equal(out_arr, in_arr)
 
     def test_packed_payload_smaller_than_unpacked(self):
         """Sanity: the packed wire form is smaller than the unpacked one."""
-        vectors = {"post_mlp": {i: [float(j) for j in range(2560)] for i in range(34)}}
+        vectors = {
+            "post_block": {i: [float(j) for j in range(2560)] for i in range(34)}
+        }
         sp_unpacked = SamplingParams(max_tokens=1, steering_vectors=vectors)
         sp_packed = SamplingParams(max_tokens=1, steering_vectors=vectors)
         maybe_pack_inline_steering_for_request(sp_packed, torch.float32)
@@ -230,3 +285,44 @@ class TestMsgspecRoundtrip:
         assert packed_bytes * 2 < unpacked_bytes, (
             f"packed={packed_bytes} not < unpacked={unpacked_bytes} / 2"
         )
+
+
+class TestMaybePackSAE:
+    """Packing inline additive vectors must not perturb the SAE-clamp
+    contribution to the per-phase steering-config hash (prefix-cache parity)."""
+
+    def test_preserves_sae_hash_contribution(self):
+        sae_spec = SAEClampSpec(
+            module_name="g",
+            clamps={
+                "post_block": {
+                    0: (
+                        SAEClampEntry(
+                            feature_idx=1,
+                            kind="absolute",
+                            value=2.0,
+                        ),
+                    )
+                }
+            },
+        )
+        sp = SamplingParams(
+            steering_vectors={"post_block": {0: [1.0, 2.0]}},
+            sae_clamp_specs=(sae_spec,),
+        )
+        prefill_hash = sp.prefill_steering_config_hash
+        decode_hash = sp.decode_steering_config_hash
+        prefill_additive_hash = sp.prefill_additive_steering_config_hash
+        decode_additive_hash = sp.decode_additive_steering_config_hash
+        prefill_sae_hash = sp.prefill_sae_clamp_config_hash
+        decode_sae_hash = sp.decode_sae_clamp_config_hash
+
+        maybe_pack_inline_steering_for_request(sp, torch.float32)
+
+        assert sp.prefill_steering_config_hash == prefill_hash
+        assert sp.decode_steering_config_hash == decode_hash
+        assert sp.prefill_additive_steering_config_hash == prefill_additive_hash
+        assert sp.decode_additive_steering_config_hash == decode_additive_hash
+        assert sp.prefill_sae_clamp_config_hash == prefill_sae_hash
+        assert sp.decode_sae_clamp_config_hash == decode_sae_hash
+        assert sp.sae_clamp_specs == (sae_spec,)

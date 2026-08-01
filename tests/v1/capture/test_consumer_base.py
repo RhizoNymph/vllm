@@ -31,7 +31,7 @@ from vllm.v1.capture.consumer import _BatchedAdapter
 # ---------------------------------------------------------------------------
 
 
-def _key(req_id: str = "req-1", layer: int = 3, hook: str = "post_mlp") -> CaptureKey:
+def _key(req_id: str = "req-1", layer: int = 3, hook: str = "post_block") -> CaptureKey:
     return (VllmInternalRequestId(req_id), layer, hook)
 
 
@@ -165,7 +165,7 @@ def test_multiple_keys_finalize_independently():
     adapter = _BatchedAdapter(consumer)
 
     key_a = _key("req-a", layer=1, hook="pre_attn")
-    key_b = _key("req-b", layer=5, hook="post_mlp")
+    key_b = _key("req-b", layer=5, hook="post_block")
 
     adapter.submit_chunk(
         CaptureChunk(
@@ -330,7 +330,7 @@ class GlobalSumConsumer(CaptureConsumer):
         self.sums: dict[CaptureKey, float] = {}
 
     def global_capture_spec(self) -> CaptureSpec | None:
-        return CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        return CaptureSpec(hooks={"post_block": [0]}, positions="last_prompt")
 
     def on_capture(
         self,
@@ -347,7 +347,7 @@ def test_hello_world_consumer_through_batched_adapter():
 
     spec = consumer.global_capture_spec()
     assert spec is not None
-    assert spec.hooks == {"post_mlp": [0]}
+    assert spec.hooks == {"post_block": [0]}
     assert spec.positions == "last_prompt"
 
     key = _key()

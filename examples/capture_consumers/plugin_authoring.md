@@ -40,7 +40,7 @@ class MyConsumer(CaptureConsumer):
 
     def global_capture_spec(self) -> CaptureSpec:
         return CaptureSpec(
-            hooks={"post_mlp": self._layers},
+            hooks={"post_block": self._layers},
             positions="last_prompt",
         )
 
@@ -86,7 +86,7 @@ pattern — the consumer always needs the same data.
 ```python
 def global_capture_spec(self) -> CaptureSpec:
     return CaptureSpec(
-        hooks={"post_mlp": [0, 15, 31]},
+        hooks={"post_block": [0, 15, 31]},
         positions="last_prompt",
     )
 ```
@@ -104,7 +104,7 @@ class FlexConsumer(CaptureConsumer):
     reads_client_spec = True
 
     def validate_client_spec(self, raw_spec, ctx):
-        hooks = raw_spec.get("hooks", {"post_mlp": list(range(ctx.num_hidden_layers))})
+        hooks = raw_spec.get("hooks", {"post_block": list(range(ctx.num_hidden_layers))})
         positions = raw_spec.get("positions", "all_prompt")
         return CaptureSpec(hooks=hooks, positions=positions)
 ```
@@ -197,7 +197,7 @@ import torch
 consumer = MyConsumer(MagicMock(), {"layers": [0]})
 adapter = _BatchedAdapter(consumer)
 
-key = (VllmInternalRequestId("test-req"), 0, "post_mlp")
+key = (VllmInternalRequestId("test-req"), 0, "post_block")
 
 adapter.submit_chunk(CaptureChunk(
     key=key,
@@ -247,7 +247,7 @@ class SumConsumer(CaptureConsumer):
 
     def global_capture_spec(self) -> CaptureSpec:
         return CaptureSpec(
-            hooks={"post_mlp": self._layers},
+            hooks={"post_block": self._layers},
             positions="last_prompt",
         )
 

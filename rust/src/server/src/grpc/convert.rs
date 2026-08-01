@@ -1,15 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 //! Conversion between gRPC protobuf types and internal `vllm-text`
 //! request/response types.
 
+use std::collections::HashMap;
+
 use tonic::Status;
 use uuid::Uuid;
-use vllm_engine_core_client::protocol::{StopReason, StructuredOutputsParams};
+use vllm_engine_core_client::protocol::output::StopReason;
+use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams;
+use vllm_engine_core_client::protocol::{ClampHookTable, SteeringClamps, SteeringVectorSpec};
 use vllm_text::{
     DecodedLogprobs, DecodedPromptLogprobs, FinishReason, Finished, Prompt, SamplingParams,
     TextDecodeOptions, TextRequest,
 };
 
 use super::pb;
+use crate::routes::openai::utils::capture::build_capture_results_response;
+use crate::routes::openai::utils::steering::unpack_steering_hook;
 
 // ========================================================================================
 // Request conversion
@@ -68,9 +77,34 @@ pub fn to_text_request(
             let map = sampling_params.vllm_xargs.get_or_insert_with(Default::default);
             map.insert("kv_transfer_params".to_string(), kv_json);
         }
+        if let Some(ec_struct) = kv.ec_transfer_params.as_ref() {
+            let ec_json = proto_struct_to_json(ec_struct);
+            let map = sampling_params.vllm_xargs.get_or_insert_with(Default::default);
+            map.insert("ec_transfer_params".to_string(), ec_json);
+        }
         if kv.bypass_prefix_cache {
             sampling_params.skip_reading_prefix_cache = Some(true);
         }
+    }
+
+    // Thread per-request steering and capture.
+    if let Some(steering) = req.steering {
+        sampling_params.steering_vectors = convert_packed_steering(steering.steering_vectors)?;
+        sampling_params.prefill_steering_vectors =
+            convert_packed_steering(steering.prefill_steering_vectors)?;
+        sampling_params.decode_steering_vectors =
+            convert_packed_steering(steering.decode_steering_vectors)?;
+        if !steering.name.is_empty() {
+            sampling_params.steering_name = Some(steering.name);
+        }
+        sampling_params.steering_clamps = convert_packed_clamps(steering.steering_clamps)?;
+        sampling_params.prefill_steering_clamps =
+            convert_packed_clamps(steering.prefill_steering_clamps)?;
+        sampling_params.decode_steering_clamps =
+            convert_packed_clamps(steering.decode_steering_clamps)?;
+    }
+    if let Some(capture) = req.capture.as_ref() {
+        sampling_params.capture = Some(proto_struct_to_json_prefer_int(capture));
     }
 
     let decode_options = TextDecodeOptions {
@@ -91,6 +125,9 @@ pub fn to_text_request(
         cache_salt: kv.map(|k| &k.cache_salt).filter(|s| !s.is_empty()).cloned(),
         add_special_tokens: true,
         data_parallel_rank: None,
+        reasoning_parser_kwargs: None,
+        lora_request: None,
+        arrival_time: None,
     })
 }
 
@@ -228,32 +265,18 @@ fn convert_structured_output(
         StructuredOutput::Json(schema) => {
             let json: serde_json::Value = serde_json::from_str(schema)
                 .map_err(|e| Status::invalid_argument(format!("invalid json schema: {e}")))?;
-            StructuredOutputsParams {
-                json: Some(json),
-                ..Default::default()
-            }
+            StructuredOutputsParams::json(json)
         }
-        StructuredOutput::Regex(regex) => StructuredOutputsParams {
-            regex: Some(regex.clone()),
-            ..Default::default()
-        },
-        StructuredOutput::Choice(choices) => StructuredOutputsParams {
-            choice: Some(choices.choices.clone()),
-            ..Default::default()
-        },
-        StructuredOutput::Grammar(grammar) => StructuredOutputsParams {
-            grammar: Some(grammar.clone()),
-            ..Default::default()
-        },
-        StructuredOutput::JsonObject(true) => StructuredOutputsParams {
-            json_object: Some(true),
-            ..Default::default()
-        },
+        StructuredOutput::Regex(regex) => StructuredOutputsParams::regex(regex.clone()),
+        StructuredOutput::Choice(choices) => {
+            StructuredOutputsParams::choice(choices.choices.clone())
+        }
+        StructuredOutput::Grammar(grammar) => StructuredOutputsParams::grammar(grammar.clone()),
+        StructuredOutput::JsonObject(true) => StructuredOutputsParams::json_object(),
         StructuredOutput::JsonObject(false) => return Ok(None),
-        StructuredOutput::StructuralTag(tag) => StructuredOutputsParams {
-            structural_tag: Some(tag.clone()),
-            ..Default::default()
-        },
+        StructuredOutput::StructuralTag(tag) => {
+            StructuredOutputsParams::structural_tag(tag.clone())
+        }
     };
     Ok(Some(params))
 }
@@ -343,16 +366,23 @@ fn to_finish_info(finished: &Finished, token_ids: &[u32]) -> pb::FinishInfo {
             (PbFinishReason::Stop as i32, sr)
         }
         FinishReason::Length => (PbFinishReason::Length as i32, None),
-        FinishReason::Abort | FinishReason::Error | FinishReason::Repetition => {
+        FinishReason::Abort | FinishReason::Error | FinishReason::Repetition(_) => {
             (PbFinishReason::Aborted as i32, None)
         }
     };
 
+    let capture_results = build_capture_results_response(&finished.capture_results)
+        .and_then(|results| serde_json::to_value(results).ok())
+        .as_ref()
+        .and_then(json_to_proto_struct);
+
     pb::FinishInfo {
-        num_output_tokens: finished.output_token_count as u32,
+        num_output_tokens: finished.usage.output_token_count as u32,
         finish_reason,
         stop_reason,
         kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_proto_struct),
+        ec_transfer_params: finished.ec_transfer_params.as_ref().and_then(json_to_proto_struct),
+        capture_results,
     }
 }
 
@@ -414,6 +444,127 @@ fn positions_to_proto(
     }
 
     (logprobs, ranks, candidates)
+}
+
+// ========================================================================================
+// Steering / capture conversion
+// ========================================================================================
+
+/// Convert one proto packed-steering map (hook name → blob) into the inline
+/// [`SteeringVectorSpec`] forwarded southbound. An empty map yields `None`.
+fn convert_packed_steering(
+    map: HashMap<String, pb::SteeringHookPacked>,
+) -> Result<Option<SteeringVectorSpec>, Status> {
+    if map.is_empty() {
+        return Ok(None);
+    }
+    let mut spec = SteeringVectorSpec::with_capacity(map.len());
+    for (hook, blob) in map {
+        // Proto3 repeated fields have no presence: an empty `scales` means
+        // "unset" (scale 1.0 for every row).
+        let scales = (!blob.scales.is_empty()).then_some(blob.scales.as_slice());
+        let entries = unpack_steering_hook(
+            &blob.dtype,
+            &blob.shape,
+            &blob.layer_indices,
+            scales,
+            &blob.data,
+        )
+        .map_err(|err| Status::invalid_argument(format!("{err}")))?;
+        spec.insert(hook, entries);
+    }
+    Ok(Some(spec))
+}
+
+/// Convert one proto packed-clamp map (hook name → blob) into the canonical
+/// [`SteeringClamps`] engine-core's strict decoder expects.
+///
+/// The raw direction bytes are upcast exactly to float64 and the flattened
+/// proto `bounds` `[lo0, hi0, lo1, hi1, ...]` are re-paired into the per-row
+/// `lo`/`hi` lists (proto doubles carry `±inf` natively). An empty map
+/// yields `None`.
+fn convert_packed_clamps(
+    map: HashMap<String, pb::ClampHookPacked>,
+) -> Result<Option<SteeringClamps>, Status> {
+    if map.is_empty() {
+        return Ok(None);
+    }
+    let mut hooks = std::collections::HashMap::with_capacity(map.len());
+    for (hook, blob) in map {
+        let [rows, hidden] = blob.shape[..] else {
+            return Err(Status::invalid_argument(format!(
+                "clamp hook '{hook}': shape must be [n, hidden]; got {:?}",
+                blob.shape,
+            )));
+        };
+        let n = rows as usize;
+        if blob.bounds.len() != 2 * n {
+            return Err(Status::invalid_argument(format!(
+                "clamp hook '{hook}': bounds length {} != 2 * num_rows {n}",
+                blob.bounds.len(),
+            )));
+        }
+        if blob.layer_indices.len() != n || blob.strengths.len() != n {
+            return Err(Status::invalid_argument(format!(
+                "clamp hook '{hook}': layer_indices/strengths length must equal num_rows {n}",
+            )));
+        }
+        let data = crate::routes::openai::utils::clamps::upcast_rows_to_f64_le(
+            &blob.dtype,
+            n,
+            hidden as usize,
+            &blob.data,
+        )
+        .map_err(|message| Status::invalid_argument(format!("clamp hook '{hook}': {message}")))?;
+        hooks.insert(
+            hook,
+            ClampHookTable {
+                shape: vec![rows, hidden],
+                layer_indices: blob.layer_indices,
+                data,
+                lo: (0..n).map(|i| blob.bounds[2 * i]).collect(),
+                hi: (0..n).map(|i| blob.bounds[2 * i + 1]).collect(),
+                strength: blob.strengths.clone(),
+            },
+        );
+    }
+    Ok(Some(SteeringClamps { hooks }))
+}
+
+/// Convert a proto `Struct` into JSON, preferring integer JSON numbers for
+/// whole-valued `NumberValue`s.
+///
+/// Protobuf `Struct` encodes every number as a `double`, but capture specs use
+/// integer layer/position indices that engine-core validates as ints. Coerce
+/// whole numbers back to integers so the forwarded capture dict matches what
+/// the HTTP (JSON) path produces.
+fn proto_struct_to_json_prefer_int(s: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        s.fields
+            .iter()
+            .map(|(k, v)| (k.clone(), proto_value_to_json_prefer_int(v)))
+            .collect(),
+    )
+}
+
+fn proto_value_to_json_prefer_int(v: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match v.kind.as_ref() {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(Kind::NumberValue(n)) => {
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                serde_json::Value::Number((*n as i64).into())
+            } else {
+                serde_json::json!(*n)
+            }
+        }
+        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(Kind::ListValue(list)) => serde_json::Value::Array(
+            list.values.iter().map(proto_value_to_json_prefer_int).collect(),
+        ),
+        Some(Kind::StructValue(s)) => proto_struct_to_json_prefer_int(s),
+    }
 }
 
 // ========================================================================================
@@ -500,7 +651,7 @@ impl ResponseOpts {
 
 #[cfg(test)]
 mod tests {
-    use vllm_engine_core_client::protocol::StopReason;
+    use vllm_engine_core_client::protocol::output::StopReason;
     use vllm_text::{FinishReason, Finished, Prompt};
 
     use super::pb::finish_info::{FinishReason as PbFinishReason, StopReason as PbStopReason};
@@ -513,6 +664,94 @@ mod tests {
             prompt: Some(pb::generate_request::Prompt::Text("hi".to_string())),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn steering_and_capture_thread_into_sampling_params() {
+        use prost_types::value::Kind;
+
+        let data: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let req = pb::GenerateRequest {
+            steering: Some(pb::Steering {
+                steering_vectors: std::collections::HashMap::from([(
+                    "pre_attn".to_string(),
+                    pb::SteeringHookPacked {
+                        dtype: "float32".to_string(),
+                        shape: vec![1, 2],
+                        layer_indices: vec![4],
+                        data,
+                        scales: vec![],
+                    },
+                )]),
+                prefill_steering_vectors: std::collections::HashMap::new(),
+                decode_steering_vectors: std::collections::HashMap::new(),
+                name: "creativity".to_string(),
+                ..Default::default()
+            }),
+            capture: Some(prost_types::Struct {
+                fields: std::collections::BTreeMap::from([(
+                    "min_position".to_string(),
+                    prost_types::Value {
+                        kind: Some(Kind::NumberValue(2.0)),
+                    },
+                )]),
+            }),
+            ..base_request()
+        };
+
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        let sp = &text.sampling_params;
+
+        let spec = sp.steering_vectors.as_ref().expect("steering decoded");
+        assert_eq!(spec["pre_attn"][&4].vector, vec![1.0, 2.0]);
+        assert_eq!(sp.steering_name.as_deref(), Some("creativity"));
+
+        // Whole-valued proto numbers are coerced to JSON integers so the
+        // forwarded capture dict matches what the HTTP/JSON path produces.
+        let capture = sp.capture.as_ref().expect("capture present");
+        assert_eq!(capture["min_position"], serde_json::json!(2));
+        assert!(capture["min_position"].is_i64());
+    }
+
+    #[test]
+    fn packed_clamps_convert_to_canonical_form() {
+        // A proto ClampHookPacked map converts into the canonical
+        // SteeringClamps: rows upcast to f64 bytes, the flattened proto
+        // bounds re-paired into per-row lo/hi with native infinities.
+        let data: Vec<u8> = [1.0f64, 0.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let req = pb::GenerateRequest {
+            steering: Some(pb::Steering {
+                steering_clamps: std::collections::HashMap::from([(
+                    "post_attn".to_string(),
+                    pb::ClampHookPacked {
+                        dtype: "float64".to_string(),
+                        shape: vec![2, 2],
+                        layer_indices: vec![5, 5],
+                        data,
+                        // Row 0: [-2, 2]; row 1: [-inf, 4] (lo infinite).
+                        bounds: vec![-2.0, 2.0, f64::NEG_INFINITY, 4.0],
+                        strengths: vec![1.0, 0.5],
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..base_request()
+        };
+
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
+        let clamps = text.sampling_params.steering_clamps.as_ref().expect("clamps present");
+        let table = &clamps.hooks["post_attn"];
+        assert_eq!(table.shape, vec![2, 2]);
+        assert_eq!(table.layer_indices, vec![5, 5]);
+        let rows: Vec<f64> = table
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(rows, vec![1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(table.lo, vec![-2.0, f64::NEG_INFINITY]);
+        assert_eq!(table.hi, vec![2.0, 4.0]);
+        assert_eq!(table.strength, vec![1.0, 0.5]);
     }
 
     #[test]
@@ -589,10 +828,15 @@ mod tests {
 
     fn finished(reason: FinishReason) -> Finished {
         Finished {
-            prompt_token_count: 0,
-            output_token_count: 0,
+            usage: vllm_llm::TokenUsage {
+                prompt_token_count: 0,
+                output_token_count: 0,
+                cached_token_count: 0,
+            },
             finish_reason: reason,
             kv_transfer_params: None,
+            ec_transfer_params: None,
+            capture_results: Default::default(),
         }
     }
 

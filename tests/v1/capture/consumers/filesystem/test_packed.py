@@ -100,10 +100,10 @@ def _write_packed(
 class TestReader:
     def test_per_file_round_trip(self, tmp_path: pathlib.Path) -> None:
         arr = np.arange(2 * 8, dtype=np.float32).reshape(2, 8)
-        _write_per_file(tmp_path / "req-1", 3, "post_mlp", arr, "float32")
-        entry = read_per_file(tmp_path / "req-1" / "3_post_mlp.bin")
+        _write_per_file(tmp_path / "req-1", 3, "post_block", arr, "float32")
+        entry = read_per_file(tmp_path / "req-1" / "3_post_block.bin")
         assert entry.layer == 3
-        assert entry.hook == "post_mlp"
+        assert entry.hook == "post_block"
         assert entry.dtype == "float32"
         np.testing.assert_array_equal(entry.array, arr)
 
@@ -111,44 +111,44 @@ class TestReader:
         a = np.random.randn(4, 16).astype(np.float32)
         b = np.random.randn(1, 16).astype(np.float32)
         c = np.random.randn(7, 16).astype(np.float32)
-        tensors = [(0, "post_mlp", a), (5, "post_mlp", b), (5, "post_attn", c)]
+        tensors = [(0, "post_block", a), (5, "post_block", b), (5, "post_attn", c)]
         _write_packed(tmp_path / "req-2", tensors, "float32")
 
         got = read_packed(tmp_path / "req-2")
-        assert set(got) == {(0, "post_mlp"), (5, "post_mlp"), (5, "post_attn")}
-        np.testing.assert_array_equal(got[(0, "post_mlp")].array, a)
-        np.testing.assert_array_equal(got[(5, "post_mlp")].array, b)
+        assert set(got) == {(0, "post_block"), (5, "post_block"), (5, "post_attn")}
+        np.testing.assert_array_equal(got[(0, "post_block")].array, a)
+        np.testing.assert_array_equal(got[(5, "post_block")].array, b)
         np.testing.assert_array_equal(got[(5, "post_attn")].array, c)
 
     def test_packed_accepts_index_or_bin_or_dir(self, tmp_path: pathlib.Path) -> None:
         arr = np.random.randn(2, 4).astype(np.float32)
-        _write_packed(tmp_path / "r", [(1, "post_mlp", arr)], "float32")
+        _write_packed(tmp_path / "r", [(1, "post_block", arr)], "float32")
         for target in (
             tmp_path / "r",
             tmp_path / "r" / PACKED_INDEX_NAME,
             tmp_path / "r" / PACKED_BIN_NAME,
         ):
             got = read_packed(target)
-            np.testing.assert_array_equal(got[(1, "post_mlp")].array, arr)
+            np.testing.assert_array_equal(got[(1, "post_block")].array, arr)
 
     def test_read_request_autodetects_layout(self, tmp_path: pathlib.Path) -> None:
         # per_file dir
         pf = tmp_path / "pf"
-        _write_per_file(pf, 0, "post_mlp", np.ones((2, 4), np.float32), "float32")
-        _write_per_file(pf, 1, "post_mlp", np.zeros((3, 4), np.float32), "float32")
+        _write_per_file(pf, 0, "post_block", np.ones((2, 4), np.float32), "float32")
+        _write_per_file(pf, 1, "post_block", np.zeros((3, 4), np.float32), "float32")
         got_pf = read_request(pf)
-        assert set(got_pf) == {(0, "post_mlp"), (1, "post_mlp")}
+        assert set(got_pf) == {(0, "post_block"), (1, "post_block")}
         # packed dir
         pk = tmp_path / "pk"
-        _write_packed(pk, [(0, "post_mlp", np.ones((2, 4), np.float32))], "float32")
+        _write_packed(pk, [(0, "post_block", np.ones((2, 4), np.float32))], "float32")
         got_pk = read_request(pk)
-        assert set(got_pk) == {(0, "post_mlp")}
+        assert set(got_pk) == {(0, "post_block")}
 
     def test_bfloat16_returns_uint16(self, tmp_path: pathlib.Path) -> None:
         # bf16 is stored as raw uint16; the reader returns it as uint16.
         raw = np.array([1, 2, 3, 4], dtype=np.uint16).reshape(2, 2)
-        _write_per_file(tmp_path / "bf", 0, "post_mlp", raw, "bfloat16")
-        entry = read_per_file(tmp_path / "bf" / "0_post_mlp.bin")
+        _write_per_file(tmp_path / "bf", 0, "post_block", raw, "bfloat16")
+        entry = read_per_file(tmp_path / "bf" / "0_post_block.bin")
         assert entry.dtype == "bfloat16"
         assert entry.array.dtype == np.uint16
         np.testing.assert_array_equal(entry.array, raw)
@@ -156,7 +156,7 @@ class TestReader:
     def test_truncated_packed_raises(self, tmp_path: pathlib.Path) -> None:
         arr = np.random.randn(4, 8).astype(np.float32)
         d = tmp_path / "trunc"
-        _write_packed(d, [(0, "post_mlp", arr)], "float32")
+        _write_packed(d, [(0, "post_block", arr)], "float32")
         # Corrupt: truncate the bin so the entry's bytes are missing.
         (d / PACKED_BIN_NAME).write_bytes(b"\x00\x00")
         try:
@@ -276,70 +276,70 @@ class TestPackedConsumer:
         req = "req-pk"
         c = _consumer(tmp_path)
         try:
-            _register_packed(c, req, {"post_mlp": [0, 2]})
-            # (0,post_mlp) spans 2 steps; (2,post_mlp) one step. Submit
+            _register_packed(c, req, {"post_block": [0, 2]})
+            # (0,post_block) spans 2 steps; (2,post_block) one step. Submit
             # interleaved across keys to exercise per-chunk indexing.
             a0 = torch.randn(2, 8, dtype=torch.float32)
             a1 = torch.randn(3, 8, dtype=torch.float32)
             b0 = torch.randn(1, 8, dtype=torch.float32)
-            c.submit_chunk(_chunk(req, 0, "post_mlp", a0, 0))
-            c.submit_chunk(_chunk(req, 2, "post_mlp", b0, 0))
-            c.submit_chunk(_chunk(req, 0, "post_mlp", a1, 1))
+            c.submit_chunk(_chunk(req, 0, "post_block", a0, 0))
+            c.submit_chunk(_chunk(req, 2, "post_block", b0, 0))
+            c.submit_chunk(_chunk(req, 0, "post_block", a1, 1))
             for layer in (0, 2):
-                c.submit_finalize(_finalize(req, layer, "post_mlp"))
+                c.submit_finalize(_finalize(req, layer, "post_block"))
 
-            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_block")
             assert _wait(c, key0).status == "ok"
 
             req_dir = tmp_path / "t" / req
             assert (req_dir / PACKED_BIN_NAME).exists()
             assert (req_dir / PACKED_INDEX_NAME).exists()
-            assert not list(req_dir.glob("*_post_mlp.bin")), "no per-file bins"
+            assert not list(req_dir.glob("*_post_block.bin")), "no per-file bins"
 
             got = read_request(req_dir)
-            assert set(got) == {(0, "post_mlp"), (2, "post_mlp")}
+            assert set(got) == {(0, "post_block"), (2, "post_block")}
             np.testing.assert_array_equal(
-                got[(0, "post_mlp")].array, torch.cat([a0, a1]).numpy()
+                got[(0, "post_block")].array, torch.cat([a0, a1]).numpy()
             )
-            np.testing.assert_array_equal(got[(2, "post_mlp")].array, b0.numpy())
+            np.testing.assert_array_equal(got[(2, "post_block")].array, b0.numpy())
         finally:
             c.shutdown(timeout=5.0)
 
     def test_submit_chunk_batch_round_trip(self, tmp_path: pathlib.Path) -> None:
         # Batched submit: a step's worth of (layer) chunks handed over in
         # one call must produce the same packed file as per-chunk submits.
-        # Two steps batched; (0,post_mlp) spans both, (2,post_mlp) only
+        # Two steps batched; (0,post_block) spans both, (2,post_block) only
         # step 0 — concatenation order must follow submission order.
         req = "req-batch"
         c = _consumer(tmp_path)
         try:
-            _register_packed(c, req, {"post_mlp": [0, 2]})
+            _register_packed(c, req, {"post_block": [0, 2]})
             a0 = torch.randn(2, 8, dtype=torch.float32)
             b0 = torch.randn(1, 8, dtype=torch.float32)
             a1 = torch.randn(3, 8, dtype=torch.float32)
             # step 0: both layers, in one batch
             c.submit_chunk_batch(
-                [_chunk(req, 0, "post_mlp", a0, 0), _chunk(req, 2, "post_mlp", b0, 0)]
+                [_chunk(req, 0, "post_block", a0, 0), _chunk(req, 2, "post_block", b0, 0)]
             )
             # step 1: only layer 0
-            c.submit_chunk_batch([_chunk(req, 0, "post_mlp", a1, 1)])
+            c.submit_chunk_batch([_chunk(req, 0, "post_block", a1, 1)])
             for layer in (0, 2):
-                c.submit_finalize(_finalize(req, layer, "post_mlp"))
+                c.submit_finalize(_finalize(req, layer, "post_block"))
 
-            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_block")
             assert _wait(c, key0).status == "ok"
 
             req_dir = tmp_path / "t" / req
             # One packed file for the whole request, no per-file bins.
             assert (req_dir / PACKED_BIN_NAME).exists()
-            assert not list(req_dir.glob("*_post_mlp.bin"))
+            assert not list(req_dir.glob("*_post_block.bin"))
 
             got = read_request(req_dir)
-            assert set(got) == {(0, "post_mlp"), (2, "post_mlp")}
+            assert set(got) == {(0, "post_block"), (2, "post_block")}
             np.testing.assert_array_equal(
-                got[(0, "post_mlp")].array, torch.cat([a0, a1]).numpy()
+                got[(0, "post_block")].array, torch.cat([a0, a1]).numpy()
             )
-            np.testing.assert_array_equal(got[(2, "post_mlp")].array, b0.numpy())
+            np.testing.assert_array_equal(got[(2, "post_block")].array, b0.numpy())
         finally:
             c.shutdown(timeout=5.0)
 
@@ -352,9 +352,9 @@ class TestPackedConsumer:
         def run(req: str, batched: bool) -> bytes:
             c = _consumer(tmp_path)
             try:
-                _register_packed(c, req, {"post_mlp": layers})
+                _register_packed(c, req, {"post_block": layers})
                 step_chunks = [
-                    _chunk(req, layer, "post_mlp", tensors[layer], 0)
+                    _chunk(req, layer, "post_block", tensors[layer], 0)
                     for layer in layers
                 ]
                 if batched:
@@ -363,8 +363,8 @@ class TestPackedConsumer:
                     for ch in step_chunks:
                         c.submit_chunk(ch)
                 for layer in layers:
-                    c.submit_finalize(_finalize(req, layer, "post_mlp"))
-                key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+                    c.submit_finalize(_finalize(req, layer, "post_block"))
+                key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_block")
                 assert _wait(c, key0).status == "ok"
                 return (tmp_path / "t" / req / PACKED_BIN_NAME).read_bytes()
             finally:
@@ -378,19 +378,19 @@ class TestPackedConsumer:
         req = "req-agg"
         c = _consumer(tmp_path)
         try:
-            _register_packed(c, req, {"post_mlp": [0, 1]})
-            c.submit_chunk(_chunk(req, 0, "post_mlp", torch.randn(2, 8), 0))
-            c.submit_chunk(_chunk(req, 1, "post_mlp", torch.randn(2, 8), 0))
+            _register_packed(c, req, {"post_block": [0, 1]})
+            c.submit_chunk(_chunk(req, 0, "post_block", torch.randn(2, 8), 0))
+            c.submit_chunk(_chunk(req, 1, "post_block", torch.randn(2, 8), 0))
             # Finalize only the first key — packed file must NOT publish.
-            c.submit_finalize(_finalize(req, 0, "post_mlp"))
+            c.submit_finalize(_finalize(req, 0, "post_block"))
             time.sleep(0.2)
             req_dir = tmp_path / "t" / req
             assert not (req_dir / PACKED_INDEX_NAME).exists(), (
                 "packed index published before all keys finalized"
             )
             # Finalize the last expected key — now it publishes.
-            c.submit_finalize(_finalize(req, 1, "post_mlp"))
-            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+            c.submit_finalize(_finalize(req, 1, "post_block"))
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_block")
             assert _wait(c, key0).status == "ok"
             assert (req_dir / PACKED_INDEX_NAME).exists()
         finally:
@@ -402,14 +402,14 @@ class TestPackedConsumer:
         req = "req-zero"
         c = _consumer(tmp_path)
         try:
-            _register_packed(c, req, {"post_mlp": [0, 1]})
-            c.submit_chunk(_chunk(req, 0, "post_mlp", torch.randn(2, 8), 0))
+            _register_packed(c, req, {"post_block": [0, 1]})
+            c.submit_chunk(_chunk(req, 0, "post_block", torch.randn(2, 8), 0))
             for layer in (0, 1):  # key 1 had no chunk
-                c.submit_finalize(_finalize(req, layer, "post_mlp"))
-            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+                c.submit_finalize(_finalize(req, layer, "post_block"))
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_block")
             assert _wait(c, key0).status == "ok"
             got = read_request(tmp_path / "t" / req)
-            assert set(got) == {(0, "post_mlp")}
+            assert set(got) == {(0, "post_block")}
         finally:
             c.shutdown(timeout=5.0)
 
@@ -421,19 +421,19 @@ class TestPackedConsumer:
             raw = FilesystemCaptureRequest(
                 request_id=req,
                 tag="t",
-                hooks={"post_mlp": [0]},
+                hooks={"post_block": [0]},
                 positions="last_prompt",
             )
             c.validate_client_spec(raw, _ctx(req))
             t0 = torch.randn(2, 8, dtype=torch.float32)
-            c.submit_chunk(_chunk(req, 0, "post_mlp", t0, 0))
-            c.submit_finalize(_finalize(req, 0, "post_mlp"))
-            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+            c.submit_chunk(_chunk(req, 0, "post_block", t0, 0))
+            c.submit_finalize(_finalize(req, 0, "post_block"))
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_block")
             assert _wait(c, key0).status == "ok"
             req_dir = tmp_path / "t" / req
-            assert (req_dir / "0_post_mlp.bin").exists()
+            assert (req_dir / "0_post_block.bin").exists()
             assert not (req_dir / PACKED_INDEX_NAME).exists()
-            entry = read_per_file(req_dir / "0_post_mlp.bin")
+            entry = read_per_file(req_dir / "0_post_block.bin")
             np.testing.assert_array_equal(entry.array, t0.numpy())
             assert entry.dtype == "float32"  # sidecar now self-describing
         finally:
@@ -451,21 +451,21 @@ class TestPackedConsumer:
                 {
                     "request_id": req,
                     "tag": "t",
-                    "hooks": {"post_mlp": [0, 1]},
+                    "hooks": {"post_block": [0, 1]},
                     "positions": "last_prompt",
                     "layout": "packed",
                 },
                 _ctx(req),
             )
             for layer in (0, 1):
-                c.submit_chunk(_chunk(req, layer, "post_mlp", torch.randn(2, 8), 0))
+                c.submit_chunk(_chunk(req, layer, "post_block", torch.randn(2, 8), 0))
             for layer in (0, 1):
-                c.submit_finalize(_finalize(req, layer, "post_mlp"))
-            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+                c.submit_finalize(_finalize(req, layer, "post_block"))
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_block")
             assert _wait(c, key0).status == "ok"
             req_dir = tmp_path / "t" / req
             assert (req_dir / PACKED_INDEX_NAME).exists()
-            assert set(read_request(req_dir)) == {(0, "post_mlp"), (1, "post_mlp")}
+            assert set(read_request(req_dir)) == {(0, "post_block"), (1, "post_block")}
         finally:
             c.shutdown(timeout=5.0)
 
@@ -478,17 +478,17 @@ class TestPackedConsumer:
                 {
                     "request_id": req,
                     "tag": "t",
-                    "hooks": {"post_mlp": [0]},
+                    "hooks": {"post_block": [0]},
                     "positions": "last_prompt",
                 },
                 _ctx(req),
             )
-            c.submit_chunk(_chunk(req, 0, "post_mlp", torch.randn(2, 8), 0))
-            c.submit_finalize(_finalize(req, 0, "post_mlp"))
-            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_mlp")
+            c.submit_chunk(_chunk(req, 0, "post_block", torch.randn(2, 8), 0))
+            c.submit_finalize(_finalize(req, 0, "post_block"))
+            key0: CaptureKey = (VllmInternalRequestId(req), 0, "post_block")
             assert _wait(c, key0).status == "ok"
             req_dir = tmp_path / "t" / req
-            assert (req_dir / "0_post_mlp.bin").exists()
+            assert (req_dir / "0_post_block.bin").exists()
             assert not (req_dir / PACKED_INDEX_NAME).exists()
         finally:
             c.shutdown(timeout=5.0)
@@ -507,7 +507,7 @@ class TestPackedConsumer:
                     {
                         "request_id": req,
                         "tag": "t",
-                        "hooks": {"post_mlp": [0]},
+                        "hooks": {"post_block": [0]},
                         "positions": "last_prompt",
                         "layout": "bogus",
                     },
@@ -539,7 +539,7 @@ class TestPackedPipelineParallel:
         # back into the request's full layer set.
         req = "req-pp"
         total = 4
-        hooks = {"post_mlp": [0, 1, 2, 3]}
+        hooks = {"post_block": [0, 1, 2, 3]}
         tensors = {layer: torch.randn(2, 8, dtype=torch.float32) for layer in range(4)}
         c0 = _pp_consumer(tmp_path, pp_size=2, pp_rank=0, total_layers=total)
         c1 = _pp_consumer(tmp_path, pp_size=2, pp_rank=1, total_layers=total)
@@ -548,16 +548,16 @@ class TestPackedPipelineParallel:
             c1.validate_client_spec(_pp_raw(req, hooks), _ctx(req))
             # The manager only feeds each stage its owned layers.
             for layer in (0, 1):
-                c0.submit_chunk(_chunk(req, layer, "post_mlp", tensors[layer], 0))
+                c0.submit_chunk(_chunk(req, layer, "post_block", tensors[layer], 0))
             for layer in (0, 1):
-                c0.submit_finalize(_finalize(req, layer, "post_mlp"))
+                c0.submit_finalize(_finalize(req, layer, "post_block"))
             for layer in (2, 3):
-                c1.submit_chunk(_chunk(req, layer, "post_mlp", tensors[layer], 0))
+                c1.submit_chunk(_chunk(req, layer, "post_block", tensors[layer], 0))
             for layer in (2, 3):
-                c1.submit_finalize(_finalize(req, layer, "post_mlp"))
+                c1.submit_finalize(_finalize(req, layer, "post_block"))
 
-            assert _wait(c0, (VllmInternalRequestId(req), 0, "post_mlp")).status == "ok"
-            assert _wait(c1, (VllmInternalRequestId(req), 2, "post_mlp")).status == "ok"
+            assert _wait(c0, (VllmInternalRequestId(req), 0, "post_block")).status == "ok"
+            assert _wait(c1, (VllmInternalRequestId(req), 2, "post_block")).status == "ok"
 
             req_dir = tmp_path / "t" / req
             # Per-stage files exist; the pp-agnostic packed.json does not.
@@ -569,10 +569,10 @@ class TestPackedPipelineParallel:
             assert not (req_dir / PACKED_BIN_NAME).exists()
 
             got = read_request(req_dir)
-            assert set(got) == {(layer, "post_mlp") for layer in range(4)}
+            assert set(got) == {(layer, "post_block") for layer in range(4)}
             for layer in range(4):
                 np.testing.assert_array_equal(
-                    got[(layer, "post_mlp")].array, tensors[layer].numpy()
+                    got[(layer, "post_block")].array, tensors[layer].numpy()
                 )
         finally:
             c0.shutdown(timeout=5.0)
@@ -588,7 +588,7 @@ class TestPackedPipelineParallel:
         c1 = _pp_consumer(tmp_path, pp_size=2, pp_rank=1, total_layers=4)
         try:
             spec = c1.validate_client_spec(
-                _pp_raw(req, {"post_mlp": [0, 1]}), _ctx(req)
+                _pp_raw(req, {"post_block": [0, 1]}), _ctx(req)
             )
             assert isinstance(spec, CaptureSpec)
             # No accumulation state for a stage that owns none of the layers.
@@ -604,8 +604,8 @@ class TestPackedPipelineParallel:
         req = "req-pp-expected"
         c1 = _pp_consumer(tmp_path, pp_size=2, pp_rank=1, total_layers=4)
         try:
-            c1.validate_client_spec(_pp_raw(req, {"post_mlp": [0, 1, 2, 3]}), _ctx(req))
+            c1.validate_client_spec(_pp_raw(req, {"post_block": [0, 1, 2, 3]}), _ctx(req))
             state = c1._packed_states[req]
-            assert state.expected_keys == {(2, "post_mlp"), (3, "post_mlp")}
+            assert state.expected_keys == {(2, "post_block"), (3, "post_block")}
         finally:
             c1.shutdown(timeout=5.0)

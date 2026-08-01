@@ -43,6 +43,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
     SteeringHookPoint,
+    apply_block_steering,
     apply_layer_steering,
     get_steering_buffer_dtype,
     register_steering_buffers,
@@ -52,18 +53,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
+    WeightsMapper,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -328,17 +325,39 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
         )
+        # mlp_in is the normed MLP input (injectable branch-tensor hook).
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
         hidden_states = self.mlp(hidden_states)
-
-        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_MLP)
-
+        # post_block must observe the true block output: residual + the *normed*
+        # MLP branch (= hidden_states[L+1]). Apply the post-FFN norm before the
+        # hook. Steering still rides ``residual`` so generation is unchanged.
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        # mlp_out is the normed MLP branch added to the residual stream, so
+        # post_block == post_attn + mlp_out (in pristine runs).
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
+
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
 
         return hidden_states, residual
 
 
 @support_torch_compile
 class Gemma3Model(nn.Module):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            # weight_name: (param_name, shard_id)
+            ".q_proj": (".qkv_proj", "q"),
+            ".k_proj": (".qkv_proj", "k"),
+            ".v_proj": (".qkv_proj", "v"),
+            ".gate_proj": (".gate_up_proj", 0),
+            ".up_proj": (".gate_up_proj", 1),
+        }
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -350,8 +369,16 @@ class Gemma3Model(nn.Module):
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
         steering_config = getattr(vllm_config, "steering_config", None)
+        # Buffer rows must cover the static config pool AND the dynamic-override
+        # pool (rows allocated at runtime by RequestSteeringOverride); mirror
+        # get_steering_buffer_config / the runner's warmup table_rows. Omitting
+        # max_dynamic_steering_configs undersizes the table and the override
+        # path writes past it (device-side assert in populate_steering_tables).
         max_steering_configs = (
-            steering_config.max_steering_configs if steering_config else 0
+            steering_config.max_steering_configs
+            + getattr(steering_config, "max_dynamic_steering_configs", 0)
+            if steering_config
+            else 0
         )
         steering_dtype = get_steering_buffer_dtype(vllm_config)
 
@@ -431,84 +458,12 @@ class Gemma3Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            # Revert +1 during llama.cpp conversion
-            # see: https://github.com/ggml-org/llama.cpp/blob/be7c3034108473beda214fd1d7c98fd6a7a3bdf5/convert_hf_to_gguf.py#L3397-L3400
-            if (
-                self.quant_config
-                and self.quant_config.get_name() == "gguf"
-                and name.endswith("norm.weight")
-            ):
-                loaded_weight -= 1
-
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
-
-            # Check if this is a scale parameter that needs remapping first
-            if name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
-                # Try to remap the scale name first
-                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-                if remapped_name is not None and remapped_name in params_dict:
-                    # Successfully remapped, use the remapped name
-                    param = params_dict[remapped_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(remapped_name)
-                    continue
-                # If remapping failed, continue with normal processing
-
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale.
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+    hf_to_vllm_mapper = Gemma3Model.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -576,4 +531,4 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

@@ -2,20 +2,30 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.config.multimodal import MultiModalConfig
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.batch_serving import (
+    OpenAIServingChatBatch,
+)
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    BatchChatCompletionRequest,
+    ChatCompletionRequest,
+)
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-from vllm.entrypoints.openai.engine.protocol import GenerationError
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse, GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+from vllm.entrypoints.openai.steering.registry import SteeringModuleRegistry
+from vllm.entrypoints.scale_out.render.serving import ServingRender
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
+from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -72,31 +82,51 @@ class MockVllmConfig:
     parallel_config: MockParallelConfig
 
 
+@dataclass
+class DummyTokenizer:
+    max_chars_per_token: int = 1
+
+    def decode(self, tokens: list[int]) -> str:
+        return str(tokens)
+
+    def encode(self, text: str, **kwargs) -> list[int]:
+        return list(range(len(text)))
+
+    def __call__(self, text: str, **kwargs):
+        return type("Tokenized", (), {"input_ids": self.encode(text, **kwargs)})()
+
+
 def _build_renderer(model_config: MockModelConfig):
     return HfRenderer(
         MockVllmConfig(model_config, parallel_config=MockParallelConfig()),
-        cached_tokenizer_from_config(model_config),
+        DummyTokenizer(),
     )
 
 
-def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
+def _build_serving_chat(
+    engine: AsyncLLM,
+    serving_cls=OpenAIServingChat,
+) -> OpenAIServingChat:
+    engine.vllm_config = MockVllmConfig(  # type: ignore[attr-defined]
+        engine.model_config,
+        parallel_config=MockParallelConfig(),
+    )
     models = OpenAIServingModels(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
     )
-    serving_render = OpenAIServingRender(
+    online_renderer = OnlineRenderer(
         model_config=engine.model_config,
         renderer=engine.renderer,
-        model_registry=models.registry,
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
     )
-    serving_chat = OpenAIServingChat(
+    serving_chat = serving_cls(
         engine,
         models,
         response_role="assistant",
-        openai_serving_render=serving_render,
+        online_renderer=online_renderer,
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
@@ -109,7 +139,7 @@ def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
             [{"prompt_token_ids": [1, 2, 3]}],
         )
 
-    serving_chat.openai_serving_render.preprocess_chat = AsyncMock(
+    serving_chat.online_renderer.preprocess_chat = AsyncMock(
         side_effect=_fake_preprocess_chat
     )
     return serving_chat
@@ -183,11 +213,37 @@ async def test_openai_chat_keeps_mm_cache_for_engine_execution():
 
     assert isinstance(result, tuple)
     assert (
-        serving_chat.openai_serving_render.preprocess_chat.call_args.kwargs[
-            "skip_mm_cache"
-        ]
+        serving_chat.online_renderer.preprocess_chat.call_args.kwargs["skip_mm_cache"]
         is False
     )
+
+
+def _build_serving_render(engine: AsyncLLM) -> ServingRender:
+    models = OpenAIServingModels(
+        engine_client=engine,
+        base_model_paths=BASE_MODEL_PATHS,
+    )
+    online_renderer = OnlineRenderer(
+        model_config=engine.model_config,
+        renderer=engine.renderer,
+        request_logger=None,
+        chat_template=None,
+        chat_template_content_format="auto",
+    )
+
+    serving_render = ServingRender(models, online_renderer)
+
+    async def _fake_preprocess_chat(*args, **kwargs):
+        # return conversation, engine_inputs
+        return (
+            [{"role": "user", "content": "Test"}],
+            [{"prompt_token_ids": [1, 2, 3]}],
+        )
+
+    serving_render.online_renderer.preprocess_chat = AsyncMock(
+        side_effect=_fake_preprocess_chat
+    )
+    return serving_render
 
 
 @pytest.mark.asyncio
@@ -198,20 +254,18 @@ async def test_renderer_only_chat_request_skips_mm_cache():
     mock_engine.input_processor = MagicMock()
     mock_engine.renderer = _build_renderer(mock_engine.model_config)
 
-    serving_chat = _build_serving_chat(mock_engine)
+    serving_render = _build_serving_render(mock_engine)
 
     request = ChatCompletionRequest(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": "Test prompt"}],
     )
 
-    result = await serving_chat.openai_serving_render.render_chat_request(request)
+    result = await serving_render.render_chat_request(request)
 
     assert result.token_ids == [1, 2, 3]
     assert (
-        serving_chat.openai_serving_render.preprocess_chat.call_args.kwargs[
-            "skip_mm_cache"
-        ]
+        serving_render.online_renderer.preprocess_chat.call_args.kwargs["skip_mm_cache"]
         is True
     )
 
@@ -295,6 +349,162 @@ async def test_chat_error_stream():
         f"Expected error message in chunks: {chunks}"
     )
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_chat_named_steering_without_raw_request_returns_error():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine)
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Test prompt"}],
+        max_tokens=10,
+        steering_name="named-module",
+    )
+
+    response = await serving_chat.create_chat_completion(request)
+
+    assert isinstance(response, ErrorResponse)
+    assert "Named steering modules are not available" in response.error.message
+
+
+@pytest.mark.asyncio
+async def test_chat_beam_search_with_steering_returns_error():
+    import base64 as _b64
+
+    import numpy as _np
+
+    row = _np.asarray([[0.1]], dtype=_np.float32)
+    packed_vectors = {
+        "post_block": {
+            "dtype": "float32",
+            "shape": [1, 1],
+            "layer_indices": [0],
+            "data": _b64.b64encode(row.tobytes()).decode("ascii"),
+        }
+    }
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Test prompt"}],
+        max_tokens=10,
+        use_beam_search=True,
+        steering_vectors=packed_vectors,
+    )
+
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine)
+    response = await serving_chat.create_chat_completion(request)
+
+    assert isinstance(response, ErrorResponse)
+    assert "Beam search does not support steering" in response.error.message
+
+
+@pytest.mark.asyncio
+async def test_batch_chat_sae_without_raw_request_returns_error():
+    request = BatchChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[[{"role": "user", "content": "Test prompt"}]],
+        max_tokens=10,
+        sae_clamp_specs=[
+            {
+                "module_name": "g",
+                "clamps": {
+                    "post_block": {
+                        "20": [
+                            {
+                                "feature_idx": 0,
+                                "kind": "absolute",
+                                "value": 1.0,
+                            }
+                        ]
+                    }
+                },
+            }
+        ],
+    )
+
+    serving_chat = OpenAIServingChatBatch.__new__(OpenAIServingChatBatch)
+    response = await serving_chat.create_batch_chat_completion(request)
+
+    assert isinstance(response, ErrorResponse)
+    assert "sae_clamp_specs requires steering to be enabled" in response.error.message
+
+
+@pytest.mark.asyncio
+async def test_batch_chat_named_steering_applies_sampling_param_hashes():
+    registry = SteeringModuleRegistry()
+    await registry.register("named-module", vectors={"post_block": {0: [1.0, 2.0]}})
+
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine, OpenAIServingChatBatch)
+    serving_chat.chat_completion_full_generator_batch = AsyncMock(
+        return_value="batch-ok"
+    )
+
+    async def mock_generate(*args, **kwargs):
+        yield RequestOutput(
+            request_id=args[2],
+            prompt="Test prompt",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="ok",
+                    token_ids=[4],
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+            metrics=None,
+            lora_request=None,
+            encoder_prompt=None,
+            encoder_prompt_token_ids=None,
+        )
+
+    mock_engine.generate = MagicMock(side_effect=mock_generate)
+    raw_request = SimpleNamespace(
+        headers={},
+        state=SimpleNamespace(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(steering_module_registry=registry)
+        ),
+    )
+    request = BatchChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[[{"role": "user", "content": "Test prompt"}]],
+        max_tokens=10,
+        steering_name="named-module",
+    )
+
+    response = await serving_chat.create_batch_chat_completion(request, raw_request)
+
+    assert response == "batch-ok"
+    sampling_params = mock_engine.generate.call_args.args[1]
+    assert sampling_params.steering_module_ref == ("named-module", 1.0)
+    assert sampling_params.prefill_steering_config_hash != 0
+    assert sampling_params.decode_steering_config_hash != 0
 
 
 @pytest.mark.parametrize(
@@ -443,4 +653,58 @@ def test_json_schema_response_format_missing_schema():
             model=MODEL_NAME,
             messages=[{"role": "user", "content": "hello"}],
             response_format={"type": "json_schema"},
+        )
+
+
+@pytest.mark.parametrize("format_value", [None, {}])
+def test_structural_tag_response_format_invalid(format_value):
+    """Malformed structural tags should be rejected during request validation."""
+    with pytest.raises(
+        ValidationError,
+        match="Invalid response_format structural_tag",
+    ):
+        ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "hello"}],
+            response_format={"type": "structural_tag", "format": format_value},
+        )
+
+
+@pytest.mark.parametrize("format_value", [None, {}])
+def test_batch_structural_tag_response_format_invalid(format_value):
+    """Batch chat should reject malformed structural tags at request parsing."""
+    with pytest.raises(
+        ValidationError,
+        match="Invalid response_format structural_tag",
+    ):
+        BatchChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[[{"role": "user", "content": "hello"}]],
+            response_format={"type": "structural_tag", "format": format_value},
+        )
+
+
+@pytest.mark.parametrize("structural_tag", ["not json", ""])
+def test_structured_outputs_structural_tag_invalid(structural_tag):
+    """Malformed direct structured_outputs structural tags should be rejected."""
+    with pytest.raises(
+        ValidationError,
+        match="Invalid structured_outputs structural_tag",
+    ):
+        ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "hello"}],
+            structured_outputs={"structural_tag": structural_tag},
+        )
+
+
+@pytest.mark.parametrize("field_name", ["prompt_logprobs", "top_logprobs"])
+def test_non_numeric_logprobs_rejected(field_name):
+    """A non-numeric logprobs value must be a clean 400 validation error, not a
+    TypeError from the mode='before' comparison (which surfaces as HTTP 500)."""
+    with pytest.raises(ValidationError, match=f"`{field_name}` must be an integer"):
+        ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "hello"}],
+            **{field_name: "2"},
         )

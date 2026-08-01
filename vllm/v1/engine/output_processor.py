@@ -175,6 +175,7 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.num_cache_creation_tokens = 0
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -226,6 +227,9 @@ class RequestState:
             if not sampling_params.detokenize:
                 tokenizer = None
             output_kind = sampling_params.output_kind
+            if sampling_params.stream_interval is not None:
+                # clamp to the engine-level stream interval.
+                stream_interval = max(sampling_params.stream_interval, stream_interval)
             logprobs_processor = LogprobsProcessor.from_new_request(
                 tokenizer=tokenizer,
                 request=request,
@@ -279,6 +283,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
         capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
@@ -336,6 +341,7 @@ class RequestState:
             outputs,
             finished,
             kv_transfer_params,
+            ec_transfer_params,
             capture_results=capture_results,
         )
 
@@ -345,6 +351,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
         capture_results: "dict[str, CaptureResult] | None" = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
@@ -379,7 +386,9 @@ class RequestState:
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
             kv_transfer_params=kv_transfer_params,
+            ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
+            num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
             capture_results=dict(capture_results) if capture_results else {},
         )
@@ -440,6 +449,12 @@ class OutputProcessor:
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
         self.request_states: dict[str, RequestState] = {}
+        # ``capture_wait``: capture results that finalized after their
+        # request finished, awaiting collection via
+        # ``AsyncLLM.wait_for_capture_results``. Insertion-ordered and
+        # bounded so uncollected entries cannot leak.
+        self._late_capture_results: dict[str, dict] = {}
+        self._late_capture_events: dict[str, asyncio.Event] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
@@ -508,6 +523,7 @@ class OutputProcessor:
                         finish_reason=FinishReason.ABORT,
                         stop_reason=None,
                         kv_transfer_params=None,
+                        ec_transfer_params=None,
                     )
                 ):
                     req_state.queue.put(request_output)
@@ -584,11 +600,21 @@ class OutputProcessor:
             # Queue the streaming update otherwise.
             req_state.input_chunk_queue.append(update)
 
+    def pop_late_capture_results(self, request_id: str) -> dict | None:
+        """Collect (and clear) late capture results for ``request_id``."""
+        self._late_capture_events.pop(request_id, None)
+        return self._late_capture_results.pop(request_id, None)
+
+    def register_late_capture_event(self, request_id: str) -> asyncio.Event:
+        """Event set when late capture results for ``request_id`` arrive."""
+        return self._late_capture_events.setdefault(request_id, asyncio.Event())
+
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
+        late_capture_results: dict[str, dict] | None = None,
     ) -> OutputProcessorOutput:
         """
         Process the EngineCoreOutputs:
@@ -614,6 +640,22 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        if late_capture_results:
+            for rid, late in late_capture_results.items():
+                # ``rid`` is the engine-internal request id, which may carry
+                # a random suffix on top of the client-facing id that
+                # ``wait_for_capture_results`` callers hold (e.g.
+                # ``cmpl-x-0-<suffix>`` vs ``cmpl-x-0``). Index under both.
+                for key in {rid, rid.rsplit("-", 1)[0]}:
+                    self._late_capture_results[key] = late
+                    if (ev := self._late_capture_events.get(key)) is not None:
+                        ev.set()
+            # Bound the stash: clients that never collect must not leak.
+            while len(self._late_capture_results) > 4096:
+                self._late_capture_results.pop(
+                    next(iter(self._late_capture_results))
+                )
+
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -631,6 +673,7 @@ class OutputProcessor:
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
+            ec_transfer_params = engine_core_output.ec_transfer_params
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
@@ -640,6 +683,9 @@ class OutputProcessor:
                 if engine_core_output.prefill_stats is not None:
                     req_state.num_cached_tokens = (
                         engine_core_output.prefill_stats.num_cached_tokens
+                    )
+                    req_state.num_cache_creation_tokens = (
+                        engine_core_output.prefill_stats.num_cache_creation_tokens
                     )
                 req_state.is_prefilling = False
 
@@ -665,6 +711,7 @@ class OutputProcessor:
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                ec_transfer_params,
                 capture_results=engine_core_output.capture_results,
             ):
                 if req_state.streaming_input:

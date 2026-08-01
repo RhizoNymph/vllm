@@ -37,7 +37,7 @@ class TestCaptureStructuralValidation:
 
     def test_dict_with_string_keys_is_accepted(self) -> None:
         spec = {
-            "filesystem": {"tag": "t", "hooks": {"post_mlp": [0]}},
+            "filesystem": {"tag": "t", "hooks": {"post_block": [0]}},
             "logging": {"level": "INFO"},
         }
         params = SamplingParams(capture=spec)

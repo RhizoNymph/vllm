@@ -11,19 +11,19 @@ class TestSetSteeringRequest:
     """Validate SetSteeringRequest Pydantic model."""
 
     def test_basic_vectors(self):
-        req = SetSteeringRequest(vectors={"post_mlp": {0: [1.0, 2.0], 5: [3.0, 4.0]}})
+        req = SetSteeringRequest(vectors={"post_block": {0: [1.0, 2.0], 5: [3.0, 4.0]}})
         assert req.vectors is not None
-        assert req.vectors["post_mlp"][0] == [1.0, 2.0]
+        assert req.vectors["post_block"][0] == [1.0, 2.0]
         assert req.prefill_vectors is None
         assert req.decode_vectors is None
         assert req.replace is False
 
     def test_with_co_located_scale(self):
         req = SetSteeringRequest(
-            vectors={"post_mlp": {0: {"vector": [1.0, 2.0], "scale": 2.5}}},
+            vectors={"post_block": {0: {"vector": [1.0, 2.0], "scale": 2.5}}},
         )
         assert req.vectors is not None
-        entry = req.vectors["post_mlp"][0]
+        entry = req.vectors["post_block"][0]
         assert isinstance(entry, dict)
         assert entry["vector"] == [1.0, 2.0]
         assert entry["scale"] == 2.5
@@ -36,7 +36,7 @@ class TestSetSteeringRequest:
         assert req.replace is True
 
     def test_replace_defaults_false(self):
-        req = SetSteeringRequest(vectors={"post_mlp": {0: [1.0]}})
+        req = SetSteeringRequest(vectors={"post_block": {0: [1.0]}})
         assert req.replace is False
 
     def test_empty_vectors_allowed(self):
@@ -52,24 +52,40 @@ class TestSetSteeringRequest:
         assert req.decode_vectors is None
 
     def test_string_keys_coerced_to_int(self):
-        """JSON dict keys are strings; Pydantic should coerce to int."""
+        """JSON dict keys are strings; coerce_steering_spec normalizes them.
+
+        ``SetSteeringRequest.vectors`` is intentionally typed ``dict[str, Any]``
+        (to also admit the packed binary-wire shape pydantic can't
+        disambiguate), so the model deliberately passes inner layer maps
+        through untouched. Int-key coercion is delegated to
+        ``coerce_steering_spec``, which the API handler calls on the request
+        before use.
+        """
+        from vllm.config.steering_types import coerce_steering_spec
+
+        # Model preserves the raw (string-keyed) inner map by design.
         req = SetSteeringRequest.model_validate(
-            {"vectors": {"post_mlp": {"0": [1.0, 2.0]}}}
+            {"vectors": {"post_block": {"0": [1.0, 2.0]}}}
         )
         assert req.vectors is not None
-        assert 0 in req.vectors["post_mlp"]
+
+        # The coercion seam normalizes JSON string keys to int layer indices.
+        spec = coerce_steering_spec(req.vectors)
+        assert spec is not None
+        assert 0 in spec["post_block"]
+        assert spec["post_block"][0] == [1.0, 2.0]
 
     def test_full_request(self):
         req = SetSteeringRequest(
             vectors={
                 "pre_attn": {0: [1.0, 0.5]},
-                "post_mlp": {3: [0.0, 1.0]},
+                "post_block": {3: [0.0, 1.0]},
             },
             prefill_vectors={
                 "pre_attn": {0: {"vector": [0.1, 0.2], "scale": 2.0}},
             },
             decode_vectors={
-                "post_mlp": {3: [0.5, 0.5]},
+                "post_block": {3: [0.5, 0.5]},
             },
             replace=True,
         )
@@ -84,7 +100,7 @@ class TestSetSteeringRequest:
             vectors={
                 "pre_attn": {0: [1.0]},
                 "post_attn": {0: [2.0]},
-                "post_mlp": {0: [3.0]},
+                "post_block": {0: [3.0]},
             }
         )
         assert req.vectors is not None
@@ -106,7 +122,7 @@ class TestSetSteeringRequest:
 
         with pytest.raises(pydantic.ValidationError):
             SetSteeringRequest(
-                vectors={"post_mlp": {0: [1.0, 2.0]}},
+                vectors={"post_block": {0: [1.0, 2.0]}},
                 scales={0: 2.5},
             )
 
@@ -117,7 +133,7 @@ class TestSetSteeringRequest:
         with pytest.raises(pydantic.ValidationError):
             SetSteeringRequest.model_validate(
                 {
-                    "vectors": {"post_mlp": {"0": [1.0]}},
+                    "vectors": {"post_block": {"0": [1.0]}},
                     "scales": {"0": 2.5},
                 }
             )

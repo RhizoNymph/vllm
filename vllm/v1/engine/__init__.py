@@ -18,6 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.capture.types import CaptureResult
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.request_metadata import RequestMetadata
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -32,10 +33,10 @@ FINISH_REASON_STRINGS = ("stop", "length", "abort", "error", "repetition")
 
 EEP_NOTIFICATION_CALL_ID = -1
 
+FT_STATUS_CALL_ID = -2
+
 
 class EEPNotificationType(enum.Enum):
-    NEW_CORE_ENGINES_INIT_READY = "NEW_CORE_ENGINES_INIT_READY"
-    NEW_CORE_ENGINES_WEIGHTS_INIT_READY = "NEW_CORE_ENGINES_WEIGHTS_INIT_READY"
     RECONFIGURE_FINISHED = "RECONFIGURE_FINISHED"
     SHUTDOWN_COMPLETE = "SHUTDOWN_COMPLETE"
 
@@ -75,8 +76,22 @@ class EngineCoreReadyResponse:
 
     max_model_len: int
     num_gpu_blocks: int
+    block_size: int
     dp_stats_address: str | None
-    dtype: str | None = None
+    dtype: str
+    vllm_version: str
+    world_size: int
+    data_parallel_size: int
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    decode_context_parallel_size: int
+    data_parallel_rank: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    instance_id: str
+    # KV cache capacity (None for encoder-only/attention-free models).
+    kv_cache_size_tokens: int | None = None
+    kv_cache_max_concurrency: float | None = None
 
 
 class EngineCoreRequest(
@@ -121,6 +136,12 @@ class EngineCoreRequest(
     # Used in outputs and to support abort(req_id, internal=False).
     external_req_id: str | None = None
 
+    # Request-level host-side metadata (conversation id, and future
+    # declarative steering specs). Distinct from sampling parameters: it does
+    # not influence sampling, so it rides here alongside ``external_req_id``
+    # rather than on ``SamplingParams``. ``None`` when the request set none.
+    request_metadata: RequestMetadata | None = None
+
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
 
@@ -150,7 +171,7 @@ class EngineCoreEventType(enum.IntEnum):
 class EngineCoreEvent(msgspec.Struct):
     """A timestamped engine core event associated with a request.
 
-    The timestamp is a monotonic timestamps and is used for by the engine
+    The timestamp is a monotonic timestamp and is used by the engine
     frontend to calculate intervals between engine core events. These
     timestamps should not be compared with timestamps from other processes.
     """
@@ -190,6 +211,7 @@ class EngineCoreOutput(
     capture_results: dict[str, CaptureResult] = msgspec.field(default_factory=dict)
     events: list[EngineCoreEvent] | None = None
     kv_transfer_params: dict[str, Any] | None = None
+    ec_transfer_params: dict[str, Any] | None = None
 
     trace_headers: Mapping[str, str] | None = None
 
@@ -234,6 +256,12 @@ class EngineCoreOutputs(
     timestamp: float = 0.0
 
     utility_output: UtilityOutput | None = None
+    # Capture results that finalized AFTER their request finished (writes are
+    # asynchronous). Keyed by request_id; routed by the output processor to
+    # ``capture_wait`` waiters since the per-request output stream is closed.
+    late_capture_results: dict[str, dict[str, CaptureResult]] = msgspec.field(
+        default_factory=dict
+    )
     finished_requests: set[str] | None = None
 
     # In DP case, used to signal that the current wave of requests
@@ -281,3 +309,9 @@ class ReconfigureRankType(enum.IntEnum):
 
     KEEP_CURRENT_RANK = -1
     SHUTDOWN_CURRENT_RANK = -2
+
+
+class EngineStatusType(enum.IntEnum):
+    HEALTHY = 0
+    DEAD = 1
+    UNHEALTHY = 2

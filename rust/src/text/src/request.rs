@@ -1,10 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::collections::HashMap;
 
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use vllm_engine_core_client::protocol::StructuredOutputsParams;
+use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::multimodal::MmFeatures;
+use vllm_engine_core_client::protocol::request::ReasoningParserKwargs;
+use vllm_engine_core_client::protocol::sampling::RepetitionDetectionParams;
+use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams;
+use vllm_engine_core_client::protocol::{
+    SaeClampSpec, SaeFullReconstructionSpec, SteeringClamps, SteeringVectorSpec,
+};
 
 use crate::error::{Error, Result};
 use crate::output::TextDecodeOptions;
@@ -55,6 +64,12 @@ pub struct SamplingParams {
     pub max_tokens: Option<u32>,
     /// Minimum number of tokens to generate before EOS or stop-token handling.
     pub min_tokens: Option<u32>,
+    /// Maximum number of reasoning ("thinking") tokens to emit before the
+    /// reasoning section is force-closed. `None` or the user-facing `-1`
+    /// "unlimited" sentinel both disable the budget. The raw value is carried
+    /// here; `-1` is normalized to `None` (and other negatives rejected) during
+    /// lowering (see `lower_sampling_params`).
+    pub thinking_token_budget: Option<i64>,
     /// Number of log probabilities to return per generated token.
     ///
     /// `None` disables sample logprobs. `-1` requests the full vocabulary.
@@ -75,6 +90,9 @@ pub struct SamplingParams {
     /// Repetition penalty applied by the sampler. `None` means no explicit user
     /// override.
     pub repetition_penalty: Option<f32>,
+    /// Parameters for detecting repetitive N-gram patterns. `None` means no
+    /// explicit user override.
+    pub repetition_detection: Option<RepetitionDetectionParams>,
     /// Explicit stop token IDs provided by the caller. `None` means no explicit
     /// user override.
     pub stop_token_ids: Option<Vec<u32>>,
@@ -103,6 +121,43 @@ pub struct SamplingParams {
     pub skip_reading_prefix_cache: Option<bool>,
     /// Additional request parameters for custom extensions.
     pub vllm_xargs: Option<HashMap<String, Value>>,
+    /// Base steering vectors applied to both prefill and decode phases, already
+    /// decoded into the inline form engine-core resolves. `None` means no
+    /// steering.
+    pub steering_vectors: Option<SteeringVectorSpec>,
+    /// Phase-specific steering vectors added to the base during prefill only.
+    pub prefill_steering_vectors: Option<SteeringVectorSpec>,
+    /// Phase-specific steering vectors added to the base during decode only.
+    pub decode_steering_vectors: Option<SteeringVectorSpec>,
+    /// Name of a pre-registered steering module to apply. Lowered into
+    /// `steering_module_ref = (name, 1.0)` on the engine-core request.
+    pub steering_name: Option<String>,
+    /// Per-request opt-in for activation-capture consumers, keyed by consumer
+    /// name. Forwarded verbatim to engine-core for offline admission.
+    pub capture: Option<Value>,
+    /// Per-request activation-patching spec (list of site entries). Forwarded
+    /// verbatim to engine-core for offline admission.
+    pub patch: Option<Value>,
+    /// Request-level packed table of client-provided patch vectors referenced
+    /// by a patch entry's `source_inline` / mask `inline`. Forwarded verbatim.
+    pub patch_vectors: Option<Value>,
+    /// Per-request SAE feature-surgery clamps (delta intervention),
+    /// referencing pre-registered named SAE modules. Typed passthrough;
+    /// engine-core validates semantics at admission.
+    pub sae_clamp_specs: Option<Vec<SaeClampSpec>>,
+    /// Per-request SAE full-reconstruction directives (residual replacement).
+    /// Typed passthrough like `sae_clamp_specs`.
+    pub sae_full_reconstruction_specs: Option<Vec<SaeFullReconstructionSpec>>,
+    /// Per-request steering clamps applied to both prefill and decode
+    /// phases, already packed into the canonical form engine-core's strict
+    /// decoder expects (the HTTP/gRPC layers parse client input).
+    pub steering_clamps: Option<SteeringClamps>,
+    /// Phase-specific steering clamps applied during prefill only. Same
+    /// canonical form.
+    pub prefill_steering_clamps: Option<SteeringClamps>,
+    /// Phase-specific steering clamps applied during decode only. Same
+    /// canonical form.
+    pub decode_steering_clamps: Option<SteeringClamps>,
 }
 
 #[allow(clippy::derivable_impls)] // more explicit
@@ -115,12 +170,14 @@ impl Default for SamplingParams {
             seed: None,
             max_tokens: None,
             min_tokens: None,
+            thinking_token_budget: None,
             logprobs: None,
             prompt_logprobs: None,
             min_p: None,
             frequency_penalty: None,
             presence_penalty: None,
             repetition_penalty: None,
+            repetition_detection: None,
             stop_token_ids: None,
             ignore_eos: false,
             logit_bias: None,
@@ -130,6 +187,18 @@ impl Default for SamplingParams {
             structured_outputs: None,
             skip_reading_prefix_cache: None,
             vllm_xargs: None,
+            steering_vectors: None,
+            prefill_steering_vectors: None,
+            decode_steering_vectors: None,
+            steering_name: None,
+            capture: None,
+            patch: None,
+            patch_vectors: None,
+            sae_clamp_specs: None,
+            sae_full_reconstruction_specs: None,
+            steering_clamps: None,
+            prefill_steering_clamps: None,
+            decode_steering_clamps: None,
         }
     }
 }
@@ -166,6 +235,19 @@ pub struct TextRequest {
     /// Override data parallel rank.
     #[serde(default)]
     pub data_parallel_rank: Option<u32>,
+    /// Optional reasoning-parser kwargs forwarded to engine-side structured
+    /// output logic.
+    #[serde(default)]
+    pub reasoning_parser_kwargs: Option<ReasoningParserKwargs>,
+    /// LoRA adapter selected for this request.
+    #[serde(default)]
+    pub lora_request: Option<LoraRequest>,
+    /// Wall-clock unix timestamp (seconds) when this request arrived at the
+    /// frontend, stamped before render/tokenize to match Python's
+    /// renderer-entry arrival_time. When unset, it is stamped before
+    /// tokenization.
+    #[serde(default)]
+    pub arrival_time: Option<f64>,
 }
 
 impl TextRequest {
@@ -182,6 +264,9 @@ impl TextRequest {
             cache_salt: None,
             add_special_tokens: false,
             data_parallel_rank: None,
+            reasoning_parser_kwargs: None,
+            lora_request: None,
+            arrival_time: None,
         }
     }
 

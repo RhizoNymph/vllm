@@ -13,16 +13,14 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 
 DEVICE_TYPE = current_platform.device_type
 
+DEVICE_TYPE = current_platform.device_type
+
 NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16]
 
 DTYPES = [torch.bfloat16]
-QDTYPES = (
-    [None, torch.float8_e4m3fn]
-    if not current_platform.is_rocm()
-    else [None, torch.float8_e4m3fnuz]
-)
+QDTYPES = [None, current_platform.fp8_dtype()]
 FP8_DTYPE = current_platform.fp8_dtype()
 
 # one value large enough to test overflow in index calculation.

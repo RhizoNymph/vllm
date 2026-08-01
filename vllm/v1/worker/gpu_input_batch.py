@@ -15,6 +15,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import swap_dict_values
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import (
@@ -27,7 +28,7 @@ from vllm.v1.sample.thinking_budget_state import (
     maybe_create_thinking_budget_state_holder,
 )
 from vllm.v1.utils import copy_slice
-from vllm.v1.worker.block_table import MultiGroupBlockTable
+from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
 
 
 @dataclass
@@ -99,24 +100,25 @@ class InputBatch:
         max_model_len: int,
         max_num_batched_tokens: int,
         device: torch.device,
-        pin_memory: bool,
         vocab_size: int,
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[int],
-        max_num_blocks_per_req: list[int] | None = None,
+        max_num_blocks_per_req: list[int],
         logitsprocs: LogitsProcessors | None = None,
         logitsprocs_need_output_token_ids: bool = False,
         num_spec_tokens: int = 0,
         is_pooling_model: bool = False,
         cp_kv_cache_interleave_size: int = 1,
         reasoning_config: ReasoningConfig | None = None,
+        use_replayssm: bool = False,
+        slot_mapping_modes: list[SlotMappingMode] | None = None,
     ):
         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
             reasoning_config,
             max_num_reqs,
             num_spec_tokens,
             device,
-            pin_memory,
+            PIN_MEMORY,
         )
         self.thinking_token_budget_reqs: set[str] = set()
         self.is_pooling_model = is_pooling_model
@@ -124,7 +126,6 @@ class InputBatch:
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
         self.device = device
-        self.pin_memory = pin_memory
         self.vocab_size = vocab_size
 
         self._req_ids: list[str | None] = []
@@ -142,7 +143,10 @@ class InputBatch:
         )
         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
         self.is_token_ids_tensor = torch.zeros(
-            (max_num_reqs, max_model_len), device="cpu", dtype=bool, pin_memory=False
+            (max_num_reqs, max_model_len),
+            device="cpu",
+            dtype=bool,
+            pin_memory=False,
         )
         self.is_token_ids = self.is_token_ids_tensor.numpy()
         # Store prompt embeddings per request to avoid OOM from large upfront
@@ -153,35 +157,46 @@ class InputBatch:
             (max_num_reqs,),
             device="cpu",
             dtype=torch.int32,
-            pin_memory=pin_memory,
+            pin_memory=PIN_MEMORY,
         )
         self.num_tokens_no_spec = self.num_tokens_no_spec_cpu_tensor.numpy()
         self.num_prompt_tokens_cpu_tensor = torch.zeros(
             (max_num_reqs,),
             device="cpu",
             dtype=torch.int32,
-            pin_memory=pin_memory,
+            pin_memory=PIN_MEMORY,
         )
         self.num_prompt_tokens = self.num_prompt_tokens_cpu_tensor.numpy()
         self.num_computed_tokens_cpu_tensor = torch.zeros(
             (max_num_reqs,),
             device="cpu",
             dtype=torch.int32,
-            pin_memory=pin_memory,
+            pin_memory=PIN_MEMORY,
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+
+        # Mamba2 ReplaySSM decode ring origin (num_computed at each request's
+        # last full-state write); populated only when the feature is on.
+        self.use_replayssm = use_replayssm
+        self.replayssm_decode_base_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=PIN_MEMORY,
+        )
+        self.replayssm_decode_base = self.replayssm_decode_base_cpu_tensor.numpy()
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
-            max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
-            pin_memory=pin_memory,
+            pin_memory=PIN_MEMORY,
             device=device,
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
             max_num_blocks=max_num_blocks_per_req,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            slot_mapping_modes=slot_mapping_modes,
         )
 
         # Sampling-related.
@@ -189,7 +204,7 @@ class InputBatch:
             (max_num_reqs,), dtype=torch.float32, device=device
         )
         self.temperature_cpu_tensor = torch.empty(
-            (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=pin_memory
+            (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=PIN_MEMORY
         )
         self.temperature_cpu = self.temperature_cpu_tensor.numpy()
         self.greedy_reqs: set[str] = set()
@@ -197,14 +212,14 @@ class InputBatch:
 
         self.top_p = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
         self.top_p_cpu_tensor = torch.empty(
-            (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=pin_memory
+            (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=PIN_MEMORY
         )
         self.top_p_cpu = self.top_p_cpu_tensor.numpy()
         self.top_p_reqs: set[str] = set()
 
         self.top_k = torch.empty((max_num_reqs,), dtype=torch.int32, device=device)
         self.top_k_cpu_tensor = torch.empty(
-            (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+            (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         self.top_k_cpu = self.top_k_cpu_tensor.numpy()
         self.top_k_reqs: set[str] = set()
@@ -214,7 +229,7 @@ class InputBatch:
             (max_num_reqs,), dtype=torch.float, device=device
         )
         self.frequency_penalties_cpu_tensor = torch.empty(
-            (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=pin_memory
+            (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=PIN_MEMORY
         )
         self.frequency_penalties_cpu = self.frequency_penalties_cpu_tensor.numpy()
         self.frequency_penalties_reqs: set[str] = set()
@@ -224,7 +239,7 @@ class InputBatch:
             (max_num_reqs,), dtype=torch.float, device=device
         )
         self.presence_penalties_cpu_tensor = torch.empty(
-            (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=pin_memory
+            (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=PIN_MEMORY
         )
         self.presence_penalties_cpu = self.presence_penalties_cpu_tensor.numpy()
         self.presence_penalties_reqs: set[str] = set()
@@ -234,14 +249,14 @@ class InputBatch:
             (max_num_reqs,), dtype=torch.float, device=device
         )
         self.repetition_penalties_cpu_tensor = torch.empty(
-            (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=pin_memory
+            (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=PIN_MEMORY
         )
         self.repetition_penalties_cpu = self.repetition_penalties_cpu_tensor.numpy()
         self.repetition_penalties_reqs: set[str] = set()
 
         # Speculative decoding
         self.num_accepted_tokens_cpu_tensor = torch.ones(
-            (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+            (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
 
@@ -249,16 +264,6 @@ class InputBatch:
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
-
-        # Steering config tracking (separate arrays for prefill and decode)
-        self.request_prefill_steering_hash = np.zeros(
-            (self.max_num_reqs,), dtype=np.int64
-        )
-        self.request_decode_steering_hash = np.zeros(
-            (self.max_num_reqs,), dtype=np.int64
-        )
-        # Tracks the union of both hashes (any non-zero hash gets tracked)
-        self.steering_hash_to_request_ids: dict[int, set[str]] = {}
 
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
@@ -388,6 +393,11 @@ class InputBatch:
         # Number of tokens without spec decode tokens.
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
+        if self.use_replayssm:
+            # Ring origin = full context at (re)admission (prompt + any resumed
+            # output), so a resumed request re-anchors past the prompt.
+            self.replayssm_decode_base[req_index] = request.num_tokens
+
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.block_table.add_row(request.block_ids, req_index)
 
@@ -492,17 +502,6 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
-        # Steering config tracking (prefill and decode)
-        prefill_hash = request.prefill_steering_config_hash
-        decode_hash = request.decode_steering_config_hash
-        self.request_prefill_steering_hash[req_index] = prefill_hash
-        self.request_decode_steering_hash[req_index] = decode_hash
-        for h in (prefill_hash, decode_hash):
-            if h != 0:
-                if h not in self.steering_hash_to_request_ids:
-                    self.steering_hash_to_request_ids[h] = set()
-                self.steering_hash_to_request_ids[h].add(request.req_id)
-
         return req_index
 
     def update_req_spec_token_ids(
@@ -562,20 +561,6 @@ class InputBatch:
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
 
-        # Steering cleanup (both prefill and decode hashes)
-        for arr in (
-            self.request_prefill_steering_hash,
-            self.request_decode_steering_hash,
-        ):
-            steering_hash = int(arr[req_index])
-            if steering_hash != 0:
-                hash_req_ids = self.steering_hash_to_request_ids.get(steering_hash)
-                if hash_req_ids:
-                    hash_req_ids.discard(req_id)
-                    if not hash_req_ids:
-                        del self.steering_hash_to_request_ids[steering_hash]
-                arr[req_index] = 0
-
         if self.is_pooling_model:
             self.pooling_params.pop(req_id, None)
             self.pooling_states.pop(req_id, None)
@@ -633,6 +618,11 @@ class InputBatch:
             self.num_prompt_tokens[i2],
             self.num_prompt_tokens[i1],
         )
+        if self.use_replayssm:
+            self.replayssm_decode_base[i1], self.replayssm_decode_base[i2] = (
+                self.replayssm_decode_base[i2],
+                self.replayssm_decode_base[i1],
+            )
         self.num_computed_tokens_cpu[i1], self.num_computed_tokens_cpu[i2] = (
             self.num_computed_tokens_cpu[i2],
             self.num_computed_tokens_cpu[i1],
@@ -669,18 +659,6 @@ class InputBatch:
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] = (
             self.request_lora_mapping[i2],
             self.request_lora_mapping[i1],
-        )
-
-        (
-            self.request_prefill_steering_hash[i1],
-            self.request_prefill_steering_hash[i2],
-        ) = (
-            self.request_prefill_steering_hash[i2],
-            self.request_prefill_steering_hash[i1],
-        )
-        self.request_decode_steering_hash[i1], self.request_decode_steering_hash[i2] = (
-            self.request_decode_steering_hash[i2],
-            self.request_decode_steering_hash[i1],
         )
 
         if self.is_pooling_model:
@@ -802,6 +780,10 @@ class InputBatch:
                 last_req_index
             ]
             self.num_prompt_tokens[empty_index] = self.num_prompt_tokens[last_req_index]
+            if self.use_replayssm:
+                self.replayssm_decode_base[empty_index] = self.replayssm_decode_base[
+                    last_req_index
+                ]
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]
@@ -810,13 +792,6 @@ class InputBatch:
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
                 last_req_index
             ]
-
-            self.request_prefill_steering_hash[empty_index] = (
-                self.request_prefill_steering_hash[last_req_index]
-            )
-            self.request_decode_steering_hash[empty_index] = (
-                self.request_decode_steering_hash[last_req_index]
-            )
 
             if self.is_pooling_model:
                 last_req_index -= 1
@@ -1021,7 +996,7 @@ class InputBatch:
             (self.num_reqs, max_prompt_len),
             device="cpu",
             dtype=torch.int64,
-            pin_memory=self.pin_memory,
+            pin_memory=PIN_MEMORY,
         )
         prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
         prompt_token_ids[:] = self.token_ids_cpu[:num_reqs, :max_prompt_len]

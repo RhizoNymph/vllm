@@ -8,7 +8,8 @@ See ``docs/design/capture_consumers.md`` for the design spec and
 
 from __future__ import annotations
 
-from vllm.v1.capture.consumer import CaptureConsumer
+from vllm.v1.capture.consumer import CaptureConsumer, SyncCaptureConsumer
+from vllm.v1.capture.controller import SteeringController
 from vllm.v1.capture.errors import (
     CaptureValidationError,
     UnknownCaptureConsumerError,
@@ -52,6 +53,8 @@ __all__ = [
     "HookName",
     "HookSchema",
     "PositionSelector",
+    "SteeringController",
+    "SyncCaptureConsumer",
     "UnknownCaptureConsumerError",
     "VllmInternalRequestId",
     "build_hook_schema",

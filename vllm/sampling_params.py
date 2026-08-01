@@ -8,20 +8,32 @@ import math
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import Any
+from typing import Annotated, Any
 
 import msgspec
 import numpy as np
+from pydantic import BeforeValidator
 from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
+from vllm.config.sae_steering_types import (
+    SAEClampSpec,
+    SAEFullReconstructionSpec,
+    coerce_sae_clamp_specs,
+    coerce_sae_full_reconstruction_specs,
+    hash_sae_clamp_specs_for_phase,
+    hash_sae_full_reconstruction_specs_for_phase,
+)
 from vllm.config.steering_types import (
+    SteeringClamps,
     SteeringLayerEntry,
     SteeringVectorSpec,
     hash_steering_config,
     normalize_layer_entry,
+    resolve_effective_clamps,
     resolve_effective_vectors,
+    validate_steering_index,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -38,6 +50,35 @@ _MAX_TEMP = 1e-2
 MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
 the per-request row width allocated by the sampler's `LogprobTokenIdsState`."""
+
+
+def validate_thinking_token_budget(value: int | float | bool | None) -> int | None:
+    """Validate ``thinking_token_budget``; return ``None`` if unset."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, float)) or not isinstance(value, int):
+        raise VLLMValidationError(
+            "`thinking_token_budget` must be a non-negative integer "
+            "or -1 for unlimited.",
+            parameter="thinking_token_budget",
+            value=value,
+        )
+    if value == -1:
+        return None
+    if value < 0:
+        raise VLLMValidationError(
+            "`thinking_token_budget` must be a non-negative integer "
+            "or -1 for unlimited.",
+            parameter="thinking_token_budget",
+            value=value,
+        )
+    return value
+
+
+ThinkingTokenBudget = Annotated[
+    int | None,
+    BeforeValidator(validate_thinking_token_budget),
+]
 
 
 class SamplingType(IntEnum):
@@ -278,6 +319,11 @@ class SamplingParams(
     include_stop_str_in_output: bool = False
     """Whether to include the stop strings in output text."""
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
+    stream_interval: int | None = None
+    """Number of newly generated tokens to batch into each streamed
+    `RequestOutput`. Raises the interval above the engine-level
+    `--stream-interval`. Values below engine setting are clamped up to it.
+    The first and final outputs are always emitted immediately."""
     skip_clone: bool = False
     """Internal flag indicating that this SamplingParams instance is safe to
     reuse without cloning. When True, clone() will return self without
@@ -385,9 +431,44 @@ class SamplingParams(
     serve. Set by ``_admit_capture`` alongside ``capture_store_hook_layers``.
     Not client-settable."""
 
+    patch: list[dict[str, Any]] | None = None
+    """Per-request activation-patching spec: a list of site entries, each
+    ``{"layer": int, "hook": str, "dest_position": int, "source_run": str,
+    "source_position": int, "alpha": float = 1.0}``. Each entry overwrites
+    (``alpha == 1``) or interpolates toward the destination's activation at
+    ``(layer, hook, dest_position)`` with the clean run ``source_run``'s
+    activation at ``source_position``.
+
+    Validation at construction is strictly structural (list of dicts with the
+    required keys/types). Layer/hook/source existence and pool capacity are
+    validated at the entrypoint against the model + source store; the worker
+    resolves source vectors from the per-rank source store."""
+
+    patch_touches_prompt: bool | None = None
+    """Whether this request patches any prompt-range position. Resolved at
+    admission (mirrors ``capture_touches_prompt``); drives prefix-cache reuse
+    via :meth:`vllm.v1.request.Request.get_skip_reading_prefix_cache`. ``None``
+    (offline path) is treated conservatively as prompt-touching. Not
+    client-settable."""
+
+    patch_min_prompt_position: int | None = None
+    """Lowest prompt position this request patches, or ``None``. Prefix-cache
+    reuse is clamped to this position so it (and later positions) are
+    re-forwarded and the patch hook fires. Not client-settable."""
+
+    patch_vectors: dict[str, Any] | None = None
+    """Request-level packed table of client-provided patch vectors, referenced
+    by a patch entry's ``source_inline`` / mask ``inline`` row index. Same
+    binary wire form as ``SteeringHookPacked`` minus layer_indices/scales:
+    ``{"dtype": "float32|float16|bfloat16", "shape": [n_rows, width],
+    "data": "<base64 contiguous bytes>"}``. Travels verbatim and is decoded
+    once per request at worker-side resolution. Deliberately packed-only (no
+    raw float-list form — inline float lists caused a large E2EL regression)."""
+
     steering_vectors: SteeringVectorSpec | None = None
     """Base steering vectors applied to both prefill and decode phases.
-    Keyed by hook point name (pre_attn, post_attn, post_mlp), then
+    Keyed by hook point name (pre_attn, post_attn, post_block, mlp_in,
+    mlp_out), then
     layer index. Values are either bare
     ``list[float]`` (scale=1.0) or ``{"vector": [...], "scale": float}``."""
 
@@ -398,6 +479,36 @@ class SamplingParams(
     decode_steering_vectors: SteeringVectorSpec | None = None
     """Phase-specific steering vectors added to base during decode only.
     Same format as ``steering_vectors``."""
+
+    steering_clamps: SteeringClamps | None = None
+    """Base directional clamps applied to both prefill and decode phases.
+
+    Post-ingestion this is always the canonical
+    :class:`vllm.config.steering_types.SteeringClamps` — per-hook packed
+    tables of raw float64 direction rows plus bounds/strengths, which is
+    also exactly what crosses the engine-core wire (msgpack map with
+    binary ``data``), so the strict typed decoder on the engine side
+    accepts precisely what the API server sends.  Constructor callers may
+    pass any shape ``SteeringClamps.from_obj`` accepts — JSON entry-lists
+    keyed by hook point then layer index with entries ``{"vector": [...],
+    "min": float|None, "max": float|None, "strength": float = 1.0}``
+    (sugar: ``{"vector", "value": c}`` pins ``min = max = c``), the
+    type's own JSON form, or the legacy base64-packed hook blobs —
+    ``__post_init__`` normalizes the field in place.  Each row constrains
+    the hidden state's scalar projection along its direction
+    (unit-normalized at consumption, so bounds live in unit-projection
+    space) to ``[min, max]``:
+    ``h' = h + strength * (clip(h @ v_hat, min, max) - h @ v_hat) * v_hat``.
+    Unlike ``steering_vectors``, tier merging concatenates rows
+    (independent constraints, not addable vectors)."""
+
+    prefill_steering_clamps: SteeringClamps | None = None
+    """Phase-specific clamps concatenated after base during prefill only.
+    Same format as ``steering_clamps``."""
+
+    decode_steering_clamps: SteeringClamps | None = None
+    """Phase-specific clamps concatenated after base during decode only.
+    Same format as ``steering_clamps``."""
 
     _effective_prefill_steering_packed: dict[str, dict[int, np.ndarray]] | None = None
     """In-process pre-resolved + packed prefill-phase steering, in the
@@ -440,6 +551,47 @@ class SamplingParams(
     hash bit-for-bit identically to today, preserving prefix-cache
     reuse."""
 
+    sae_full_reconstruction_specs: tuple[SAEFullReconstructionSpec, ...] | None = None
+    """Optional SAE full-reconstruction directives (residual replacement).
+
+    Each entry references a named SAE module (registered via the
+    standard module-registration API with
+    ``kind="sae_full_reconstruction"``) and optionally declares
+    per-(hook, layer) clamps to apply to the SAE's activations
+    before the decoder pass.  When ``clamps`` is empty the SAE
+    reconstruction replaces the residual without modifications —
+    pure ``decode(activate(encode(h))) + b_dec``.
+
+    Hash determinism: the full-reconstruction state is folded into
+    :pyattr:`prefill_steering_config_hash` /
+    :pyattr:`decode_steering_config_hash` via
+    :func:`hash_steering_config`'s
+    ``sae_full_reconstruction_specs`` argument with a distinct
+    domain separator from the delta block, so a delta-clamp request
+    and a full-reconstruction request with identical clamp content
+    do not collide on prefix-cache keys.  Replacement and
+    perturbation produce different residual streams and must not
+    share prefill cache."""
+
+    sae_clamp_specs: tuple[SAEClampSpec, ...] | None = None
+    """Optional SAE feature-surgery clamps (delta intervention).
+
+    Each entry references a named SAE module (registered via the
+    standard module-registration API with ``kind="sae_delta"``) and
+    declares which feature activations to clamp on which
+    (hook, layer) pairs.  See :class:`SAEClampSpec` and
+    ``docs/features/sae_steering.md`` for the runtime contract.
+
+    Hash determinism: SAE clamp state is folded into
+    :pyattr:`prefill_steering_config_hash` /
+    :pyattr:`decode_steering_config_hash` via
+    :func:`hash_steering_config`'s ``sae_clamp_specs`` argument, so
+    different clamp configurations produce different prefix-cache
+    keys.  Requests that do not use SAE clamps
+    (``sae_clamp_specs is None``) hash bit-for-bit identically to
+    requests on a build without SAE support, preserving prefix-cache
+    reuse."""
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -468,11 +620,13 @@ class SamplingParams(
         max_tokens: int | None = 16,
         min_tokens: int = 0,
         logprobs: int | None = None,
+        logprob_token_ids: list[int] | None = None,
         prompt_logprobs: int | None = None,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
         output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE,
+        stream_interval: int | None = None,
         structured_outputs: StructuredOutputsParams | None = None,
         logit_bias: dict[int, float] | dict[str, float] | None = None,
         allowed_token_ids: list[int] | None = None,
@@ -480,18 +634,44 @@ class SamplingParams(
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
         capture: dict[str, Any] | None = None,
+        patch: list[dict[str, Any]] | None = None,
+        patch_vectors: dict[str, Any] | None = None,
         steering_vectors: SteeringVectorSpec | None = None,
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
         steering_module_ref: tuple[str, float] | None = None,
+        sae_clamp_specs: object = None,
+        sae_full_reconstruction_specs: object = None,
+        steering_clamps: SteeringClamps | dict | None = None,
+        prefill_steering_clamps: SteeringClamps | dict | None = None,
+        decode_steering_clamps: SteeringClamps | dict | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
-            # Convert token_id to integer
-            # Clamp the bias between -100 and 100 per OpenAI API spec
-            logit_bias = {
-                int(token): min(100.0, max(-100.0, bias))
-                for token, bias in logit_bias.items()
-            }
+            # Fast path uses a dict comprehension; on failure we iterate once
+            # to identify the exact offending entry for the error message.
+            try:
+                logit_bias = {
+                    int(token): min(100.0, max(-100.0, bias))
+                    for token, bias in logit_bias.items()
+                }
+            except (ValueError, TypeError):
+                invalid_keys = []
+                converted_logit_bias = {}
+                for token, bias in logit_bias.items():
+                    try:
+                        token_id = int(token)
+                    except (ValueError, TypeError):
+                        invalid_keys.append(token)
+                        continue
+                    converted_logit_bias[token_id] = min(100.0, max(-100.0, bias))
+                if invalid_keys:
+                    raise VLLMValidationError(
+                        f"logit_bias contains key(s) that cannot be "
+                        f"converted to integer token IDs: {invalid_keys!r}",
+                        parameter="logit_bias",
+                        value=invalid_keys,
+                    ) from None
+                logit_bias = converted_logit_bias
 
         return SamplingParams(
             n=1 if n is None else n,
@@ -514,11 +694,13 @@ class SamplingParams(
             max_tokens=max_tokens,
             min_tokens=min_tokens,
             logprobs=logprobs,
+            logprob_token_ids=logprob_token_ids,
             prompt_logprobs=prompt_logprobs,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
             output_kind=output_kind,
+            stream_interval=stream_interval,
             structured_outputs=structured_outputs,
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
@@ -526,10 +708,19 @@ class SamplingParams(
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
             capture=capture,
+            patch=patch,
+            patch_vectors=patch_vectors,
             steering_vectors=steering_vectors,
             prefill_steering_vectors=prefill_steering_vectors,
             decode_steering_vectors=decode_steering_vectors,
             steering_module_ref=steering_module_ref,
+            sae_clamp_specs=coerce_sae_clamp_specs(sae_clamp_specs),
+            sae_full_reconstruction_specs=coerce_sae_full_reconstruction_specs(
+                sae_full_reconstruction_specs
+            ),
+            steering_clamps=steering_clamps,
+            prefill_steering_clamps=prefill_steering_clamps,
+            decode_steering_clamps=decode_steering_clamps,
         )
 
     def __post_init__(self) -> None:
@@ -545,6 +736,10 @@ class SamplingParams(
 
         if self.seed == -1:
             self.seed = None
+
+        self.thinking_token_budget = validate_thinking_token_budget(
+            self.thinking_token_budget
+        )
 
         if self.stop is None:
             self.stop = []
@@ -570,6 +765,7 @@ class SamplingParams(
 
         self._verify_args()
         self._validate_capture()
+        self._validate_patch()
 
         if self.temperature < _SAMPLING_EPS:
             # Zero temperature means greedy sampling.
@@ -620,6 +816,164 @@ class SamplingParams(
                     f"{type(key).__name__} ({key!r})"
                 )
 
+    def _validate_patch(self) -> None:
+        """Structural check on ``patch`` (and ``patch_vectors``).
+
+        Verifies shape at construction: a list of dicts with the common keys,
+        exactly one source kind per entry (``source_run`` + ``source_position``
+        | ``source_module`` | ``source_inline``), an optional ``mask``
+        (``{"indices": [...]}`` or ``{"inline": row}``), and — when present — a
+        structurally-valid packed ``patch_vectors`` table whose every referenced
+        row index is in range. Layer/hook/source existence, named-module
+        existence, inline widths and pool capacity are validated at the
+        entrypoint against the model + registries, keeping this module free of
+        patch-framework imports.
+        """
+        patch = self.patch
+        if patch is None:
+            if self.patch_vectors is not None:
+                self._validate_patch_vectors_table()
+            return
+        if not isinstance(patch, list):
+            raise ValueError(
+                f"patch must be a list of site dicts, got {type(patch).__name__}"
+            )
+        n_rows = self._validate_patch_vectors_table()
+        for i, entry in enumerate(patch):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"patch[{i}] must be a dict, got {type(entry).__name__}"
+                )
+            for req_field in ("layer", "hook", "dest_position"):
+                if req_field not in entry:
+                    raise ValueError(f"patch[{i}] missing required key {req_field!r}")
+            if not isinstance(entry["layer"], int):
+                raise ValueError(f"patch[{i}]['layer'] must be an int")
+            if not isinstance(entry["hook"], str):
+                raise ValueError(f"patch[{i}]['hook'] must be a str")
+            if not isinstance(entry["dest_position"], int):
+                raise ValueError(f"patch[{i}]['dest_position'] must be an int")
+            alpha = entry.get("alpha", 1.0)
+            if not isinstance(alpha, (int, float)):
+                raise ValueError(f"patch[{i}]['alpha'] must be a number")
+            self._validate_patch_source_kind(i, entry, n_rows)
+            self._validate_patch_mask(i, entry.get("mask"), n_rows)
+
+    def _validate_patch_source_kind(
+        self, i: int, entry: dict, n_rows: int | None
+    ) -> None:
+        """Enforce exactly-one-of source kinds and their per-field types."""
+        has_run = entry.get("source_run") is not None
+        has_module = entry.get("source_module") is not None
+        has_inline = entry.get("source_inline") is not None
+        n_kinds = sum((has_run, has_module, has_inline))
+        if n_kinds != 1:
+            raise ValueError(
+                f"patch[{i}] must set exactly one source kind — "
+                f"(source_run + source_position) | source_module | "
+                f"source_inline; got {n_kinds}"
+            )
+        if has_run:
+            if not isinstance(entry["source_run"], str):
+                raise ValueError(f"patch[{i}]['source_run'] must be a str")
+            if "source_position" not in entry:
+                raise ValueError(f"patch[{i}]: source_run requires source_position")
+            if not isinstance(entry["source_position"], int):
+                raise ValueError(f"patch[{i}]['source_position'] must be an int")
+        elif has_module:
+            if not isinstance(entry["source_module"], str):
+                raise ValueError(f"patch[{i}]['source_module'] must be a str")
+        else:  # has_inline
+            idx = entry["source_inline"]
+            if not isinstance(idx, int):
+                raise ValueError(f"patch[{i}]['source_inline'] must be an int")
+            self._require_patch_row(i, "source_inline", idx, n_rows)
+
+    def _validate_patch_mask(self, i: int, mask: Any, n_rows: int | None) -> None:
+        """Structural check on an optional per-entry ``mask``."""
+        if mask is None:
+            return
+        if not isinstance(mask, dict):
+            raise ValueError(f"patch[{i}]['mask'] must be a dict")
+        has_indices = mask.get("indices") is not None
+        has_inline = mask.get("inline") is not None
+        if has_indices == has_inline:
+            raise ValueError(
+                f"patch[{i}]['mask'] must set exactly one of 'indices' | 'inline'"
+            )
+        if has_indices:
+            indices = mask["indices"]
+            if not isinstance(indices, list):
+                raise ValueError(f"patch[{i}]['mask']['indices'] must be a list")
+            for j in indices:
+                if not isinstance(j, int) or j < 0:
+                    raise ValueError(
+                        f"patch[{i}]['mask']['indices'] must be non-negative ints"
+                    )
+        else:
+            idx = mask["inline"]
+            if not isinstance(idx, int):
+                raise ValueError(f"patch[{i}]['mask']['inline'] must be an int")
+            self._require_patch_row(i, "mask.inline", idx, n_rows)
+
+    def _require_patch_row(
+        self, i: int, what: str, idx: int, n_rows: int | None
+    ) -> None:
+        """A ``source_inline`` / mask inline index must reference a real row."""
+        if n_rows is None:
+            raise ValueError(f"patch[{i}]: {what} index {idx} requires patch_vectors")
+        if not (0 <= idx < n_rows):
+            raise ValueError(
+                f"patch[{i}]: {what} index {idx} out of range [0, {n_rows})"
+            )
+
+    def _validate_patch_vectors_table(self) -> int | None:
+        """Structurally validate ``patch_vectors``; return its ``n_rows``.
+
+        ``None`` when no table is set. Raises on malformed keys, dtype, shape,
+        or a base64 payload whose byte length disagrees with ``shape``/dtype.
+        """
+        pv = self.patch_vectors
+        if pv is None:
+            return None
+        if not isinstance(pv, dict):
+            raise ValueError("patch_vectors must be a dict")
+        for key in ("dtype", "shape", "data"):
+            if key not in pv:
+                raise ValueError(f"patch_vectors missing required key {key!r}")
+        itemsize = {"float32": 4, "float16": 2, "bfloat16": 2}.get(str(pv["dtype"]))
+        if itemsize is None:
+            raise ValueError(
+                f"patch_vectors.dtype {pv['dtype']!r} must be one of "
+                f"float32 | float16 | bfloat16"
+            )
+        shape = pv["shape"]
+        if (
+            not isinstance(shape, (list, tuple))
+            or len(shape) != 2
+            or not all(isinstance(s, int) and s >= 0 for s in shape)
+        ):
+            raise ValueError(
+                "patch_vectors.shape must be [n_rows, width] of non-negative ints"
+            )
+        if not isinstance(pv["data"], str):
+            raise ValueError("patch_vectors.data must be a base64 string")
+        import binascii
+
+        import pybase64 as base64
+
+        try:
+            raw = base64.b64decode(pv["data"])
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"patch_vectors.data is not valid base64: {exc}") from exc
+        expected = int(shape[0]) * int(shape[1]) * itemsize
+        if len(raw) != expected:
+            raise ValueError(
+                f"patch_vectors.data length {len(raw)} != expected {expected} "
+                f"(shape={list(shape)}, dtype={pv['dtype']})"
+            )
+        return int(shape[0])
+
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):
             raise ValueError(f"n must be an int, but is of type {type(self.n)}")
@@ -640,14 +994,31 @@ class SamplingParams(
             raise ValueError(
                 f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
             )
+        if not math.isfinite(self.repetition_penalty):
+            raise ValueError(
+                "repetition_penalty must be a finite number, "
+                f"got {self.repetition_penalty}."
+            )
         if self.repetition_penalty <= 0.0:
             raise ValueError(
                 "repetition_penalty must be greater than zero, got "
                 f"{self.repetition_penalty}."
             )
+        if not math.isfinite(self.temperature):
+            raise VLLMValidationError(
+                f"temperature must be a finite number, got {self.temperature}.",
+                parameter="temperature",
+                value=self.temperature,
+            )
         if self.temperature < 0.0:
             raise VLLMValidationError(
                 f"temperature must be non-negative, got {self.temperature}.",
+                parameter="temperature",
+                value=self.temperature,
+            )
+        if self.temperature > 2.0:
+            raise VLLMValidationError(
+                f"temperature must be in [0, 2], got {self.temperature}.",
                 parameter="temperature",
                 value=self.temperature,
             )
@@ -682,6 +1053,12 @@ class SamplingParams(
             raise ValueError(
                 f"min_tokens must be less than or equal to "
                 f"max_tokens={self.max_tokens}, got {self.min_tokens}."
+            )
+        if self.stream_interval is not None and self.stream_interval < 1:
+            raise VLLMValidationError(
+                f"stream_interval must be at least 1, got {self.stream_interval}.",
+                parameter="stream_interval",
+                value=self.stream_interval,
             )
         if self.logprobs is not None and self.logprobs != -1 and self.logprobs < 0:
             raise VLLMValidationError(
@@ -722,6 +1099,150 @@ class SamplingParams(
 
         self._validate_steering_vectors()
 
+    def _validate_steering_clamps(self) -> None:
+        """Normalize the clamp fields to canonical SteeringClamps in place.
+
+        ``SteeringClamps.from_obj`` accepts every submission shape (JSON
+        entry-lists with int or string layer keys, ``value`` sugar and
+        omitted bounds resolved; the type's own wire/JSON form; the
+        legacy base64-packed blobs) and fully validates row content.
+        Running in ``__post_init__`` makes this the single ingestion seam
+        for every frontend: msgspec runs it on decode, so the Python HTTP
+        path, the offline ``LLM`` path, and the Rust msgpack path all
+        cross it.  Hook-point names are checked here — ``from_obj`` is
+        deliberately model-layer-agnostic.
+        """
+        for field_name in (
+            "steering_clamps",
+            "prefill_steering_clamps",
+            "decode_steering_clamps",
+        ):
+            spec = SteeringClamps.from_obj(
+                getattr(self, field_name), field_name=field_name
+            )
+            if spec is not None:
+                for hook_name in spec.hooks:
+                    if hook_name not in VALID_HOOK_POINT_NAMES:
+                        raise ValueError(
+                            f"{field_name} key {hook_name!r} is not a "
+                            f"valid hook point. Valid values: "
+                            f"{sorted(VALID_HOOK_POINT_NAMES)}."
+                        )
+            setattr(self, field_name, spec)
+
+    @cached_property
+    def effective_prefill_steering(
+        self,
+    ) -> dict[str, dict[int, np.ndarray]] | None:
+        """Resolved prefill steering: base + prefill-specific, pre-scaled.
+
+        Returns 1-D ``np.ndarray`` per (hook, layer).  When the request
+        was packed by the client (``_effective_prefill_steering_packed``
+        is set) those arrays are already in the model's compute dtype;
+        otherwise a fresh resolve over the original list-of-floats
+        fields produces ``np.float64`` arrays.  ``hash_steering_config``
+        casts to ``float32`` at the SHA boundary in either case, so the
+        hash is stable within a deployment (cross-pipeline reuse — i.e.,
+        switching a workload between packed and unpacked — is a one-time
+        cache miss).
+        """
+        if self._effective_prefill_steering_packed is not None:
+            return self._effective_prefill_steering_packed
+        return resolve_effective_vectors(
+            self.steering_vectors, self.prefill_steering_vectors
+        )
+
+    @cached_property
+    def effective_decode_steering(
+        self,
+    ) -> dict[str, dict[int, np.ndarray]] | None:
+        """Resolved decode steering: base + decode-specific, pre-scaled."""
+        if self._effective_decode_steering_packed is not None:
+            return self._effective_decode_steering_packed
+        return resolve_effective_vectors(
+            self.steering_vectors, self.decode_steering_vectors
+        )
+
+    @cached_property
+    def effective_prefill_clamps(self) -> SteeringClamps | None:
+        """Resolved prefill clamps: base + prefill-specific, concatenated.
+
+        The per-site K cap is NOT enforced here —
+        ``max_clamp_directions`` is an engine knob unknown at
+        request-construction time; the entrypoint and worker enforce it.
+        """
+        return resolve_effective_clamps(
+            self.steering_clamps, self.prefill_steering_clamps
+        )
+
+    @cached_property
+    def effective_decode_clamps(self) -> SteeringClamps | None:
+        """Resolved decode clamps: base + decode-specific, concatenated."""
+        return resolve_effective_clamps(
+            self.steering_clamps, self.decode_steering_clamps
+        )
+
+    @cached_property
+    def patch_site_demand(self) -> dict[tuple[int, str], int]:
+        """Per-``(layer, hook)`` patch-slot demand for this request.
+
+        Counts the distinct patched ``dest_position``s at each site. A single
+        forward step can compute all of a request's positions at a site at once
+        (a prefill chunk), so this count is the request's worst-case slot draw
+        at that site — what the scheduler reserves to keep the per-site pool
+        from overflowing (see ``Scheduler``). Empty when no patching."""
+        if not self.patch:
+            return {}
+        demand: dict[tuple[int, str], int] = {}
+        for entry in self.patch:
+            key = (int(entry["layer"]), str(entry["hook"]))
+            seen = demand.setdefault(key, 0)
+            demand[key] = seen + 1
+        return demand
+
+    @cached_property
+    def patch_kv_taint(self) -> tuple[int, int] | None:
+        """``(min_dest_position, spec_hash)`` for patch-aware prefix caching.
+
+        A patched activation at position ``p`` changes the KV written at ``p``
+        and (via attention in later layers) at every subsequent position, so
+        blocks containing any position ``>= min_dest_position`` must not share
+        cache entries with unpatched runs. ``spec_hash`` is a deterministic
+        digest of the full spec (stable across processes, unlike ``hash()``),
+        folded into those blocks' hashes: distinct specs get distinct KV
+        chains, while blocks strictly below the patch floor stay shareable.
+        ``None`` when the request patches nothing."""
+        if not self.patch:
+            return None
+        import hashlib
+
+        # Include every source kind + mask so distinct sources get distinct KV
+        # chains; a client-provided value's identity lives in patch_vectors, so
+        # fold the packed payload in too (different rows -> different KV).
+        entries = sorted(
+            (
+                int(e["layer"]),
+                str(e["hook"]),
+                int(e["dest_position"]),
+                str(e.get("source_run") or ""),
+                (
+                    int(e["source_position"])
+                    if e.get("source_position") is not None
+                    else -1
+                ),
+                str(e.get("source_module") or ""),
+                (int(e["source_inline"]) if e.get("source_inline") is not None else -1),
+                repr(e.get("mask")),
+                float(e.get("alpha", 1.0)),
+            )
+            for e in self.patch
+        )
+        payload = repr(entries)
+        if self.patch_vectors is not None:
+            payload += repr(self.patch_vectors.get("data"))
+        digest = hashlib.sha256(payload.encode()).digest()
+        return min(e[2] for e in entries), int.from_bytes(digest[:8], "big")
+
     def _validate_steering_vectors(self) -> None:
         """Validate all steering vector fields if provided.
 
@@ -738,6 +1259,7 @@ class SamplingParams(
                 not isinstance(ref, (tuple, list))
                 or len(ref) != 2
                 or not isinstance(ref[0], str)
+                or isinstance(ref[1], bool)
                 or not isinstance(ref[1], (int, float))
                 or not math.isfinite(float(ref[1]))
             ):
@@ -757,6 +1279,8 @@ class SamplingParams(
         for field_name, spec in fields_to_check:
             if spec is not None:
                 self._validate_single_steering_spec(field_name, spec)
+
+        self._validate_steering_clamps()
 
         # Cross-validate overlapping dimensions between base and phase specs.
         if self.steering_vectors:
@@ -787,6 +1311,19 @@ class SamplingParams(
                                 f"Overlapping entries must have "
                                 f"matching dimensions."
                             )
+
+        # Normalize SAE clamp specs.  Direct ``SamplingParams(...)`` callers
+        # may pass raw JSON-shaped dicts; coerce them into validated
+        # ``SAEClampSpec`` tuples here so downstream code only ever sees
+        # the typed form.  ``coerce_sae_clamp_specs`` is idempotent for
+        # already-typed input (no allocation when the field is already a
+        # tuple of SAEClampSpec).
+        if self.sae_clamp_specs is not None:
+            self.sae_clamp_specs = coerce_sae_clamp_specs(self.sae_clamp_specs)
+        if self.sae_full_reconstruction_specs is not None:
+            self.sae_full_reconstruction_specs = coerce_sae_full_reconstruction_specs(
+                self.sae_full_reconstruction_specs
+            )
 
         # Cross-validate overlapping dimensions between prefill and decode
         # phase specs (caught even when no base ``steering_vectors`` is set).
@@ -834,12 +1371,10 @@ class SamplingParams(
                     f"mapping layer indices to layer entries."
                 )
             for key, value in layer_vecs.items():
-                if not isinstance(key, int) or key < 0:
-                    raise ValueError(
-                        f"{field_name}[{hook_name!r}] keys must be "
-                        f"non-negative integers, got {key!r}."
-                    )
-                self._validate_layer_entry(field_name, hook_name, key, value)
+                layer_idx = validate_steering_index(
+                    key, f"{field_name}[{hook_name!r}] key"
+                )
+                self._validate_layer_entry(field_name, hook_name, layer_idx, value)
 
     def _validate_layer_entry(
         self,
@@ -863,7 +1398,9 @@ class SamplingParams(
                     f"{prefix} dict entries must have 'vector' "
                     f"and 'scale' keys, got {sorted(entry.keys())}."
                 )
-            if not isinstance(entry["scale"], (int, float)):
+            if isinstance(entry["scale"], bool) or not isinstance(
+                entry["scale"], (int, float)
+            ):
                 raise ValueError(
                     f"{prefix}['scale'] must be a finite float, got "
                     f"{type(entry['scale']).__name__}."
@@ -875,24 +1412,21 @@ class SamplingParams(
             self._validate_float_list(prefix + "['vector']", entry["vector"])
         elif isinstance(entry, list):
             self._validate_float_list(prefix, entry)
-        else:
+        elif isinstance(entry, np.ndarray):
             # ndarray entries arrive from the binary-wire decode path
             # (``unpack_steering_vectors``).  The downstream resolver
             # already accepts ndarrays — ``np.asarray`` is a no-op on
             # them — so we just sanity-check shape/dtype here rather
             # than rejecting outright.
-            import numpy as _np
-
-            if isinstance(entry, _np.ndarray):
-                if entry.ndim != 1:
-                    raise ValueError(
-                        f"{prefix} ndarray must be 1-D, got shape {entry.shape}."
-                    )
-                if entry.dtype.kind != "f":
-                    raise ValueError(
-                        f"{prefix} ndarray must be a floating dtype, got {entry.dtype}."
-                    )
-                return
+            if entry.ndim != 1:
+                raise ValueError(
+                    f"{prefix} ndarray must be 1-D, got shape {entry.shape}."
+                )
+            if entry.dtype.kind != "f":
+                raise ValueError(
+                    f"{prefix} ndarray must be a floating dtype, got {entry.dtype}."
+                )
+        else:
             raise ValueError(
                 f"{prefix} must be a list of floats or a dict with "
                 f"'vector' and 'scale' keys, got "
@@ -907,76 +1441,142 @@ class SamplingParams(
                 f"{prefix} must be a list of floats, got {type(values).__name__}."
             )
         for i, v in enumerate(values):
-            if not isinstance(v, (int, float)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise ValueError(
                     f"{prefix}[{i}] must be a finite float, got {type(v).__name__}."
                 )
             if not math.isfinite(v):
                 raise ValueError(f"{prefix}[{i}] must be finite, got {v}.")
 
-    @cached_property
-    def effective_prefill_steering(
-        self,
-    ) -> dict[str, dict[int, np.ndarray]] | None:
-        """Resolved prefill steering: base + prefill-specific, pre-scaled.
+    def _phase_filtered_sae_specs(
+        self, want_phase: str
+    ) -> tuple[SAEClampSpec, ...] | None:
+        """Filter ``sae_clamp_specs`` to those active in *want_phase*.
 
-        Returns 1-D ``np.ndarray`` per (hook, layer).  When the request
-        was packed by the client (``_effective_prefill_steering_packed``
-        is set) those arrays are already in the model's compute dtype;
-        otherwise a fresh resolve over the original list-of-floats
-        fields produces ``np.float64`` arrays.  ``hash_steering_config``
-        casts to ``float32`` at the SHA boundary in either case, so the
-        hash is stable within a deployment (cross-pipeline reuse — i.e.,
-        switching a workload between packed and unpacked — is a one-time
-        cache miss).
+        A spec with ``phase="both"`` enters both prefill and decode
+        digests; a spec with ``phase="prefill"`` only enters the
+        prefill digest; ``phase="decode"`` only the decode digest.
+        Returns ``None`` when no spec applies — letting
+        :func:`hash_steering_config` skip the SAE block entirely so
+        the resulting digest is bit-for-bit identical to a request
+        without ``sae_clamp_specs``.
         """
-        if self._effective_prefill_steering_packed is not None:
-            return self._effective_prefill_steering_packed
-        return resolve_effective_vectors(
-            self.steering_vectors, self.prefill_steering_vectors
+        if not self.sae_clamp_specs:
+            return None
+        filtered = tuple(
+            s for s in self.sae_clamp_specs if s.phase in ("both", want_phase)
         )
+        return filtered if filtered else None
 
-    @cached_property
-    def effective_decode_steering(
-        self,
-    ) -> dict[str, dict[int, np.ndarray]] | None:
-        """Resolved decode steering: base + decode-specific, pre-scaled."""
-        if self._effective_decode_steering_packed is not None:
-            return self._effective_decode_steering_packed
-        return resolve_effective_vectors(
-            self.steering_vectors, self.decode_steering_vectors
+    def _phase_filtered_sae_full_recon_specs(
+        self, want_phase: str
+    ) -> tuple[SAEFullReconstructionSpec, ...] | None:
+        """Filter ``sae_full_reconstruction_specs`` to those active in *want_phase*.
+
+        Same shape as :meth:`_phase_filtered_sae_specs`: ``"both"``
+        always matches; ``"prefill"`` / ``"decode"`` match only their
+        own phase.  Returns ``None`` when no spec applies so
+        :func:`hash_steering_config` can skip the full-recon block.
+        """
+        if not self.sae_full_reconstruction_specs:
+            return None
+        filtered = tuple(
+            s
+            for s in self.sae_full_reconstruction_specs
+            if s.phase in ("both", want_phase)
         )
+        return filtered if filtered else None
 
     @cached_property
     def prefill_steering_config_hash(self) -> int:
         """Cached hash of ``effective_prefill_steering`` plus
-        ``steering_module_ref``.
+        ``steering_module_ref`` plus prefill-active ``sae_clamp_specs``.
 
         Lives on ``SamplingParams`` (not ``Request``) so that many requests
         sharing the same ``SamplingParams`` object — the common case for
         batched ``llm.generate(prompts, [sp]*N)`` — only pay the hashing
         cost once across the whole batch instead of once per request.
 
-        When ``steering_module_ref`` is ``None`` this reduces to the
-        original inline-only hash bit-for-bit, preserving prefix-cache
-        reuse for requests that don't reference a named module.  When set
-        to a *user*-named module, the ``(name, scale)`` tuple is folded
-        into the digest so two requests with the same reference plus
-        identical inline overrides produce the same hash regardless of
-        when the module was registered worker-side.
+        When ``steering_module_ref`` and ``sae_clamp_specs`` are both
+        ``None`` this reduces to the original inline-only hash
+        bit-for-bit, preserving prefix-cache reuse for requests that
+        don't reference a named module or SAE clamp.  When set, those
+        fields are folded into the digest so two requests with the
+        same reference + identical inline overrides + identical SAE
+        clamps produce the same hash regardless of when the named
+        modules were registered worker-side.
         """
+        return hash_steering_config(
+            self.effective_prefill_steering,
+            module_ref=self.steering_module_ref,
+            clamps=self.effective_prefill_clamps,
+            sae_clamp_specs=self._phase_filtered_sae_specs("prefill"),
+            sae_full_reconstruction_specs=(
+                self._phase_filtered_sae_full_recon_specs("prefill")
+            ),
+        )
+
+    @cached_property
+    def decode_steering_config_hash(self) -> int:
+        """Cached hash of ``effective_decode_steering`` plus
+        ``steering_module_ref`` plus decode-active ``sae_clamp_specs``.
+        See ``prefill_steering_config_hash``."""
+        return hash_steering_config(
+            self.effective_decode_steering,
+            module_ref=self.steering_module_ref,
+            clamps=self.effective_decode_clamps,
+            sae_clamp_specs=self._phase_filtered_sae_specs("decode"),
+            sae_full_reconstruction_specs=(
+                self._phase_filtered_sae_full_recon_specs("decode")
+            ),
+        )
+
+    @cached_property
+    def prefill_additive_steering_config_hash(self) -> int:
+        """Cached hash of only the additive prefill steering identity."""
         return hash_steering_config(
             self.effective_prefill_steering,
             module_ref=self.steering_module_ref,
         )
 
     @cached_property
-    def decode_steering_config_hash(self) -> int:
-        """Cached hash of ``effective_decode_steering`` plus
-        ``steering_module_ref``. See ``prefill_steering_config_hash``."""
+    def decode_additive_steering_config_hash(self) -> int:
+        """Cached hash of only the additive decode steering identity."""
         return hash_steering_config(
             self.effective_decode_steering,
             module_ref=self.steering_module_ref,
+        )
+
+    @cached_property
+    def prefill_sae_clamp_config_hash(self) -> int:
+        """Cached hash of only the prefill-active SAE clamp identity."""
+        return hash_sae_clamp_specs_for_phase(
+            self._phase_filtered_sae_specs("prefill"),
+            "prefill",
+        )
+
+    @cached_property
+    def decode_sae_clamp_config_hash(self) -> int:
+        """Cached hash of only the decode-active SAE clamp identity."""
+        return hash_sae_clamp_specs_for_phase(
+            self._phase_filtered_sae_specs("decode"),
+            "decode",
+        )
+
+    @cached_property
+    def prefill_sae_full_recon_config_hash(self) -> int:
+        """Cached hash of only the prefill-active SAE full-reconstruction identity."""
+        return hash_sae_full_reconstruction_specs_for_phase(
+            self._phase_filtered_sae_full_recon_specs("prefill"),
+            "prefill",
+        )
+
+    @cached_property
+    def decode_sae_full_recon_config_hash(self) -> int:
+        """Cached hash of only the decode-active SAE full-reconstruction identity."""
+        return hash_sae_full_reconstruction_specs_for_phase(
+            self._phase_filtered_sae_full_recon_specs("decode"),
+            "decode",
         )
 
     def _verify_greedy_sampling(self) -> None:
@@ -1110,11 +1710,24 @@ class SamplingParams(
             self.steering_vectors,
             self.prefill_steering_vectors,
             self.decode_steering_vectors,
+            self._effective_prefill_steering_packed,
+            self._effective_decode_steering_packed,
+            self.sae_clamp_specs,
+            self.sae_full_reconstruction_specs,
+            # SteeringClamps are immutable post-ingestion, so clones share
+            # them by reference too.
+            self.steering_clamps,
+            self.prefill_steering_clamps,
+            self.decode_steering_clamps,
         ):
             if attr is not None:
                 memo[id(attr)] = attr
 
         new_sp = copy.deepcopy(self, memo)
+        if self.sae_clamp_specs is not None:
+            new_sp.sae_clamp_specs = self.sae_clamp_specs
+        if self.sae_full_reconstruction_specs is not None:
+            new_sp.sae_full_reconstruction_specs = self.sae_full_reconstruction_specs
 
         # Carry over cached @cached_property values so the clone doesn't
         # re-hash the same steering vectors. cached_property stores its
@@ -1122,8 +1735,16 @@ class SamplingParams(
         for key in (
             "prefill_steering_config_hash",
             "decode_steering_config_hash",
+            "prefill_additive_steering_config_hash",
+            "decode_additive_steering_config_hash",
+            "prefill_sae_clamp_config_hash",
+            "decode_sae_clamp_config_hash",
+            "prefill_sae_full_recon_config_hash",
+            "decode_sae_full_recon_config_hash",
             "effective_prefill_steering",
             "effective_decode_steering",
+            "effective_prefill_clamps",
+            "effective_decode_clamps",
         ):
             if key in self.__dict__:
                 new_sp.__dict__[key] = self.__dict__[key]
@@ -1142,7 +1763,10 @@ class SamplingParams(
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(tokenizer)
         self._validate_spec_decode(speculative_config)
-        self._validate_structured_outputs(structured_outputs_config, tokenizer)
+        self._validate_diffusion(model_config)
+        self._validate_structured_outputs(
+            model_config, structured_outputs_config, tokenizer
+        )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs
@@ -1170,6 +1794,20 @@ class SamplingParams(
                     f"which is greater than max allowed: {MAX_LOGPROB_TOKEN_IDS}",
                     parameter="logprob_token_ids",
                     value=n,
+                )
+            vocab_size = model_config.get_vocab_size()
+            invalid_token_ids = [
+                token_id
+                for token_id in self.logprob_token_ids
+                if token_id < 0 or token_id >= vocab_size
+            ]
+            if invalid_token_ids:
+                raise VLLMValidationError(
+                    f"token_id(s) {invalid_token_ids} in logprob_token_ids "
+                    f"contain out-of-vocab token ids. Vocabulary size: "
+                    f"{vocab_size}",
+                    parameter="logprob_token_ids",
+                    value=invalid_token_ids,
                 )
             if self.logprobs is not None and self.logprobs != n:
                 raise VLLMValidationError(
@@ -1259,13 +1897,48 @@ class SamplingParams(
                 "are not yet supported with speculative decoding."
             )
 
+    def _validate_diffusion(self, model_config: ModelConfig) -> None:
+        if not model_config.is_diffusion:
+            return
+
+        # Diffusion models denoise a whole canvas per step with a fixed
+        # temperature schedule, so per-request sampling parameters are not
+        # supported. Penalties are ignored by the sampler with a warning.
+        if (
+            self.temperature != 1.0
+            or self.min_p > _SAMPLING_EPS
+            or self.seed is not None
+            or self.min_tokens > 0
+            or self.logit_bias
+            or self.bad_words
+            or self.allowed_token_ids
+        ):
+            raise ValueError(
+                "The temperature, min_p, seed, min_tokens, logit_bias, "
+                "bad_words, and allowed_token_ids sampling parameters "
+                "are not yet supported with diffusion models."
+            )
+
     def _validate_structured_outputs(
         self,
+        model_config: ModelConfig,
         structured_outputs_config: StructuredOutputsConfig | None,
         tokenizer: TokenizerLike | None,
     ) -> None:
         if structured_outputs_config is None or self.structured_outputs is None:
             return
+
+        if model_config.is_diffusion:
+            # Diffusion LLMs denoise a whole canvas of tokens in parallel
+            # rather than sampling left-to-right, which the grammar FSM
+            # requires. Without this check, requests fail mid-generation
+            # with an FSM rejection (HTTP 500). See issue #45436.
+            raise ValueError(
+                "Structured outputs are not yet supported for diffusion "
+                "language models. Remove the structured output constraint "
+                "(e.g. `response_format`, `structured_outputs`) from the "
+                "request."
+            )
 
         if tokenizer is None:
             raise ValueError(
@@ -1306,6 +1979,18 @@ class SamplingParams(
             and self.structured_outputs.grammar.strip() == ""
         ):
             raise ValueError("structured_outputs.grammar cannot be an empty string")
+        # Reject empty string json schema early to avoid engine-side crashes
+        if (
+            isinstance(self.structured_outputs.json, str)
+            and self.structured_outputs.json.strip() == ""
+        ):
+            raise ValueError("structured_outputs.json cannot be an empty string")
+        # Reject json_object=False early to avoid engine-side crashes
+        if self.structured_outputs.json_object is False:
+            raise ValueError(
+                "structured_outputs.json_object must be True if set; omit "
+                "structured_outputs to disable structured outputs"
+            )
 
         from vllm.v1.structured_output.backend_guidance import (
             has_guidance_unsupported_json_features,
@@ -1456,3 +2141,4 @@ class BeamSearchParams(
     temperature: float = 0.0
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
+    structured_outputs: StructuredOutputsParams | None = None

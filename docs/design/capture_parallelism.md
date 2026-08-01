@@ -17,11 +17,11 @@ guide see [Capture Consumers](../features/capture_consumers.md).
 
 ## TL;DR
 
-- **The capturable hooks are replicated.** The three hooks that fire
-  today — `pre_attn`, `post_attn`, `post_mlp` — read the residual
-  stream *after* the TP all-reduce and the MoE combine, so the tensor
-  is full `hidden_size`, **byte-identical on every TP and every EP
-  rank**. For these hooks, TP/EP support is a *rank gate*, not a
+- **The capturable hooks are replicated.** The residual-stream hooks —
+  `pre_attn`, `post_attn`, `post_block` — read the residual stream
+  *after* the TP all-reduce and the MoE combine, so the tensor is full
+  `hidden_size`, **byte-identical on every TP and every EP rank** (the
+  `mlp_in`/`mlp_out` branch hooks are likewise replicated; see below). For these hooks, TP/EP support is a *rank gate*, not a
   gather: exactly one rank per replication group captures; the rest
   no-op.
 - **Pipeline parallelism is the substantive work.** Layers are
@@ -49,21 +49,24 @@ The fired hooks tap `hidden_states` after the residual add, which is
 downstream of the reducing collectives:
 
 - `RowParallelLinear` all-reduces when `reduce_results=True`
-  (`vllm/model_executor/layers/linear.py:1558-1559`), so attention- and
+  (`vllm/model_executor/layers/linear.py`), so attention- and
   MLP-output projections produce full `hidden_size` on every TP rank.
 - MoE paths all-gather/all-reduce before the residual add
-  (`vllm/model_executor/models/deepseek_v2.py:384`), so `post_mlp` on an
+  (`vllm/model_executor/models/deepseek_v2.py`), so `post_block` on an
   EP rank also sees the full residual.
 
-Hence `pre_attn` / `post_attn` / `post_mlp` are `[num_rows,
+Hence `pre_attn` / `post_attn` / `post_block` are `[num_rows,
 hidden_size]` and identical across the TP×EP plane of a PP stage.
 
 What is **genuinely sharded** (and not captured today):
 
 - The MLP **intermediate** (`gate_up_proj` output) is sharded along
-  `intermediate_size / tp` (`ColumnParallelLinear`). Note `mlp_in` (the
-  input to `gate_up_proj`) is the *replicated* residual; only the
-  intermediate between `gate_up` and `down` is sharded.
+  `intermediate_size / tp` (`ColumnParallelLinear`). Note the `mlp_in`
+  hook (the normed input to `gate_up_proj`) and the `mlp_out` hook (the
+  block's MLP branch, read after the `down_proj` all-reduce) are both
+  *replicated* and are captured today on gemma3/gemma4/qwen3 like the
+  other residual-stream hooks; only the intermediate between `gate_up`
+  and `down` is sharded.
 - Per-expert MoE outputs are sharded across EP ranks before the
   combine.
 
@@ -78,36 +81,36 @@ activations](#sharded-activations)).
   layers keep their **global** indices and fire hooks with them.
 - But the manager is constructed with
   `model_config.get_num_layers(parallel_config)`, which returns
-  `end - start` — the **local** count (`vllm/config/model.py:1329`,
-  used at `vllm/v1/worker/gpu_model_runner.py:560`).
+  `end - start` — the **local** count (`vllm/config/model.py`,
+  used at `vllm/v1/worker/gpu_model_runner.py`).
 - Result: on stage 1 (global layers 32–63), `_num_hidden_layers == 32`,
   and `register_request` rejects every global index `>= 32`
-  (`vllm/v1/capture/manager.py:360`). The registration path assumes one
+  (`vllm/v1/capture/manager.py`). The registration path assumes one
   global `[0, N)` layer space in a single manager.
 
 ### One runner/manager per worker; one authoritative output rank
 
 - There is one `GPUModelRunner` and one `CaptureManager` per worker
   process (per TP×PP rank), `set_active_capture_manager` called once
-  (`gpu_model_runner.py:557-582`).
+  (`gpu_model_runner.py`).
 - The executor returns only `output_rank`'s `ModelRunnerOutput`:
   `output_rank = world_size - tp_size * pcp_size`, i.e. **TP rank 0 of
-  the last PP stage** (`vllm/v1/executor/multiproc_executor.py:480-494`,
-  filtered at `:948-970`). Other ranks' outputs are discarded by
-  default.
+  the last PP stage** (`vllm/v1/executor/multiproc_executor.py`, which
+  also filters the collected outputs). Other ranks' outputs are discarded
+  by default.
 - **Exception — the aggregation template:** when a `KVOutputAggregator`
   is set, *all* workers' outputs are passed to `aggregate()`, which
   merges per-rank auxiliary fields (`finished_sending`,
   `kv_connector_stats`, …) into `outputs[output_rank]` before returning
-  (`vllm/distributed/kv_transfer/kv_connector/utils.py:65-173`).
-  `ModelRunnerOutput.capture_results` (`vllm/v1/outputs.py:288`) can be
+  (`vllm/distributed/kv_transfer/kv_connector/utils.py`).
+  `ModelRunnerOutput.capture_results` (`vllm/v1/outputs.py`) can be
   merged the same way.
 
 ### Data parallelism is independent per rank
 
 - Non-MoE DP ranks are "completely independent" — each runs with
   `data_parallel_size = 1` locally and processes a disjoint request
-  queue (`vllm/v1/engine/core.py:1133-1138`). MoE DP ranks synchronize
+  queue (`vllm/v1/engine/core.py`). MoE DP ranks synchronize
   *finished* metadata but still own disjoint request batches.
 - So captures partition by request across DP; no cross-DP aggregation
   is required. The only hazard is two DP ranks writing the same
@@ -124,9 +127,9 @@ On `GroupCoordinator` (`vllm/distributed/parallel_state.py`):
 - Mixed tensor+metadata: `send_tensor_dict` / `recv_tensor_dict` /
   `isend_tensor_dict` / `irecv_tensor_dict` — the same primitives PP
   uses to pass `IntermediateTensors`
-  (`vllm/v1/worker/gpu_worker.py:826-867`).
+  (`vllm/v1/worker/gpu_worker.py`).
 - Wrappers: `tensor_model_parallel_all_gather` /
-  `_all_reduce` / `_reduce_scatter` (`communication_op.py:12-24`).
+  `_all_reduce` / `_reduce_scatter` (`communication_op.py`).
 
 Group accessors: `get_tp_group`, `get_pp_group`, `get_ep_group`,
 `get_dp_group`, with `.rank_in_group`, `.world_size`, `.is_first_rank`,
@@ -163,10 +166,10 @@ declared `location` can select between them.
 
 - Each capturer rank registers only the spec layers in its **local**
   `[start, end)` range, captures them, and the (worker-location)
-  filesystem consumer writes to a path keyed by **global** layer index
-  + request_id on a **shared** mount.
+  filesystem consumer writes to a path keyed by **global** layer
+  index + request_id on a **shared** mount.
 - The on-disk layout merges naturally: stage 0 writes
-  `…/req/12_post_mlp.bin`, stage 1 writes `…/req/40_post_mlp.bin`, no
+  `…/req/12_post_block.bin`, stage 1 writes `…/req/40_post_block.bin`, no
   collision. The `packed`/`sharded` layouts (one file per request / per
   tag) cannot merge by global layer index alone, so under PP each stage
   writes its **own** file keyed by stage rank

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,10 +28,14 @@ pub enum Error {
     ValueDecode(#[from] rmpv::decode::Error),
     #[error("messagepack ext value decode failed: {message}")]
     ExtValueDecode { message: String },
+    #[error("invalid structured outputs params: {message}")]
+    InvalidStructuredOutputsParams { message: String },
     #[error("io error")]
     Io(#[from] std::io::Error),
     #[error("transport error")]
     Transport(#[from] zeromq::ZmqError),
+    #[error("ZMQ runtime task failed")]
+    ZmqRuntimeTask(#[from] tokio::task::JoinError),
     #[error("engine core reported fatal failure")]
     EngineCoreDead,
     #[error("startup handshake timed out while waiting for {stage} after {timeout:?}")]
@@ -83,8 +90,30 @@ pub enum Error {
     },
     #[error("utility call `{method}` closed unexpectedly (call_id={call_id})")]
     UtilityCallClosed { method: String, call_id: u64 },
+    #[error("utility call `{method}` returned inconsistent results across engines: {values}")]
+    InconsistentUtilityResults { method: String, values: String },
 
     /// A special variant to allow cloning the same error.
     #[error(transparent)]
     Shared(Arc<Self>),
+}
+
+impl Error {
+    /// Whether this error is a per-frame decode failure of an engine-core
+    /// output message, as opposed to a fatal transport/engine condition.
+    ///
+    /// A single undecodable output frame (e.g. after a wire-format drift) must
+    /// not tear down the whole client: the output dispatcher logs and skips it
+    /// so subsequent frames for other requests keep flowing. Transport failures
+    /// and the engine-dead sentinel are fatal and are not classified here.
+    pub fn is_output_frame_decode_failure(&self) -> bool {
+        match self {
+            Self::Decode { .. }
+            | Self::ValueDecode(_)
+            | Self::ExtValueDecode { .. }
+            | Self::UnsupportedAuxFrames { .. } => true,
+            Self::Shared(inner) => inner.is_output_frame_decode_failure(),
+            _ => false,
+        }
+    }
 }

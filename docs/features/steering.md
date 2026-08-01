@@ -5,8 +5,22 @@ decoder layers during inference. It can be used to shift model behavior
 without fine-tuning, for example for tone/style changes, behavioral
 interventions, or SAE-derived steering vectors.
 
-This page is the user-facing guide to steering in vLLM. For internal
-runtime details, see [Steering Runtime Design](../design/steering_runtime.md).
+Alongside additive vectors, steering supports **directional clamps** that
+bound a feature's projection instead of shifting every token
+([below](#directional-clamps)).
+
+This page is the user-facing guide to *static* steering in vLLM — vectors and
+clamps a client or operator sets. For internal runtime details, see
+[Steering Runtime Design](../design/steering_runtime.md). Two neighboring
+pages cover the rest of the intervention stack:
+
+- [Dynamic Steering](../design/dynamic_steering.md) — activation-conditioned
+  steering (the model's own activations decide when/how much to steer), the
+  in-graph monitor, and the declarative per-request `when × scope × apply`
+  gates a client can attach to a request.
+- [Activation Patching](activation_patching.md) — overwrite/interpolate an
+  activation from a prior run at a `(layer, hook, position)` site, and the
+  `/v1/patch_sweep` causal-tracing endpoint.
 
 ## Supported Scope
 
@@ -27,12 +41,12 @@ Steering is wired into the following decoder architectures:
 - Olmo family: `olmo`, `olmo2`, `olmo_hybrid`
 - Exaone family: `exaone`, `exaone4`
 - Phi family: `phi`
-- Plamo family: `plamo2`, `plamo3`
+- Plamo family: `plamo3`
 - Step family: `step1`, `step3_text`, `step3p5`
 - Molmo family: `molmo`, `molmo2`
 - Falcon / Baichuan / Command / StableLM: `falcon`, `baichuan`, `commandr`,
   `stablelm`
-- Other: `AXK1`, `gpt_neox`, `hyperclovax`, `opt`, `orion`, `ouro`,
+- Other: `AXK1`, `gpt_neox`, `hyperclovax`, `opt`, `orion`,
   `persimmon`, `seed_oss`, `starcoder2`, `hunyuan_v1`, `mimo_v2_flash`
 
 End-to-end tested with real weights:
@@ -55,17 +69,22 @@ Also supported:
 - Global steering through HTTP endpoints
 - Per-request steering through `SamplingParams`
 - Three additive tiers (base / prefill-specific / decode-specific)
-- Three hook points on standard models: `pre_attn`, `post_attn`, `post_mlp`
-  (mHC models expose a different hook set — see [mHC Steering](#mhc-steering))
+- Five hook points on standard models: `pre_attn`, `post_attn`, `post_block`
+  (residual stream) plus `mlp_in`, `mlp_out` (MLP branch; wired on
+  gemma3/gemma4 and the qwen3 family). mHC models expose an additional
+  multi-stream hook set — see [mHC Steering](#mhc-steering)
+- Directional clamps on the same three tiers (see
+  [Directional Clamps](#directional-clamps))
 - Phase-aware scheduler admission for per-request steering
 - Prefix-cache separation for different prefill steering configs
 - Continuous batching
 - `torch.compile` and CUDA graph execution
-
-Not currently supported:
-
-- v2 model runner integration (dev-flag-gated in vllm main; steering
-  integration pending)
+- Both GPU model runners: the v1 runner and the v2 runner (the control plane
+  is shared via `SteeringModelRunnerMixin`; see
+  [Steering + Capture on the V2 Model Runner](../design/v2_runner_steering_capture.md))
+- Activation-conditioned (dynamic) steering, where the model's own activations
+  decide when and how much to steer — see
+  [Dynamic Steering](../design/dynamic_steering.md)
 
 ## Steering Model
 
@@ -82,6 +101,141 @@ Each vector entry can be written either as:
 - a scaled entry: `{"vector": [...], "scale": float}`
 
 Scaled entries are multiplied before addition.
+
+## Directional Clamps
+
+In addition to additive vectors, steering supports **directional
+projection clamps**: constrain the hidden state's scalar coordinate along
+a direction to an interval, per token, at any hook point:
+
+```text
+p  = h · v̂                      # current expression of the feature
+h' = h + strength · (clip(p, min, max) − p) · v̂
+```
+
+A token whose projection is already inside `[min, max]` is untouched, and
+everything orthogonal to the direction is always preserved — unlike an
+additive vector, which shifts every token by the same amount.
+
+Clamp entries live in `steering_clamps` / `prefill_steering_clamps` /
+`decode_steering_clamps` (per-request), the same tier names on
+`/v1/steering/set` (`clamps` / `prefill_clamps` / `decode_clamps`,
+global), and an optional clamps tier on named modules:
+
+```json
+"steering_clamps": {
+  "post_block": {
+    "20": [
+      {"vector": [/* hidden_size floats */], "max": 4.0},
+      {"vector": [/* ... */], "value": 8.0, "strength": 0.5}
+    ]
+  }
+}
+```
+
+Entry semantics:
+
+- `{"vector": v, "min": lo, "max": hi}` — clamp the projection to
+  `[lo, hi]`; either bound may be omitted (one-sided).
+- `{"vector": v, "value": c}` — sugar for `min = max = c` (pin the
+  feature to a constant expression; `c = 0` is directional ablation).
+- `strength` in `[0, 1]` applies a partial correction (default 1.0).
+- Directions are **unit-normalized server-side**, so bounds are in
+  unit-projection space and portable across vectors. Zero vectors are
+  rejected.
+- Unlike vectors, tiers merge by **concatenation** (base entries first,
+  then phase entries) — each direction is an independent constraint. Up
+  to `--steering-config.max_clamp_directions` (default 4) directions per
+  (hook, layer) site after composing global + per-request tiers.
+
+Clamps run **after** additive steering at each hook, so the bound holds on
+whatever leaves the site. They participate in the steering config hash,
+so prefix caching stays correct, and clamp-only requests are admitted
+exactly like vector requests.
+
+### Gating clamps with a probe ("clamp when a feature fires")
+
+Clamps can be **modulated by the in-graph monitor**: when the monitor's
+probe fires, every clamp's effective strength scales with the per-token
+gate value (`effective = strength × gate`, `gate ∈ [0, 1]`). This
+expresses "detect a condition at layer L, clamp a feature at layers ≥ L".
+The gate is row-level — it scales all of a token's clamp directions at a
+site uniformly, the same per-token gate the additive steering row term
+reads.
+
+**The working flow is server-side and global** (not per-request):
+
+1. Start the server with `--steering-config.enable_cross_layer_monitor`
+   (a.k.a. *monitor writes gates*): the monitor then materializes the
+   per-token gate into the shared row-gate buffer that both the additive
+   steering path and the clamp ops read.
+2. Install a **global** steering monitor with `gate_rows` at the probe site
+   (via a server-registered steering consumer emitting an untargeted
+   `SteeringMonitorUpdate`). All steered rows — and all clamps — at layers
+   ≥ the probe layer are then modulated by that probe.
+
+Without `enable_cross_layer_monitor` (the default fused mode) the gate is
+computed inside the additive steering kernel and never reaches the separate
+clamp op, so clamps always run ungated.
+
+**Per-request clamp gates are not supported.** The declarative gate wire
+schema reserves `apply.kind = "clamp"` for a future materializing per-row
+monitor, but requests carrying it are **rejected with HTTP 400** in every
+server mode: the shared row-gate buffer is written only by the global
+monitor, so a per-request probe could never reach the clamp op — the
+request's declared probe/threshold/scope would be silently ignored.
+`add` / `attenuate` gates (which target additive steering) are unaffected.
+
+Picking bounds: capture activations at the target site (the capture
+feature), compute `h · v̂` over representative traffic to see the
+projection's natural range, then set `min`/`max` relative to it.
+
+### Packed clamp submission format
+
+Each of the three per-request clamp fields (and the `clamps` /
+`prefill_clamps` / `decode_clamps` tiers of `/v1/steering/set` and named
+modules) also accepts a **binary packed** form that avoids re-sending clamp
+directions as JSON float lists and re-parsing/normalizing them per request.
+Per hook point, mirroring `SteeringHookPacked`:
+
+```json
+"steering_clamps": {
+  "post_block": {
+    "dtype": "float64",
+    "shape": [3, 4096],
+    "layer_indices": [20, 20, 21],
+    "data": "<base64 contiguous [n, hidden] tensor>",
+    "bounds": [[-2.0, 2.0], [null, 4.0], [0.0, 0.0]],
+    "strengths": [1.0, 0.5, 1.0]
+  }
+}
+```
+
+- Row `i` is the direction for `layer_indices[i]`; a layer may appear in
+  several rows (one per clamp direction). **Row order within a layer is
+  preserved** — it is the tier-concat order that the per-site `K` budget
+  applies to.
+- `bounds` is one `[lo, hi]` pair per row; `strengths` is one value per row
+  (both stay as small JSON lists — only the direction vectors are bulk). An
+  **infinite** bound is written as JSON `null` (`lo` null → `-inf`, `hi` null
+  → `+inf`); all present bounds must be finite.
+- Pack directions at **`float64`** for a bit-identical prefix-cache hash
+  versus the equivalent JSON submission. Narrower dtypes are accepted but may
+  cost a one-time cache miss when the same config is also sent as JSON
+  (same trade-off as the packed steering-vector path).
+- Both this packed form and the JSON entry-list form are **client input
+  shapes only**: ingestion normalizes every clamp tier into one canonical
+  in-process type (`SteeringClamps`, `vllm/config/steering_types.py` — raw
+  float64 rows + bounds/strengths per hook), which is also exactly what
+  crosses the APIServer→EngineCore wire (msgpack map with binary row data,
+  no base64). Directions are unit-normalized at consumption, so a packed
+  and a JSON submission of the same logical config are interchangeable.
+
+Legacy JSON and packed clamp tiers can be mixed across fields in the same
+request (e.g. `steering_clamps` packed, `prefill_steering_clamps` JSON). The
+gRPC API carries the same layout as a `ClampHookPacked` message (with
+`bounds` flattened to `[lo0, hi0, lo1, hi1, ...]` and infinities as native
+`±inf` doubles).
 
 ## Enabling Steering
 
@@ -115,10 +269,22 @@ activation that is discarded immediately afterward.
 | --- | --- |
 | `pre_attn` | Residual stream before attention |
 | `post_attn` | Residual stream after attention |
-| `post_mlp` | Residual stream after MLP |
+| `post_block` | Residual stream after MLP |
+| `mlp_in` | MLP branch: normed input entering the MLP sublayer |
+| `mlp_out` | MLP branch: sublayer output before its residual add |
 
 For supported models, these hooks are wired directly into each decoder
 layer's forward path. Unused hook points are zero-valued no-ops.
+
+The three residual-stream hooks steer the carried residual and are wired on
+every steerable model. `mlp_in`/`mlp_out` steer the MLP *branch* tensor and
+are wired on gemma3, gemma4, and the qwen3 family (`qwen3`, `qwen3_moe`,
+`qwen3_next`/Qwen3.5); on other models they are silent no-ops (buffers exist
+but no emission site). Note an additive steer at `mlp_out` propagates
+identically to `post_block` — the branch is added to the residual stream —
+so `mlp_out` exists chiefly for patching (replace/ablate the MLP branch);
+`mlp_in` is the genuinely new steering site (its effect passes *through*
+the MLP nonlinearity).
 
 ## mHC Steering
 
@@ -131,17 +297,29 @@ be both captured and steered under one identifier.
 
 | Hook Point | Tensor | Vector shape | Width |
 | --- | --- | --- | --- |
-| `pre_attn` | single-stream pre-mixed attention input | `(hidden,)` | `hidden` |
+| `pre_attn` | normed single-stream attention input | `(hidden,)` | `hidden` |
 | `post_attn` | single-stream attention output | `(hidden,)` | `hidden` |
-| `mlp_in` | single-stream pre-mixed FFN input | `(hidden,)` | `hidden` |
+| `mlp_in` | normed single-stream FFN input | `(hidden,)` | `hidden` |
 | `mlp_out` | single-stream FFN output | `(hidden,)` | `hidden` |
 | `mhc_streams_pre_attn` | multi-stream residual entering attention | `(hc_mult, hidden)` | `hc_mult * hidden` |
 | `mhc_streams_pre_mlp` | multi-stream residual entering the FFN | `(hc_mult, hidden)` | `hc_mult * hidden` |
 | `mhc_streams_final` | final multi-stream residual before the head fold | `(hc_mult, hidden)` | `hc_mult * hidden` |
 
-DeepSeek-V4 has no single-stream `post_mlp` hook — its end-of-layer
+The single-stream hooks tap the tensor **after** the sublayer norm — the mHC
+pre kernels fuse `attn_norm`/`ffn_norm`, so the pre-norm tensor is never
+materialized. This matches the standard `mlp_in` contract (the normed branch
+input) and holds on both the nvidia and AMD paths.
+
+DeepSeek-V4 has no single-stream `post_block` hook — its end-of-layer
 residual is the multi-stream tensor, so steer `mhc_streams_pre_mlp` of the
 next layer (or `mhc_streams_final` at the tail) instead.
+
+Every intervention family works at an mHC hook: additive vectors, the
+dynamic tier, in-graph monitors, patch, and directional clamps are all
+registered at the hook's own width, so a clamp direction at
+`mhc_streams_pre_attn` is a unit vector in the full `hc_mult * hidden`
+stream space. Budget for the memory: clamp direction buffers scale with
+hook width, so the multi-stream hooks cost `hc_mult x` a single-stream hook.
 
 Multi-stream hooks take an **independent vector per stream**. The vector is
 supplied flattened to `hc_mult * hidden` values in stream-major order
@@ -168,14 +346,18 @@ layer index, so request it on that layer.
 
 ## Global Steering API
 
-Global steering endpoints require `VLLM_SERVER_DEV_MODE=1`.
+Global steering endpoints are mounted whenever the server runs (they answer
+with a clear error when `--enable-steering` is not set). Mutation endpoints
+should be protected with a steering API key on any shared deployment.
 
 ### Gating Mutation Endpoints Behind a Steering API Key
 
-`POST /v1/steering/set` and `POST /v1/steering/clear` can optionally be
-gated behind a dedicated steering API key, separate from the server-wide
-`--api-key`.  This lets operators issue a narrower credential for
-mutating global steering state without handing out the main server key.
+Mutating steering endpoints (`POST /v1/steering/set`, `POST
+/v1/steering/clear`, `POST /v1/steering/modules/register`, `POST
+/v1/steering/modules/unregister`) can optionally be gated behind a
+dedicated steering API key, separate from the server-wide `--api-key`.
+This lets operators issue a narrower credential for mutating steering
+state without handing out the main server key.
 
 Configure it with either the CLI flag or the env var:
 
@@ -193,14 +375,19 @@ vllm serve google/gemma-3-4b-it \
   --steering-api-key primary-key --steering-api-key rotation-key
 ```
 
-When configured, requests to `/v1/steering/set` and `/v1/steering/clear`
-must include an `Authorization: Bearer <key>` header; anything else
-returns `401 Unauthorized` without dispatching the mutation.  This check
+When configured, requests to the mutation endpoints must include an
+`Authorization: Bearer <key>` header; anything else returns
+`401 Unauthorized` without dispatching the mutation.  This check
 is additive with the server-wide `--api-key` middleware: if both are
 set, requests must satisfy both.
 
-Read-only `GET /v1/steering` and the `/v1/steering/modules/*` endpoints
-are **not** gated by this key.
+The Rust frontend honors the same key for its steering-module routes
+(`POST /v1/steering/modules`, `DELETE /v1/steering/modules/{name}`) —
+`--steering-api-key` is forwarded to the Rust process, and
+`VLLM_STEERING_API_KEY` works there too.
+
+Read-only endpoints (`GET /v1/steering`, `GET /v1/steering/layers`,
+`GET /v1/steering/modules`) are **not** gated by this key.
 
 ### Set Steering
 
@@ -209,7 +396,7 @@ curl -X POST http://localhost:8000/v1/steering/set \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
-      "post_mlp": {
+      "post_block": {
         "15": {"vector": [0.1, 0.2], "scale": 2.0}
       }
     },
@@ -261,7 +448,7 @@ packed_hook = {
 
 requests.post(
     "http://localhost:8000/v1/steering/set",
-    json={"vectors": {"post_mlp": packed_hook}},
+    json={"vectors": {"post_block": packed_hook}},
 )
 ```
 
@@ -300,7 +487,7 @@ params = SamplingParams(
     max_tokens=64,
     temperature=0.0,
     steering_vectors={
-        "post_mlp": {
+        "post_block": {
             15: {"vector": [0.1, 0.2], "scale": 2.0},
         },
     },
@@ -340,7 +527,7 @@ vec = np.random.standard_normal(2560).astype(np.float16)
 stacked = np.stack([vec], axis=0)  # (num_layers, hidden_size)
 
 base = {
-    "post_mlp": {
+    "post_block": {
         "dtype": str(stacked.dtype),  # "float16" | "float32" | "float64"
         "shape": list(stacked.shape),
         "layer_indices": [15],
@@ -387,7 +574,7 @@ The JSON file uses the same three-tier format as the global steering API:
 ```json
 {
   "vectors": {
-    "post_mlp": {
+    "post_block": {
       "15": [0.1, 0.2, 0.3],
       "20": {"vector": [0.4, 0.5, 0.6], "scale": 2.0}
     }
@@ -409,7 +596,7 @@ startup cost:
 ```json
 {
   "vectors": {
-    "post_mlp": {
+    "post_block": {
       "dtype": "float32",
       "shape": [2, 2560],
       "layer_indices": [15, 20],
@@ -422,7 +609,9 @@ startup cost:
 
 ### Registering at Runtime (API)
 
-Runtime management endpoints require `VLLM_SERVER_DEV_MODE=1`.
+Runtime registration is a steering *mutation*: when `--steering-api-key` /
+`VLLM_STEERING_API_KEY` is configured, these requests need the
+`Authorization: Bearer <key>` header.
 
 ```bash
 # Register a module (legacy JSON form)
@@ -431,7 +620,7 @@ curl -X POST http://localhost:8000/v1/steering/modules/register \
   -d '{
     "name": "creativity",
     "vectors": {
-      "post_mlp": {"15": [0.1, 0.2, 0.3]}
+      "post_block": {"15": [0.1, 0.2, 0.3]}
     }
   }'
 
@@ -464,7 +653,7 @@ requests.post(
     json={
         "name": "creativity",
         "vectors": {
-            "post_mlp": {
+            "post_block": {
                 "dtype": str(stacked.dtype),
                 "shape": list(stacked.shape),
                 "layer_indices": [15],
@@ -506,7 +695,7 @@ response = client.chat.completions.create(
     extra_body={
         "steering_name": "creativity",
         "steering_vectors": {
-            "post_mlp": {15: [0.05, 0.1, 0.15]},
+            "post_block": {15: [0.05, 0.1, 0.15]},
         },
     },
 )
@@ -565,9 +754,10 @@ as long as the model has been wired correctly.
 
 - See [Supported Scope](#supported-scope) for the list of wired decoder
   architectures
-- Global HTTP endpoints are gated behind `VLLM_SERVER_DEV_MODE=1`
-- `POST /v1/steering/set` and `POST /v1/steering/clear` can additionally
-  be gated behind `--steering-api-key` / `VLLM_STEERING_API_KEY`
+- Mutating HTTP endpoints (`/v1/steering/set`, `/v1/steering/clear`,
+  `/v1/steering/modules/register`, `/v1/steering/modules/unregister`) can
+  be gated behind `--steering-api-key` / `VLLM_STEERING_API_KEY`; protect
+  them on any shared deployment
 - Per-request steering requires `--enable-steering`
 - Distinct steering configs in flight are capped by `--max-steering-configs`
 
@@ -576,7 +766,7 @@ as long as the model has been wired correctly.
 Steering is compatible with tensor and pipeline parallelism.
 
 | Configuration        | Supported | Notes                                                   |
-|----------------------|-----------|---------------------------------------------------------|
+| -------------------- | --------- | ------------------------------------------------------- |
 | `TP=1, PP=1`         | yes       | baseline                                                |
 | `TP>1, PP=1`         | yes       | vectors replicated on every TP rank                     |
 | `TP=1, PP>1`         | yes       | vectors sharded by layer ownership                      |
@@ -598,7 +788,7 @@ Returns per-layer hook-point availability aggregated across TP × PP ranks:
 
 ```bash
 curl http://localhost:8000/v1/steering/layers
-# {"layers": {"0": {"hook_points": ["post_mlp"]}, "1": {"hook_points": ["post_mlp", "pre_attn"]}, ...}}
+# {"layers": {"0": {"hook_points": ["post_block"]}, "1": {"hook_points": ["post_block", "pre_attn"]}, ...}}
 ```
 
 Useful to confirm which layers of the loaded model are steerable before
@@ -612,8 +802,44 @@ invariant violation" naming the diverging ranks. This indicates a
 model-loading asymmetry (e.g., different weights loaded on different
 ranks) and not a user error.
 
+## Intervention Tier Template
+
+Steering is one of several residual-stream intervention tiers (activation
+patching is another; clamping follows the same shape). The payload-agnostic
+scaffolding a new tier reuses instead of hand-copying:
+
+- `vllm/model_executor/layers/intervention_common.py` — `hook_attrs` /
+  `derived_attrs` for the per-hook buffer attribute-name dicts (the values
+  are a runtime contract read by `getattr`-by-string), and `BufferKnob` for
+  config-first buffer sizing with a TEST-ONLY process-global fallback.
+- `vllm/model_executor/layers/intervention_kernel_common.py` — the kernel
+  warmup harness (`normalize_warmup_sizes` + `run_kernel_warmup` with
+  Triton-version-tolerant compiled-variant accounting); a tier's warmup
+  keeps only buffer allocation and a per-size `drive(n)` closure.
+- `vllm/v1/worker/phase_tiers.py` — `PhaseTiers`, the generic
+  base/prefill/decode container behind `SteeringManager`'s global tiers.
+- `vllm/v1/worker/steering_action_queue.py` —
+  `validate_vector_entries(vectors, steerable_layers, style)`, the single
+  vector-spec check core; callers supply a `VectorValidationStyle` (message
+  templates + unknown-layer skip/reject strictness).
+- `vllm/model_executor/layers/steering_table_layout.py` — `TableLayout` and
+  the reserved-row constants, the single definition of the steering row
+  space (row 0 sentinel, rows 1/2 global prefill/decode effective, then the
+  static and dynamic pools). Every buffer family that rides the steering
+  rows (scales, row monitors, clamp dirs/bounds/strength) must be congruent
+  with it — kernels gather through the shared `steering_index`, so a size
+  mismatch fails as silent garbage, not an error.
+
+The ops, kernels, and `register_*_buffers` bodies stay per-tier — payload
+semantics (add vs. lerp vs. bound) differ by design.
+
 ## References
 
 - [Steering Runtime Design](../design/steering_runtime.md)
+- [Dynamic Steering](../design/dynamic_steering.md) — activation-conditioned
+  steering, the in-graph monitor, and declarative per-request gates
+- [Activation Patching](activation_patching.md)
+- [Capture Consumers](capture_consumers.md) — the tap side of the same hooks
+- [Steering + Capture on the V2 Model Runner](../design/v2_runner_steering_capture.md)
 - [Automatic Prefix Caching](automatic_prefix_caching.md)
 - [OpenAI-Compatible Server](../serving/openai_compatible_server.md)

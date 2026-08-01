@@ -6,13 +6,12 @@ Tests cover three-tier steering (base, prefill, decode) with co-located
 scale format support.
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-import vllm.envs as envs
 from vllm.entrypoints.serve.steering.api_router import (
     _normalize_spec,
     attach_router,
@@ -477,7 +476,7 @@ class TestNormalizeSpec:
     def test_normalize_spec_drops_empty_hook(self):
         """Hooks whose layer dict is empty are dropped from the result.
 
-        An input like ``{"post_mlp": {}}`` is functionally
+        An input like ``{"post_block": {}}`` is functionally
         equivalent to omitting the hook entirely: no layers and no
         vectors would be applied. Keeping the empty hook in the
         normalized spec would produce a truthy-but-empty entry that
@@ -507,21 +506,15 @@ class TestNormalizeSpec:
 
 
 class TestAttachRouter:
-    def test_attached_in_dev_mode(self):
+    def test_attached_unconditionally(self):
+        # Steering routes are not dev-mode endpoints: mutation routes carry
+        # their own auth (--steering-api-key) and reads are harmless.
         app = FastAPI()
-        with patch.object(envs, "VLLM_SERVER_DEV_MODE", True):
-            attach_router(app)
+        attach_router(app)
         paths = {r.path for r in app.routes}
         assert "/v1/steering/set" in paths
         assert "/v1/steering/clear" in paths
         assert "/v1/steering" in paths
-
-    def test_not_attached_without_dev_mode(self):
-        app = FastAPI()
-        with patch.object(envs, "VLLM_SERVER_DEV_MODE", False):
-            attach_router(app)
-        paths = {r.path for r in app.routes}
-        assert "/v1/steering/set" not in paths
 
 
 # --- steering API key auth ---
@@ -745,3 +738,36 @@ class TestSetSteeringPacked:
         )
         assert kwargs.get("vectors") is None
         assert kwargs.get("prefill_vectors") is None
+
+
+class TestSetSteeringClamps:
+    """Clamp tiers through /v1/steering/set (canonical SteeringClamps)."""
+
+    def test_set_clamps_only_full_response(self, client, engine):
+        engine.collective_rpc.side_effect = [[(0, 0, [3])], [(0, 0, [3])]]
+        resp = client.post(
+            "/v1/steering/set",
+            json={"clamps": {_HP: {"3": [{"vector": [1.0, 0.0], "value": 2.0}]}}},
+        )
+        assert resp.status_code == 200, resp.json()
+        body = resp.json()
+        assert body["status"] == "ok"
+        # Regression: the response's hook_points listing iterates the
+        # canonical SteeringClamps (was a 500 via ctier.keys()).
+        assert body["hook_points"] == [_HP]
+        assert body["layers_updated"] == [3]
+        # Workers receive the canonical Struct.
+        from vllm.config.steering_types import SteeringClamps
+
+        apply_call = engine.collective_rpc.call_args_list[1]
+        kwargs = apply_call.kwargs.get("kwargs", {})
+        assert isinstance(kwargs["clamps"], SteeringClamps)
+        assert engine.reset_prefix_cache.await_count == 1
+
+    def test_set_malformed_clamps_400(self, client, engine):
+        resp = client.post(
+            "/v1/steering/set",
+            json={"clamps": {_HP: {"3": [{"vector": [0.0, 0.0], "value": 1.0}]}}},
+        )
+        assert resp.status_code == 400
+        assert "non-zero" in resp.json()["error"]

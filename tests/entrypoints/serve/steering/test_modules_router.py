@@ -186,3 +186,49 @@ class TestRegisterPacked:
         broadcast_vec = modules["broadcast"]["vectors"][_HP][5]
         assert isinstance(broadcast_vec, list)
         assert broadcast_vec == pytest.approx([0.1, 0.2], rel=1e-6)
+
+
+class TestModuleMutationAuth:
+    """register/unregister are steering mutations: when steering API tokens
+    are configured they require the bearer key, mirroring /v1/steering/set."""
+
+    @pytest.fixture
+    def keyed_client(self, engine, registry):
+        app = _make_app(engine, registry)
+        app.state.steering_api_tokens = ["sekrit"]
+        return _SyncASGIClient(app)
+
+    def _body(self):
+        return {"name": "m", "vectors": {_HP: {"5": [0.1, 0.2]}}}
+
+    def test_register_without_key_401(self, keyed_client):
+        resp = keyed_client.post("/v1/steering/modules/register", json=self._body())
+        assert resp.status_code == 401
+
+    def test_register_wrong_key_401(self, keyed_client):
+        resp = keyed_client.post(
+            "/v1/steering/modules/register",
+            json=self._body(),
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert resp.status_code == 401
+
+    def test_register_with_key_ok(self, keyed_client, registry):
+        resp = keyed_client.post(
+            "/v1/steering/modules/register",
+            json=self._body(),
+            headers={"Authorization": "Bearer sekrit"},
+        )
+        assert resp.status_code == 200
+        assert registry.get("m") is not None
+
+    def test_unregister_without_key_401(self, keyed_client):
+        resp = keyed_client.post(
+            "/v1/steering/modules/unregister", json={"name": "m"}
+        )
+        assert resp.status_code == 401
+
+    def test_no_tokens_configured_is_open(self, client, registry):
+        resp = client.post("/v1/steering/modules/register", json=self._body())
+        assert resp.status_code == 200
+        assert registry.get("m") is not None

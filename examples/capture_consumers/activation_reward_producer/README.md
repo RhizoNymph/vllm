@@ -48,7 +48,7 @@ llm = LLM(
             "name": "activation_reward",
             "params": {
                 "layer": 12,
-                "hook": "post_mlp",
+                "hook": "post_block",
                 "vector_path": "/models/happy/sadness.pt",
                 "position_slice": {"start": 10, "end": None, "stride": 1},
                 "scale": 5.0,
@@ -64,7 +64,7 @@ llm = LLM(
 
 ```bash
 vllm serve meta-llama/Llama-3-8B \
-    --capture-consumers activation_reward:layer=12,hook=post_mlp,vector_path=/models/happy/sadness.pt,scale=5.0,nonlinearity=tanh
+    --capture-consumers activation_reward:layer=12,hook=post_block,vector_path=/models/happy/sadness.pt,scale=5.0,nonlinearity=tanh
 ```
 
 ### Parameters
@@ -72,7 +72,7 @@ vllm serve meta-llama/Llama-3-8B \
 | Field | Type | Default | Purpose |
 | --- | --- | --- | --- |
 | `layer` | `int` | required | Layer index to capture at. |
-| `hook` | `str` | required | One of `pre_attn`, `post_attn`, `post_mlp`, `mlp_in`, `mlp_out`. |
+| `hook` | `str` | required | One of `pre_attn`, `post_attn`, `post_block`, `mlp_in`, `mlp_out`. |
 | `vector_path` | `str` | required | Path to a `.pt` file holding a 1-D tensor of shape `(hidden_size,)`. L2-normalized at load. |
 | `position_slice` | `dict` | `{start: 10, end: null, stride: 1}` | Applied to the `all_generated` span before mean-pooling. |
 | `scale` | `float` | `1.0` | Multiplicative factor on the raw cosine. |
@@ -120,7 +120,7 @@ llm = LLM(
             "name": "activation_reward",
             "instance_name": "sadness_reward",
             "params": {
-                "layer": 12, "hook": "post_mlp",
+                "layer": 12, "hook": "post_block",
                 "vector_path": "/models/happy/sadness.pt",
             },
         },

@@ -20,7 +20,7 @@ from vllm.v1.capture import (
 )
 
 
-def _key(req_id: str = "req-1", layer: int = 3, hook: str = "post_mlp") -> CaptureKey:
+def _key(req_id: str = "req-1", layer: int = 3, hook: str = "post_block") -> CaptureKey:
     return (VllmInternalRequestId(req_id), layer, hook)
 
 
@@ -31,15 +31,15 @@ def test_capture_key_is_a_three_tuple():
     req_id, layer, hook = key
     assert req_id == "req-1"
     assert layer == 3
-    assert hook == "post_mlp"
+    assert hook == "post_block"
 
 
 def test_capture_spec_is_frozen():
     spec = CaptureSpec(
-        hooks={"post_mlp": [1, 2, 3]},
+        hooks={"post_block": [1, 2, 3]},
         positions="last_prompt",
     )
-    assert spec.hooks == {"post_mlp": [1, 2, 3]}
+    assert spec.hooks == {"post_block": [1, 2, 3]}
     assert spec.positions == "last_prompt"
 
     with pytest.raises(dataclasses.FrozenInstanceError):

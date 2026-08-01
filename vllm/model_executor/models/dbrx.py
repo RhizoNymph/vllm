@@ -17,6 +17,7 @@ from vllm.distributed import (
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
+    RoutedExperts,
 )
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
@@ -26,6 +27,15 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    get_steering_buffer_config,
+    get_steering_buffer_dtype,
+    register_steering_buffers,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -39,6 +49,7 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsPP
 from .utils import (
     AutoWeightsLoader,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -73,27 +84,17 @@ class DbrxRouter(nn.Module):
         return router_logits
 
 
-class DbrxExperts(FusedMoE):
+class DbrxExperts(RoutedExperts):
     def __init__(
         self,
+        *args,
         config: DbrxConfig,
-        quant_config: QuantizationConfig | None = None,
-        params_dtype: torch.dtype | None = None,
-        prefix: str = "",
+        **kwargs,
     ):
-        super().__init__(
-            num_experts=config.ffn_config.moe_num_experts,
-            top_k=config.ffn_config.moe_top_k,
-            hidden_size=config.d_model,
-            intermediate_size=config.ffn_config.ffn_hidden_size,
-            params_dtype=params_dtype,
-            renormalize=True,
-            quant_config=quant_config,
-            tp_size=get_tensor_model_parallel_world_size(),
-            prefix=prefix,
-        )
+        super().__init__(*args, **kwargs)
         self.config = config
         self.d_model = config.d_model
+        self.tp_size = self.moe_config.tp_size
         self.intermediate_size = self.config.ffn_config.ffn_hidden_size // self.tp_size
 
     # Define custom weight loader for dbrx model
@@ -168,11 +169,18 @@ class DbrxMoE(nn.Module):
 
         self.router = DbrxRouter(config, self.params_dtype)
 
-        self.experts = DbrxExperts(
-            config=config,
-            quant_config=quant_config,
+        self.experts = FusedMoE(
+            num_experts=config.ffn_config.moe_num_experts,
+            top_k=config.ffn_config.moe_top_k,
+            hidden_size=config.d_model,
+            intermediate_size=config.ffn_config.ffn_hidden_size,
             params_dtype=self.params_dtype,
-            prefix=f"{prefix}.experts",
+            renormalize=True,
+            quant_config=quant_config,
+            tp_size=get_tensor_model_parallel_world_size(),
+            prefix=prefix,
+            routed_experts_cls=DbrxExperts,
+            routed_experts_args={"config": config},
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -309,23 +317,44 @@ class DbrxBlock(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        vllm_config: VllmConfig | None = None,
     ):
         super().__init__()
+        self.layer_idx = extract_layer_index(prefix)
         self.norm_attn_norm = DbrxFusedNormAttention(
             config, cache_config, quant_config, prefix=f"{prefix}.norm_attn_norm"
         )
         self.ffn = DbrxMoE(config, quant_config, prefix=f"{prefix}.ffn")
+
+        max_steering_tokens, max_steering_configs = get_steering_buffer_config(
+            vllm_config
+        )
+        register_steering_buffers(
+            self,
+            config.d_model,
+            max_steering_tokens=max_steering_tokens,
+            max_steering_configs=max_steering_configs,
+            dtype=get_steering_buffer_dtype(vllm_config),
+        )
 
     def forward(
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # DBRX adds each branch explicitly (no deferred add), so the input
+        # hidden_states is the pre-attn residual and norm_attn_norm returns the
+        # post-attn residual. Hooks mirror the shared steering/capture seam.
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.PRE_ATTN
+        )
         hidden_states, residual = self.norm_attn_norm(
             position_ids=position_ids,
             hidden_states=hidden_states,
         )
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
         hidden_states = self.ffn(hidden_states)
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         hidden_states = hidden_states + residual
         return hidden_states
 
@@ -345,9 +374,16 @@ class DbrxModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.blocks = make_layers(
             config.n_layers,
-            lambda prefix: DbrxBlock(config, cache_config, quant_config, prefix=prefix),
+            lambda prefix: DbrxBlock(
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                vllm_config=vllm_config,
+            ),
             prefix=f"{prefix}.blocks",
         )
+        share_steering_index_across_layers(self.blocks)
         self.norm_f = nn.LayerNorm(config.d_model, eps=1e-5)
         for module in self.modules():
             if hasattr(module, "bias") and isinstance(module.bias, nn.Parameter):
@@ -394,19 +430,6 @@ class DbrxModel(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
-
             if name.endswith(("w1", "w2", "v1")):
                 name = name + "_weight"
             for param_name, weight_name in expert_params_mapping:

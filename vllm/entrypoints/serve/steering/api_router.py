@@ -4,23 +4,28 @@
 import asyncio
 import hashlib
 import secrets
+import time
 from http import HTTPStatus
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-import vllm.envs as envs
 from vllm.config.steering_types import (
+    SteeringClamps,
     SteeringVectorSpec,
     coerce_steering_spec,
     normalize_layer_entry,
 )
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.steering._merge import (
+    check_action_determinism,
     deep_merge_status,
     normalize_worker_err,
 )
-from vllm.entrypoints.serve.steering.protocol import SetSteeringRequest
+from vllm.entrypoints.serve.steering.protocol import (
+    SetSAEGlobalClampsRequest,
+    SetSteeringRequest,
+)
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import VALID_HOOK_POINT_NAMES
@@ -33,6 +38,27 @@ router = APIRouter()
 # validate-then-apply flow in /set cannot be interleaved with
 # another /set or /clear request.
 _steering_lock = asyncio.Lock()
+
+# Rate limit (seconds) for the applied-action determinism-divergence ERROR
+# log, so a client polling the status endpoint cannot flood the log.
+_DETERMINISM_LOG_INTERVAL_S = 60.0
+_last_determinism_log_s = 0.0
+
+
+def _log_determinism_divergence(checksums: dict) -> None:
+    """Log a cross-rank action-checksum divergence at ERROR (rate-limited)."""
+    global _last_determinism_log_s
+    now = time.monotonic()
+    if now - _last_determinism_log_s < _DETERMINISM_LOG_INTERVAL_S:
+        return
+    _last_determinism_log_s = now
+    logger.error(
+        "dynamic steering determinism violation: applied-action checksums "
+        "diverge across ranks (worker=checksum: %s). One rank's steering "
+        "tables have silently desynced from its siblings; outputs may be "
+        "corrupted. See docs/design/dynamic_steering.md §6.",
+        checksums,
+    )
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -144,6 +170,7 @@ async def set_steering(
     # shape; ``coerce_steering_spec`` decodes the latter to ndarray entries
     # that the downstream resolver/normalizer accepts transparently.
     tiers: dict[str, SteeringVectorSpec] = {}
+    clamp_tiers: dict[str, SteeringClamps] = {}
     try:
         if (v := coerce_steering_spec(request.vectors)) is not None:
             tiers["vectors"] = v
@@ -151,19 +178,28 @@ async def set_steering(
             tiers["prefill_vectors"] = v
         if (v := coerce_steering_spec(request.decode_vectors)) is not None:
             tiers["decode_vectors"] = v
+        for clamp_field, clamp_obj in (
+            ("clamps", request.clamps),
+            ("prefill_clamps", request.prefill_clamps),
+            ("decode_clamps", request.decode_clamps),
+        ):
+            c = SteeringClamps.from_obj(clamp_obj, field_name=clamp_field)
+            if c is not None:
+                clamp_tiers[clamp_field] = c
     except (KeyError, ValueError, TypeError) as err:
         return JSONResponse(
             content={"error": f"Malformed steering payload: {err}"},
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
 
-    if not tiers:
+    if not tiers and not clamp_tiers:
         return JSONResponse(
             content={
                 "error": (
-                    "No vectors provided. Include at least one of "
-                    "vectors, prefill_vectors, or decode_vectors "
-                    "with hook point/layer data."
+                    "No vectors or clamps provided. Include at least one "
+                    "of vectors, prefill_vectors, decode_vectors, clamps, "
+                    "prefill_clamps, or decode_clamps with hook "
+                    "point/layer data."
                 ),
             },
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -173,6 +209,10 @@ async def set_steering(
     all_invalid: set[str] = set()
     for spec in tiers.values():
         invalid = _validate_hook_points(spec)
+        if invalid:
+            all_invalid.update(invalid)
+    for cspec in clamp_tiers.values():
+        invalid = _validate_hook_points(cspec.hooks)
         if invalid:
             all_invalid.update(invalid)
     if all_invalid:
@@ -218,6 +258,9 @@ async def set_steering(
                     prefill_vectors=normalized_prefill,
                     decode_vectors=normalized_decode,
                     validate_only=True,
+                    clamps=clamp_tiers.get("clamps"),
+                    prefill_clamps=clamp_tiers.get("prefill_clamps"),
+                    decode_clamps=clamp_tiers.get("decode_clamps"),
                 ),
             )
             # Each worker now returns ``(tp_rank, pp_rank, valid_layers)``.
@@ -262,6 +305,9 @@ async def set_steering(
                 if tier:
                     for layer_vecs in tier.values():
                         requested_layers.update(layer_vecs.keys())
+            for ctier in clamp_tiers.values():
+                for table in ctier.hooks.values():
+                    requested_layers.update(table.site_counts().keys())
 
             missing = requested_layers - validated_layers
             if missing:
@@ -298,6 +344,9 @@ async def set_steering(
                     decode_vectors=normalized_decode,
                     replace=request.replace,
                     validate_only=False,
+                    clamps=clamp_tiers.get("clamps"),
+                    prefill_clamps=clamp_tiers.get("prefill_clamps"),
+                    decode_clamps=clamp_tiers.get("decode_clamps"),
                 ),
             )
 
@@ -311,6 +360,9 @@ async def set_steering(
                 normalized_base is not None
                 or normalized_prefill is not None
                 or normalized_decode is not None
+                # Clamps alter hidden states (and thus KV) exactly like
+                # vectors do; any clamp tier change invalidates the cache.
+                or bool(clamp_tiers)
                 or request.replace  # replace clears all tiers
             )
             if affects_cache:
@@ -346,6 +398,8 @@ async def set_steering(
         for tier in (normalized_base, normalized_prefill, normalized_decode):
             if tier:
                 all_hooks.update(tier.keys())
+        for ctier in clamp_tiers.values():
+            all_hooks.update(ctier.hooks.keys())
 
         return JSONResponse(
             content={
@@ -481,7 +535,272 @@ async def get_steering_layers(raw_request: Request) -> JSONResponse:
         )
 
 
+@router.get("/v1/steering/dynamic")
+async def get_dynamic_steering(raw_request: Request) -> JSONResponse:
+    """Return dynamic-steering state from every worker.
+
+    Per-worker dicts are returned unaggregated (keyed into a list in
+    worker order): sync consumer decisions are supposed to be identical
+    across TP ranks within a stage, so surfacing each rank's recent
+    ring of (step, on_step_ms, n_actions) tuples and apply counters
+    side by side doubles as the cheap rank-divergence audit. See
+    docs/design/dynamic_steering.md §5.5.
+    """
+    engine = engine_client(raw_request)
+
+    try:
+        results = await engine.collective_rpc("get_dynamic_steering_status")
+        workers = list(results)
+        determinism = check_action_determinism(workers)
+        if not determinism["consistent"]:
+            _log_determinism_divergence(determinism["checksums"])
+        return JSONResponse(content={"workers": workers, "determinism": determinism})
+    except Exception as err:
+        logger.exception("Failed to get dynamic steering status")
+        return JSONResponse(
+            content={"error": f"Failed to get dynamic steering status: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
+def _check_sae_rank_divergence(results) -> JSONResponse | None:
+    """Validate the ``(tp_rank, pp_rank)`` tuples returned by
+    ``set_sae_global_clamps``.
+
+    Global SAE clamps are not layer-scoped, so unlike the additive
+    ``/set`` there is no per-rank layer set to compare — every worker
+    that validates successfully simply reports its rank coordinates.
+    The invariant checkable from those alone is that no two workers
+    claim the same ``(tp, pp)`` coordinate: a duplicate means rank
+    identity is confused and the per-rank determinism contract for the
+    global tier cannot be trusted.  Server-side bug, not user error.
+
+    Returns ``None`` when the results are consistent and a 500
+    ``JSONResponse`` otherwise.
+    """
+    seen: set[tuple[int, int]] = set()
+    for entry in results:
+        tp_rank, pp_rank = entry
+        coord = (int(tp_rank), int(pp_rank))
+        if coord in seen:
+            logger.error(
+                "SAE global clamp rank divergence: duplicate rank "
+                "coordinate tp=%d pp=%d reported by multiple workers.",
+                coord[0],
+                coord[1],
+            )
+            return JSONResponse(
+                content={
+                    "error": (
+                        "Server-side invariant violation: multiple "
+                        f"workers reported rank coordinate tp={coord[0]} "
+                        f"pp={coord[1]}. Check for worker-topology "
+                        "misconfiguration."
+                    )
+                },
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            )
+        seen.add(coord)
+    return None
+
+
+@router.post("/v1/steering/sae/set")
+async def set_sae_global_clamps(
+    request: SetSAEGlobalClampsRequest,
+    raw_request: Request,
+) -> JSONResponse:
+    """Install global SAE delta clamps applied to every token in a phase.
+
+    Two-tier: ``prefill_specs`` populate the global prefill tier and
+    ``decode_specs`` the global decode tier.  Specs are JSON-shape SAE
+    clamp specs (identical to the per-request ``sae_clamp_specs``
+    sampling field); the workers coerce and validate them against the
+    SAE module registry before committing.
+
+    When ``replace`` is ``True``, all existing global clamps in both
+    tiers are cleared atomically before the new ones are applied.
+    """
+    if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
+        return unauthorized
+
+    engine = engine_client(raw_request)
+
+    if not request.prefill_specs and not request.decode_specs and not request.replace:
+        return JSONResponse(
+            content={
+                "error": (
+                    "No clamp specs provided. Include at least one of "
+                    "prefill_specs or decode_specs, or set replace=true "
+                    "to atomically clear the global tiers."
+                ),
+            },
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+
+    try:
+        async with _steering_lock:
+            # Phase 1 -- coerce + validate on every worker without
+            # mutating the global tier (validate_only skips the
+            # commit).  A validation failure on any rank raises here,
+            # before any rank has changed state.
+            results = await engine.collective_rpc(
+                "set_sae_global_clamps",
+                args=(),
+                kwargs=dict(
+                    prefill_specs_raw=request.prefill_specs,
+                    decode_specs_raw=request.decode_specs,
+                    validate_only=True,
+                ),
+            )
+            if (divergence := _check_sae_rank_divergence(results)) is not None:
+                return divergence
+
+            # Phase 2 -- apply.  The worker re-validates and commits
+            # atomically (a manager-side failure leaves the previous
+            # global state intact on every rank, deterministically).
+            results = await engine.collective_rpc(
+                "set_sae_global_clamps",
+                args=(),
+                kwargs=dict(
+                    prefill_specs_raw=request.prefill_specs,
+                    decode_specs_raw=request.decode_specs,
+                    replace=request.replace,
+                    validate_only=False,
+                ),
+            )
+            if (divergence := _check_sae_rank_divergence(results)) is not None:
+                return divergence
+
+            # Global clamps change every token's activations in the
+            # affected phase, so any cached KV block may be stale.
+            success = await engine.reset_prefix_cache(reset_running_requests=True)
+            if success:
+                logger.info(
+                    "Prefix cache invalidated after global SAE clamp change."
+                )
+            else:
+                logger.error(
+                    "Prefix cache reset failed after global SAE clamp "
+                    "change — some blocks were still in use. Global "
+                    "clamps have been applied but cached KV blocks "
+                    "may be stale."
+                )
+                return JSONResponse(
+                    content={
+                        "error": (
+                            "Global SAE clamps were applied but prefix "
+                            "cache could not be fully invalidated. "
+                            "Retry the request or call "
+                            "/v1/steering/sae/clear and re-apply."
+                        )
+                    },
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                )
+
+        return JSONResponse(content={"status": "ok"})
+    except (SteeringVectorError, ValueError) as err:
+        return JSONResponse(
+            content={"error": normalize_worker_err(str(err))},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    except Exception as err:
+        logger.exception("Failed to set global SAE clamps")
+        return JSONResponse(
+            content={
+                "error": (
+                    f"Failed to set global SAE clamps: "
+                    f"{normalize_worker_err(str(err))}"
+                )
+            },
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
+@router.post("/v1/steering/sae/clear")
+async def clear_sae_global_clamps(raw_request: Request) -> JSONResponse:
+    """Drop all configured global SAE delta clamps (both phase tiers)."""
+    if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
+        return unauthorized
+
+    engine = engine_client(raw_request)
+
+    try:
+        async with _steering_lock:
+            await engine.collective_rpc("clear_sae_global_clamps")
+            # Clearing changes every token's activations in phases
+            # that had globals installed, so invalidate the prefix
+            # cache to prevent reuse of stale KV blocks.
+            success = await engine.reset_prefix_cache(reset_running_requests=True)
+            if not success:
+                logger.error(
+                    "Prefix cache reset failed after clearing global "
+                    "SAE clamps — some blocks still in use. Cached KV "
+                    "blocks may be stale."
+                )
+                return JSONResponse(
+                    content={
+                        "error": (
+                            "Global SAE clamps were cleared but prefix "
+                            "cache could not be fully invalidated. "
+                            "Retry the request."
+                        )
+                    },
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                )
+        return JSONResponse(content={"status": "ok"})
+    except Exception as err:
+        logger.exception("Failed to clear global SAE clamps")
+        return JSONResponse(
+            content={"error": f"Failed to clear global SAE clamps: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
+@router.get("/v1/steering/sae")
+async def get_sae_global_clamps(raw_request: Request) -> JSONResponse:
+    """Return the currently-configured global SAE clamps.
+
+    Global clamps are installed via a deterministic broadcast, so
+    every worker must report an identical
+    ``{"prefill": [...], "decode": [...]}`` view.  A mismatch is a
+    server-side invariant violation (a rank silently desynced), not
+    user error.
+    """
+    engine = engine_client(raw_request)
+
+    try:
+        results = await engine.collective_rpc("get_sae_global_clamps_status")
+        statuses = list(results)
+        if not statuses:
+            return JSONResponse(content={"prefill": [], "decode": []})
+        first = statuses[0]
+        for other in statuses[1:]:
+            if other != first:
+                logger.error(
+                    "Global SAE clamp status divergence across workers: "
+                    "%s != %s",
+                    first,
+                    other,
+                )
+                return JSONResponse(
+                    content={
+                        "error": (
+                            "Server-side invariant violation: workers "
+                            "disagree on global SAE clamp state. Check "
+                            "for rank desync or model-loading "
+                            "asymmetries."
+                        )
+                    },
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                )
+        return JSONResponse(content=first)
+    except Exception as err:
+        logger.exception("Failed to get global SAE clamp status")
+        return JSONResponse(
+            content={"error": f"Failed to get global SAE clamp status: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
 def attach_router(app: FastAPI):
-    if not envs.VLLM_SERVER_DEV_MODE:
-        return
     app.include_router(router)

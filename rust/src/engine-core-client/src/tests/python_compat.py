@@ -10,6 +10,7 @@
 # ]
 # ///
 
+from dataclasses import dataclass
 from enum import Enum, IntEnum
 
 import msgpack
@@ -30,13 +31,51 @@ class FinishReason(IntEnum):
     REPETITION = 4
 
 
-class EngineCoreSamplingParams(msgspec.Struct, dict=True):
+# Mirrors of the SAE per-request spec dataclasses
+# (vllm.config.sae_steering_types) — msgspec dataclasses and Structs share
+# the same map wire shape.
+class SAEClampEntry(msgspec.Struct):
+    feature_idx: int
+    kind: str
+    value: float
+    only_if_active: bool = False
+
+
+class SAEClampSpec(msgspec.Struct):
+    module_name: str
+    clamps: dict[str, dict[int, list[SAEClampEntry]]]
+    phase: str = "both"
+    gated: bool = False
+
+
+class SAEFullReconstructionSpec(msgspec.Struct):
+    module_name: str
+    clamps: dict[str, dict[int, list[SAEClampEntry]]] = {}
+    phase: str = "both"
+    gated: bool = False
+# Mirrors of the canonical clamp Structs (vllm.config.steering_types).
+class ClampHookTable(msgspec.Struct, forbid_unknown_fields=True):
+    shape: list[int]
+    layer_indices: list[int]
+    data: bytes
+    lo: list[float]
+    hi: list[float]
+    strength: list[float]
+
+
+class SteeringClamps(msgspec.Struct, omit_defaults=True, forbid_unknown_fields=True):
+    hooks: dict[str, ClampHookTable] = {}
+
+
+# Mirror of real SamplingParams; omit_defaults makes fixtures match real maps.
+class EngineCoreSamplingParams(msgspec.Struct, dict=True, omit_defaults=True):
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
     seed: int | None = None
-    max_tokens: int = 65536
+    max_tokens: int = 16
     min_tokens: int = 0
+    thinking_token_budget: int | None = None
     min_p: float = 0.0
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -45,6 +84,9 @@ class EngineCoreSamplingParams(msgspec.Struct, dict=True):
     _eos_token_id: int | None = None
     _all_stop_token_ids: set[int] = set()
     output_kind: RequestOutputKind = RequestOutputKind.DELTA
+    sae_clamp_specs: list[SAEClampSpec] | None = None
+    sae_full_reconstruction_specs: list[SAEFullReconstructionSpec] | None = None
+    steering_clamps: SteeringClamps | None = None
 
 
 class EngineCoreRequest(
@@ -69,6 +111,7 @@ class EngineCoreRequest(
     trace_headers: dict[str, str] | None = None
     resumable: bool = False
     external_req_id: str | None = None
+    request_metadata: dict[str, object] | None = None
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, object] | None = None
     abort_immediately: bool = False
@@ -86,8 +129,10 @@ class EngineCoreOutput(
     pooling_output: object | None = None
     finish_reason: FinishReason | None = None
     stop_reason: int | str | None = None
+    capture_results: dict = msgspec.field(default_factory=dict)
     events: object | None = None
     kv_transfer_params: object | None = None
+    ec_transfer_params: object | None = None
     trace_headers: object | None = None
     prefill_stats: object | None = None
     routed_experts: object | None = None
@@ -104,6 +149,10 @@ class EngineCoreOutputs(
     scheduler_stats: object | None = None
     timestamp: float = 0.0
     utility_output: object | None = None
+    # Async-finalized capture results, keyed by request_id then consumer name.
+    # array_like slot 5 (between utility_output and finished_requests); mirrors
+    # vllm.v1.engine.EngineCoreOutputs so the fixture matches the real wire.
+    late_capture_results: dict = msgspec.field(default_factory=dict)
     finished_requests: set[str] | None = None
     wave_complete: int | None = None
     start_wave: int | None = None
@@ -120,6 +169,7 @@ request = EngineCoreRequest(
         seed=None,
         max_tokens=32,
         min_tokens=1,
+        thinking_token_budget=256,
         min_p=0.0,
         frequency_penalty=0.0,
         presence_penalty=0.0,
@@ -132,6 +182,16 @@ request = EngineCoreRequest(
     pooling_params=None,
     arrival_time=42.5,
     client_index=0,
+)
+
+# All defaults -> empty map. Regression guard for the sparse-map decode.
+defaults_request = EngineCoreRequest(
+    request_id="req-defaults",
+    prompt_token_ids=[5, 6, 7],
+    mm_features=None,
+    sampling_params=EngineCoreSamplingParams(),
+    pooling_params=None,
+    arrival_time=1.0,
 )
 
 multimodal_tensor = np.array([[1.0, 2.0], [3.5, 4.25]], dtype=np.float32)
@@ -264,7 +324,10 @@ def engine_output_wire(
 
 
 def engine_outputs_wire(output):
-    return [0, [output], None, 0.0, None, ["req-1"]]
+    # [engine_index, outputs, scheduler_stats, timestamp, utility_output,
+    #  late_capture_results, finished_requests] -- late_capture_results is the
+    #  array_like slot 5 (empty map) added upstream; matches the real wire.
+    return [0, [output], None, 0.0, None, {}, ["req-1"]]
 
 
 inline_logprobs = engine_outputs_wire(
@@ -337,7 +400,111 @@ multipart_prompt_logprobs = engine_outputs_wire(
     )
 )
 
+
+@dataclass
+class EngineCoreReadyResponse:
+    max_model_len: int
+    num_gpu_blocks: int
+    block_size: int
+    dp_stats_address: str | None
+    dtype: str
+    vllm_version: str
+    world_size: int
+    data_parallel_size: int
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    decode_context_parallel_size: int
+    data_parallel_rank: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    instance_id: str
+    kv_cache_size_tokens: int | None = None
+    kv_cache_max_concurrency: float | None = None
+
+
+# SAE-bearing request: pins the Python->Rust direction of the SAE spec
+# wire contract (typed maps, integer layer keys).
+sae_request = EngineCoreRequest(
+    request_id="req-sae",
+    prompt_token_ids=[9, 8],
+    mm_features=None,
+    sampling_params=EngineCoreSamplingParams(
+        temperature=0.0,
+        sae_clamp_specs=[
+            SAEClampSpec(
+                module_name="sae_mod",
+                clamps={
+                    "post_block": {
+                        20: [
+                            SAEClampEntry(feature_idx=34, kind="absolute", value=5.0),
+                            SAEClampEntry(
+                                feature_idx=7,
+                                kind="additive",
+                                value=-1.5,
+                                only_if_active=True,
+                            ),
+                        ]
+                    }
+                },
+                phase="decode",
+                gated=True,
+            )
+        ],
+        sae_full_reconstruction_specs=[SAEFullReconstructionSpec(module_name="fr_mod")],
+    ),
+    pooling_params=None,
+    arrival_time=3.5,
+)
+
+
+# Clamp-bearing request: proves the canonical clamp Struct crosses the wire
+# with the row bytes as msgpack bin and native ±inf bounds.
+clamp_request = EngineCoreRequest(
+    request_id="req-clamps",
+    prompt_token_ids=[1, 2],
+    mm_features=None,
+    sampling_params=EngineCoreSamplingParams(
+        temperature=0.0,
+        steering_clamps=SteeringClamps(
+            hooks={
+                "post_block": ClampHookTable(
+                    shape=[2, 2],
+                    layer_indices=[5, 9],
+                    data=np.array(
+                        [[1.5, -2.0], [0.25, 8.0]], dtype=np.float64
+                    ).tobytes(),
+                    lo=[-2.0, float("-inf")],
+                    hi=[2.0, 4.0],
+                    strength=[1.0, 0.5],
+                )
+            }
+        ),
+    ),
+    pooling_params=None,
+    arrival_time=7.5,
+)
+
+
+ready_response = EngineCoreReadyResponse(
+    max_model_len=32768,
+    num_gpu_blocks=1000,
+    block_size=16,
+    dp_stats_address=None,
+    dtype="float32",
+    vllm_version="0.0.0",
+    data_parallel_size=1,
+    world_size=1,
+    tensor_parallel_size=1,
+    pipeline_parallel_size=1,
+    decode_context_parallel_size=1,
+    data_parallel_rank=0,
+    max_num_seqs=256,
+    max_num_batched_tokens=8192,
+    instance_id="test-instance",
+)
+
 print(msgspec.msgpack.encode(request).hex())
+print(msgspec.msgpack.encode(defaults_request).hex())
 print(msgpack.packb(multimodal_request_wire, use_bin_type=True).hex())
 print(msgspec.msgpack.encode(outputs).hex())
 print(" ".join(frame.hex() for frame in encode_output_frames(inline_logprobs)))
@@ -354,3 +521,6 @@ print(
         for frame in encode_output_frames(multipart_prompt_logprobs, size_threshold=1)
     )
 )
+print(msgspec.msgpack.encode(ready_response).hex())
+print(msgspec.msgpack.encode(sae_request).hex())
+print(msgspec.msgpack.encode(clamp_request).hex())

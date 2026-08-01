@@ -25,7 +25,7 @@ from vllm.v1.request import Request
 
 
 def _spec(positions: object) -> CaptureSpec:
-    return CaptureSpec(hooks={"post_mlp": [0]}, positions=positions)  # type: ignore[arg-type]
+    return CaptureSpec(hooks={"post_block": [0]}, positions=positions)  # type: ignore[arg-type]
 
 
 def _request(sampling_params: SamplingParams) -> Request:

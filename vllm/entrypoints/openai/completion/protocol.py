@@ -3,28 +3,33 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
-import json
 import time
 from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
 
+import vllm.envs as envs
 from vllm.config import ModelConfig
+from vllm.config.sae_steering_types import (
+    coerce_sae_clamp_specs,
+    coerce_sae_full_reconstruction_specs,
+)
 from vllm.config.steering_types import (
     SteeringVectorSpecPacked,
     unpack_steering_vectors,
 )
-from vllm.config.utils import replace
 from vllm.entrypoints.openai.chat_completion.protocol import (
     CaptureResultResponse,
 )
 from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
-    LegacyStructuralTagResponseFormat,
     OpenAIBaseModel,
+    PerRequestTimingMetrics,
     StreamOptions,
-    StructuralTagResponseFormat,
     UsageInfo,
+    structured_outputs_from_response_format,
+    validate_structural_tag_response_format,
+    validate_structured_outputs_structural_tag,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -36,8 +41,11 @@ from vllm.sampling_params import (
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
+    ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
+from vllm.utils.collection_utils import is_list_of
+from vllm.v1.request_metadata import RequestMetadata
 
 logger = init_logger(__name__)
 
@@ -96,6 +104,20 @@ class CompletionRequest(OpenAIBaseModel):
     )
     allowed_token_ids: list[int] | None = None
     prompt_logprobs: int | None = None
+    logprob_token_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "Specific vocab token IDs to return logprobs for at each generated "
+            "position, in addition to the sampled token. More efficient than "
+            "requesting the full vocab when only a small fixed label set is "
+            "needed (e.g. multilabel "
+            "scoring where each label corresponds to a known vocab id). When "
+            "set, this explicit token selection takes precedence over the "
+            "natural top-k selected by `logprobs`. Requires `logprobs` to be "
+            "set."
+        ),
+    )
+    bad_words: list[str] = Field(default_factory=list)
     # --8<-- [end:completion-sampling-params]
 
     # --8<-- [start:completion-extra-params]
@@ -156,6 +178,21 @@ class CompletionRequest(OpenAIBaseModel):
             "need to map generated text back to input tokens."
         ),
     )
+    return_token_offsets: bool | None = Field(
+        default=False,
+        description=(
+            "If true, return char-level (start, end) offsets for each "
+            "token relative to the tokenized source string in the "
+            "`token_offsets` field of the rendered response. Only "
+            "supported on the `/v1/completions/render` and "
+            "`/v1/chat/completions/render` endpoints; ignored on regular "
+            "generation endpoints. Honored only for Fast (Rust-backed) "
+            "tokenizers; otherwise `token_offsets` is null. For chat "
+            "requests, offsets are relative to the templated prompt "
+            "string (after applying the chat template). Multimodal "
+            "inputs and pre-tokenized inputs always yield null."
+        ),
+    )
 
     cache_salt: str | None = Field(
         default=None,
@@ -174,10 +211,17 @@ class CompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
-    vllm_xargs: dict[str, str | int | float] | None = Field(
+    ec_transfer_params: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Additional request parameters with string or "
+            "ECTransfer parameters used for encoder-cache disaggregated serving."
+        ),
+    )
+
+    vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
+        default=None,
+        description=(
+            "Additional request parameters with (list of) string or "
             "numeric values, used by custom extensions."
         ),
     )
@@ -192,11 +236,47 @@ class CompletionRequest(OpenAIBaseModel):
         "can detect such behavior and terminate early, saving time and tokens.",
     )
 
-    thinking_token_budget: int | None = Field(
+    thinking_token_budget: ThinkingTokenBudget = Field(
         default=None,
         description=(
             "Maximum number of tokens allowed for thinking operations "
-            "(reasoning models). -1 = unlimited."
+            "(reasoning models). Non-negative integer sets the limit; "
+            "-1 means unlimited (treated as unset)."
+        ),
+    )
+
+    stream_interval: Annotated[int, Field(ge=1)] | None = Field(
+        default=None,
+        description=(
+            "Number of tokens to batch into each streamed chunk. Raises the "
+            "server's `--stream-interval` for this request. Values below the "
+            "server setting are clamped up to it. The first and last chunks "
+            "are always sent immediately. Ignored for non-streaming requests."
+        ),
+    )
+
+    sae_clamp_specs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of SAE feature-surgery clamp directives.  Each entry "
+            "references a named SAE-kind module (registered via "
+            "POST /v1/steering/modules/register with kind='sae_delta') "
+            "and declares which feature activations to clamp on which "
+            "(hook, layer) pairs.  See docs/features/sae_steering.md "
+            "for the schema."
+        ),
+    )
+
+    sae_full_reconstruction_specs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of SAE full-reconstruction directives.  Each entry "
+            "references a named SAE module of kind "
+            "'sae_full_reconstruction' (loaded at startup via "
+            "--steering-modules) and optionally clamps features inside "
+            "the reconstruction.  An entry with no 'clamps' applies the "
+            "pure reconstruction.  See docs/features/sae_steering.md "
+            "for the schema."
         ),
     )
 
@@ -208,6 +288,38 @@ class CompletionRequest(OpenAIBaseModel):
             "``ChatCompletionRequest.capture`` for the full schema."
         ),
     )
+    capture_wait: bool = Field(
+        default=False,
+        description=(
+            "When true (and `capture` is set), hold the response until this "
+            "request's capture results have finalized (files durable), then "
+            "report them in `capture_results`. Capture writes are otherwise "
+            "asynchronous and may land after the response."
+        ),
+    )
+    patch: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Activation-patching sites. Each entry: {layer, hook, "
+            "dest_position, source_run, source_position, alpha?} — overwrite "
+            "(alpha=1) or interpolate toward the destination activation at "
+            "(layer, hook, dest_position) with the clean run `source_run`'s "
+            "activation at `source_position`. Instead of source_run a client "
+            "may set source_module (named steering module or 'zeros') or "
+            "source_inline (a row of patch_vectors); an optional per-entry mask "
+            "restricts the patch to a subset of dims. The result is graded via "
+            "normal logprobs; no extra response field."
+        ),
+    )
+    patch_vectors: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Request-level packed table of client-provided patch vectors "
+            "referenced by a patch entry's source_inline / mask.inline row "
+            "index. Binary wire form: {dtype, shape:[n_rows, width], data: "
+            "base64}."
+        ),
+    )
 
     # Per-request inline steering vectors in binary wire format.  Each entry
     # is ``{dtype, shape, layer_indices, data: base64, scales?}`` — see
@@ -217,7 +329,7 @@ class CompletionRequest(OpenAIBaseModel):
     steering_vectors: SteeringVectorSpecPacked | None = Field(
         default=None,
         description="Per-request activation steering vectors keyed by hook "
-        "point name (pre_attn, post_attn, post_mlp). Each hook carries one "
+        "point name (pre_attn, post_attn, post_block). Each hook carries one "
         "base64-encoded (num_layers, hidden_size) blob plus a sibling "
         "layer_indices list (and optional per-row scales).",
     )
@@ -234,11 +346,59 @@ class CompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
+    # Per-request directional clamps. Accepts either the JSON entry-list form
+    # or the binary packed form ({hook: ClampHookPacked}); see the chat
+    # protocol's steering_clamps for details.
+    steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-request directional clamps applied to both "
+        "phases, keyed by hook point then layer index; each value is a "
+        "list of clamp entries ({'vector': [...], 'min': float?, 'max': "
+        "float?, 'strength': float=1.0} or {'vector': [...], 'value': c} "
+        "to pin).",
+    )
+
+    prefill_steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Phase-specific clamps concatenated after base during "
+        "prefill only. Same format as steering_clamps.",
+    )
+
+    decode_steering_clamps: dict[str, Any] | None = Field(
+        default=None,
+        description="Phase-specific clamps concatenated after base during "
+        "decode only. Same format as steering_clamps.",
+    )
+
+    conversation_id: str | None = Field(
+        default=None,
+        description="Opaque client conversation/session id. Carried as "
+        "request metadata (not a sampling parameter) and surfaced to "
+        "worker-side capture consumers via StepRequestView.conversation_id so a "
+        "dynamic-steering consumer can apply per-conversation (e.g. latched) "
+        "steering across the requests of one conversation. It is an "
+        "unauthenticated global namespace: in a multi-client deployment the "
+        "operator or gateway must namespace ids per client (e.g. a "
+        "per-tenant prefix) so one client cannot inherit or pre-latch "
+        "another's steering.",
+    )
+
     steering_name: str | None = Field(
         default=None,
         description="Name of a pre-registered steering module. "
         "When set, the named vectors are resolved and additively "
         "composed with any inline steering vector fields.",
+    )
+
+    steering: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Declarative per-request steering gates: a list of "
+        "{when, scope, apply}. See the chat completion `steering` field for "
+        "the gate schema. A vector source may be {kind:'name', name:...} "
+        "(registered via /v1/steering/vectors/register) or {kind:'inline', "
+        "packed:...}; scope=rest_of_conversation with apply=add requires a "
+        "named steer vector. Applied by the built-in declarative consumer; "
+        "requires --enable-steering.",
     )
 
     # --8<-- [end:completion-extra-params]
@@ -253,6 +413,7 @@ class CompletionRequest(OpenAIBaseModel):
             needs_detokenization=bool(self.echo and not self.return_token_ids),
             max_total_tokens_param="max_model_len",
             max_output_tokens_param="max_tokens",
+            return_token_offsets=bool(self.return_token_offsets),
         )
 
     # Default sampling parameters for completion requests
@@ -283,6 +444,13 @@ class CompletionRequest(OpenAIBaseModel):
             temperature=temperature,
             length_penalty=self.length_penalty,
             include_stop_str_in_output=self.include_stop_str_in_output,
+        )
+
+    def extract_structured_outputs(self) -> StructuredOutputsParams | None:
+        """Normalize request constraints into ``StructuredOutputsParams``."""
+        return structured_outputs_from_response_format(
+            self.structured_outputs,
+            self.response_format,
         )
 
     def to_sampling_params(
@@ -316,48 +484,31 @@ class CompletionRequest(OpenAIBaseModel):
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
 
+        # Merge server-default stop_token_ids (e.g., model-specific tokens
+        # like </call> for gpt-oss) with any request-specified ones
+        stop_token_ids = self.stop_token_ids
+        default_stop_ids = default_sampling_params.get("stop_token_ids")
+        if default_stop_ids:
+            if not stop_token_ids:
+                stop_token_ids = list(default_stop_ids)
+            else:
+                stop_token_ids = list(
+                    dict.fromkeys([*stop_token_ids, *default_stop_ids])
+                )
+
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
             prompt_logprobs = self.logprobs
 
         echo_without_generation = self.echo and self.max_tokens == 0
 
-        response_format = self.response_format
-        if response_format is not None:
-            structured_outputs_kwargs = dict[str, Any]()
-
-            # Set structured output params for response format
-            if response_format.type == "json_object":
-                structured_outputs_kwargs["json_object"] = True
-            elif response_format.type == "json_schema":
-                json_schema = response_format.json_schema
-                assert json_schema is not None
-                structured_outputs_kwargs["json"] = json_schema.json_schema
-            elif response_format.type == "structural_tag":
-                structural_tag = response_format
-                assert isinstance(
-                    structural_tag,
-                    (
-                        LegacyStructuralTagResponseFormat,
-                        StructuralTagResponseFormat,
-                    ),
-                )
-                s_tag_obj = structural_tag.model_dump(by_alias=True)
-                structured_outputs_kwargs["structural_tag"] = json.dumps(s_tag_obj)
-
-            # If structured outputs wasn't already enabled,
-            # we must enable it for these features to work
-            if len(structured_outputs_kwargs) > 0:
-                self.structured_outputs = (
-                    StructuredOutputsParams(**structured_outputs_kwargs)
-                    if self.structured_outputs is None
-                    else replace(self.structured_outputs, **structured_outputs_kwargs)
-                )
-
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        if self.ec_transfer_params:
+            # Pass in ec_transfer_params via extra_args
+            extra_args["ec_transfer_params"] = self.ec_transfer_params
         sampling_params = SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -369,21 +520,24 @@ class CompletionRequest(OpenAIBaseModel):
             min_p=min_p,
             seed=self.seed,
             stop=self.stop,
-            stop_token_ids=self.stop_token_ids,
-            logprobs=self.logprobs,
+            stop_token_ids=stop_token_ids,
+            logprobs=None if self.logprob_token_ids else self.logprobs,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,
             prompt_logprobs=prompt_logprobs,
+            logprob_token_ids=self.logprob_token_ids or None,
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
             output_kind=RequestOutputKind.DELTA
             if self.stream
             else RequestOutputKind.FINAL_ONLY,
-            structured_outputs=self.structured_outputs,
+            stream_interval=self.stream_interval,
+            structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             allowed_token_ids=self.allowed_token_ids,
+            bad_words=self.bad_words,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
@@ -395,10 +549,56 @@ class CompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
+            sae_clamp_specs=coerce_sae_clamp_specs(self.sae_clamp_specs),
+            sae_full_reconstruction_specs=coerce_sae_full_reconstruction_specs(
+                self.sae_full_reconstruction_specs
+            ),
+            # SamplingParams' own validation normalizes every accepted
+            # clamp shape via SteeringClamps.from_obj (400 on malformed).
+            steering_clamps=self.steering_clamps,
+            prefill_steering_clamps=self.prefill_steering_clamps,
+            decode_steering_clamps=self.decode_steering_clamps,
         )
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)
+        if self.patch is not None:
+            sampling_params.patch = [dict(e) for e in self.patch]
+        if self.patch_vectors is not None:
+            sampling_params.patch_vectors = dict(self.patch_vectors)
         return sampling_params
+
+    def to_request_metadata(
+        self, vector_registry=None, *, monitor_writes_gates: bool | None = None
+    ) -> RequestMetadata:
+        """Build the request-level metadata channel for this request.
+
+        Holds host-side per-request fields that are not sampling parameters
+        (the conversation id and declarative steering gates); threaded to the
+        worker alongside the client request id rather than on
+        ``SamplingParams``. Named vector sources in ``steering`` are resolved
+        via *vector_registry*; raises ``ValueError`` on a malformed spec or
+        unknown name (surfaced by the caller as HTTP 400).
+        ``monitor_writes_gates`` (the engine's ``enable_cross_layer_monitor``)
+        rejects a clamp-target gate the engine cannot materialize.
+        """
+        from vllm.v1.steering_schema import build_steering_gates
+
+        return RequestMetadata(
+            conversation_id=self.conversation_id,
+            steering=build_steering_gates(
+                self.steering,
+                vector_registry,
+                monitor_writes_gates=monitor_writes_gates,
+            ),
+        )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_null_max_tokens(cls, data):
+        if isinstance(data, dict) and data.get("max_tokens") is None:
+            data = data.copy()
+            data["max_tokens"] = cls.model_fields["max_tokens"].default
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -425,6 +625,9 @@ class CompletionRequest(OpenAIBaseModel):
                     "'json_schema' field must be provided.",
                     parameter="response_format",
                 )
+
+        if rf_type == "structural_tag":
+            validate_structural_tag_response_format(response_format)
 
         return data
 
@@ -453,11 +656,47 @@ class CompletionRequest(OpenAIBaseModel):
                 "outputs ('json', 'regex' or 'choice').",
                 parameter="structured_outputs",
             )
+        validate_structured_outputs_structural_tag(structured_outputs_kwargs)
         return data
 
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
+        if data.get("logprob_token_ids") and data.get("use_beam_search"):
+            raise VLLMValidationError(
+                "`logprob_token_ids` is not supported with beam search.",
+                parameter="logprob_token_ids",
+            )
+
+        if (
+            data.get("logprob_token_ids")
+            and data.get("echo")
+            and data.get("max_tokens") == 0
+        ):
+            raise VLLMValidationError(
+                "`logprob_token_ids` is not supported when `echo=True` and "
+                "`max_tokens=0` because no output tokens are generated.",
+                parameter="logprob_token_ids",
+            )
+
+        if data.get("logprob_token_ids") and data.get("logprobs") is None:
+            raise VLLMValidationError(
+                "when using `logprob_token_ids`, `logprobs` must be set.",
+                parameter="logprob_token_ids",
+            )
+
+        # These fields are integers, but `mode="before"` runs on the raw
+        # request data, so a non-numeric value (e.g. a JSON string) would
+        # reach the comparisons below and raise TypeError -> HTTP 500. Reject
+        # it here so the client gets a clean 400 instead.
+        for field_name in ("prompt_logprobs", "logprobs"):
+            field_value = data.get(field_name)
+            if field_value is not None and not isinstance(field_value, (int, float)):
+                raise VLLMValidationError(
+                    f"`{field_name}` must be an integer.",
+                    parameter=field_name,
+                    value=field_value,
+                )
         if (prompt_logprobs := data.get("prompt_logprobs")) is not None:
             if data.get("stream") and (prompt_logprobs > 0 or prompt_logprobs == -1):
                 raise VLLMValidationError(
@@ -503,8 +742,41 @@ class CompletionRequest(OpenAIBaseModel):
         )
 
         if prompt_is_empty and embeds_is_empty:
-            raise ValueError(
-                "Either prompt or prompt_embeds must be provided and non-empty."
+            raise VLLMValidationError(
+                "Either prompt or prompt_embeds must be provided and non-empty.",
+                parameter="prompt",
+            )
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_prompt_list_length(cls, data):
+        max_prompts = envs.VLLM_MAX_COMPLETION_PROMPTS
+
+        prompt = data.get("prompt")
+        if (
+            isinstance(prompt, list)
+            and len(prompt) > 0
+            and not is_list_of(prompt, int)
+            and len(prompt) > max_prompts
+        ):
+            raise VLLMValidationError(
+                f"prompt list length {len(prompt)} exceeds the maximum "
+                f"allowed count of {max_prompts}. To increase this "
+                "limit, set the VLLM_MAX_COMPLETION_PROMPTS "
+                "environment variable.",
+                parameter="prompt",
+            )
+
+        prompt_embeds = data.get("prompt_embeds")
+        if isinstance(prompt_embeds, list) and len(prompt_embeds) > max_prompts:
+            raise VLLMValidationError(
+                f"prompt_embeds list length {len(prompt_embeds)} exceeds "
+                f"the maximum allowed count of {max_prompts}. To increase "
+                "this limit, set the VLLM_MAX_COMPLETION_PROMPTS "
+                "environment variable.",
+                parameter="prompt_embeds",
             )
 
         return data
@@ -515,8 +787,9 @@ class CompletionRequest(OpenAIBaseModel):
         if data.get("cache_salt") is not None and (
             not isinstance(data["cache_salt"], str) or not data["cache_salt"]
         ):
-            raise ValueError(
-                "Parameter 'cache_salt' must be a non-empty string if provided."
+            raise VLLMValidationError(
+                "Parameter 'cache_salt' must be a non-empty string if provided.",
+                parameter="cache_salt",
             )
         return data
 
@@ -570,6 +843,10 @@ class CompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    ec_transfer_params: dict[str, Any] | None = Field(
+        default=None, description="ECTransfer parameters."
+    )
+    metrics: PerRequestTimingMetrics | None = None
     capture_results: dict[str, CaptureResultResponse] | None = Field(
         default=None,
         description=(
@@ -609,3 +886,4 @@ class CompletionStreamResponse(OpenAIBaseModel):
     # Set only on the final chunk of a stream to mirror non-streaming responses
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
+    metrics: PerRequestTimingMetrics | None = None

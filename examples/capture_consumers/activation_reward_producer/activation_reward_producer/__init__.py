@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from vllm.v1.capture.types import CaptureContext
 
 
-_HOOK_NAMES = frozenset({"pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out"})
+_HOOK_NAMES = frozenset({"pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out"})
 _NONLIN = {
     "tanh": math.tanh,
     "sigmoid": lambda x: 1.0 / (1.0 + math.exp(-x)),

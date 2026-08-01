@@ -26,7 +26,7 @@ _MOCK_CONFIG = MagicMock()
 _LOGGER_NAME = "vllm.capture.logging"
 
 
-def _key(req_id: str = "req-1", layer: int = 0, hook: str = "post_mlp") -> CaptureKey:
+def _key(req_id: str = "req-1", layer: int = 0, hook: str = "post_block") -> CaptureKey:
     return (VllmInternalRequestId(req_id), layer, hook)
 
 
@@ -60,7 +60,7 @@ def test_construction():
     """LoggingConsumer constructs without error when given valid params."""
     consumer = LoggingConsumer(
         _MOCK_CONFIG,
-        {"hooks": {"post_mlp": [0]}, "positions": "last_prompt"},
+        {"hooks": {"post_block": [0]}, "positions": "last_prompt"},
     )
     assert consumer is not None
 
@@ -75,11 +75,11 @@ def test_global_capture_spec_returns_configured_spec():
     and positions."""
     consumer = LoggingConsumer(
         _MOCK_CONFIG,
-        {"hooks": {"post_mlp": [0, 1], "pre_attn": [2]}, "positions": "all"},
+        {"hooks": {"post_block": [0, 1], "pre_attn": [2]}, "positions": "all"},
     )
     spec = consumer.global_capture_spec()
     assert isinstance(spec, CaptureSpec)
-    assert spec.hooks == {"post_mlp": [0, 1], "pre_attn": [2]}
+    assert spec.hooks == {"post_block": [0, 1], "pre_attn": [2]}
     assert spec.positions == "all"
 
 
@@ -93,7 +93,7 @@ def test_on_capture_logs_key_rows_dtype(caplog: pytest.LogCaptureFixture):
     dtype."""
     consumer = LoggingConsumer(
         _MOCK_CONFIG,
-        {"hooks": {"post_mlp": [0]}},
+        {"hooks": {"post_block": [0]}},
     )
     key = _key()
     tensor = torch.randn(5, 16)
@@ -117,7 +117,7 @@ def test_custom_level_debug(caplog: pytest.LogCaptureFixture):
     """Construct with level='DEBUG', verify log message at DEBUG level."""
     consumer = LoggingConsumer(
         _MOCK_CONFIG,
-        {"hooks": {"post_mlp": [0]}, "level": "DEBUG"},
+        {"hooks": {"post_block": [0]}, "level": "DEBUG"},
     )
     key = _key()
     tensor = torch.randn(3, 8)
@@ -138,7 +138,7 @@ def test_default_positions():
     """Construct without positions param, verify default is 'last_prompt'."""
     consumer = LoggingConsumer(
         _MOCK_CONFIG,
-        {"hooks": {"post_mlp": [0]}},
+        {"hooks": {"post_block": [0]}},
     )
     spec = consumer.global_capture_spec()
     assert spec.positions == "last_prompt"

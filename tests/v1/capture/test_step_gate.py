@@ -78,7 +78,7 @@ def test_extract_selectors_none_and_empty():
 
 
 def test_extract_selectors_dict_spec():
-    raw = {"filesystem": {"hooks": {"post_mlp": "all"}, "positions": "last_prompt"}}
+    raw = {"filesystem": {"hooks": {"post_block": "all"}, "positions": "last_prompt"}}
     assert _extract_selectors(raw) == ["last_prompt"]
 
 

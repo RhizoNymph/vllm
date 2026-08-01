@@ -17,6 +17,7 @@ from vllm.distributed.device_communicators.shm_broadcast import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import (
+    _get_open_port,
     get_distributed_init_method,
     get_open_port,
 )
@@ -79,24 +80,25 @@ class RayWorkerProc(WorkerProc):
     1. __init__: lightweight setup, stores init args (no device/model init)
     2. initialize_worker: called after GPU IDs are discovered, completes
        the full WorkerProc initialization with the correct local_rank and
-       CUDA_VISIBLE_DEVICES.
+       logical-to-physical GPU mapping.
 
-    CUDA_VISIBLE_DEVICES setup flow:
+    GPU assignment flow:
 
     1. RayExecutorV2 enables RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES so Ray does
        not set CUDA_VISIBLE_DEVICES on RayWorkerProc actors at creation time.
     2. Each actor is scheduled with a placement group and bundle index; Ray resolves
        the physical GPU ID for that bundle at placement time.
-    3. After placement, the worker discovers that GPU ID and sets
-       CUDA_VISIBLE_DEVICES before finishing WorkerProc initialization.
+    3. After placement, the executor discovers each worker's GPU ID and passes the
+       node's logical-to-physical mapping (assigned_physical_gpu_ids) to
+       initialize_worker(); CUDA_VISIBLE_DEVICES is never modified.
 
-    There is no workaround for this unset-and-reset sequence when the placement group
-    is externally managed: scheduling must complete before CUDA_VISIBLE_DEVICES can
-    match the GPU tied to the worker's bundle.
+    Scheduling must complete before the mapping is known when the placement
+    group is externally managed: only then is the GPU tied to the worker's
+    bundle resolved.
 
     This sequence allows multiple vLLM instances to coexist on the same node:
     each instance is unaware which physical devices others hold, and the
-    externally managed placement group avoids CUDA_VISIBLE_DEVICES conflicts
+    externally managed placement group avoids device assignment conflicts
     by binding workers to specific placement group bundles.
     """
 
@@ -120,34 +122,46 @@ class RayWorkerProc(WorkerProc):
             is_driver_worker=is_driver_worker,
         )
 
-    def get_node_and_gpu_ids(self) -> tuple[str, list[int]]:
-        """Return (node_id, gpu_ids) assigned to this actor by Ray."""
+    def get_node_and_physical_gpu_ids(self) -> tuple[str, list[int]]:
+        """Return (node_id, physical_gpu_ids) assigned to this actor by Ray."""
         node_id = ray.get_runtime_context().get_node_id()
         device_key = current_platform.ray_device_key
         if not device_key:
             raise RuntimeError(
                 f"current platform {current_platform.device_name} does not support ray."
             )
-        gpu_ids = ray.get_runtime_context().get_accelerator_ids()[device_key]
-        return node_id, [int(x) for x in gpu_ids]
+        physical_gpu_ids = ray.get_runtime_context().get_accelerator_ids()[device_key]
+        return node_id, [
+            current_platform.device_control_id_to_physical_device_id(str(x))
+            for x in physical_gpu_ids
+        ]
 
     def initialize_worker(
         self,
         local_rank: int,
         env_vars: dict[str, str],
         driver_env_vars: dict[str, str] | None = None,
+        assigned_physical_gpu_ids: list[int] | None = None,
     ) -> None:
         """Complete initialization after GPU assignment is known.
 
         *driver_env_vars* are applied with ``setdefault`` — they fill
         in missing vars but never overwrite node-local values.
-        *env_vars* (e.g. CUDA_VISIBLE_DEVICES) always overwrite.
+        *env_vars* always overwrite.
+        *assigned_physical_gpu_ids* maps local_rank to physical CUDA device ID.
         """
         if driver_env_vars:
             for key, value in driver_env_vars.items():
                 os.environ.setdefault(key, value)
         for key, value in env_vars.items():
             os.environ[key] = value
+
+        if assigned_physical_gpu_ids is not None:
+            vllm_config = self._init_kwargs["vllm_config"]
+            assert isinstance(vllm_config, VllmConfig)
+            vllm_config.parallel_config.assigned_physical_gpu_ids = (
+                assigned_physical_gpu_ids
+            )
 
         self.local_rank = local_rank
         super().__init__(
@@ -246,6 +260,25 @@ class RayExecutorV2(MultiprocExecutor):
             return {"num_gpus": num_devices}
         return {"num_gpus": 0, "resources": {device_key: num_devices}}
 
+    @staticmethod
+    def _select_tcpstore_port(local_dp_rank: int | None, master_port: int) -> int:
+        """Pick the torch.distributed TCPStore port for this engine.
+
+        Co-located DP engines choosing this port with a shared random search
+        collide intermittently. Seeding by node-local DP rank gives each a
+        disjoint window. Non-DP engines and full windows fall back to a
+        random port.
+        """
+        if local_dp_rank is None:
+            return get_open_port()
+        # Offset past the DP master port reserved range, one window per rank.
+        window = 32
+        start_port = master_port + 100 + local_dp_rank * window
+        try:
+            return _get_open_port(start_port=start_port, max_attempts=window)
+        except RuntimeError:
+            return get_open_port()
+
     def _init_executor(self) -> None:
         """Initialize the RayExecutorV2 executor."""
         self._finalizer = weakref.finalize(self, self.shutdown)
@@ -253,12 +286,23 @@ class RayExecutorV2(MultiprocExecutor):
         self.failure_callback = None
         self.shutting_down = False
         self.shutdown_lock = threading.Lock()
+        # Job that owns the worker actor handles; set once actors are created
+        # in Step 1. Used to guard actor teardown against stale Ray sessions.
+        self._ray_job_id: str | None = None
 
         # Step 1: Initialize Ray cluster and retrieve placement group
         if ray is None:
             raise ImportError("Using Ray backend requires installation of ray.")
         initialize_ray_cluster(self.parallel_config, require_gpu_on_driver=False)
         placement_group = self.parallel_config.placement_group
+
+        # Record the Ray job that owns the worker actor handles. Handles are
+        # only valid within the session/job that created them; ray.kill() on a
+        # handle from a stale job raises ActorHandleNotFoundError. shutdown()
+        # uses this to skip actor teardown when Ray has been re-initialized
+        # under a different job (e.g. after an init failure or interpreter
+        # teardown re-runs ray.init()).
+        self._ray_job_id = ray.get_runtime_context().get_job_id()
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -295,7 +339,12 @@ class RayExecutorV2(MultiprocExecutor):
         # The TCPStore server runs on rank 0's node, so all workers
         # must be able to reach this address.
         dist_ip = bundle_assignments[0]["node_ip"]
-        distributed_init_method = get_distributed_init_method(dist_ip, get_open_port())
+        parallel_config = self.vllm_config.parallel_config
+        port = self._select_tcpstore_port(
+            parallel_config.data_parallel_rank_local,
+            parallel_config.data_parallel_master_port,
+        )
+        distributed_init_method = get_distributed_init_method(dist_ip, port)
 
         # Step 4: Create broadcast MessageQueue.
         # Workers on the driver node use shared memory; the rest use TCP.
@@ -365,35 +414,47 @@ class RayExecutorV2(MultiprocExecutor):
             )
             self.ray_worker_handles.append(handle)
 
-        # Step 6: Discover GPU IDs assigned to each worker via Ray runtime context.
-        worker_node_and_gpu_ids = ray.get(
-            [h.actor.get_node_and_gpu_ids.remote() for h in self.ray_worker_handles]
+        # Step 6: Discover physical GPU IDs assigned to each worker via Ray
+        # runtime context.
+        worker_node_and_physical_gpu_ids = ray.get(
+            [
+                h.actor.get_node_and_physical_gpu_ids.remote()
+                for h in self.ray_worker_handles
+            ]
         )
 
         node_workers: dict[str, list[int]] = defaultdict(list)
-        node_gpus: dict[str, list[int]] = defaultdict(list)
-        for i, (node_id, gpu_ids) in enumerate(worker_node_and_gpu_ids):
+        node_physical_gpu_ids: dict[str, list[int]] = defaultdict(list)
+        for i, (node_id, physical_gpu_ids) in enumerate(
+            worker_node_and_physical_gpu_ids
+        ):
             node_workers[node_id].append(i)
-            node_gpus[node_id].extend(gpu_ids)
-        for node_id, gpu_ids in node_gpus.items():
-            node_gpus[node_id] = sorted(gpu_ids)
+            node_physical_gpu_ids[node_id].extend(physical_gpu_ids)
+        for node_id, physical_gpu_ids in node_physical_gpu_ids.items():
+            node_physical_gpu_ids[node_id] = sorted(physical_gpu_ids)
 
-        # Step 7: Initialize workers with correct local_rank and
-        # CUDA_VISIBLE_DEVICES. Each worker sees all GPUs assigned to
-        # this executor on its node; local_rank indexes into that set.
+        # Step 7: Initialize workers with local logical ranks and the
+        # logical-to-physical GPU mapping discovered from Ray placement.
         init_worker_refs = []
-        for i, (node_id, _) in enumerate(worker_node_and_gpu_ids):
+        for i, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
             local_rank = node_workers[node_id].index(i)
-            worker_env_vars = {
-                current_platform.device_control_env_var: ",".join(
-                    map(str, node_gpus[node_id])
-                ),
-            }
+            assigned_physical_gpu_ids = sorted(node_physical_gpu_ids[node_id])
+            worker_env_vars: dict[str, str] = {}
             self.ray_worker_handles[i].local_rank = local_rank
             init_worker_refs.append(
                 self.ray_worker_handles[i].actor.initialize_worker.remote(
-                    local_rank, worker_env_vars, self.driver_env_vars
+                    local_rank,
+                    worker_env_vars,
+                    self.driver_env_vars,
+                    assigned_physical_gpu_ids=assigned_physical_gpu_ids,
                 )
+            )
+        # Also set on the executor-side config for consistency. The mapping
+        # is per-node, so only do this when all workers share one node.
+        if len(node_physical_gpu_ids) == 1:
+            node_id_0 = worker_node_and_physical_gpu_ids[0][0]
+            self.vllm_config.parallel_config.assigned_physical_gpu_ids = sorted(
+                node_physical_gpu_ids[node_id_0]
             )
         ray.get(init_worker_refs)
 
@@ -495,6 +556,33 @@ class RayExecutorV2(MultiprocExecutor):
         ):
             monitor.join(timeout=10)
 
+    def _worker_actors_killable(self) -> bool:
+        """Whether worker actor handles can be killed in the current session.
+
+        Returns False when Ray is not initialized, or when the current Ray
+        job differs from the job that created the handles — in which case
+        ray.kill() would raise ActorHandleNotFoundError.
+        """
+        if ray is None or not ray.is_initialized():
+            return False
+        if getattr(self, "_ray_job_id", None) is None:
+            # Actors were never created (init failed before Step 1) — nothing
+            # to kill.
+            return False
+        try:
+            current_job_id = ray.get_runtime_context().get_job_id()
+        except Exception:
+            return False
+        if current_job_id != self._ray_job_id:
+            logger.debug(
+                "Skipping worker actor teardown: handles belong to Ray job "
+                "%s but current job is %s (session changed).",
+                self._ray_job_id,
+                current_job_id,
+            )
+            return False
+        return True
+
     def shutdown(self) -> None:
         """Properly shut down the executor and its workers."""
         lock = getattr(self, "shutdown_lock", None)
@@ -508,12 +596,19 @@ class RayExecutorV2(MultiprocExecutor):
 
         self._join_monitor_thread()
 
-        for handle in getattr(self, "ray_worker_handles", []):
-            try:
-                ray.kill(handle.actor)
-                logger.debug("Killed actor rank=%d", handle.rank)
-            except Exception:
-                logger.exception("Failed to kill actor rank=%d", handle.rank)
+        # Worker actor handles are only valid within the Ray session/job that
+        # created them. If Ray has been torn down, or re-initialized under a
+        # different job (which happens when an init failure or interpreter
+        # teardown re-runs ray.init()), ray.kill() on those handles raises
+        # ActorHandleNotFoundError. In both cases the original actors are gone
+        # with their session, so skip the kill rather than fail teardown.
+        if self._worker_actors_killable():
+            for handle in getattr(self, "ray_worker_handles", []):
+                try:
+                    ray.kill(handle.actor)
+                    logger.debug("Killed actor rank=%d", handle.rank)
+                except Exception:
+                    logger.exception("Failed to kill actor rank=%d", handle.rank)
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()

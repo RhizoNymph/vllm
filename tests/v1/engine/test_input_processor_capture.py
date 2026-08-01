@@ -27,7 +27,7 @@ class _PromptConsumer(CaptureConsumer):
         pass
 
     def validate_client_spec(self, raw_spec, ctx):  # type: ignore[override]
-        return CaptureSpec(hooks={"post_mlp": [0]}, positions="last_prompt")
+        return CaptureSpec(hooks={"post_block": [0]}, positions="last_prompt")
 
     def on_capture(self, key, tensor, sidecar):  # pragma: no cover - unused
         pass
@@ -62,7 +62,7 @@ def _processor(capture_config, consumers) -> InputProcessor:
 class TestOfflinePrefixFlagResolution:
     def test_stamps_flags_for_prompt_touching_spec(self) -> None:
         proc = _processor(object(), {"fs": _PromptConsumer()})
-        sp = SamplingParams(capture={"fs": {"hooks": {"post_mlp": [0]}}})
+        sp = SamplingParams(capture={"fs": {"hooks": {"post_block": [0]}}})
 
         proc._resolve_capture_prefix_flags("r", sp, [1, 2, 3, 4, 5, 6, 7, 8], None)
 

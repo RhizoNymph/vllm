@@ -181,6 +181,9 @@ class WorkerBase:
         decode_vectors: dict[str, dict[int, list[float]]] | None = None,
         replace: bool = False,
         validate_only: bool = False,
+        clamps: dict[str, dict[int, list[dict]]] | None = None,
+        prefill_clamps: dict[str, dict[int, list[dict]]] | None = None,
+        decode_clamps: dict[str, dict[int, list[dict]]] | None = None,
     ) -> tuple[int, int, list[int]]:
         raise NotImplementedError
 
@@ -193,6 +196,9 @@ class WorkerBase:
     def get_steering_status(self) -> dict:
         raise NotImplementedError
 
+    def get_dynamic_steering_status(self) -> dict:
+        raise NotImplementedError
+
     def register_steering_modules(
         self,
         modules: dict[str, dict],
@@ -203,10 +209,52 @@ class WorkerBase:
     def unregister_steering_modules(self, names: list[str]) -> None:
         raise NotImplementedError
 
+    def attach_sae_weights(
+        self,
+        module_name: str,
+        weights: dict[tuple[int, str], dict[str, torch.Tensor]],
+    ) -> None:
+        raise NotImplementedError
+
+    def attach_sae_full_recon_weights(
+        self,
+        module_name: str,
+        weights: dict[tuple[int, str], dict[str, torch.Tensor]],
+    ) -> None:
+        raise NotImplementedError
+
+    def set_sae_global_clamps(
+        self,
+        prefill_specs_raw: object = None,
+        decode_specs_raw: object = None,
+        *,
+        replace: bool = False,
+        validate_only: bool = False,
+    ) -> tuple[int, int]:
+        raise NotImplementedError
+
+    def clear_sae_global_clamps(self) -> None:
+        raise NotImplementedError
+
+    def get_sae_global_clamps_status(self) -> dict:
+        raise NotImplementedError
+
     def pre_materialize_steering_module(self, name: str) -> list[tuple[int, str]]:
         raise NotImplementedError
 
     def release_pre_materialized_steering_module(self, name: str) -> None:
+        raise NotImplementedError
+
+    def register_steering_vector_name(
+        self,
+        name: str,
+        kind: str,
+        packed: dict,
+        digest: str | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def unregister_steering_vector_name(self, name: str, kind: str) -> bool:
         raise NotImplementedError
 
     @property
@@ -320,6 +368,12 @@ class WorkerWrapperBase:
                     worker_class,
                     extended_calls,
                 )
+
+        assigned_physical_gpu_ids = kwargs.pop("assigned_physical_gpu_ids", None)
+        if assigned_physical_gpu_ids is not None:
+            vllm_config.parallel_config.assigned_physical_gpu_ids = (
+                assigned_physical_gpu_ids
+            )
 
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
         if shared_worker_lock is None:

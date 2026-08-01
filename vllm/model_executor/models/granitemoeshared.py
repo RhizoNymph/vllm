@@ -172,7 +172,7 @@ class GraniteMoeSharedDecoderLayer(nn.Module):
             del moe_hidden_states
         hidden_states = residual + hidden_states * self.residual_multiplier
         hidden_states = apply_layer_steering(
-            self, hidden_states, SteeringHookPoint.POST_MLP
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
         )
 
         return hidden_states
@@ -256,11 +256,11 @@ class GraniteMoeSharedModel(nn.Module):
                 for e in range(p.size(0)):
                     w1_name = n.replace(
                         ".block_sparse_moe.input_linear.weight",
-                        f".block_sparse_moe.experts.{e}.w1.weight",
+                        f".block_sparse_moe.experts.routed_experts.{e}.w1.weight",
                     )
                     w3_name = n.replace(
                         ".block_sparse_moe.input_linear.weight",
-                        f".block_sparse_moe.experts.{e}.w3.weight",
+                        f".block_sparse_moe.experts.routed_experts.{e}.w3.weight",
                     )
                     w1_param, w3_param = p[e].chunk(2, dim=0)
                     assert w1_name not in new_weights
@@ -271,7 +271,7 @@ class GraniteMoeSharedModel(nn.Module):
                 for e in range(p.size(0)):
                     w2_name = n.replace(
                         ".block_sparse_moe.output_linear.weight",
-                        f".block_sparse_moe.experts.{e}.w2.weight",
+                        f".block_sparse_moe.experts.routed_experts.{e}.w2.weight",
                     )
                     w2_param = p[e]
                     assert w2_name not in new_weights

@@ -82,7 +82,7 @@ def test_two_consumers_both_see_captures(tmp_path: pathlib.Path) -> None:
     # is what ``build_consumers`` does for ``CaptureConsumer`` subclasses.
     recording = _RecordingConsumer(
         _FakeVllmConfig(),
-        params={"hooks": {"post_mlp": [1]}, "positions": "last_prompt"},
+        params={"hooks": {"post_block": [1]}, "positions": "last_prompt"},
     )
     recording_sink = _BatchedAdapter(recording)
 
@@ -109,7 +109,7 @@ def test_two_consumers_both_see_captures(tmp_path: pathlib.Path) -> None:
 
     req_id = "req-multi-1"
     fs_client_spec = CaptureSpec(
-        hooks={"post_mlp": [1]},
+        hooks={"post_block": [1]},
         positions="last_prompt",
     )
 
@@ -136,7 +136,7 @@ def test_two_consumers_both_see_captures(tmp_path: pathlib.Path) -> None:
     )
     plan = mgr.build_step_plan(batch_view)
     hidden = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-    mgr.on_hook(1, "post_mlp", hidden)
+    mgr.on_hook(1, "post_block", hidden)
     mgr.dispatch_step_captures(plan)
 
     # Finalize — indexed by consumer index.
@@ -152,12 +152,12 @@ def test_two_consumers_both_see_captures(tmp_path: pathlib.Path) -> None:
 
     # Give filesystem writer time to flush before asserting the on-disk
     # result status.
-    _wait_for_filesystem_result(fs_consumer, (req_id, 1, "post_mlp"))
+    _wait_for_filesystem_result(fs_consumer, (req_id, 1, "post_block"))
 
     # Recording consumer received the capture via ``on_capture``.
     assert len(recording.captured) == 1
     rec_key, rec_shape = recording.captured[0]
-    assert rec_key == (VllmInternalRequestId(req_id), 1, "post_mlp")
+    assert rec_key == (VllmInternalRequestId(req_id), 1, "post_block")
     # "last_prompt" at num_prompt_tokens=4 → one row, hidden_size=8.
     assert rec_shape == (1, 8)
 
@@ -174,7 +174,7 @@ def test_one_consumer_errors_other_still_finalizes(tmp_path: pathlib.Path) -> No
 
         def global_capture_spec(self) -> CaptureSpec:
             return CaptureSpec(
-                hooks={"post_mlp": [0]},
+                hooks={"post_block": [0]},
                 positions="last_prompt",
             )
 
@@ -184,7 +184,7 @@ def test_one_consumer_errors_other_still_finalizes(tmp_path: pathlib.Path) -> No
     failing = _FailingConsumer(_FakeVllmConfig(), params={})
     recording = _RecordingConsumer(
         _FakeVllmConfig(),
-        params={"hooks": {"post_mlp": [0]}, "positions": "last_prompt"},
+        params={"hooks": {"post_block": [0]}, "positions": "last_prompt"},
     )
     failing_sink = _BatchedAdapter(failing)
     recording_sink = _BatchedAdapter(recording)
@@ -216,7 +216,7 @@ def test_one_consumer_errors_other_still_finalizes(tmp_path: pathlib.Path) -> No
     )
     plan = mgr.build_step_plan(batch_view)
     hidden = torch.zeros((2, 4), dtype=torch.float32)
-    mgr.on_hook(0, "post_mlp", hidden)
+    mgr.on_hook(0, "post_block", hidden)
     mgr.dispatch_step_captures(plan)
 
     indexed = mgr.finalize_request("req-isolated")

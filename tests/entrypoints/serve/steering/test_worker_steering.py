@@ -3,7 +3,7 @@
 """Unit tests for steering model-runner mixin methods using a mock model.
 
 All hook-point-aware tests use the default hook point
-(``post_mlp``) unless testing multi-hook-point behaviour.
+(``post_block``) unless testing multi-hook-point behaviour.
 
 Tests cover three-tier steering (base, prefill, decode) and co-located
 scale format (bare list vs dict with scale).
@@ -22,7 +22,7 @@ from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 from vllm.v1.worker.worker_base import WorkerBase
 
 # Shorthand for test readability
-_HP = DEFAULT_HOOK_POINT.value  # "post_mlp"
+_HP = DEFAULT_HOOK_POINT.value  # "post_block"
 
 
 class FakeDecoderLayer(nn.Module):
@@ -31,9 +31,9 @@ class FakeDecoderLayer(nn.Module):
     def __init__(self, layer_idx: int, hidden_size: int, max_steering_configs: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
-        # Default hook point buffers (post_mlp) — table + index only
+        # Default hook point buffers (post_block) — table + index only
         self.register_buffer(
-            "steering_table_post_mlp",
+            "steering_table_post_block",
             torch.zeros(max_steering_configs + 2, hidden_size),
             persistent=False,
         )

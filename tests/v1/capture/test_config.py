@@ -187,6 +187,19 @@ class TestCaptureConsumersConfigHash:
         assert isinstance(h, str)
         assert len(h) == 16
 
+    def test_changes_when_piecewise_fallback_toggled(self) -> None:
+        # The fallback changes splitting_ops (the compiled graph), so it must
+        # participate in the compile-cache key.
+        cfg_a = CaptureConsumersConfig(
+            consumers=[CaptureConsumerSpec(name="fs")],
+            piecewise_capture_fallback=False,
+        )
+        cfg_b = CaptureConsumersConfig(
+            consumers=[CaptureConsumerSpec(name="fs")],
+            piecewise_capture_fallback=True,
+        )
+        assert cfg_a.compute_hash() != cfg_b.compute_hash()
+
 
 class TestActivationCacheBudget:
     def test_defaults_to_disabled(self) -> None:

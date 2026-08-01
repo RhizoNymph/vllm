@@ -86,17 +86,17 @@ class TestShardedReader:
             0,
             0,
             [
-                ("reqA", 0, "post_mlp", a),
-                ("reqB", 0, "post_mlp", b),
-                ("reqA", 1, "post_mlp", c),
+                ("reqA", 0, "post_block", a),
+                ("reqB", 0, "post_block", b),
+                ("reqA", 1, "post_block", c),
             ],
             "float32",
         )
         got = read_sharded(tag)
         assert set(got) == {"reqA", "reqB"}
-        np.testing.assert_array_equal(got["reqA"][(0, "post_mlp")].array, a)
-        np.testing.assert_array_equal(got["reqA"][(1, "post_mlp")].array, c)
-        np.testing.assert_array_equal(got["reqB"][(0, "post_mlp")].array, b)
+        np.testing.assert_array_equal(got["reqA"][(0, "post_block")].array, a)
+        np.testing.assert_array_equal(got["reqA"][(1, "post_block")].array, c)
+        np.testing.assert_array_equal(got["reqB"][(0, "post_block")].array, b)
 
     def test_request_spanning_two_shards(self, tmp_path: pathlib.Path) -> None:
         # reqA L0 has rows in seq 0 then seq 1 (sealed mid-request); reader
@@ -104,11 +104,11 @@ class TestShardedReader:
         tag = tmp_path / "t"
         a0 = np.arange(2 * 8, dtype=np.float32).reshape(2, 8)
         a1 = (np.arange(3 * 8, dtype=np.float32) + 100).reshape(3, 8)
-        _write_shard(tag, 0, 0, [("reqA", 0, "post_mlp", a0)], "float32")
-        _write_shard(tag, 0, 1, [("reqA", 0, "post_mlp", a1)], "float32")
+        _write_shard(tag, 0, 0, [("reqA", 0, "post_block", a0)], "float32")
+        _write_shard(tag, 0, 1, [("reqA", 0, "post_block", a1)], "float32")
         got = read_sharded(tag)
         np.testing.assert_array_equal(
-            got["reqA"][(0, "post_mlp")].array, np.concatenate([a0, a1])
+            got["reqA"][(0, "post_block")].array, np.concatenate([a0, a1])
         )
 
 
@@ -182,7 +182,7 @@ class TestShardedConsumer:
         expected: dict[str, dict[tuple[int, str], np.ndarray]] = {}
         try:
             for rid in reqs:
-                _register(c, rid, {"post_mlp": [0, 1]})
+                _register(c, rid, {"post_block": [0, 1]})
             # Interleave chunks across requests and layers; 2 steps each.
             tensors: dict = {}
             for step in range(2):
@@ -190,15 +190,15 @@ class TestShardedConsumer:
                     for layer in (0, 1):
                         t = torch.randn(2, 8, dtype=torch.float32)
                         tensors.setdefault((rid, layer), []).append(t)
-                        c.submit_chunk(_chunk(rid, layer, "post_mlp", t, step))
+                        c.submit_chunk(_chunk(rid, layer, "post_block", t, step))
             for rid in reqs:
                 for layer in (0, 1):
-                    c.submit_finalize(_finalize(rid, layer, "post_mlp"))
-                    expected.setdefault(rid, {})[(layer, "post_mlp")] = torch.cat(
+                    c.submit_finalize(_finalize(rid, layer, "post_block"))
+                    expected.setdefault(rid, {})[(layer, "post_block")] = torch.cat(
                         tensors[(rid, layer)]
                     ).numpy()
             # results are ok before seal (data captured, readable after seal)
-            r = _wait(c, (VllmInternalRequestId("req0"), 0, "post_mlp"))
+            r = _wait(c, (VllmInternalRequestId("req0"), 0, "post_block"))
             assert r is not None and r.status == "ok"
             assert r.payload and all("shard-" in p for p in r.payload)
         finally:
@@ -209,8 +209,8 @@ class TestShardedConsumer:
         for rid in reqs:
             for layer in (0, 1):
                 np.testing.assert_array_equal(
-                    got[rid][(layer, "post_mlp")].array,
-                    expected[rid][(layer, "post_mlp")],
+                    got[rid][(layer, "post_block")].array,
+                    expected[rid][(layer, "post_block")],
                 )
 
     def test_size_based_sealing_rotates(self, tmp_path: pathlib.Path) -> None:
@@ -218,14 +218,14 @@ class TestShardedConsumer:
         # Each row is 8*4=32 bytes; cap at 200 bytes -> seal every ~6 rows.
         c = _consumer(tmp_path, num_shards=1, shard_max_bytes=200)
         try:
-            _register(c, "r", {"post_mlp": [0]})
+            _register(c, "r", {"post_block": [0]})
             tensors = []
             for step in range(20):
                 t = torch.randn(1, 8, dtype=torch.float32)
                 tensors.append(t)
-                c.submit_chunk(_chunk("r", 0, "post_mlp", t, step))
-            c.submit_finalize(_finalize("r", 0, "post_mlp"))
-            assert _wait(c, (VllmInternalRequestId("r"), 0, "post_mlp")).status == "ok"
+                c.submit_chunk(_chunk("r", 0, "post_block", t, step))
+            c.submit_finalize(_finalize("r", 0, "post_block"))
+            assert _wait(c, (VllmInternalRequestId("r"), 0, "post_block")).status == "ok"
         finally:
             c.shutdown(timeout=5.0)
         tag = tmp_path / "t"
@@ -233,7 +233,7 @@ class TestShardedConsumer:
         assert len(shards) >= 2, f"expected rotation into multiple shards, got {shards}"
         got = read_sharded(tag)
         np.testing.assert_array_equal(
-            got["r"][(0, "post_mlp")].array, torch.cat(tensors).numpy()
+            got["r"][(0, "post_block")].array, torch.cat(tensors).numpy()
         )
 
 
@@ -280,7 +280,7 @@ class TestShardedPipelineParallel:
         # stage seals its own shard-pp{rank} files; read_sharded merges by
         # request across both, recovering the full layer set.
         req = "req"
-        hooks = {"post_mlp": [0, 1, 2, 3]}
+        hooks = {"post_block": [0, 1, 2, 3]}
         tensors = {layer: torch.randn(2, 8, dtype=torch.float32) for layer in range(4)}
         c0 = _pp_consumer(tmp_path, pp_rank=0, num_shards=1)
         c1 = _pp_consumer(tmp_path, pp_rank=1, num_shards=1)
@@ -288,11 +288,11 @@ class TestShardedPipelineParallel:
             _register(c0, req, hooks)
             _register(c1, req, hooks)
             for layer in (0, 1):
-                c0.submit_chunk(_chunk(req, layer, "post_mlp", tensors[layer], 0))
-                c0.submit_finalize(_finalize(req, layer, "post_mlp"))
+                c0.submit_chunk(_chunk(req, layer, "post_block", tensors[layer], 0))
+                c0.submit_finalize(_finalize(req, layer, "post_block"))
             for layer in (2, 3):
-                c1.submit_chunk(_chunk(req, layer, "post_mlp", tensors[layer], 0))
-                c1.submit_finalize(_finalize(req, layer, "post_mlp"))
+                c1.submit_chunk(_chunk(req, layer, "post_block", tensors[layer], 0))
+                c1.submit_finalize(_finalize(req, layer, "post_block"))
         finally:
             c0.shutdown(timeout=5.0)  # seal each stage's open shard
             c1.shutdown(timeout=5.0)
@@ -303,10 +303,10 @@ class TestShardedPipelineParallel:
         assert sorted(p.name for p in tag.glob("shard-pp01-*.bin"))
         got = read_sharded(tag)
         assert set(got) == {req}
-        assert set(got[req]) == {(layer, "post_mlp") for layer in range(4)}
+        assert set(got[req]) == {(layer, "post_block") for layer in range(4)}
         for layer in range(4):
             np.testing.assert_array_equal(
-                got[req][(layer, "post_mlp")].array, tensors[layer].numpy()
+                got[req][(layer, "post_block")].array, tensors[layer].numpy()
             )
 
     def test_stage_owning_no_layers_creates_no_state(
@@ -315,7 +315,7 @@ class TestShardedPipelineParallel:
         req = "req-skip"
         c1 = _pp_consumer(tmp_path, pp_rank=1, num_shards=1)
         try:
-            _register(c1, req, {"post_mlp": [0, 1]})  # all on stage 0
+            _register(c1, req, {"post_block": [0, 1]})  # all on stage 0
             assert req not in c1._sharded_requests
         finally:
             c1.shutdown(timeout=5.0)

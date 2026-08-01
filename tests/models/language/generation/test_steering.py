@@ -362,12 +362,6 @@ PHASE1_DISCOVERY_CASES = [
         id="qwen3-moe",
     ),
     pytest.param(
-        "ByteDance/Ouro-1.4B",
-        _SMALL_DECODER_OVERRIDES,
-        {"enforce_eager": True},
-        id="ouro",
-    ),
-    pytest.param(
         "ByteDance-Seed/Seed-OSS-36B-Instruct",
         _SMALL_DECODER_OVERRIDES,
         {"enforce_eager": True},
@@ -406,12 +400,6 @@ PHASE1_GENERATION_CASES = [
         _SMALL_DECODER_OVERRIDES,
         {"enforce_eager": True},
         id="seed-oss",
-    ),
-    pytest.param(
-        "ByteDance/Ouro-1.4B",
-        _SMALL_DECODER_OVERRIDES,
-        {"enforce_eager": True},
-        id="ouro",
     ),
     pytest.param(
         "IQuestLab/IQuest-Coder-V1-40B-Loop-Instruct",
@@ -1948,6 +1936,8 @@ def test_steering_changes_output(vllm_runner, monkeypatch, model: str) -> None:
             load_format="dummy",
             max_model_len=512,
             enable_prefix_caching=True,
+            enable_steering=True,
+            max_steering_configs=4,
         ) as llm:
             # 1. Baseline (zero steering buffers)
             baseline_tokens = _gen_tokens(llm, prompt, sampling)
@@ -2478,6 +2468,8 @@ def test_global_prefill_steering_via_worker_api(
             load_format="dummy",
             max_model_len=512,
             enable_prefix_caching=True,
+            enable_steering=True,
+            max_steering_configs=4,
         ) as llm:
             # 1. Baseline (no global steering)
             baseline_tokens = _gen_tokens(llm, prompt, sampling)

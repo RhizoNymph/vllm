@@ -17,6 +17,8 @@ Covers:
   dicts on ``SamplingParams``
 - optional per-row ``scales`` are applied at unpack time
 - ``steering_name`` field is unaffected
+- ``sae_clamp_specs`` flow through to ``SamplingParams`` (chat/completion)
+  and are forwarded by the batch request
 """
 
 import numpy as np
@@ -25,6 +27,7 @@ import pytest
 from pydantic import ValidationError
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    BatchChatCompletionRequest,
     ChatCompletionRequest,
 )
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
@@ -75,6 +78,24 @@ _COMPLETION_BASE = {
     "prompt": "Hello",
     "model": "test-model",
 }
+
+_SAE_CLAMP_SPECS = [
+    {
+        "module_name": "golden-gate",
+        "phase": "prefill",
+        "clamps": {
+            "post_block": {
+                "20": [
+                    {
+                        "feature_idx": 34,
+                        "kind": "absolute",
+                        "value": 5.0,
+                    }
+                ]
+            }
+        },
+    }
+]
 
 
 def _make_chat(**extra):
@@ -129,7 +150,7 @@ class TestChatCompletionSteering:
         with pytest.raises(ValidationError):
             _make_chat(
                 steering_vectors={
-                    "post_mlp": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
+                    "post_block": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
                 }
             )
 
@@ -160,13 +181,27 @@ class TestChatCompletionSteering:
 
     def test_per_row_scales_applied_at_unpack(self):
         packed = {
-            "post_mlp": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
+            "post_block": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
         }
         req = _make_chat(steering_vectors=packed)
         sp = req.to_sampling_params(max_tokens=100, default_sampling_params={})
-        assert sp.steering_vectors["post_mlp"][10].tolist() == pytest.approx(
+        assert sp.steering_vectors["post_block"][10].tolist() == pytest.approx(
             [2.0] * _HIDDEN
         )
+
+    def test_sae_clamp_specs_to_sampling_params(self):
+        req = _make_chat(sae_clamp_specs=_SAE_CLAMP_SPECS)
+        sp = req.to_sampling_params(
+            max_tokens=100,
+            default_sampling_params={},
+        )
+
+        assert sp.sae_clamp_specs is not None
+        spec = sp.sae_clamp_specs[0]
+        assert spec.module_name == "golden-gate"
+        assert spec.phase == "prefill"
+        assert 20 in spec.clamps["post_block"]
+        assert spec.clamps["post_block"][20][0].feature_idx == 34
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +248,7 @@ class TestCompletionSteering:
         with pytest.raises(ValidationError):
             _make_completion(
                 steering_vectors={
-                    "post_mlp": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
+                    "post_block": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
                 }
             )
 
@@ -243,13 +278,24 @@ class TestCompletionSteering:
 
     def test_per_row_scales_applied_at_unpack(self):
         packed = {
-            "post_mlp": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
+            "post_block": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
         }
         req = _make_completion(steering_vectors=packed)
         sp = req.to_sampling_params(max_tokens=100)
-        assert sp.steering_vectors["post_mlp"][10].tolist() == pytest.approx(
+        assert sp.steering_vectors["post_block"][10].tolist() == pytest.approx(
             [2.0] * _HIDDEN
         )
+
+    def test_sae_clamp_specs_to_sampling_params(self):
+        req = _make_completion(sae_clamp_specs=_SAE_CLAMP_SPECS)
+        sp = req.to_sampling_params(max_tokens=100)
+
+        assert sp.sae_clamp_specs is not None
+        spec = sp.sae_clamp_specs[0]
+        assert spec.module_name == "golden-gate"
+        assert spec.phase == "prefill"
+        assert 20 in spec.clamps["post_block"]
+        assert spec.clamps["post_block"][20][0].feature_idx == 34
 
 
 # ---------------------------------------------------------------------------
@@ -284,3 +330,56 @@ class TestSteeringNameField:
         )
         assert chat.steering_name == "base_personality"
         assert chat.steering_vectors is not None
+
+    def test_conversation_id_defaults_none(self):
+        assert _make_chat().conversation_id is None
+        assert _make_completion().conversation_id is None
+
+    def test_conversation_id_not_on_sampling_params(self):
+        """conversation_id is request metadata, not a sampling parameter:
+        ``to_sampling_params`` must not carry it onto ``SamplingParams``."""
+        chat = _make_chat(conversation_id="conv-7")
+        sp = chat.to_sampling_params(max_tokens=8, default_sampling_params={})
+        assert not hasattr(sp, "conversation_id")
+
+        comp = _make_completion(conversation_id="conv-9")
+        sp_c = comp.to_sampling_params(max_tokens=8, default_sampling_params={})
+        assert not hasattr(sp_c, "conversation_id")
+
+    def test_conversation_id_threads_to_request_metadata(self):
+        """conversation_id on the request reaches RequestMetadata (and thus the
+        worker / StepRequestView), for both chat and completion."""
+        chat = _make_chat(conversation_id="conv-7")
+        assert chat.conversation_id == "conv-7"
+        assert chat.to_request_metadata().conversation_id == "conv-7"
+
+        comp = _make_completion(conversation_id="conv-9")
+        assert comp.conversation_id == "conv-9"
+        assert comp.to_request_metadata().conversation_id == "conv-9"
+
+    def test_conversation_id_none_when_absent(self):
+        meta = _make_chat().to_request_metadata()
+        assert meta.conversation_id is None
+        assert meta.is_empty()
+
+
+class TestBatchChatCompletionSteering:
+    def test_batch_chat_declares_and_forwards_steering_fields(self):
+        batch = BatchChatCompletionRequest.model_validate(
+            {
+                "model": "test-model",
+                "messages": [[{"role": "user", "content": "Hello"}]],
+                "steering_name": "base_personality",
+                "steering_vectors": _BASE_PACKED,
+                "sae_clamp_specs": _SAE_CLAMP_SPECS,
+            }
+        )
+
+        single = batch.to_chat_completion_request(batch.messages[0])
+
+        assert batch.steering_name == "base_personality"
+        assert batch.steering_vectors == _BASE_PACKED
+        assert batch.sae_clamp_specs == _SAE_CLAMP_SPECS
+        assert single.steering_name == "base_personality"
+        assert single.steering_vectors == _BASE_PACKED
+        assert single.sae_clamp_specs == _SAE_CLAMP_SPECS

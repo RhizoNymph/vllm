@@ -1,14 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 from http import HTTPStatus
+from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-import vllm.envs as envs
+from vllm.config.sae_steering_types import SAEActivation, SteeringModuleKind
+from vllm.config.steering import (
+    is_steering_topology_frozen,
+    sae_topology_mismatch,
+)
 from vllm.config.steering_types import coerce_steering_spec
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.openai.steering.registry import (
+    SAEModuleManifest,
+    SteeringModule,
+    pack_sae_weights_for_broadcast,
+)
+from vllm.entrypoints.openai.steering.sae_loader import (
+    _load_weights_for_manifest,
+)
+from vllm.entrypoints.serve.steering.api_router import (
+    _authorize_steering_mutation,
+)
 from vllm.entrypoints.serve.steering.modules_protocol import (
     RegisterSteeringModuleRequest,
     UnregisterSteeringModuleRequest,
@@ -18,6 +35,109 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 router = APIRouter()
+
+
+def _check_frozen_sae_topology_frontend(
+    vllm_config,
+    registry,
+    *,
+    name: str,
+    manifest: SAEModuleManifest,
+) -> None:
+    """Reject frozen-topology-violating SAE registrations with a 400.
+
+    Frontend mirror of the worker's ``_check_frozen_sae_topology`` —
+    both compare against ``SteeringConfig.sae_module_topology`` via
+    :func:`sae_topology_mismatch`, so they cannot diverge.  Raising
+    ``ValueError`` here (before any weight I/O or broadcast) maps to a
+    clean 400; the worker check remains the backstop for direct
+    ``collective_rpc`` callers.  Spare availability is estimated from
+    the registry (undeclared delta modules hold one spare per site);
+    the worker's slot records are ground truth.
+    """
+    if not is_steering_topology_frozen(vllm_config):
+        return
+    steering_config = getattr(vllm_config, "steering_config", None)
+    remedy = (
+        "The SAE topology is frozen on a compiled engine — declare the "
+        "module's final shape at startup via --steering-modules, reserve "
+        "spare slots (--sae-spare-slot-sites), or serve with "
+        "--enforce-eager."
+    )
+    declared = {
+        t.name: t for t in (getattr(steering_config, "sae_module_topology", ()) or ())
+    }
+    topo = declared.get(name)
+    if topo is not None:
+        mismatch = sae_topology_mismatch(
+            topo,
+            kind="sae_delta",
+            layers=tuple((int(li), str(hs)) for li, hs in manifest.layers),
+            d_model=manifest.d_model,
+            d_sae=manifest.d_sae,
+            n_clamp=len(manifest.clampable_features),
+            activation=manifest.activation.value,
+            activation_params=dict(manifest.activation_params),
+            storage_dtype=manifest.storage_dtype,
+        )
+        if mismatch is not None:
+            raise ValueError(
+                f"Steering module {name!r} does not match its "
+                f"startup-declared topology: {mismatch}. {remedy}"
+            )
+        return
+    if manifest.storage_dtype != "auto":
+        raise ValueError(
+            f"Steering module {name!r} requests storage_dtype "
+            f"{manifest.storage_dtype!r}, but spare slots store weights "
+            "in compute dtype — fp8 modules must be declared at startup "
+            f"via --steering-modules. {remedy}"
+        )
+    spare_sites = set(getattr(steering_config, "sae_spare_slot_sites", ()) or ())
+    spare_features = int(getattr(steering_config, "sae_spare_slot_features", 0) or 0)
+    per_site = int(getattr(steering_config, "sae_spare_slots_per_site", 1) or 1)
+    if not spare_sites or spare_features <= 0:
+        raise ValueError(
+            f"Steering module {name!r} was not declared at startup and no "
+            f"spare SAE slots are configured. {remedy}"
+        )
+    if manifest.activation not in (SAEActivation.RELU, SAEActivation.JUMPRELU):
+        raise ValueError(
+            f"Steering module {name!r} uses activation "
+            f"{manifest.activation.value!r}, but spare slots are baked as "
+            f"JumpReLU and only serve relu/jumprelu modules. {remedy}"
+        )
+    n_clamp = len(manifest.clampable_features)
+    if n_clamp > spare_features:
+        raise ValueError(
+            f"Steering module {name!r} clamps {n_clamp} features but spare "
+            f"slots reserve only {spare_features}. {remedy}"
+        )
+    for layer_idx, hook_str in manifest.layers:
+        site = f"{layer_idx}:{hook_str}"
+        if site not in spare_sites:
+            raise ValueError(
+                f"Steering module {name!r} targets site (layer={layer_idx}, "
+                f"hook={hook_str!r}) which has no spare slots reserved. "
+                f"{remedy}"
+            )
+        claimed = 0
+        for other_name, other in registry._modules.items():
+            if other_name == name or other_name in declared:
+                continue
+            if other.kind is not SteeringModuleKind.SAE_DELTA:
+                continue
+            other_manifest = other.sae_manifest
+            if other_manifest is not None and (
+                (layer_idx, hook_str) in set(other_manifest.layers)
+            ):
+                claimed += 1
+        if claimed >= per_site:
+            raise ValueError(
+                f"Steering module {name!r}: all {per_site} spare slot(s) at "
+                f"site (layer={layer_idx}, hook={hook_str!r}) are claimed by "
+                f"other modules. {remedy}"
+            )
 
 
 def _get_registry(request: Request):
@@ -98,12 +218,121 @@ async def _pre_materialize_module_on_workers(
     )
 
 
+def _build_broadcast_payload_for_module(module: SteeringModule) -> dict:
+    """Reconstruct the broadcast payload for an in-registry module.
+
+    Mirrors the inline payload built by :func:`register_steering_module`
+    so the compensating-broadcast path can re-install a previously-
+    working module after a failed replacement.  For SAE modules, the
+    encoder/decoder tensors are re-loaded from ``manifest.weights_uri``
+    — the registry stores only the manifest, not the loaded weights.
+    """
+    if module.kind is SteeringModuleKind.ADDITIVE:
+        return {
+            "kind": module.kind.value,
+            "vectors": module.vectors,
+            "prefill_vectors": module.prefill_vectors,
+            "decode_vectors": module.decode_vectors,
+        }
+    assert module.sae_manifest is not None
+    manifest = module.sae_manifest
+    if not manifest.weights_uri:
+        raise ValueError(
+            f"Cannot rebuild compensating payload for SAE module "
+            f"{module.name!r}: manifest has no 'weights_uri' to re-load "
+            "weights from."
+        )
+    weights = _load_weights_for_manifest(manifest, Path(manifest.weights_uri))
+    return {
+        "kind": module.kind.value,
+        "sae_manifest": {
+            "d_model": manifest.d_model,
+            "d_sae": manifest.d_sae,
+            "activation": manifest.activation.value,
+            "layers": [list(p) for p in manifest.layers],
+            "clampable_features": list(manifest.clampable_features),
+            "activation_params": dict(manifest.activation_params),
+            "weights_uri": manifest.weights_uri,
+            "storage_dtype": manifest.storage_dtype,
+        },
+        "sae_weights": pack_sae_weights_for_broadcast(weights),
+    }
+
+
+async def _compensating_broadcast_after_failure(
+    engine: EngineClient | None,
+    name: str,
+    prev_module: SteeringModule | None,
+) -> None:
+    """Best-effort cluster repair after a failed register broadcast.
+
+    ``collective_rpc`` is not transactional — when a multi-worker
+    broadcast raises, some ranks may have already accepted the new
+    module while others rolled back to their prior state.  After the
+    server-side registry has been rolled back, this helper attempts to
+    realign every worker by sending a second broadcast that re-installs
+    *prev_module* (or unregisters the name when there was no prior
+    entry).
+
+    This is strictly best-effort: if the compensating broadcast itself
+    fails, the cluster may remain inconsistent and we log a warning.
+    A proper fix would be a worker-side prepare/commit protocol; that
+    is tracked separately.  We never raise from this helper so the
+    caller's original exception always reaches the client.
+    """
+    if engine is None:
+        return
+    try:
+        if prev_module is None:
+            await _broadcast_module_to_workers(engine, name, None)
+        else:
+            restore_payload = _build_broadcast_payload_for_module(prev_module)
+            await _broadcast_module_to_workers(engine, name, restore_payload)
+    except Exception:
+        logger.warning(
+            "Compensating broadcast for steering module %r failed; "
+            "cluster state may be inconsistent across worker ranks.  "
+            "Manually unregister and re-register the module to "
+            "resynchronise.",
+            name,
+            exc_info=True,
+        )
+
+
+async def _reset_prefix_cache_after_module_change(
+    engine: EngineClient | None,
+    *,
+    action: str,
+) -> bool:
+    """Invalidate KV blocks whose steering hash only names a module.
+
+    Request hashes include named-module references by name/scale, not by
+    the current vector payload or SAE weights.  Replacing a module under
+    the same name can therefore make old prefix-cache blocks appear
+    reusable unless we invalidate the cache after the worker registry
+    changes.
+    """
+    if engine is None:
+        return True
+    success = await engine.reset_prefix_cache(reset_running_requests=True)
+    if not success:
+        logger.error(
+            "Prefix cache reset failed after steering module %s; cached "
+            "KV blocks may still reflect the previous module payload.",
+            action,
+        )
+        return False
+    return True
+
+
 @router.post("/v1/steering/modules/register")
 async def register_steering_module(
     request: RegisterSteeringModuleRequest,
     raw_request: Request,
 ) -> JSONResponse:
     """Register a named steering vector configuration."""
+    if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
+        return unauthorized
     registry = _get_registry(raw_request)
     if registry is None:
         return JSONResponse(
@@ -114,53 +343,213 @@ async def register_steering_module(
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
 
-    # Each tier may arrive as either the legacy SteeringVectorSpec or the
-    # binary-wire SteeringVectorSpecPacked shape; normalize before handing
-    # off so the registry, the broadcast payload, and the pre-materialize
-    # path all see the same legacy-shaped dict.
+    # Snapshot the pre-call entry so a failed broadcast can either
+    # restore it (when re-registering an existing name) or remove the
+    # newly-created one — never destroy a previously-working module
+    # because its replacement failed.
+    prev_module = registry.get(request.name)
     try:
-        vectors = coerce_steering_spec(request.vectors)
-        prefill_vectors = coerce_steering_spec(request.prefill_vectors)
-        decode_vectors = coerce_steering_spec(request.decode_vectors)
-    except (KeyError, ValueError, TypeError) as err:
-        return JSONResponse(
-            content={"error": f"Malformed steering payload: {err}"},
-            status_code=HTTPStatus.BAD_REQUEST.value,
-        )
-
-    try:
-        await registry.register(
-            name=request.name,
-            vectors=vectors,
-            prefill_vectors=prefill_vectors,
-            decode_vectors=decode_vectors,
-        )
-        # Push the freshly-registered module to every worker so requests
-        # carrying ``SamplingParams.steering_module_ref`` resolve it
-        # locally instead of forcing the API server to materialize the
-        # full vector spec into the multiprocessing payload.
-        engine = _engine_client(raw_request)
-        await _broadcast_module_to_workers(
-            engine,
-            request.name,
-            {
+        kind = SteeringModuleKind(request.kind)
+        if kind is SteeringModuleKind.ADDITIVE:
+            if request.sae_manifest is not None:
+                raise ValueError(
+                    f"Steering module {request.name!r}: sae_manifest is "
+                    "not valid for kind='additive'."
+                )
+            # Each tier may arrive as either the legacy SteeringVectorSpec or
+            # the binary-wire SteeringVectorSpecPacked shape; normalize before
+            # handing off so the registry, the broadcast payload, and the
+            # pre-materialize path all see the same legacy-shaped dict.
+            try:
+                vectors = coerce_steering_spec(request.vectors)
+                prefill_vectors = coerce_steering_spec(request.prefill_vectors)
+                decode_vectors = coerce_steering_spec(request.decode_vectors)
+            except ValueError as err:
+                raise ValueError(f"Malformed steering payload: {err}") from err
+            await registry.register(
+                name=request.name,
+                kind=kind,
+                vectors=vectors,
+                prefill_vectors=prefill_vectors,
+                decode_vectors=decode_vectors,
+                clamps=request.clamps,
+                prefill_clamps=request.prefill_clamps,
+                decode_clamps=request.decode_clamps,
+            )
+            # Clamp tiers are read back from the registry so the broadcast
+            # carries the canonical SteeringClamps form it validated.
+            registered = registry.get(request.name)
+            payload: dict = {
+                "kind": kind.value,
                 "vectors": vectors,
                 "prefill_vectors": prefill_vectors,
                 "decode_vectors": decode_vectors,
-            },
-        )
+                "clamps": registered.clamps if registered else None,
+                "prefill_clamps": registered.prefill_clamps if registered else None,
+                "decode_clamps": registered.decode_clamps if registered else None,
+            }
+        else:  # SAE_DELTA
+            if request.sae_manifest is None:
+                raise ValueError("kind='sae_delta' requires a 'sae_manifest' payload.")
+            if (
+                request.vectors is not None
+                or request.prefill_vectors is not None
+                or request.decode_vectors is not None
+            ):
+                raise ValueError(
+                    f"Steering module {request.name!r}: additive vector fields "
+                    "are not valid for kind='sae_delta'."
+                )
+            # ``clampable_features`` order is significant — the safetensors
+            # loader aligns each weight row to ``manifest.clampable_features[i]``,
+            # so reordering here would relabel decoder directions and silently
+            # clamp the wrong features.  Reject duplicates without reordering.
+            clampable = tuple(request.sae_manifest.clampable_features)
+            if len(set(clampable)) != len(clampable):
+                raise ValueError(
+                    f"Steering module {request.name!r}: "
+                    "sae_manifest.clampable_features must not contain "
+                    f"duplicates; got {list(clampable)}."
+                )
+            manifest = SAEModuleManifest(
+                d_model=request.sae_manifest.d_model,
+                d_sae=request.sae_manifest.d_sae,
+                activation=SAEActivation(request.sae_manifest.activation),
+                layers=tuple((li, hp) for li, hp in request.sae_manifest.layers),
+                clampable_features=clampable,
+                activation_params=dict(request.sae_manifest.activation_params),
+                weights_uri=request.sae_manifest.weights_uri,
+                storage_dtype=request.sae_manifest.storage_dtype,
+            )
+            # Validate shape/site invariants before touching checkpoint
+            # files.  Registry.register repeats this check when it commits,
+            # but doing it here keeps malformed manifests from triggering
+            # expensive SAE weight I/O.
+            registry._validate_sae_manifest(name=request.name, manifest=manifest)
+            # Frozen-topology precheck: on a compiled engine this
+            # registration must fit the pre-allocated buffer set
+            # (declared shape or a spare slot).  Fails as a 400 here,
+            # before weight I/O and broadcast.
+            _check_frozen_sae_topology_frontend(
+                getattr(raw_request.app.state, "vllm_config", None),
+                registry,
+                name=request.name,
+                manifest=manifest,
+            )
+            if not manifest.weights_uri:
+                # Without a weights_uri the worker would attach
+                # zero-filled encoder/decoder buffers and every clamp
+                # would silently no-op.  Fail fast at the API boundary
+                # so callers see a 400 instead of an opaque runtime
+                # mis-behaviour.
+                raise ValueError(
+                    f"Steering module {request.name!r}: kind='sae_delta' "
+                    "requires 'sae_manifest.weights_uri' to point to a "
+                    "local SAE checkpoint directory containing per-(layer, "
+                    "hook) safetensors files.  Without weights the worker "
+                    "buffers would stay zero-filled and every clamp would "
+                    "no-op."
+                )
+            # Load weights synchronously off the event loop so a large
+            # SAE checkpoint doesn't block other API traffic.  Use the
+            # caller-provided manifest as the source of truth for shapes;
+            # this lets the loader read only the weight files (the disk
+            # ``manifest.json`` is irrelevant on this path).
+            try:
+                weights = await asyncio.to_thread(
+                    _load_weights_for_manifest,
+                    manifest,
+                    Path(manifest.weights_uri),
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                raise ValueError(
+                    f"Steering module {request.name!r}: failed to load "
+                    f"SAE weights from {manifest.weights_uri!r}: {exc}"
+                ) from exc
+            await registry.register(
+                name=request.name,
+                kind=kind,
+                sae_manifest=manifest,
+            )
+            payload = {
+                "kind": kind.value,
+                "sae_manifest": {
+                    "d_model": manifest.d_model,
+                    "d_sae": manifest.d_sae,
+                    "activation": manifest.activation.value,
+                    "layers": [list(p) for p in manifest.layers],
+                    "clampable_features": list(manifest.clampable_features),
+                    "activation_params": dict(manifest.activation_params),
+                    "weights_uri": manifest.weights_uri,
+                    "storage_dtype": manifest.storage_dtype,
+                },
+                # Weights ride along with the manifest so the worker
+                # registers the module and attaches its encoder/decoder
+                # tensors in one indivisible RPC.  Without this, a
+                # successful manifest broadcast followed by an attach
+                # failure would leave the worker with a registered SAE
+                # module whose buffers are still zero-filled — the
+                # silent-no-op failure mode this endpoint exists to
+                # prevent.  Packed to the wire-safe form: raw tensors
+                # do not survive the collective_rpc msgpack hop.
+                "sae_weights": pack_sae_weights_for_broadcast(weights),
+            }
+        # Push the freshly-registered module to every worker so requests
+        # carrying ``SamplingParams.steering_module_ref`` (additive) or
+        # ``SamplingParams.sae_clamp_specs`` (sae_delta) resolve names
+        # locally without crossing the multiprocessing boundary with
+        # the full payload.  If the broadcast raises, restore the
+        # pre-call entry so a failed replacement does not destroy the
+        # previously-working module (and a failed first-time
+        # registration removes the name entirely).  ``collective_rpc``
+        # is not transactional — some workers may have committed the
+        # new state before the failing rank raised — so we follow up
+        # with a compensating broadcast that re-installs the prior
+        # state (or unregisters the name) on every rank.
+        engine = _engine_client(raw_request)
+        try:
+            await _broadcast_module_to_workers(
+                engine,
+                request.name,
+                payload,
+            )
+        except Exception:
+            await registry.restore_or_remove(request.name, prev_module)
+            await _compensating_broadcast_after_failure(
+                engine, request.name, prev_module
+            )
+            raise
         # Eagerly upload the module's vectors to the manager so the
         # first request resolving to this name finds the (hash, phase)
-        # row already in the refcount table — turning a ~15 ms
-        # cold-path materialize (synchronous bf16 H2D for every layer)
-        # into a ~5 µs refcount bump on its TTFT.  Strictly ordered
-        # after the registry-update broadcast: pre-materialize reads
-        # the resolved cache populated by ``register_steering_modules``.
-        await _pre_materialize_module_on_workers(engine, request.name)
+        # row already in the refcount table — turning a ~15 ms cold-path
+        # materialize into a ~5 µs refcount bump on its TTFT.  Only
+        # additive modules have precomputed rows to pre-materialize;
+        # SAE modules attach their encoder/decoder buffers as part of
+        # the register broadcast above.  Strictly ordered after the
+        # registry-update broadcast: pre-materialize reads the resolved
+        # cache populated by ``register_steering_modules``.
+        if kind is SteeringModuleKind.ADDITIVE:
+            await _pre_materialize_module_on_workers(engine, request.name)
+        if not await _reset_prefix_cache_after_module_change(
+            engine,
+            action=f"registration for {request.name!r}",
+        ):
+            return JSONResponse(
+                content={
+                    "error": (
+                        "Steering module was registered but prefix cache "
+                        "could not be fully invalidated. Retry the request "
+                        "or reset the prefix cache before generating with "
+                        "this module."
+                    )
+                },
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
         return JSONResponse(
             content={
                 "status": "ok",
                 "name": request.name,
+                "kind": kind.value,
                 "modules": registry.list_modules(),
             },
         )
@@ -185,6 +574,8 @@ async def unregister_steering_module(
     raw_request: Request,
 ) -> JSONResponse:
     """Remove a named steering vector configuration."""
+    if (unauthorized := _authorize_steering_mutation(raw_request)) is not None:
+        return unauthorized
     registry = _get_registry(raw_request)
     if registry is None:
         return JSONResponse(
@@ -194,8 +585,8 @@ async def unregister_steering_module(
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
 
-    existed = await registry.unregister(request.name)
-    if not existed:
+    prev_module = registry.get(request.name)
+    if prev_module is None:
         return JSONResponse(
             content={
                 "error": (
@@ -205,14 +596,45 @@ async def unregister_steering_module(
             },
             status_code=HTTPStatus.NOT_FOUND.value,
         )
+
+    await registry.unregister(request.name)
     # Drop the module on every worker to keep the broadcast registry
-    # in lock-step with the server-side registry.  Workers will raise
-    # on subsequent requests that reference this name.
-    await _broadcast_module_to_workers(
-        _engine_client(raw_request),
-        request.name,
-        None,
-    )
+    # in lock-step with the server-side registry.  If the worker RPC
+    # fails, restore the server entry and best-effort re-register it
+    # on every rank; otherwise a failed unregister could leave the
+    # API server believing the name is gone while some workers still
+    # retain it (or vice versa after a partial collective failure).
+    engine = _engine_client(raw_request)
+    try:
+        await _broadcast_module_to_workers(
+            engine,
+            request.name,
+            None,
+        )
+    except Exception as err:
+        await registry.restore_or_remove(request.name, prev_module)
+        await _compensating_broadcast_after_failure(engine, request.name, prev_module)
+        logger.exception("Failed to unregister steering module '%s'", request.name)
+        return JSONResponse(
+            content={
+                "error": f"Failed to unregister steering module: {err}",
+            },
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+    if not await _reset_prefix_cache_after_module_change(
+        engine,
+        action=f"unregister for {request.name!r}",
+    ):
+        return JSONResponse(
+            content={
+                "error": (
+                    "Steering module was unregistered but prefix cache "
+                    "could not be fully invalidated. Retry the request "
+                    "or reset the prefix cache before continuing."
+                )
+            },
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
     return JSONResponse(
         content={
             "status": "ok",
@@ -244,6 +666,4 @@ async def list_steering_modules(raw_request: Request) -> JSONResponse:
 
 
 def attach_router(app: FastAPI):
-    if not envs.VLLM_SERVER_DEV_MODE:
-        return
     app.include_router(router)

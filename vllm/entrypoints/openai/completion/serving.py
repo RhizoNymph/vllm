@@ -4,17 +4,23 @@
 import asyncio
 import io
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import numpy as np
 import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.logger import RequestLogger
+from vllm.entrypoints.generate.base.serving import (
+    GenerateBaseServing,
+    GenerationError,
+    build_per_request_timing_metrics,
+    clamp_prompt_logprobs,
+    format_token_id_placeholder,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     CaptureResultResponse,
 )
@@ -31,22 +37,20 @@ from vllm.entrypoints.openai.completion.protocol import (
 )
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
+    PerRequestTimingMetrics,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     UsageInfo,
 )
-from vllm.entrypoints.openai.engine.serving import (
-    GenerationError,
-    OpenAIServing,
-    clamp_prompt_logprobs,
-)
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
+from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
@@ -61,9 +65,6 @@ from vllm.v1.capture.admission import (
     build_capture_context,
     resolve_capture_prefix_flags,
 )
-
-if TYPE_CHECKING:
-    from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
 
@@ -81,17 +82,18 @@ def _build_capture_results_response(
     return _build_capture_results_response_chat(request, final_res)  # type: ignore[arg-type]
 
 
-class OpenAIServingCompletion(OpenAIServing):
+class OpenAIServingCompletion(GenerateBaseServing):
     def __init__(
         self,
         engine_client: EngineClient,
         models: OpenAIServingModels,
         *,
-        openai_serving_render: "OpenAIServingRender",
+        online_renderer: "OnlineRenderer",
         request_logger: RequestLogger | None,
         return_tokens_as_token_ids: bool = False,
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
+        enable_per_request_metrics: bool = False,
     ):
         super().__init__(
             engine_client=engine_client,
@@ -100,9 +102,10 @@ class OpenAIServingCompletion(OpenAIServing):
             return_tokens_as_token_ids=return_tokens_as_token_ids,
         )
 
-        self.openai_serving_render = openai_serving_render
+        self.online_renderer = online_renderer
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
+        self.enable_per_request_metrics = enable_per_request_metrics
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
@@ -167,6 +170,50 @@ class OpenAIServingCompletion(OpenAIServing):
             )
         return None
 
+    def _admit_patch(
+        self,
+        *,
+        sampling_params: SamplingParams,
+        engine_input: EngineInput,
+        request_id: str,
+        named_module_exists: Callable[[str], bool] | None = None,
+    ) -> ErrorResponse | None:
+        """Validate the patch spec and stamp prefix-cache flags."""
+        from vllm.v1.capture.patch_admission import (
+            PatchValidationError,
+            resolve_patch_prefix_flags,
+        )
+
+        if not sampling_params.patch:
+            return None
+        try:
+            num_prompt_tokens = self._extract_prompt_len(engine_input)
+            ctx = build_capture_context(
+                self.engine_client.vllm_config, num_prompt_tokens, request_id
+            )
+        except Exception as exc:
+            return self.create_error_response(
+                f"patch: failed to read request shape: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="patch",
+            )
+        patch_config = getattr(self.engine_client.vllm_config, "patch_config", None)
+        max_patch_slots = (
+            getattr(patch_config, "max_patch_slots", 0) if patch_config else 0
+        )
+        try:
+            resolve_patch_prefix_flags(
+                sampling_params,
+                ctx,
+                max_patch_slots=max_patch_slots,
+                named_module_exists=named_module_exists,
+            )
+        except PatchValidationError as exc:
+            return self.create_error_response(
+                str(exc), status_code=HTTPStatus.BAD_REQUEST, param="patch"
+            )
+        return None
+
     async def render_completion_request(
         self,
         request: CompletionRequest,
@@ -174,7 +221,7 @@ class OpenAIServingCompletion(OpenAIServing):
         """
         Validate the model and preprocess a completion request.
 
-        Delegates preprocessing logic to OpenAIServingRender, adding the
+        Delegates preprocessing logic to OnlineRenderer, adding the
         engine-aware checks (LoRA model validation, engine health).
 
         Returns:
@@ -190,7 +237,7 @@ class OpenAIServingCompletion(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        return await self.openai_serving_render.render_completion(request)
+        return await self.online_renderer.render_completion(request)
 
     async def create_completion(
         self,
@@ -219,6 +266,20 @@ class OpenAIServingCompletion(OpenAIServing):
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
             )
+        has_steering = (
+            request.steering_name is not None
+            or request.steering_vectors is not None
+            or request.prefill_steering_vectors is not None
+            or request.decode_steering_vectors is not None
+            or bool(request.sae_clamp_specs)
+            or bool(request.sae_full_reconstruction_specs)
+        )
+        if request.use_beam_search and has_steering:
+            return self.create_error_response(
+                "Beam search does not support steering. Disable "
+                "use_beam_search or remove steering fields from the request.",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
 
         result = await self.render_completion_request(request)
         if isinstance(result, ErrorResponse):
@@ -243,6 +304,7 @@ class OpenAIServingCompletion(OpenAIServing):
         # the activation-steering plan).  Inline overrides ride along
         # unmodified on ``request.steering_vectors`` etc.
         steering_module_ref: tuple[str, float] | None = None
+        named_steering_registry = None
         if request.steering_name is not None:
             steering_registry = (
                 None
@@ -255,15 +317,80 @@ class OpenAIServingCompletion(OpenAIServing):
                     "Ensure the server was started with steering enabled.",
                     status_code=HTTPStatus.BAD_REQUEST,
                 )
-            if steering_registry.get(request.steering_name) is None:
+            err = steering_registry.validate_additive_lookup(request.steering_name)
+            if err is not None:
                 return self.create_error_response(
-                    (
-                        f"Unknown steering module '{request.steering_name}'. "
-                        f"Available: {steering_registry.list_modules() or 'none'}"
-                    ),
-                    status_code=HTTPStatus.BAD_REQUEST,
+                    err, status_code=HTTPStatus.BAD_REQUEST
                 )
             steering_module_ref = (request.steering_name, 1.0)
+            named_steering_registry = steering_registry
+
+        # Validate sae_clamp_specs at the API server symmetrically with
+        # steering_name, so the response distinguishes "steering disabled"
+        # / "unknown module" / "wrong kind" failures cleanly with a 400
+        # rather than letting the worker crash later (or silently drop
+        # the SAE state when steering is disabled).
+        if request.sae_clamp_specs:
+            steering_registry = (
+                None
+                if raw_request is None
+                else getattr(raw_request.app.state, "steering_module_registry", None)
+            )
+            if steering_registry is None:
+                return self.create_error_response(
+                    "sae_clamp_specs requires steering to be enabled. "
+                    "Start the server with --enable-steering.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            err = steering_registry.validate_sae_clamp_specs(request.sae_clamp_specs)
+            if err is not None:
+                return self.create_error_response(
+                    err, status_code=HTTPStatus.BAD_REQUEST
+                )
+
+        if request.sae_full_reconstruction_specs:
+            steering_registry = (
+                None
+                if raw_request is None
+                else getattr(raw_request.app.state, "steering_module_registry", None)
+            )
+            if steering_registry is None:
+                return self.create_error_response(
+                    "sae_full_reconstruction_specs requires steering to be "
+                    "enabled. Start the server with --enable-steering.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            err = steering_registry.validate_sae_full_reconstruction_specs(
+                request.sae_full_reconstruction_specs
+            )
+            if err is not None:
+                return self.create_error_response(
+                    err, status_code=HTTPStatus.BAD_REQUEST
+                )
+
+        # Build the request-metadata channel once (declarative steering gate
+        # names are resolved against the vector registry here; a malformed
+        # gate spec or unknown name raises ValueError → HTTP 400).
+        steering_vector_registry = (
+            None
+            if raw_request is None
+            else getattr(raw_request.app.state, "steering_vector_registry", None)
+        )
+        from vllm.entrypoints.openai.steering import (
+            monitor_writes_gates_from_request,
+        )
+
+        monitor_writes_gates = monitor_writes_gates_from_request(raw_request)
+        try:
+            req_metadata_channel = request.to_request_metadata(
+                vector_registry=steering_vector_registry,
+                monitor_writes_gates=monitor_writes_gates,
+            )
+        except ValueError as exc:
+            return self.create_error_response(
+                f"Invalid steering gate spec: {exc}",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
@@ -297,6 +424,16 @@ class OpenAIServingCompletion(OpenAIServing):
                 # vectors over multiprocessing.
                 if steering_module_ref is not None:
                     sampling_params.steering_module_ref = steering_module_ref
+                    assert named_steering_registry is not None
+                    err = named_steering_registry.apply_sampling_params_hash_overrides(
+                        sampling_params,
+                        steering_module_ref[0],
+                        scale=steering_module_ref[1],
+                    )
+                    if err is not None:
+                        return self.create_error_response(
+                            err, status_code=HTTPStatus.BAD_REQUEST
+                        )
 
             request_id_item = f"{request_id}-{i}"
 
@@ -311,6 +448,35 @@ class OpenAIServingCompletion(OpenAIServing):
                 )
                 if error_response is not None:
                     return error_response
+
+            if isinstance(sampling_params, SamplingParams) and sampling_params.patch:
+                from vllm.v1.capture.patch_admission import (
+                    make_named_module_existence,
+                )
+
+                error_response = self._admit_patch(
+                    sampling_params=sampling_params,
+                    engine_input=engine_input,
+                    request_id=request_id_item,
+                    named_module_exists=make_named_module_existence(raw_request),
+                )
+                if error_response is not None:
+                    return error_response
+                # Reject (HTTP 400) if a referenced patch source run/site does
+                # not exist, instead of silently completing unpatched.
+                from vllm.v1.capture.patch_admission import (
+                    PatchValidationError,
+                    validate_patch_sources,
+                )
+
+                try:
+                    await validate_patch_sources(self.engine_client, sampling_params)
+                except PatchValidationError as exc:
+                    return self.create_error_response(
+                        str(exc),
+                        status_code=HTTPStatus.BAD_REQUEST,
+                        param="patch",
+                    )
 
             self._log_inputs(
                 request_id_item,
@@ -342,6 +508,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     trace_headers=trace_headers,
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
+                    request_metadata=req_metadata_channel,
                 )
 
             generators.append(generator)
@@ -383,6 +550,21 @@ class OpenAIServingCompletion(OpenAIServing):
                     final_res.prompt = self._extract_prompt_text(engine_inputs[i])
 
             final_res_batch_checked = cast(list[RequestOutput], final_res_batch)
+
+            if (
+                request.capture
+                and getattr(request, "capture_wait", False)
+                and final_res_batch_checked
+                and not final_res_batch_checked[0].capture_results
+                and hasattr(self.engine_client, "wait_for_capture_results")
+            ):
+                # Capture writes are asynchronous; hold the response until
+                # this request's results finalize (files durable).
+                late = await self.engine_client.wait_for_capture_results(
+                    final_res_batch_checked[0].request_id
+                )
+                if late:
+                    final_res_batch_checked[0].capture_results = late
 
             response = self.request_output_to_completion_response(
                 final_res_batch_checked,
@@ -434,8 +616,10 @@ class OpenAIServingCompletion(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        last_res: RequestOutput | None = None
         try:
             async for prompt_idx, res in result_generator:
+                last_res = res
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
 
@@ -514,6 +698,7 @@ class OpenAIServingCompletion(OpenAIServing):
                             top_logprobs=out_logprobs,
                             num_output_top_logprobs=request.logprobs,
                             tokenizer=tokenizer,
+                            logprob_token_ids=request.logprob_token_ids,
                             initial_text_offset=previous_text_lens[i],
                             return_as_token_id=request.return_tokens_as_token_ids,
                         )
@@ -576,12 +761,29 @@ class OpenAIServingCompletion(OpenAIServing):
                 total_tokens=total_prompt_tokens + total_completion_tokens,
             )
 
-            if self.enable_prompt_tokens_details and num_cached_tokens:
+            if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
                     cached_tokens=num_cached_tokens
                 )
 
             if include_usage:
+                # In streaming, metrics ride on this final usage chunk, which is
+                # only emitted when usage reporting is enabled (i.e.
+                # ``stream_options.include_usage=true`` or
+                # ``--enable-force-include-usage``).
+                stream_per_request_metrics: PerRequestTimingMetrics | None = None
+                if (
+                    self.enable_per_request_metrics
+                    # See note in request_output_to_completion_response: suppress
+                    # when not attributable to one stream (multi-prompt or n>1).
+                    and num_prompts == 1
+                    and (request.n or 1) == 1
+                ):
+                    last_metrics = last_res.metrics if last_res is not None else None
+                    stream_per_request_metrics = build_per_request_timing_metrics(
+                        last_metrics, total_completion_tokens
+                    )
+
                 final_usage_chunk = CompletionStreamResponse(
                     id=request_id,
                     created=created_time,
@@ -589,6 +791,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     choices=[],
                     usage=final_usage_info,
                     system_fingerprint=self.system_fingerprint,
+                    metrics=stream_per_request_metrics,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=False, exclude_none=True
@@ -620,6 +823,7 @@ class OpenAIServingCompletion(OpenAIServing):
         num_prompt_tokens = 0
         num_generated_tokens = 0
         kv_transfer_params = None
+        ec_transfer_params = None
         last_final_res = None
         for final_res in final_res_batch:
             last_final_res = final_res
@@ -669,6 +873,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         top_logprobs=out_logprobs,
                         tokenizer=tokenizer,
                         num_output_top_logprobs=request.logprobs,
+                        logprob_token_ids=request.logprob_token_ids,
                         return_as_token_id=request.return_tokens_as_token_ids,
                     )
                 else:
@@ -716,19 +921,38 @@ class OpenAIServingCompletion(OpenAIServing):
         if (
             self.enable_prompt_tokens_details
             and last_final_res
-            and last_final_res.num_cached_tokens
+            and last_final_res.num_cached_tokens is not None
         ):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=last_final_res.num_cached_tokens
             )
 
         request_metadata.final_usage_info = usage
+
+        per_request_metrics: PerRequestTimingMetrics | None = None
+        if (
+            self.enable_per_request_metrics
+            # Metrics describe a single generation stream, so suppress them when
+            # they cannot be attributed to one: multiple prompts (timestamps
+            # span prompts) or n>1 (stats belong to one of the n sequences).
+            and len(final_res_batch) == 1
+            and (request.n or 1) == 1
+        ):
+            last_metrics = (
+                last_final_res.metrics if last_final_res is not None else None
+            )
+            per_request_metrics = build_per_request_timing_metrics(
+                last_metrics, num_generated_tokens
+            )
+
         capture_results: dict[str, CaptureResultResponse] | None = None
         if final_res_batch:
             kv_transfer_params = final_res_batch[0].kv_transfer_params
+            ec_transfer_params = final_res_batch[0].ec_transfer_params
             capture_results = _build_capture_results_response(
                 request, final_res_batch[0]
             )
+
         return CompletionResponse(
             id=request_id,
             created=created_time,
@@ -737,6 +961,8 @@ class OpenAIServingCompletion(OpenAIServing):
             usage=usage,
             system_fingerprint=self.system_fingerprint,
             kv_transfer_params=kv_transfer_params,
+            ec_transfer_params=ec_transfer_params,
+            metrics=per_request_metrics,
             capture_results=capture_results,
         )
 
@@ -746,6 +972,7 @@ class OpenAIServingCompletion(OpenAIServing):
         top_logprobs: GenericSequence[dict[int, Logprob] | None],
         num_output_top_logprobs: int,
         tokenizer: TokenizerLike | None,
+        logprob_token_ids: list[int] | None = None,
         initial_text_offset: int = 0,
         return_as_token_id: bool | None = None,
     ) -> CompletionLogProbs:
@@ -766,7 +993,7 @@ class OpenAIServingCompletion(OpenAIServing):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None:
                 if should_return_as_token_id:
-                    token = f"token_id:{token_id}"
+                    token = format_token_id_placeholder(token_id)
                 else:
                     if tokenizer is None:
                         raise VLLMValidationError(
@@ -810,7 +1037,7 @@ class OpenAIServingCompletion(OpenAIServing):
                             return_as_token_id=should_return_as_token_id,
                         ): max(top_lp[1].logprob, -9999.0)
                         for i, top_lp in enumerate(step_top_logprobs.items())
-                        if num_output_top_logprobs >= i
+                        if logprob_token_ids or num_output_top_logprobs >= i
                     }
                 )
 

@@ -59,10 +59,13 @@ if TYPE_CHECKING:
 # carries no hook schema (older construction sites / unit tests). In
 # production the model's hook schema (``ctx.hook_schema``) is the source of
 # truth for which hooks are tapped — see ``validate_filesystem_request``.
-# These three are the hooks ``apply_layer_steering`` taps on every standard
-# model; ``mlp_in`` / ``mlp_out`` are reserved names not wired into a
-# standard model forward (DeepSeek-V4 wires them via its own schema).
-_VALID_HOOK_NAMES: frozenset[str] = frozenset(("pre_attn", "post_attn", "post_mlp"))
+# These are the standard-model hook names, mirroring
+# ``vllm.model_executor.layers.steering`` but redeclared here (rather than
+# imported) to keep this module torch-free; the mHC hooks reach the
+# validator only through a model's own schema.
+_VALID_HOOK_NAMES: frozenset[str] = frozenset(
+    ("pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out")
+)
 
 _VALID_POSITION_KINDS: frozenset[str] = frozenset(
     ("last_prompt", "all_prompt", "all_generated", "all")
@@ -382,7 +385,7 @@ def validate_filesystem_request(
     _structural_validate(raw, valid_hooks)
 
     # 2. Parallelism. The residual hooks captured today (pre_attn /
-    # post_attn / post_mlp) read the residual stream after the
+    # post_attn / post_block) read the residual stream after the
     # tensor-parallel all-reduce / MoE combine, so it is replicated and
     # full-width across the TP and EP planes; data parallelism partitions
     # requests across independent engine cores. All four axes are

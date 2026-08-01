@@ -22,12 +22,48 @@ import torch.nn as nn
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
     HOOK_POINT_TABLE_ATTR,
+    MHC_STREAM_HOOKS,
     STANDARD_STEERING_HOOKS,
     SteeringHookPoint,
+    SteeringOpArgs,
     apply_layer_steering_streams,
     apply_steering,
     register_steering_buffers,
 )
+
+
+def _op_args(
+    hidden: torch.Tensor,
+    table: torch.Tensor,
+    index: torch.Tensor,
+    any_active: torch.Tensor,
+) -> SteeringOpArgs:
+    """Build the canonical op args with every extra tier/monitor inert.
+
+    ``apply_steering`` takes 15 positional tensors (row gather plus the
+    dynamic tier, the fused global monitor, and the per-row monitor). These
+    tests exercise only the row gather, so the rest default to their no-op
+    state: zero dynamic vector, unit row gate, monitors inactive.
+    """
+    num_tokens, width = hidden.shape[0], table.shape[1]
+    dev = table.device
+    return SteeringOpArgs(
+        hidden_states=hidden,
+        steering_table=table,
+        steering_index=index,
+        any_active=any_active,
+        steering_scales=torch.ones(table.shape[0], device=dev),
+        steering_dynamic_vec=torch.zeros(width, device=dev),
+        steering_token_scales=torch.zeros(num_tokens, device=dev),
+        steering_row_gate=torch.ones(num_tokens, device=dev),
+        steering_monitor_probe=torch.zeros(width, device=dev),
+        steering_monitor_params=torch.tensor([0.0, 1.0, 0.0], device=dev),
+        steering_monitor_active=torch.zeros(1, dtype=torch.bool, device=dev),
+        steering_decode_mask=torch.zeros(num_tokens, device=dev),
+        steering_monitor_probe_table=torch.zeros(1, 1, device=dev),
+        steering_monitor_row_params=torch.tensor([[-1.0e30, 1.0]], device=dev),
+        steering_monitor_row_active=torch.zeros(1, dtype=torch.bool, device=dev),
+    )
 
 
 def _op_cpu_dispatchable() -> bool:
@@ -40,14 +76,17 @@ def _op_cpu_dispatchable() -> bool:
     """
     try:
         torch.ops.vllm.apply_steering(
-            torch.zeros(1, 1),
-            torch.zeros(3, 1),
-            torch.zeros(1, dtype=torch.long),
-            torch.zeros(1, dtype=torch.bool),
+            *_op_args(
+                torch.zeros(1, 1),
+                torch.zeros(3, 1),
+                torch.zeros(1, dtype=torch.long),
+                torch.zeros(1, dtype=torch.bool),
+            )
         )
-    except (NotImplementedError, RuntimeError):
+    except (NotImplementedError, RuntimeError, TypeError):
         return False
     return True
+
 
 HIDDEN = 4
 HC_MULT = 3
@@ -78,11 +117,7 @@ class TestRegisterSteeringBuffers:
             table = getattr(mod, HOOK_POINT_TABLE_ATTR[hp])
             assert table.shape == (NUM_ROWS, HIDDEN)
         # mHC hooks must NOT be registered on a standard model.
-        for hp in (
-            SteeringHookPoint.MLP_IN,
-            SteeringHookPoint.MHC_STREAMS_PRE_ATTN,
-            SteeringHookPoint.MHC_STREAMS_FINAL,
-        ):
+        for hp in MHC_STREAM_HOOKS:
             assert not hasattr(mod, HOOK_POINT_TABLE_ATTR[hp])
 
     def test_hook_widths_selects_and_sizes_tables(self):
@@ -105,7 +140,7 @@ class TestRegisterSteeringBuffers:
         assert single.shape == (NUM_ROWS, HIDDEN)
         assert multi.shape == (NUM_ROWS, HC_DIM)
         # A hook absent from the map gets no table.
-        assert not hasattr(mod, HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_MLP])
+        assert not hasattr(mod, HOOK_POINT_TABLE_ATTR[SteeringHookPoint.POST_BLOCK])
         # The any-active flags and shared index come along too.
         assert hasattr(
             mod, HOOK_POINT_ANY_ACTIVE_ATTR[SteeringHookPoint.MHC_STREAMS_PRE_ATTN]
@@ -160,9 +195,9 @@ class TestApplyLayerSteeringStreams:
         index = torch.full((n,), 3, dtype=torch.long)
         streams = torch.randn(n, HC_MULT, HIDDEN)
 
-        steered = apply_steering(streams.flatten(1), table, index, flag).view_as(
-            streams
-        )
+        steered = apply_steering(
+            *_op_args(streams.flatten(1), table, index, flag)
+        ).view_as(streams)
 
         assert steered.shape == streams.shape
         assert torch.allclose(steered, streams + per_stream.view(HC_MULT, HIDDEN))

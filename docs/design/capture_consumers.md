@@ -118,8 +118,8 @@ CaptureKey = tuple[VllmInternalRequestId, int, str]
 # (request id, layer index, hook name)
 
 HookName = Literal[
-    # Standard residual hooks (every model): full residual, model dtype.
-    "pre_attn", "post_attn", "post_mlp", "mlp_in", "mlp_out",
+    # Standard hooks (every model): full residual / MLP branch, model dtype.
+    "pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out",
     # DeepSeek-V4 mHC: multi-stream residual (hc_mult * hidden, bf16).
     "mhc_streams_pre_attn", "mhc_streams_pre_mlp", "mhc_streams_final",
     # DeepSeek-V4 mHC: stream-mixing coefficients (fp32).
@@ -480,11 +480,12 @@ finish reason):
    `sidecar_fields + {"consumer_index": i}` and call
    `sink.submit_finalize`. Exceptions are logged per consumer and
    do not fail the request.
-3. For each consumer, call `sink.get_result(first_key)` (current
-   implementation returns a single representative result per
-   consumer — aggregating across keys is a TODO) and synthesize
-   `CaptureResult(status="ok")` if the sink hasn't produced a
-   terminal result yet.
+3. For each consumer, wait for every key's terminal result and reduce
+   them with `_aggregate_capture_results`: worst-of-status wins, errors
+   are joined, and the payload becomes `{capture_key: payload}` when the
+   consumer captured more than one key (a single key passes its payload
+   through unchanged). A spec with no hooks yields
+   `CaptureResult(status="not_requested")`.
 
 Returns `dict[consumer_index, CaptureResult]`; the runner maps
 indices back to consumer names via `_capture_index_to_name`.
@@ -630,12 +631,26 @@ without buffering the whole tensor. Owns a private `ActivationWriter`
 thread pool (`writer.py`).
 
 - `location = "worker"`, `reads_client_spec = True`.
-- `global_capture_spec()` returns `None` — captures are always
-  per-request via `SamplingParams.capture["filesystem"]`.
+- `global_capture_spec()` returns `None` by default (captures are
+  per-request via `SamplingParams.capture["filesystem"]`), **or** a
+  `CaptureSpec` built from the consumer-level `global_hooks` /
+  `global_positions` params when those are configured. A global spec
+  captures every request uniformly and rides the manager's
+  CUDA-graph-safe persistent-buffer path, so filesystem capture no
+  longer forces eager every step (the dominant cost at
+  `positions="all_generated"` under cudagraph). Global-driven requests
+  have no per-request `tag`/`request_id`, so files are named
+  `{root}/{default_tag}/{engine_request_id}/{layer}_{hook}.bin` — the
+  engine request id is already threaded through the manager dispatch
+  path (`CapturePositionEntry.request_id` → `CaptureChunk.key[0]` →
+  the finalize key), so no extra plumbing is needed. `default_tag`
+  defaults to `"default"` (the legacy fallback directory name).
 - `validate_client_spec` accepts `FilesystemCaptureRequest` or a
   matching dict, then lazily delegates to
   `validation.validate_filesystem_request` (lazy to avoid pulling
-  pydantic in at module import).
+  pydantic in at module import). Per-request client specs and the
+  global spec coexist: a client spec for a request overrides the
+  global spec for that request (manager merge rule).
 
 Per-chunk flow:
 
@@ -719,9 +734,9 @@ Writer details (`writer.py`):
   (no parallel-size rejection). See
   [Capture Consumers under Parallelism](capture_parallelism.md).
 - Every hook name is one the model taps, i.e. present in
-  `ctx.hook_schema` (falls back to `{pre_attn, post_attn, post_mlp}` when
-  no schema is supplied). On a DeepSeek-V4 model this also accepts the
-  `mhc_*` hooks and `mlp_in` / `mlp_out`; on a standard model those are
+  `ctx.hook_schema` (falls back to `{pre_attn, post_attn, post_block,
+  mlp_in, mlp_out}` when no schema is supplied). On a DeepSeek-V4 model
+  this also accepts the `mhc_*` hooks; on a standard model those are
   rejected.
 - Every resolved layer is in `[0, num_hidden_layers)`, the **global**
   layer count (admission validates the full layer space; the runner then
@@ -879,9 +894,9 @@ The fix is staged in three layers, B → C → A:
 
   Remaining wiring sub-steps (block hashes live only in the engine-core
   `Request`, not in the `CaptureManager`):
-  - **A.1 store core (done):** the data structure + global accessor +
+    - **A.1 store core (done):** the data structure + global accessor +
     tests.
-  - **A.2 write-through (done):** the worker populates the store with
+    - **A.2 write-through (done):** the worker populates the store with
     freshly-captured prompt residuals. `NewRequestData.from_request`
     carries the request's prompt `block_hashes` and the scheduler's
     `hash_block_size` to the worker (only for capture requests); the
@@ -892,7 +907,7 @@ The fix is staged in three layers, B → C → A:
     being re-derived worker-side, because it can diverge from the KV block
     size; using the wrong granularity would silently misalign keys. No
     behavior change yet — this only fills the store.
-  - **A.3 read floor + serve-inject (done):** when the whole captured
+    - **A.3 read floor + serve-inject (done):** when the whole captured
     prefix is store-resident, reuse the full KV prefix (skip the
     re-forward) and inject the stored rows. The race-safe primitives:
     `ActivationStore.extract_all` (an atomic all-or-nothing snapshot under
@@ -920,7 +935,7 @@ The fix is staged in three layers, B → C → A:
     Because admission also resolves with `num_computed=0`, the worker's
     resolution matches the threaded union exactly, so the serve payload is
     always complete.
-  - **A.4 config + invalidation (done):** `--capture-activation-cache-gb`
+    - **A.4 config + invalidation (done):** `--capture-activation-cache-gb`
     (a `CaptureConsumersConfig.activation_cache_bytes` budget, runtime-only
     so excluded from `compute_hash`); the runner instantiates the
     `ActivationStore` and calls `set_active_activation_store` when capture
@@ -935,30 +950,27 @@ The fix is staged in three layers, B → C → A:
 These are behaviors the current implementation exhibits that may be
 worth tightening:
 
-- **`CaptureManager.finalize_request` returns a single
-  representative result per consumer**, not an aggregated result
-  across all `(layer, hook)` keys for that request. The runner
-  surfaces one payload per consumer; multi-key aggregation is a
-  TODO.
-- **Runner does not populate `tag_slug` / `request_id_slug`
-  metadata** on `CaptureChunk`. The filesystem consumer falls back
-  to `"default"` and `str(vllm_internal_request_id)`, so on-disk
-  files currently live at
-  `{root}/default/{vllm_internal_request_id}/{layer}_{hook}.bin`.
-  Wiring the admission-time slugs through the runner is tracked
-  work.
+- **Consumers own their own path slugs.** The runner does not put
+  `tag_slug` / `request_id_slug` on `CaptureChunk`; the filesystem
+  consumer slugs `tag` / `request_id` itself at admission (from the
+  raw `FilesystemCaptureRequest`, so a bad slug is a 400 rather than a
+  silent `"default"`) and looks them up again at submit time. Only
+  captures with no admitted per-request spec — i.e. global-spec
+  traffic — fall back to
+  `{root}/{default_tag}/{vllm_internal_request_id}/…`. A consumer that
+  wants request-scoped paths must do the same bookkeeping.
 - **`CaptureChunk.row_offset` is always `0`** today — the dispatch
   path does not cumulate offsets across steps. Order is still
   correct because the writer's partition-by-request-id invariant
   carries multi-step appends; `_BatchedAdapter`'s sort is a no-op.
-- **Sidecar schema is minimal.** The framework propagates what the
-  manager puts in (`consumer_index`) plus whatever the consumer
-  inserts into `finalize.sidecar`. Optional fields like
-  `client_request_id`, `tag`, `prompt_token_ids`,
-  `generated_token_ids`, `model_name`, `created_at`,
-  `finalized_at`, `finish_reason` are not yet populated by the
-  runner — consumers that want them will need the runner to plumb
-  them through.
+- **Sidecar schema is minimal.** The runner populates
+  `vllm_internal_request_id`, `client_request_id`, and
+  `prompt_token_ids` at registration; the manager adds
+  `consumer_index` at finalize, on top of whatever the consumer
+  inserts into `finalize.sidecar`. Fields like `tag`,
+  `generated_token_ids`, `model_name`, `created_at`, `finalized_at`,
+  and `finish_reason` are still not plumbed through — consumers that
+  want them will need the runner to add them.
 - **Speculative decoding over-captures generated positions.** The
   capture path is spec-decode-unaware and purely position-based, and
   rejection sampling runs *after* the target forward. So in a verify
