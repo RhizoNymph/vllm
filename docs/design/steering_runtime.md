@@ -400,9 +400,11 @@ For a multi-stream (mHC) residual, pass an explicit `hook_widths` map to
 `register_steering_buffers` (single-stream hooks at `hidden_size`,
 multi-stream hooks at `hc_mult * hidden_size`) and apply with
 `apply_layer_steering_streams(self, streams, hook_point)`, which handles the
-flatten/reshape. `deepseek_v4` is the reference; its decoder layer routes
-the steerable tensors through these helpers while the fp32 mixing
-coefficients remain capture-only.
+flatten/reshape. `deepseek_v4` is the reference; its registration and
+per-sublayer routing live once in
+`vllm/models/deepseek_v4/common/interventions.py` (shared by the nvidia and
+amd decoder layers), which routes the steerable tensors through these
+helpers while the fp32 mixing coefficients remain capture-only.
 
 The extension work is model-specific, but the runtime invariants above do not
 change.

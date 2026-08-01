@@ -39,6 +39,7 @@ from torch import nn
 from vllm.model_executor.layers.intervention_common import BufferKnob, hook_attrs
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
+    STANDARD_STEERING_HOOKS,
     SteeringHookPoint,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -151,8 +152,8 @@ def register_patch_buffers(
     """Attach per-hook patch buffers to a decoder layer.
 
     ``hook_widths`` mirrors :func:`register_steering_buffers`: it selects which
-    hook points get buffers and each one's row width. ``None`` registers every
-    hook in ``HOOK_POINT_TABLE_ATTR`` at ``hidden_size`` (historical
+    hook points get buffers and each one's row width. ``None`` registers the
+    :data:`STANDARD_STEERING_HOOKS` at ``hidden_size`` (historical
     behaviour); mHC models pass a map so the multi-stream hooks are patched at
     ``hc_mult * hidden_size``.
 
@@ -175,7 +176,7 @@ def register_patch_buffers(
         return
     table_dtype = dtype if dtype is not None else torch.float32
     if hook_widths is None:
-        hook_widths = {hp: hidden_size for hp in HOOK_POINT_TABLE_ATTR}
+        hook_widths = {hp: hidden_size for hp in STANDARD_STEERING_HOOKS}
     for hp, width in hook_widths.items():
         module.register_buffer(
             PATCH_TABLE_ATTR[hp],

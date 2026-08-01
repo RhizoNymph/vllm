@@ -414,9 +414,15 @@ def validate_filesystem_request(
     for hook_name, selector in raw.hooks.items():
         if hook_name in MODEL_LEVEL_HOOKS:
             # Model-level hook: fires once at the model tail, keyed to the
-            # last layer. The layer selector is meaningless here, so accept
-            # any selector and normalize to that single index — callers need
-            # not know it (e.g. ``{"mhc_streams_final": "all"}``).
+            # last layer. The selector's *value* is meaningless here, so any
+            # well-formed selector normalizes to that single index — callers
+            # need not know it (e.g. ``{"mhc_streams_final": "all"}``) — but
+            # a malformed selector still fails fast like any other hook's.
+            _expand_hook_layers(
+                selector,
+                ctx.num_hidden_layers,
+                where=f"capture.hooks[{hook_name!r}]",
+            )
             resolved_hooks[cast(HookName, hook_name)] = [ctx.num_hidden_layers - 1]
             continue
         resolved = _expand_hook_layers(

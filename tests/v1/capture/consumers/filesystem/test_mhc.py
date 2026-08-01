@@ -113,11 +113,29 @@ class TestMhcValidation:
         spec = validate_filesystem_request(raw, MagicMock(), _ctx("r"))
         assert spec.hooks["mhc_attn_res_mix"] == [0]
 
+    def test_standard_schema_accepts_all_standard_hooks(self) -> None:
+        """The non-mHC schema keeps every standard hook name admissible.
+
+        ``post_block`` is wired on every steerable model; ``mlp_in`` /
+        ``mlp_out`` only on some (not derivable from ``hf_config``), so the
+        schema must not reject them — an unwired hook yields an empty
+        capture, matching the pre-schema validator.
+        """
+        raw = FilesystemCaptureRequest(
+            request_id="r",
+            tag="t",
+            hooks={"post_block": [0], "mlp_in": [1], "mlp_out": [2]},
+            positions="all",
+        )
+        spec = validate_filesystem_request(raw, MagicMock(), _ctx("r", hc_mult=None))
+        assert spec.hooks["post_block"] == [0]
+        assert spec.hooks["mlp_in"] == [1]
+
     @pytest.mark.parametrize("selector", ["all", [0], [3], {"layers": [1]}])
     def test_model_level_hook_normalizes_to_last_layer(self, selector) -> None:
         """``mhc_streams_final`` ignores its layer selector → last layer.
 
-        It is a model-tail hook, so any selector resolves to
+        It is a model-tail hook, so any well-formed selector resolves to
         ``num_hidden_layers - 1`` (4 layers in ``_ctx`` → layer 3); the
         caller need not know the index.
         """
@@ -129,6 +147,18 @@ class TestMhcValidation:
         )
         spec = validate_filesystem_request(raw, MagicMock(), _ctx("r"))
         assert spec.hooks["mhc_streams_final"] == [3]
+
+    @pytest.mark.parametrize("selector", ["banana", 7, [1.5], {"layer": [0]}])
+    def test_model_level_hook_rejects_malformed_selector(self, selector) -> None:
+        """The selector's value is ignored, but it must still be well-formed."""
+        raw = FilesystemCaptureRequest(
+            request_id="r",
+            tag="t",
+            hooks={"mhc_streams_final": selector},
+            positions="all",
+        )
+        with pytest.raises(CaptureValidationError):
+            validate_filesystem_request(raw, MagicMock(), _ctx("r"))
 
 
 # ---------------------------------------------------------------------------

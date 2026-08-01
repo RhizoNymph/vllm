@@ -138,10 +138,13 @@ a list of ints, the literal string `"all"`, or a dict
 explicit `list[int]`.
 
 **Available hooks** depend on the model — admission accepts only the
-hooks the model actually taps (its hook schema):
+hooks in the model's hook schema:
 
-- **Every model** (residual stream, `(hidden_size,)`, model dtype):
-  `pre_attn`, `post_attn`, `post_mlp`.
+- **Every standard model** (residual stream, `(hidden_size,)`, model
+  dtype): `pre_attn`, `post_attn`, `post_block`, plus `mlp_in` /
+  `mlp_out` (MLP branch). All five are accepted everywhere; `mlp_in` /
+  `mlp_out` produce data only on models that wire them (gemma3/gemma4,
+  the qwen3 family) and an empty capture elsewhere.
 - **DeepSeek-V4 (mHC)** instead taps: `pre_attn`, `post_attn`, `mlp_in`,
   `mlp_out` (single-stream attention/FFN in-out, `(hidden_size,)` bf16);
   `mhc_streams_pre_attn`, `mhc_streams_pre_mlp`, `mhc_streams_final`
@@ -151,7 +154,8 @@ hooks the model actually taps (its hook schema):
   `mhc_ffn_res_mix` (the Sinkhorn matrix, `(hc_mult, hc_mult)` fp32).
 
 `mhc_streams_final` is a **model-level hook** — it fires once at the
-model tail, not per layer, so its layer selector is ignored; just write
+model tail, not per layer, so its layer selector's value is ignored
+(it must still be a well-formed selector); just write
 `{"mhc_streams_final": "all"}`.
 
 Example DeepSeek-V4 request capturing the FFN routing matrix and the

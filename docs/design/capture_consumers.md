@@ -185,21 +185,25 @@ class CaptureContext:
 `vllm/model_executor/layers/activation_capture.py`.
 
 **Per-hook schema.** `build_hook_schema(hidden_size, dtype, hc_mult)` (in
-`types.py`) returns the hooks a model taps, keyed by name, each with its
-`HookSchema`. Without `hc_mult` it is the standard wired residual hooks
-(`pre_attn` / `post_attn` / `post_mlp`); a model exposing `hf_config.hc_mult`
-(DeepSeek-V4) gets the mHC hooks instead, sized from `hc_mult`. The runner
-and the OpenAI entrypoints build it from `model_config` and pass it on
-`CaptureContext` (admission) and to the `CaptureManager` (buffer sizing /
-scratch dtype). The schema is the source of truth for *which hooks are
-tapped*: admission rejects any hook not in it, so `mlp_in` / `mlp_out` /
-`mhc_*` are accepted only on models that wire them.
+`types.py`) returns the hooks a model may tap, keyed by name, each with its
+`HookSchema`. Without `hc_mult` it is the five standard residual hooks
+(`pre_attn` / `post_attn` / `post_block` / `mlp_in` / `mlp_out`); a model
+exposing `hf_config.hc_mult` (DeepSeek-V4) gets the mHC hooks instead,
+sized from `hc_mult`. The runner and the OpenAI entrypoints build it from
+`model_config` and pass it on `CaptureContext` (admission) and to the
+`CaptureManager` (buffer sizing / scratch dtype). The schema is what makes
+`mhc_*` hooks per-model: admission rejects any hook not in it, so they are
+accepted only on mHC models. `mlp_in` / `mlp_out` stay in the standard
+schema even though only some models wire them (gemma3/gemma4, the qwen3
+family) — that wiring is not derivable from `hf_config`, so an unwired
+hook yields an empty capture rather than a rejection, matching the
+pre-schema validator.
 
 **Model-level hooks.** `MODEL_LEVEL_HOOKS` (currently `{mhc_streams_final}`)
 fire once per request at the model tail rather than per decoder layer. They
-are keyed to the last layer (`num_hidden_layers - 1`); admission ignores
-their layer selector and normalizes to that index, so a caller writes
-`{"mhc_streams_final": "all"}` without knowing it.
+are keyed to the last layer (`num_hidden_layers - 1`); admission validates
+their layer selector's form but ignores its value, normalizing to that
+index, so a caller writes `{"mhc_streams_final": "all"}` without knowing it.
 
 ## Sinks and Consumers
 
@@ -733,16 +737,17 @@ Writer details (`writer.py`):
 - TP / PP / EP / DP are all accepted for the replicated residual hooks
   (no parallel-size rejection). See
   [Capture Consumers under Parallelism](capture_parallelism.md).
-- Every hook name is one the model taps, i.e. present in
-  `ctx.hook_schema` (falls back to `{pre_attn, post_attn, post_block,
-  mlp_in, mlp_out}` when no schema is supplied). On a DeepSeek-V4 model
-  this also accepts the `mhc_*` hooks; on a standard model those are
-  rejected.
+- Every hook name is present in `ctx.hook_schema` (falls back to
+  `{pre_attn, post_attn, post_block, mlp_in, mlp_out}` when no schema is
+  supplied — the same set a standard model's schema lists). On a
+  DeepSeek-V4 model this also accepts the `mhc_*` hooks; on a standard
+  model those are rejected.
 - Every resolved layer is in `[0, num_hidden_layers)`, the **global**
   layer count (admission validates the full layer space; the runner then
   filters each pipeline stage's spec to its owned slice). Exception:
-  model-level hooks (`MODEL_LEVEL_HOOKS`, e.g. `mhc_streams_final`) ignore
-  their layer selector and normalize to `num_hidden_layers - 1`.
+  model-level hooks (`MODEL_LEVEL_HOOKS`, e.g. `mhc_streams_final`) still
+  validate their layer selector's form but ignore its value, normalizing
+  to `num_hidden_layers - 1`.
 - Tag / request_id: non-empty, ≤256 chars, no `..`, no leading `/`;
   characters outside `[a-zA-Z0-9._-]` become `_`.
 - Explicit positions ≥ `num_computed_tokens` (reject prefix-cache

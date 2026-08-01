@@ -11,7 +11,7 @@ several rows. Rows are written in step order, so the last row for a
 position is the canonical (accepted) one — :func:`latest_per_position`
 collapses to it.
 
-These tests are framework-general (standard ``post_mlp`` hook); the mHC
+These tests are framework-general (standard ``post_block`` hook); the mHC
 work just rides on the same machinery.
 """
 
@@ -41,12 +41,12 @@ from vllm.v1.capture.types import (
 )
 
 HIDDEN = 4
-HOOK = "post_mlp"
+HOOK = "post_block"
 
 
 def _ctx(req_id: str) -> CaptureContext:
     # No hook_schema → validation falls back to the standard wired hooks,
-    # which include post_mlp.
+    # which include post_block.
     return CaptureContext(
         vllm_internal_request_id=VllmInternalRequestId(req_id),
         num_prompt_tokens=4,

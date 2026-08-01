@@ -330,6 +330,14 @@ DeepSeek-V4 has no single-stream `post_block` hook — its end-of-layer
 residual is the multi-stream tensor, so steer `mhc_streams_pre_mlp` of the
 next layer (or `mhc_streams_final` at the tail) instead.
 
+Note the apply timing at the multi-stream hooks: the sublayer input and
+the mixing coefficients are computed from the streams *before* the steer
+runs, so a vector at `mhc_streams_pre_attn` / `mhc_streams_pre_mlp` takes
+effect through the sublayer's mix-back and the residual carried into
+subsequent layers — not through that sublayer's own input. To steer the
+tensor the sublayer itself consumes, use the single-stream hook
+(`pre_attn` / `mlp_in`) at the same layer.
+
 Every intervention family works at an mHC hook: additive vectors, the
 dynamic tier, in-graph monitors, patch, and directional clamps are all
 registered at the hook's own width, so a clamp direction at

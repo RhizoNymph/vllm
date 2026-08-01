@@ -67,31 +67,28 @@ HookName = Literal[
 
 # The five standard residual hook *names* (mirrors the hook-id table in
 # ``activation_capture.py``); each, when tapped, captures the full
-# ``(hidden_size,)`` residual in the model dtype.
+# ``(hidden_size,)`` residual in the model dtype. ``pre_attn`` /
+# ``post_attn`` / ``post_block`` are tapped on every steerable standard
+# model; ``mlp_in`` / ``mlp_out`` only where the model wires them
+# (gemma3/gemma4 and the qwen3 family). Which of these a given standard
+# model actually fires is not derivable from ``hf_config``, so the default
+# schema lists all five and an unwired hook yields an empty capture (the
+# historical behaviour) rather than a false admission rejection.
 STANDARD_HOOKS: tuple[str, ...] = (
     "pre_attn",
     "post_attn",
-    "post_mlp",
+    "post_block",
     "mlp_in",
     "mlp_out",
-)
-
-# The hooks ``apply_layer_steering`` actually taps on every standard model
-# today (``mlp_in`` / ``mlp_out`` are reserved names but not wired into any
-# standard model forward). A model's hook schema lists exactly the hooks it
-# taps, so admission can reject hooks that would yield empty captures.
-WIRED_STANDARD_HOOKS: tuple[str, ...] = (
-    "pre_attn",
-    "post_attn",
-    "post_mlp",
 )
 
 # Hooks that fire once per request at the *model tail*, not per decoder
 # layer (DeepSeek-V4's final pre-``hc_head`` streams). They are keyed to the
 # last layer index (``num_hidden_layers - 1``), where the tap fires on the
-# last pipeline stage. Their layer selector is meaningless, so admission
-# ignores it and normalizes to that single index — a caller writes
-# ``{"mhc_streams_final": "all"}`` without needing to know the index.
+# last pipeline stage. Their layer selector's *value* is meaningless, so
+# admission validates its form but ignores it, normalizing to that single
+# index — a caller writes ``{"mhc_streams_final": "all"}`` without needing
+# to know the index.
 MODEL_LEVEL_HOOKS: frozenset[str] = frozenset({"mhc_streams_final"})
 
 PositionSelector = (
@@ -222,16 +219,18 @@ class HookSchema:
 
 
 def default_hook_schema(hidden_size: int, dtype: torch.dtype) -> dict[str, HookSchema]:
-    """Schema for the standard residual hooks a normal model taps.
+    """Schema for the standard residual hooks a normal model may tap.
 
-    Lists exactly :data:`WIRED_STANDARD_HOOKS` — the hooks
-    ``apply_layer_steering`` fires on every standard model — so a request
-    for an unwired hook (``mlp_in`` / ``mlp_out`` / ``mhc_*``) is rejected
-    at admission (the validator checks the hook is present in the schema).
+    Lists all of :data:`STANDARD_HOOKS`: ``mlp_in`` / ``mlp_out`` are wired
+    only on some standard models (gemma3/gemma4, qwen3 family) and that
+    wiring is not derivable from ``hf_config``, so the schema keeps every
+    standard name and an unwired hook yields an empty capture — matching
+    the pre-schema validator. ``mhc_*`` hooks are still rejected here (they
+    appear only in an mHC model's schema, see :func:`build_hook_schema`).
     """
     return {
         hook: HookSchema(hidden_size, dtype, (hidden_size,))
-        for hook in WIRED_STANDARD_HOOKS
+        for hook in STANDARD_HOOKS
     }
 
 
@@ -242,13 +241,13 @@ def build_hook_schema(
 ) -> dict[str, HookSchema]:
     """Hook schema for a model — the hooks it taps, with their geometry.
 
-    Without ``hc_mult`` this is the standard wired residual hooks
+    Without ``hc_mult`` this is the standard residual hooks
     (:func:`default_hook_schema`). When ``hc_mult`` is provided (DeepSeek-V4
     manifold-hyperconnection models expose it as ``hf_config.hc_mult``) the
     schema instead describes the V4 decoder's tapped hooks: the
     single-stream attention/FFN in-out residuals (reusing the standard
     ``pre_attn`` / ``post_attn`` / ``mlp_in`` / ``mlp_out`` names — note V4
-    has no single-stream ``post_mlp``, its end-of-layer residual is the
+    has no single-stream ``post_block``, its end-of-layer residual is the
     multi-stream ``mhc_streams_*``) plus the mHC stream and coefficient
     hooks.
     """

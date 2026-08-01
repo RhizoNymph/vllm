@@ -456,7 +456,9 @@ class CaptureRunnerMixin:
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             expert_parallel_size=capture_expert_parallel_size(parallel_config),
             data_parallel_size=parallel_config.data_parallel_size,
-            hook_schema=self._capture_hook_schema,
+            # ``getattr``: runner stand-ins that never ran _init_capture_state
+            # get an empty schema, which validation treats as "standard hooks".
+            hook_schema=getattr(self, "_capture_hook_schema", {}),
         )
 
         raw_client = getattr(sp, "capture", None)
