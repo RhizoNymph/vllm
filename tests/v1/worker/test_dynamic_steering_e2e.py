@@ -14,6 +14,9 @@ unit tests cannot reach through stubs:
    identical concurrent requests; the other (the in-batch control)
    reproduces the no-consumer baseline byte for byte.
 
+Runs both eager and CUDA-graph modes: sync consumers must not force
+eager, and a graph replay must read the step's updated steering tables.
+
 Requires CUDA and a model whose architecture carries the capture taps
 *and* steering hooks (only ``gemma4`` today). Skipped unless run
 manually against such a model:
@@ -29,52 +32,21 @@ weights; point it at a local GGUF to run without HF access.
 
 from __future__ import annotations
 
-import os
-
-# The engine core spawns workers; this test touches CUDA in the parent
-# (the skipif below), so force spawn to avoid "Cannot re-initialize CUDA
-# in forked subprocess". vLLM's conftest normally sets this, but this
-# test is run standalone (it has no conftest dependencies).
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+from tests.v1.worker.steering_e2e_utils import (  # isort: skip
+    MAX_TOKENS,
+    NOISE_FLOOR,
+    PROMPT,
+    build_llm,
+    common_prefix_len,
+    env_layer,
+    requires_consumer_plugin,
+    requires_cuda,
+    requires_model_path,
+)
 
 import pytest
-import torch
 
-MODEL = os.environ.get("DYNSTEER_E2E_MODEL", "google/gemma-4-E2B-it")
-LAYER = int(os.environ.get("DYNSTEER_E2E_LAYER", "8"))
-IS_LOCAL = MODEL.endswith(".gguf") or os.path.exists(MODEL)
-
-PROMPT = "The capital of France is"
-MAX_TOKENS = 24
-
-
-def _common_prefix_len(a: list[int], b: list[int]) -> int:
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n
-
-
-def _build_llm(capture_consumers):
-    from vllm import LLM
-
-    kwargs: dict = dict(
-        model=MODEL,
-        enable_steering=True,
-        max_dynamic_steering_configs=4,
-        max_model_len=256,
-        enforce_eager=True,
-        gpu_memory_utilization=0.92,
-        seed=0,
-    )
-    if not IS_LOCAL:
-        # Tiny dummy-weight gemma4 for CI / no-GGUF environments.
-        kwargs["load_format"] = "dummy"
-    if capture_consumers is not None:
-        kwargs["capture_consumers"] = capture_consumers
-    return LLM(**kwargs)
+LAYER = env_layer(8)
 
 
 def _token_ids(llm, prompts):
@@ -85,26 +57,11 @@ def _token_ids(llm, prompts):
     return [list(o.outputs[0].token_ids) for o in outs]
 
 
-# Greedy decoding of two identical prompts in one batch is NOT bitwise
-# identical deep into generation: batched reductions use position-
-# dependent orders, so the two diverge from pure FP noise after many
-# tokens (~20+ observed on gemma4-31B). The test must therefore not
-# assume "identical prompt => identical baseline". Instead it compares
-# the two outputs *within the same steered run* (target vs. in-batch
-# control): real steering forces an EARLY divergence (~token 2), well
-# separated from the late FP-noise floor. This also needs only one model
-# load. ``NOISE_FLOOR`` is the margin between the two regimes.
-NOISE_FLOOR = 10
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="dynamic-steering e2e requires CUDA"
-)
-@pytest.mark.skipif(
-    IS_LOCAL and not os.path.exists(MODEL),
-    reason=f"DYNSTEER_E2E_MODEL path not found: {MODEL}",
-)
-def test_dynamic_override_one_step_latency_and_targeting():
+@requires_cuda
+@requires_model_path
+@requires_consumer_plugin("dynamic_steering_e2e")
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "cudagraph"])
+def test_dynamic_override_one_step_latency_and_targeting(enforce_eager):
     """One emitted override shifts only the target request, one step late.
 
     Asserted within a single steered batch of two identical requests:
@@ -125,13 +82,13 @@ def test_dynamic_override_one_step_latency_and_targeting():
             },
         }
     ]
-    llm = _build_llm(capture_consumers=consumers)
+    llm = build_llm(consumers, enforce_eager=enforce_eager)
     try:
         out_a, out_b = _token_ids(llm, prompts)
     finally:
         del llm
 
-    first_diff = _common_prefix_len(out_a, out_b)
+    first_diff = common_prefix_len(out_a, out_b)
     print(f"first_diff={first_diff} a={out_a}\n           b={out_b}")
 
     # Targeting: exactly one request was steered, so the two diverge.

@@ -346,7 +346,13 @@ class SteeringManager:
         # global-vector update marks content (forcing a populate) but does NOT
         # need to rebuild the scratch tensors.
         self._cached_indices: torch.Tensor | None = None
-        self._cached_zero_row: torch.Tensor | None = None
+        # Zero-row sentinel per table width. mHC models register tables of
+        # more than one width on a single layer (single-stream hooks at
+        # ``hidden`` and multi-stream residual hooks at ``num_streams *
+        # hidden``), so the no-vector fallback row is cached per width
+        # rather than as one fixed-width tensor. Device-fixed, so entries
+        # never need invalidation.
+        self._cached_zero_rows: dict[int, torch.Tensor] = {}
         self._cached_ordered_configs: list[tuple[tuple[int, str], int]] | None = None
         self._cached_ordered_dynamic: list[tuple[int, int]] | None = None
 
@@ -579,8 +585,15 @@ class SteeringManager:
         # A different logical config whose additive content matches an
         # already-registered physical row aliases onto that row instead of
         # consuming a fresh one.  This keeps physical-row usage bounded by the
-        # number of distinct additive contents (what the scheduler reserves),
-        # even when many logical (clamp-varying) hashes are active at once.
+        # number of distinct additive contents (what the scheduler reserves).
+        #
+        # NOTE: ``row_hash`` (the additive hash) folds in clamps precisely so
+        # that clamp-varying configs do NOT alias.  Clamps are written per row
+        # *position* in ``populate_steering_tables`` while aliased positions
+        # resolve to one physical row, so sharing a row across differing
+        # clamps would let the last write win — and the alias branch below
+        # never populates ``config_clamps`` for the aliased key, dropping its
+        # clamps outright.  Aliasing is only sound when clamps match too.
         if content_key in self._content_to_row:
             row = self._content_to_row[content_key]
             self.config_to_row[key] = row
@@ -1630,7 +1643,11 @@ class SteeringManager:
             if scales_buf is None or id(scales_buf) in written:
                 continue
             scales_vec = self._build_scales_vector(scales_buf.device)
-            scales_buf.index_copy_(0, indices, scales_vec)
+            scales_buf.index_copy_(
+                0,
+                indices,
+                scales_vec.to(device=scales_buf.device, dtype=scales_buf.dtype),
+            )
             written.add(id(scales_buf))
         self._dirty.scales = False
 
@@ -1859,9 +1876,18 @@ class SteeringManager:
             or self._stack_pinned_numel[slot] < numel
         ):
             try:
-                self._stack_pinned_ring[slot] = torch.empty(
-                    numel, dtype=torch.float32, pin_memory=True
-                )
+                # Allocate with inference mode locally disabled: a slot
+                # allocated on the step thread inside
+                # ``torch.inference_mode()`` would be an inference tensor,
+                # and the ``copy_`` below raises "Inplace update to
+                # inference tensor outside InferenceMode" when a
+                # control-plane RPC (module register, global set) later
+                # reuses that slot. A normal tensor accepts ``copy_``
+                # from both contexts.
+                with torch.inference_mode(False):
+                    self._stack_pinned_ring[slot] = torch.empty(
+                        numel, dtype=torch.float32, pin_memory=True
+                    )
                 self._stack_pinned_numel[slot] = numel
             except RuntimeError:
                 # Pinned allocation failed (e.g. CPU-only test env, or
@@ -1952,12 +1978,12 @@ class SteeringManager:
             self._dirty.content = False
             return
 
-        # Derive device and hidden_size from the first active table.
-        # All tables registered through ``register_steering_buffers`` share
-        # the same device and hidden_size by construction.
-        first_table = active_tables[0][0]
-        device = first_table.device
-        hidden_size = first_table.shape[1]
+        # Derive device from the first active table; all tables share one
+        # device by construction. Widths may differ (mHC multi-stream
+        # residual hooks are ``num_streams * hidden`` wide while single-stream
+        # hooks are ``hidden`` wide), so per-width state — the zero sentinel
+        # row and the final stacked cast — is grouped by width below.
+        device = active_tables[0][0].device
 
         # Per-(hook, layer) "any non-zero row" tracking.  Filled in during
         # row assembly below and written into each layer's ``_any_active``
@@ -1978,7 +2004,6 @@ class SteeringManager:
         if (
             self._dirty.membership
             or self._cached_indices is None
-            or self._cached_zero_row is None
             or self._cached_ordered_configs is None
             or self._cached_ordered_dynamic is None
         ):
@@ -1986,9 +2011,10 @@ class SteeringManager:
             # per-row scale / monitor owners (keyed by logical ``config_hash``)
             # line up position-for-position.  Aliased logical configs share a
             # physical row, so ``_cached_indices`` may repeat a row id; the
-            # ``index_copy_`` scatters below tolerate the duplicate (aliased
-            # configs carry identical additive content, so whichever write
-            # wins is correct).
+            # ``index_copy_`` scatters below tolerate the duplicate: aliasing
+            # requires an identical additive hash, which covers vectors,
+            # module_ref *and* clamps, so every write targeting a shared row
+            # carries the same content and whichever one wins is correct.
             new_ordered_configs: list[tuple[tuple[int, str], int]] = list(
                 self.config_to_row.items()
             )
@@ -2003,18 +2029,22 @@ class SteeringManager:
             self._cached_indices = torch.tensor(
                 target_indices_list, dtype=torch.long, device=device
             )
-            self._cached_zero_row = torch.zeros(
-                hidden_size, dtype=torch.float32, device=device
-            )
             self._cached_ordered_configs = new_ordered_configs
             self._cached_ordered_dynamic = new_ordered_dynamic
             self._dirty.membership = False
         indices: torch.Tensor = self._cached_indices
-        zero_row: torch.Tensor = self._cached_zero_row
         ordered_configs: list[tuple[tuple[int, str], int]] = (
             self._cached_ordered_configs
         )
         ordered_dynamic: list[tuple[int, int]] = self._cached_ordered_dynamic
+
+        def zero_row_for(width: int) -> torch.Tensor:
+            """Return a cached fp32 zero sentinel row of the given width."""
+            cached = self._cached_zero_rows.get(width)
+            if cached is None:
+                cached = torch.zeros(width, dtype=torch.float32, device=device)
+                self._cached_zero_rows[width] = cached
+            return cached
 
         # Build all rows for all active tables in fp32. ``all_rows`` ends
         # up shape ``(num_active_tables, num_rows, hidden)``. We do ONE
@@ -2022,7 +2052,8 @@ class SteeringManager:
         # per-(hook, layer), then index_copy_ each layer's slice.
         num_rows = NUM_RESERVED_ROWS + len(ordered_configs) + len(ordered_dynamic)
         per_table_rows: list[list[torch.Tensor]] = []
-        for _table, hp_str, layer_idx, _mod in active_tables:
+        for table, hp_str, layer_idx, _mod in active_tables:
+            zero_row = zero_row_for(table.shape[1])
             base_vec = self._get_global_vec(hp_str, layer_idx, self.global_base_vectors)
             prefill_vec = self._get_global_vec(
                 hp_str, layer_idx, self.global_prefill_vectors
@@ -2121,28 +2152,28 @@ class SteeringManager:
             per_table_rows.append(rows)
             per_table_any_active.append(any_active)
 
-        # Stack all rows into one fp32 tensor of shape
-        # ``(num_active_tables, num_rows, hidden)`` and split by dtype.
-        # The vast majority of deployments use a single dtype across all
-        # tables, so the dtype loop is one iteration in the common case.
-        flat_rows: list[torch.Tensor] = [
-            r for table_rows in per_table_rows for r in table_rows
-        ]
-        stacked_fp32 = torch.stack(flat_rows).reshape(
-            len(active_tables), num_rows, hidden_size
-        )
-
-        # Group by dtype so we can do one cast per dtype.
-        dtype_to_indices: dict[torch.dtype, list[int]] = defaultdict(list)
+        # Group active tables by ``(width, dtype)``. Tables sharing a group
+        # stack into one ``(num_tables, num_rows, width)`` fp32 tensor and
+        # cast in a single launch; mixing widths in one stack is impossible,
+        # so width is the primary key. Both width and dtype are uniform
+        # across tables in the common (non-mHC) deployment, so this collapses
+        # to a single group and a single cast there.
+        group_to_positions: dict[tuple[int, torch.dtype], list[int]] = defaultdict(list)
         for i, (table, _hp, _layer, _mod) in enumerate(active_tables):
-            dtype_to_indices[table.dtype].append(i)
+            group_to_positions[(table.shape[1], table.dtype)].append(i)
 
-        for dtype, table_indices_in_active in dtype_to_indices.items():
-            # One batched cast covering every table that uses this dtype.
-            casted = stacked_fp32[table_indices_in_active].to(dtype=dtype)
-            for casted_pos, active_pos in enumerate(table_indices_in_active):
+        for (width, dtype), positions in group_to_positions.items():
+            group_rows: list[torch.Tensor] = [
+                r for pos in positions for r in per_table_rows[pos]
+            ]
+            stacked = (
+                torch.stack(group_rows)
+                .reshape(len(positions), num_rows, width)
+                .to(dtype=dtype)
+            )
+            for stacked_pos, active_pos in enumerate(positions):
                 table = active_tables[active_pos][0]
-                table.index_copy_(0, indices, casted[casted_pos])
+                table.index_copy_(0, indices, stacked[stacked_pos])
 
         # Write the per-(hook, layer) any-active flags into each layer's
         # bool buffer so the apply_steering kernel can short-circuit when
@@ -2246,8 +2277,16 @@ class SteeringManager:
             if not any_cfg:
                 row_active_buf.fill_(False)
                 continue
-            probe_tbl.index_copy_(0, indices, probe_mat.to(probe_tbl.dtype))
-            row_params_buf.index_copy_(0, indices, params_mat.to(row_params_buf.dtype))
+            probe_tbl.index_copy_(
+                0, indices, probe_mat.to(device=probe_tbl.device, dtype=probe_tbl.dtype)
+            )
+            row_params_buf.index_copy_(
+                0,
+                indices,
+                params_mat.to(
+                    device=row_params_buf.device, dtype=row_params_buf.dtype
+                ),
+            )
             row_active_buf.fill_(True)
 
         # Write each (hook, layer)'s directional-clamp dirs/bounds/strength
@@ -2281,15 +2320,35 @@ class SteeringManager:
                 ordered_configs,
                 ordered_dynamic,
                 k_cap=int(dirs_buf.shape[1]),
-                hidden_size=hidden_size,
+                # Per-site width, read off the site's own buffer: mHC models
+                # register multi-stream hooks at ``hc_mult * hidden``, so
+                # ``dirs`` is ``(rows, K, width)`` with width varying by hook.
+                hidden_size=int(dirs_buf.shape[2]),
                 device=dirs_buf.device,
             )
             if not any_clamp:
                 clamp_active_buf.fill_(False)
                 continue
-            dirs_buf.index_copy_(0, indices, dirs_mat.to(dirs_buf.dtype))
-            bounds_buf.index_copy_(0, indices, bounds_mat.to(bounds_buf.device))
-            strength_buf.index_copy_(0, indices, strength_mat.to(strength_buf.device))
+            # ``index_copy_`` is strict about dtype (unlike ``copy_``), so match
+            # both device and dtype of the destination rather than relying on
+            # the builders above to happen to produce the right one: ``dirs`` is
+            # built on-device in the compute dtype while ``bounds``/``strength``
+            # are built on CPU in fp32. ``.to()`` is a no-op when both already
+            # agree, so this costs nothing and stops a future dtype change in
+            # ``clamp.py`` from raising on every clamped fp16/bf16 request.
+            dirs_buf.index_copy_(
+                0, indices, dirs_mat.to(device=dirs_buf.device, dtype=dirs_buf.dtype)
+            )
+            bounds_buf.index_copy_(
+                0,
+                indices,
+                bounds_mat.to(device=bounds_buf.device, dtype=bounds_buf.dtype),
+            )
+            strength_buf.index_copy_(
+                0,
+                indices,
+                strength_mat.to(device=strength_buf.device, dtype=strength_buf.dtype),
+            )
             clamp_active_buf.fill_(True)
 
         # Write the per-row strength scales (§5.3) alongside the tables.
@@ -2302,7 +2361,11 @@ class SteeringManager:
             if scales_buf is None or id(scales_buf) in scales_written:
                 continue
             scales_vec = self._build_scales_vector(scales_buf.device)
-            scales_buf.index_copy_(0, indices, scales_vec)
+            scales_buf.index_copy_(
+                0,
+                indices,
+                scales_vec.to(device=scales_buf.device, dtype=scales_buf.dtype),
+            )
             scales_written.add(id(scales_buf))
 
         # All per-layer table buffers now reflect current state. Subsequent

@@ -37,8 +37,18 @@ class SteeringHookPoint(str, Enum):
     input tensor. ``MLP_IN``/``MLP_OUT`` operate on the MLP *branch* tensor
     bracketing the MLP sublayer; both are ``hidden_size``-wide and
     TP-replicated (``mlp_out`` is tapped after the down-projection
-    all-reduce), so every hook point shares one width and injection
-    contract.
+    all-reduce), so these five share one width and injection contract.
+
+    The ``MHC_STREAMS_*`` hooks operate on the *multi-stream* residual of
+    manifold-constrained-hyperconnection models (DeepSeek-V4), which carry
+    ``hc_mult`` parallel hidden-size streams instead of one residual. Their
+    tables are ``hc_mult * hidden_size`` wide (the per-stream vectors
+    concatenated stream-major) and they are registered only on mHC models,
+    which pass an explicit ``hook_widths`` map to
+    :func:`register_steering_buffers`. Every intervention family (additive,
+    patch, clamp, SAE, monitor) is registered at the hook's own width, so
+    the apply path is width-agnostic — see
+    :func:`apply_layer_steering_streams`.
     """
 
     PRE_ATTN = "pre_attn"
@@ -62,6 +72,21 @@ class SteeringHookPoint(str, Enum):
     additive steer here propagates identically to ``POST_BLOCK``; the hook
     exists chiefly for *patching* (replace/ablate the MLP branch)."""
 
+    # --- mHC (manifold-constrained hyper-connection) hook points ---
+    # Registered only on mHC models via ``hook_widths``; the string values
+    # match the capture framework's hook names so a tensor can be both
+    # captured and steered under one identifier.
+
+    MHC_STREAMS_PRE_ATTN = "mhc_streams_pre_attn"
+    """Steer the multi-stream residual entering the attention sublayer."""
+
+    MHC_STREAMS_PRE_MLP = "mhc_streams_pre_mlp"
+    """Steer the multi-stream residual entering the FFN sublayer."""
+
+    MHC_STREAMS_FINAL = "mhc_streams_final"
+    """Steer the final multi-stream residual before the head fold. A
+    model-level hook: registered only on the last decoder layer."""
+
 
 # Buffer attribute names on decoder layer modules, keyed by hook point.
 HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
@@ -70,7 +95,31 @@ HOOK_POINT_TABLE_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.POST_BLOCK: "steering_table_post_block",
     SteeringHookPoint.MLP_IN: "steering_table_mlp_in",
     SteeringHookPoint.MLP_OUT: "steering_table_mlp_out",
+    SteeringHookPoint.MHC_STREAMS_PRE_ATTN: "steering_table_mhc_streams_pre_attn",
+    SteeringHookPoint.MHC_STREAMS_PRE_MLP: "steering_table_mhc_streams_pre_mlp",
+    SteeringHookPoint.MHC_STREAMS_FINAL: "steering_table_mhc_streams_final",
 }
+
+# The single-stream hook points wired into every standard decoder
+# architecture, all at the model ``hidden_size``.
+# :func:`register_steering_buffers` registers exactly these unless a model
+# passes an explicit ``hook_widths`` map, so adding a ``SteeringHookPoint``
+# member above does NOT change what standard models register.
+STANDARD_STEERING_HOOKS: tuple[SteeringHookPoint, ...] = (
+    SteeringHookPoint.PRE_ATTN,
+    SteeringHookPoint.POST_ATTN,
+    SteeringHookPoint.POST_BLOCK,
+    SteeringHookPoint.MLP_IN,
+    SteeringHookPoint.MLP_OUT,
+)
+
+# The multi-stream mHC residual hook points. Width is ``hc_mult *
+# hidden_size`` and they are never part of the standard registration set.
+MHC_STREAM_HOOKS: tuple[SteeringHookPoint, ...] = (
+    SteeringHookPoint.MHC_STREAMS_PRE_ATTN,
+    SteeringHookPoint.MHC_STREAMS_PRE_MLP,
+    SteeringHookPoint.MHC_STREAMS_FINAL,
+)
 
 # Per-hook ``any-active`` flag attribute names. The flag is a single-element
 # bool tensor co-located with each hook point's table buffer; the apply
@@ -133,6 +182,9 @@ HOOK_POINT_SAE_SLOTS_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_slots_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_slots_post_attn",
     SteeringHookPoint.POST_BLOCK: "sae_slots_post_block",
+    SteeringHookPoint.MHC_STREAMS_PRE_ATTN: "sae_slots_mhc_streams_pre_attn",
+    SteeringHookPoint.MHC_STREAMS_PRE_MLP: "sae_slots_mhc_streams_pre_mlp",
+    SteeringHookPoint.MHC_STREAMS_FINAL: "sae_slots_mhc_streams_final",
 }
 
 # Full-reconstruction (Phase 4) site marker.  Same pattern as the delta
@@ -142,6 +194,9 @@ HOOK_POINT_SAE_FR_CLAMP_KIND_ATTR: dict[SteeringHookPoint, str] = {
     SteeringHookPoint.PRE_ATTN: "sae_fr_clamp_kind_pre_attn",
     SteeringHookPoint.POST_ATTN: "sae_fr_clamp_kind_post_attn",
     SteeringHookPoint.POST_BLOCK: "sae_fr_clamp_kind_post_block",
+    SteeringHookPoint.MHC_STREAMS_PRE_ATTN: "sae_fr_clamp_kind_mhc_streams_pre_attn",
+    SteeringHookPoint.MHC_STREAMS_PRE_MLP: "sae_fr_clamp_kind_mhc_streams_pre_mlp",
+    SteeringHookPoint.MHC_STREAMS_FINAL: "sae_fr_clamp_kind_mhc_streams_final",
 }
 
 
@@ -198,8 +253,20 @@ def register_steering_buffers(
     max_steering_tokens: int,
     max_steering_configs: int,
     dtype: torch.dtype | None = None,
+    hook_widths: dict[SteeringHookPoint, int] | None = None,
 ) -> None:
     """Attach per-hook steering buffers to a decoder layer.
+
+    ``hook_widths`` selects which hook points get buffers and, for each, the
+    per-row width. When ``None`` (the default for every standard decoder
+    architecture) exactly the :data:`STANDARD_STEERING_HOOKS` are registered,
+    each ``hidden_size`` wide — historical behaviour. mHC models (DeepSeek-V4)
+    pass an explicit map so the multi-stream residual hooks get
+    ``hc_mult * hidden_size``-wide buffers while single-stream hooks stay
+    ``hidden_size`` wide. Every family — additive table, dynamic-tier vector,
+    monitor probes, patch, clamp — is registered at the hook's own width, and
+    the apply path reads each buffer's width from the buffer itself, so mixed
+    widths coexist on one layer.
 
     ``dtype`` controls the storage dtype of the steering table buffers.
     When ``None`` (the default), the buffers fall back to fp32 to
@@ -221,12 +288,18 @@ def register_steering_buffers(
     file changes.  This must run before the steering early-return so
     patch buffers are attached even when ``max_steering_configs == 0``.
     """
+    if hook_widths is None:
+        hook_widths = {hp: hidden_size for hp in STANDARD_STEERING_HOOKS}
     # Lazy import: ``patch`` imports hook-point constants from this module,
     # so a module-level import here would be circular.
     from vllm.model_executor.layers.patch import maybe_register_patch_buffers
 
     maybe_register_patch_buffers(
-        module, hidden_size, max_patch_tokens=max_steering_tokens, dtype=dtype
+        module,
+        hidden_size,
+        max_patch_tokens=max_steering_tokens,
+        dtype=dtype,
+        hook_widths=hook_widths,
     )
     if max_steering_configs == 0:
         return
@@ -247,11 +320,12 @@ def register_steering_buffers(
         hidden_size,
         num_rows=num_rows,
         dtype=table_dtype,
+        hook_widths=hook_widths,
     )
-    for hp in SteeringHookPoint:
+    for hp, width in hook_widths.items():
         module.register_buffer(
             HOOK_POINT_TABLE_ATTR[hp],
-            torch.zeros(num_rows, hidden_size, dtype=table_dtype),
+            torch.zeros(num_rows, width, dtype=table_dtype),
             persistent=False,
         )
         # Per-hook activity flag.  A single-element bool tensor that the
@@ -266,17 +340,17 @@ def register_steering_buffers(
             torch.zeros(1, dtype=torch.bool),
             persistent=False,
         )
-        # Per-hook dedicated dynamic-tier vector (§5.4): fp32 (hidden,),
+        # Per-hook dedicated dynamic-tier vector (§5.4): fp32 (width,),
         # default 0 ⇒ no tier. The manager writes it from
         # ``dynamic_tier_vectors`` in populate; the kernel adds
         # ``dynamic_vec * token_scales`` on top of the row gather.
         module.register_buffer(
             HOOK_POINT_DYNVEC_ATTR[hp],
-            torch.zeros(hidden_size, dtype=torch.float32),
+            torch.zeros(width, dtype=torch.float32),
             persistent=False,
         )
         # Per-hook in-graph monitor buffers (Phase 2, §8). The probe is a
-        # fp32 (hidden,) detector vector; params is
+        # fp32 (width,) detector vector; params is
         # [threshold, sharpness, gate_rows];
         # active is a bool flag the monitor op reads at launch and uses to
         # short-circuit (a tensor, not a Python bool, so the compiled graph
@@ -287,7 +361,7 @@ def register_steering_buffers(
         # finite if ever read while inactive.
         module.register_buffer(
             HOOK_POINT_MONITOR_PROBE_ATTR[hp],
-            torch.zeros(hidden_size, dtype=torch.float32),
+            torch.zeros(width, dtype=torch.float32),
             persistent=False,
         )
         # [threshold, sharpness, gate_rows]. gate_rows (0/1) ⇒ the monitor
@@ -306,8 +380,9 @@ def register_steering_buffers(
         # at a ``(1, 1)`` / ``(1, 2)`` dummy size so the ``apply_steering`` op
         # signature is always present without touching the ~70 model files.
         # When the engine enables the row monitor, the runner resizes these to
-        # ``(max_steering_configs + 3, hidden)`` / ``(rows, 2)`` once across all
-        # layers via :func:`resize_steering_row_monitor_buffers`. The active
+        # ``(rows, width)`` / ``(rows, 2)`` once across all layers via
+        # :func:`resize_steering_row_monitor_buffers` (which reads each hook's
+        # width off its own table, so mHC hooks resize wider). The active
         # flag is never set while the buffers are dummies, so the kernel/eager
         # per-row block (guarded by this flag) never indexes them.
         module.register_buffer(
@@ -683,6 +758,44 @@ def apply_layer_steering(
     # constraint on whatever leaves the site, so neither the additive term
     # nor an SAE delta can push the projection back out of bounds.
     return maybe_apply_clamp(module, hidden_states, hook_point)
+
+
+def apply_layer_steering_streams(
+    module: nn.Module,
+    streams: torch.Tensor,
+    hook_point: SteeringHookPoint,
+) -> torch.Tensor:
+    """Apply the intervention stack at ``hook_point`` to a multi-stream residual.
+
+    ``streams`` is ``(num_tokens, num_streams, hidden)`` — the mHC residual
+    carried as ``num_streams`` parallel hidden-size streams. Every buffer at an
+    mHC hook is registered at ``num_streams * hidden`` width (stream-major
+    concatenation), so this flattens to ``(num_tokens, num_streams * hidden)``,
+    runs the *same* pipeline as :func:`apply_layer_steering` (capture -> patch
+    -> steer -> sae -> clamp — every op's hidden dim is a runtime arg), and
+    reshapes back.
+
+    The disabled path (no buffers registered for this hook) is decided once at
+    ``__init__`` so ``torch.compile`` traces it as a static branch; the
+    flattened view is then dead and folds out of the compiled graph, leaving
+    the capture tap's own ``None`` gate as the only residual cost. Every
+    ``maybe_*`` stage returns its input object unchanged when its family is not
+    attached here, so ``out is flat`` identifies the fully-disabled path and
+    ``streams`` is handed straight back with no reshape at all.
+    """
+    from vllm.model_executor.layers.clamp import maybe_apply_clamp
+    from vllm.model_executor.layers.patch import maybe_apply_patch
+
+    flat = streams.flatten(1)
+    maybe_capture_residual(flat, module.layer_idx, hook_point.value)
+    out = maybe_apply_patch(module, flat, hook_point)
+    if hasattr(module, HOOK_POINT_TABLE_ATTR[hook_point]):
+        out = _emit_steering_op(module, out, hook_point)
+    out = _maybe_apply_layer_sae(module, out, hook_point)
+    out = maybe_apply_clamp(module, out, hook_point)
+    if out is flat:
+        return streams
+    return out.view_as(streams)
 
 
 def apply_block_steering(

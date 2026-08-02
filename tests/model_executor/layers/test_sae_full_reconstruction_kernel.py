@@ -657,3 +657,126 @@ class TestCudaWarmup:
             activation_code=ACTIVATION_CODE_TOPK,
             activation_param=8.0,
         )
+
+
+@cuda_required
+class TestKernelCudaGraph:
+    """The FR kernel must capture and replay correctly under a CUDA graph.
+
+    The delta kernel has this coverage in
+    ``test_sae_steering_kernel.py::TestKernelCudaGraph``; this is the
+    full-reconstruction analogue, including the per-token ``recon_mask``
+    copy-through inside the captured graph.
+    """
+
+    def test_capture_and_replay_matches_eager(self):
+        torch.manual_seed(0)
+        n_tokens, d_model, d_sae, n_clamp = 4, 32, 64, 4
+        cpu_inputs = _make_inputs(
+            n_tokens=n_tokens, d_model=d_model, d_sae=d_sae, n_clamp=n_clamp, seed=2024
+        )
+        cpu_clamps = _random_clamps(n_tokens, n_clamp, seed=2025)
+        recon_mask = torch.tensor([True, False, True, True])
+        gpu_inputs = {k: v.cuda() for k, v in cpu_inputs.items()}
+        gpu_clamps = {k: v.cuda() for k, v in cpu_clamps.items()}
+        gpu_mask = recon_mask.cuda()
+
+        # Warm the kernel JIT before capture; capture cannot include
+        # Triton compilation.
+        warmup_apply_sae_full_recon_kernel(
+            hidden_size=d_model,
+            d_sae=d_sae,
+            n_clamp=n_clamp,
+            table_dtype=torch.float32,
+            compute_dtype=torch.float32,
+            device=torch.device("cuda"),
+            activation_code=ACTIVATION_CODE_RELU,
+            activation_param=0.0,
+        )
+
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        out_buf = torch.empty_like(gpu_inputs["hidden_states"])
+        with torch.cuda.graph(graph):
+            captured = apply_sae_full_recon_triton(
+                **gpu_inputs,
+                **gpu_clamps,
+                recon_mask=gpu_mask,
+                activation_code=ACTIVATION_CODE_RELU,
+                activation_param=0.0,
+            )
+            out_buf.copy_(captured)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        ref = apply_sae_full_reconstruction(
+            **cpu_inputs,
+            activation=SAEActivation.RELU,
+            activation_params={},
+            **cpu_clamps,
+            recon_mask=recon_mask,
+        )
+        assert torch.allclose(out_buf.cpu(), ref, atol=1e-4, rtol=1e-4)
+        # Masked-off rows pass through bit-identically inside the graph too.
+        out_cpu = out_buf.cpu()
+        for t in range(n_tokens):
+            if not bool(recon_mask[t]):
+                assert torch.equal(out_cpu[t], cpu_inputs["hidden_states"][t])
+
+    def test_replay_sees_updated_clamp_tables(self):
+        """A replay after in-place clamp-table mutation must read the new
+        values — the property FULL-cudagraph serving relies on."""
+        torch.manual_seed(0)
+        n_tokens, d_model, d_sae, n_clamp = 4, 32, 64, 4
+        cpu_inputs = _make_inputs(
+            n_tokens=n_tokens, d_model=d_model, d_sae=d_sae, n_clamp=n_clamp, seed=2026
+        )
+        clamps_a = _random_clamps(n_tokens, n_clamp, seed=2027)
+        clamps_b = _random_clamps(n_tokens, n_clamp, seed=2028)
+        recon_mask = torch.ones(n_tokens, dtype=torch.bool)
+        gpu_inputs = {k: v.cuda() for k, v in cpu_inputs.items()}
+        gpu_clamps = {k: v.cuda() for k, v in clamps_a.items()}
+        gpu_mask = recon_mask.cuda()
+
+        warmup_apply_sae_full_recon_kernel(
+            hidden_size=d_model,
+            d_sae=d_sae,
+            n_clamp=n_clamp,
+            table_dtype=torch.float32,
+            compute_dtype=torch.float32,
+            device=torch.device("cuda"),
+            activation_code=ACTIVATION_CODE_RELU,
+            activation_param=0.0,
+        )
+
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        out_buf = torch.empty_like(gpu_inputs["hidden_states"])
+        with torch.cuda.graph(graph):
+            captured = apply_sae_full_recon_triton(
+                **gpu_inputs,
+                **gpu_clamps,
+                recon_mask=gpu_mask,
+                activation_code=ACTIVATION_CODE_RELU,
+                activation_param=0.0,
+            )
+            out_buf.copy_(captured)
+
+        def _ref(clamps: dict) -> torch.Tensor:
+            return apply_sae_full_reconstruction(
+                **cpu_inputs,
+                activation=SAEActivation.RELU,
+                activation_params={},
+                **clamps,
+                recon_mask=recon_mask,
+            )
+
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.allclose(out_buf.cpu(), _ref(clamps_a), atol=1e-4, rtol=1e-4)
+
+        for k, v in clamps_b.items():
+            gpu_clamps[k].copy_(v.cuda())
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.allclose(out_buf.cpu(), _ref(clamps_b), atol=1e-4, rtol=1e-4)

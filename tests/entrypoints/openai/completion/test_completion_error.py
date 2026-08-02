@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import UserDict
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -85,6 +86,16 @@ class MockVllmConfig:
     parallel_config: MockParallelConfig
 
 
+class _DummyEncoding(UserDict):
+    """Minimal stand-in for ``transformers.BatchEncoding``."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self.data[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
 @dataclass
 class DummyTokenizer:
     max_chars_per_token: int = 1
@@ -96,7 +107,13 @@ class DummyTokenizer:
         return list(range(len(text)))
 
     def __call__(self, text: str, **kwargs):
-        return type("Tokenized", (), {"input_ids": self.encode(text, **kwargs)})()
+        # Real HF tokenizers return a ``BatchEncoding`` (a ``UserDict``), which
+        # supports both mapping and attribute access; renderers subscript it.
+        input_ids = self.encode(text, **kwargs)
+        return _DummyEncoding(
+            input_ids=input_ids,
+            offset_mapping=[(i, i + 1) for i in range(len(input_ids))],
+        )
 
 
 def _build_serving_completion(engine: AsyncLLM) -> OpenAIServingCompletion:
@@ -482,6 +499,10 @@ async def test_completion_beam_search_with_sae_steering_returns_error():
     )
 
     serving_completion = OpenAIServingCompletion.__new__(OpenAIServingCompletion)
+    # ``create_completion`` is wrapped in the KV-transfer rejection cleanup,
+    # which reads this flag before awaiting the inner coroutine. ``__init__``
+    # is skipped here on purpose (no engine needed for this validation error).
+    serving_completion.has_kv_connector = False
     response = await serving_completion.create_completion(request)
 
     assert isinstance(response, ErrorResponse)

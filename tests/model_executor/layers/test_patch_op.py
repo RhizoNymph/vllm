@@ -37,6 +37,8 @@ from vllm.model_executor.layers.patch import (
 )
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
+    MHC_STREAM_HOOKS,
+    STANDARD_STEERING_HOOKS,
     SteeringHookPoint,
     register_steering_buffers,
 )
@@ -324,7 +326,9 @@ class TestRegisterPatchBuffers:
             max_patch_slots=max_slots,
             dtype=torch.float32,
         )
-        for hp in HOOK_POINT_TABLE_ATTR:
+        # Default (hook_widths=None) registration covers exactly the
+        # standard single-stream hooks; mHC hooks are opt-in via hook_widths.
+        for hp in STANDARD_STEERING_HOOKS:
             table = getattr(mod, PATCH_TABLE_ATTR[hp])
             alpha = getattr(mod, PATCH_ALPHA_ATTR[hp])
             index = getattr(mod, PATCH_INDEX_ATTR[hp])
@@ -338,6 +342,8 @@ class TestRegisterPatchBuffers:
             assert flag.dtype == torch.bool
             # alpha row 0 passthrough invariant
             assert torch.all(alpha[0] == 0.0)
+        for hp in MHC_STREAM_HOOKS:
+            assert not hasattr(mod, PATCH_TABLE_ATTR[hp])
 
     def test_disabled_is_noop(self):
         mod = nn.Module()
@@ -383,8 +389,9 @@ class TestGlobalConfigFold:
             # No steering tables...
             for hp in HOOK_POINT_TABLE_ATTR.values():
                 assert not hasattr(mod, hp)
-            # ...but patch tables are present.
-            for hp in HOOK_POINT_TABLE_ATTR:
+            # ...but patch tables are present (at the default registration
+            # set: exactly the standard single-stream hooks).
+            for hp in STANDARD_STEERING_HOOKS:
                 assert hasattr(mod, PATCH_TABLE_ATTR[hp])
                 assert getattr(mod, PATCH_TABLE_ATTR[hp]).shape == (8, 16)
                 assert getattr(mod, PATCH_INDEX_ATTR[hp]).shape == (32,)

@@ -27,7 +27,11 @@ from vllm.model_executor.layers.clamp import (
     register_clamp_buffers,
     set_clamp_buffer_directions,
 )
-from vllm.model_executor.layers.steering import SteeringHookPoint
+from vllm.model_executor.layers.steering import (
+    MHC_STREAM_HOOKS,
+    STANDARD_STEERING_HOOKS,
+    SteeringHookPoint,
+)
 
 ROWS = 6
 K = 4
@@ -273,7 +277,11 @@ class TestClampBufferRegistration:
         register_clamp_buffers(
             module, HIDDEN, num_rows=ROWS, max_directions=K, dtype=torch.bfloat16
         )
-        for hp in SteeringHookPoint:
+        # Default (hook_widths=None) registration covers exactly the
+        # standard single-stream hooks; mHC hooks are opt-in via hook_widths.
+        for hp in MHC_STREAM_HOOKS:
+            assert not hasattr(module, CLAMP_DIRS_ATTR[hp])
+        for hp in STANDARD_STEERING_HOOKS:
             dirs = getattr(module, CLAMP_DIRS_ATTR[hp])
             bounds = getattr(module, CLAMP_BOUNDS_ATTR[hp])
             strength = getattr(module, CLAMP_STRENGTH_ATTR[hp])
@@ -660,7 +668,7 @@ class TestClampGateSchema:
         register_clamp_buffers(
             module, HIDDEN, num_rows=ROWS, max_directions=K, dtype=torch.float32
         )
-        for hp in SteeringHookPoint:
+        for hp in STANDARD_STEERING_HOOKS:
             flag = getattr(module, CLAMP_GATE_ACTIVE_ATTR[hp])
             assert flag.shape == (1,)
             assert flag.dtype == torch.bool

@@ -1535,18 +1535,31 @@ class SamplingParams(
 
     @cached_property
     def prefill_additive_steering_config_hash(self) -> int:
-        """Cached hash of only the additive prefill steering identity."""
+        """Cached hash of the additive prefill steering identity.
+
+        Clamps are included because the worker stores them *in* the additive
+        row: two requests with identical vectors but different clamp bounds
+        occupy distinct physical rows, so they must not alias onto one. SAE
+        specs stay excluded — those live in their own pool with their own
+        hash, and excluding them preserves the intended aliasing there.
+        """
         return hash_steering_config(
             self.effective_prefill_steering,
             module_ref=self.steering_module_ref,
+            clamps=self.effective_prefill_clamps,
         )
 
     @cached_property
     def decode_additive_steering_config_hash(self) -> int:
-        """Cached hash of only the additive decode steering identity."""
+        """Cached hash of the additive decode steering identity.
+
+        See :attr:`prefill_additive_steering_config_hash` for why clamps are
+        part of the row identity.
+        """
         return hash_steering_config(
             self.effective_decode_steering,
             module_ref=self.steering_module_ref,
+            clamps=self.effective_decode_clamps,
         )
 
     @cached_property

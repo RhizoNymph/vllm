@@ -63,8 +63,10 @@ from vllm.v1.capture.types import (
     CaptureSpec,
     CaptureStatus,
     HookName,
+    HookSchema,
     VllmInternalRequestId,
     captured_prompt_positions,
+    default_hook_schema,
 )
 
 logger = logging.getLogger(__name__)
@@ -303,6 +305,7 @@ class CaptureManager:
         spill_dir: str | None = None,
         spill_max_bytes: int = 4 << 30,
         local_layer_range: tuple[int, int] | None = None,
+        hook_schema: dict[str, HookSchema] | None = None,
         extra_global_specs: tuple[CaptureSpec | None, ...] = (),
         slim: bool = False,
         graphsafe_keys: Sequence[tuple[int, str]] | None = None,
@@ -364,6 +367,17 @@ class CaptureManager:
             self._local_layer_range = (start, end)
         self._hidden_size = hidden_size
         self._model_dtype = model_dtype
+        # Per-hook row geometry. Defaults to the five standard residual
+        # hooks (``hidden_size``, ``model_dtype``); models with non-uniform
+        # hooks (DeepSeek-V4 mHC) pass a richer map. ``_schema_for`` falls
+        # back to the standard geometry for any hook absent from the map so
+        # an unexpected key degrades gracefully rather than crashing the
+        # forward path.
+        self._hook_schema = (
+            hook_schema
+            if hook_schema is not None
+            else default_hook_schema(hidden_size, model_dtype)
+        )
         self._device = torch.device(device) if isinstance(device, str) else device
         self._finalize_timeout = finalize_timeout_s
         self._requests: dict[str, _RequestCaptureState] = {}
@@ -422,9 +436,11 @@ class CaptureManager:
         self._global_buffers: dict[tuple[int, str], torch.Tensor] = {}
         if candidate_keys and max_num_tokens > 0:
             for key in candidate_keys:
+                _layer_idx, hook_name = key
+                schema = self._schema_for(hook_name)
                 self._global_buffers[key] = torch.empty(
-                    (max_num_tokens, hidden_size),
-                    dtype=model_dtype,
+                    (max_num_tokens, schema.width),
+                    dtype=schema.dtype,
                     device=self._device,
                 )
             total_bytes = sum(
@@ -615,6 +631,20 @@ class CaptureManager:
         (model-wide), matching client-spec layer references.
         """
         return self._graphsafe_keys
+
+    def _schema_for(self, hook_name: str) -> HookSchema:
+        """Row geometry for ``hook_name``, defaulting to standard residual.
+
+        Any hook missing from the configured schema falls back to the
+        full-residual geometry (``hidden_size``, ``model_dtype``), matching
+        the framework's historical single-width assumption.
+        """
+        schema = self._hook_schema.get(hook_name)
+        if schema is None:
+            return HookSchema(
+                self._hidden_size, self._model_dtype, (self._hidden_size,)
+            )
+        return schema
 
     # ---------------------------------------------------------- registration
 
@@ -859,8 +889,11 @@ class CaptureManager:
         # consumer's rows can be sliced from it, and the per-entry
         # ``consumer_mask`` still fans the rows out to both.
         scratch_gpu: dict[tuple[int, str], torch.Tensor] = {}
+        # Per-hook dtype: fp32 mHC coefficient hooks must not be downcast to
+        # the bf16 model dtype. ``_schema_for`` falls back to the model dtype
+        # for every standard residual hook.
         scratch_dtype: dict[tuple[int, str], torch.dtype] = {
-            key: self._model_dtype for key in gather_rows
+            key: self._schema_for(key[1]).dtype for key in gather_rows
         }
         # Reuse cached device index tensors when this step's per-key row pattern
         # is identical to the last (the common case in steady-state decode),
@@ -1601,6 +1634,12 @@ class CaptureManager:
                             metadata={
                                 "consumer_index": consumer_idx,
                                 "positions": [e.logical_pos for e in chunk_entries],
+                                # Per-row logical shape so consumers can
+                                # reshape the flat ``(rows, width)`` tensor
+                                # back to e.g. ``(rows, hc_mult, hidden)``
+                                # for mHC hooks. ``(width,)`` for standard
+                                # residual hooks.
+                                "row_shape": self._schema_for(hook).logical_shape,
                             },
                         )
                     )

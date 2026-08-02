@@ -480,8 +480,10 @@ class TestGetSteeringStatus:
     def test_norm_values(self, worker_with_manager):
         worker_with_manager.set_steering_vectors(vectors={_HP: {0: [3.0] * 8}})
         status = worker_with_manager.get_steering_status()
-        expected_norm = round(math.sqrt(8 * 9.0), 6)
-        assert status[0][_HP]["norm"] == expected_norm
+        # The reported norm is computed on the stored vector, whose dtype
+        # follows the layer buffers — compare with a tolerance wide enough for
+        # any of bf16/fp16/fp32 rather than exact float64 equality.
+        assert status[0][_HP]["norm"] == pytest.approx(math.sqrt(8 * 9.0), rel=1e-2)
 
     def test_cleared_after_set(self, worker_with_manager):
         worker_with_manager.set_steering_vectors(vectors={_HP: {0: [1.0] * 8}})
@@ -553,6 +555,84 @@ class TestGetSteeringStatus:
         # Decode norm from manager
         expected_decode = round(torch.tensor(decode_vec).norm().item(), 6)
         assert layer_status["decode_norm"] == expected_decode
+
+
+# --- clamp tiers through the worker RPC surface ---
+
+
+@pytest.fixture
+def worker_with_clamps(model):
+    """Worker whose runner and manager accept clamp specs (K cap 4)."""
+    w = FakeWorker(model)
+    assert w.model_runner is not None
+    w.model_runner._steering_manager = SteeringManager(
+        max_steering_configs=4, max_clamp_directions=4
+    )
+    w.model_runner._max_clamp_directions = 4
+    return w
+
+
+def _clamp_spec(layer: int, width: int = 8, count: int = 1) -> dict:
+    entries = []
+    for j in range(count):
+        vec = [0.0] * width
+        vec[j % width] = 1.0
+        entries.append({"vector": vec, "value": float(j)})
+    return {_HP: {layer: entries}}
+
+
+class TestSetSteeringVectorsClamps:
+    def test_set_base_clamps_reports_layer(self, worker_with_clamps):
+        _tp, _pp, layers = worker_with_clamps.set_steering_vectors(
+            clamps=_clamp_spec(1)
+        )
+        assert layers == [1]
+        mgr = worker_with_clamps.model_runner._steering_manager
+        assert mgr.has_global_clamps
+        assert 1 in mgr.global_clamp_base[_HP]
+
+    def test_three_clamp_tiers_land_in_phase_dicts(self, worker_with_clamps):
+        worker_with_clamps.set_steering_vectors(
+            clamps=_clamp_spec(0),
+            prefill_clamps=_clamp_spec(1),
+            decode_clamps=_clamp_spec(2),
+        )
+        mgr = worker_with_clamps.model_runner._steering_manager
+        assert 0 in mgr.global_clamp_base[_HP]
+        assert 1 in mgr.global_clamp_prefill[_HP]
+        assert 2 in mgr.global_clamp_decode[_HP]
+
+    def test_wrong_width_raises(self, worker_with_clamps):
+        with pytest.raises(SteeringVectorError, match="expected clamp"):
+            worker_with_clamps.set_steering_vectors(
+                clamps={_HP: {1: [{"vector": [1.0, 0.0], "value": 0.0}]}}
+            )
+
+    def test_over_k_cap_raises(self, worker_with_clamps):
+        with pytest.raises(SteeringVectorError, match="max_clamp_directions"):
+            worker_with_clamps.set_steering_vectors(clamps=_clamp_spec(1, count=5))
+
+    def test_clamps_disabled_raises(self, worker_with_manager):
+        # No _max_clamp_directions on the runner -> clamping disabled.
+        with pytest.raises(SteeringVectorError, match="disabled"):
+            worker_with_manager.set_steering_vectors(clamps=_clamp_spec(1))
+
+    def test_validate_only_does_not_store(self, worker_with_clamps):
+        _tp, _pp, layers = worker_with_clamps.set_steering_vectors(
+            clamps=_clamp_spec(1), validate_only=True
+        )
+        assert layers == [1]
+        mgr = worker_with_clamps.model_runner._steering_manager
+        assert not mgr.has_global_clamps
+
+    def test_clear_empties_clamp_tiers(self, worker_with_clamps):
+        worker_with_clamps.set_steering_vectors(
+            clamps=_clamp_spec(0), decode_clamps=_clamp_spec(1)
+        )
+        mgr = worker_with_clamps.model_runner._steering_manager
+        assert mgr.has_global_clamps
+        worker_with_clamps.clear_steering_vectors()
+        assert not mgr.has_global_clamps
 
 
 # --- no model runner ---

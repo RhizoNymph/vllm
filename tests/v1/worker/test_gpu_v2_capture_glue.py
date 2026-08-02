@@ -13,6 +13,7 @@ import threading
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vllm.v1.worker.gpu.capture_runner_mixin import CaptureRunnerMixin
 
@@ -469,6 +470,9 @@ def test_warmup_kernels_flags_execute_model_as_warmup(monkeypatch):
         is_pooling_model=True,  # skips sampler/decode/grammar branches
         is_last_pp_rank=True,
         kv_connector=SimpleNamespace(set_disabled=lambda _disabled: None),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_encoder_decoder=False,
+        kv_block_zeroer=None,
         _in_kernel_warmup=False,
     )
 
@@ -550,3 +554,40 @@ def test_step_capture_view_carries_conversation_id():
 
     convs = {r.req_id: r.conversation_id for r in view.requests}
     assert convs == {"d": "conv-1", "p": None}
+
+
+class _FinishGlue(_AddGlue):
+    """Adds finalize recording so the finish path can be observed."""
+
+    def __init__(self, gate, mgr):
+        super().__init__(gate, mgr)
+        self.finalized = []
+
+    def _finalize_capture_for_request_async(self, req_id):
+        self.finalized.append(req_id)
+
+
+@pytest.mark.parametrize("req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_"])
+def test_capture_add_ignores_warmup_requests(req_id):
+    """Synthetic kernel-warmup requests must never reach the capture
+    pipeline: their activations are garbage and consumers acting on them
+    (e.g. steering policies) mutate state before the first real request."""
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _AddGlue(gate, mgr)
+
+    glue._capture_add_request(_new_req(req_id, {"c": {}}), was_present=False)
+
+    assert glue.registered_calls == []
+    assert gate.registered == {}
+    assert glue._sync_conversation_ids == {}
+
+
+@pytest.mark.parametrize("req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_"])
+def test_capture_finish_ignores_warmup_requests(req_id):
+    gate, mgr = _FakeGate(), _FakeManager()
+    glue = _FinishGlue(gate, mgr)
+
+    glue._capture_finish_request(req_id)
+
+    assert gate.dropped == []
+    assert glue.finalized == []

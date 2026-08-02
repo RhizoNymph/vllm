@@ -59,14 +59,27 @@ End-to-end tested with real weights:
 Other listed architectures have hook wiring and pass small-decoder fixture
 tests but have not been validated against released checkpoints.
 
+Manifold-constrained hyper-connection (mHC) steering is wired for
+DeepSeek-V4 (`deepseek_v4`), which carries a multi-stream residual rather
+than a single residual. See [mHC Steering](#mhc-steering) for the extra
+hook points and the per-stream vector format.
+
+The full HTTP surface (packed per-request vectors, clamps and their
+exactness edges, `/v1/steering/set|clear`, named modules, request-level
+400s) is exercised against a live `vllm serve` process by the collected,
+CUDA-gated suite in
+`tests/entrypoints/serve/e2e/test_server_steering_e2e.py`; the manual
+`tests/gpu_clamp_validate.py` script remains for ad-hoc runs.
+
 Also supported:
 
 - Global steering through HTTP endpoints
 - Per-request steering through `SamplingParams`
 - Three additive tiers (base / prefill-specific / decode-specific)
-- Five hook points: `pre_attn`, `post_attn`, `post_block` (residual stream)
-  plus `mlp_in`, `mlp_out` (MLP branch; wired on gemma3/gemma4 and the qwen3
-  family)
+- Five hook points on standard models: `pre_attn`, `post_attn`, `post_block`
+  (residual stream) plus `mlp_in`, `mlp_out` (MLP branch; wired on
+  gemma3/gemma4 and the qwen3 family). mHC models expose an additional
+  multi-stream hook set — see [mHC Steering](#mhc-steering)
 - Directional clamps on the same three tiers (see
   [Directional Clamps](#directional-clamps))
 - Phase-aware scheduler admission for per-request steering
@@ -146,6 +159,15 @@ Clamps run **after** additive steering at each hook, so the bound holds on
 whatever leaves the site. They participate in the steering config hash,
 so prefix caching stays correct, and clamp-only requests are admitted
 exactly like vector requests.
+
+Test anchors: clamp math in
+`tests/model_executor/layers/test_clamp_op.py` (eager) and
+`test_clamp_gpu.py` (Triton parity, CUDA); engine-level behavior
+(exactness edges, clamp-after-add ordering, decode-only phase, global
+RPC tier, prefix-cache separation, CUDA-graph batching, packed-vs-JSON)
+in `tests/models/language/generation/test_steering_clamps.py`; TP/PP
+equivalence in `test_steering_distributed.py`; live-server HTTP checks
+in the manual `tests/gpu_clamp_validate.py` script.
 
 ### Gating clamps with a probe ("clamp when a feature fires")
 
@@ -279,6 +301,72 @@ identically to `post_block` — the branch is added to the residual stream —
 so `mlp_out` exists chiefly for patching (replace/ablate the MLP branch);
 `mlp_in` is the genuinely new steering site (its effect passes *through*
 the MLP nonlinearity).
+
+## mHC Steering
+
+DeepSeek-V4 uses manifold-constrained hyper-connections (mHC): instead of
+one residual stream it carries `hc_mult` parallel hidden-size streams that
+are mixed per token. Steering is wired at both the single-stream sublayer
+boundaries and the multi-stream residual. The string names match the
+[capture](capture_consumers.md) framework's mHC hook names, so a tensor can
+be both captured and steered under one identifier.
+
+| Hook Point | Tensor | Vector shape | Width |
+| --- | --- | --- | --- |
+| `pre_attn` | normed single-stream attention input | `(hidden,)` | `hidden` |
+| `post_attn` | single-stream attention output | `(hidden,)` | `hidden` |
+| `mlp_in` | normed single-stream FFN input | `(hidden,)` | `hidden` |
+| `mlp_out` | single-stream FFN output | `(hidden,)` | `hidden` |
+| `mhc_streams_pre_attn` | multi-stream residual entering attention | `(hc_mult, hidden)` | `hc_mult * hidden` |
+| `mhc_streams_pre_mlp` | multi-stream residual entering the FFN | `(hc_mult, hidden)` | `hc_mult * hidden` |
+| `mhc_streams_final` | final multi-stream residual before the head fold | `(hc_mult, hidden)` | `hc_mult * hidden` |
+
+The single-stream hooks tap the tensor **after** the sublayer norm — the mHC
+pre kernels fuse `attn_norm`/`ffn_norm`, so the pre-norm tensor is never
+materialized. This matches the standard `mlp_in` contract (the normed branch
+input) and holds on both the nvidia and AMD paths.
+
+DeepSeek-V4 has no single-stream `post_block` hook — its end-of-layer
+residual is the multi-stream tensor, so steer `mhc_streams_pre_mlp` of the
+next layer (or `mhc_streams_final` at the tail) instead.
+
+Note the apply timing at the multi-stream hooks: the sublayer input and
+the mixing coefficients are computed from the streams *before* the steer
+runs, so a vector at `mhc_streams_pre_attn` / `mhc_streams_pre_mlp` takes
+effect through the sublayer's mix-back and the residual carried into
+subsequent layers — not through that sublayer's own input. To steer the
+tensor the sublayer itself consumes, use the single-stream hook
+(`pre_attn` / `mlp_in`) at the same layer.
+
+Every intervention family works at an mHC hook: additive vectors, the
+dynamic tier, in-graph monitors, patch, and directional clamps are all
+registered at the hook's own width, so a clamp direction at
+`mhc_streams_pre_attn` is a unit vector in the full `hc_mult * hidden`
+stream space. Budget for the memory: clamp direction buffers scale with
+hook width, so the multi-stream hooks cost `hc_mult x` a single-stream hook.
+
+Multi-stream hooks take an **independent vector per stream**. The vector is
+supplied flattened to `hc_mult * hidden` values in stream-major order
+(stream 0's full hidden vector, then stream 1's, …); to steer every stream
+identically, repeat the same `hidden`-length block `hc_mult` times. The
+wire format is unchanged from single-stream steering — the packed
+`(num_layers, width)` blob and the `SamplingParams` list-of-floats both
+just carry the wider row:
+
+```python
+import numpy as np
+
+# Steer stream 1 only, on mhc_streams_pre_attn of layer 20.
+hc_mult, hidden = 4, 4096
+row = np.zeros((hc_mult, hidden), dtype=np.float32)
+row[1] = my_direction  # (hidden,)
+params = SamplingParams(
+    steering_vectors={"mhc_streams_pre_attn": {20: row.reshape(-1).tolist()}},
+)
+```
+
+`mhc_streams_final` is a model-level hook: it is keyed to the last decoder
+layer index, so request it on that layer.
 
 ## Global Steering API
 
