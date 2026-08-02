@@ -23,6 +23,7 @@ use serde_with::{DefaultOnNull, OneOrMany, serde_as};
 use thiserror_ext::AsReport as _;
 use uuid::Uuid;
 use vllm_chat::ReasoningParserFactory;
+use vllm_chat::multimodal::MmLimitPerPrompt;
 use vllm_engine_core_client::TransportMode;
 use vllm_managed_engine::ManagedEngineConfig;
 use vllm_managed_engine::cli::{ManagedEngineArgs, repartition_managed_engine_args};
@@ -195,6 +196,17 @@ pub struct SharedRuntimeArgs {
     #[arg(long, value_parser = parse_json::<HashMap<String, Value>>, value_name = "JSON")]
     #[serde(default)]
     pub default_chat_template_kwargs: Option<HashMap<String, Value>>,
+
+    /// The maximum number of input items allowed per prompt for each
+    /// modality, as a JSON object (e.g. `{"image": 16, "video": 2}`).
+    ///
+    /// Also accepts the engine's configurable form
+    /// (e.g. `{"video": {"count": 1, "num_frames": 32}}`); the extra
+    /// profiling options are forwarded to the engine untouched.
+    /// Unspecified modalities are unlimited.
+    #[arg(long, value_parser = parse_json::<MmLimitPerPrompt>, value_name = "JSON", default_value = "{}")]
+    #[serde(default)]
+    pub limit_mm_per_prompt: MmLimitPerPrompt,
 
     /// The format to render message content within a chat template.
     ///
@@ -375,6 +387,18 @@ impl SharedRuntimeArgs {
             .expect("profiler config serialization should not fail")
     }
 
+    /// Return the per-modality limits as JSON for managed Python engine
+    /// forwarding, or `None` when nothing is configured.
+    ///
+    /// Round-tripping the parsed map rather than the raw argument keeps the
+    /// engine's own profiling options (`num_frames`, `width`, ...) intact.
+    pub fn limit_mm_per_prompt_json(&self) -> Option<String> {
+        (!self.limit_mm_per_prompt.is_empty()).then(|| {
+            serde_json::to_string(&self.limit_mm_per_prompt)
+                .expect("limit-mm-per-prompt serialization should not fail")
+        })
+    }
+
     /// Apply fallback logic for API key configuration from env variables.
     fn apply_env_api_key_fallback(&mut self) {
         if self.api_key.is_empty()
@@ -433,6 +457,7 @@ impl SharedRuntimeArgs {
             language_model_only: self.language_model_only,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
+            limit_mm_per_prompt: self.limit_mm_per_prompt,
             chat_template_content_format: self.chat_template_content_format,
             max_logprobs: self.max_logprobs,
             api_server_options,
@@ -489,6 +514,7 @@ impl SharedRuntimeArgs {
             language_model_only: self.language_model_only,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
+            limit_mm_per_prompt: self.limit_mm_per_prompt,
             chat_template_content_format: self.chat_template_content_format,
             max_logprobs: self.max_logprobs,
             api_server_options,
@@ -744,6 +770,7 @@ impl ServeArgs {
                 .iter()
                 .map(|m| format!("{}={}", m.name, m.path))
                 .collect(),
+            self.runtime.limit_mm_per_prompt_json(),
         )
     }
 }

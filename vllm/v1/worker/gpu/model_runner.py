@@ -376,7 +376,7 @@ class GPUModelRunner(
             )
 
         if self.is_pooling_model and self.is_last_pp_rank:
-            self.pooling_runner = PoolingRunner(self.model)
+            self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
         eplb_models_added |= self.eplb.maybe_register_model(
             self.model,
             self.model_config,
@@ -813,6 +813,8 @@ class GPUModelRunner(
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        if self.pooling_runner is not None:
+            self.pooling_runner.remove_request(req_idx)
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
         if self.encoder_cache is not None:
@@ -878,6 +880,14 @@ class GPUModelRunner(
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+
+            if self.pooling_runner is not None:
+                assert new_req_data.pooling_params is not None
+                self.pooling_runner.add_request(
+                    req_index,
+                    new_req_data.pooling_params,
+                    new_req_data.prompt_token_ids,
+                )
 
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
@@ -1715,7 +1725,7 @@ class GPUModelRunner(
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         assert self.pooling_runner is not None
-        pooler_output, is_valid = self.pooling_runner.pool(
+        pooler_output, finished_mask = self.pooling_runner.pool(
             hidden_states, input_batch, self.req_states
         )
 
@@ -1728,7 +1738,7 @@ class GPUModelRunner(
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
             pooler_output=pooler_output,
-            is_valid=is_valid,
+            finished_mask=finished_mask,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
         )
