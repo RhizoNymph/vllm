@@ -29,7 +29,7 @@ import torch.nn as nn
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
     HOOK_POINT_TABLE_ATTR,
-    SteeringHookPoint,
+    STANDARD_STEERING_HOOKS,
     register_steering_buffers,
 )
 from vllm.model_executor.layers.steering import apply_steering as _real_apply_steering
@@ -181,7 +181,9 @@ class TestRegisterSteeringBuffersFlag:
             max_steering_tokens=16,
             max_steering_configs=4,
         )
-        for hp in SteeringHookPoint:
+        # The default registration covers exactly the standard single-stream
+        # hooks; model-specific hooks (e.g. mHC) are opt-in via hook_widths.
+        for hp in STANDARD_STEERING_HOOKS:
             flag_attr = HOOK_POINT_ANY_ACTIVE_ATTR[hp]
             flag = getattr(mod, flag_attr)
             assert flag.dtype == torch.bool
@@ -200,7 +202,7 @@ class TestRegisterSteeringBuffersFlag:
             max_steering_tokens=16,
             max_steering_configs=4,
         )
-        for hp in SteeringHookPoint:
+        for hp in STANDARD_STEERING_HOOKS:
             assert hasattr(mod, HOOK_POINT_TABLE_ATTR[hp])
             assert hasattr(mod, HOOK_POINT_ANY_ACTIVE_ATTR[hp])
 

@@ -782,17 +782,19 @@ class SteeringModelRunnerMixin:
         # avoiding CPU->GPU copies each step.
         table_device: torch.device | None = None
         table_dtype: torch.dtype | None = None
-        hidden_size: int | None = None
+        # All distinct table widths across this worker's steerable layers.
+        # mHC models register multi-stream residual hooks wider than the
+        # single-stream hooks, so the kernel must be warmed at each width to
+        # cover every gather shape the served window will hit.
+        table_widths: set[int] = set()
         for mod in steerable.values():
             for attr in HOOK_POINT_TABLE_ATTR.values():
                 if hasattr(mod, attr):
                     table_buf = getattr(mod, attr)
-                    table_device = table_buf.device
-                    table_dtype = table_buf.dtype
-                    hidden_size = table_buf.shape[1]
-                    break
-            if table_device is not None:
-                break
+                    if table_device is None:
+                        table_device = table_buf.device
+                        table_dtype = table_buf.dtype
+                    table_widths.add(table_buf.shape[1])
 
         self._max_clamp_directions = int(
             getattr(steering_config, "max_clamp_directions", 0)
@@ -905,7 +907,7 @@ class SteeringModelRunnerMixin:
             table_device is not None
             and table_device.type == "cuda"
             and table_dtype is not None
-            and hidden_size is not None
+            and table_widths
         ):
             from vllm.model_executor.layers.steering_kernel import (
                 warmup_apply_steering_kernel,
@@ -918,51 +920,55 @@ class SteeringModelRunnerMixin:
                 if compilation_config is not None
                 else None
             )
-            warmup_apply_steering_kernel(
-                hidden_size=hidden_size,
-                table_rows=TableLayout.from_steering_config(steering_config).num_rows,
-                table_dtype=table_dtype,
-                compute_dtype=compute_dtype,
-                device=table_device,
-                capture_sizes=list(capture_sizes) if capture_sizes else None,
-                row_monitor_enabled=self._row_monitor_enabled,
-            )
-
-            # Warm the in-graph monitor kernel (Phase 2, §8) too — the
-            # monitor op is emitted at every steered hook, so its Triton
-            # JIT must retire before CUDA-graph capture even when no probe
-            # is configured yet (the inactive branch shares the artifact).
-            from vllm.model_executor.layers.steering_monitor_kernel import (
-                warmup_steering_monitor_kernel,
-            )
-
-            warmup_steering_monitor_kernel(
-                hidden_size=hidden_size,
-                compute_dtype=compute_dtype,
-                device=table_device,
-                capture_sizes=list(capture_sizes) if capture_sizes else None,
-            )
-
-            # Warm the directional-clamp kernels when clamping is enabled —
-            # the clamp ops are emitted at every steered hook once buffers
-            # exist, so their Triton JIT must retire before CUDA-graph
-            # capture even when no clamp is configured yet.
-            if self._max_clamp_directions > 0:
-                from vllm.model_executor.layers.clamp_kernel import (
-                    warmup_apply_clamp_kernel,
-                )
-
-                warmup_apply_clamp_kernel(
-                    hidden_size=hidden_size,
-                    table_rows=TableLayout.from_steering_config(
-                        steering_config
-                    ).num_rows,
-                    max_directions=self._max_clamp_directions,
+            # Warmed per distinct table width: mHC models register
+            # multi-stream hooks wider than the single-stream ones, and each
+            # width is a separate Triton specialization. A non-mHC model has
+            # exactly one width, so this is a single pass as before.
+            num_rows = TableLayout.from_steering_config(steering_config).num_rows
+            for width in sorted(table_widths):
+                warmup_apply_steering_kernel(
+                    hidden_size=width,
+                    table_rows=num_rows,
                     table_dtype=table_dtype,
                     compute_dtype=compute_dtype,
                     device=table_device,
                     capture_sizes=list(capture_sizes) if capture_sizes else None,
+                    row_monitor_enabled=self._row_monitor_enabled,
                 )
+
+                # Warm the in-graph monitor kernel (Phase 2, §8) too — the
+                # monitor op is emitted at every steered hook, so its Triton
+                # JIT must retire before CUDA-graph capture even when no probe
+                # is configured yet (the inactive branch shares the artifact).
+                from vllm.model_executor.layers.steering_monitor_kernel import (
+                    warmup_steering_monitor_kernel,
+                )
+
+                warmup_steering_monitor_kernel(
+                    hidden_size=width,
+                    compute_dtype=compute_dtype,
+                    device=table_device,
+                    capture_sizes=list(capture_sizes) if capture_sizes else None,
+                )
+
+                # Warm the directional-clamp kernels when clamping is enabled —
+                # the clamp ops are emitted at every steered hook once buffers
+                # exist, so their Triton JIT must retire before CUDA-graph
+                # capture even when no clamp is configured yet.
+                if self._max_clamp_directions > 0:
+                    from vllm.model_executor.layers.clamp_kernel import (
+                        warmup_apply_clamp_kernel,
+                    )
+
+                    warmup_apply_clamp_kernel(
+                        hidden_size=width,
+                        table_rows=num_rows,
+                        max_directions=self._max_clamp_directions,
+                        table_dtype=table_dtype,
+                        compute_dtype=compute_dtype,
+                        device=table_device,
+                        capture_sizes=list(capture_sizes) if capture_sizes else None,
+                    )
 
         # Pre-allocate SAE buffers for the startup-declared module
         # topology (plus configured spare slots) so compiled graphs /
@@ -1027,18 +1033,18 @@ class SteeringModelRunnerMixin:
         any_layer = next(iter(steerable.values()))
         ref_dtype: torch.dtype | None = None
         table_device: torch.device | None = None
-        hidden_size: int | None = None
+        default_width: int | None = None
         for attr in HOOK_POINT_TABLE_ATTR.values():
             if hasattr(any_layer, attr):
                 ref_buffer = getattr(any_layer, attr)
                 ref_dtype = ref_buffer.dtype
                 table_device = ref_buffer.device
-                hidden_size = int(ref_buffer.shape[1])
+                default_width = int(ref_buffer.shape[1])
                 break
-        if ref_dtype is None or hidden_size is None:
+        if ref_dtype is None or default_width is None:
             ref_dtype = getattr(self.vllm_config.model_config, "dtype", torch.float32)
             table_device = torch.device("cpu")
-            hidden_size = int(self.vllm_config.model_config.get_hidden_size())
+            default_width = int(self.vllm_config.model_config.get_hidden_size())
         scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
         max_tokens = (
             int(scheduler_config.max_num_batched_tokens)
@@ -1047,6 +1053,8 @@ class SteeringModelRunnerMixin:
         )
         max_sae_configs = int(steering_config.max_steering_configs)
         spare_layers: list[nn.Module] = []
+        # Distinct spare-slot widths; one Triton specialization each.
+        spare_widths: set[int] = set()
         for site in sites:
             layer_str, _, hook_str = site.partition(":")
             try:
@@ -1062,6 +1070,14 @@ class SteeringModelRunnerMixin:
             layer = steerable.get(layer_idx)
             if layer is None:
                 continue
+            # The SAE's d_model is the width of the tensor at THIS site, which
+            # on an mHC model differs per hook (multi-stream hooks are
+            # ``hc_mult * hidden`` wide), so read it off the site's own table.
+            site_table = getattr(layer, HOOK_POINT_TABLE_ATTR[hook_point], None)
+            site_width = (
+                int(site_table.shape[1]) if site_table is not None else default_width
+            )
+            spare_widths.add(site_width)
             for _ in range(per_site):
                 register_sae_buffers(
                     layer,
@@ -1070,7 +1086,7 @@ class SteeringModelRunnerMixin:
                     activation=SAEActivation.JUMPRELU,
                     activation_params={},
                     n_clamp=n_features,
-                    hidden_size=hidden_size,
+                    hidden_size=site_width,
                     max_sae_configs=max_sae_configs,
                     dtype=ref_dtype,
                     device=table_device,
@@ -1099,15 +1115,16 @@ class SteeringModelRunnerMixin:
             )
 
             compute_dtype = getattr(self.vllm_config.model_config, "dtype", ref_dtype)
-            warmup_apply_sae_delta_kernel(
-                hidden_size=hidden_size,
-                n_clamp=n_features,
-                table_dtype=ref_dtype,
-                compute_dtype=compute_dtype,
-                device=table_device,
-                activation_code=_ACTIVATION_TO_CODE[SAEActivation.JUMPRELU],
-                activation_param=_activation_to_scalar(SAEActivation.JUMPRELU, {}),
-            )
+            for width in sorted(spare_widths):
+                warmup_apply_sae_delta_kernel(
+                    hidden_size=width,
+                    n_clamp=n_features,
+                    table_dtype=ref_dtype,
+                    compute_dtype=compute_dtype,
+                    device=table_device,
+                    activation_code=_ACTIVATION_TO_CODE[SAEActivation.JUMPRELU],
+                    activation_param=_activation_to_scalar(SAEActivation.JUMPRELU, {}),
+                )
 
     # -----------------------------------------------------------------------
     # Steerable-layer discovery and vector-spec validation

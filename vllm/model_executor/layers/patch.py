@@ -39,6 +39,7 @@ from torch import nn
 from vllm.model_executor.layers.intervention_common import BufferKnob, hook_attrs
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_TABLE_ATTR,
+    STANDARD_STEERING_HOOKS,
     SteeringHookPoint,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -146,8 +147,15 @@ def register_patch_buffers(
     max_patch_tokens: int,
     max_patch_slots: int,
     dtype: torch.dtype | None = None,
+    hook_widths: dict[SteeringHookPoint, int] | None = None,
 ) -> None:
     """Attach per-hook patch buffers to a decoder layer.
+
+    ``hook_widths`` mirrors :func:`register_steering_buffers`: it selects which
+    hook points get buffers and each one's row width. ``None`` registers the
+    :data:`STANDARD_STEERING_HOOKS` at ``hidden_size`` (historical
+    behaviour); mHC models pass a map so the multi-stream hooks are patched at
+    ``hc_mult * hidden_size``.
 
     No-op when ``max_patch_slots <= 0`` (patching disabled), matching the
     disabled-mode discipline of :func:`register_steering_buffers`: with no
@@ -167,16 +175,18 @@ def register_patch_buffers(
     if max_patch_slots <= 0:
         return
     table_dtype = dtype if dtype is not None else torch.float32
-    for hp in HOOK_POINT_TABLE_ATTR:
+    if hook_widths is None:
+        hook_widths = {hp: hidden_size for hp in STANDARD_STEERING_HOOKS}
+    for hp, width in hook_widths.items():
         module.register_buffer(
             PATCH_TABLE_ATTR[hp],
-            torch.zeros(max_patch_slots, hidden_size, dtype=table_dtype),
+            torch.zeros(max_patch_slots, width, dtype=table_dtype),
             persistent=False,
         )
         # alpha row 0 == 0 (passthrough invariant); zeros() satisfies it.
         module.register_buffer(
             PATCH_ALPHA_ATTR[hp],
-            torch.zeros(max_patch_slots, hidden_size, dtype=torch.float32),
+            torch.zeros(max_patch_slots, width, dtype=torch.float32),
             persistent=False,
         )
         module.register_buffer(
@@ -207,6 +217,7 @@ def maybe_register_patch_buffers(
     *,
     max_patch_tokens: int,
     dtype: torch.dtype | None = None,
+    hook_widths: dict[SteeringHookPoint, int] | None = None,
 ) -> None:
     """Register patch buffers iff patching is enabled in the vllm config.
 
@@ -224,6 +235,7 @@ def maybe_register_patch_buffers(
         max_patch_tokens=max_patch_tokens,
         max_patch_slots=max_patch_slots,
         dtype=dtype,
+        hook_widths=hook_widths,
     )
 
 

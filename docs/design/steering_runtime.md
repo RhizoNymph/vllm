@@ -126,6 +126,40 @@ points reuse the same row mapping but look up different per-hook tables.
 That is why steering supports multiple hook points without multiplying the
 per-token bookkeeping cost.
 
+### Per-hook table width
+
+A hook point's table is `(NUM_RESERVED_ROWS + max_configs, width)`. Standard
+decoder layers register exactly the `STANDARD_STEERING_HOOKS` (`pre_attn`,
+`post_attn`, `post_block`, `mlp_in`, `mlp_out`), all `width = hidden_size`.
+mHC models (DeepSeek-V4) instead pass an explicit `hook_widths` map to
+`register_steering_buffers`, registering single-stream sublayer hooks at
+`hidden_size` and multi-stream residual hooks at `hc_mult * hidden_size`
+on the same layer.
+
+`hook_widths` governs *every* buffer family at a hook, not just the vector
+table: the dynamic-tier vector, the global and per-row monitor probes, the
+patch table/alpha, and the clamp dirs are all registered at the hook's own
+width, so an mHC stream hook supports the full intervention stack in the
+`hc_mult * hidden` stream space. Note the memory consequence — clamp dirs
+are `(rows, K, width)` per hook per layer, so the multi-stream hooks cost
+`hc_mult x` a single-stream hook.
+
+The apply path stays uniform: `apply_layer_steering_streams` flattens a
+`(tokens, hc_mult, hidden)` residual to 2-D, runs the same
+capture → patch → steer → sae → clamp pipeline as `apply_layer_steering`
+(every op's hidden dim is a runtime arg), and reshapes back. The per-token
+row index, the row layout, and the `any_active` short-circuit are all
+width-agnostic. `SteeringManager`'s table population groups active tables
+by `(width, dtype)` so each width is stacked and cast in one launch — a
+single group in the non-mHC case. Kernel warmup likewise iterates the
+distinct registered widths.
+
+Because a multi-stream row is just the per-stream vectors concatenated,
+the wire format (`(num_layers, width)` packed blob; `SamplingParams`
+list-of-floats) needs no change: the row is simply `hc_mult * hidden` long.
+`mhc_streams_final` is model-level — it is registered only on the last
+decoder layer and keyed to that layer's index.
+
 ## Directional Clamps
 
 Clamping is a third intervention methodology (alongside additive steering
@@ -358,6 +392,19 @@ To add steering to another model family, contributors need to wire:
 - per-hook steering tables
 - the shared steering index
 - `apply_steering` calls at the intended residual-stream hook points
+
+The standard wiring uses `apply_layer_steering(self, residual, hook_point)`
+at the three single-stream hooks (see `deepseek_v2.py` for a MoE reference).
+
+For a multi-stream (mHC) residual, pass an explicit `hook_widths` map to
+`register_steering_buffers` (single-stream hooks at `hidden_size`,
+multi-stream hooks at `hc_mult * hidden_size`) and apply with
+`apply_layer_steering_streams(self, streams, hook_point)`, which handles the
+flatten/reshape. `deepseek_v4` is the reference; its registration and
+per-sublayer routing live once in
+`vllm/models/deepseek_v4/common/interventions.py` (shared by the nvidia and
+amd decoder layers), which routes the steerable tensors through these
+helpers while the fp32 mixing coefficients remain capture-only.
 
 The extension work is model-specific, but the runtime invariants above do not
 change.

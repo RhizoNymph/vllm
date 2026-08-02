@@ -36,6 +36,12 @@ from vllm.model_executor.layers.mhc import (
     MHCPreOp,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    apply_layer_steering_streams,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -56,6 +62,10 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
+from vllm.models.deepseek_v4.common.interventions import (
+    register_mhc_steering_buffers,
+    steer_and_capture_mhc,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -298,6 +308,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4ROCMAiterMLAAttention(
@@ -365,6 +376,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             HAS_AITER_MHC and self.hidden_size % 256 == 0
         )
 
+        # Per-request activation steering; wiring shared with the nvidia path
+        # (see deepseek_v4/common/interventions.py).
+        register_mhc_steering_buffers(
+            self,
+            vllm_config,
+            is_last_layer=self.layer_idx == config.num_hidden_layers - 1,
+        )
+
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -426,7 +445,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         x = self.attn_norm(x)
+        # mHC steering + capture taps (both no-ops when neither is active; the
+        # static disabled branches constant-fold out of the compiled graph).
+        # ``residual`` is the multi-stream residual entering this layer;
+        # ``post_mix`` / ``res_mix`` are the attention sublayer's
+        # hyperconnection mixing coefficients (capture-only); ``x`` is the
+        # normed single-stream attention input.
+        residual, x = steer_and_capture_mhc(
+            self, residual, post_mix, res_mix, x, "attn"
+        )
         x = self.attn(positions, x, None)
+        x = apply_layer_steering(self, x, SteeringHookPoint.POST_ATTN)
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
@@ -443,7 +472,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
         )
         x = self.ffn_norm(x)
+        residual, x = steer_and_capture_mhc(self, residual, post_mix, res_mix, x, "ffn")
         x = self.ffn(x, input_ids)
+        x = apply_layer_steering(self, x, SteeringHookPoint.MLP_OUT)
         return x, residual, post_mix, res_mix
 
     def _forward_unfused_post_pre(
@@ -462,7 +493,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
+        residual, x = steer_and_capture_mhc(self, residual, post, comb, x, "attn")
         x = self.attn(positions, x, None)
+        x = apply_layer_steering(self, x, SteeringHookPoint.POST_ATTN)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
@@ -470,7 +503,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
         x = self.ffn_norm(x)
+        residual, x = steer_and_capture_mhc(self, residual, post, comb, x, "ffn")
         x = self.ffn(x, input_ids)
+        x = apply_layer_steering(self, x, SteeringHookPoint.MLP_OUT)
         x = self.hc_post(x, residual, post, comb)
         return x, None, None, None
 
@@ -547,6 +582,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        # Share one ``steering_index`` tensor across all steerable layers so
+        # the per-step token->row map is written once and read by every
+        # layer's apply_steering gather. No-op when steering is disabled
+        # (layers register no buffers).
+        share_steering_index_across_layers(list(self.layers))
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -678,6 +718,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
+
+        # Steer + capture the final multi-stream residual before the head
+        # fold. ``layer`` is the last decoder layer (global index
+        # num_hidden_layers-1 on the last PP rank) — the only layer that
+        # registers the model-level ``mhc_streams_final`` table, matching the
+        # capture framework's tail attribution. Both the steer and the capture
+        # tap are no-ops (static branches) when their feature is disabled. The
+        # steered residual then feeds the MTP draft buffer.
+        if layer is not None:
+            hidden_states = apply_layer_steering_streams(
+                layer, hidden_states, SteeringHookPoint.MHC_STREAMS_FINAL
+            )
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]

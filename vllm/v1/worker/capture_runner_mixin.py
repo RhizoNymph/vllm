@@ -48,7 +48,7 @@ from vllm.utils.torch_utils import get_dtype_size
 if TYPE_CHECKING:
     import numpy as np
 
-    from vllm.v1.capture.types import CaptureResult
+    from vllm.v1.capture.types import CaptureResult, HookSchema
     from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
 logger = init_logger(__name__)
@@ -75,6 +75,9 @@ class CaptureRunnerMixin:
     _in_kernel_warmup: bool = False
     _capture_manager: Any = None
     _capture_step_gate: Any = None
+    # This model's per-hook row geometry (width, dtype, logical shape), shared
+    # by the capture managers and every per-request ``CaptureContext``.
+    _capture_hook_schema: dict[str, HookSchema]
     _capture_validators: list[Any]
     _capture_name_to_index: dict[str, int]
     _capture_index_to_name: dict[int, str]
@@ -128,6 +131,18 @@ class CaptureRunnerMixin:
         # (``RequestMetadata.steering``), unpacked to numpy once at admission
         # and surfaced on ``StepRequestView.steering``.
         self._sync_steering_gates: dict[str, list | None] = {}
+
+        from vllm.v1.capture.types import build_hook_schema
+
+        # Per-hook row geometry for this model, resolved once. Driven from
+        # ``hf_config`` (not the model object, which may not be loaded yet):
+        # mHC models expose ``hc_mult`` and get the wider/fp32 stream and
+        # coefficient hooks; every other model gets the standard residual set.
+        self._capture_hook_schema = build_hook_schema(
+            self.model_config.get_hidden_size(),
+            self.model_config.dtype,
+            getattr(self.model_config.hf_config, "hc_mult", None),
+        )
 
         cc_config = self.vllm_config.capture_consumers_config
         self._capture_feature_enabled = cc_config is not None
@@ -188,6 +203,7 @@ class CaptureRunnerMixin:
                     model_dtype=self.model_config.dtype,
                     device=self.device,
                     max_num_tokens=self.max_num_tokens,
+                    hook_schema=self._capture_hook_schema,
                     slim=True,
                 )
                 self._sync_capture_buffers = slim_mgr
@@ -238,6 +254,7 @@ class CaptureRunnerMixin:
                 spill_dir=getattr(cc_config, "spill_dir", None),
                 spill_max_bytes=getattr(cc_config, "spill_max_bytes", 4 << 30),
                 graphsafe_keys=getattr(cc_config, "graphsafe_keys", None),
+                hook_schema=self._capture_hook_schema,
             )
             self._capture_validators = validators
             self._capture_name_to_index = dict(name_to_index)
@@ -439,6 +456,9 @@ class CaptureRunnerMixin:
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             expert_parallel_size=capture_expert_parallel_size(parallel_config),
             data_parallel_size=parallel_config.data_parallel_size,
+            # ``getattr``: runner stand-ins that never ran _init_capture_state
+            # get an empty schema, which validation treats as "standard hooks".
+            hook_schema=getattr(self, "_capture_hook_schema", {}),
         )
 
         raw_client = getattr(sp, "capture", None)

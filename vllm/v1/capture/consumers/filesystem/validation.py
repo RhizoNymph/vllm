@@ -38,6 +38,7 @@ import regex as re
 
 from vllm.v1.capture.errors import CaptureValidationError
 from vllm.v1.capture.types import (
+    MODEL_LEVEL_HOOKS,
     CaptureContext,
     CaptureSpec,
     HookName,
@@ -54,10 +55,14 @@ if TYPE_CHECKING:
 # Hook-point + position-kind literal sets
 # ---------------------------------------------------------------------------
 
-# Hook names mirror ``vllm.model_executor.layers.steering``; redeclared
-# here (rather than imported) to keep this module torch-free. Whenever
-# steering grows a new hook point, this tuple must be updated in
-# lockstep.
+# Fallback valid-hook set, used only when the request's ``CaptureContext``
+# carries no hook schema (older construction sites / unit tests). In
+# production the model's hook schema (``ctx.hook_schema``) is the source of
+# truth for which hooks are tapped — see ``validate_filesystem_request``.
+# These are the standard-model hook names, mirroring
+# ``vllm.model_executor.layers.steering`` but redeclared here (rather than
+# imported) to keep this module torch-free; the mHC hooks reach the
+# validator only through a model's own schema.
 _VALID_HOOK_NAMES: frozenset[str] = frozenset(
     ("pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out")
 )
@@ -298,8 +303,15 @@ def _resolve_positions(
 # ---------------------------------------------------------------------------
 
 
-def _structural_validate(raw: FilesystemCaptureRequest) -> None:
-    """Structural validation of the raw request before resolving."""
+def _structural_validate(
+    raw: FilesystemCaptureRequest, valid_hooks: frozenset[str]
+) -> None:
+    """Structural validation of the raw request before resolving.
+
+    ``valid_hooks`` is the set of hook points the target model actually
+    taps (its hook schema). A request for any other hook is rejected here
+    so it fails fast rather than producing an empty, zero-byte capture.
+    """
     if not isinstance(raw.request_id, str) or not raw.request_id:
         raise CaptureValidationError(
             f"capture.request_id must be a non-empty string, got {raw.request_id!r}"
@@ -318,10 +330,10 @@ def _structural_validate(raw: FilesystemCaptureRequest) -> None:
             raise CaptureValidationError(
                 f"capture.hooks key must be a string, got {type(hook_name).__name__}"
             )
-        if hook_name not in _VALID_HOOK_NAMES:
+        if hook_name not in valid_hooks:
             raise CaptureValidationError(
-                f"capture.hooks key {hook_name!r} is not a valid hook "
-                f"point; valid names: {sorted(_VALID_HOOK_NAMES)}"
+                f"capture.hooks key {hook_name!r} is not a hook point this "
+                f"model taps; valid names: {sorted(valid_hooks)}"
             )
     if isinstance(raw.positions, str):
         if raw.positions not in _VALID_POSITION_KINDS:
@@ -364,8 +376,13 @@ def validate_filesystem_request(
     kind string (``all_generated`` / ``all``) which the runner
     materializes per-step.
     """
-    # 1. Structural validation.
-    _structural_validate(raw)
+    # 1. Structural validation. A model's hook schema lists exactly the
+    # hooks it taps; use it as the valid-hook set so per-model hooks
+    # (``mlp_in`` / ``mlp_out`` / ``mhc_*`` on DeepSeek-V4) are accepted
+    # only where wired. Fall back to the standard wired residual hooks when
+    # no schema was provided (older construction sites / unit tests).
+    valid_hooks = frozenset(ctx.hook_schema) if ctx.hook_schema else _VALID_HOOK_NAMES
+    _structural_validate(raw, valid_hooks)
 
     # 2. Parallelism. The residual hooks captured today (pre_attn /
     # post_attn / post_block) read the residual stream after the
@@ -395,6 +412,19 @@ def validate_filesystem_request(
         )
     resolved_hooks: dict[HookName, list[int]] = {}
     for hook_name, selector in raw.hooks.items():
+        if hook_name in MODEL_LEVEL_HOOKS:
+            # Model-level hook: fires once at the model tail, keyed to the
+            # last layer. The selector's *value* is meaningless here, so any
+            # well-formed selector normalizes to that single index — callers
+            # need not know it (e.g. ``{"mhc_streams_final": "all"}``) — but
+            # a malformed selector still fails fast like any other hook's.
+            _expand_hook_layers(
+                selector,
+                ctx.num_hidden_layers,
+                where=f"capture.hooks[{hook_name!r}]",
+            )
+            resolved_hooks[cast(HookName, hook_name)] = [ctx.num_hidden_layers - 1]
+            continue
         resolved = _expand_hook_layers(
             selector,
             ctx.num_hidden_layers,
