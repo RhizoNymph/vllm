@@ -194,7 +194,7 @@ class InputProcessor:
         if not has_steering and not has_clamps:
             return
         if not self.steering_config:
-            raise ValueError(
+            raise VLLMValidationError(
                 "Per-request steering vectors/clamps, named-module "
                 "references, or SAE clamp specs were provided but steering "
                 "is not enabled. Start the server with --enable-steering "
@@ -210,39 +210,45 @@ class InputProcessor:
         )
 
         expected = self.model_config.get_hidden_size()
-        for field_name, spec in (
-            ("steering_vectors", params.steering_vectors),
-            ("prefill_steering_vectors", params.prefill_steering_vectors),
-            ("decode_steering_vectors", params.decode_steering_vectors),
-        ):
-            validate_spec_row_widths(spec, expected, field_name=field_name)
-        if has_clamps:
-            max_dirs = int(getattr(self.steering_config, "max_clamp_directions", 0))
-            if max_dirs <= 0:
-                raise ValueError(
-                    "Per-request clamps were provided but clamping is "
-                    "disabled (steering_config.max_clamp_directions=0)."
-                )
-            for field_name, cspec in (
-                ("steering_clamps", params.steering_clamps),
-                ("prefill_steering_clamps", params.prefill_steering_clamps),
-                ("decode_steering_clamps", params.decode_steering_clamps),
+        # ``steering_types`` raises ValueError so it can double as a pydantic
+        # validator; re-raise as VLLMValidationError so the entrypoints map
+        # these to 400 rather than letting them escape as a 500.
+        try:
+            for field_name, spec in (
+                ("steering_vectors", params.steering_vectors),
+                ("prefill_steering_vectors", params.prefill_steering_vectors),
+                ("decode_steering_vectors", params.decode_steering_vectors),
             ):
-                if cspec is not None:
-                    cspec.validate_row_width(expected, field_name=field_name)
-            # Per-site K cap after the tier concat — reject over-budget
-            # requests here (request-level error) rather than crashing the
-            # step thread at manager materialization.
-            resolve_effective_clamps(
-                params.steering_clamps,
-                params.prefill_steering_clamps,
-                max_directions=max_dirs,
-            )
-            resolve_effective_clamps(
-                params.steering_clamps,
-                params.decode_steering_clamps,
-                max_directions=max_dirs,
-            )
+                validate_spec_row_widths(spec, expected, field_name=field_name)
+            if has_clamps:
+                max_dirs = int(getattr(self.steering_config, "max_clamp_directions", 0))
+                if max_dirs <= 0:
+                    raise ValueError(
+                        "Per-request clamps were provided but clamping is "
+                        "disabled (steering_config.max_clamp_directions=0)."
+                    )
+                for field_name, cspec in (
+                    ("steering_clamps", params.steering_clamps),
+                    ("prefill_steering_clamps", params.prefill_steering_clamps),
+                    ("decode_steering_clamps", params.decode_steering_clamps),
+                ):
+                    if cspec is not None:
+                        cspec.validate_row_width(expected, field_name=field_name)
+                # Per-site K cap after the tier concat — reject over-budget
+                # requests here (request-level error) rather than crashing the
+                # step thread at manager materialization.
+                resolve_effective_clamps(
+                    params.steering_clamps,
+                    params.prefill_steering_clamps,
+                    max_directions=max_dirs,
+                )
+                resolve_effective_clamps(
+                    params.steering_clamps,
+                    params.decode_steering_clamps,
+                    max_directions=max_dirs,
+                )
+        except ValueError as exc:
+            raise VLLMValidationError(str(exc)) from exc
 
     def _get_mm_identifier(
         self,
@@ -596,7 +602,7 @@ class InputProcessor:
 
         patch_config = getattr(self.vllm_config, "patch_config", None)
         if patch_config is None:
-            raise ValueError(
+            raise VLLMValidationError(
                 "A patch spec was provided but patching is not enabled. Start "
                 "vLLM with --enable-patching to use per-request activation "
                 "patching."
@@ -612,7 +618,7 @@ class InputProcessor:
                 sampling_params, ctx, max_patch_slots=max_patch_slots
             )
         except PatchValidationError as exc:
-            raise ValueError(str(exc)) from exc
+            raise VLLMValidationError(str(exc)) from exc
 
     def _validate_prompt_len(
         self,
