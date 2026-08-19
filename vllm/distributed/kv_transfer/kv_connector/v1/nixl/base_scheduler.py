@@ -51,6 +51,11 @@ logger = init_logger(__name__)
 class NixlBaseConnectorScheduler:
     """Base implementation of Scheduler side methods shared by pull and push."""
 
+    # Emitted in kv_transfer_params so an external router can distinguish a
+    # pull (READ) producer from a push (WRITE) one. Overridden by the push
+    # scheduler.
+    _TRANSFER_MODE: str = "pull"
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -453,6 +458,10 @@ class NixlBaseConnectorScheduler:
             self._build_save_meta(meta, scheduler_output)
 
         meta.reqs_to_send = self._reqs_need_send
+        # Clock reference for reqs_to_send: deadlines above are in this
+        # process's perf_counter domain; workers (possibly on other nodes,
+        # where perf_counter has a different epoch) rebase against this.
+        meta.scheduler_clock = time.perf_counter()
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 

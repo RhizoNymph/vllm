@@ -49,6 +49,19 @@ Steering is wired into the following decoder architectures:
 - Other: `AXK1`, `gpt_neox`, `hyperclovax`, `opt`, `orion`,
   `persimmon`, `seed_oss`, `starcoder2`, `hunyuan_v1`, `mimo_v2_flash`
 
+Architectures that live in the hardware-split `vllm/models/` packages (a
+per-vendor `nvidia/` and `amd/` implementation behind one registry entry) are
+hooked per implementation, so coverage can differ by platform:
+
+- `deepseek_v4` — both the NVIDIA and ROCm implementations are hooked
+  (multi-stream mHC hook set; see [mHC Steering](#mhc-steering))
+- `kimi_k3` — serves `KimiLinearForCausalLM` and `KimiK3ForConditionalGeneration`.
+  Only the NVIDIA implementation (`vllm/models/kimi_k3/nvidia/model.py`) is
+  hooked. The ROCm implementation (`vllm/models/kimi_k3/amd/linear.py`) carries
+  its own `KimiDecoderLayer` with a separate attention-residual forward path and
+  is **not** hooked, so steering, capture, and patching are inert for this
+  architecture on ROCm.
+
 End-to-end tested with real weights:
 
 - Gemma 3 (primary test target)

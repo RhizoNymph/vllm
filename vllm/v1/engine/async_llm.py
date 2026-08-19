@@ -295,6 +295,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
         prompt_text: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
@@ -356,6 +357,7 @@ class AsyncLLM(EngineClient):
                 trace_headers,
                 priority,
                 data_parallel_rank,
+                session_id,
             )
 
         # Convert Input --> Request.
@@ -374,19 +376,39 @@ class AsyncLLM(EngineClient):
                     "latter will be used, and the former will be ignored."
                 )
         else:
-            request = self.input_processor.process_inputs(
-                request_id,
-                prompt,
-                params,
-                supported_tasks=await self.get_supported_tasks(),
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
-                request_metadata=request_metadata,
-            )
+            if isinstance(prompt, dict) and "type" in prompt:
+                # Rendered EngineInput; no blocking preprocessing needed.
+                request = self.input_processor.process_inputs(
+                    request_id,
+                    prompt,
+                    params,
+                    supported_tasks=await self.get_supported_tasks(),
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                    session_id=session_id,
+                    request_metadata=request_metadata,
+                )
+            else:
+                # Raw prompts require tokenization and possibly multimodal
+                # processing, which must not block the event loop.
+                request = await self.input_processor.process_inputs_async(
+                    request_id,
+                    prompt,
+                    params,
+                    supported_tasks=await self.get_supported_tasks(),
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                    session_id=session_id,
+                    request_metadata=request_metadata,
+                )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
         if reasoning_ended is not None:
@@ -454,6 +476,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
     ) -> RequestOutputCollector:
         self._validate_streaming_input_sampling_params(sampling_params)
 
@@ -465,6 +488,7 @@ class AsyncLLM(EngineClient):
             trace_headers=trace_headers,
             priority=priority,
             data_parallel_rank=data_parallel_rank,
+            session_id=session_id,
         )
 
         if not sampling_params.skip_clone:
@@ -565,6 +589,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         request_metadata: RequestMetadata | None = None,
@@ -595,6 +620,7 @@ class AsyncLLM(EngineClient):
                 trace_headers=trace_headers,
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
+                session_id=session_id,
                 prompt_text=prompt_text,
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
@@ -682,6 +708,8 @@ class AsyncLLM(EngineClient):
         self._logger_ref = [self.logger_manager]
         logger_ref = self._logger_ref
         renderer = self.renderer
+        # P0 multi-modal sender ("shadow") cache; None for text-only models.
+        mm_processor_cache = renderer.mm_processor_cache
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
 
         async def output_handler():
@@ -723,6 +751,16 @@ class AsyncLLM(EngineClient):
                         )
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
+
+                        # 2b) Recover from P0/P1 cache drift: the engine flags hashes
+                        # it couldn't find (mm_cache_miss_hashes); drop them from the
+                        # P0 shadow so the client's retry resends the data and
+                        # repopulates P1. Hot-path no-op (field is None otherwise).
+                        if mm_processor_cache is not None:
+                            for eco in outputs_slice:
+                                if eco.mm_cache_miss_hashes:
+                                    for mm_hash in eco.mm_cache_miss_hashes:
+                                        mm_processor_cache.invalidate(mm_hash)
 
                         # Allow other asyncio tasks to run between chunks
                         if end < num_outputs:

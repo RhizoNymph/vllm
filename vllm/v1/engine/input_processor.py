@@ -28,6 +28,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tasks import GENERATION_TASKS, POOLING_TASKS, SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
+from vllm.utils.async_utils import make_async
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.request_metadata import RequestMetadata
@@ -82,6 +83,12 @@ class InputProcessor:
         # capture request; stays ``None`` for non-capture workloads so they
         # pay nothing. See ``vllm/v1/capture/admission.py``.
         self._capture_consumers: dict[str, Any] | None = None
+        # Raw-prompt preprocessing (tokenization and multimodal processing)
+        # is blocking, so async callers should run it on the renderer's
+        # thread pool to keep their event loop responsive.
+        self.process_inputs_async = make_async(
+            self.process_inputs, executor=self.renderer._executor
+        )
 
     @property
     def tokenizer(self) -> TokenizerLike | None:
@@ -110,22 +117,26 @@ class InputProcessor:
                 self.tokenizer,
             )
 
-            if params.thinking_token_budget is not None:
-                if (
-                    self.vllm_config.reasoning_config is None
-                    or not self.vllm_config.reasoning_config.enabled
-                ):
-                    raise VLLMValidationError(
-                        "thinking_token_budget is set but reasoning_config is "
-                        "not configured. Please set --reasoning-parser "
-                        "and/or --reasoning-config to use thinking_token_budget."
+            if self.model_config.return_sampling_mask:
+                if params.temperature <= 0:
+                    raise ValueError(
+                        "sampling distribution replay requires temperature > 0"
                     )
-                if self.use_v2_model_runner:
-                    raise VLLMValidationError(
-                        "thinking_token_budget is not yet supported by the V2 "
-                        "model runner. Run vLLM with VLLM_USE_V2_MODEL_RUNNER=0 "
-                        "to use thinking_token_budget."
+                if params.top_k <= 0:
+                    raise ValueError(
+                        "sampling distribution replay requires top_k > 0 to "
+                        "bound sampling mask size, reduce transfer overhead, "
+                        "and avoid potential OOMs"
                     )
+            if params.thinking_token_budget is not None and (
+                self.vllm_config.reasoning_config is None
+                or not self.vllm_config.reasoning_config.enabled
+            ):
+                raise VLLMValidationError(
+                    "thinking_token_budget is set but reasoning_config is "
+                    "not configured. Please set --reasoning-parser "
+                    "and/or --reasoning-config to use thinking_token_budget."
+                )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS
@@ -341,6 +352,7 @@ class InputProcessor:
         data_parallel_rank: int | None = None,
         resumable: bool = False,
         request_metadata: RequestMetadata | None = None,
+        session_id: str | None = None,
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
@@ -510,6 +522,7 @@ class InputProcessor:
             trace_headers=trace_headers,
             resumable=resumable,
             request_metadata=request_metadata,
+            session_id=session_id,
         )
 
     def _resolve_capture_prefix_flags(
@@ -704,6 +717,7 @@ class InputProcessor:
 
         if prompt_ids and tokenizer is not None:
             max_input_id = max(prompt_ids, default=0)
+            min_input_id = min(prompt_ids, default=0)
 
             # NOTE: tokenizer.max_token_id is the tokenizer’s vocab size while
             # self.model_config.get_vocab_size() is the model’s vocab size.
@@ -716,6 +730,15 @@ class InputProcessor:
             # Here we take the max of the two to determine if a token id is
             # truly out-of-vocabulary.
             model_vocab_size = model_config.get_vocab_size()
+            # A negative id is out of vocabulary just like an over-large one,
+            # but is not caught by the upper-bound check below. Reject it here
+            # so it is not used as an embedding index downstream. This
+            # validation path is shared by generate, embedding and pooling
+            # requests, so the check covers all three.
+            if min_input_id < 0:
+                raise VLLMValidationError(
+                    f"Token id {min_input_id} is out of vocabulary"
+                )
             if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
                 raise VLLMValidationError(
                     f"Token id {max_input_id} is out of vocabulary"
