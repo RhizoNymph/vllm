@@ -380,7 +380,11 @@ def run_multi_api_server(args: argparse.Namespace):
     sidecar_sock = None
     sidecar_listen_address = sidecar_url = None
     if spawn_sidecar:
-        sidecar_sock = create_server_socket(("127.0.0.1", args.patch_sidecar_port))
+        # Single sidecar process on its own loopback port, so no SO_REUSEPORT
+        # (that is for several API server processes sharing one port).
+        sidecar_sock = create_server_socket(
+            ("127.0.0.1", args.patch_sidecar_port), reuse_port=False
+        )
         sidecar_port = sidecar_sock.getsockname()[1]
         sidecar_url = patch_sidecar_url("127.0.0.1", sidecar_port)
         sidecar_listen_address = sidecar_url
