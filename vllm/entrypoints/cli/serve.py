@@ -11,15 +11,10 @@ import uvloop
 import vllm
 import vllm.envs as envs
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.openai.api_server import (
-    create_server_socket,
-    run_server,
-    setup_server,
-)
+from vllm.entrypoints.launchers.api_server.entry import run_server, setup_server
+from vllm.entrypoints.launchers.launcher import create_server_socket
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.openai.dp_supervisor import (
-    run_dp_supervisor,
-)
+from vllm.entrypoints.openai.dp_supervisor import run_dp_supervisor
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
@@ -385,7 +380,11 @@ def run_multi_api_server(args: argparse.Namespace):
     sidecar_sock = None
     sidecar_listen_address = sidecar_url = None
     if spawn_sidecar:
-        sidecar_sock = create_server_socket(("127.0.0.1", args.patch_sidecar_port))
+        # Single sidecar process on its own loopback port, so no SO_REUSEPORT
+        # (that is for several API server processes sharing one port).
+        sidecar_sock = create_server_socket(
+            ("127.0.0.1", args.patch_sidecar_port), reuse_port=False
+        )
         sidecar_port = sidecar_sock.getsockname()[1]
         sidecar_url = patch_sidecar_url("127.0.0.1", sidecar_port)
         sidecar_listen_address = sidecar_url
@@ -410,8 +409,11 @@ def run_multi_api_server(args: argparse.Namespace):
     )
 
     with launch_core_engines(
-        vllm_config, executor_class, log_stats, addresses, num_frontends
-    ) as (local_engine_manager, coordinator, addresses, tensor_queue):
+        vllm_config, executor_class, log_stats, addresses
+    ) as engine_launch:
+        local_engine_manager = engine_launch.engine_manager
+        coordinator = engine_launch.coordinator
+        addresses = engine_launch.addresses
         stats_update_address = (
             coordinator.get_stats_publish_address() if coordinator else None
         )
@@ -432,6 +434,7 @@ def run_multi_api_server(args: argparse.Namespace):
                 output_address=addresses.outputs[0],
                 engine_start_index=expected_engine_start_index,
                 engine_count=expected_engine_count,
+                data_parallel_size=parallel_config.data_parallel_size,
                 stats_update_address=stats_update_address,
                 patch_sidecar_url=sidecar_url,
             )
@@ -450,7 +453,7 @@ def run_multi_api_server(args: argparse.Namespace):
                     input_addresses=[addresses.inputs[1]],
                     output_addresses=[addresses.outputs[1]],
                     stats_update_address=stats_update_address,
-                    tensor_queue=tensor_queue,
+                    tensor_queue=engine_launch.tensor_queue,
                     client_index_start=1,
                     client_count=num_frontends,
                 )
@@ -467,7 +470,7 @@ def run_multi_api_server(args: argparse.Namespace):
                 input_addresses=addresses.inputs,
                 output_addresses=addresses.outputs,
                 stats_update_address=stats_update_address,
-                tensor_queue=tensor_queue,
+                tensor_queue=engine_launch.tensor_queue,
             )
 
             if not is_ray_dp:
@@ -479,6 +482,11 @@ def run_multi_api_server(args: argparse.Namespace):
                 )
                 addresses.inputs = actual_inputs
                 addresses.outputs = actual_outputs
+
+        # Set frontend processes to watch during engine startup.
+        # If any of these processes exit before the engines are up, the engine startup
+        # will be aborted with an error.
+        engine_launch.watched_frontend_processes = api_server_manager.processes
 
     # Wait for API servers.
     try:

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar, overload
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
@@ -148,6 +149,7 @@ class Executor(ABC):
         # Activation capture also needs every rank's output merged (see
         # ``_output_aggregator``); set once here so all backends agree.
         self.capture_enabled = vllm_config.capture_consumers_config is not None
+        self.ec_output_aggregator: ECOutputAggregator | None = None
 
     @abstractmethod
     def _init_executor(self) -> None:
@@ -336,12 +338,20 @@ class Executor(ABC):
         if self.capture_enabled:
             return _CaptureAwareAggregator(self.kv_output_aggregator)
         return self.kv_output_aggregator
+    def init_ec_output_aggregator(self) -> None:
+        self.ec_output_aggregator = ECOutputAggregator()
 
     @cached_property  # Avoid unnecessary RPC calls
     def supported_tasks(self) -> tuple[SupportedTask, ...]:
         output: list[tuple[SupportedTask, ...]]
         output = self.collective_rpc("get_supported_tasks")
         return output[0]
+
+    def supports_draft_weight_updates(self) -> bool:
+        worker_support: list[bool] = self.collective_rpc(
+            "supports_draft_weight_updates"
+        )
+        return all(worker_support)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         assert lora_request.lora_int_id > 0, "lora_id must be greater than 0."

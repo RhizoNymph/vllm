@@ -130,6 +130,9 @@ pub struct EngineCoreRequest {
     /// standard `request_finished` hook.
     #[serde(default)]
     pub abort_immediately: bool,
+    /// Stable session identity shared by related requests.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl EngineCoreRequest {
@@ -143,6 +146,17 @@ impl EngineCoreRequest {
         }
         Ok(())
     }
+
+    /// Extract large request tensors into ordered auxiliary frames.
+    pub(crate) fn extract_aux_frames(&mut self, threshold: usize) -> Vec<Bytes> {
+        let mut aux_frames = Vec::new();
+        if let Some(features) = &mut self.mm_features {
+            for feature in features {
+                feature.extract_aux_frames(&mut aux_frames, threshold);
+            }
+        }
+        aux_frames
+    }
 }
 
 #[cfg(test)]
@@ -150,8 +164,14 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
+    use crate::protocol::multimodal::{
+        MmBatchedField, MmFeatureSpec, MmField, MmFieldElem, MmKwargValue, PlaceholderRange,
+    };
     use crate::protocol::sampling::EngineCoreSamplingParams;
+    use crate::protocol::tensor::{WireArrayData, WireTensor};
     use crate::protocol::{decode_value, encode_msgpack};
+
+    const AUX_FRAME_THRESHOLD: usize = 256;
 
     #[test]
     fn engine_core_request_serializes_as_full_array() {
@@ -164,6 +184,7 @@ mod tests {
             }),
             arrival_time: 1234.5,
             client_index: 7,
+            session_id: Some("session-1".to_string()),
             ..EngineCoreRequest::default()
         };
 
@@ -174,11 +195,95 @@ mod tests {
             other => panic!("expected array, got {other:?}"),
         };
 
-        assert_eq!(array.len(), 21);
+        // 22, not upstream's 21: the fork carries `request_metadata` at index
+        // 17, which shifts every field after it up by one.
+        assert_eq!(array.len(), 22);
         assert_eq!(array[0], Value::from("req-1"));
         assert_eq!(array[2], Value::Nil);
         assert_eq!(array[4], Value::Nil);
         assert_eq!(array[10], Value::Nil);
         assert_eq!(array[11], Value::from(7));
+        assert_eq!(array[17], Value::Nil);
+        assert_eq!(array[21], Value::from("session-1"));
+    }
+
+    #[test]
+    fn engine_core_request_extracts_large_nested_tensors_in_wire_order() {
+        let inline = vec![1_u8; AUX_FRAME_THRESHOLD - 1];
+        let first_aux = vec![2_u8; AUX_FRAME_THRESHOLD];
+        let second_aux = vec![3_u8; AUX_FRAME_THRESHOLD + 1];
+        let first_aux_ptr = first_aux.as_ptr();
+        let second_aux_ptr = second_aux.as_ptr();
+        let mut request = EngineCoreRequest {
+            mm_features: Some(vec![MmFeatureSpec {
+                data: Some(BTreeMap::from([
+                    (
+                        "inline".to_string(),
+                        MmFieldElem {
+                            data: Some(MmKwargValue::Tensor(WireTensor::from_raw(
+                                "uint8",
+                                vec![inline.len()],
+                                inline,
+                            ))),
+                            field: MmField::Batched(MmBatchedField { keep_on_cpu: false }),
+                        },
+                    ),
+                    (
+                        "nested".to_string(),
+                        MmFieldElem {
+                            data: Some(MmKwargValue::List(vec![
+                                MmKwargValue::Int(7),
+                                MmKwargValue::Tensor(WireTensor::from_raw(
+                                    "uint8",
+                                    vec![first_aux.len()],
+                                    first_aux,
+                                )),
+                            ])),
+                            field: MmField::Batched(MmBatchedField { keep_on_cpu: false }),
+                        },
+                    ),
+                ])),
+                modality: "image".to_string(),
+                identifier: "id".to_string(),
+                mm_position: PlaceholderRange {
+                    offset: 0,
+                    length: second_aux.len(),
+                    is_embed: Some(WireTensor::from_raw(
+                        "bool",
+                        vec![second_aux.len()],
+                        second_aux,
+                    )),
+                },
+                mm_hash: None,
+            }]),
+            ..EngineCoreRequest::default()
+        };
+
+        let aux_frames = request.extract_aux_frames(AUX_FRAME_THRESHOLD);
+
+        assert_eq!(aux_frames.len(), 2);
+        assert_eq!(aux_frames[0].as_ptr(), first_aux_ptr);
+        assert_eq!(aux_frames[1].as_ptr(), second_aux_ptr);
+        let feature = &request.mm_features.as_ref().unwrap()[0];
+        let MmKwargValue::Tensor(inline) =
+            feature.data.as_ref().unwrap()["inline"].data.as_ref().unwrap()
+        else {
+            panic!("expected inline tensor");
+        };
+        assert!(matches!(inline.data, WireArrayData::RawView(_)));
+        let MmKwargValue::List(nested) =
+            feature.data.as_ref().unwrap()["nested"].data.as_ref().unwrap()
+        else {
+            panic!("expected nested tensor list");
+        };
+        let MmKwargValue::Tensor(nested_tensor) = &nested[1] else {
+            panic!("expected nested tensor");
+        };
+        assert_eq!(nested_tensor.data, WireArrayData::AuxIndex(1));
+        assert_eq!(
+            feature.mm_position.is_embed.as_ref().unwrap().data,
+            WireArrayData::AuxIndex(2)
+        );
+        assert!(request.extract_aux_frames(AUX_FRAME_THRESHOLD).is_empty());
     }
 }

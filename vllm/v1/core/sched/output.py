@@ -6,6 +6,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
+from vllm.multimodal.utils import strip_covered_mm_data
 
 if TYPE_CHECKING:
     import numpy as np
@@ -80,6 +81,7 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
         hash_block_size: int = 0,
+        uses_mrope: bool = False,
     ) -> "NewRequestData":
         has_capture = request.sampling_params is not None and bool(
             request.sampling_params.capture
@@ -87,7 +89,11 @@ class NewRequestData:
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
-            mm_features=request.mm_features,
+            mm_features=strip_covered_mm_data(
+                request.mm_features,
+                request.num_computed_tokens,
+                uses_mrope=uses_mrope,
+            ),
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
             block_ids=block_ids,
@@ -103,6 +109,14 @@ class NewRequestData:
             capture_block_hashes=(list(request.block_hashes) if has_capture else None),
             capture_hash_block_size=hash_block_size if has_capture else 0,
         )
+
+    @property
+    def prompt_len(self) -> int:
+        if self.prompt_token_ids is not None:
+            return len(self.prompt_token_ids)
+        if self.prompt_embeds is not None:
+            return self.prompt_embeds.shape[0]
+        return 0
 
     def __repr__(self) -> str:
         prompt_embeds_shape = (

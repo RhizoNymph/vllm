@@ -30,7 +30,7 @@ from vllm.config.steering_types import (
     merge_steering_specs,
     validate_spec_row_widths,
 )
-from vllm.entrypoints.openai.api_server import init_app_state
+from vllm.entrypoints.launchers.api_server.app_state import init_app_state
 from vllm.entrypoints.openai.steering.registry import (
     SAEModuleManifest,
     SteeringModuleRegistry,
@@ -605,20 +605,20 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
 
     with (
         patch(
-            "vllm.entrypoints.openai.api_server.load_chat_template",
+            "vllm.entrypoints.launchers.api_server.app_state.load_chat_template",
             return_value=None,
         ),
         patch(
-            "vllm.entrypoints.openai.api_server.process_lora_modules",
+            "vllm.entrypoints.launchers.api_server.app_state.process_lora_modules",
             return_value=[],
         ),
         patch(
-            "vllm.entrypoints.openai.api_server.OpenAIServingModels",
+            "vllm.entrypoints.launchers.api_server.app_state.OpenAIServingModels",
             return_value=models,
         ),
-        patch("vllm.entrypoints.openai.api_server.OnlineRenderer"),
-        patch("vllm.entrypoints.openai.api_server.OnlineDerenderer"),
-        patch("vllm.entrypoints.openai.api_server.ServingTokenization"),
+        patch("vllm.entrypoints.launchers.api_server.app_state.OnlineRenderer"),
+        patch("vllm.entrypoints.launchers.api_server.app_state.OnlineDerenderer"),
+        patch("vllm.entrypoints.launchers.api_server.app_state.ServingTokenization"),
     ):
         await init_app_state(
             engine_client,
@@ -633,20 +633,20 @@ async def test_init_app_state_only_sets_registry_when_steering_enabled():
 
     with (
         patch(
-            "vllm.entrypoints.openai.api_server.load_chat_template",
+            "vllm.entrypoints.launchers.api_server.app_state.load_chat_template",
             return_value=None,
         ),
         patch(
-            "vllm.entrypoints.openai.api_server.process_lora_modules",
+            "vllm.entrypoints.launchers.api_server.app_state.process_lora_modules",
             return_value=[],
         ),
         patch(
-            "vllm.entrypoints.openai.api_server.OpenAIServingModels",
+            "vllm.entrypoints.launchers.api_server.app_state.OpenAIServingModels",
             return_value=models,
         ),
-        patch("vllm.entrypoints.openai.api_server.OnlineRenderer"),
-        patch("vllm.entrypoints.openai.api_server.OnlineDerenderer"),
-        patch("vllm.entrypoints.openai.api_server.ServingTokenization"),
+        patch("vllm.entrypoints.launchers.api_server.app_state.OnlineRenderer"),
+        patch("vllm.entrypoints.launchers.api_server.app_state.OnlineDerenderer"),
+        patch("vllm.entrypoints.launchers.api_server.app_state.ServingTokenization"),
     ):
         await init_app_state(
             engine_client,
@@ -730,19 +730,19 @@ async def test_init_app_state_preloads_sae_directory_and_broadcasts_weights(
 
     with (
         patch(
-            "vllm.entrypoints.openai.api_server.load_chat_template",
+            "vllm.entrypoints.launchers.api_server.app_state.load_chat_template",
             return_value=None,
         ),
         patch(
-            "vllm.entrypoints.openai.api_server.process_lora_modules",
+            "vllm.entrypoints.launchers.api_server.app_state.process_lora_modules",
             return_value=[],
         ),
         patch(
-            "vllm.entrypoints.openai.api_server.OpenAIServingModels",
+            "vllm.entrypoints.launchers.api_server.app_state.OpenAIServingModels",
             return_value=models,
         ),
         patch("vllm.entrypoints.scale_out.factories.init_render_state"),
-        patch("vllm.entrypoints.openai.api_server.ServingTokenization"),
+        patch("vllm.entrypoints.launchers.api_server.app_state.ServingTokenization"),
     ):
         await init_app_state(
             engine_client,

@@ -99,6 +99,7 @@ impl ManagedEngineArgs {
         shutdown_timeout: u64,
         handshake_port: u16,
         steering_modules: Vec<String>,
+        limit_mm_per_prompt: Option<String>,
     ) -> ManagedEngineConfig {
         let mut python_args = self.python_args;
         if !steering_modules.is_empty() {
@@ -137,6 +138,10 @@ impl ManagedEngineArgs {
         if let Some(data_parallel_size_local) = self.data_parallel_size_local {
             python_args.push("--data-parallel-size-local".to_string());
             python_args.push(data_parallel_size_local.to_string());
+        }
+        if let Some(limit_mm_per_prompt) = limit_mm_per_prompt {
+            python_args.push("--limit-mm-per-prompt".to_string());
+            python_args.push(limit_mm_per_prompt);
         }
 
         ManagedEngineConfig {
