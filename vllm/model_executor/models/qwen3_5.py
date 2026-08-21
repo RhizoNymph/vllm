@@ -366,7 +366,8 @@ class Qwen3_5HybridStateMixin(IsHybrid):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
-    IsHybrid,
+    # IsHybrid comes from Qwen3_5HybridStateMixin. Listing it here as well puts
+    # a base ahead of its own subclass, which has no consistent MRO.
     SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
