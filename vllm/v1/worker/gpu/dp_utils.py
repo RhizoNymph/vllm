@@ -117,6 +117,7 @@ def dispatch_cg_and_sync_dp(
             num_tokens,
             uniform_token_count,
             num_active_loras=num_active_loras,
+            max_query_len=max_query_len,
         )
         if pw_desc is not None:
             if dp_size == 1:

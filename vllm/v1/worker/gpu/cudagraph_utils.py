@@ -415,6 +415,7 @@ class CudaGraphManager:
         num_tokens: int,
         uniform_token_count: int | None,
         num_active_loras: int,
+        max_query_len: int | None = None,
     ) -> BatchExecutionDescriptor | None:
         """Find a matching PIECEWISE descriptor, or ``None`` if none applies.
 
@@ -440,6 +441,7 @@ class CudaGraphManager:
                 num_tokens,
                 uniform_token_count,
                 effective_loras,
+                max_query_len,
             ):
                 return desc
         return None
