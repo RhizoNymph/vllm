@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -12,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
+    DraftTailCheck,
     KVCacheBlock,
     resolve_block_hashes,
 )
@@ -107,6 +109,11 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
+        # For a drafter group whose prefix hits are verified by the following
+        # tokens instead of dropping the last matched block (see
+        # ``DraftTailCheck``): how many tokens past each cached block to
+        # record. 0 (default) records nothing. Set by the coordinator.
+        self.draft_lookahead = 0
 
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
@@ -440,6 +447,10 @@ class SingleTypeKVCacheManager(ABC):
                 a tail once per that-sized segment. Only SWA acts on it.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+        if self.draft_lookahead:
+            # A drafter block is cached only once the tokens past it, which
+            # its last KV slots were computed from, are known.
+            num_tokens = min(num_tokens, request.num_tokens - self.draft_lookahead)
         num_full_blocks = num_tokens // self.block_size
 
         if num_cached_blocks >= num_full_blocks:
@@ -469,6 +480,7 @@ class SingleTypeKVCacheManager(ABC):
             block_size=self.block_size,
             kv_cache_group_id=self.kv_cache_group_id,
             block_mask=block_mask,
+            draft_lookahead=self.draft_lookahead,
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
@@ -552,6 +564,7 @@ class SingleTypeKVCacheManager(ABC):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        draft_tail_check: DraftTailCheck | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
         Get the longest cache hit prefix of the blocks that is not longer than
@@ -582,6 +595,10 @@ class SingleTypeKVCacheManager(ABC):
                 be set to the block_size.
             dcp_world_size: The world size of decode context parallelism.
             pcp_world_size: The world size of prefill context parallelism.
+            draft_tail_check: With ``drop_eagle_block``, verify each matched
+                block's drafter tail against the request's tokens instead of
+                dropping the last matched block. Only full attention supports
+                it; the coordinator passes it to no other manager.
 
         Returns:
             A tuple containing cached blocks and the exact cache-hit length in
@@ -692,6 +709,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        draft_tail_check: DraftTailCheck | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         assert isinstance(
             kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec
@@ -730,10 +748,23 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(len(kv_cache_group_ids))
         )
+        # Drafter blocks verified by their tail: every matched block's last
+        # slots must have been computed from this request's following tokens,
+        # so no block needs to be dropped.
+        verify_tail = drop_eagle_block and draft_tail_check is not None
         # Phase 1: longest run of cached full blocks from the start. A missing
         # block implies every later block misses too (chained hashes).
-        for block_hash in itertools.islice(full_block_hashes, max_length // block_size):
-            cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
+        for i, block_hash in enumerate(
+            itertools.islice(full_block_hashes, max_length // block_size)
+        ):
+            accept = None
+            if verify_tail:
+                assert draft_tail_check is not None
+                end = (i + 1) * block_size
+                accept = functools.partial(draft_tail_check.accepts, end=end)
+            cached_block = block_pool.get_cached_block(
+                block_hash, kv_cache_group_ids, accept
+            )
             if not cached_block:
                 break
             for computed, cached in zip(computed_blocks, cached_block):
@@ -742,7 +773,9 @@ class FullAttentionManager(SingleTypeKVCacheManager):
 
         # Phase 2 (fine-grained only): extend into the first non-full block by
         # probing its interior hash boundaries high-to-low (longest hit first).
-        if fine_grained:
+        # Partial entries carry no drafter tail, so verified drafter groups
+        # stop at full blocks.
+        if fine_grained and not verify_tail:
             # list or lazy BlobBlockHashes view
             assert isinstance(block_hashes, Sequence)
             scale_factor = block_size // alignment_tokens
@@ -766,8 +799,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         # Eagle needs the tokens right before the generation point recomputed:
         # drop one hash unit when fine-grained (the tail block's KV is
         # append-only, so it still covers the reduced length), else one cache
-        # block.
-        if drop_eagle_block and hit_length > 0:
+        # block. Not needed when every matched block's tail was verified.
+        if drop_eagle_block and hit_length > 0 and not verify_tail:
             hit_length -= min(alignment_tokens, block_size)
         # Round down to the alignment; a no-op when fine-grained (hits land on
         # hash boundaries by construction) and when alignment_tokens ==

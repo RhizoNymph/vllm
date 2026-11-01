@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    draft_tail_of,
     generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
@@ -58,16 +59,23 @@ class BlockHashToBlockMap:
             BlockHashWithGroupId, KVCacheBlock | dict[int, KVCacheBlock]
         ] = {}
 
-    def get_one_block(self, key: BlockHashWithGroupId) -> KVCacheBlock | None:
+    def get_one_block(
+        self,
+        key: BlockHashWithGroupId,
+        accept: Callable[[KVCacheBlock], bool] | None = None,
+    ) -> KVCacheBlock | None:
         """
-        Gets any block with the given block hash key.
+        Gets any block with the given block hash key, or the first one that
+        ``accept`` accepts when given.
         """
         blocks = self._cache.get(key)
         if blocks is not None:
             if isinstance(blocks, KVCacheBlock):
-                return blocks
+                return blocks if accept is None or accept(blocks) else None
             if isinstance(blocks, dict):
-                return next(iter(blocks.values()))
+                if accept is None:
+                    return next(iter(blocks.values()))
+                return next((b for b in blocks.values() if accept(b)), None)
             self._unexpected_blocks_type(blocks)
         return None
 
@@ -196,15 +204,20 @@ class BlockPool:
         self.metrics_collector = metrics_collector
 
     def get_cached_block(
-        self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+        self,
+        block_hash: BlockHash,
+        kv_cache_group_ids: list[int],
+        accept: Callable[[KVCacheBlock], bool] | None = None,
     ) -> list[KVCacheBlock] | None:
         """Get the cached block by the block hash for each group in
         `kv_cache_group_ids`, or None if cache miss for any group.
-        If there are duplicated blocks, we return the first block in the cache.
+        If there are duplicated blocks, we return the first block in the cache
+        (the first one ``accept`` accepts, when given).
 
         Args:
             block_hash: The hash value of the block.
             kv_cache_group_ids: The ids of the KV cache groups.
+            accept: Optional predicate a cached block must satisfy.
 
         Returns:
             The cached blocks if exists, or None.
@@ -215,7 +228,7 @@ class BlockPool:
                 block_hash, group_id
             )
             block = self.cached_block_hash_to_block.get_one_block(
-                block_hash_with_group_id
+                block_hash_with_group_id, accept
             )
             if not block:
                 return None
@@ -231,6 +244,7 @@ class BlockPool:
         block_size: int,
         kv_cache_group_id: int,
         block_mask: list[bool] | None = None,
+        draft_lookahead: int = 0,
     ) -> None:
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash
@@ -255,6 +269,11 @@ class BlockPool:
                 consults a subset of blocks (e.g. SWA tail-window), so blocks
                 that can never serve a hit stay out of the prefix-cache hash
                 map.
+            draft_lookahead: For a drafter KV cache group whose hits are
+                verified by the following tokens, how many tokens past each
+                block to record in ``KVCacheBlock.draft_tail``; 0 records
+                nothing. The caller only caches blocks whose following
+                tokens are known.
         """
         if num_cached_blocks >= num_full_blocks:
             return
@@ -295,6 +314,10 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            if draft_lookahead and blk.block_hash == block_hash_with_group_id:
+                blk.draft_tail = draft_tail_of(
+                    request.all_token_ids, num_hash_tokens, draft_lookahead
+                )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 

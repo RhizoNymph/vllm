@@ -183,4 +183,16 @@ Features Index:
       - "POST /v1/steering/modules/register with kind: sae_delta | sae_full_reconstruction"
     depends_on: [activation_steering]
     doc: docs/features/sae_steering.md
+  draft_prefix_hit:
+    description: >
+      Prefix-cache hits for EAGLE / MTP drafter KV verified by the tokens the
+      drafter consumed past each cached block, instead of dropping the last
+      matched block (--draft-prefix-hit verify_next_tokens). Keeps whole
+      shared prefixes on hybrid attention + GDN / Mamba models.
+    entry_points:
+      - vllm/v1/core/kv_cache_coordinator.py (HybridKVCacheCoordinator.find_longest_cache_hit)
+      - vllm/v1/core/single_type_kv_cache_manager.py (FullAttentionManager.find_longest_cache_hit)
+      - "CacheConfig.draft_prefix_hit / --draft-prefix-hit"
+    depends_on: []
+    doc: docs/features/draft_prefix_hit.md
 ```
