@@ -156,6 +156,49 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
     NONE_HASH = BlockHash(hash_fn(_NONE_HASH_SEED))
 
 
+class DraftTail(NamedTuple):
+    """The tokens a drafter consumed past a cached block when it wrote the
+    block's last KV slots.
+
+    An EAGLE / MTP drafter's KV at position ``p`` is computed from the target
+    hidden state at ``p`` and the token at ``p + 1`` (multi-module MTP: up to
+    ``p + lookahead``). The last slots of a block ending at ``end`` therefore
+    depend on ``token_ids == all_token_ids[end:end + lookahead]`` of the
+    request that wrote them, which the block hash does not cover.
+    """
+
+    end: int
+    token_ids: tuple[int, ...]
+
+
+class DraftTailCheck(NamedTuple):
+    """Accepts a cached drafter block only if the requesting sequence has the
+    same tokens past the block as the request that wrote it (see
+    ``DraftTail``). Used instead of dropping the last matched block."""
+
+    token_ids: Sequence[int]
+    lookahead: int
+
+    def accepts(self, block: "KVCacheBlock", end: int) -> bool:
+        tail = block.draft_tail
+        return (
+            tail is not None
+            and tail.end == end
+            and len(tail.token_ids) == self.lookahead
+            and tuple(self.token_ids[end : end + self.lookahead]) == tail.token_ids
+        )
+
+
+def draft_tail_of(
+    token_ids: Sequence[int], end: int, lookahead: int
+) -> DraftTail | None:
+    """The ``DraftTail`` of a block ending at ``end``, or ``None`` while the
+    tokens past it are not all known yet."""
+    if end + lookahead > len(token_ids):
+        return None
+    return DraftTail(end, tuple(token_ids[end : end + lookahead]))
+
+
 @dataclass(slots=True)
 class KVCacheBlock:
     """KV-cache block metadata."""
@@ -178,6 +221,11 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+
+    # For drafter (EAGLE / MTP) KV cache groups whose prefix hits are verified
+    # by the following tokens: the tokens the drafter consumed past this block
+    # when it wrote the block's last slots. Cleared with the hash.
+    draft_tail: DraftTail | None = None
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -202,6 +250,7 @@ class KVCacheBlock:
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
         self._block_hash_num_tokens = None
+        self.draft_tail = None
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
