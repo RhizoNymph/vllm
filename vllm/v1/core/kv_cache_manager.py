@@ -130,6 +130,7 @@ class KVCacheManager:
         enable_caching: bool = True,
         use_eagle: bool = False,
         num_prefill_lookahead: int = 0,
+        verify_draft_tails: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
@@ -170,6 +171,7 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            verify_draft_tails=verify_draft_tails,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -295,7 +297,9 @@ class KVCacheManager:
 
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+                request.block_hashes,
+                max_cache_hit_length,
+                token_ids=request.all_token_ids,
             )
         )
 

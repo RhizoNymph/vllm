@@ -10,10 +10,12 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    DraftTailCheck,
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -82,6 +84,7 @@ class KVCacheCoordinator(ABC):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        verify_draft_tails: bool = False,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -94,6 +97,15 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
+        # Tokens past a block that a drafter's KV slots in that block depend
+        # on. With ``verify_draft_tails``, drafter full-attention hits are
+        # verified against them instead of dropping the last matched block
+        # (see ``DraftTailCheck``); 0 keeps the drop.
+        self.draft_lookahead = (
+            max(1, num_prefill_lookahead)
+            if verify_draft_tails and enable_caching and use_eagle
+            else 0
+        )
 
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
@@ -405,16 +417,35 @@ class KVCacheCoordinator(ABC):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        token_ids: Sequence[int] | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """Returns the per-group hit blocks, the hit length, and the number of
         ``num_uncached_common_prefix_tokens`` (a shared prefix that a
-        sparse-retention group has not cached yet; 0 unless hybrid)."""
+        sparse-retention group has not cached yet; 0 unless hybrid).
+        ``token_ids`` (the request's tokens) lets drafter groups verify their
+        hits (``verify_draft_tails``); without it they drop the last block."""
         pass
 
     def new_step_starts(self) -> None:
         """Notify each manager that a new step is starting."""
         for manager in self.single_type_managers:
             manager.new_step_starts()
+
+    def _enable_draft_tail_verification(self) -> None:
+        """Make drafter full-attention managers record the tokens past each
+        block they cache. Call once ``use_eagle`` is set on the managers."""
+        if not self.draft_lookahead:
+            return
+        for manager in self.single_type_managers:
+            if manager.use_eagle and isinstance(manager, FullAttentionManager):
+                manager.draft_lookahead = self.draft_lookahead
+
+    def _draft_tail_check(
+        self, token_ids: Sequence[int] | None
+    ) -> DraftTailCheck | None:
+        if not self.draft_lookahead or token_ids is None:
+            return None
+        return DraftTailCheck(token_ids, self.draft_lookahead)
 
 
 class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
@@ -438,6 +469,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        verify_draft_tails: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -452,6 +484,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            verify_draft_tails=verify_draft_tails,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -462,6 +495,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        token_ids: Sequence[int] | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(self.num_single_type_manager)
@@ -490,6 +524,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        verify_draft_tails: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -504,6 +539,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            verify_draft_tails=verify_draft_tails,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -521,12 +557,19 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         )
         # Single group; useless but just set ``use_eagle`` for consistency regardless.
         self.single_type_managers[0].use_eagle = 0 in self.eagle_group_ids
+        self._enable_draft_tail_verification()
 
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        token_ids: Sequence[int] | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
+        tail_check = (
+            self._draft_tail_check(token_ids)
+            if isinstance(self.single_type_managers[0], FullAttentionManager)
+            else None
+        )
         hit_blocks, hit_length = self.single_type_managers[0].find_longest_cache_hit(
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
@@ -537,6 +580,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             alignment_tokens=self.block_size,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
+            **({"draft_tail_check": tail_check} if tail_check is not None else {}),
         )
         # Single group: nothing "uncached common" -- no other group to lag it.
         return hit_blocks, hit_length, 0
@@ -577,6 +621,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        verify_draft_tails: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -591,6 +636,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            verify_draft_tails=verify_draft_tails,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -711,6 +757,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.use_eagle:
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
+        self._enable_draft_tail_verification()
 
     def _align_cacheable(self, num_tokens: int) -> int:
         """Largest prefix of ``num_tokens`` a future cache hit could match.
@@ -758,6 +805,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        token_ids: Sequence[int] | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
@@ -795,6 +843,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # ``curr_hit_length``. Each eagle group applies the drop at most once
         # per candidate length (see issue #32802).
         eagle_verified: set[int] = set()
+        draft_tail_check = self._draft_tail_check(token_ids)
 
         while True:
             curr_hit_length = hit_length
@@ -817,6 +866,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     continue
 
                 drop_eagle_block = use_eagle and idx not in eagle_verified
+                # Full-attention drafter groups verify each matched block's
+                # drafter tail instead of matching one extra block and
+                # dropping it.
+                tail_check = (
+                    draft_tail_check
+                    if drop_eagle_block
+                    and isinstance(spec, FullAttentionSpec)
+                    and issubclass(manager_cls, FullAttentionManager)
+                    else None
+                )
 
                 _max_length = curr_hit_length
                 # Eagle matches one extra drop unit (one hash unit for
@@ -824,7 +883,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 # it, landing back at the candidate length. No margin for
                 # mamba: its finder never drops (draft models have no mamba
                 # layers), so the hit would grow past the candidate.
-                if drop_eagle_block and not isinstance(spec, MambaSpec):
+                if (
+                    drop_eagle_block
+                    and tail_check is None
+                    and not isinstance(spec, MambaSpec)
+                ):
                     eagle_margin = (
                         self.hash_block_size
                         if self.enable_partial_hash_hits
@@ -847,6 +910,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         self.dcp_world_size
                         if isinstance(spec, FullAttentionSpec)
                         else 1
+                    ),
+                    **(
+                        {"draft_tail_check": tail_check}
+                        if tail_check is not None
+                        else {}
                     ),
                 )
                 if drop_eagle_block:
@@ -933,6 +1001,7 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
+    verify_draft_tails: bool = False,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -947,6 +1016,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            verify_draft_tails=verify_draft_tails,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -962,6 +1032,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            verify_draft_tails=verify_draft_tails,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -976,4 +1047,5 @@ def get_kv_cache_coordinator(
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
         num_prefill_lookahead=num_prefill_lookahead,
+        verify_draft_tails=verify_draft_tails,
     )

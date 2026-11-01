@@ -273,6 +273,11 @@ class Scheduler(SchedulerInterface):
         # manager's re-prefillable window (this minus 1), and how many tokens to
         # reserve between a chunk boundary and the prefill end.
         self.num_prefill_lookahead = 0
+        # Drafter prefix hits verified by the tokens past each block instead
+        # of dropping the last matched block (CacheConfig.draft_prefix_hit).
+        self.verify_draft_tails = (
+            self.cache_config.draft_prefix_hit == "verify_next_tokens"
+        )
         self.dynamic_sd_lookup: list[int] | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
@@ -300,6 +305,7 @@ class Scheduler(SchedulerInterface):
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
             num_prefill_lookahead=self.num_prefill_lookahead,
+            verify_draft_tails=self.verify_draft_tails,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,

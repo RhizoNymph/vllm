@@ -52,6 +52,9 @@ PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
+DraftPrefixHit = Literal["drop_last_block", "verify_next_tokens"]
+
+
 @config
 class CacheConfig:
     """Configuration for the KV cache."""
@@ -77,6 +80,23 @@ class CacheConfig:
 
     This equals to the `hash_block_size` used throughout the KV cache code.
     """
+    draft_prefix_hit: DraftPrefixHit = "drop_last_block"
+    """How prefix-cache hits handle the KV cache of an EAGLE / MTP drafter.
+
+    A drafter's KV at position `p` is computed from the token at `p + 1`
+    (multi-module MTP: up to `p + num_speculative_tokens`), which the block
+    hash of the block holding `p` does not cover.
+
+    - "drop_last_block": a hit must match one block past its end, which is
+      then dropped and recomputed. On hybrid models whose recurrent (Mamba /
+      GDN) state can only resume at block boundaries this loses a whole
+      block of every shared prefix.
+
+    - "verify_next_tokens": each cached drafter block records the tokens past
+      it that its last KV slots were computed from, and a block is a hit only
+      if the request has the same tokens there. Nothing is dropped and every
+      reused drafter slot is exact. Partial (sub-block) hits are not taken for
+      drafter groups in this mode."""
     gpu_memory_utilization: float = Field(default=0.92, gt=0, le=1)
     """The fraction of GPU memory to be used for the model executor, which can
     range from 0 to 1. For example, a value of 0.5 would imply 50% GPU memory
@@ -241,6 +261,7 @@ class CacheConfig:
             "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
+            "draft_prefix_hit",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",
