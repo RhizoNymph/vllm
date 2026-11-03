@@ -2536,27 +2536,24 @@ class GPUModelRunner(
             # Iterate over the dictionary rather than all requests since not all
             # requests have draft tokens.
             num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
-            # For chunked prefills, use -1 as mask rather than 0, as guided
-            # decoding may rollback speculative tokens.
-            num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
             for (
                 req_id,
                 draft_token_ids,
             ) in scheduler_output.scheduled_spec_decode_tokens.items():
                 req_idx = self.input_batch.req_id_to_index[req_id]
-                draft_len = len(draft_token_ids)
-                num_draft_tokens[req_idx] = draft_len
-                if num_scheduled_tokens[req_idx] == draft_len + 1:
-                    num_decode_draft_tokens[req_idx] = draft_len
+                num_draft_tokens[req_idx] = len(draft_token_ids)
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens
             )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
-            # For DECODE only cuda graph of some attention backends (e.g., GDN).
-            self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
-            self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
-            self.num_decode_draft_tokens.copy_to_gpu()
+
+        if self.speculative_config is not None:
+            # Staged on every step, including steps where no request has a
+            # draft (see _stage_num_decode_draft_tokens).
+            self._stage_num_decode_draft_tokens(
+                scheduler_output, num_scheduled_tokens, num_reqs
+            )
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -2573,6 +2570,40 @@ class GPUModelRunner(
             spec_decode_metadata,
             int(num_sampled_tokens.max()),
         )
+
+    def _stage_num_decode_draft_tokens(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+        num_reqs: int,
+    ) -> None:
+        """Mark the decode rows for the linear-attention spec-decode path.
+
+        A row is a decode row when it schedules exactly one token past its
+        drafts and its whole prompt is already computed. Its entry is its draft
+        count, which may be 0: a decode with no draft this step (n-gram found
+        no match) still has to read its recurrent and conv state at the slot
+        the previous verification step accepted, and only the spec-decode path
+        does that. Every other row gets -1 (prefill chunks; -1 rather than 0
+        because guided decoding may roll back speculative tokens).
+        """
+        num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
+        is_decode = (num_scheduled_tokens[:num_reqs] == 1) & (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            >= self.input_batch.num_prompt_tokens[:num_reqs]
+        )
+        num_decode_draft_tokens[is_decode] = 0
+        for (
+            req_id,
+            draft_token_ids,
+        ) in scheduler_output.scheduled_spec_decode_tokens.items():
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            draft_len = len(draft_token_ids)
+            if num_scheduled_tokens[req_idx] == draft_len + 1:
+                num_decode_draft_tokens[req_idx] = draft_len
+        self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
+        self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+        self.num_decode_draft_tokens.copy_to_gpu()
 
     def _build_attention_metadata(
         self,
@@ -4736,7 +4767,10 @@ class GPUModelRunner(
                         self.mamba_state_idx,
                     )
 
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            # Linear-attention builders need the spec-decode inputs whenever
+            # speculation is on, drafts or not (see
+            # _stage_num_decode_draft_tokens).
+            use_spec_decode = self.speculative_config is not None
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(

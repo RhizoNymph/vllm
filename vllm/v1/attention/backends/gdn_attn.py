@@ -228,13 +228,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        # Every decode row (entry >= 0) takes the spec path, also when no row
+        # has a draft this step: after a verification step a row's recurrent
+        # and conv state sits at the accepted slot (num_accepted_tokens - 1),
+        # which the non-spec decode path does not read.
         if (
             not self.use_spec_decode
             or num_decode_draft_tokens_cpu is None
-            or num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
-            .sum()
-            .item()
-            == 0
+            or not bool((num_decode_draft_tokens_cpu >= 0).any())
         ):
             spec_sequence_masks = None
             num_spec_decodes = 0
