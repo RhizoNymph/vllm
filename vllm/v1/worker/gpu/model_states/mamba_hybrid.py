@@ -254,16 +254,19 @@ class MambaHybridModelState(DefaultModelState):
             # need the -1 sentinel rather than a raw zero draft count.
             num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
-            if num_draft_tokens_per_req is not None:
-                # A row is a spec-decode row only when its whole prompt is already
-                # computed, i.e. exactly one non-draft (decode) token is scheduled.
-                is_decode = (
-                    input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
-                )
-                spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
-                num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
-                    spec_decode_mask, num_draft_tokens_per_req, -1
-                )
+            if num_draft_tokens_per_req is None:
+                num_draft_tokens_per_req = np.zeros(input_batch.num_reqs, np.int32)
+            # A row is a spec-decode row when its whole prompt is already
+            # computed and exactly one non-draft (decode) token is scheduled.
+            # That includes decodes with no draft this step: their recurrent
+            # and conv state sits at the slot the previous verification step
+            # accepted, which only the spec-decode path reads.
+            spec_decode_mask = (
+                input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
+            ) & ~input_batch.is_prefilling_np
+            num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
+                spec_decode_mask, num_draft_tokens_per_req, -1
+            )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         mamba_attn_metadata = MambaHybridAttnMetadata(

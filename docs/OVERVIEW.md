@@ -195,4 +195,16 @@ Features Index:
       - "CacheConfig.draft_prefix_hit / --draft-prefix-hit"
     depends_on: []
     doc: docs/features/draft_prefix_hit.md
+  gdn_spec_zero_draft_decode:
+    description: >
+      Speculative decoding on hybrid GDN / Mamba models: decodes that get no
+      draft this step (n-gram without a match) still run the linear-attention
+      spec-decode path, so they resume from the state slot the previous
+      verification step accepted instead of slot 0.
+    entry_points:
+      - vllm/v1/worker/gpu_model_runner.py (GPUModelRunner._stage_num_decode_draft_tokens)
+      - vllm/v1/attention/backends/gdn_attn.py (GDNAttentionMetadataBuilder.build)
+      - vllm/v1/worker/gpu/model_states/mamba_hybrid.py (MambaHybridModelState.prepare_attn)
+    depends_on: []
+    doc: docs/features/gdn_spec_zero_draft_decode.md
 ```

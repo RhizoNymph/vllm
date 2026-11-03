@@ -119,6 +119,39 @@ GDN_BUILD_TEST_CASES = {
         expected_num_prefill_tokens=1,
         expected_num_spec_decodes=1,
     ),
+    # Decodes with no draft this step (n-gram found no match) still read
+    # their state at the accepted slot, so they stay on the spec path even
+    # when no row in the batch has a draft.
+    "zero_draft_decodes_only": GDNBuildTestCase(
+        seq_lens=[40, 30],
+        query_lens=[1, 1],
+        num_decode_draft_tokens=[0, 0],
+        num_speculative_tokens=3,
+        expected_num_decodes=0,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=2,
+    ),
+    "zero_draft_decode_with_spec_decode": GDNBuildTestCase(
+        seq_lens=[40, 20],
+        query_lens=[1, 4],
+        num_decode_draft_tokens=[0, 3],
+        num_speculative_tokens=3,
+        expected_num_decodes=0,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=2,
+    ),
+    "zero_draft_decode_with_prefill": GDNBuildTestCase(
+        seq_lens=[100, 40],
+        query_lens=[50, 1],
+        num_decode_draft_tokens=[-1, 0],
+        num_speculative_tokens=3,
+        expected_num_decodes=0,
+        expected_num_prefills=1,
+        expected_num_prefill_tokens=50,
+        expected_num_spec_decodes=1,
+    ),
 }
 
 
@@ -221,3 +254,26 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_zero_draft_decodes_keep_accepted_slot():
+    """A batch of decodes without drafts must still hand the kernels the
+    per-row accepted counts, so each row reads the state slot its previous
+    verification step accepted instead of slot 0."""
+    builder = _create_gdn_builder(num_speculative_tokens=3)
+    batch = BatchSpec(seq_lens=[40, 30], query_lens=[1, 1])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    num_accepted = torch.tensor([3, 1], dtype=torch.int32, device=DEVICE)
+    meta = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_decode_draft_tokens_cpu=torch.tensor([0, 0], dtype=torch.int32),
+        num_accepted_tokens=num_accepted,
+    )
+
+    assert meta.spec_sequence_masks is not None
+    assert meta.num_accepted_tokens is not None
+    assert meta.num_accepted_tokens.tolist() == [3, 1]
+    assert meta.spec_state_indices_tensor is not None
+    assert meta.spec_state_indices_tensor.shape == (2, 4)
+    assert meta.non_spec_state_indices_tensor is None
