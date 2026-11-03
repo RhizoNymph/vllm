@@ -4214,18 +4214,47 @@ class GPUModelRunner(
         num_tokens: int,
         num_reqs: int,
         force_uniform_decode: bool | None = None,
+        num_spec_decode_reqs: int | None = None,
     ) -> bool:
         """
         Checks if it's a decode batch with same amount scheduled tokens
         across all requests.
+
+        ``num_spec_decode_reqs`` (spec decoding only) counts the requests that
+        verify a full set of drafts this step. A prompt chunk that happens to
+        have ``uniform_decode_query_len`` tokens has the decode shape but is
+        not a decode, so the batch is uniform only if every request is one of
+        those.
         """
+        if force_uniform_decode is not None:
+            return force_uniform_decode
         return (
-            (
-                (max_num_scheduled_tokens == uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+            max_num_scheduled_tokens == uniform_decode_query_len
+            and num_tokens == max_num_scheduled_tokens * num_reqs
+            and (num_spec_decode_reqs is None or num_spec_decode_reqs == num_reqs)
+        )
+
+    def _count_full_spec_decode_reqs(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> int | None:
+        """Requests verifying ``num_spec_tokens`` drafts this step, or None
+        without speculative decoding.
+
+        A FULL cudagraph captured for uniform decode runs the linear-attention
+        (GDN) spec-decode path off its persistent metadata buffers, which the
+        builder only refreshes for decode-only batches. A batch that mixes in a
+        prompt chunk of the decode length must therefore not replay it.
+        """
+        if self.uniform_decode_query_len <= 1:
+            return None
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        return sum(
+            1
+            for req_id, draft_token_ids in (
+                scheduler_output.scheduled_spec_decode_tokens.items()
             )
-            if force_uniform_decode is None
-            else force_uniform_decode
+            if len(draft_token_ids) + 1 == self.uniform_decode_query_len
+            and num_scheduled[req_id] == self.uniform_decode_query_len
         )
 
     def _allow_microbatching(
@@ -4288,6 +4317,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        num_spec_decode_reqs: int | None = None,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -4301,6 +4331,7 @@ class GPUModelRunner(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
+            num_spec_decode_reqs=num_spec_decode_reqs,
         )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
@@ -4649,6 +4680,9 @@ class GPUModelRunner(
                 force_eager=capture_pending,
                 allow_microbatching=self._allow_microbatching(
                     num_reqs, num_scheduled_tokens_np
+                ),
+                num_spec_decode_reqs=self._count_full_spec_decode_reqs(
+                    scheduler_output
                 ),
             )
 
