@@ -195,4 +195,15 @@ Features Index:
       - "CacheConfig.draft_prefix_hit / --draft-prefix-hit"
     depends_on: []
     doc: docs/features/draft_prefix_hit.md
+  spec_uniform_decode_cudagraph:
+    description: >
+      With speculative decoding, only batches whose every row verifies a full
+      set of drafts replay the uniform-decode FULL cudagraph; a prompt chunk
+      of the decode length (e.g. a --prefix-match-unit tail chunk) falls back
+      to the mixed path, since the GDN builder's persistent buffers are only
+      refreshed for decode-only batches.
+    entry_points:
+      - vllm/v1/worker/gpu_model_runner.py (GPUModelRunner._is_uniform_decode, _count_full_spec_decode_reqs)
+    depends_on: []
+    doc: docs/features/spec_uniform_decode_cudagraph.md
 ```
