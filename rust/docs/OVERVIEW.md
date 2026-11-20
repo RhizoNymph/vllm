@@ -21,13 +21,14 @@ data_flow: |
   back up to the response DTOs.
 
   Backend file resolution: the frontend loads the tokenizer + config + chat
-  template from `--model` by default. `--tokenizer <path>` overrides only the
-  frontend's resolution source (LoadModelBackendsOptions.tokenizer →
-  ResolvedModelFiles::new), so the public model id / engine model can differ from
-  where the frontend reads its tokenizer. This decouples the two for formats
-  without a loadable `tokenizer.json` (e.g. a GGUF model whose tokenizer the Rust
-  `tokenizers` crate cannot extract, unlike the Python engine which reads it from
-  the GGUF metadata).
+  template from `--model` by default. Upstream's `--tokenizer` /
+  `--tokenizer-revision` (tokenizer files and chat template) and
+  `--hf-config-path` (`config.json` / `generation_config.json`) override those
+  sources (ModelArgs::file_sources → ModelFileSources → ResolvedModelFiles::from_sources)
+  and are also forwarded to the managed Python engine. This supersedes the fork's
+  earlier frontend-only `--tokenizer`, which resolved every backend file from the
+  tokenizer path: for a GGUF model whose tokenizer the Rust `tokenizers` crate
+  cannot extract, pass both `--tokenizer <dir>` and `--hf-config-path <dir>`.
 
 # Features Index
 

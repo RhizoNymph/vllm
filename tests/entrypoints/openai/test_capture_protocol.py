@@ -36,7 +36,7 @@ from vllm.entrypoints.openai.completion.protocol import (
     CompletionResponseChoice,
     CompletionStreamResponse,
 )
-from vllm.entrypoints.openai.engine.protocol import UsageInfo
+from vllm.entrypoints.serve.engine.protocol import UsageInfo
 from vllm.v1.capture import (
     CaptureConsumer,
     CaptureContext,

@@ -218,7 +218,6 @@ def _model_output(scheduler_output):
     req_ids = list(scheduler_output.num_scheduled_tokens.keys())
     return ModelRunnerOutput(
         req_ids=req_ids,
-        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
         sampled_token_ids=[[EOS] for _ in req_ids],
         logprobs=None,
         prompt_logprobs_dict={},

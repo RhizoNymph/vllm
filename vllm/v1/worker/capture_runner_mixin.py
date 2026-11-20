@@ -323,7 +323,13 @@ class CaptureRunnerMixin:
     # reach capture consumers: their activations are garbage, and a consumer
     # acting on them (e.g. a steering policy) mutates state before the first
     # real request.
-    _WARMUP_REQ_PREFIXES = ("_warmup", "_v2_mixed_warmup")
+    _WARMUP_REQ_PREFIXES = (
+        "_warmup",
+        "_v2_mixed_warmup",
+        "_context_warmup",
+        "_sparse_mla_v2_warmup",
+        "_step5_dsa_warmup",
+    )
 
     def _capture_add_request(
         self, new_req_data: NewRequestData, was_present: bool

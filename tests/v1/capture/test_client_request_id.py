@@ -74,6 +74,7 @@ def _engine_core_request(request_id: str, external_req_id: str | None):
         abort_immediately=False,
         request_metadata=None,
         session_id=None,
+        kv_hints=None,
     )
 
 
@@ -132,14 +133,18 @@ def test_request_external_req_id_defaults_none() -> None:
 
 def test_new_request_data_carries_client_request_id() -> None:
     req = _make_request("client-7-ab12cd34", external_req_id="client-7")
-    nrd = NewRequestData.from_request(req, block_ids=([],))
+    nrd = NewRequestData.from_request(
+        req, block_ids=([],), prefill_token_ids=req.prefill_token_ids
+    )
     assert nrd.req_id == "client-7-ab12cd34"
     assert nrd.client_request_id == "client-7"
 
 
 def test_new_request_data_client_id_none_safe() -> None:
     req = _make_request("internal-only", external_req_id=None)
-    nrd = NewRequestData.from_request(req, block_ids=([],))
+    nrd = NewRequestData.from_request(
+        req, block_ids=([],), prefill_token_ids=req.prefill_token_ids
+    )
     assert nrd.client_request_id is None
 
 
@@ -147,7 +152,9 @@ def test_new_request_data_client_id_equals_internal_when_randomization_off() -> 
     # With VLLM_DISABLE_REQUEST_ID_RANDOMIZATION the internal id is not
     # suffixed, so external == internal.
     req = _make_request("client-7", external_req_id="client-7")
-    nrd = NewRequestData.from_request(req, block_ids=([],))
+    nrd = NewRequestData.from_request(
+        req, block_ids=([],), prefill_token_ids=req.prefill_token_ids
+    )
     assert nrd.client_request_id == nrd.req_id == "client-7"
 
 
@@ -158,7 +165,9 @@ def test_new_request_data_client_id_equals_internal_when_randomization_off() -> 
 
 def test_capture_sidecar_contains_client_request_id() -> None:
     req = _make_request("client-9-ffeedd00", external_req_id="client-9")
-    nrd = NewRequestData.from_request(req, block_ids=([],))
+    nrd = NewRequestData.from_request(
+        req, block_ids=([],), prefill_token_ids=req.prefill_token_ids
+    )
     sidecar = _capture_sidecar_fields(nrd)
     assert sidecar["client_request_id"] == "client-9"
     assert sidecar["vllm_internal_request_id"] == "client-9-ffeedd00"
@@ -166,7 +175,9 @@ def test_capture_sidecar_contains_client_request_id() -> None:
 
 def test_capture_sidecar_client_id_falls_back_to_internal() -> None:
     req = _make_request("internal-only", external_req_id=None)
-    nrd = NewRequestData.from_request(req, block_ids=([],))
+    nrd = NewRequestData.from_request(
+        req, block_ids=([],), prefill_token_ids=req.prefill_token_ids
+    )
     sidecar = _capture_sidecar_fields(nrd)
     # None-safe: falls back to the internal id so attribution always works.
     assert sidecar["client_request_id"] == "internal-only"
@@ -178,8 +189,8 @@ def test_capture_sidecar_client_id_falls_back_to_internal() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. v1 runner `_register_capture_request` builds the client id into the
-#    sidecar (parity with the v2 capture-runner mixin)
+# 5. The runner's `_register_capture_request` builds the client id into the
+#    sidecar
 # ---------------------------------------------------------------------------
 
 
@@ -209,7 +220,7 @@ class _RecordingManager:
         pass
 
 
-def _fake_v1_runner(mgr: _RecordingManager):
+def _fake_runner(mgr: _RecordingManager):
     from types import SimpleNamespace
 
     parallel_config = SimpleNamespace(
@@ -232,29 +243,35 @@ def _fake_v1_runner(mgr: _RecordingManager):
     )
 
 
-def _drive_v1_register(nrd: NewRequestData) -> dict:
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+def _drive_runner_register(nrd: NewRequestData) -> dict:
+    # ``_register_capture_request`` lives on the shared capture mixin, which
+    # the v2 runner inherits.
+    from vllm.v1.worker.gpu.capture_runner_mixin import CaptureRunnerMixin
 
     mgr = _RecordingManager()
-    runner = _fake_v1_runner(mgr)
-    GPUModelRunner._register_capture_request(runner, nrd)
+    runner = _fake_runner(mgr)
+    CaptureRunnerMixin._register_capture_request(runner, nrd)
     assert not mgr.errors, mgr.errors
     assert nrd.req_id in mgr.registered
     return mgr.registered[nrd.req_id]
 
 
-def test_v1_register_capture_request_carries_client_request_id() -> None:
+def test_register_capture_request_carries_client_request_id() -> None:
     req = _make_request("client-9-ffeedd00", external_req_id="client-9")
-    nrd = NewRequestData.from_request(req, block_ids=([],))
-    sidecar = _drive_v1_register(nrd)
+    nrd = NewRequestData.from_request(
+        req, block_ids=([],), prefill_token_ids=req.prefill_token_ids
+    )
+    sidecar = _drive_runner_register(nrd)
     assert sidecar["client_request_id"] == "client-9"
     assert sidecar["vllm_internal_request_id"] == "client-9-ffeedd00"
 
 
-def test_v1_register_capture_request_client_id_falls_back_to_internal() -> None:
+def test_register_capture_request_client_id_falls_back_to_internal() -> None:
     req = _make_request("internal-only", external_req_id=None)
-    nrd = NewRequestData.from_request(req, block_ids=([],))
-    sidecar = _drive_v1_register(nrd)
+    nrd = NewRequestData.from_request(
+        req, block_ids=([],), prefill_token_ids=req.prefill_token_ids
+    )
+    sidecar = _drive_runner_register(nrd)
     # None-safe: falls back to the internal id so attribution always works.
     assert sidecar["client_request_id"] == "internal-only"
 
@@ -283,7 +300,9 @@ def test_filesystem_json_includes_client_request_id(tmp_path: pathlib.Path) -> N
 
     # Drive registration with the sidecar the runner mixin would build.
     req = _make_request(internal_id, external_req_id=client_id)
-    nrd = NewRequestData.from_request(req, block_ids=([],))
+    nrd = NewRequestData.from_request(
+        req, block_ids=([],), prefill_token_ids=req.prefill_token_ids
+    )
     sidecar_fields = _capture_sidecar_fields(nrd)
 
     mgr.register_request(

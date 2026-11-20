@@ -214,19 +214,7 @@ _OPT_OVERRIDES = {
     "activation_function": "relu",
 }
 
-_GPT_NEOX_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "hidden_act": "gelu",
-    "intermediate_size": 1024,
-    "layer_norm_eps": 1e-5,
-    "use_parallel_residual": True,
-}
 
-_PHI_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "hidden_act": "gelu_new",
-    "tie_word_embeddings": False,
-}
 
 _PERSIMMON_OVERRIDES = {
     **_SMALL_DECODER_OVERRIDES,
@@ -241,13 +229,6 @@ _STARCODER2_OVERRIDES = {
     "use_bias": True,
 }
 
-_JAIS2_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "hidden_act": "relu2",
-    "layer_norm_eps": 1e-5,
-    "attention_bias": False,
-    "mlp_bias": False,
-}
 
 _OLMO_OVERRIDES = {
     **_SMALL_DECODER_OVERRIDES,
@@ -262,31 +243,8 @@ _FALCON_OVERRIDES = {
     "bias": False,
 }
 
-_ARCTIC_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "num_local_experts": 2,
-    "num_experts_per_tok": 2,
-    "moe_layer_frequency": 1,
-    "use_residual": True,
-    "parallel_attn_mlp_res": True,
-    "enable_expert_tensor_parallelism": False,
-}
 
-_FLEX_OLMO_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "num_experts": 2,
-    "num_experts_per_tok": 2,
-}
 
-_HUNYUAN_DENSE_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "head_dim": 64,
-    "attention_head_dim": 64,
-    "use_cla": False,
-    "cla_share_factor": 1,
-    "use_qk_norm": True,
-    "mlp_bias": False,
-}
 
 
 def _mimo_v2_flash_overrides(config):
@@ -350,22 +308,10 @@ PHASE1_DISCOVERY_CASES = [
         id="qwen3-next",
     ),
     pytest.param(
-        "Qwen/Qwen1.5-MoE-A2.7B-Chat",
-        _QWEN_MOE_OVERRIDES,
-        {"enforce_eager": True},
-        id="qwen2-moe",
-    ),
-    pytest.param(
         "Qwen/Qwen3-30B-A3B",
         _QWEN_MOE_OVERRIDES,
         {"enforce_eager": True},
         id="qwen3-moe",
-    ),
-    pytest.param(
-        "ByteDance-Seed/Seed-OSS-36B-Instruct",
-        _SMALL_DECODER_OVERRIDES,
-        {"enforce_eager": True},
-        id="seed-oss",
     ),
     pytest.param(
         "IQuestLab/IQuest-Coder-V1-40B-Loop-Instruct",
@@ -384,22 +330,10 @@ PHASE1_GENERATION_CASES = [
         id="qwen3-next",
     ),
     pytest.param(
-        "Qwen/Qwen1.5-MoE-A2.7B-Chat",
-        _QWEN_MOE_OVERRIDES,
-        {"enforce_eager": True},
-        id="qwen2-moe",
-    ),
-    pytest.param(
         "Qwen/Qwen3-30B-A3B",
         _QWEN_MOE_OVERRIDES,
         {"enforce_eager": True},
         id="qwen3-moe",
-    ),
-    pytest.param(
-        "ByteDance-Seed/Seed-OSS-36B-Instruct",
-        _SMALL_DECODER_OVERRIDES,
-        {"enforce_eager": True},
-        id="seed-oss",
     ),
     pytest.param(
         "IQuestLab/IQuest-Coder-V1-40B-Loop-Instruct",
@@ -435,22 +369,10 @@ PHASE2_DISCOVERY_CASES = [
         id="solar",
     ),
     pytest.param(
-        "stabilityai/stablelm-3b-4e1t",
-        _SMALL_DECODER_OVERRIDES,
-        _EAGER_ONLY,
-        id="stablelm",
-    ),
-    pytest.param(
         "nvidia/Minitron-8B-Base",
         _SMALL_DECODER_OVERRIDES,
         _EAGER_ONLY,
         id="nemotron",
-    ),
-    pytest.param(
-        "arcee-ai/AFM-4.5B-Base",
-        _SMALL_DECODER_OVERRIDES,
-        _EAGER_ONLY,
-        id="arcee",
     ),
     pytest.param(
         "naver-hyperclovax/HyperCLOVAX-SEED-Think-14B",
@@ -636,18 +558,6 @@ PHASE5_DISCOVERY_CASES = [
         id="opt",
     ),
     pytest.param(
-        "EleutherAI/pythia-70m",
-        _GPT_NEOX_OVERRIDES,
-        _EAGER_ONLY,
-        id="gpt-neox",
-    ),
-    pytest.param(
-        "microsoft/phi-2",
-        _PHI_OVERRIDES,
-        _EAGER_ONLY,
-        id="phi",
-    ),
-    pytest.param(
         "adept/persimmon-8b-chat",
         _PERSIMMON_OVERRIDES,
         _EAGER_ONLY,
@@ -658,12 +568,6 @@ PHASE5_DISCOVERY_CASES = [
         _STARCODER2_OVERRIDES,
         _EAGER_ONLY,
         id="starcoder2",
-    ),
-    pytest.param(
-        "inceptionai/Jais-2-8B-Chat",
-        _JAIS2_OVERRIDES,
-        _EAGER_ONLY,
-        id="jais2",
     ),
     pytest.param(
         "allenai/OLMo-1B-hf",
@@ -715,32 +619,11 @@ PHASE5_GENERATION_CASES = [
         id="opt",
     ),
     pytest.param(
-        "EleutherAI/pythia-70m",
-        _GPT_NEOX_OVERRIDES,
-        _EAGER_ONLY,
-        500.0,
-        id="gpt-neox",
-    ),
-    pytest.param(
-        "microsoft/phi-2",
-        _PHI_OVERRIDES,
-        _EAGER_ONLY,
-        500.0,
-        id="phi",
-    ),
-    pytest.param(
         "bigcode/starcoder2-3b",
         _STARCODER2_OVERRIDES,
         _EAGER_ONLY,
         500.0,
         id="starcoder2",
-    ),
-    pytest.param(
-        "inceptionai/Jais-2-8B-Chat",
-        _JAIS2_OVERRIDES,
-        _EAGER_ONLY,
-        500.0,
-        id="jais2",
     ),
     pytest.param(
         "allenai/OLMo-2-0425-1B",
@@ -759,21 +642,6 @@ PHASE5_GENERATION_CASES = [
 ]
 
 PHASE6_DISCOVERY_CASES = [
-    # arctic is steering-wired but cannot be loaded under torch >= 2.9 because
-    # ``arctic.local_moe_fused`` passes ``inplace=True`` to ``fused_experts``
-    # unconditionally. Re-enable once that pre-existing issue is fixed.
-    pytest.param(
-        "allenai/Flex-reddit-2x7B-1T",
-        _FLEX_OLMO_OVERRIDES,
-        _EAGER_ONLY,
-        id="flex-olmo",
-    ),
-    pytest.param(
-        "tencent/Hunyuan-7B-Instruct",
-        _HUNYUAN_DENSE_OVERRIDES,
-        _EAGER_ONLY,
-        id="hunyuan-dense",
-    ),
     pytest.param(
         "XiaomiMiMo/MiMo-V2-Flash",
         _mimo_v2_flash_overrides,
@@ -789,21 +657,6 @@ PHASE6_DISCOVERY_CASES = [
 ]
 
 PHASE6_GENERATION_CASES = [
-    # arctic skipped — see PHASE6_DISCOVERY_CASES comment above.
-    pytest.param(
-        "allenai/Flex-reddit-2x7B-1T",
-        _FLEX_OLMO_OVERRIDES,
-        _EAGER_ONLY,
-        500.0,
-        id="flex-olmo",
-    ),
-    pytest.param(
-        "tencent/Hunyuan-7B-Instruct",
-        _HUNYUAN_DENSE_OVERRIDES,
-        _EAGER_ONLY,
-        500.0,
-        id="hunyuan-dense",
-    ),
     pytest.param(
         "XiaomiMiMo/MiMo-V2-Flash",
         _mimo_v2_flash_overrides,
@@ -982,8 +835,8 @@ def test_steering_layers_discovered_small_decoder_family(
     hf_overrides: dict | None,
     extra_runner_kwargs: dict | None,
 ) -> None:
-    """Small decoder families (baichuan, internlm2, orion, solar, stablelm,
-    nemotron, arcee, hyperclovax, glm4, grok1, commandr, openpangu) should
+    """Small decoder families (baichuan, internlm2, orion, solar, nemotron,
+    hyperclovax, glm4, grok1, commandr, openpangu) should
     expose steerable layers."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
@@ -1063,67 +916,6 @@ def test_steering_changes_output_small_decoder_family(
             ), f"Clearing steering should restore baseline logprob for {model}"
 
 
-def test_stablelm_steering_changes_output_real_weights(
-    vllm_runner, monkeypatch
-) -> None:
-    """StableLM needs a real checkpoint to produce a meaningful steering signal."""
-    model = "stabilityai/stablelm-3b-4e1t"
-    model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
-    model_info.check_available_online(on_fail="skip")
-
-    with monkeypatch.context() as m:
-        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
-        prompt = "What does the fox say? " * 32
-        sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=5)
-
-        with vllm_runner(
-            model,
-            max_model_len=256,
-            enable_steering=True,
-            max_steering_configs=4,
-            enable_prefix_caching=True,
-            enforce_eager=True,
-        ) as llm:
-            baseline_tokens, baseline_logprob = _gen_tokens_and_cumulative_logprob(
-                llm, prompt, sampling
-            )
-
-            assert llm.llm.reset_prefix_cache()
-
-            target_layer, hidden_size = _discover_layers(llm)
-
-            vec = [500.0] * hidden_size
-            llm.llm.collective_rpc(
-                "set_steering_vectors",
-                kwargs={"vectors": {_HP: {target_layer: vec}}},
-            )
-
-            steered_tokens, steered_logprob = _gen_tokens_and_cumulative_logprob(
-                llm, prompt, sampling
-            )
-
-            assert steered_tokens != baseline_tokens or not math.isclose(
-                steered_logprob,
-                baseline_logprob,
-                rel_tol=0.0,
-                abs_tol=1e-6,
-            ), "Steering should change output or logprob for StableLM"
-
-            llm.llm.collective_rpc("clear_steering_vectors")
-            assert llm.llm.reset_prefix_cache()
-
-            restored_tokens, restored_logprob = _gen_tokens_and_cumulative_logprob(
-                llm, prompt, sampling
-            )
-
-            assert restored_tokens == baseline_tokens
-            assert math.isclose(
-                restored_logprob,
-                baseline_logprob,
-                rel_tol=0.0,
-                abs_tol=1e-6,
-            )
 
 
 @pytest.mark.parametrize(
@@ -1705,8 +1497,8 @@ def test_steering_layers_discovered_legacy_decoder_family(
     hf_overrides: dict | None,
     extra_runner_kwargs: dict | None,
 ) -> None:
-    """Legacy decoder families (exaone, granite, opt, gpt-neox, phi,
-    persimmon, starcoder2, jais2, olmo, olmo2, falcon) should expose
+    """Legacy decoder families (exaone, granite, opt, persimmon, starcoder2,
+    olmo, olmo2, falcon) should expose
     steerable layers."""
     try:
         model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
@@ -1816,8 +1608,7 @@ def test_steering_layers_discovered_new_decoder_family(
     hf_overrides: dict | None,
     extra_runner_kwargs: dict | None,
 ) -> None:
-    """Newly-wired decoder families (arctic, flex_olmo, hunyuan_v1,
-    mimo_v2_flash, param2moe) should expose steerable layers."""
+    """Newly-wired decoder families (mimo_v2_flash, param2moe) should expose steerable layers."""
     try:
         model_info = HF_EXAMPLE_MODELS.find_hf_info(model)
         model_info.check_available_online(on_fail="skip")

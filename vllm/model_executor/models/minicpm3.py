@@ -27,7 +27,7 @@
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 
 import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.config import CacheConfig, VllmConfig
@@ -53,7 +53,7 @@ from .utils import make_layers
 class MiniCPM3Attention(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         hidden_size: int,
         num_heads: int,
         qk_nope_head_dim: int,
@@ -209,7 +209,7 @@ class MiniCPM3Model(MiniCPMModel):
     def _init_layers(
         self,
         prefix: str,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
         max_steering_tokens: int,

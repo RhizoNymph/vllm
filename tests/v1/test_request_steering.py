@@ -13,16 +13,13 @@ from unittest.mock import MagicMock
 
 import torch
 
+from tests.v1.core.utils import new_kv_cache_group
 from vllm.config import DeviceConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256_cbor
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.request import Request, StreamingUpdate
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -77,9 +74,9 @@ def _create_scheduler() -> Scheduler:
         num_blocks=1000,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(
+            new_kv_cache_group(
                 ["layer"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=16,
                     num_kv_heads=1,
                     head_size=1,

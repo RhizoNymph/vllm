@@ -33,6 +33,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.layernorm import LayerNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -164,7 +165,7 @@ class OPTDecoderLayer(nn.Module):
         )
         self.do_layer_norm_before = config.do_layer_norm_before
 
-        self.self_attn_layer_norm = nn.LayerNorm(
+        self.self_attn_layer_norm = LayerNorm(
             self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
         )
         self.fc1 = ColumnParallelLinear(
@@ -182,7 +183,7 @@ class OPTDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
         )
 
@@ -249,6 +250,7 @@ class OPTDecoder(nn.Module):
         )
 
         # Project out & in will be replicated if they exist.
+        self.project_out: ReplicatedLinear | None
         if config.word_embed_proj_dim != config.hidden_size:
             self.project_out = ReplicatedLinear(
                 config.hidden_size,
@@ -260,6 +262,7 @@ class OPTDecoder(nn.Module):
         else:
             self.project_out = None
 
+        self.project_in: ReplicatedLinear | None
         if config.word_embed_proj_dim != config.hidden_size:
             self.project_in = ReplicatedLinear(
                 config.word_embed_proj_dim,
@@ -275,8 +278,9 @@ class OPTDecoder(nn.Module):
         # keep backward compatibility with checkpoints that have been fine-tuned
         # before transformers v4.20.1
         # see https://github.com/facebookresearch/metaseq/pull/164
+        self.final_layer_norm: LayerNorm | None
         if config.do_layer_norm_before and not config._remove_final_layer_norm:
-            self.final_layer_norm = nn.LayerNorm(
+            self.final_layer_norm = LayerNorm(
                 config.hidden_size,
                 elementwise_affine=config.layer_norm_elementwise_affine,
             )
@@ -431,10 +435,5 @@ class OPTForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(
-                ["lm_head.weight"] if self.config.tie_word_embeddings else None
-            ),
-        )
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

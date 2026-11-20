@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Integration tests for the sync-consumer steering loop (Phase 1a M1).
 
-Drives the unbound ``GPUModelRunner`` / ``SteeringModelRunnerMixin``
+Drives the unbound v2 ``CaptureRunnerMixin`` / ``SteeringModelRunnerMixin``
 methods against duck-typed stubs — no engine, no GPU. Covers:
 ``_build_step_capture_view`` (spans/phase/token_ids/tensor slicing),
 ``_run_sync_consumers`` (timing, isolation, action routing), and
@@ -22,32 +22,12 @@ from vllm.v1.capture.types import CaptureSpec
 from vllm.v1.worker.gpu.capture_runner_mixin import (
     CaptureRunnerMixin as _V2CaptureMixin,
 )
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.steering_action_queue import SteeringVectorUpdate
 from vllm.v1.worker.steering_manager import SteeringManager
 from vllm.v1.worker.steering_model_runner_mixin import SteeringModelRunnerMixin
 
 HIDDEN = 8
 MAX_TOKENS = 32
-
-
-class _FakeInputBatch:
-    def __init__(self, reqs: list[dict]):
-        # reqs: [{req_id, num_computed, num_prompt}]
-        self.num_reqs = len(reqs)
-        self.req_ids = [r["req_id"] for r in reqs]
-        self.req_id_to_index = {r["req_id"]: i for i, r in enumerate(reqs)}
-        self.num_computed_tokens_cpu = np.array(
-            [r["num_computed"] for r in reqs], dtype=np.int32
-        )
-        self.num_prompt_tokens = np.array(
-            [r["num_prompt"] for r in reqs], dtype=np.int32
-        )
-        # Token table: row r holds 1000*r + position so tests can assert
-        # exact window contents.
-        self.token_ids_cpu = np.stack(
-            [np.arange(64, dtype=np.int64) + 1000 * i for i in range(len(reqs))]
-        )
 
 
 class _FakeSchedulerOutput:
@@ -73,21 +53,42 @@ def _slim_manager(keys=((1, "post_block"),)) -> CaptureManager:
     )
 
 
-class _RunnerStub:
-    """Duck-typed receiver for the unbound runner methods under test.
+class _FakeV2InputBatch:
+    """v2 forward-batch layout: contiguous ``query_start_loc`` offsets plus an
+    ``idx_mapping`` from batch row to the ``req_states`` slot."""
 
-    The shared step-capture view builder / sync-consumer loop live on
-    ``CaptureRunnerMixin``; the two runner-specific hooks
-    (``_iter_step_capture_rows`` / ``_step_view_token_ids``) are the v1 runner's
-    implementations, which read ``self.input_batch``.
+    def __init__(self, req_ids, query_start_loc, idx_mapping):
+        self.num_reqs = len(req_ids)
+        self.req_ids = list(req_ids)
+        self.query_start_loc_np = np.asarray(query_start_loc, dtype=np.int64)
+        self.idx_mapping_np = np.asarray(idx_mapping, dtype=np.int64)
+
+
+class _RunnerStub:
+    """Duck-typed receiver for the unbound v2 runner methods under test.
+
+    The shared step-capture view builder / sync-consumer loop live on the
+    shared ``CaptureRunnerMixin``; the two runner-specific hooks
+    (``_iter_step_capture_rows`` / ``_step_view_token_ids``) are the v2
+    runner's, which read ``req_states`` plus the forward ``input_batch``. When
+    a test passes no ``input_batch`` the stub lays one out from ``reqs`` in
+    order, one contiguous span per request sized by its scheduled tokens.
     """
 
-    # v1's per-step hooks; the shared builder calls back into these.
-    _iter_step_capture_rows = GPUModelRunner._iter_step_capture_rows
-    _step_view_token_ids = GPUModelRunner._step_view_token_ids
+    _iter_step_capture_rows = _V2CaptureMixin._iter_step_capture_rows
+    _step_view_token_ids = _V2CaptureMixin._step_view_token_ids
 
     def __init__(self, reqs, monitor_keys=((1, "post_block"),)):
-        self.input_batch = _FakeInputBatch(reqs)
+        # reqs: [{req_id, num_computed, num_prompt}]
+        self._req_ids = [r["req_id"] for r in reqs]
+        self.req_states = SimpleNamespace(
+            num_computed_tokens_np=np.array(
+                [r["num_computed"] for r in reqs], dtype=np.int32
+            ),
+            prompt_len=SimpleNamespace(
+                np=np.array([r["num_prompt"] for r in reqs], dtype=np.int32)
+            ),
+        )
         self._sync_capture_buffers = _slim_manager(monitor_keys)
         self._sync_monitor_keys = sorted(monitor_keys)
         self._sync_consumers = []
@@ -99,13 +100,30 @@ class _RunnerStub:
         self._sync_steering_gates: dict[str, list | None] = {}
         self.applied_calls = []
 
+    def _input_batch_for(self, scheduler_output) -> _FakeV2InputBatch:
+        offsets = [0]
+        for req_id in self._req_ids:
+            n = int(scheduler_output.num_scheduled_tokens.get(req_id, 0))
+            offsets.append(offsets[-1] + n)
+        return _FakeV2InputBatch(
+            req_ids=self._req_ids,
+            query_start_loc=offsets,
+            idx_mapping=list(range(len(self._req_ids))),
+        )
+
     def _build_step_capture_view(self, scheduler_output, input_batch=None):
-        return GPUModelRunner._build_step_capture_view(
+        if input_batch is None:
+            input_batch = self._input_batch_for(scheduler_output)
+        return _V2CaptureMixin._build_step_capture_view(
             self, scheduler_output, input_batch
         )
 
-    def _run_sync_consumers(self, scheduler_output):
-        return GPUModelRunner._run_sync_consumers(self, scheduler_output)
+    def _run_sync_consumers(self, scheduler_output, input_batch=None):
+        if input_batch is None:
+            input_batch = self._input_batch_for(scheduler_output)
+        return _V2CaptureMixin._run_sync_consumers(
+            self, scheduler_output, input_batch
+        )
 
     def _apply_steering_actions(self, actions, *, source):
         self.applied_calls.append((source, list(actions)))
@@ -117,7 +135,7 @@ class _RunnerStub:
 # ---------------------------------------------------------------------------
 
 
-def test_step_view_spans_phases_and_token_ids():
+def test_step_view_spans_and_phases():
     stub = _RunnerStub(
         reqs=[
             # Mid-prefill: 4 of 10 prompt tokens computed, 3 scheduled.
@@ -134,9 +152,10 @@ def test_step_view_spans_phases_and_token_ids():
 
     a, b = out.requests
     assert (a.req_id, a.start, a.end, a.phase) == ("a", 0, 3, "prefill")
-    np.testing.assert_array_equal(a.token_ids, [4, 5, 6])
     assert (b.req_id, b.start, b.end, b.phase) == ("b", 3, 4, "decode")
-    np.testing.assert_array_equal(b.token_ids, [1012])
+    # v2 token ids are GPU-resident: the view exposes an empty CPU window.
+    assert a.token_ids.shape == (0,)
+    assert b.token_ids.shape == (0,)
 
 
 def test_step_view_carries_conversation_id():
@@ -154,7 +173,7 @@ def test_step_view_carries_conversation_id():
     assert convs == {"a": "conv-1", "b": None}
 
 
-def test_step_view_skips_zero_token_and_unknown_requests():
+def test_step_view_skips_zero_token_requests():
     stub = _RunnerStub(
         reqs=[
             {"req_id": "a", "num_computed": 0, "num_prompt": 4},
@@ -182,43 +201,8 @@ def test_step_view_tensor_is_zero_copy_of_buffer():
 
 
 # ---------------------------------------------------------------------------
-# _build_step_capture_view parity across the v1 and v2 runner hooks
+# _build_step_capture_view on the v2 layout (slot mapping)
 # ---------------------------------------------------------------------------
-
-
-class _FakeV2InputBatch:
-    """v2 forward-batch layout: contiguous ``query_start_loc`` offsets plus an
-    ``idx_mapping`` from batch row to the ``req_states`` slot."""
-
-    def __init__(self, req_ids, query_start_loc, idx_mapping):
-        self.num_reqs = len(req_ids)
-        self.req_ids = list(req_ids)
-        self.query_start_loc_np = np.asarray(query_start_loc, dtype=np.int64)
-        self.idx_mapping_np = np.asarray(idx_mapping, dtype=np.int64)
-
-
-class _V2RunnerStub:
-    """Duck-typed receiver driving the v2 runner's per-step hooks through the
-    shared ``_build_step_capture_view``."""
-
-    _iter_step_capture_rows = _V2CaptureMixin._iter_step_capture_rows
-    _step_view_token_ids = _V2CaptureMixin._step_view_token_ids
-
-    def __init__(self, req_ids, num_computed, num_prompt, monitor_keys):
-        self.req_states = SimpleNamespace(
-            num_computed_tokens_np=np.asarray(num_computed, dtype=np.int32),
-            prompt_len=SimpleNamespace(np=np.asarray(num_prompt, dtype=np.int32)),
-        )
-        self._sync_capture_buffers = _slim_manager(monitor_keys)
-        self._sync_monitor_keys = sorted(monitor_keys)
-        self._sync_step_counter = 0
-        self._sync_conversation_ids: dict[str, str | None] = {}
-        self._sync_steering_gates: dict[str, list | None] = {}
-
-    def _build_step_capture_view(self, scheduler_output, input_batch):
-        return _V2CaptureMixin._build_step_capture_view(
-            self, scheduler_output, input_batch
-        )
 
 
 @pytest.mark.parametrize(
@@ -230,55 +214,41 @@ class _V2RunnerStub:
         [("a", 8, 8, 1), ("b", 3, 6, 3), ("c", 20, 5, 1)],  # decode/prefill/decode
     ],
 )
-def test_step_view_parity_v1_v2_hooks(reqs):
-    monitor_keys = ((1, "post_block"),)
-    scheduled = {r[0]: r[3] for r in reqs}
-    sched_out = _FakeSchedulerOutput(scheduled)
-
-    v1 = _RunnerStub(
+def test_step_view_reads_phase_through_slot_mapping(reqs):
+    """Batch rows map to ``req_states`` slots through ``idx_mapping``; the view
+    must read each request's counts from its slot, not its batch row."""
+    sched_out = _FakeSchedulerOutput({r[0]: r[3] for r in reqs})
+    # Store the requests in reverse slot order so batch row != slot.
+    stub = _RunnerStub(
         reqs=[
-            {"req_id": r[0], "num_computed": r[1], "num_prompt": r[2]} for r in reqs
-        ],
-        monitor_keys=monitor_keys,
+            {"req_id": r[0], "num_computed": r[1], "num_prompt": r[2]}
+            for r in reversed(reqs)
+        ]
     )
-    v1.input_batch.token_ids_cpu = np.stack(
-        [np.arange(64, dtype=np.int64) + 1000 * i for i in range(len(reqs))]
-    )
-    v1_view = v1._build_step_capture_view(sched_out)
-
-    # Same logical batch expressed in v2's layout: contiguous qsl offsets and a
-    # 1:1 batch-row -> req_states-slot mapping.
     offsets = [0]
     for r in reqs:
         offsets.append(offsets[-1] + r[3])
-    v2_ib = _FakeV2InputBatch(
+    n = len(reqs)
+    input_batch = _FakeV2InputBatch(
         req_ids=[r[0] for r in reqs],
         query_start_loc=offsets,
-        idx_mapping=list(range(len(reqs))),
+        idx_mapping=[n - 1 - i for i in range(n)],
     )
-    v2 = _V2RunnerStub(
-        req_ids=[r[0] for r in reqs],
-        num_computed=[r[1] for r in reqs],
-        num_prompt=[r[2] for r in reqs],
-        monitor_keys=monitor_keys,
-    )
-    v2_view = v2._build_step_capture_view(sched_out, v2_ib)
 
-    # Spans / phases / conversation-id / gates must be identical across runners.
-    def _key(v):
-        return [
-            (r.req_id, r.start, r.end, r.phase, r.conversation_id, r.steering)
-            for r in v.requests
-        ]
+    view = stub._build_step_capture_view(sched_out, input_batch)
 
-    assert _key(v1_view) == _key(v2_view)
-    assert v1_view.step == v2_view.step
-
-    # token_ids diverge by design: populated on v1, empty on v2.
-    for r in v1_view.requests:
-        assert r.token_ids.shape == (r.end - r.start,)
-    for r in v2_view.requests:
-        assert r.token_ids.shape == (0,)
+    expected = [
+        (
+            r[0],
+            offsets[i],
+            offsets[i + 1],
+            "prefill" if r[1] < r[2] else "decode",
+        )
+        for i, r in enumerate(reqs)
+    ]
+    assert [(v.req_id, v.start, v.end, v.phase) for v in view.requests] == expected
+    for v in view.requests:
+        assert v.token_ids.shape == (0,)
 
 
 # ---------------------------------------------------------------------------

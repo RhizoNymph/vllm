@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 
 import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
@@ -44,7 +44,12 @@ from vllm.model_executor.model_loader.weight_utils import (
     composed_weight_loader,
     default_weight_loader,
 )
-from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     extract_layer_index,
@@ -58,7 +63,7 @@ from vllm.sequence import IntermediateTensors
 # Only used for type hinting.
 if TYPE_CHECKING:
 
-    class Plamo3Config(PretrainedConfig):  # type: ignore
+    class Plamo3Config(PreTrainedConfig):  # type: ignore
         model_type: str = "plamo3"
 
         hidden_size: int
@@ -222,10 +227,14 @@ class Plamo3AttentionMixer(nn.Module):
 
         q_shape = q.shape
         q = q.reshape(q_shape[:-1] + (q_shape[-1] // self.head_dim, self.head_dim))
-        q = self.q_norm.forward_native(q).reshape(q_shape)
+        normalized_q = self.q_norm.forward_native(q)
+        assert isinstance(normalized_q, torch.Tensor)
+        q = normalized_q.reshape(q_shape)
         k_shape = k.shape
         k = k.reshape(k_shape[:-1] + (k_shape[-1] // self.head_dim, self.head_dim))
-        k = self.k_norm.forward_native(k).reshape(k_shape)
+        normalized_k = self.k_norm.forward_native(k)
+        assert isinstance(normalized_k, torch.Tensor)
+        k = normalized_k.reshape(k_shape)
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
@@ -312,7 +321,7 @@ class Plamo3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Plamo3Decoder(torch.nn.Module):
+class Plamo3Decoder(torch.nn.Module, EagleModelMixin):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         num_hidden_layers = vllm_config.model_config.hf_config.num_hidden_layers
@@ -324,23 +333,32 @@ class Plamo3Decoder(torch.nn.Module):
         )
         share_steering_index_across_layers(self.layers)
 
+    def __len__(self) -> int:
+        return len(self.layers)
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
-        return hidden_states, residual
+            self._maybe_add_hidden_state(
+                aux_hidden_states, idx + 1, hidden_states, residual
+            )
+        return hidden_states, residual, aux_hidden_states
 
 
 @support_torch_compile
-class Plamo3Model(nn.Module):
+class Plamo3Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -368,13 +386,16 @@ class Plamo3Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.layers._set_aux_hidden_state_layers(layers)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -386,7 +407,7 @@ class Plamo3Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        hidden_states, residual = self.layers(
+        hidden_states, residual, aux_hidden_states = self.layers(
             positions=positions, hidden_states=hidden_states, residual=residual
         )
         if not get_pp_group().is_last_rank:
@@ -394,10 +415,12 @@ class Plamo3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
-class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     packed_modules_mapping = {
         "qkv_proj": ["qkv_proj"],
         "gate_up_proj": ["gate_up_proj"],
@@ -409,6 +432,7 @@ class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
+        self.quant_config = vllm_config.quant_config
 
         self.model = Plamo3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -423,7 +447,8 @@ class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.config.hidden_size,
             org_num_embeddings=self.config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
-            prefix=f"{prefix}.lm_head",
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
         )
         if self.config.tie_word_embeddings:
             self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
@@ -444,7 +469,7 @@ class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -458,8 +483,5 @@ class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

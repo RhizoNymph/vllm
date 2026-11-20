@@ -260,7 +260,7 @@ is HTTP-only.
 
 | file | role / key exports |
 | ---- | ------------------ |
-| `rust/proto/vllm_grpc.proto` | `SteeringHookPacked`, `Steering`, and `GenerateRequest.steering` / `.capture` (`google.protobuf.Struct`) |
+| `rust/proto/inference.proto` | `SteeringHookPacked`, `ClampHookPacked`, `Steering`, `GenerateRequest.steering` (tag 100) / `.capture` (tag 101, `google.protobuf.Struct`), and `FinishInfo.capture_results` (tag 100). Fork-only fields live at tags 100+ so upstream can keep taking the next low tags. |
 | `src/server/src/steering_modules.rs` | `load_steering_module`, `parse_module`, `load_and_broadcast_steering_modules`, `register_modules`, `unregister_modules`; SAE payload types `SteeringModuleKind`, `SaeManifest`, `PackedTensor`, `SaeWeights` |
 | `src/server/src/routes/steering.rs` | runtime endpoints: list / register / unregister; `reset_prefix_cache_after_module_change` (503 on failed invalidation) |
 | `src/server/src/config.rs` | `SteeringModulePath`, `Config.steering_modules` |
@@ -283,6 +283,13 @@ is HTTP-only.
 
 ## Invariants & constraints
 
+- **Output tuple layout**: `EngineCoreOutput` decodes with the derived
+  `Deserialize_tuple`, so its struct field order IS the wire order
+  (`capture_results` at index 7); each output is read with
+  `AllowTrailingFields`. The `EngineCoreOutputs` envelope keeps a hand-written
+  visitor (fork `late_capture_results` at index 5, trailing fields drained) whose
+  field list must be kept in step with the struct. Both fork slots decode `nil`
+  as empty.
 - **Integer layer keys**: the southbound layer map MUST serialize with integer
   keys (enforced by the `u32` key type; covered by a wire-format test).
 - **Field names** on `EngineCoreSamplingParams` MUST match Python

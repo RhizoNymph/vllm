@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 
 import vllm.model_executor.layers.steering  # noqa: F401  # registers custom op
 from vllm.compilation.decorators import support_torch_compile
@@ -206,7 +206,7 @@ class InternLM2Attention(nn.Module):
 class InternLMDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -358,7 +358,7 @@ class InternLM2Model(nn.Module):
 
 class InternLM2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsQuant):
     hf_to_vllm_mapper = InternLM2Model.hf_to_vllm_mapper
-    packed_modules_mapping = {
+    packed_modules_mapping: dict[str, list[str]] = {
         "wqkv": ["wqkv"],
         "gate_up_proj": ["w1", "w3"],
     }
@@ -416,10 +416,7 @@ class InternLM2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsQuant):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["output."] if self.config.tie_word_embeddings else None),
-        )
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
 

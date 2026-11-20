@@ -35,6 +35,8 @@ def _make_manager(
     ``dispatch_piecewise`` read, skipping the GPU-touching ``__init__``."""
     mgr = object.__new__(CudaGraphManager)
     mgr._candidates = candidates
+    # Uniform-decode graphs keyed by (query_len, loras, ubatches); none here.
+    mgr._decode_descs = {}
     mgr._graphs_captured = captured
     mgr._lora_dispatch_map = {}
     mgr._max_lora_case = 0

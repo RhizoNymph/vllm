@@ -2,19 +2,25 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
+use bytes::Bytes;
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_default::DefaultFromSerde;
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use serde_tuple::Serialize_tuple;
+use serde_tuple::{Deserialize_tuple, Serialize_tuple};
+use serde_with::de::DeserializeAsWrap;
 
+use super::serde_utils::AllowTrailingFields;
 use super::utility::UtilityOutput;
 use crate::error::{Error, Result, ext_value_decode};
 use crate::protocol::capture::CaptureResult;
 use crate::protocol::logprobs::MaybeWireLogprobs;
+use crate::protocol::sampling_mask::MaybeWireSamplingMask;
 use crate::protocol::stats::{PrefillStats, SchedulerStats};
-use crate::protocol::{OpaqueValue, decode_msgpack};
+use crate::protocol::tensor::WireNdArray;
+use crate::protocol::{OpaqueValue, decode_msgpack, encode_msgpack};
 
 /// The stop reason associated with a finished output.
 ///
@@ -74,16 +80,26 @@ pub struct EngineCoreEvent {
     pub timestamp: f64,
 }
 
+/// Decode a fork-only `array_like` slot, treating `nil` like an omitted
+/// value: upstream-shaped senders put their own `nil` defaults at the index the
+/// fork's field occupies.
+fn nil_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Engine-core output for a single request.
 ///
 /// Original Python definition:
 /// <https://github.com/vllm-project/vllm/blob/d3af8c18317c0dc008d42e4367fbb9045cfb7bf6/vllm/v1/engine/__init__.py#L154-L184>
-// Decoded with a hand-written seq visitor (not `Deserialize_tuple`) so the
-// frontend tolerates BOTH shorter tuples (upstream `omit_defaults` elides
-// trailing defaults) AND longer tuples (upstream appends a new `array_like`
-// field the frontend does not know yet): unknown trailing elements are drained
-// instead of raising a decode error. See the `Deserialize` impl below.
-#[derive(Debug, Clone, PartialEq, Serialize_tuple, DefaultFromSerde)]
+///
+/// Fields that are set on few outputs (first or final output, or opt-in
+/// features) are boxed: outputs are moved by value through the dispatcher and
+/// the request stream once per engine step, so their inline size matters.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
 pub struct EngineCoreOutput {
     pub request_id: String,
     pub new_token_ids: Vec<u32>,
@@ -96,7 +112,7 @@ pub struct EngineCoreOutput {
     #[serde(default)]
     pub new_prompt_logprobs_tensors: Option<MaybeWireLogprobs>,
     #[serde(default)]
-    pub pooling_output: Option<OpaqueValue>,
+    pub pooling_output: Option<Box<OpaqueValue>>,
     #[serde(default)]
     pub finish_reason: Option<EngineCoreFinishReason>,
     #[serde(default)]
@@ -105,23 +121,26 @@ pub struct EngineCoreOutput {
     /// by engine-core for requests that opted into capture; empty otherwise.
     ///
     /// MUST stay positioned between `stop_reason` and `events` to match the
-    /// Python `EngineCoreOutput` tuple layout (`array_like`).
-    #[serde(default)]
+    /// Python `EngineCoreOutput` tuple layout (`array_like`). A `nil` slot
+    /// (a sender that does not know the fork field) decodes as empty.
+    #[serde(default, deserialize_with = "nil_as_default")]
     pub capture_results: HashMap<String, CaptureResult>,
     #[serde(default)]
     pub events: Option<Vec<EngineCoreEvent>>,
     #[serde(default)]
-    pub kv_transfer_params: Option<serde_json::Value>,
+    pub kv_transfer_params: Option<Box<serde_json::Value>>,
     #[serde(default)]
-    pub ec_transfer_params: Option<serde_json::Value>,
+    pub ec_transfer_params: Option<Box<serde_json::Value>>,
     #[serde(default)]
-    pub trace_headers: Option<OpaqueValue>,
+    pub trace_headers: Option<Box<OpaqueValue>>,
     /// Breakdown of the scheduled prefill computation, set on the first output
     /// of a newly scheduled prefill and elided for subsequent decode outputs.
     #[serde(default)]
-    pub prefill_stats: Option<PrefillStats>,
+    pub prefill_stats: Option<Box<PrefillStats>>,
+    /// Routed-expert rows `[num_rows, num_layers, top_k]` captured for this
+    /// output, when `enable_return_routed_experts` is on.
     #[serde(default)]
-    pub routed_experts: Option<OpaqueValue>,
+    pub routed_experts: Option<Box<WireNdArray>>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     #[serde(default)]
     pub num_nans_in_logits: u32,
@@ -137,7 +156,84 @@ pub struct EngineCoreOutput {
     #[serde(default)]
     pub mm_cache_miss_hashes: Option<Vec<String>>,
     #[serde(default)]
-    pub new_sampling_mask: Option<OpaqueValue>,
+    pub new_sampling_mask: Option<MaybeWireSamplingMask>,
+    /// Per-request speculative-decoding acceptance metrics, set on the final
+    /// output when `--per-request-spec-decode-metrics` is enabled.
+    #[serde(default)]
+    pub spec_decode_metrics: Option<Box<RequestSpecDecodeMetrics>>,
+    /// Log probabilities of `SamplingParams.prompt_logprob_token_ids`, set on
+    /// the first output of a request that asked for them.
+    #[serde(default)]
+    pub prompt_token_id_logprobs: Option<Box<WireNdArray>>,
+    /// Request-level error sent with [`EngineCoreFinishReason::Error`], e.g.
+    /// when a paused engine rejects a request.
+    #[serde(default)]
+    pub error: Option<Box<RequestError>>,
+    /// Whether the sampler watermarks this request, after EngineCore applied
+    /// `watermark_config.enforce`. Set on the first output, and only when the
+    /// engine has a `watermark_config`.
+    #[serde(default)]
+    pub watermarking: Option<bool>,
+}
+
+/// A request-level error that does not mark the engine as unhealthy.
+///
+/// Python models this as a plain `@dataclass`, so it is serialized by msgspec
+/// as a map (named fields).
+///
+/// Original Python definition: `RequestError` in `vllm/outputs.py`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestError {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+impl RequestError {
+    /// `code` of an error caused by the request itself, e.g. a structured-output
+    /// constraint the engine's backend cannot compile. Python raises
+    /// `VLLMValidationError` for it.
+    pub const VALIDATION_ERROR: &str = "validation_error";
+
+    /// Whether the request itself is invalid, so frontends report a client
+    /// error.
+    pub fn is_validation_error(&self) -> bool {
+        self.code == Self::VALIDATION_ERROR
+    }
+}
+
+/// Raw per-sequence speculative-decoding accumulator.
+///
+/// Python models this as a plain `@dataclass`, so it is serialized by msgspec
+/// as a map (named fields). Derived values such as acceptance rates are
+/// computed by the frontend, not carried on the wire.
+///
+/// Original Python definition: `RequestSpecDecodeMetrics` in
+/// `vllm/v1/metrics/stats.py`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestSpecDecodeMetrics {
+    /// Configured `num_speculative_tokens`.
+    #[serde(default)]
+    pub num_spec_tokens: u64,
+    /// Verify-step counts indexed by accepted draft-token count.
+    #[serde(default)]
+    pub histogram: Vec<u64>,
+    /// Total proposed draft tokens.
+    #[serde(default)]
+    pub num_draft_tokens: u64,
+    /// Accepted draft count per verify step; empty unless `detailed`.
+    #[serde(default)]
+    pub per_step_accepted: Vec<u64>,
+    /// Proposed draft count per verify step; empty unless `detailed`.
+    #[serde(default)]
+    pub per_step_drafted: Vec<u64>,
+    /// Total draft tokens the target model ran a forward pass on.
+    #[serde(default)]
+    pub num_verified_tokens: u64,
+    /// Verified draft count per verify step; empty unless `detailed`.
+    #[serde(default)]
+    pub per_step_verified: Vec<u64>,
 }
 
 impl EngineCoreOutput {
@@ -146,67 +242,49 @@ impl EngineCoreOutput {
         self.finish_reason.is_some()
     }
 
+    /// Move the large arrays of wire-format fields into the ordered
+    /// auxiliary-frame list, the inverse of [`Self::resolve_in_place`].
+    fn extract_aux_frames(&mut self, aux_frames: &mut Vec<Bytes>, threshold: usize) {
+        if let Some(value) = &mut self.new_logprobs {
+            value.extract_aux_frames(aux_frames, threshold);
+        }
+        if let Some(value) = &mut self.new_prompt_logprobs_tensors {
+            value.extract_aux_frames(aux_frames, threshold);
+        }
+        if let Some(value) = &mut self.new_sampling_mask {
+            value.extract_aux_frames(aux_frames, threshold);
+        }
+        if let Some(value) = &mut self.prompt_token_id_logprobs {
+            value.extract_aux_frame(aux_frames, threshold);
+        }
+        if let Some(value) = &mut self.routed_experts {
+            value.extract_aux_frame(aux_frames, threshold);
+        }
+    }
+
     /// Resolve all wire-format fields in-place by looking up aux frames and
     /// decoding raw-view payloads as needed.
-    fn resolve_in_place<Frame>(&mut self, frames: &[Frame]) -> Result<()>
-    where
-        Frame: AsRef<[u8]>,
-    {
+    fn resolve_in_place(&mut self, frames: &[Bytes]) -> Result<()> {
         self.new_logprobs = (self.new_logprobs.take())
             .map(|value| value.resolve(frames, "new_logprobs"))
             .transpose()?;
         self.new_prompt_logprobs_tensors = (self.new_prompt_logprobs_tensors.take())
             .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
             .transpose()?;
-        Ok(())
-    }
-}
-
-impl<'de> Deserialize<'de> for EngineCoreOutput {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct OutputVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for OutputVisitor {
-            type Value = EngineCoreOutput;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("an EngineCoreOutput array_like tuple")
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                // Missing trailing elements fall back to defaults (omit_defaults);
-                // any elements past the known fields are drained (forward-compat).
-                let output = EngineCoreOutput {
-                    request_id: seq.next_element()?.unwrap_or_default(),
-                    new_token_ids: seq.next_element()?.unwrap_or_default(),
-                    new_logprobs: seq.next_element()?.unwrap_or_default(),
-                    new_prompt_logprobs_tensors: seq.next_element()?.unwrap_or_default(),
-                    pooling_output: seq.next_element()?.unwrap_or_default(),
-                    finish_reason: seq.next_element()?.unwrap_or_default(),
-                    stop_reason: seq.next_element()?.unwrap_or_default(),
-                    capture_results: seq.next_element()?.unwrap_or_default(),
-                    events: seq.next_element()?.unwrap_or_default(),
-                    kv_transfer_params: seq.next_element()?.unwrap_or_default(),
-                    ec_transfer_params: seq.next_element()?.unwrap_or_default(),
-                    trace_headers: seq.next_element()?.unwrap_or_default(),
-                    prefill_stats: seq.next_element()?.unwrap_or_default(),
-                    routed_experts: seq.next_element()?.unwrap_or_default(),
-                    num_nans_in_logits: seq.next_element()?.unwrap_or_default(),
-                    mm_cache_miss_hashes: seq.next_element()?.unwrap_or_default(),
-                    new_sampling_mask: seq.next_element()?.unwrap_or_default(),
-                };
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(output)
-            }
+        self.new_sampling_mask = (self.new_sampling_mask.take())
+            .map(|value| value.resolve(frames, "new_sampling_mask"))
+            .transpose()?;
+        if let Some(value) = self.prompt_token_id_logprobs.as_mut() {
+            value
+                .resolve_aux_frame(frames)
+                .map_err(|message| ext_value_decode!("prompt_token_id_logprobs: {message}"))?;
         }
-
-        deserializer.deserialize_seq(OutputVisitor)
+        if let Some(value) = self.routed_experts.as_mut() {
+            value
+                .resolve_aux_frame(frames)
+                .map_err(|message| ext_value_decode!("routed_experts: {message}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -214,14 +292,20 @@ impl<'de> Deserialize<'de> for EngineCoreOutput {
 ///
 /// Original Python definition:
 /// <https://github.com/vllm-project/vllm/blob/f22d6e026798a74e6542a52ef776c054f2de572a/vllm/v1/engine/__init__.py#L186-L214>
-// See `EngineCoreOutput`: decoded with a hand-written seq visitor so the
-// frontend tolerates both shorter and longer `array_like` tuples across
-// upstream wire-format changes.
+// Decoded with a hand-written seq visitor (not `Deserialize_tuple`) so the
+// frontend tolerates BOTH shorter tuples (upstream `omit_defaults` elides
+// trailing defaults) AND longer tuples (upstream appends a new `array_like`
+// envelope field the frontend does not know yet): unknown trailing elements
+// are drained instead of raising a decode error. Each element of `outputs` is
+// decoded with `AllowTrailingFields` for the same reason. See the
+// `Deserialize` impl below; its field order MUST match this struct's.
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, DefaultFromSerde)]
 struct WireEngineCoreOutputs {
     #[serde(default)]
     engine_index: u32,
-    /// Outputs grouped for this client in the current engine tick.
+    /// Outputs grouped for this client in the current engine tick. Each is
+    /// decoded with `AllowTrailingFields` to match msgspec's append-only
+    /// schema evolution, including Omni extensions.
     #[serde(default)]
     outputs: Vec<EngineCoreOutput>,
     #[serde(default)]
@@ -247,6 +331,10 @@ struct WireEngineCoreOutputs {
     /// wave needs to start in other engines.
     #[serde(default)]
     start_wave: Option<u32>,
+    /// Label of the weights used for this step, as set by the
+    /// `set_weight_version` utility; `"default"` until set.
+    #[serde(default)]
+    weight_version: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for WireEngineCoreOutputs {
@@ -271,14 +359,25 @@ impl<'de> Deserialize<'de> for WireEngineCoreOutputs {
                 // any elements past the known fields are drained (forward-compat).
                 let outputs = WireEngineCoreOutputs {
                     engine_index: seq.next_element()?.unwrap_or_default(),
-                    outputs: seq.next_element()?.unwrap_or_default(),
+                    outputs: seq
+                        .next_element::<DeserializeAsWrap<
+                            Vec<EngineCoreOutput>,
+                            Vec<AllowTrailingFields>,
+                        >>()?
+                        .map(DeserializeAsWrap::into_inner)
+                        .unwrap_or_default(),
                     scheduler_stats: seq.next_element()?.unwrap_or_default(),
                     timestamp: seq.next_element()?.unwrap_or_default(),
                     utility_output: seq.next_element()?.unwrap_or_default(),
-                    late_capture_results: seq.next_element()?.unwrap_or_default(),
+                    // `nil` here (a sender without the fork field) is empty.
+                    late_capture_results: seq
+                        .next_element::<Option<_>>()?
+                        .flatten()
+                        .unwrap_or_default(),
                     finished_requests: seq.next_element()?.unwrap_or_default(),
                     wave_complete: seq.next_element()?.unwrap_or_default(),
                     start_wave: seq.next_element()?.unwrap_or_default(),
+                    weight_version: seq.next_element()?.unwrap_or_default(),
                 };
                 while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
                 Ok(outputs)
@@ -303,6 +402,9 @@ pub struct RequestBatchOutputs {
     pub scheduler_stats: Option<Box<SchedulerStats>>,
     pub timestamp: f64,
     pub finished_requests: Option<BTreeSet<String>>,
+    /// Label of the weights used for this step. It changes only while
+    /// generation is paused, so it applies to every output in the batch.
+    pub weight_version: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -350,12 +452,21 @@ impl From<DpControlOutput> for EngineCoreOutputs {
 }
 
 impl EngineCoreOutputs {
+    /// Move the large arrays of wire-format fields into the ordered
+    /// auxiliary-frame list, the inverse of [`Self::resolve_in_place`].
+    fn extract_aux_frames(&mut self, threshold: usize) -> Vec<Bytes> {
+        let mut aux_frames = Vec::new();
+        if let Self::RequestBatch(batch) = self {
+            for output in &mut batch.outputs {
+                output.extract_aux_frames(&mut aux_frames, threshold);
+            }
+        }
+        aux_frames
+    }
+
     /// Resolve all wire-format fields in-place by looking up aux frames and
     /// decoding raw-view payloads as needed.
-    fn resolve_in_place<Frame>(&mut self, frames: &[Frame]) -> Result<()>
-    where
-        Frame: AsRef<[u8]>,
-    {
+    fn resolve_in_place(&mut self, frames: &[Bytes]) -> Result<()> {
         if let Self::RequestBatch(batch) = self {
             for output in &mut batch.outputs {
                 output.resolve_in_place(frames)?;
@@ -387,6 +498,7 @@ impl TryFrom<WireEngineCoreOutputs> for EngineCoreOutputs {
                 scheduler_stats: value.scheduler_stats,
                 timestamp: value.timestamp,
                 finished_requests: value.finished_requests,
+                weight_version: value.weight_version.map(Arc::from),
             }
             .into()),
             (false, Some(_), None, None) => Ok(UtilityCallOutput {
@@ -425,6 +537,7 @@ impl From<EngineCoreOutputs> for WireEngineCoreOutputs {
                 scheduler_stats: batch.scheduler_stats,
                 timestamp: batch.timestamp,
                 finished_requests: batch.finished_requests,
+                weight_version: batch.weight_version.map(|version| version.to_string()),
                 ..Default::default()
             },
             EngineCoreOutputs::Utility(utility) => Self {
@@ -455,6 +568,8 @@ impl Serialize for EngineCoreOutputs {
     where
         S: Serializer,
     {
+        // Clones the batch; an engine encodes by value with `into_frames`
+        // instead.
         WireEngineCoreOutputs::from(self.clone()).serialize(serializer)
     }
 }
@@ -470,17 +585,31 @@ impl<'de> Deserialize<'de> for EngineCoreOutputs {
     }
 }
 
-/// Decode one ordinary or multipart engine-core output message into the strong
-/// typed public protocol shape.
-pub fn decode_engine_core_outputs<Frame>(frames: &[Frame]) -> Result<EngineCoreOutputs>
-where
-    Frame: AsRef<[u8]>,
-{
-    let first_frame = frames.first().ok_or_else(|| ext_value_decode!("missing output frame"))?;
+impl EngineCoreOutputs {
+    /// Decode one ordinary or multipart engine-core output message into the strong
+    /// typed public protocol shape.
+    pub fn from_frames(frames: &[Bytes]) -> Result<Self> {
+        let first_frame =
+            frames.first().ok_or_else(|| ext_value_decode!("missing output frame"))?;
 
-    let mut outputs: EngineCoreOutputs = decode_msgpack(first_frame.as_ref())?;
-    outputs.resolve_in_place(frames)?;
-    Ok(outputs)
+        let mut outputs: Self = decode_msgpack(first_frame.as_ref())?;
+        outputs.resolve_in_place(frames)?;
+        Ok(outputs)
+    }
+
+    /// Encode into one ordinary or multipart message: the msgpack frame, then
+    /// an auxiliary frame for each array of at least `aux_frame_threshold`
+    /// bytes, as Python's `MsgpackEncoder` does. The inverse of
+    /// [`Self::from_frames`].
+    pub fn into_frames(mut self, aux_frame_threshold: usize) -> Result<Vec<Bytes>> {
+        let aux_frames = self.extract_aux_frames(aux_frame_threshold);
+        let mut frames = Vec::with_capacity(1 + aux_frames.len());
+        frames.push(Bytes::from(encode_msgpack(&WireEngineCoreOutputs::from(
+            self,
+        ))?));
+        frames.extend(aux_frames);
+        Ok(frames)
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +651,61 @@ mod tests {
     }
 
     #[test]
+    fn engine_core_outputs_ignore_appended_fields() {
+        let output = EngineCoreOutput {
+            request_id: "req-1".into(),
+            new_token_ids: vec![42],
+            finish_reason: Some(EngineCoreFinishReason::Length),
+            ..Default::default()
+        };
+        let mut fields = crate::protocol::decode_value(&encode_msgpack(&output).unwrap())
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone();
+        // Omni appends multimodal_output, is_segment_finished, and
+        // new_prompt_len_snapshot. Unknown payloads may contain nested values.
+        fields.extend([
+            OpaqueValue::Map(vec![(
+                "audio".into(),
+                OpaqueValue::Array(vec![OpaqueValue::Ext(1, vec![0, 1])]),
+            )]),
+            false.into(),
+            OpaqueValue::Nil,
+        ]);
+        let wire = (0, vec![OpaqueValue::Array(fields); 2]);
+        let frames = [Bytes::from(encode_msgpack(&wire).unwrap())];
+        let decoded = EngineCoreOutputs::from_frames(&frames).unwrap();
+        // A second output also checks that the first output's tail was consumed.
+        assert_eq!(decoded.as_request_batch().unwrap().outputs, vec![output; 2]);
+    }
+
+    #[test]
+    fn engine_core_output_requires_valid_known_fields() {
+        for fields in [
+            vec![],
+            vec!["req-1".into()],
+            vec!["req-1".into(), OpaqueValue::Nil],
+            vec!["req-1".into(), OpaqueValue::Array(vec![]), false.into()],
+        ] {
+            let wire = (0, vec![OpaqueValue::Array(fields)]);
+            let frames = [Bytes::from(encode_msgpack(&wire).unwrap())];
+            assert!(EngineCoreOutputs::from_frames(&frames).is_err());
+        }
+        let wire = (0, vec![("req-1", vec![42_u32])]);
+        let frames = [Bytes::from(encode_msgpack(&wire).unwrap())];
+        let decoded = EngineCoreOutputs::from_frames(&frames).unwrap();
+        assert_eq!(
+            decoded.as_request_batch().unwrap().outputs,
+            vec![EngineCoreOutput {
+                request_id: "req-1".into(),
+                new_token_ids: vec![42],
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
     fn engine_core_outputs_classify_request_batch() {
         let outputs = WireEngineCoreOutputs {
             outputs: vec![EngineCoreOutput {
@@ -558,6 +742,10 @@ mod tests {
                             num_nans_in_logits: 0,
                             mm_cache_miss_hashes: None,
                             new_sampling_mask: None,
+                            spec_decode_metrics: None,
+                            prompt_token_id_logprobs: None,
+                            error: None,
+                            watermarking: None,
                         },
                     ],
                     scheduler_stats: None,
@@ -567,6 +755,7 @@ mod tests {
                             "req-1",
                         },
                     ),
+                    weight_version: None,
                 },
             )
         "#]]
@@ -619,6 +808,86 @@ mod tests {
             )
         "#]]
         .assert_debug_eq(&EngineCoreOutputs::try_from(outputs).unwrap());
+    }
+
+    #[test]
+    fn engine_core_outputs_encode_large_arrays_in_aux_frames() {
+        use crate::protocol::logprobs::{Logprobs, PositionLogprobs, TokenLogprob, WireLogprobs};
+        use crate::protocol::tensor::WireNdArray;
+
+        const THRESHOLD: usize = 64;
+        // One position with 16 candidates: 16 * 8 bytes of token ids go in an
+        // auxiliary frame, 16 * 4 bytes of logprobs too, the rank stays inline.
+        let entries: Vec<TokenLogprob> = (0..16)
+            .map(|i| TokenLogprob {
+                token_id: 100 + i,
+                logprob: -(i as f32),
+                rank: if i == 0 { 3 } else { i },
+            })
+            .collect();
+        let wire = WireLogprobs {
+            logprob_token_ids: WireNdArray::from_i64(
+                vec![1, 16],
+                entries.iter().map(|e| i64::from(e.token_id)).collect(),
+            )
+            .unwrap(),
+            logprobs: WireNdArray::from_f32(
+                vec![1, 16],
+                entries.iter().map(|e| e.logprob).collect(),
+            )
+            .unwrap(),
+            token_ranks: WireNdArray::from_i64(vec![1], vec![3]).unwrap(),
+            cu_num_generated_tokens: None,
+            cu_num_generated_tokens_tensor: None,
+        };
+        let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 1,
+            outputs: vec![EngineCoreOutput {
+                request_id: "req-1".into(),
+                new_token_ids: vec![100],
+                new_logprobs: Some(MaybeWireLogprobs::Wire(Box::new(wire))),
+                ..Default::default()
+            }],
+            timestamp: 2.5,
+            weight_version: Some("v1".into()),
+            ..Default::default()
+        });
+
+        let frames = outputs.into_frames(THRESHOLD).unwrap();
+        assert_eq!(frames.len(), 3);
+        let decoded = EngineCoreOutputs::from_frames(&frames).unwrap();
+        let batch = decoded.as_request_batch().unwrap();
+        assert_eq!((batch.engine_index, batch.timestamp), (1, 2.5));
+        assert_eq!(batch.weight_version.as_deref(), Some("v1"));
+        assert_eq!(
+            *batch.outputs[0].new_logprobs.as_ref().unwrap().as_direct().unwrap(),
+            Logprobs {
+                positions: vec![PositionLogprobs { entries }]
+            }
+        );
+    }
+
+    #[test]
+    fn engine_core_outputs_encode_utility_and_control() {
+        for outputs in [
+            EngineCoreOutputs::Utility(UtilityCallOutput {
+                engine_index: 2,
+                timestamp: 1.0,
+                output: UtilityOutput {
+                    call_id: 7_u64.into(),
+                    failure_message: Some("boom".into()),
+                    result: None,
+                },
+            }),
+            EngineCoreOutputs::DpControl(DpControlOutput {
+                engine_index: 0,
+                timestamp: 1.0,
+                control: DpControlMessage::WaveComplete(4),
+            }),
+        ] {
+            let frames = outputs.clone().into_frames(0).unwrap();
+            assert_eq!(EngineCoreOutputs::from_frames(&frames).unwrap(), outputs);
+        }
     }
 
     #[test]
@@ -838,6 +1107,7 @@ mod tests {
             Value::Nil,           // finished_requests
             Value::Nil,           // wave_complete
             Value::Nil,           // start_wave
+            Value::Nil,           // weight_version
             Value::from(true),    // hypothetical future trailing field
         ]);
 

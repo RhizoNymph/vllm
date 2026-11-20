@@ -26,6 +26,7 @@ pub mod capture;
 pub mod clamps;
 pub mod dtype;
 pub mod handshake;
+pub mod kv_hints;
 pub mod logprobs;
 pub mod lora;
 pub mod multimodal;
@@ -33,6 +34,8 @@ pub mod output;
 pub mod request;
 pub mod sae;
 pub mod sampling;
+pub mod sampling_mask;
+mod serde_utils;
 pub mod stats;
 pub mod steering;
 pub mod structured_outputs;
@@ -45,6 +48,16 @@ pub use sae::{
     SaeClampEntry, SaeClampHookMap, SaeClampKind, SaeClampSpec, SaeFullReconstructionSpec, SaePhase,
 };
 pub use steering::{SteeringLayerEntry, SteeringVectorSpec};
+/// The smallest array, in bytes, that a sender moves into an auxiliary frame
+/// rather than inlining, from `VLLM_MSGPACK_ZERO_COPY_THRESHOLD` as in Python's
+/// `MsgpackEncoder` (256 by default). Only the sender reads it, so read it once
+/// when creating the sender.
+pub fn msgpack_zero_copy_threshold() -> usize {
+    std::env::var("VLLM_MSGPACK_ZERO_COPY_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256)
+}
 
 /// Encode a Rust value into msgpack using the protocol crate's serde model.
 pub fn encode_msgpack<T>(value: &T) -> Result<Vec<u8>>

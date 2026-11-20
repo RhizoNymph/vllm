@@ -526,6 +526,52 @@ def test_capture_add_no_request_metadata_is_none():
     assert glue._sync_conversation_ids == {"a": None}
 
 
+def test_capture_add_streaming_readd_refreshes_sync_metadata_stashes():
+    """A streaming re-add must refresh the sync-consumer metadata stashes.
+
+    Ported from the removed v1 runner's ``_update_streaming_request`` test: a
+    streaming continuation that changes the conversation id or declarative
+    gates must not keep serving the prior chunk's stale values. On v2 the
+    re-add arrives through ``_capture_add_request`` with ``was_present=True``.
+    """
+    from vllm.v1.request_metadata import RequestMetadata
+    from vllm.v1.steering_schema import build_steering_gates, resolve_gates_safe
+
+    gate, mgr = _FakeGate(), _FakeManager()
+    mgr._reqs.add("a")
+    glue = _AddGlue(gate, mgr)
+    # Stale stashes left over from the prior chunk's registration.
+    glue._sync_conversation_ids = {"a": "conv-old"}
+    glue._sync_steering_gates = {"a": ["STALE"]}
+
+    gates = build_steering_gates(
+        [
+            {
+                "when": {"kind": "always"},
+                "scope": "rest_of_request",
+                "apply": {"kind": "attenuate", "strength": 0.25},
+            }
+        ],
+        None,
+    )
+    glue._capture_add_request(
+        _new_req(
+            "a",
+            {"c": {}},
+            request_metadata=RequestMetadata(
+                conversation_id="conv-new", steering=gates
+            ),
+        ),
+        was_present=True,
+    )
+
+    assert glue._sync_conversation_ids["a"] == "conv-new"
+    refreshed = glue._sync_steering_gates["a"]
+    assert refreshed != ["STALE"]
+    assert refreshed is not None
+    assert len(refreshed) == len(resolve_gates_safe(gates, "a"))
+
+
 def test_capture_finish_drops_conversation_id():
     glue = _AddGlue(_FakeGate(), None)
     glue._sync_conversation_ids["a"] = "conv-1"
