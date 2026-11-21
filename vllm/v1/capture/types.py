@@ -276,6 +276,56 @@ def build_hook_schema(
     }
 
 
+# Text-config ``model_type`` of the Qwen4Exp hyper-connection decoder. Its
+# multi-stream width is ``hc_count`` (not DeepSeek-V4's ``hc_mult``), and its
+# MTP drafter config (``qwen4_exp_mtp``) is never the capture target.
+_QWEN4_EXP_TEXT_MODEL_TYPE = "qwen4_exp_text"
+
+
+def hyperconnection_hook_schema(
+    hidden_size: int,
+    dtype: torch.dtype,
+    hc_count: int,
+) -> dict[str, HookSchema]:
+    """Hook schema for the Qwen4Exp hyper-connection decoder.
+
+    Unlike DeepSeek-V4 it keeps all five standard hooks at ``hidden_size``:
+    ``pre_attn`` / ``post_attn`` / ``post_block`` are the *stream mean* of the
+    multi-stream residual and ``mlp_in`` / ``mlp_out`` the single-stream MoE
+    branch. The full residual is exposed through the three multi-stream hooks,
+    reshaped to ``(hc_count, hidden_size)``. There are no mixing-coefficient
+    hooks. See ``docs/features/steering.md`` § "Hyper-Connection Steering
+    (Qwen4Exp)".
+    """
+    schema = default_hook_schema(hidden_size, dtype)
+    stream = HookSchema(hc_count * hidden_size, dtype, (hc_count, hidden_size))
+    for hook in ("mhc_streams_pre_attn", "mhc_streams_pre_mlp", "mhc_streams_final"):
+        schema[hook] = stream
+    return schema
+
+
+def build_model_hook_schema(
+    hidden_size: int,
+    dtype: torch.dtype,
+    hf_config: Any,
+    hf_text_config: Any,
+) -> dict[str, HookSchema]:
+    """Resolve a model's hook schema from its HF configs.
+
+    DeepSeek-V4 exposes ``hc_mult`` on ``hf_config``; Qwen4Exp exposes
+    ``hc_count`` on its text config. Every other model gets the standard
+    residual hooks.
+    """
+    hc_mult = getattr(hf_config, "hc_mult", None)
+    if hc_mult is not None:
+        return build_hook_schema(hidden_size, dtype, hc_mult)
+    if getattr(hf_text_config, "model_type", None) == _QWEN4_EXP_TEXT_MODEL_TYPE:
+        return hyperconnection_hook_schema(
+            hidden_size, dtype, int(hf_text_config.hc_count)
+        )
+    return default_hook_schema(hidden_size, dtype)
+
+
 # ---------------------------------------------------------------------------
 # CaptureChunk and CaptureFinalize
 # ---------------------------------------------------------------------------
