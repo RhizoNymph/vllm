@@ -29,6 +29,7 @@ from vllm.config.steering_types import (
     SteeringClamps,
     SteeringLayerEntry,
     SteeringVectorSpec,
+    expand_steering_spec_layers,
     hash_steering_config,
     normalize_layer_entry,
     resolve_effective_clamps,
@@ -964,14 +965,8 @@ class SamplingParams(
                 f"patch must be a list of site dicts, got {type(patch).__name__}"
             )
         n_rows = self._validate_patch_vectors_table()
+        patch = self.patch = self._expand_patch_layers(patch)
         for i, entry in enumerate(patch):
-            if not isinstance(entry, dict):
-                raise ValueError(
-                    f"patch[{i}] must be a dict, got {type(entry).__name__}"
-                )
-            for req_field in ("layer", "hook", "dest_position"):
-                if req_field not in entry:
-                    raise ValueError(f"patch[{i}] missing required key {req_field!r}")
             if not isinstance(entry["layer"], int):
                 raise ValueError(f"patch[{i}]['layer'] must be an int")
             if not isinstance(entry["hook"], str):
@@ -983,6 +978,39 @@ class SamplingParams(
                 raise ValueError(f"patch[{i}]['alpha'] must be a number")
             self._validate_patch_source_kind(i, entry, n_rows)
             self._validate_patch_mask(i, entry.get("mask"), n_rows)
+
+    @staticmethod
+    def _expand_patch_layers(patch: list) -> list:
+        """One entry per site: on a looped model ``layer`` (an index, or
+        ``"L@p"``) with an optional ``pass`` targets loop pass ``p``, a plain
+        index every pass (``vllm.config.loop_layers``); the result's
+        ``layer`` is the site's layer key and carries no ``pass``.
+        Idempotent."""
+        from vllm.config.loop_layers import expand_layer_key
+
+        out: list = []
+        changed = False
+        for i, entry in enumerate(patch):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"patch[{i}] must be a dict, got {type(entry).__name__}"
+                )
+            for req_field in ("layer", "hook", "dest_position"):
+                if req_field not in entry:
+                    raise ValueError(f"patch[{i}] missing required key {req_field!r}")
+            layer = entry["layer"]
+            if isinstance(layer, bool) or not isinstance(layer, (int, str)):
+                raise ValueError(f"patch[{i}]['layer'] must be an int")
+            keys = expand_layer_key(
+                layer, entry.get("pass"), label=f"patch[{i}]['layer']"
+            )
+            if keys == [layer] and "pass" not in entry:
+                out.append(entry)
+                continue
+            changed = True
+            base = {k: v for k, v in entry.items() if k != "pass"}
+            out.extend({**base, "layer": key} for key in keys)
+        return out if changed else patch
 
     def _validate_patch_source_kind(
         self, i: int, entry: dict, n_rows: int | None
@@ -1408,6 +1436,18 @@ class SamplingParams(
             if not isinstance(ref, tuple):
                 self.steering_module_ref = (ref[0], float(ref[1]))
 
+        # Rewrite layer keys to the model's layer keys: on a looped model a
+        # plain index targets every loop pass and ``"L@p"`` one pass
+        # (``vllm.config.loop_layers``). Idempotent, so re-validation in
+        # every process a request crosses is safe.
+        for name in (
+            "steering_vectors",
+            "prefill_steering_vectors",
+            "decode_steering_vectors",
+        ):
+            spec = getattr(self, name)
+            if isinstance(spec, dict):
+                setattr(self, name, expand_steering_spec_layers(spec, name))
         fields_to_check: list[tuple[str, SteeringVectorSpec | None]] = [
             ("steering_vectors", self.steering_vectors),
             ("prefill_steering_vectors", self.prefill_steering_vectors),

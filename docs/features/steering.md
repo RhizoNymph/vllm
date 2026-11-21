@@ -171,9 +171,19 @@ hooked per implementation, so coverage can differ by platform:
   `hf_config.hc_mult`, so the GLM-5.3 VL wrapper and single-stream GLM / HY
   configurations get a mismatched capture schema (known gap).
 
+- `inkling2` — serves `Inkling2ForConditionalGeneration` (Inkling 2 Small) and
+  `Inkling2LoopForConditionalGeneration` (Inkling 2 Mini, looped). NVIDIA only
+  (the package has no other implementation), all backends (native NVFP4 /
+  MXFP8 on SM90+, quant-method / GGUF / BF16 on SM8x), full five-hook set
+  with one site per layer *visit*. Block attention residuals replace the
+  residual stream with the running block state; configuring steering,
+  patching, or capture runs the unfused short convs and AttnRes mixes so
+  each hook edits what the next sublayer reads. See
+  [Looped Models](#looped-models-inkling-2-mini).
+
 Not hooked: `deepseek_v32` (`DeepseekV32ForCausalLM`, `GlmMoeDsaForCausalLM`)
-and `dots3_note`, whose decoder layers never carried hooks; `inkling`,
-`minimax_m3`; and `inkling2`, which is wired separately.
+and `dots3_note`, whose decoder layers never carried hooks; `inkling` and
+`minimax_m3`.
 
 End-to-end tested with real weights:
 
@@ -594,6 +604,76 @@ a bitwise no-op.
   not captured.
 - Without steering, patching, or capture configured, the layers run
   upstream's forward unchanged.
+
+## Looped Models (Inkling 2 Mini)
+
+Inkling 2 Mini runs its core layers 6-17 three times per token (a prelude,
+three passes of the core, a coda: 48 layer visits). Every visit is its own
+intervention site with its own steering rows, clamp directions, patch slots,
+SAE slots and capture rows; the per-token index / gate buffers are shared.
+
+**Addressing.** Wherever a layer index is accepted (per-request vectors and
+clamps in dict or packed `layer_indices` form, global set, named modules,
+patch entries, SAE clamp specs):
+
+| Reference | Targets |
+|---|---|
+| `7` (plain index) | every pass of layer 7 (all three visits) |
+| `"7@1"` | layer 7 in pass 1 only (passes are 0-based) |
+| `{"layer": 7, "pass": 1}` | same, in list-shaped specs (patch entries) |
+| `20`, `"20@0"` | coda layer 20 (prelude / coda layers have only pass 0) |
+
+An all-pass entry and a pass entry for the same layer compose: vectors add,
+clamp rows concatenate, SAE clamp entries concatenate (a feature at most
+once per site). Non-looped models reject a pass index (400); `"7@3"` (no
+such pass) and `"3@1"` (layer outside the core) are rejected too.
+
+**Layer keys.** Ingestion rewrites references to integer *layer keys*: `L`
+for a prelude / coda layer, `L + (p + 1) * 24` for core layer `L` in pass
+`p` (layer 7: 31, 55, 79). They are what `/v1/steering/layers` lists, what
+capture results and capture file names (`55_post_block.bin`) use, and what
+SAE manifests name their sites by (an SAE is trained on one visit, so a
+core layer must be named with its pass, `"7@1"`, and its weight file is the
+site file of key 55). The rewrite is idempotent, so specs re-validated in
+every process stay stable. `vllm.config.loop_layers.LoopLayerSpace.decode`
+maps a key back to `(layer, pass)`.
+
+**Hook semantics** (`vllm/models/inkling2/interventions.py`). Inkling2 has
+no single residual stream: block attention residuals keep completed blocks
+plus the running block, and every sublayer reads a softmax mix of them. The
+residual hooks act on the running block state `h`:
+
+- `pre_attn`: `h` entering the visit (at a block's first layer, the block
+  just completed, which every later mix reads);
+- `post_attn`: `h + attn_out` (`attn_out` alone at a block's first layer),
+  `attn_out` after its short conv;
+- `post_block`: `h` leaving the visit;
+- `mlp_in`: the normalized MoE input, after the loop message blend in
+  passes 1-2;
+- `mlp_out`: the MoE output before the MLP short conv.
+
+The three residual hooks share one space, so a captured vector can be fed
+back as a steering vector at any of them. Edits are written back as deltas,
+so a zero vector (or an inactive row) is an exact no-op. Each pass restarts
+from the prelude's `post_block` state of layer 5: a pass-0 edit reaches
+passes 1-2 only through the cross-pass messages (and through later
+passes' reads of the per-pass KV / conv caches it changed for later tokens).
+The gated cross-pass messages are **not** separate sites: they are fp32
+mixes of the previous pass's blocks (already captured at that pass's
+`post_block`), blended into `pre_attn`'s attention inputs and `mlp_in`.
+
+**Memory and graphs.** Per-row tables are per site (48 instead of 24 on
+Mini); at `hidden_size` 2304 that is ~4.6 KB per row and hook per site,
+small next to the per-pass KV caches. Per-token buffers are shared across
+sites. Sites are static `nn.Module`s and the hooks are the usual custom ops,
+so breakable CUDA graphs and the per-pass caches are unaffected; the
+unfused path is chosen once per process (when steering, patching, or
+capture is configured).
+
+**Not covered yet:** the Rust frontend forwards plain indices (all passes)
+but has no `"L@p"` form (its packed `layer_indices` are `u32`); capture
+requests select layers, not passes (every pass of a requested layer is
+captured).
 
 ## Global Steering API
 

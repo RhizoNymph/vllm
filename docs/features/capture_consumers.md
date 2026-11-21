@@ -541,6 +541,16 @@ happens at admission time; an invalid spec (unknown consumer, bad
 layout, out-of-range layer, …) returns HTTP 400 with a descriptive
 error.
 
+## Looped Models
+
+On looped models (Inkling 2 Mini) a requested layer is captured at every
+visit, one row per (layer, pass), each under its *layer key*: `L` for a
+prelude / coda layer, `L + (p + 1) * num_hidden_layers` for core layer `L`
+in pass `p` (Mini: layer 7 is captured as 31, 55, 79, e.g.
+`55_post_block.bin`). Layer selectors take plain indices; see
+[Looped Models](steering.md#looped-models-inkling-2-mini) for the hook
+semantics and `vllm.config.loop_layers` for the key mapping.
+
 ## Reading Results
 
 On request completion, `RequestOutput.capture_results` is a

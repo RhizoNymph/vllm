@@ -34,8 +34,7 @@ from vllm.distributed.ec_transfer.ec_connector.encoder_output_width import (
     measure_encoder_output_widths,
 )
 from vllm.envs import enable_envs_cache
-from vllm.exceptions import SteeringVectorError
-from vllm.exceptions import VLLMValidationError
+from vllm.exceptions import SteeringVectorError, VLLMValidationError
 from vllm.logger import configure_logging, init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
@@ -166,6 +165,11 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        # Per-(layer, pass) intervention keys of looped models, for the
+        # request specs this process re-validates on decode.
+        from vllm.config.loop_layers import install_loop_layer_space_from_config
+
+        install_loop_layer_space_from_config(vllm_config.model_config)
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",

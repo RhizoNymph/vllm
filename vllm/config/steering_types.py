@@ -21,11 +21,12 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import Counter
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 import msgspec
 import numpy as np
-from typing_extensions import NotRequired
+
+from vllm.config.loop_layers import expand_layer_key, expand_layer_map
 
 if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
@@ -39,7 +40,10 @@ if TYPE_CHECKING:
 # transparently without widening this alias.
 SteeringLayerEntry = list[float] | dict[str, Any]
 
-# Full spec: {hook_point_name: {layer_idx: SteeringLayerEntry}}
+# Full spec: {hook_point_name: {layer_idx: SteeringLayerEntry}}. On looped
+# models a layer key may also be ``"L@p"`` (layer ``L``, loop pass ``p``); a
+# plain index targets every pass (``vllm.config.loop_layers``). Ingestion
+# rewrites keys to integer layer keys.
 SteeringVectorSpec = dict[str, dict[int, SteeringLayerEntry]]
 
 
@@ -53,7 +57,9 @@ SteeringVectorSpec = dict[str, dict[int, SteeringLayerEntry]]
 class SteeringHookPacked(TypedDict):
     dtype: str  # "float32" | "float16" | "bfloat16"
     shape: list[int]  # [num_layers_in_blob, hidden_size]
-    layer_indices: list[int]  # which layer each row corresponds to
+    # Which layer each row corresponds to; ``"L@p"`` targets loop pass ``p``
+    # of layer ``L`` on looped models (a plain index targets every pass).
+    layer_indices: list[int | str]
     data: str  # base64-encoded contiguous bytes
     # Optional per-row scales matching ``layer_indices``.  When set,
     # each row is multiplied by its scale at decode.  Mirrors the
@@ -124,7 +130,8 @@ SteeringClampSpec = dict[str, dict[int, list[ClampEntry]]]
 class ClampHookPacked(TypedDict):
     dtype: str  # "float64" | "float32" | "float16" | "bfloat16"
     shape: list[int]  # [n, hidden]
-    layer_indices: list[int]  # layer for each of the n rows (repeats allowed)
+    # Layer for each of the n rows (repeats allowed; ``"L@p"`` on looped models).
+    layer_indices: list[int | str]
     data: str  # base64-encoded contiguous [n, hidden] bytes
     bounds: list[list[float | None]]  # [[lo, hi], ...] len n; null -> ±inf
     strengths: list[float]  # len n
@@ -580,24 +587,16 @@ class SteeringClamps(
                 )
             layers: dict[int, list] = {}
             for layer_key, entries in layer_entries.items():
-                layer_idx = layer_key
-                if isinstance(layer_idx, str) and layer_idx.isdigit():
-                    layer_idx = int(layer_idx)
-                if (
-                    not isinstance(layer_idx, int)
-                    or isinstance(layer_idx, bool)
-                    or layer_idx < 0
-                ):
-                    raise ValueError(
-                        f"{field_name}[{hook!r}] has invalid layer index "
-                        f"{layer_key!r}; expected a non-negative integer"
-                    )
                 if not isinstance(entries, list):
                     raise ValueError(
-                        f"{field_name}[{hook!r}][{layer_idx}] must be a list "
+                        f"{field_name}[{hook!r}][{layer_key}] must be a list "
                         f"of clamp entries, got {type(entries).__name__}"
                     )
-                layers[layer_idx] = entries
+                # A plain index on a looped model targets every pass; an
+                # ``"L@p"`` key one pass. Entries landing on one site
+                # concatenate (all-pass rows first, in key order).
+                for layer_idx in _expand_clamp_layer(layer_key, field_name, hook):
+                    layers.setdefault(layer_idx, []).extend(entries)
             rows: list[np.ndarray] = []
             layer_indices: list[int] = []
             lo: list[float] = []
@@ -661,14 +660,28 @@ class SteeringClamps(
                 lo_raw, hi_raw = pair
                 lo.append(-math.inf if lo_raw is None else float(lo_raw))
                 hi.append(math.inf if hi_raw is None else float(hi_raw))
+            strengths = [float(v) for v in blob["strengths"]]
+            # One row per site a row's layer key targets (every pass for a
+            # plain index on a looped model).
+            row_ids: list[int] = []
+            layer_indices: list[int] = []
+            for row, layer_key in enumerate(blob["layer_indices"]):
+                for layer_idx in _expand_clamp_layer(layer_key, field_name, hook):
+                    row_ids.append(row)
+                    layer_indices.append(layer_idx)
+            if len(row_ids) != n:
+                stacked = stacked[row_ids]
+                lo = [lo[r] for r in row_ids]
+                hi = [hi[r] for r in row_ids]
+                strengths = [strengths[r] for r in row_ids]
             try:
                 hooks[hook] = ClampHookTable(
-                    shape=[n, hidden],
-                    layer_indices=[int(v) for v in blob["layer_indices"]],
+                    shape=[len(row_ids), hidden],
+                    layer_indices=layer_indices,
                     data=np.ascontiguousarray(stacked).tobytes(),
                     lo=lo,
                     hi=hi,
-                    strength=[float(v) for v in blob["strengths"]],
+                    strength=strengths,
                 )
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{field_name}[{hook!r}]: {exc}") from exc
@@ -736,6 +749,69 @@ class SteeringClamps(
         )
 
 
+def _expand_clamp_layer(layer_key: object, field_name: str, hook: str) -> list[int]:
+    """Layer keys of a clamp site reference (``ValueError`` on a bad one)."""
+    if isinstance(layer_key, bool):
+        raise ValueError(
+            f"{field_name}[{hook!r}] has invalid layer index {layer_key!r}; "
+            "expected a non-negative integer"
+        )
+    try:
+        return expand_layer_key(layer_key, label=f"{field_name}[{hook!r}] layer")
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name}[{hook!r}] has invalid layer index {layer_key!r}; "
+            f"expected a non-negative integer ({exc})"
+        ) from exc
+
+
+def _sum_layer_entries(
+    first: SteeringLayerEntry | np.ndarray, second: SteeringLayerEntry | np.ndarray
+) -> np.ndarray:
+    """Additive merge of two entries landing on one site (``"7"`` and
+    ``"7@1"``), scales applied."""
+    vec_a, scale_a = normalize_layer_entry(first)
+    vec_b, scale_b = normalize_layer_entry(second)
+    a = np.asarray(vec_a, dtype=np.float64)
+    b = np.asarray(vec_b, dtype=np.float64)
+    if a.shape != b.shape:
+        raise ValueError(
+            f"steering entries for one site have widths {a.shape} and {b.shape}"
+        )
+    return a * scale_a + b * scale_b
+
+
+def expand_steering_spec_layers(
+    spec: dict | None, field_name: str = "steering_vectors"
+) -> dict | None:
+    """``spec`` with its layer keys rewritten to layer keys
+    (``vllm.config.loop_layers``): ``"L@p"`` targets one loop pass, a plain
+    index every pass of a looped model; entries landing on one site add.
+
+    Idempotent, and the identity (same object) for a non-looped model with
+    integer keys, so it can run at every ingestion seam.
+    """
+    if not spec:
+        return spec
+    out: dict = {}
+    changed = False
+    for hook, layers in spec.items():
+        if not isinstance(layers, dict):
+            out[hook] = layers
+            continue
+        try:
+            expanded = expand_layer_map(
+                layers, _sum_layer_entries, label=f"{field_name}[{hook!r}] layer"
+            )
+        except ValueError as exc:
+            raise ValueError(f"{field_name}[{hook!r}]: {exc}") from exc
+        changed |= expanded.keys() != layers.keys() or any(
+            expanded[k] is not layers.get(k) for k in expanded
+        )
+        out[hook] = expanded
+    return out if changed else spec
+
+
 def _looks_packed(tier: dict) -> bool:
     """Detect whether *tier* is the binary ``SteeringVectorSpecPacked`` shape.
 
@@ -795,19 +871,15 @@ def coerce_steering_spec(
                 f"Steering tier {hook!r} must map layer indices to entries, "
                 f"got {type(layer_vecs).__name__}"
             )
-        coerced_layers: dict[int, list[float] | dict] = {}
-        for layer_key, entry in layer_vecs.items():
-            if isinstance(layer_key, int):
-                coerced_layers[layer_key] = entry
-                continue
-            try:
-                coerced_layers[int(layer_key)] = entry
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Steering tier {hook!r} has invalid layer index "
-                    f"{layer_key!r}; expected an integer"
-                ) from exc
-        result[hook] = coerced_layers
+        try:
+            result[hook] = expand_layer_map(
+                layer_vecs, _sum_layer_entries, label=f"Steering tier {hook!r} layer"
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Steering tier {hook!r} has invalid layer index: {exc}; "
+                "expected an integer (or 'layer@pass' on a looped model)"
+            ) from exc
     return result
 
 
@@ -856,24 +928,33 @@ def unpack_steering_vectors(
             )
         stacked = np.frombuffer(raw, dtype=dtype).reshape(shape)
         scales = blob.get("scales")
-        if scales is None:
-            result[hook] = {int(idx): stacked[i] for i, idx in enumerate(layer_indices)}
-            continue
-        if len(scales) != len(layer_indices):
+        if scales is not None and len(scales) != len(layer_indices):
             raise ValueError(
                 f"SteeringHookPacked.scales length ({len(scales)}) must equal "
                 f"layer_indices length ({len(layer_indices)})"
             )
         rows: dict[int, np.ndarray] = {}
+        # A repeated identical index keeps the last row (legacy); distinct
+        # references landing on one site (``7`` and ``"7@1"``) add.
+        origin: dict[int, object] = {}
         for i, idx in enumerate(layer_indices):
-            s = float(scales[i])
-            if s == 1.0:
-                rows[int(idx)] = stacked[i]
-            else:
+            row = stacked[i]
+            s = 1.0 if scales is None else float(scales[i])
+            if s != 1.0:
                 # ``stacked[i] * dtype.type(s)`` keeps the result in
                 # the source dtype (Python float scalar would promote
                 # to float64).
-                rows[int(idx)] = stacked[i] * dtype.type(s)
+                row = stacked[i] * dtype.type(s)
+            # ``"L@p"`` targets one loop pass, a plain index every pass of
+            # a looped model; rows landing on one site add.
+            for key in expand_layer_key(
+                idx, label=f"SteeringHookPacked[{hook!r}].layer_indices"
+            ):
+                if key in rows and origin[key] != idx:
+                    rows[key] = rows[key] + row
+                else:
+                    rows[key] = row
+                origin[key] = idx
         result[hook] = rows
     return result
 
@@ -936,6 +1017,7 @@ def steering_vector_content_digest(packed: SteeringVectorSpecPacked) -> str:
 
     Returns:
         The lowercase hex sha256 digest of the canonical serialization.
+
     """
     import json
 

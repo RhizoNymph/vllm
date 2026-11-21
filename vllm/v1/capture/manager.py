@@ -45,6 +45,7 @@ from typing import Any, cast
 
 import torch
 
+from vllm.config.loop_layers import expand_layer_list, get_loop_layer_space
 from vllm.v1.capture.activation_store import (
     activation_key,
     get_active_activation_store,
@@ -67,6 +68,7 @@ from vllm.v1.capture.types import (
     VllmInternalRequestId,
     captured_prompt_positions,
     default_hook_schema,
+    expand_capture_spec,
 )
 
 logger = logging.getLogger(__name__)
@@ -345,6 +347,20 @@ class CaptureManager:
             not getattr(getattr(s, "_consumer", s), "needs_payload", True)
             for s in consumers
         )
+        # A looped model taps one site per (layer, pass): a requested layer
+        # captures every visit, each under its own layer key
+        # (``vllm.config.loop_layers``).
+        self._loop_space = space = get_loop_layer_space()
+        consumer_specs = tuple(expand_capture_spec(s, space) for s in consumer_specs)
+        extra_global_specs = tuple(
+            expand_capture_spec(s, space) for s in extra_global_specs
+        )
+        if graphsafe_keys is not None and space is not None:
+            graphsafe_keys = [
+                (key, hook)
+                for layer, hook in graphsafe_keys
+                for key in expand_layer_list([layer], space)
+            ]
         self._consumer_specs = consumer_specs
         # ``num_hidden_layers`` is the GLOBAL layer count (across all
         # pipeline stages); client/global specs reference global layer
@@ -355,7 +371,10 @@ class CaptureManager:
         # this range at registration so each stage captures and finalizes
         # only its own layers; ``None`` means the whole model (no PP).
         if local_layer_range is None:
-            self._local_layer_range = (0, num_hidden_layers)
+            self._local_layer_range = (
+                0,
+                num_hidden_layers if space is None else space.num_keys,
+            )
         else:
             start, end = local_layer_range
             if not (0 <= start <= end <= num_hidden_layers):
@@ -487,11 +506,14 @@ class CaptureManager:
         # row signature. During steady-state decode the signature repeats every
         # step (each request captures its one new token at a fixed buffer row),
         # so we reuse the device tensors and skip the per-step H2D entirely.
-        self._gather_cache: tuple[
-            tuple[tuple[tuple[int, str], tuple[int, ...]], ...],
-            dict[tuple[int, str], "torch.Tensor"],
-            dict[tuple[int, str], "torch.Tensor"],
-        ] | None = None
+        self._gather_cache: (
+            tuple[
+                tuple[tuple[tuple[int, str], tuple[int, ...]], ...],
+                dict[tuple[int, str], torch.Tensor],
+                dict[tuple[int, str], torch.Tensor],
+            ]
+            | None
+        ) = None
         # Metadata fast-path row accumulator: req_id -> {(consumer, layer, hook)
         # -> total rows}. The per-step fan-out just increments counts (no chunk
         # objects, no submit); one meta chunk per key is flushed at finalize on
@@ -722,6 +744,11 @@ class CaptureManager:
         if not merged:
             # None of the requested layers live on this stage.
             return
+        if self._loop_space is not None:
+            merged = {
+                i: expand_capture_spec(spec, self._loop_space)
+                for i, spec in merged.items()
+            }
 
         position_kind: dict[int, str] = {}
         static_positions: dict[int, list[int] | None] = {}

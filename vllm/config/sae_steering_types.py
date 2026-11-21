@@ -254,6 +254,44 @@ class SAEClampSpec:
         object.__setattr__(self, "clamps", coerced)
 
 
+def _expand_sae_layer_keys(layer_map_raw: dict, label: str) -> dict:
+    """Rewrite SAE clamp layer keys to layer keys: on a looped model
+    ``"L@p"`` targets loop pass ``p`` and a plain index every pass
+    (``vllm.config.loop_layers``); entries landing on one site concatenate
+    (a feature may still appear once per site). Idempotent."""
+    from vllm.config.loop_layers import expand_layer_map
+
+    def concat(first, second):
+        if not isinstance(first, (list, tuple)) or not isinstance(
+            second, (list, tuple)
+        ):
+            raise ValueError(f"{label}: clamp entries must be lists")
+        return [*first, *second]
+
+    from vllm.config.loop_layers import LoopLayerKeyError, parse_layer_key
+
+    where = label.removesuffix(" layer")
+    references: set[tuple[int, int | None]] = set()
+    for layer_key in layer_map_raw:
+        try:
+            reference = parse_layer_key(layer_key, label)
+        except LoopLayerKeyError as exc:
+            raise ValueError(
+                f"{where} has invalid layer key {layer_key!r}; expected an "
+                f"integer. ({exc})"
+            ) from exc
+        if reference in references:
+            raise ValueError(
+                f"{where} contains duplicate layer key {layer_key!r} after "
+                "integer normalization."
+            )
+        references.add(reference)
+    try:
+        return expand_layer_map(layer_map_raw, concat, label=label)
+    except LoopLayerKeyError as exc:
+        raise ValueError(f"{where}: {exc}") from exc
+
+
 def coerce_sae_clamp_specs(
     raw: object,
 ) -> tuple[SAEClampSpec, ...] | None:
@@ -331,6 +369,9 @@ def coerce_sae_clamp_specs(
                     f"be a dict mapping layer indices to entry lists, got "
                     f"{type(layer_map_raw).__name__}."
                 )
+            layer_map_raw = _expand_sae_layer_keys(
+                layer_map_raw, f"sae_clamp_specs[{i}]['clamps'][{hook_name!r}] layer"
+            )
             layer_map: SAEClampLayerMap = {}
             for layer_key, entries_raw in layer_map_raw.items():
                 if type(layer_key) is int:
@@ -759,6 +800,10 @@ def coerce_sae_full_reconstruction_specs(
                     f"[{hook_name!r}] must be a dict mapping layer indices "
                     f"to entry lists, got {type(layer_map_raw).__name__}."
                 )
+            layer_map_raw = _expand_sae_layer_keys(
+                layer_map_raw,
+                f"sae_full_reconstruction_specs[{i}]['clamps'][{hook_name!r}] layer",
+            )
             layer_map: SAEClampLayerMap = {}
             for layer_key, entries_raw in layer_map_raw.items():
                 # Guarded str->int layer-key coercion, matching

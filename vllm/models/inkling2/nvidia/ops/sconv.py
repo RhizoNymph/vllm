@@ -25,6 +25,11 @@ RMS-normalizes V per head and writes both to the paged KV cache.
 import torch
 
 from vllm.models.inkling2.nvidia.ops.norm import qr_clip_rel_tokens, rsqrt
+from vllm.models.inkling2.nvidia.ops.pdl import (
+    LAUNCH_PDL,
+    gdc_launch_dependents,
+    gdc_wait,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -248,7 +253,7 @@ def _conv(
         cached1 = _cached_tap(*taps, 2)
         cached2 = _cached_tap(*taps, 1)
         cached3 = _cached_tap(*taps, 0)
-        tl.extra.cuda.gdc_wait()
+        gdc_wait()
 
     dtype = cache_ptr.dtype.element_ty
     cur = tl.load(x_ptr + toff[:, None] * stride_x + coff[None, :], mask=tc_mask)
@@ -335,7 +340,7 @@ def _sconv_kernel(
     first = tl.program_id(0) * BT
     tile_reads_cache = True
     if SKIP_IDLE_CACHE:
-        tl.extra.cuda.gdc_wait()
+        gdc_wait()
         # Request starts are non-decreasing: no token of the tile is among the
         # first W - 1 of its request unless the last token's request starts
         # after first - (W - 1).
@@ -458,7 +463,7 @@ def short_conv(
         SKIP_IDLE_CACHE=prefill,
         num_warps=4,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=LAUNCH_PDL,
     )
     return out
 
@@ -552,14 +557,15 @@ def _attn_prologue_kernel(
     BLOCK_HQ: tl.constexpr,
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
+    FUSE_QR: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     # The decode attention kernel prefetches cached keys meanwhile.
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_launch_dependents()
     # Programs (tile, head, 0 | 1) run the K | V conv of one KV head; programs
     # (tile, head, 2) clip q of QR_TOKENS of the tile's tokens and programs
     # (tile, head, 3 + c) their r and column block c of the relative logits.
-    if tl.program_id(2) >= 2:
+    if FUSE_QR and tl.program_id(2) >= 2:
         if tl.program_id(1) * QR_TOKENS < BT:
             qr_clip_rel_tokens(
                 tl.program_id(0) * BT + tl.program_id(1) * QR_TOKENS,
@@ -634,6 +640,72 @@ def _attn_prologue_kernel(
             DYNAMIC,
             BT,
         )
+
+
+@triton.jit
+def _qr_rel_kernel(
+    q_ptr,
+    r_ptr,
+    q_scale_ptr,
+    r_scale_ptr,
+    tau_ptr,
+    rel_proj_ptr,
+    q_out_ptr,
+    rel_out_ptr,
+    seq_idx_ptr,
+    cu_seqlens_q_ptr,
+    seq_lens_ptr,
+    T,
+    stride_q,
+    stride_r,
+    clip_threshold,
+    rel_threshold,
+    clip_eps,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    D_REL: tl.constexpr,
+    E: tl.constexpr,
+    SHIFT_W: tl.constexpr,
+    HAS_TAU: tl.constexpr,
+    BLOCK_HQ: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    QR_TOKENS: tl.constexpr,
+):
+    # Runs alongside the K/V conv launch (`_attn_prologue_kernel` without
+    # FUSE_QR), which started it after its own grid dependency wait; waiting
+    # for that launch before exiting keeps the KV cache written for the
+    # attention that follows.
+    qr_clip_rel_tokens(
+        tl.program_id(0) * QR_TOKENS,
+        QR_TOKENS,
+        tl.program_id(1) - 1,
+        T,
+        q_ptr,
+        r_ptr,
+        q_scale_ptr,
+        r_scale_ptr,
+        tau_ptr,
+        rel_proj_ptr,
+        q_out_ptr,
+        rel_out_ptr,
+        seq_idx_ptr,
+        cu_seqlens_q_ptr,
+        seq_lens_ptr,
+        stride_q,
+        stride_r,
+        clip_threshold,
+        rel_threshold,
+        clip_eps,
+        HQ,
+        D,
+        D_REL,
+        E,
+        SHIFT_W,
+        HAS_TAU,
+        BLOCK_HQ,
+        BLOCK_E,
+    )
+    gdc_wait()
 
 
 @triton.jit
@@ -746,6 +818,22 @@ def _kv_conv_tile(
     tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
 
 
+# From this many tokens, q/r run in their own launch (8 tokens per program)
+# beside the K/V convs (8 per program): the fused launch's one-token q/r
+# programs dominate prefill.
+_PROLOGUE_SPLIT_MIN_TOKENS = 2048
+
+
+def _prologue_block_t(num_tokens: int) -> int:
+    return 8 if num_tokens >= _PROLOGUE_SPLIT_MIN_TOKENS else 4
+
+
+def _prologue_qr_tokens(num_tokens: int) -> int:
+    """Tokens per program of the separate q/r launch, or 0 to run q/r in the
+    K/V conv launch."""
+    return 8 if num_tokens >= _PROLOGUE_SPLIT_MIN_TOKENS else 0
+
+
 def attention_prologue(
     q: torch.Tensor,
     r: torch.Tensor,
@@ -824,8 +912,14 @@ def attention_prologue(
     else:
         width = k_weight.shape[1]
         dyn_strides = (0, 0)
-    block_t = 4
-    grid = (triton.cdiv(num_tokens, block_t), num_heads, 3 + (extent + 256) // block_e)
+    block_t = _prologue_block_t(num_tokens)
+    qr_tokens = _prologue_qr_tokens(num_tokens)
+    qr_blocks = 1 + (extent + 256) // block_e
+    grid = (
+        triton.cdiv(num_tokens, block_t),
+        num_heads,
+        2 + (0 if qr_tokens else qr_blocks),
+    )
     _attn_prologue_kernel[grid](
         k,
         v,
@@ -888,7 +982,40 @@ def attention_prologue(
         BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
         BLOCK_E=block_e,
         QR_TOKENS=triton.cdiv(block_t, num_heads),
+        FUSE_QR=not qr_tokens,
         num_warps=4,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=LAUNCH_PDL,
     )
+    if qr_tokens:
+        _qr_rel_kernel[(triton.cdiv(num_tokens, qr_tokens), qr_blocks)](
+            q,
+            r,
+            q_scale,
+            r_scale,
+            tau,
+            rel_proj,
+            q_out,
+            rel_out,
+            seq_idx,
+            cu_seqlens_q,
+            seq_lens,
+            num_tokens,
+            q.stride(0),
+            r.stride(0),
+            clip_threshold,
+            rel_threshold,
+            clip_eps,
+            HQ=num_q_heads,
+            D=head_dim,
+            D_REL=d_rel,
+            E=extent,
+            SHIFT_W=rel_proj.shape[2],
+            HAS_TAU=tau is not None,
+            BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
+            BLOCK_E=block_e,
+            QR_TOKENS=qr_tokens,
+            num_warps=4,
+            enable_fp_fusion=False,
+            launch_pdl=LAUNCH_PDL,
+        )

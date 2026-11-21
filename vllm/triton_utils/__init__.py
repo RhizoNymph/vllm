@@ -20,7 +20,7 @@ else:
     triton = TritonPlaceholder()
     tl = TritonLanguagePlaceholder()
     tldevice = TritonLanguagePlaceholder()
-    gluon = TritonLanguagePlaceholder()
+    gluon = TritonPlaceholder()
     gl = TritonLanguagePlaceholder()
     aggregate = TritonLanguagePlaceholder()
 

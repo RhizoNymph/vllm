@@ -49,6 +49,11 @@ class InputProcessor:
     ) -> None:
         self.vllm_config = vllm_config
         self.model_config = model_config = vllm_config.model_config
+        # Per-(layer, pass) intervention keys of looped models: request specs
+        # are rewritten to them at ingestion (``vllm.config.loop_layers``).
+        from vllm.config.loop_layers import install_loop_layer_space_from_config
+
+        install_loop_layer_space_from_config(model_config)
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.scheduler_config = vllm_config.scheduler_config

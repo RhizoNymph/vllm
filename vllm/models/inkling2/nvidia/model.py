@@ -6,6 +6,8 @@ Decoder layers are tied together by block attention residuals: instead of a
 single residual stream, each sublayer input is a learned softmax mix over the
 outputs of previous blocks of `n_layers_per_attn_res_block` layers plus the
 running partial block. Residual blocks are stored in bf16; mixes are fp32.
+
+Looped checkpoints (`loop_config`) are `Inkling2LoopModel` (`loop.py`).
 """
 
 from collections import Counter
@@ -24,6 +26,8 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.steering import SteeringHookPoint, apply_layer_steering
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -51,14 +55,21 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
 )
 
 from ..configs import Inkling2MMConfig, Inkling2ModelConfig
+from ..interventions import (
+    hook_branch,
+    hook_state,
+    interventions_configured,
+    make_intervention_sites,
+)
 from ..processing import (
     IMAGE_PLACEHOLDER,
     Inkling2DummyInputsBuilder,
     Inkling2MultiModalProcessor,
     Inkling2ProcessingInfo,
 )
-from ..quant_config import Inkling2QuantConfig
 from .attention import Inkling2Attention
+from .backend import Inkling2LayerQuant, cast_dense_weight, select_inkling2_backend
+from .experts_quant import Inkling2QuantMoE, load_quant_expert_weight
 from .lora import (
     LORA_NAME_PREFIXES,
     LORA_NAME_SUBSTRINGS,
@@ -69,10 +80,34 @@ from .moe import Inkling2MoE, QuantFormat
 from .ops.allreduce import Inkling2AllReduceWorkspace
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
+from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
 from .ops.norm import rms_norm
 from .ops.seq_parallel import SeqParallel
 from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
 from .vision import Inkling2VisionEncoder, VisionMetadata
+
+
+class Inkling2LogitsProcessor(LogitsProcessor):
+    """Use the low-M projection while preserving vocab gathering and softcaps."""
+
+    def _apply_head(self, lm_head, hidden_states, embedding_bias):
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            UnquantizedEmbeddingMethod,
+        )
+
+        if (
+            self.head_dtype == torch.float32
+            and isinstance(
+                lm_head.quant_method,
+                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+            )
+            and use_sm12x_bf16_gemv(hidden_states, lm_head.weight, embedding_bias)
+        ):
+            return sm12x_bf16_gemv(
+                hidden_states, lm_head.weight, embedding_bias, out_dtype=torch.float32
+            )
+        return super()._apply_head(lm_head, hidden_states, embedding_bias)
 
 
 class Inkling2RMSNorm(nn.Module):
@@ -135,31 +170,56 @@ class Inkling2AttnRes(nn.Module):
         param.data.copy_(weight.view(param.shape)).mul_(self.scale)
 
 
+def as_layer_quant(
+    quant: "Inkling2LayerQuant | QuantizationConfig | None",
+) -> Inkling2LayerQuant:
+    """The decoder backend of a quantization config (or an already
+    selected backend)."""
+    if isinstance(quant, Inkling2LayerQuant):
+        return quant
+    return select_inkling2_backend(quant, get_tensor_model_parallel_world_size())
+
+
 class Inkling2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Inkling2ModelConfig,
         layer_id: int,
-        quant_config: Inkling2QuantConfig | None,
+        quant_config: Inkling2LayerQuant | QuantizationConfig | None,
         prefix: str,
+        num_passes: int = 1,
     ) -> None:
+        """`num_passes > 1` (a loop core layer) gives each pass its own KV and
+        conv-state caches. `quant_config` is the checkpoint's quantization
+        config or the backend selected for it (`backend.py`)."""
         super().__init__()
+        quant = as_layer_quant(quant_config)
         self.is_local = layer_id in config.local_layer_ids
         num_kv_heads = (
             config.swa_num_key_value_heads
             if self.is_local
             else config.num_key_value_heads
         )
-        self.conv_state = InklingConvState(
-            num_kv_heads=num_kv_heads,
-            head_dim=config.swa_head_dim if self.is_local else config.head_dim,
-            hidden_size=config.hidden_size,
-            kernel_size=config.sconv_kernel_size,
-            prefix=f"{prefix}.conv_state",
-            replicate_hidden=True,
+        self.conv_states = tuple(
+            InklingConvState(
+                num_kv_heads=num_kv_heads,
+                head_dim=config.swa_head_dim if self.is_local else config.head_dim,
+                hidden_size=config.hidden_size,
+                kernel_size=config.sconv_kernel_size,
+                prefix=f"{prefix}.conv_state" + (f".pass{p}" if p else ""),
+                replicate_hidden=True,
+            )
+            for p in range(num_passes)
         )
+        self.conv_state = self.conv_states[0]
         self.attn = Inkling2Attention(
-            config, self.is_local, self.conv_state, prefix=f"{prefix}.attn"
+            config,
+            self.is_local,
+            self.conv_state,
+            prefix=f"{prefix}.attn",
+            pass_conv_states=self.conv_states[1:],
+            quant_config=quant.linear,
+            split_linears=quant.split_attention_linears,
         )
         eps = config.rms_norm_eps
         # Local layers: attn_norm; full layers: q/k/v_input_norm, stacked.
@@ -168,12 +228,21 @@ class Inkling2DecoderLayer(nn.Module):
             config.hidden_size, eps, num_inputs=self.num_attn_inputs
         )
         self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
-        expert_format: QuantFormat = (
-            "mxfp8"
-            if quant_config is not None and quant_config.is_mxfp8_layer(layer_id)
-            else "nvfp4"
-        )
-        self.mlp = Inkling2MoE(config, expert_format)
+        self.mlp: Inkling2MoE | Inkling2QuantMoE
+        if quant.uses_quant_method:
+            self.mlp = Inkling2QuantMoE(
+                config, quant.linear, f"{prefix}.mlp", config.layer_visit_ids(layer_id)
+            )
+        else:
+            native = quant.native
+            expert_format: QuantFormat = (
+                "mxfp8"
+                if native is not None and native.is_mxfp8_layer(layer_id)
+                else "nvfp4"
+            )
+            self.mlp = Inkling2MoE(
+                config, expert_format, config.layer_visit_ids(layer_id)
+            )
         self.attn_sconv, self.mlp_sconv = (
             Inkling2ShortConv(
                 config.hidden_size, config.sconv_kernel_size, self.conv_state, stream
@@ -187,36 +256,63 @@ class Inkling2DecoderLayer(nn.Module):
         inputs: Sequence[torch.Tensor],
         tau: torch.Tensor | None,
         out: torch.Tensor | None = None,
+        pass_idx: int = 0,
     ) -> torch.Tensor:
-        """This rank's partial attention output on the normalized `inputs`."""
-        if self.is_local:
-            return self.attn(positions, inputs[0], out=out)
-        return self.attn(positions, inputs[0], inputs[1], inputs[2], tau, out)
+        """This rank's partial attention output on the normalized `inputs`
+        (one for local layers, or separate q/k/v inputs)."""
+        if self.is_local and len(inputs) == 1:
+            return self.attn(positions, inputs[0], out=out, pass_idx=pass_idx)
+        return self.attn(
+            positions,
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            None if self.is_local else tau,
+            out,
+            pass_idx,
+        )
 
 
 class Inkling2Model(nn.Module):
+    # Whether TP > 1 keeps a token shard of the hidden stream for large
+    # batches (sequence parallel).
+    seq_parallel_paths = True
+
     def __init__(
         self,
         config: Inkling2ModelConfig,
-        quant_config: Inkling2QuantConfig | None,
+        quant_config: Inkling2LayerQuant | QuantizationConfig | None,
         prefix: str,
     ) -> None:
         super().__init__()
+        quant_config = self.quant = as_layer_quant(quant_config)
         self.config = config
         self.block_size = config.n_layers_per_attn_res_block
         self.normalize_values = config.attn_res_normalize_values
         self.embed_tokens = VocabParallelEmbedding(
-            config.padded_vocab_size, config.hidden_size
+            config.padded_vocab_size,
+            config.hidden_size,
+            quant_config=quant_config.linear,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.embed_norm = Inkling2RMSNorm(
             config.hidden_size, config.rms_norm_eps, out_dtype=None
         )
         self.layers = nn.ModuleList(
-            Inkling2DecoderLayer(config, i, quant_config, f"{prefix}.layers.{i}")
+            self._make_layer(config, i, quant_config, f"{prefix}.layers.{i}")
             for i in range(config.num_hidden_layers)
         )
         self.attn_res = Inkling2AttnRes(config)
         self.norm = Inkling2RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # One intervention site per layer visit (`interventions.py`); with
+        # steering, patching or capture configured the forward runs the
+        # unfused convs and mixes so every hook sees what the next
+        # sublayer reads.
+        vllm_config = get_current_vllm_config()
+        self.interventions = interventions_configured(vllm_config)
+        self.intervention_sites = make_intervention_sites(
+            config, vllm_config if self.interventions else None
+        )
         # Large batches keep a token shard of the hidden stream on each rank.
         self.allreduce_workspace = None
         self.seq_parallel = None
@@ -226,7 +322,7 @@ class Inkling2Model(nn.Module):
             self.allreduce_workspace = Inkling2AllReduceWorkspace.create(
                 group, config.hidden_size
             )
-            if self.allreduce_workspace is not None:
+            if self.allreduce_workspace is not None and self.seq_parallel_paths:
                 vllm_config = get_current_vllm_config()
                 spec = vllm_config.speculative_config
                 num_spec = 0 if spec is None else spec.num_speculative_tokens
@@ -239,6 +335,15 @@ class Inkling2Model(nn.Module):
         # Layers whose input (the partial block) the DSpark draft reads; layer
         # id num_hidden_layers stands for the final-norm output.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+    def _make_layer(
+        self,
+        config: Inkling2ModelConfig,
+        layer_id: int,
+        quant_config: Inkling2LayerQuant,
+        prefix: str,
+    ) -> Inkling2DecoderLayer:
+        return Inkling2DecoderLayer(config, layer_id, quant_config, prefix)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_norm(self.embed_tokens(input_ids))
@@ -258,6 +363,8 @@ class Inkling2Model(nn.Module):
     def forward(
         self, positions: torch.Tensor, inputs_embeds: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        if self.interventions:
+            return self._forward_interventions(positions, inputs_embeds)
         num_tokens, hidden = inputs_embeds.shape
         aux_hidden_states = []
         num_layers = len(self.layers)
@@ -290,13 +397,7 @@ class Inkling2Model(nn.Module):
         stack = stacked[:, : end - begin]
         stack[0].copy_(inputs_embeds[begin:end])
         num_blocks = 0
-        tau = None
-        if self.config.log_scaling_n_floor is not None:
-            tau = compute_log_scaling_tau(
-                positions,
-                self.config.log_scaling_n_floor,
-                self.config.log_scaling_alpha,
-            )
+        tau = self._log_scaling_tau(positions)
         # The fused MoE all-reduce also produces the next layer's inputs.
         inputs = None
         for i, layer in enumerate(self.layers):
@@ -434,6 +535,127 @@ class Inkling2Model(nn.Module):
             return out, [*aux_hidden_states, out]
         return out
 
+    def _forward_interventions(
+        self, positions: torch.Tensor, inputs_embeds: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """`forward` with the intervention hooks of `interventions.py`, on
+        unfused convs and mixes (all-reduced sublayer outputs, no sequence
+        parallel)."""
+        num_tokens, hidden = inputs_embeds.shape
+        max_blocks = -(-len(self.layers) // self.block_size)
+        stack = inputs_embeds.new_empty((max_blocks + 1, num_tokens, hidden))
+        stack[0].copy_(inputs_embeds)
+        tau = self._log_scaling_tau(positions)
+        aux_hidden_states = []
+        num_blocks = 0
+        for i in range(len(self.layers)):
+            if i in self.aux_hidden_state_layers:
+                aux_hidden_states.append(stack[num_blocks].clone())
+            num_blocks = self._hooked_visit(
+                i, 0, self.intervention_sites[i], stack, num_blocks, positions, tau
+            )
+        out = self._mix(
+            stack[:num_blocks], stack[num_blocks], self.attn_res.output_query, self.norm
+        )[0]
+        if self.aux_hidden_state_layers:
+            return out, [*aux_hidden_states, out]
+        return out
+
+    def _visit_attn_inputs(
+        self,
+        i: int,
+        layer: Inkling2DecoderLayer,
+        stack: torch.Tensor,
+        num_blocks: int,
+        bank: torch.Tensor | None,
+    ) -> tuple[Sequence[torch.Tensor], torch.Tensor | None]:
+        """The attention inputs of layer `i` from the block stack, and the
+        visit's loop messages (None: not a looped visit)."""
+        assert bank is None
+        partial = stack[num_blocks]
+        if num_blocks == 0:
+            return [
+                layer.attn_norm(partial, j) for j in range(layer.num_attn_inputs)
+            ], None
+        query = self.attn_res.attn_queries[i - 1]
+        return self._mix(stack[:num_blocks], partial, query, layer.attn_norm), None
+
+    def _hooked_visit(
+        self,
+        i: int,
+        pass_idx: int,
+        site: nn.Module,
+        stack: torch.Tensor,
+        num_blocks: int,
+        positions: torch.Tensor,
+        tau: torch.Tensor | None,
+        bank: torch.Tensor | None = None,
+    ) -> int:
+        """Run layer `i` in loop pass `pass_idx` with the hooks of `site`
+        (see `interventions.py` for what each hook sees); `bank` holds the
+        previous pass's blocks for a looped visit. Returns the number of
+        completed blocks after the layer."""
+        layer = self.layers[i]
+        partial = stack[num_blocks]
+        hook_state(site, partial, SteeringHookPoint.PRE_ATTN)
+        attn_inputs, messages = self._visit_attn_inputs(
+            i, layer, stack, num_blocks, bank
+        )
+        attn_partial = layer.attention(positions, attn_inputs, tau, pass_idx=pass_idx)
+        owner = layer.conv_states[pass_idx]
+        attn_out = layer.attn_sconv(
+            tensor_model_parallel_all_reduce(attn_partial), positions, owner=owner
+        )
+        first = i % self.block_size == 0
+        attn_out = hook_branch(
+            site, SteeringHookPoint.POST_ATTN, attn_out, None if first else partial
+        )
+        # The MLP input mixes the blocks with (partial +) attn_out; a looped
+        # visit blends its message into the fp32 mix before the norm.
+        norm = None if messages is not None else layer.mlp_norm
+        mix_args = (
+            self.attn_res.mlp_queries[i],
+            None if norm is None else norm.weight,
+            0.0 if norm is None else norm.eps,
+            self.normalize_values,
+        )
+        if first:
+            mlp_in = attn_res(stack[: num_blocks + 1], attn_out, None, *mix_args)
+        else:
+            mlp_in = attn_res(stack[:num_blocks], partial, attn_out, *mix_args)
+        if messages is not None:
+            mlp_norm = layer.mlp_norm
+            mlp_in = layer.blend(
+                slice(3, 4), mlp_in, messages[3:], mlp_norm.weight, mlp_norm.eps
+            )
+        moe_in = apply_layer_steering(site, mlp_in[0], SteeringHookPoint.MLP_IN)
+        if pass_idx:
+            moe_out = layer.mlp(moe_in, pass_idx=pass_idx)
+        else:
+            moe_out = layer.mlp(moe_in)
+        moe_out = apply_layer_steering(site, moe_out, SteeringHookPoint.MLP_OUT)
+        # The MLP short conv also applies the residual update.
+        residual = None if first else partial
+        if first:
+            num_blocks += 1
+        layer.mlp_sconv(
+            moe_out,
+            positions,
+            addend=attn_out,
+            residual=residual,
+            out=stack[num_blocks],
+            owner=owner,
+        )
+        hook_state(site, stack[num_blocks], SteeringHookPoint.POST_BLOCK)
+        return num_blocks
+
+    def _log_scaling_tau(self, positions: torch.Tensor) -> torch.Tensor | None:
+        if self.config.log_scaling_n_floor is None:
+            return None
+        return compute_log_scaling_tau(
+            positions, self.config.log_scaling_n_floor, self.config.log_scaling_alpha
+        )
+
     def _prefix_align(self) -> int:
         """A token multiple of every prefix-cache hit (a KV cache block size
         of the full-attention layers)."""
@@ -457,7 +679,11 @@ class Inkling2ForConditionalGeneration(
     SupportsLoRA,
 ):
     # LoRA (``lora.py``): adapters use the checkpoint's module names.
-    packed_modules_mapping = PACKED_MODULES_MAPPING
+    packed_modules_mapping = {
+        **PACKED_MODULES_MAPPING,
+        # `Inkling2Attention.split_linears` (QUANT_METHOD backend).
+        "q_proj": ["wq_du", "wr_du", "gate_attn", "attn_sink_proj"],
+    }
     embedding_modules: dict[str, str] = {}
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr=LORA_NAME_SUBSTRINGS,
@@ -485,13 +711,37 @@ class Inkling2ForConditionalGeneration(
         ".k_input_norm.": (".attn_norm.", 1),
         ".v_input_norm.": (".attn_norm.", 2),
     }
+    # The `QUANT_METHOD` backend with a quantization config: q-side, k and v
+    # are separate quantizable linears (`Inkling2Attention.split_linears`).
+    _split_shards = {
+        ".attn.wq_du.": (".attn.q_proj.", 0),
+        ".attn.wr_du.": (".attn.q_proj.", 1),
+        ".attn.gate_attn.": (".attn.q_proj.", 2),
+        ".attn.attn_sink_proj.": (".attn.q_proj.", 3),
+        ".q_input_norm.": (".attn_norm.", 0),
+        ".k_input_norm.": (".attn_norm.", 1),
+        ".v_input_norm.": (".attn_norm.", 2),
+    }
+    _split_renames = (
+        (".attn.wk_dv.", ".attn.k_proj."),
+        (".attn.wv_dv.", ".attn.v_proj."),
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Inkling2MMConfig = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        assert quant_config is None or isinstance(quant_config, Inkling2QuantConfig)
         assert vllm_config.parallel_config.pipeline_parallel_size == 1
+        # NATIVE (NVFP4 / MXFP8 experts) or QUANT_METHOD (any vLLM
+        # quantization method, or BF16 on SM8x); see backend.py.
+        self.quant = quant = select_inkling2_backend(
+            vllm_config.quant_config,
+            vllm_config.parallel_config.tensor_parallel_size,
+        )
+        if quant.uses_quant_method and vllm_config.lora_config is not None:
+            raise ValueError(
+                "Inkling2 LoRA needs the native backend (SM90+ with the "
+                "checkpoint's NVFP4 / MXFP8 experts)"
+            )
         if vllm_config.model_config.enable_prompt_embeds:
             # The reference applies embed_norm to raw input embeddings, which
             # cannot be told apart from already-normalized ones here.
@@ -505,11 +755,24 @@ class Inkling2ForConditionalGeneration(
             and vllm_config.model_config.multimodal_config.get_limit_per_prompt("image")
             else None
         )
-        self.model = Inkling2Model(text_config, quant_config, f"{prefix}model")
+        model_cls: type[Inkling2Model] = Inkling2Model
+        if text_config.loop_config is not None:
+            from .loop import Inkling2LoopModel
+
+            model_cls = Inkling2LoopModel
+        self.model = model_cls(text_config, quant, f"{prefix}model")
         self.lm_head = ParallelLMHead(
-            text_config.padded_vocab_size, text_config.hidden_size
+            text_config.padded_vocab_size,
+            text_config.hidden_size,
+            quant_config=quant.linear,
+            prefix=f"{prefix}lm_head",
         )
-        self.logits_processor = LogitsProcessor(
+        processor = (
+            Inkling2LogitsProcessor
+            if vllm_config.lora_config is None
+            else LogitsProcessor
+        )
+        self.logits_processor = processor(
             text_config.padded_vocab_size,
             org_vocab_size=text_config.vocab_size,
             soft_cap=text_config.final_logit_softcapping,
@@ -693,6 +956,9 @@ class Inkling2ForConditionalGeneration(
         loaded: set[str] = set()
         loaded_shards: set[tuple[str, int]] = set()
         visual_weights: list[tuple[str, torch.Tensor]] = []
+        quant_method = self.quant.uses_quant_method
+        split = self.quant.split_attention_linears
+        shards = self._split_shards if split else self._shards
         for name, weight in weights:
             if name.startswith("model.visual."):
                 if self.visual is not None:
@@ -700,8 +966,16 @@ class Inkling2ForConditionalGeneration(
                 continue
             for old, new in self._renames:
                 name = name.replace(old, new)
+            if split:
+                for old, new in self._split_renames:
+                    name = name.replace(old, new)
+            if quant_method:
+                expert_param = load_quant_expert_weight(params, name, weight)
+                if expert_param is not None:
+                    loaded.add(expert_param)
+                    continue
             shard_id = None
-            for old, (new, shard) in self._shards.items():
+            for old, (new, shard) in shards.items():
                 if old in name:
                     name = name.replace(old, new)
                     shard_id = shard
@@ -714,7 +988,12 @@ class Inkling2ForConditionalGeneration(
                     continue
                 raise ValueError(f"Unexpected checkpoint tensor: {name}")
             param = params[name]
-            if param.dtype != weight.dtype:
+            if quant_method:
+                # Dense tensors may arrive in another float dtype (e.g. F32
+                # GGUF norms); quantized ones go to their quant method's
+                # loader as they are.
+                weight = cast_dense_weight(param, weight)
+            elif param.dtype != weight.dtype:
                 if ".mlp.experts." in name and weight.dtype == torch.bfloat16:
                     raise ValueError(
                         f"{name}: BF16 expert weights are not supported; the "
@@ -733,7 +1012,7 @@ class Inkling2ForConditionalGeneration(
             else:
                 loader(param, weight, shard_id)
                 loaded_shards.add((name, shard_id))
-        num_shards = Counter(new for new, _ in self._shards.values())
+        num_shards = Counter(new for new, _ in shards.values())
         for name, count in Counter(name for name, _ in loaded_shards).items():
             fused = next(f for f in num_shards if f in name)
             if count == num_shards[fused]:

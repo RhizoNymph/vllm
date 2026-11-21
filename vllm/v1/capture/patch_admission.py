@@ -21,6 +21,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from vllm.config.loop_layers import get_loop_layer_space
 from vllm.logger import init_logger
 from vllm.model_executor.layers.steering import HOOK_POINT_TABLE_ATTR
 
@@ -82,6 +83,7 @@ def resolve_patch_prefix_flags(
 
     The prefix floor (``patch_touches_prompt`` / ``patch_min_prompt_position``)
     is driven by dest positions and is source-kind independent.
+
     """
     spec = sampling_params.patch
     if not spec:
@@ -117,7 +119,12 @@ def resolve_patch_prefix_flags(
                 f"{sorted(_INJECTABLE_HOOKS)}"
             )
         layer = int(entry["layer"])
-        if not (0 <= layer < ctx.num_hidden_layers):
+        # On a looped model ``layer`` is a per-(layer, pass) layer key,
+        # already rewritten by ``SamplingParams._validate_patch``.
+        space = get_loop_layer_space()
+        if (space is None and not (0 <= layer < ctx.num_hidden_layers)) or (
+            space is not None and not space.is_key(layer)
+        ):
             raise PatchValidationError(
                 f"patch[{i}]: layer {layer} out of range [0, {ctx.num_hidden_layers})"
             )
