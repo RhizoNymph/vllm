@@ -230,9 +230,7 @@ def test_pre_attn_and_post_block_vectors_through_real_kernels(runtime):
     streams, _, _ = _run(config, layer, *inputs)
     _clear(layer)
     shift = (streams.float() - base_streams.float()).unflatten(-1, (HC, H))
-    torch.testing.assert_close(
-        shift, vec.float().expand(T, HC, H), atol=0.1, rtol=0.02
-    )
+    torch.testing.assert_close(shift, vec.float().expand(T, HC, H), atol=0.1, rtol=0.02)
 
     _set_vector(layer, HP.POST_BLOCK, vec)
     streams, mlp_out, inj = _run(config, layer, *inputs)
