@@ -27,10 +27,17 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.models.common.interventions import register_layer_steering_buffers
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.ricursive import RicursiveConfig
 
@@ -204,8 +211,12 @@ class RicursiveDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        vllm_config: VllmConfig | None = None,
     ) -> None:
         super().__init__()
+        self.layer_idx = extract_layer_index(prefix)
+        if vllm_config is not None:
+            register_layer_steering_buffers(self, vllm_config, config.hidden_size)
         self.self_attn = RicursiveAttention(
             config,
             cache_config=cache_config,
@@ -242,14 +253,27 @@ class RicursiveDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(positions, hidden_states, value_residual)
         hidden_states = self.post_attention_layernorm(hidden_states)
 
+        # The attention branch joins the residual inside this fused add, so
+        # post_attn is read after it.
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
         )
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        # mlp_out is the normed branch added to the residual stream, so
+        # post_block == post_attn + mlp_out in pristine runs.
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -273,10 +297,15 @@ class RicursiveModel(nn.Module, EagleModelMixin):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: RicursiveDecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                vllm_config=vllm_config,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.embed_scale = config.embed_scale
         self.use_valres = config.use_valres
