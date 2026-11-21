@@ -741,10 +741,29 @@ def apply_layer_steering(
     of the layer's lifetime, so ``torch.compile`` traces it as a static
     branch and the disabled path emits no steering kernel at all.
     """
+    maybe_capture_residual(hidden_states, module.layer_idx, hook_point.value)
+    return apply_layer_interventions(module, hidden_states, hook_point)
+
+
+def apply_layer_interventions(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    hook_point: SteeringHookPoint,
+) -> torch.Tensor:
+    """Run the editing stages of :func:`apply_layer_steering` without capture.
+
+    The stack is patch -> steer -> sae -> clamp. Each stage returns its input
+    object unchanged when its family has no buffers at ``hook_point``, so
+    ``out is hidden_states`` identifies the fully-disabled path.
+
+    Models whose hook tensor is a *derived view* of the carried state (the
+    Qwen4Exp stream mean, for example) capture through their own
+    live-anchored op and call this for the edits, then fold
+    ``out - view`` back into the state.
+    """
     from vllm.model_executor.layers.clamp import maybe_apply_clamp
     from vllm.model_executor.layers.patch import maybe_apply_patch
 
-    maybe_capture_residual(hidden_states, module.layer_idx, hook_point.value)
     hidden_states = maybe_apply_patch(module, hidden_states, hook_point)
     table_attr = HOOK_POINT_TABLE_ATTR[hook_point]
     if hasattr(module, table_attr):
