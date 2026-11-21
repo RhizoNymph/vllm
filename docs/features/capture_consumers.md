@@ -62,8 +62,8 @@ The available hooks are:
 and `mlp_out` are the paired taps needed to **train transcoders** (a
 transcoder learns `mlp_in → mlp_out` for one layer; cross-layer
 transcoders consume them across layers, aligned per token). They are
-wired on **gemma3, gemma4, and the qwen3 family** (`qwen3`, `qwen3_moe`,
-`qwen3_next`/Qwen3.5); request them explicitly by name (e.g.
+wired on **gemma3, gemma4, the qwen3 family** (`qwen3`, `qwen3_moe`,
+`qwen3_next`/Qwen3.5), **and every Transformers-backend architecture**; request them explicitly by name (e.g.
 `{"mlp_in": [12], "mlp_out": [12]}`). They are deliberately excluded from
 the `:all` fan-out so `:all` stays model-agnostic, but are injectable
 (steering + patching) like the residual hooks on the wired models. On gemma

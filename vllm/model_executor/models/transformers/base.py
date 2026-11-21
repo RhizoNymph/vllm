@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from functools import cached_property
 from itertools import chain
 from operator import attrgetter
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import regex as re
 import torch
@@ -65,6 +65,12 @@ from vllm.model_executor.models.transformers.fusers import AttentionFuser, MLAFu
 from vllm.model_executor.models.transformers.fusers.attention import (
     VLLM_ATTN_IMPL,
     VLLM_MLA_ATTN_IMPL,
+)
+from vllm.model_executor.models.transformers.interventions import (
+    BufferSizes,
+    UnsupportedInterventionLayout,
+    install_interventions,
+    interventions_requested,
 )
 from vllm.model_executor.models.transformers.utils import (
     attrsetter,
@@ -142,6 +148,9 @@ class Base(
     supports_aux_hidden_states_over_pp = True
     _tower_model_names: tuple[str, ...] = ()
     """Read by `recursive_replace`, so text-only models need this empty default."""
+    supports_interventions: ClassVar[bool] = True
+    """Whether the decoder layers are hooked for steering, patching and capture
+    when those are configured. Draft models (MTP) are not intervention targets."""
 
     def __init__(self, *, vllm_config: "VllmConfig", prefix: str = ""):
         nn.Module.__init__(self)
@@ -237,6 +246,9 @@ class Base(
         # Upcast weights Transformers always keeps in fp32
         self.keep_in_fp32(self.model)
 
+        # Hook the decoder layers for steering, patching and activation capture
+        self._install_interventions()
+
         # Later pipeline ranks pass their received hidden states to the first layer
         self._intermediate_hidden_states: torch.Tensor | None = None
         self._copy_intermediate_hidden_states = False
@@ -266,6 +278,29 @@ class Base(
         # Pipeline parallel intermediate tensors
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.text_config.hidden_size
+        )
+
+    def _install_interventions(self):
+        """Give this rank's decoder layers the native intervention hook points.
+
+        Only when steering, patching, or activation capture is configured, so
+        other servers run the upstream forward unchanged. Raises
+        `UnsupportedInterventionLayout` if a decoder layer cannot be hooked,
+        rather than leaving the intervention silently inert."""
+        if not self.supports_interventions or not interventions_requested(
+            self.vllm_config
+        ):
+            return
+        if (layers := self._decoder_layers) is None:
+            raise UnsupportedInterventionLayout(
+                type(self.model).__name__,
+                "its decoder layers could not be identified",
+            )
+        install_interventions(
+            layers,
+            range(*self._pp_indices()),
+            hidden_size=self.text_config.hidden_size,
+            sizes=BufferSizes.from_vllm_config(self.vllm_config),
         )
 
     def _patch_config(self):

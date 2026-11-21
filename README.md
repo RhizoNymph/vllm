@@ -332,10 +332,11 @@ actions — see the [design doc](docs/design/dynamic_steering.md) and
 
 Residual-stream hooks (`pre_attn`, `post_attn`, `post_block`) are wired into the
 Llama, Qwen, Gemma, Mixtral/MoE, GLM, InternLM, Olmo, Exaone, Phi, Plamo, Step,
-Molmo, Falcon/Baichuan/Command families and more — 100+ decoder
-architectures. The MLP-branch hooks (`mlp_in`, `mlp_out`) are wired on gemma3,
-gemma4, and the qwen3 family (`qwen3`, `qwen3_moe`, `qwen3_next`/Qwen3.5); they
-are silent no-ops elsewhere. Gemma 3 is the primary end-to-end test target;
+Molmo, Falcon/Baichuan/Command/StableLM families and more — 100+ decoder
+architectures, including every standard decoder served by the Transformers
+modeling backend. The MLP-branch hooks (`mlp_in`, `mlp_out`) are wired on
+gemma3, gemma4, the qwen3 family (`qwen3`, `qwen3_moe`, `qwen3_next`/Qwen3.5),
+and the Transformers backend; they are silent no-ops elsewhere. Gemma 3 is the primary end-to-end test target;
 several MoE models are validated against real weights, and patching is
 GPU-validated on Qwen3-0.6B and gemma3-4b across TP1/PP1, TP2/PP1, and TP1/PP2.
 See the full list in the

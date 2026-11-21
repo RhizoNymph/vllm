@@ -23,7 +23,7 @@ capture run.
   reconstruction): `mlp_in` is the normed MLP input, `mlp_out` the branch
   before its residual add — replacing `mlp_out` is the classic
   attention-vs-MLP causal decomposition. The MLP taps are wired on gemma3,
-  gemma4, and the qwen3 family; on unwired models an mlp patch stages but no
+  gemma4, the qwen3 family, and the Transformers backend; on unwired models an mlp patch stages but no
   emission site reads it (a silent no-op), so use the wired models for
   MLP-hook studies. After an
   `mlp_out` intervention, downstream captures (`post_block`) see the
