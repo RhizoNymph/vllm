@@ -1708,6 +1708,142 @@ def test_steering_changes_output_new_decoder_family(
 
 
 # ---------------------------------------------------------------------------
+# Native families upstream added after the 08-19 sync (hooked on this branch)
+# ---------------------------------------------------------------------------
+
+_RICURSIVE_OVERRIDES = {
+    **_SMALL_DECODER_OVERRIDES,
+    "num_hidden_layers": 2,
+    "head_dim": 64,
+    "layer_types": ["sliding_attention", "full_attention"],
+}
+
+# Dory layers are attention-only or MLP-only; post_block (the default hook)
+# exists on the MLP layers, so keep the registry's 8-layer recurrent layout.
+_DORY_OVERRIDES = {
+    "num_hidden_layers": 8,
+    "n_input_layers": 2,
+    "n_recurrent_layers": 4,
+    "n_output_layers": 2,
+    "n_recurrent_loops": 2,
+    "layer_types": ["sliding_attention", "mlp"] * 3 + ["full_attention", "mlp"],
+}
+
+_LFM3_OVERRIDES = {"num_hidden_layers": 2, "layer_types": ["conv", "full_attention"]}
+
+_ZAYA_OVERRIDES = {"num_hidden_layers": 2, "layer_types": ["hybrid", "hybrid"]}
+
+_ALICE_AI_OVERRIDES = {
+    "num_hidden_layers": 2,
+    "layer_types": ["linear_attention", "full_attention"],
+    "block_attn_res_block_size": 1,
+    "hidden_size": 256,
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 128,
+    "shared_expert_intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 2,
+    "linear_key_head_dim": 64,
+    "linear_value_head_dim": 64,
+}
+
+_K2_HORIZON_OVERRIDES = {
+    "num_hidden_layers": 2,
+    "hidden_size": 256,
+    "intermediate_size": 512,
+    "moe_intermediate_size": 128,
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "num_shared_experts": 1,
+    "decoder_sparse_step": 2,
+    "mova_num_experts": 0,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "rope_head_dim": 32,
+    "layernorm_num_groups": 1,
+}
+
+_NEW_NATIVE_CASES = [
+    ("ricursiveAI/Ripple-65B-Preview", _RICURSIVE_OVERRIDES, _EAGER_ONLY, "ricursive"),
+    (
+        "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
+        _DORY_OVERRIDES,
+        _EAGER_ONLY,
+        "dory",
+    ),
+    ("LiquidAI/LFM3-1.7B", _LFM3_OVERRIDES, _EAGER_ONLY, "lfm3"),
+    (
+        "domyn/Domyn-Edge-Base",
+        {"num_hidden_layers": 2},
+        _TRUST_REMOTE_EAGER,
+        "domyn-edge",
+    ),
+    ("Zyphra/ZAYA1-8B", _ZAYA_OVERRIDES, _EAGER_ONLY, "zaya"),
+    (
+        "yandex/AliceAI-Foundation-80B-A3B-Base",
+        _ALICE_AI_OVERRIDES,
+        _TRUST_REMOTE_EAGER,
+        "alice-ai",
+    ),
+    ("IFM/K2-Horizon-36B", _K2_HORIZON_OVERRIDES, _TRUST_REMOTE_EAGER, "k2-horizon"),
+]
+
+NEW_NATIVE_DISCOVERY_CASES = [
+    pytest.param(model, overrides, extra, id=case_id)
+    for model, overrides, extra, case_id in _NEW_NATIVE_CASES
+]
+
+NEW_NATIVE_GENERATION_CASES = [
+    pytest.param(model, overrides, extra, 500.0, id=case_id)
+    for model, overrides, extra, case_id in _NEW_NATIVE_CASES
+]
+
+
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs"), NEW_NATIVE_DISCOVERY_CASES
+)
+def test_steering_layers_discovered_new_native_family(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+) -> None:
+    """Native families added upstream after the 08-19 sync expose steerable layers."""
+    test_steering_layers_discovered_new_decoder_family(
+        vllm_runner, monkeypatch, model, hf_overrides, extra_runner_kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "hf_overrides", "extra_runner_kwargs", "vector_scale"),
+    NEW_NATIVE_GENERATION_CASES,
+)
+def test_steering_changes_output_new_native_family(
+    vllm_runner,
+    monkeypatch,
+    model: str,
+    hf_overrides: dict | None,
+    extra_runner_kwargs: dict | None,
+    vector_scale: float,
+) -> None:
+    """Steering changes output, and clearing restores it, on the new families."""
+    test_steering_changes_output_new_decoder_family(
+        vllm_runner,
+        monkeypatch,
+        model,
+        hf_overrides,
+        extra_runner_kwargs,
+        vector_scale,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Existing tests (updated for kwargs-based collective_rpc API)
 # ---------------------------------------------------------------------------
 
