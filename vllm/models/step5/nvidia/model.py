@@ -54,6 +54,12 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -75,6 +81,10 @@ from vllm.model_executor.models.utils import (
     skip_spec_layers,
 )
 from vllm.model_executor.parameter import BasevLLMParameter, ModelWeightParameter
+from vllm.models.common.interventions import (
+    interventions_configured,
+    register_layer_steering_buffers,
+)
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -746,11 +756,18 @@ class Step5SparseIndexerIndexTPLinear(ColumnParallelLinear):
 
 
 def _step5_use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    """Whether the residual stream is token-sharded across TP ranks.
+
+    Off when any intervention is configured: every hook would otherwise see
+    only this rank's token shard, which no longer lines up with the
+    per-token steering index or the captured request rows.
+    """
     parallel = vllm_config.parallel_config
     return (
         parallel.enable_expert_parallel
         and parallel.tensor_parallel_size > 1
         and vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        and not interventions_configured(vllm_config)
     )
 
 
@@ -1776,7 +1793,14 @@ class Step5MoE(nn.Module):
         )
         self.use_sequence_parallel = _step5_use_sequence_parallel(vllm_config)
         if self.use_mega_moe:
-            self.fuse_all_reduce, reduce_results = False, False
+            # Sequence parallelism leaves each rank its own token shard, so the
+            # shared expert needs no all-reduce. With interventions configured
+            # it is off (see `_step5_use_sequence_parallel`): every rank then
+            # holds all tokens and the TP-sharded shared expert reduces itself.
+            self.fuse_all_reduce = False
+            reduce_results = (
+                not self.use_sequence_parallel and interventions_configured(vllm_config)
+            )
 
         self.share_expert = Step5MLP(
             config=config,
@@ -1847,13 +1871,17 @@ class Step5DecoderLayer(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        interventions: bool = True,
     ) -> None:
+        """``interventions=False`` skips steering buffers (the MTP drafter)."""
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         self.fp32_residual_connection = config.fp32_residual_connection
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
+        if interventions:
+            register_layer_steering_buffers(self, vllm_config, config.hidden_size)
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         # Preserve the configured SWA window before clearing the per-layer
@@ -2052,6 +2080,7 @@ class Step5DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
             hidden_states = self._cast_for_param_op(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
@@ -2073,8 +2102,15 @@ class Step5DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self._cast_for_param_op(hidden_states)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
 
+        # Complete (all-reduced) dense MLP or shared + routed MoE output.
         ffn_output = self._forward_ffn(hidden_states, padding=padding)
+        ffn_output = apply_layer_steering(self, ffn_output, SteeringHookPoint.MLP_OUT)
+        ffn_output, residual = apply_block_steering(self, ffn_output, residual)
         return ffn_output, residual
 
 
@@ -2107,6 +2143,7 @@ class Step5Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         if get_pp_group().is_last_rank:
             norm_dtype = get_step5_norm_dtype(config)
             self.norm = make_step5_rms_norm(

@@ -115,6 +115,7 @@ class Step5MultiTokenPredictorLayer(nn.Module):
         self.mtp_block = Step5DecoderLayer(
             mtp_vllm_config,
             prefix=f"{prefix}.mtp_block",
+            interventions=False,
         )
 
     def forward(
