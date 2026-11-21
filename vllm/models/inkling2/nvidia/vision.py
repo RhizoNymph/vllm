@@ -91,7 +91,8 @@ class Inkling2VisionAttention(nn.Module):
         else:
             from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-            version = 2 if current_platform.is_device_capability_family(120) else 3
+            # FA3 is Hopper-only; SM12x and SM8x run FA2.
+            version = 3 if current_platform.is_device_capability_family(90) else 2
             out = flash_attn_varlen_func(q, k, v, fa_version=version, **kwargs)
         return self.out_proj(out.view(hidden.shape))
 
