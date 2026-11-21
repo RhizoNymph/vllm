@@ -26,6 +26,7 @@
 import typing
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
+from typing import ClassVar
 
 import regex as re
 import torch
@@ -41,6 +42,10 @@ from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_ma
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -58,6 +63,13 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
     pp_topk_buffers,
+)
+from vllm.models.hy_v4.interventions import (
+    register_hy_v4_steering_buffers,
+    steer,
+    steer_and_capture_ihc,
+    steer_block,
+    steer_streams,
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -95,6 +107,9 @@ class HYV4DecoderLayer(nn.Module):
     channels and each sub-block is wrapped by an `HYV4HCLayer` boundary;
     otherwise it uses the standard single-stream residual.
     """
+
+    # Same contract as the NVIDIA layer (see hy_v4/interventions.py).
+    intervention_hooks: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -152,6 +167,15 @@ class HYV4DecoderLayer(nn.Module):
         self.hc_mlp_layer = HYV4HCLayer(
             config, layer_idx, prefix=f"{prefix}.hc_mlp_layer"
         )
+        if self.intervention_hooks:
+            if self.enable_ihc:
+                self.hc_mult = config.hc_mult
+            register_hy_v4_steering_buffers(
+                self,
+                vllm_config,
+                ihc=self.enable_ihc,
+                is_last_layer=layer_idx == config.num_hidden_layers - 1,
+            )
 
     def forward(
         self,
@@ -172,6 +196,7 @@ class HYV4DecoderLayer(nn.Module):
         """Standard single-residual-stream forward (iHC disabled)."""
         if residual is not None:
             hidden_states = hidden_states + residual
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.PRE_ATTN)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -181,12 +206,15 @@ class HYV4DecoderLayer(nn.Module):
         )
 
         hidden_states = hidden_states + residual
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.POST_ATTN)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.MLP_IN)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.MLP_OUT)
 
-        return hidden_states, residual
+        return steer_block(self, hidden_states, residual)
 
     def _forward_ihc(
         self,
@@ -197,10 +225,17 @@ class HYV4DecoderLayer(nn.Module):
         hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
         hidden_states, post_gates, residual = self.hc_attn_layer.pre(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
+        # DeepSeek-V4 mHC hook set: ``residual`` holds the channels the pre op
+        # just reduced, ``hidden_states`` the normed attention input.
+        residual, hidden_states = steer_and_capture_ihc(
+            self, residual, post_gates, hidden_states, "attn"
+        )
         attention_output = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        # Steered before the (possibly fused) post op consumes it.
+        attention_output = steer(self, attention_output, SteeringHookPoint.POST_ATTN)
         can_fuse_ihc_post_pre_rms_norm = (
             triton_ihc_supported(attention_output)
             and self.hc_attn_layer.hc_post.hpc_op is None
@@ -226,7 +261,13 @@ class HYV4DecoderLayer(nn.Module):
             hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
             hidden_states, post_gates, residual = self.hc_mlp_layer.pre(hidden_states)
             hidden_states = self.post_attention_layernorm(hidden_states)
+        # Both branches leave the FFN channels and the normed FFN input; the
+        # fused Triton kernel returns them just like the unfused ops.
+        residual, hidden_states = steer_and_capture_ihc(
+            self, residual, post_gates, hidden_states, "ffn"
+        )
         hidden_states = self.mlp(hidden_states)
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.MLP_OUT)
         hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post_gates)
 
         # Under iHC the residual is carried inside hidden_states.
@@ -282,6 +323,9 @@ class HYV4Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        # One steering_index shared by every steerable layer, so the runner's
+        # per-step token->row map reaches all of them (no-op without steering).
+        share_steering_index_across_layers(list(self.layers))
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         else:
@@ -419,11 +463,26 @@ class HYV4Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual, **buffers}
             )
         if self.enable_ihc:
+            hidden_states = self._steer_final_channels(hidden_states)
             hidden_states = self.hc_head(hidden_states)
         else:
             hidden_states = hidden_states + residual
 
         return self.norm(hidden_states)
+
+    def _steer_final_channels(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``mhc_streams_final``: the iHC channels entering the head merge.
+
+        Only the last decoder layer (global index ``num_hidden_layers - 1``,
+        on the last PP rank where this runs) registers the table.
+        """
+        if self.start_layer >= self.end_layer:
+            return hidden_states
+        return steer_streams(
+            self.layers[self.end_layer - 1],
+            hidden_states,
+            SteeringHookPoint.MHC_STREAMS_FINAL,
+        )
 
     def load_fused_expert_weights(
         self,

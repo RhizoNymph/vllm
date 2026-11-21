@@ -173,6 +173,9 @@ class HYV4DFlyFeedForward(HYV4FeedForward):
 
 class HYV4DFlyDecoderLayer(HYV4DecoderLayer):
     feed_forward_cls: type[HYV4FeedForward] = HYV4DFlyFeedForward
+    # Drafter layers restart at index 0; unhooked so they cannot collide with
+    # the target model's steering / capture layers.
+    intervention_hooks = False
 
 
 class HYV4DFlyModel(nn.Module):
