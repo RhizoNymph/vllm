@@ -40,6 +40,13 @@ _QWEN_MOE_OVERRIDES = {
     "shared_expert_intermediate_size": 0,
 }
 
+# Qwen2-MoE runs on the Transformers backend, which always builds the shared
+# expert; a zero-width one divides by zero in the gated activation.
+_QWEN2_MOE_OVERRIDES = {
+    **_QWEN_MOE_OVERRIDES,
+    "shared_expert_intermediate_size": 1024,
+}
+
 _QWEN3_NEXT_OVERRIDES = {
     **_QWEN_MOE_OVERRIDES,
     "num_hidden_layers": 2,
@@ -226,6 +233,10 @@ _PHI_OVERRIDES = {
     **_SMALL_DECODER_OVERRIDES,
     "hidden_act": "gelu_new",
     "tie_word_embeddings": False,
+    # phi-2's 80-wide heads: its partial_rotary_factor of 0.4 is then 32
+    # rotary dims. The 64-wide default gives 25.6, which HF and vLLM round
+    # differently.
+    "hidden_size": 640,
 }
 
 _PERSIMMON_OVERRIDES = {
@@ -341,7 +352,7 @@ PHASE1_DISCOVERY_CASES = [
     ),
     pytest.param(
         "Qwen/Qwen1.5-MoE-A2.7B-Chat",
-        _QWEN_MOE_OVERRIDES,
+        _QWEN2_MOE_OVERRIDES,
         {"enforce_eager": True},
         id="qwen2-moe",
     ),
@@ -375,7 +386,7 @@ PHASE1_GENERATION_CASES = [
     ),
     pytest.param(
         "Qwen/Qwen1.5-MoE-A2.7B-Chat",
-        _QWEN_MOE_OVERRIDES,
+        _QWEN2_MOE_OVERRIDES,
         {"enforce_eager": True},
         id="qwen2-moe",
     ),
