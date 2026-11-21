@@ -40,6 +40,10 @@ class MTPMixin(CausalMixin):
     proposer replaces with the target's.
     """
 
+    # A draft model is not an intervention target; its layer indices would
+    # collide with the target's.
+    supports_interventions = False
+
     def _patch_config(self):
         # `vllm_config.model_config` is the target's, which must not be patched
         assert self.vllm_config.speculative_config is not None
