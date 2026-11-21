@@ -87,6 +87,9 @@ Features Index:
       stream (three tiers, five hook points): additive vectors, plus
       directional clamps that bound a feature's projection along up to
       max_clamp_directions unit directions per site and run after the add.
+      Multi-stream hyper-connection models add stream-width hooks:
+      DeepSeek-V4 (mHC) and Qwen4Exp, whose standard hooks are a stream-mean
+      view (vllm/models/qwen4_exp/common/interventions.py).
     entry_points:
       ["SamplingParams.steering_vectors", "SamplingParams.steering_clamps", "--enable-steering"]
     depends_on: [activation_capture]

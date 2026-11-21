@@ -96,6 +96,20 @@ hooked per implementation, so coverage can differ by platform:
   input-quant fusion, so `mlp_in`/`mlp_out`/`post_block` see complete,
   full-precision activations. Servers with none of them configured keep the
   fused path.
+- `qwen4_exp` — serves `Qwen4ExpForCausalLM` and
+  `Qwen4ExpForConditionalGeneration` (Qwen3.8-Flash-Next). The NVIDIA and ROCm
+  implementations are both hooked. Their decoder forwards are near copies and
+  call the shared helpers in `vllm/models/qwen4_exp/common/interventions.py`.
+  The hook set is the five standard hooks on a stream-mean view plus three
+  multi-stream hooks; see
+  [Hyper-Connection Steering (Qwen4Exp)](#hyper-connection-steering-qwen4exp).
+  No fusion is given up: the fused HC combine+norm, the sm_90+ down+SiLU and
+  up+gate-mix kernels, and the ROCm two-stage combine+mix all still return the
+  materialized streams the hooks act on. HC sequence parallelism
+  (`enable_hc_sp`, or sequence-parallel MoE at TP>1) is rejected at model
+  build when steering, patching, or capture is configured, because it shards
+  the streams over the token axis. The `Qwen4ExpMTP` drafter is not hooked,
+  like the other MTP drafters.
 - `kimi_k3` — serves `KimiLinearForCausalLM` and `KimiK3ForConditionalGeneration`.
   Only the NVIDIA implementation (`vllm/models/kimi_k3/nvidia/model.py`) is
   hooked. The ROCm implementation (`vllm/models/kimi_k3/amd/linear.py`) carries
@@ -116,7 +130,10 @@ tests but have not been validated against released checkpoints.
 Manifold-constrained hyper-connection (mHC) steering is wired for
 DeepSeek-V4 (`deepseek_v4`), which carries a multi-stream residual rather
 than a single residual. See [mHC Steering](#mhc-steering) for the extra
-hook points and the per-stream vector format.
+hook points and the per-stream vector format. Qwen4Exp (`qwen4_exp`) also
+carries a multi-stream hyper-connection residual. It keeps the standard
+hook names on a stream-mean view and adds the same multi-stream hooks; see
+[Hyper-Connection Steering (Qwen4Exp)](#hyper-connection-steering-qwen4exp).
 
 The full HTTP surface (packed per-request vectors, clamps and their
 exactness edges, `/v1/steering/set|clear`, named modules, request-level
@@ -348,8 +365,8 @@ layer's forward path. Unused hook points are zero-valued no-ops.
 
 The three residual-stream hooks steer the carried residual and are wired on
 every steerable model. `mlp_in`/`mlp_out` steer the MLP *branch* tensor and
-are wired on gemma3, gemma4, and the qwen3 family (`qwen3`, `qwen3_moe`,
-`qwen3_next`/Qwen3.5); on other models they are silent no-ops (buffers exist
+are wired on gemma3, gemma4, the qwen3 family (`qwen3`, `qwen3_moe`,
+`qwen3_next`/Qwen3.5), and `qwen4_exp`; on other models they are silent no-ops (buffers exist
 but no emission site). Note an additive steer at `mlp_out` propagates
 identically to `post_block` — the branch is added to the residual stream —
 so `mlp_out` exists chiefly for patching (replace/ablate the MLP branch);
@@ -421,6 +438,101 @@ params = SamplingParams(
 
 `mhc_streams_final` is a model-level hook: it is keyed to the last decoder
 layer index, so request it on that layer.
+
+## Hyper-Connection Steering (Qwen4Exp)
+
+Qwen4Exp (Qwen3.8-Flash-Next) carries `hc_count` hyper-connection streams of
+`hidden_size` each (4 × 2560 on the released model), stored stream-major as
+`[tokens, hc_count * hidden]`. Each sublayer reads one `hidden`-wide input,
+the *mix*: a learned, gated mean of the per-stream RMS-normalized streams.
+It writes its output back to every stream through a learned per-stream
+injection weight, the *combine*:
+`stream_i += out * 2 * sigmoid(logit_i / hc_count)`. The embedding enters as
+`hc_count` identical copies. A final mixer collapses the streams for the LM
+head. There is no single tensor that is "the residual".
+
+| Hook Point | Tensor | Vector shape | Width |
+| --- | --- | --- | --- |
+| `pre_attn` | stream mean of the streams entering the attention mix (after PLE) | `(hidden,)` | `hidden` |
+| `post_attn` | stream mean after the attention combine | `(hidden,)` | `hidden` |
+| `post_block` | stream mean after the MoE combine (HF `hidden_states[L+1]`, averaged) | `(hidden,)` | `hidden` |
+| `mlp_in` | MoE input (the MoE mix output) | `(hidden,)` | `hidden` |
+| `mlp_out` | MoE output, before the combine | `(hidden,)` | `hidden` |
+| `mhc_streams_pre_attn` | full streams entering the attention mix | `(hc_count, hidden)` | `hc_count * hidden` |
+| `mhc_streams_pre_mlp` | full streams after the attention combine | `(hc_count, hidden)` | `hc_count * hidden` |
+| `mhc_streams_final` | full streams the final mixer reads (last layer only) | `(hc_count, hidden)` | `hc_count * hidden` |
+
+**Residual hooks take a stream-mean view.** At `pre_attn`, `post_attn`, and
+`post_block`, every family reads the mean over the streams: capture, patch,
+additive, SAE, clamp, and the dynamic-tier monitors. An edit to that view is
+added as the same delta to every stream. An additive vector `v` therefore
+adds `v` to each stream, and the captured mean moves by exactly `v`. The
+reasons for this choice:
+
+- It is what "steer the residual stream at layer L" means on a standard
+  model, generalized. At `hc_count == 1` it is ordinary residual steering.
+  Broadcasting a delta keeps the streams' relative structure, just as an
+  additive steer leaves the rest of a standard residual alone.
+- Capture and steering share the coordinate. A difference of means captured
+  at `post_attn` of layer L, fed back as a `post_attn` vector, shifts the
+  next capture by that difference. Hidden-width SAEs and probes trained on
+  these captures can be served at the same hook.
+- The hooks stay `hidden` wide, so `:all` captures, existing tooling, and
+  hidden-width steering vectors work unchanged.
+
+The alternatives were rejected. Making `pre_attn` the attention input (the
+mix output) would steer a branch tensor that is discarded after the
+sublayer; `mlp_in` already covers that for the MoE. Making the residual
+hooks full-width would break every hidden-width consumer. The full streams
+are still available through the `mhc_streams_*` hooks, which use DeepSeek-V4's
+names, widths, and stream-major layout. Those hooks carry an independent
+vector per stream: a `hidden` vector `v` repeated `hc_count` times at
+`mhc_streams_pre_attn` steers identically to `v` at `pre_attn`, and the
+`pre_attn` capture is the mean of the `mhc_streams_pre_attn` capture.
+
+**Timing** matches standard models. `pre_attn` / `mhc_streams_pre_attn`
+(and `post_attn` / `mhc_streams_pre_mlp`) edit the carried streams *after*
+that sublayer's mix has read them, the same way a standard `pre_attn` edit
+lands after `input_layernorm` has read the residual. The edit reaches every
+later sublayer and layer, but not that sublayer's own input. To steer what
+the MoE reads, use `mlp_in`. At one site the full-width hook runs before
+the mean hook, so a mean-hook capture sees a stream-hook edit made at the
+same site.
+
+**Block output.** The NVIDIA and ROCm layers defer each combine into the next
+layer's fused combine+norm kernel, so `post_block` and `mhc_streams_final`
+form the combine themselves: in fp32, only when something reads or edits the
+hook. Edits are folded back into the pre-combine streams. The combine is
+affine in the streams, so the fused kernels run unchanged and see exactly
+the edited block output. Under PP, a non-last rank materializes the combine
+before shipping the streams, so the edit crosses the stage boundary.
+
+**`mlp_out` vs `post_block`.** Unlike on standard models, a vector at
+`mlp_out` does not propagate like the same vector at `post_block`. The
+branch is scaled by each stream's injection weight, so `stream_i` gains
+`v * 2 * sigmoid(logit_i / hc_count)` rather than `v`.
+
+**Precision.** Edits at the derived views (the stream mean and the block
+output) are applied as `edited_view - view` added in fp32, then rounded once
+to the model dtype. This costs one extra bf16 rounding on top of a direct
+add, at most `ulp(view) / 2` per element. `mhc_streams_pre_attn` and
+`mhc_streams_pre_mlp` edit the streams directly. A zero or inactive row is
+a bitwise no-op.
+
+**Coverage and limits.**
+
+- Both NVIDIA (`vllm/models/qwen4_exp/nvidia/model.py`) and ROCm
+  (`.../amd/model.py`) are hooked through the shared
+  `vllm/models/qwen4_exp/common/interventions.py`.
+- `mhc_streams_final` is model-level, registered only on the last decoder
+  layer, which lives on the last PP rank. It is keyed to layer
+  `num_hidden_layers - 1`.
+- HC sequence parallelism is rejected when any intervention is configured.
+- MTP drafter layers carry no hooks.
+- There are no mixing-coefficient hooks; the injection weights and gates are
+  not captured.
+- Without steering, patching, or capture configured, the layers run
+  upstream's forward unchanged.
 
 ## Global Steering API
 
