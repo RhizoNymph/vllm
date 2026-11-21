@@ -23,6 +23,12 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -41,6 +47,10 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     spec_decode_needs_target_embed,
 )
+from vllm.models.common.interventions import (
+    interventions_configured,
+    register_layer_steering_buffers,
+)
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.mistral.common.layer_spec import MistralLayerSpec, get_layer_specs
 from vllm.models.mistral.common.rope import MistralRotaryEmbedding
@@ -56,13 +66,15 @@ from vllm.v1.attention.backends.mla.index_group import (
 
 def defers_allreduce(vllm_config: VllmConfig) -> bool:
     """Whether sublayers leave their outputs TP-partial and fuse the all-reduce
-    into the next residual RMSNorm."""
+    into the next residual RMSNorm. Never under interventions: the hooks need
+    the complete attention and MLP outputs."""
     parallel_config = vllm_config.parallel_config
     return bool(
         vllm_config.compilation_config.pass_config.fuse_allreduce_rms
         and vllm_config.model_config.dtype == torch.bfloat16
         and not parallel_config.enable_expert_parallel
         and not parallel_config.use_sequence_parallel_moe
+        and not interventions_configured(vllm_config)
     )
 
 
@@ -82,6 +94,11 @@ class MistralLarge4DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.defer_allreduce = defers_allreduce(vllm_config)
+        self.layer_idx = extract_layer_index(prefix)
+        # Per-request interventions; DSpark draft layers (built past their own
+        # layer count, at the target's following indices) are not steered.
+        if self.layer_idx < config.num_hidden_layers:
+            register_layer_steering_buffers(self, vllm_config, config.hidden_size)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = MistralMLAAttention(
             vllm_config,
@@ -143,13 +160,24 @@ class MistralLarge4DecoderLayer(nn.Module):
         rotary_emb: MistralRotaryEmbedding,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the layer on the outputs of `input_norm`."""
+        # The residual stream entering the layer (input_norm folded in the
+        # previous layer's MLP branch); hidden_states is its normed copy.
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(
             positions, hidden_states, log_positions, rotary_emb
         )
         hidden_states, residual = self.residual_norm(
             self.post_attention_layernorm, hidden_states, residual
         )
-        return self.mlp(hidden_states), residual
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
+        return apply_block_steering(self, hidden_states, residual)
 
 
 class MistralLarge4Model(nn.Module, EagleModelMixin):
@@ -204,6 +232,9 @@ class MistralLarge4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        # One steering_index for every steerable layer (no-op when steering
+        # is off: the layers register no buffers).
+        share_steering_index_across_layers(list(self.layers))
         _check_pp_stage(self.layer_specs, self.start_layer, self.end_layer)
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

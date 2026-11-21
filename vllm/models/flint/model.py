@@ -35,6 +35,12 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -48,6 +54,10 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+)
+from vllm.models.common.interventions import (
+    interventions_configured,
+    register_layer_steering_buffers,
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -479,9 +489,19 @@ class FlintDecoderLayer(nn.Module):
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
         prefix: str = "",
+        vllm_config: VllmConfig | None = None,
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
+        # The low-latency decode kernels fold the input residual-add RMSNorm
+        # into the qkv GEMV and the post-attention residual-add RMSNorm plus
+        # the whole MoE block into one kernel, leaving no tensor for the
+        # pre_attn / post_attn / mlp_in / mlp_out hooks. Interventions take
+        # the unfused path; unconfigured servers keep the fused one.
+        self.fused_low_latency = not interventions_configured(vllm_config)
+        if vllm_config is not None:
+            register_layer_steering_buffers(self, vllm_config, config.hidden_size)
         self.self_attn = FlintAttention(
             config,
             layer_idx,
@@ -510,7 +530,7 @@ class FlintDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.self_attn.flint_decode:
+        if self.fused_low_latency and self.self_attn.flint_decode:
             ll = self.self_attn.forward_ll(
                 positions, hidden_states, residual, self.input_layernorm
             )
@@ -521,20 +541,32 @@ class FlintDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(positions, hidden_states)
         return self._post_attention(hidden_states, residual)
 
     def _post_attention(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(self.mlp, FlintSparseMoeBlock):
+        if self.fused_low_latency and isinstance(self.mlp, FlintSparseMoeBlock):
             ll = self.mlp.forward_ll(
                 hidden_states, residual, self.post_attention_layernorm
             )
             if ll is not None:
                 return ll
+        # The attention branch joins the residual inside this fused add, so
+        # post_attn is read after it.
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
+        # Dense MLP or the whole MoE block (shared + routed experts, reduced).
         hidden_states = self.mlp(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -557,10 +589,15 @@ class FlintModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: FlintDecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                vllm_config=vllm_config,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size

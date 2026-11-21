@@ -24,8 +24,11 @@ Overview:
       Per-(layer, hook) residual-stream hook points folded into
       apply_layer_steering / apply_block_steering. Persistent buffers + opaque
       ops (mutates_args=[]) so a FULL cudagraph replay reads each step's values.
-      Buffers attach at model build via register_steering_buffers; disabled mode
-      constant-folds out of the forward. Tier-agnostic scaffolding (hook-attr
+      Buffers attach at model build via register_steering_buffers (natively
+      implemented decoders use vllm/models/common/interventions.py:
+      register_layer_steering_buffers, plus interventions_configured to turn
+      off fusions that hide or split a hook site only when an intervention is
+      configured); disabled mode constant-folds out of the forward. Tier-agnostic scaffolding (hook-attr
       dicts, buffer-sizing knob, kernel warmup harness, phase-tier storage,
       vector-spec validation core) is shared via intervention_common.py /
       intervention_kernel_common.py / phase_tiers.py; the steering row space

@@ -22,17 +22,35 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.parameter import PerTensorScaleParameter
+from vllm.models.common.interventions import register_layer_steering_buffers
 from vllm.sequence import IntermediateTensors
 
 from .utils import maybe_prefix
 
 EPS = 1e-6
+
+# Each physical Dory layer holds ONE sublayer and carries no separate residual
+# tensor (the slerp folds the branch into the unit-norm stream), so each layer
+# registers only the hooks that exist on it. Asking for an absent hook (e.g.
+# ``post_block`` on an attention layer) is rejected by the runner as
+# "hook point not active on layer" instead of being silently dropped.
+ATTENTION_HOOKS = (SteeringHookPoint.PRE_ATTN, SteeringHookPoint.POST_ATTN)
+MLP_HOOKS = (
+    SteeringHookPoint.MLP_IN,
+    SteeringHookPoint.MLP_OUT,
+    SteeringHookPoint.POST_BLOCK,
+)
 
 
 def justnorm(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -198,13 +216,44 @@ class DoryMLP(nn.Module):
 
 
 class DoryDecoderLayer(nn.Module):
-    """One physical layer: a single sublayer (attention OR mlp) + slerp residual."""
+    """One physical layer: a single sublayer (attention OR mlp) + slerp residual.
+
+    Intervention hooks (the stream is the only residual; there is no deferred
+    branch add, so every residual hook sees the complete stream):
+
+    * attention layer: ``pre_attn`` on the incoming stream (the slerp anchor;
+      the attention input itself is left unsteered, as in Qwen3 where
+      ``pre_attn`` steers the residual and not the normed attention input),
+      ``post_attn`` on the slerped stream leaving the layer.
+    * mlp layer: ``mlp_in`` on the MLP input (the incoming unit-norm stream;
+      Dory has no pre-MLP norm), ``mlp_out`` on the MLP branch before the
+      slerp, ``post_block`` on the slerped stream leaving the layer.
+
+    Recurrent layers are re-run ``n_recurrent_loops`` times under one physical
+    ``layer_idx``, so their hooks fire once per loop (as in IQuest LoopCoder).
+    """
 
     def __init__(
-        self, config, layer_idx, cache_config, quant_config, prefix, num_loops=1
+        self,
+        config,
+        layer_idx,
+        cache_config,
+        quant_config,
+        prefix,
+        num_loops=1,
+        vllm_config: VllmConfig | None = None,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.is_attention = config.layer_types[layer_idx] != "mlp"
+        if vllm_config is not None:
+            hooks = ATTENTION_HOOKS if self.is_attention else MLP_HOOKS
+            register_layer_steering_buffers(
+                self,
+                vllm_config,
+                config.hidden_size,
+                hook_widths=dict.fromkeys(hooks, config.hidden_size),
+            )
         self._alpha_scale = config.ngpt_alpha_init / config.initializer_range
         if self.is_attention:
             self.mixer = DoryAttention(
@@ -221,17 +270,40 @@ class DoryDecoderLayer(nn.Module):
             self.mlp_alpha = nn.Parameter(torch.empty(config.hidden_size))
 
     def forward(self, positions, hidden_states, loop_idx=0):
-        residual = hidden_states
         if self.is_attention:
+            residual = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.PRE_ATTN
+            )
             out = self.mixer(positions, hidden_states, loop_idx=loop_idx)
-            return slerp_alpha(residual, out, self.attn_alpha, self._alpha_scale)
+            hidden_states = slerp_alpha(
+                residual, out, self.attn_alpha, self._alpha_scale
+            )
+            return apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.POST_ATTN
+            )
+        residual = hidden_states
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
         out = self.mixer(hidden_states)
-        return slerp_alpha(residual, out, self.mlp_alpha, self._alpha_scale)
+        out = apply_layer_steering(self, out, SteeringHookPoint.MLP_OUT)
+        hidden_states = slerp_alpha(residual, out, self.mlp_alpha, self._alpha_scale)
+        # No separate residual tensor exists to defer an add into, so
+        # post_block is the plain layer-steering op on the full stream (as in
+        # CommandR / IQuest LoopCoder) rather than apply_block_steering.
+        return apply_layer_steering(self, hidden_states, SteeringHookPoint.POST_BLOCK)
 
 
 @support_torch_compile
 class DoryBackbone(nn.Module):
-    def __init__(self, config, cache_config, quant_config, prefix):
+    def __init__(
+        self,
+        config,
+        cache_config,
+        quant_config,
+        prefix,
+        vllm_config: VllmConfig | None = None,
+    ):
         super().__init__()
         self.config = config
         self.num_loops = config.n_recurrent_loops
@@ -247,10 +319,12 @@ class DoryBackbone(nn.Module):
                     quant_config,
                     f"{prefix}.layers.{i}",
                     num_loops=self.num_loops if n_in <= i < n_in + n_rec else 1,
+                    vllm_config=vllm_config,
                 )
                 for i in range(config.num_hidden_layers)
             ]
         )
+        share_steering_index_across_layers(self.layers)
 
     def forward(
         self,
@@ -299,6 +373,7 @@ class DoryForCausalLM(nn.Module):
             vllm_config.cache_config,
             vllm_config.quant_config,
             prefix=maybe_prefix(prefix, "backbone"),
+            vllm_config=vllm_config,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

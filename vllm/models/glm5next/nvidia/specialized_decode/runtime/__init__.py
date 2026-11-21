@@ -6,6 +6,8 @@ GB300 TP4, enabled by default; `decode_backend=stock` disables it.
 
 from dataclasses import dataclass
 
+from vllm.models.common.interventions import interventions_configured
+
 
 @dataclass(frozen=True, slots=True)
 class DecodeConfig:
@@ -29,7 +31,7 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         raise ValueError(
             "Supported decode_backend values are auto/stock/latency_specialized"
         )
-    reasons = unsupported(vllm_config)
+    reasons = intervention_reasons(vllm_config) + unsupported(vllm_config)
     if reasons:
         if backend == "auto":
             return None
@@ -45,6 +47,15 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         ),
         policy=tuple(extra.get("policy", {}).items()),
     )
+
+
+def intervention_reasons(vllm_config) -> list[str]:
+    """The specialized decode runs its own kernels instead of the decoder-layer
+    forward, so steering, patching, and capture would silently skip every decode
+    step it serves: such deployments keep the stock (hooked) decode."""
+    if interventions_configured(vllm_config):
+        return ["steering, activation patching, or activation capture"]
+    return []
 
 
 def kda_dtypes(vllm_config):

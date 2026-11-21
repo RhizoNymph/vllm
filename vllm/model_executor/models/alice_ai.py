@@ -37,6 +37,12 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
 )
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -65,6 +71,10 @@ from vllm.model_executor.offloader import (
     PrefetchOffloader,
     UVAOffloader,
     get_offloader,
+)
+from vllm.models.common.interventions import (
+    interventions_configured,
+    register_layer_steering_buffers,
 )
 from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.sequence import IntermediateTensors
@@ -304,7 +314,39 @@ class AliceAISparseMoeBlock(nn.Module):
 
 
 class AliceAIDecoderBlock(nn.Module):
-    """AliceAI topology with upstream Qwen, Kimi KDA, MoE and AttnRes operations."""
+    """AliceAI topology with upstream Qwen, Kimi KDA, MoE and AttnRes operations.
+
+    Intervention hooks (block-local semantics). Block Attention Residuals carry
+    no single residual stream: ``residual_bank`` holds the completed block
+    sources and ``partial`` is the running sum of the current block's sublayer
+    outputs (``None`` right after a block is committed). Each sublayer reads a
+    softmax mixture of the bank and ``partial``. The hooks steer the stream
+    *tip*, the source every later mixture and the next committed bank row are
+    built from:
+
+    * ``pre_attn``: ``partial`` entering the layer when mid-block. On a
+      block-start layer (``partial is None``) it is the most recently committed
+      source ``residual_bank[:, n - 1]`` (the embeddings on layer 0), and the
+      steered value is written back into that bank row so every later mixture
+      reads it. That branch only runs when interventions are configured
+      (``steer_committed_source``), so the unconfigured forward is upstream's.
+    * ``post_attn``: ``partial`` after this layer's attention/KDA output is
+      added.
+    * ``mlp_in``: the ``post_attention_layernorm`` output entering the MoE.
+    * ``mlp_out``: the MoE output (shared + routed, all-reduced).
+    * ``post_block``: ``partial + mlp_out``, the returned ``partial``.
+
+    A vector added at ``pre_attn``/``post_attn``/``post_block`` therefore
+    shifts the block's ``partial`` (and so its committed bank row) by itself;
+    it does not shift the sublayer input mixtures one-for-one. The per-sublayer
+    AttnRes mixtures and the model-level ``attnres_final`` readout are not
+    hooked.
+    """
+
+    # Static per process: whether the block-start ``pre_attn`` hook runs and
+    # writes the steered committed source back into the residual bank. The
+    # class default keeps layers built without ``__init__`` on upstream's path.
+    steer_committed_source: bool = False
 
     def __init__(
         self,
@@ -327,6 +369,8 @@ class AliceAIDecoderBlock(nn.Module):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        register_layer_steering_buffers(self, vllm_config, config.hidden_size)
+        self.steer_committed_source = interventions_configured(vllm_config)
         self.attn_res_block_size = get_attn_res_block_size(config)
         self.attn_res_rms_norm_eps = float(config.rms_norm_eps)
 
@@ -426,6 +470,18 @@ class AliceAIDecoderBlock(nn.Module):
             num_completed_sources += 1
             partial = None
 
+        if partial is not None:
+            partial = apply_layer_steering(self, partial, SteeringHookPoint.PRE_ATTN)
+        elif self.steer_committed_source:
+            # The stream tip is the committed source; bank rows are strided
+            # views, so steer a contiguous copy and write it back.
+            source = residual_bank[:, num_completed_sources - 1]
+            residual_bank[:, num_completed_sources - 1].copy_(
+                apply_layer_steering(
+                    self, source.contiguous(), SteeringHookPoint.PRE_ATTN
+                )
+            )
+
         if self.layer_idx == 0:
             hidden_states = residual_bank[:, 0]
         else:
@@ -441,6 +497,7 @@ class AliceAIDecoderBlock(nn.Module):
             hidden_states=hidden_states, positions=positions
         )
         partial = attention_output if partial is None else partial + attention_output
+        partial = apply_layer_steering(self, partial, SteeringHookPoint.POST_ATTN)
 
         hidden_states = self._apply_attention_residual(
             residual_bank=residual_bank,
@@ -450,7 +507,14 @@ class AliceAIDecoderBlock(nn.Module):
             norm_weight_name="mlp_res_norm_weight",
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
+        # FusedMoEFactory reduces routed + fused/TP shared experts; a replicated
+        # shared expert is already full-width, so the branch is complete here.
         mlp_output = self.mlp(hidden_states)
+        mlp_output = apply_layer_steering(self, mlp_output, SteeringHookPoint.MLP_OUT)
+        mlp_output, partial = apply_block_steering(self, mlp_output, partial)
         return num_completed_sources, partial + mlp_output
 
 
@@ -499,6 +563,7 @@ class AliceAIModel(nn.Module):
             layer_fn=get_layer,
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.fused_shared_expert_layers = get_fused_shared_expert_layers(
             self,
             AliceAISparseMoeBlock,

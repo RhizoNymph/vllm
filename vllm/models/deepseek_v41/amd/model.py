@@ -36,6 +36,11 @@ from vllm.model_executor.layers.mhc import (
     MHCPreDelayedOp,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -58,6 +63,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.utils import refill_derived
+from vllm.models.common.interventions import interventions_configured
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -69,6 +75,7 @@ from vllm.models.deepseek_v4.amd.model import (
     DeepseekV4MoE as DeepseekV4MoEBase,
 )
 from vllm.models.deepseek_v4.amd.model import takes_rocm_mxfp8_input
+from vllm.models.deepseek_v4.common.interventions import steer_and_capture_mhc
 from vllm.models.deepseek_v4.common.spec_decode import needs_mtp_hidden_buffer
 from vllm.models.deepseek_v41.amd.engram import RocmEngram
 from vllm.models.deepseek_v41.amd.mhc import (
@@ -102,6 +109,7 @@ from ..common.engram import (
     can_share_engram_tables,
     gather_engram_hashes,
 )
+from ..common.interventions import register_v41_steering_buffers, steer_final_streams
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
 if typing.TYPE_CHECKING:
@@ -238,6 +246,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
         self.mhc_overlap = mhc_overlap
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
@@ -276,6 +285,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.hc_post_alpha = 2.0
+        # Per-request interventions on the DeepSeek-V4 mHC hook set, shared
+        # with the nvidia path; DSpark draft layers skip it.
+        register_v41_steering_buffers(self, vllm_config, config.num_hidden_layers)
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
         self.hc_attn_fn = nn.Parameter(
@@ -359,7 +371,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "mhc_seam: aiter mhc_fused_post_pre_delayed from %d tokens",
                 MHC_SEAM_MIN_TOKENS,
             )
-        # Decode steps of an eligible layer may run as the mono decode layer.
+        # Decode steps of an eligible layer may run as the mono decode layer,
+        # whose launches skip the intervention hooks: refuse the combination.
+        if vllm_config.kernel_config.monokernel and interventions_configured(
+            vllm_config
+        ):
+            raise ValueError(
+                "--monokernel runs DeepSeek-V4.1 decode steps without the "
+                "intervention hooks; drop it to use steering, patching or "
+                "activation capture."
+            )
         self.mono = MonoDecodeLayer.create(self, vllm_config)
         if self.mono is not None and self.mono.ffn_only:
             # A decode step hands wo_b's TP partial to the FFN launch; forward
@@ -544,6 +565,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         if not fuse_attn_norm:
             x = self.attn_norm(x)
 
+        # mHC steering + capture taps (static no-ops when nothing is
+        # configured): the multi-stream residual entering attention and the
+        # normed single-stream attention input. Under interventions the
+        # overlap stream is off, so the mixes are ready on this stream.
+        residual, x = steer_and_capture_mhc(
+            self, residual, post_mix, res_mix, x, "attn"
+        )
+
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
@@ -557,6 +586,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if out is not None:
                 return out
             x = tensor_model_parallel_all_reduce(x)
+        x = apply_layer_steering(self, x, SteeringHookPoint.POST_ATTN)
 
         residual, post_mix, res_mix, x, ffn_pre = ffn_pre_fn(
             residual,
@@ -578,7 +608,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if not self.fuse_seam_norm:
             x = self.ffn_norm(x)
+        residual, x = steer_and_capture_mhc(self, residual, post_mix, res_mix, x, "ffn")
         x = self.ffn(x, input_ids)
+        x = apply_layer_steering(self, x, SteeringHookPoint.MLP_OUT)
         if mhc_overlap is not None:
             mhc_overlap.join()
         return x, residual, post_mix, res_mix, ffn_pre
@@ -657,7 +689,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj). fused_wqa_wkv stays on
         # the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
-        mhc_overlap = MHCOverlapStream() if supports_mhc_overlap(vllm_config) else None
+        # The hooks read the streams and mixes on the caller stream, which the
+        # overlap's side stream writes concurrently: off under interventions.
+        mhc_overlap = (
+            MHCOverlapStream()
+            if supports_mhc_overlap(vllm_config)
+            and not interventions_configured(vllm_config)
+            else None
+        )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
@@ -714,6 +753,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        # One steering_index for every steerable layer (no-op when steering
+        # is off: the layers register no buffers).
+        share_steering_index_across_layers(list(self.layers))
         engram = next(
             (
                 layer.engram
@@ -998,6 +1040,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
             pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
 
+        # The final multi-stream residual, before the MTP stash and collapse.
+        hidden_states = steer_final_streams(
+            self.layers, self.start_layer, self.end_layer, hidden_states
+        )
+
         if self._mtp_hidden_buffer is not None:
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
@@ -1141,7 +1188,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         draft_window = getattr(draft_hf_config, "sliding_window", None)
         draft_layer_types = getattr(draft_hf_config, "layer_types", None) or ()
         window = self.config.sliding_window
-        if self.start_layer > cut or self.end_layer < self.config.num_hidden_layers:
+        if interventions_configured(vllm_config):
+            reason = (
+                "interventions read every row at every layer, and the replay "
+                "layers run on each request's trailing window only"
+            )
+        elif self.start_layer > cut or self.end_layer < self.config.num_hidden_layers:
             reason = (
                 "the pipeline stage holding the last KV source layer must also "
                 "hold every layer after it"

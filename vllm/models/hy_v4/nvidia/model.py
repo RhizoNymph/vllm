@@ -26,6 +26,7 @@
 import typing
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
+from typing import ClassVar
 
 import regex as re
 import torch
@@ -44,6 +45,10 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -68,6 +73,14 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_reduce_scatter,
     sp_shard,
 )
+from vllm.models.hy_v4.interventions import (
+    interventions_configured,
+    register_hy_v4_steering_buffers,
+    steer,
+    steer_and_capture_ihc,
+    steer_block,
+    steer_streams,
+)
 from vllm.models.hy_v4.nvidia.mrope import set_token_rope
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -84,6 +97,36 @@ logger = init_logger(__name__)
 
 # Smallest step that shards the iHC rows; shorter ones keep them replicated.
 _IHC_SP_MIN_TOKENS = 1024
+
+
+def _use_ihc_sequence_parallel(
+    vllm_config: VllmConfig, *, enable_ihc: bool, supported: bool
+) -> bool:
+    """Whether the iHC rows (and every hook tensor) run on a TP token shard.
+
+    The sharded path hands each intervention hook a token shard (the
+    per-token steering index then no longer lines up with the rows) and
+    defers the attention / MLP all-reduces into a later reduce-scatter, so it
+    is turned off when steering, patching, or capture is configured.
+    """
+    parallel_config = vllm_config.parallel_config
+    speculative_config = vllm_config.speculative_config
+    return (
+        enable_ihc
+        and supported
+        and parallel_config.tensor_parallel_size > 1
+        and parallel_config.data_parallel_size == 1
+        and parallel_config.pipeline_parallel_size == 1
+        and parallel_config.prefill_context_parallel_size == 1
+        and parallel_config.decode_context_parallel_size == 1
+        and parallel_config.all2all_backend != "passthrough"
+        and vllm_config.lora_config is None
+        and not envs.VLLM_BATCH_INVARIANT
+        and (
+            speculative_config is None or not speculative_config.uses_aux_hidden_states
+        )
+        and not interventions_configured(vllm_config)
+    )
 
 
 def _normalize_hyv4_config(config: PreTrainedConfig) -> PreTrainedConfig:
@@ -105,6 +148,9 @@ class HYV4DecoderLayer(nn.Module):
     """
 
     feed_forward_cls = HYV4FeedForward
+    # Target-model layers take the intervention hooks; draft blocks that reuse
+    # this class (MTP, DFly) turn them off (see hy_v4/interventions.py).
+    intervention_hooks: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -169,6 +215,15 @@ class HYV4DecoderLayer(nn.Module):
         self.hc_mlp_layer = HYV4HCLayer(
             config, layer_idx, prefix=f"{prefix}.hc_mlp_layer"
         )
+        if self.intervention_hooks:
+            if self.enable_ihc:
+                self.hc_mult = config.hc_mult
+            register_hy_v4_steering_buffers(
+                self,
+                vllm_config,
+                ihc=self.enable_ihc,
+                is_last_layer=layer_idx == config.num_hidden_layers - 1,
+            )
 
     def forward(
         self,
@@ -189,6 +244,7 @@ class HYV4DecoderLayer(nn.Module):
         """Standard single-residual-stream forward (iHC disabled)."""
         if residual is not None:
             hidden_states = hidden_states + residual
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.PRE_ATTN)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -198,12 +254,15 @@ class HYV4DecoderLayer(nn.Module):
         )
 
         hidden_states = hidden_states + residual
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.POST_ATTN)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.MLP_IN)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.MLP_OUT)
 
-        return hidden_states, residual
+        return steer_block(self, hidden_states, residual)
 
     def _forward_ihc(
         self,
@@ -216,6 +275,11 @@ class HYV4DecoderLayer(nn.Module):
         hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
         hidden_states, post_gates, residual = self.hc_attn_layer.pre(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
+        # DeepSeek-V4 mHC hook set: ``residual`` holds the channels the pre op
+        # just reduced, ``hidden_states`` the normed attention input.
+        residual, hidden_states = steer_and_capture_ihc(
+            self, residual, post_gates, hidden_states, "attn"
+        )
         if use_ihc_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.self_attn(
@@ -228,11 +292,15 @@ class HYV4DecoderLayer(nn.Module):
                 if use_ihc_sequence_parallel
                 else tensor_model_parallel_all_reduce(hidden_states)
             )
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.POST_ATTN)
         hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
 
         hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
         hidden_states, post_gates, residual = self.hc_mlp_layer.pre(hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
+        residual, hidden_states = steer_and_capture_ihc(
+            self, residual, post_gates, hidden_states, "ffn"
+        )
         if use_ihc_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.mlp(hidden_states)
@@ -242,6 +310,7 @@ class HYV4DecoderLayer(nn.Module):
                 if use_ihc_sequence_parallel
                 else tensor_model_parallel_all_reduce(hidden_states)
             )
+        hidden_states = steer(self, hidden_states, SteeringHookPoint.MLP_OUT)
         hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post_gates)
 
         # Under iHC the residual is carried inside hidden_states.
@@ -282,22 +351,10 @@ class HYV4Model(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.enable_ihc = getattr(config, "enable_ihc", False)
-        speculative_config = vllm_config.speculative_config
-        self.ihc_sequence_parallel = (
-            self.enable_ihc
-            and self.supports_ihc_sequence_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and parallel_config.data_parallel_size == 1
-            and parallel_config.pipeline_parallel_size == 1
-            and parallel_config.prefill_context_parallel_size == 1
-            and parallel_config.decode_context_parallel_size == 1
-            and parallel_config.all2all_backend != "passthrough"
-            and vllm_config.lora_config is None
-            and not envs.VLLM_BATCH_INVARIANT
-            and (
-                speculative_config is None
-                or not speculative_config.uses_aux_hidden_states
-            )
+        self.ihc_sequence_parallel = _use_ihc_sequence_parallel(
+            vllm_config,
+            enable_ihc=self.enable_ihc,
+            supported=self.supports_ihc_sequence_parallel,
         )
 
         if get_pp_group().is_first_rank or (
@@ -322,6 +379,9 @@ class HYV4Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        # One steering_index shared by every steerable layer, so the runner's
+        # per-step token->row map reaches all of them (no-op without steering).
+        share_steering_index_across_layers(list(self.layers))
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         else:
@@ -475,6 +535,7 @@ class HYV4Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual, **buffers}
             )
         if self.enable_ihc:
+            hidden_states = self._steer_final_channels(hidden_states)
             hidden_states = self.hc_head(hidden_states)
         else:
             hidden_states = hidden_states + residual
@@ -483,6 +544,20 @@ class HYV4Model(nn.Module):
         if use_ihc_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         return hidden_states
+
+    def _steer_final_channels(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``mhc_streams_final``: the iHC channels entering the head merge.
+
+        Only the last decoder layer (global index ``num_hidden_layers - 1``,
+        on the last PP rank where this runs) registers the table.
+        """
+        if self.start_layer >= self.end_layer:
+            return hidden_states
+        return steer_streams(
+            self.layers[self.end_layer - 1],
+            hidden_states,
+            SteeringHookPoint.MHC_STREAMS_FINAL,
+        )
 
     def load_fused_expert_weights(
         self,

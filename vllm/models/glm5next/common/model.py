@@ -60,6 +60,13 @@ from vllm.model_executor.layers.mhc import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    apply_layer_steering_streams,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -105,6 +112,11 @@ from vllm.utils.math_utils import cdiv, round_up
 
 from ..nvidia.specialized_decode.runtime import specialized_decode_config
 from .attention import Glm5NextMLAAttention
+from .interventions import (
+    interventions_configured,
+    register_glm5next_steering_buffers,
+    steer_and_capture_mhc,
+)
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
     Glm5NextProcessingInfo,
@@ -173,6 +185,23 @@ def _is_kda_layer(config: Glm5NextTextConfig, layer_idx: int) -> bool:
 def _is_linear_attn(config: Glm5NextTextConfig) -> bool:
     layer_types = config.layer_types
     return layer_types is not None and "linear_attention" in layer_types
+
+
+def _use_sequence_parallel_moe(
+    parallel_config: ParallelConfig, vllm_config: VllmConfig
+) -> bool:
+    """Whether the decoder runs mHC and the MoE on a token shard of the step.
+
+    Sequence-parallel MoE hands every hook a token shard (the per-token
+    steering index then no longer lines up with the rows) and leaves the
+    attention output projection un-reduced until a later reduce-scatter, so
+    it is turned off when steering, patching, or capture is configured. The
+    decoder layer, its MoE, and the model all read this one switch so they
+    agree on the layout.
+    """
+    return parallel_config.use_sequence_parallel_moe and (
+        not interventions_configured(vllm_config)
+    )
 
 
 def _validate_supported_config(config: Glm5NextTextConfig) -> None:
@@ -262,7 +291,10 @@ class Glm5NextMoE(nn.Module):
         self.n_routed_experts: int = config.n_routed_experts
         self.n_shared_experts: int = config.n_shared_experts
 
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        vllm_config = get_current_vllm_config()
+        self.is_sequence_parallel = _use_sequence_parallel_moe(
+            parallel_config, vllm_config
+        )
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -299,7 +331,6 @@ class Glm5NextMoE(nn.Module):
         )
 
         swiglu_limit = config.swiglu_limit
-        vllm_config = get_current_vllm_config()
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         )
@@ -495,7 +526,9 @@ class Glm5NextDecoderLayer(nn.Module):
         self.mhc = config.mhc
         is_kda_layer = not is_mtp_layer and _is_kda_layer(config, layer_idx)
         self.layer_kind = "kda" if is_kda_layer else "mla"
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.is_sequence_parallel = _use_sequence_parallel_moe(
+            parallel_config, vllm_config
+        )
 
         if is_kda_layer:
             self.self_attn = Glm5NextLinearAttention(
@@ -676,6 +709,19 @@ class Glm5NextDecoderLayer(nn.Module):
                     hc_mult=self.n,
                 )
 
+        # Steering / patching / capture buffers (no-op when none configured).
+        # mHC layers take the DeepSeek-V4 mHC hook set; MTP draft blocks reuse
+        # this class and stay unhooked (see glm5next/common/interventions.py).
+        if not is_mtp_layer:
+            if self.mhc:
+                self.hc_mult = config.hc_mult
+            register_glm5next_steering_buffers(
+                self,
+                vllm_config,
+                mhc=self.mhc,
+                is_last_layer=layer_idx == config.num_hidden_layers - 1,
+            )
+
     def _load_hc_attn_fn(self, param: torch.Tensor, loaded_weight: torch.Tensor):
         default_weight_loader(param, loaded_weight)
         # Layerwise reload also runs loaders on meta tensors, to count them.
@@ -707,8 +753,8 @@ class Glm5NextDecoderLayer(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        # 70B or MTP layers: KDA + MoE without HC.
-        if not self.mhc or self.is_mtp_layer:
+        # MTP draft blocks: KDA + MoE without HC, and no intervention hooks.
+        if self.is_mtp_layer:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
@@ -720,12 +766,39 @@ class Glm5NextDecoderLayer(nn.Module):
                 attn_output, residual=residual
             )
             hidden_states = self.mlp(hidden_states)
-            if self.is_mtp_layer:
-                # Return the unsummed pair: the MTP caller feeds it straight
-                # into shared_head's fused_add_rms_norm (one kernel instead of
-                # a separate residual-add + norm). The sum itself is unchanged
-                # (fp32-accumulated inside the fused kernel).
-                return hidden_states, residual, None, None
+            # Return the unsummed pair: the MTP caller feeds it straight
+            # into shared_head's fused_add_rms_norm (one kernel instead of
+            # a separate residual-add + norm). The sum itself is unchanged
+            # (fp32-accumulated inside the fused kernel).
+            return hidden_states, residual, None, None
+
+        # 70B layers: KDA + MoE without HC, on a single residual stream.
+        if not self.mhc:
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.PRE_ATTN
+            )
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+            attn_output = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+            )
+            hidden_states, residual = self.post_attention_layernorm(
+                attn_output, residual=residual
+            )
+            # post_attn: the residual now holding this layer's attention branch.
+            residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.MLP_IN
+            )
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = apply_layer_steering(
+                self, hidden_states, SteeringHookPoint.MLP_OUT
+            )
+            hidden_states, residual = apply_block_steering(
+                self, hidden_states, residual
+            )
             hidden_states = residual + hidden_states
             return hidden_states, residual, None, None
 
@@ -760,6 +833,12 @@ class Glm5NextDecoderLayer(nn.Module):
                 fn_split=self.hc_attn_fn_split,
             )
 
+        # mHC steering + capture taps, DeepSeek-V4 hook set: ``residual`` is
+        # the multi-stream residual the pre op just consumed, ``x`` the normed
+        # single-stream attention input (input_layernorm is fused into the
+        # pre op), ``post``/``comb`` the capture-only mixing coefficients.
+        residual, x = steer_and_capture_mhc(self, residual, post, comb, x, "attn")
+
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
@@ -772,6 +851,8 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
+
+        x = apply_layer_steering(self, x, SteeringHookPoint.POST_ATTN)
 
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
         residual, post, comb, x = self.hc_fused_post_pre(
@@ -787,17 +868,25 @@ class Glm5NextDecoderLayer(nn.Module):
             fn_split=self.hc_ffn_fn_split,
         )
 
+        residual, x = steer_and_capture_mhc(self, residual, post, comb, x, "ffn")
+
         # Fully Connected
         if self._mlp_is_moe:
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
+        x = apply_layer_steering(self, x, SteeringHookPoint.MLP_OUT)
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
         # the next layer's fused pre, returning the state.
         if self.layer_idx == self.num_hidden_layers - 1:
             x = self.hc_post(x, residual, post, comb)
+            # The final multi-stream residual before the contraction; only the
+            # last layer registers this model-level table.
+            x = apply_layer_steering_streams(
+                self, x, SteeringHookPoint.MHC_STREAMS_FINAL
+            )
             x = hc_contract(x, self.n)
             return x, None, None, None
 
@@ -940,6 +1029,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        # One steering_index shared by every steerable layer, so the runner's
+        # per-step token->row map reaches all of them (no-op without steering).
+        share_steering_index_across_layers(list(self.layers))
         self._aux_post_op = MHCPostOp()
         # The active slice is fixed after construction; cache it so forward
         # doesn't rebuild the slice (a fresh list) every step.
@@ -955,8 +1047,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         else:
             self.norm = PPMissingLayer()
 
-        self.is_sequence_parallel = (
-            vllm_config.parallel_config.use_sequence_parallel_moe
+        self.is_sequence_parallel = _use_sequence_parallel_moe(
+            vllm_config.parallel_config, vllm_config
         )
 
         world_size = get_tensor_model_parallel_world_size()

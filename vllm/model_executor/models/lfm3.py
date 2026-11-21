@@ -30,10 +30,17 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mamba.short_conv import ShortConv
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.models.common.interventions import register_layer_steering_buffers
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.lfm3 import Lfm3Config
 
@@ -207,9 +214,13 @@ class Lfm3DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        vllm_config: VllmConfig | None = None,
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
+        if vllm_config is not None:
+            register_layer_steering_buffers(self, vllm_config, config.hidden_size)
         layer_type = config.layer_types[layer_idx]
         self.is_attention_layer = layer_type in ATTENTION_LAYER_TYPES
         if self.is_attention_layer:
@@ -251,6 +262,8 @@ class Lfm3DecoderLayer(nn.Module):
             hidden_states = self.operator_norm(hidden_states)
         else:
             hidden_states, residual = self.operator_norm(hidden_states, residual)
+        # The operator (attention or short conv) is the "attention" sublayer.
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         if self.is_attention_layer:
             hidden_states = self.self_attn(positions, hidden_states)
         else:
@@ -259,10 +272,21 @@ class Lfm3DecoderLayer(nn.Module):
             hidden_states = output
         if self.use_sandwich_norm:
             hidden_states = self.post_operator_norm(hidden_states)
+        # The operator branch joins the residual inside this fused add, so
+        # post_attn is read after it.
         hidden_states, residual = self.ffn_norm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
         hidden_states = self.feed_forward(hidden_states)
         if self.use_sandwich_norm:
             hidden_states = self.post_ffn_norm(hidden_states)
+        # mlp_out is the (post-FFN-normed) branch added to the residual stream.
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -313,9 +337,11 @@ class Lfm3Model(nn.Module, EagleModelMixin):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
+                vllm_config=vllm_config,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )

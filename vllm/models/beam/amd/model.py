@@ -13,6 +13,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.steering import share_steering_index_across_layers
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -33,9 +34,14 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.models.common.interventions import (
+    interventions_configured,
+    register_layer_steering_buffers,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.beam import BeamConfig
 
+from ..common.interventions import beam_steerable_layer_forward
 from .activation import beam_softcap_logits
 from .attention import BeamAttention, use_merged_qkv_gate
 from .layernorm import RMSNorm, beam_norm_residual_norm, beam_rms_norm
@@ -56,6 +62,11 @@ class BeamDecoderLayer(nn.Module):
         super().__init__()
         config = cast(BeamConfig, vllm_config.model_config.hf_config)
         self.layer_id = extract_layer_index(prefix)
+        self.layer_idx = self.layer_id
+        register_layer_steering_buffers(self, vllm_config, config.hidden_size)
+        # Interventions need each hook tensor materialized and complete, so
+        # the fused join/next-norm boundaries are bypassed when configured.
+        self.steerable = interventions_configured(vllm_config)
         self.rms_norm_eps = config.rms_norm_eps
 
         self.self_attn = BeamAttention(
@@ -92,6 +103,11 @@ class BeamDecoderLayer(nn.Module):
         normalized_states: torch.Tensor | None = None,
         next_norm_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.steerable:
+            assert normalized_states is None
+            return beam_steerable_layer_forward(
+                self, positions, hidden_states, beam_rms_norm
+            )
         x = (
             beam_rms_norm(hidden_states, self.input_layernorm.weight, self.rms_norm_eps)
             if normalized_states is None
@@ -183,6 +199,7 @@ class BeamModel(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.norm = (
             RMSNorm(config.hidden_size)
             if get_pp_group().is_last_rank

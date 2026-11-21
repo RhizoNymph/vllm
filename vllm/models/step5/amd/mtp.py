@@ -63,7 +63,9 @@ class Step5MultiTokenPredictorLayer(nn.Module):
         self.shared_head = Step5MTPSharedHead(
             config, vllm_config.quant_config, prefix=f"{prefix}.shared_head"
         )
-        self.mtp_block = Step5DecoderLayer(vllm_config, prefix=f"{prefix}.mtp_block")
+        self.mtp_block = Step5DecoderLayer(
+            vllm_config, prefix=f"{prefix}.mtp_block", interventions=False
+        )
 
     def forward(
         self,

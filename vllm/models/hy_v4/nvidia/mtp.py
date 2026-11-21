@@ -314,6 +314,16 @@ class HYV4SharedHead(nn.Module):
         return hidden_states
 
 
+class HYV4MTPDecoderLayer(HYV4DecoderLayer):
+    """The MTP draft block: the target decoder layer without intervention hooks.
+
+    Its layer index sits past the backbone's, so it neither registers
+    steering buffers nor fires capture taps.
+    """
+
+    intervention_hooks = False
+
+
 class HYV4MultiTokenPredictorLayer(nn.Module):
     """A single MTP draft block."""
 
@@ -349,7 +359,7 @@ class HYV4MultiTokenPredictorLayer(nn.Module):
             getattr(mtp_config, "mlp_layer_types", None), layer_idx, "sparse"
         )
 
-        self.mtp_block = HYV4DecoderLayer(
+        self.mtp_block = HYV4MTPDecoderLayer(
             config=mtp_config,
             vllm_config=vllm_config,
             cache_config=cache_config,

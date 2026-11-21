@@ -31,6 +31,12 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -47,6 +53,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     skip_spec_layers,
 )
+from vllm.models.common.interventions import register_layer_steering_buffers
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import get_cdna_version, on_gfx1250
 from vllm.sequence import IntermediateTensors
@@ -531,10 +538,16 @@ def use_fp32_norm_weights(module: nn.Module, config: Step5Config) -> None:
 
 
 class Step5DecoderLayer(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(
+        self, vllm_config: VllmConfig, prefix: str = "", interventions: bool = True
+    ) -> None:
+        """``interventions=False`` skips steering buffers (the MTP drafter)."""
         super().__init__()
         config = vllm_config.model_config.hf_config
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
+        if interventions:
+            register_layer_steering_buffers(self, vllm_config, config.hidden_size)
         if vllm_config.cache_config is not None:
             vllm_config.cache_config.sliding_window = None
         self.self_attn = Step5Attention(vllm_config, prefix=f"{prefix}.self_attn")
@@ -560,9 +573,16 @@ class Step5DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden = self.input_layernorm(residual).to(self.act_dtype)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         residual = residual + self.self_attn(positions, hidden).float()
         hidden = self.post_attention_layernorm(residual).to(self.act_dtype)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden = apply_layer_steering(self, hidden, SteeringHookPoint.MLP_IN)
+        # The MoE folds the shared expert into one FusedMoE call whose combined
+        # output is all-reduced, so `ffn` is complete either way.
         ffn = self.moe(hidden) if self.use_moe else self.mlp(hidden)
+        ffn = apply_layer_steering(self, ffn, SteeringHookPoint.MLP_OUT)
+        ffn, residual = apply_block_steering(self, ffn, residual)
         return residual + ffn.float()
 
 
@@ -651,6 +671,7 @@ class Step5Model(nn.Module):
             lambda prefix: Step5DecoderLayer(vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         if get_pp_group().is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         else:

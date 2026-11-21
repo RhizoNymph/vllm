@@ -76,6 +76,12 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -102,6 +108,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.models.common.interventions import register_layer_steering_buffers
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl
 
@@ -953,6 +960,8 @@ class K2HorizonDecoderLayer(nn.Module):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
+        register_layer_steering_buffers(self, vllm_config, config.hidden_size)
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
@@ -1038,12 +1047,25 @@ class K2HorizonDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
-        # Fully Connected
+        # Fully Connected. The attention branch joins the residual inside this
+        # fused add-norm, so post_attn is read after it.
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
+        # Dense down_proj and FusedMoEFactory (shared + routed) both reduce, and
+        # the sequence-parallel MoE path all-gathers inside the block, so the
+        # branch here is complete on every TP rank.
         hidden_states = self.mlp(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
+        hidden_states, residual = apply_block_steering(self, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1078,6 +1100,7 @@ class K2HorizonModel(nn.Module, EagleModelMixin):
             lambda prefix: decoder_layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
 
         self.norm = K2HorizonRMSNorm(
             hidden_size=config.hidden_size,

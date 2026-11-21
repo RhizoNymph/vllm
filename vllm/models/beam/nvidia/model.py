@@ -26,6 +26,7 @@ from vllm.distributed import (
 from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.steering import share_steering_index_across_layers
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -46,9 +47,14 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.models.common.interventions import (
+    interventions_configured,
+    register_layer_steering_buffers,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.beam import BeamConfig
 
+from ..common.interventions import beam_steerable_layer_forward
 from .activation import beam_softcap_logits
 from .allreduce import (
     BeamAllReduceWorkspace,
@@ -87,6 +93,11 @@ class BeamDecoderLayer(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         self.layer_id = extract_layer_index(prefix)
+        self.layer_idx = self.layer_id
+        register_layer_steering_buffers(self, vllm_config, config.hidden_size)
+        # Interventions need each hook tensor materialized and complete, so
+        # the fused join/next-norm boundaries are bypassed when configured.
+        self.steerable = interventions_configured(vllm_config)
         self.rms_norm_eps = config.rms_norm_eps
         fuse_attention_reduce = allreduce_workspace is not None
 
@@ -153,6 +164,11 @@ class BeamDecoderLayer(nn.Module):
         normalized_states: torch.Tensor | None = None,
         next_norm_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.steerable:
+            assert normalized_states is None
+            return beam_steerable_layer_forward(
+                self, positions, hidden_states, beam_rms_norm
+            )
         x = (
             beam_rms_norm(hidden_states, self.input_layernorm.weight, self.rms_norm_eps)
             if normalized_states is None
@@ -252,16 +268,21 @@ class BeamModel(nn.Module, EagleModelMixin):
             )
         else:
             self.embed_tokens = PPMissingLayer()
-        tp_group = get_tp_group()
-        self.allreduce_workspace = BeamAllReduceWorkspace.create(
-            tp_group.cpu_group,
-            config.hidden_size,
-            max(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                vllm_config.scheduler_config.max_num_seqs,
-            ),
-            vllm_config.model_config.dtype,
-        )
+        # The MNNVL all-reduce is fused into the next norm, so the branch at
+        # mlp_out / post_block would never exist reduced. Interventions keep
+        # the standard in-sublayer all-reduces instead.
+        self.allreduce_workspace: BeamAllReduceWorkspace | None = None
+        if not interventions_configured(vllm_config):
+            tp_group = get_tp_group()
+            self.allreduce_workspace = BeamAllReduceWorkspace.create(
+                tp_group.cpu_group,
+                config.hidden_size,
+                max(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    vllm_config.scheduler_config.max_num_seqs,
+                ),
+                vllm_config.model_config.dtype,
+            )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: BeamDecoderLayer(
@@ -271,6 +292,7 @@ class BeamModel(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.norm = (
             RMSNorm(config.hidden_size)
             if get_pp_group().is_last_rank

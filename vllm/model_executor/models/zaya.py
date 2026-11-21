@@ -26,6 +26,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -33,6 +38,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import maybe_prefix, sequence_parallel_chunk
+from vllm.models.common.interventions import register_layer_steering_buffers
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
@@ -449,25 +455,42 @@ class ZayaResidualScaling(nn.Module):
         self.residual_scale = nn.Parameter(torch.ones(hidden_size))
         self.residual_bias = nn.Parameter(torch.zeros(hidden_size))
 
+    def scale_branch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The sublayer branch as it joins the residual stream."""
+        return (hidden_states + self.hidden_states_bias) * self.hidden_states_scale
+
+    def scale_residual(self, residual: torch.Tensor) -> torch.Tensor:
+        return (residual + self.residual_bias) * self.residual_scale
+
     def forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
     ) -> torch.Tensor:
-        hidden_states = (hidden_states + self.hidden_states_bias) * (
-            self.hidden_states_scale
-        )
-        return hidden_states + (residual + self.residual_bias) * self.residual_scale
+        return self.scale_branch(hidden_states) + self.scale_residual(residual)
 
 
 class ZayaDecoderLayer(nn.Module):
+    """CCA attention + MoE with learned residual scaling.
+
+    The layer carries the full (fp32) residual stream and returns it complete,
+    so there is no deferred branch add: ``pre_attn`` / ``post_attn`` /
+    ``post_block`` act on that stream, ``mlp_in`` on the normed MoE input, and
+    ``mlp_out`` on the scaled MoE branch (``scale_branch``) just before it is
+    added to the scaled residual.
+    """
+
     def __init__(
         self,
         config: ZayaConfig,
         layer_idx: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        vllm_config: VllmConfig | None = None,
     ):
         super().__init__()
         size = config.hidden_size
+        self.layer_idx = layer_idx
+        if vllm_config is not None:
+            register_layer_steering_buffers(self, vllm_config, size)
         self.input_layernorm = RMSNorm(size, eps=config.rms_norm_eps)
         self.self_attn = ZayaAttention(
             config, layer_idx, quant_config, f"{prefix}.self_attn"
@@ -485,14 +508,29 @@ class ZayaDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # The residual stream stays in fp32; each sublayer runs in the model dtype
         dtype = self.input_layernorm.weight.dtype
-        hidden_states = self.self_attn(
-            self.input_layernorm(residual.to(dtype)), positions
-        )
+        hidden_states = self.input_layernorm(residual.to(dtype))
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
+        hidden_states = self.self_attn(hidden_states, positions)
         residual = self.post_attention_residual_scale(hidden_states, residual)
-        hidden_states, router_states = self.mlp(
-            self.post_attention_layernorm(residual.to(dtype)), router_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = self.post_attention_layernorm(residual.to(dtype))
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
         )
-        return self.post_mlp_residual_scale(hidden_states, residual), router_states
+        # mlp_in/mlp_out bracket the whole MoE block (its output is complete:
+        # under sequence-parallel MoE it is all-gathered back to every token).
+        hidden_states, router_states = self.mlp(hidden_states, router_states)
+        scale = self.post_mlp_residual_scale
+        hidden_states = apply_layer_steering(
+            self, scale.scale_branch(hidden_states), SteeringHookPoint.MLP_OUT
+        )
+        hidden_states = hidden_states + scale.scale_residual(residual)
+        # The full stream is returned (no separate residual tensor), so
+        # post_block is the plain layer-steering op on it.
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
+        )
+        return hidden_states, router_states
 
 
 @support_torch_compile
@@ -507,10 +545,15 @@ class ZayaModel(nn.Module):
         self.input_hidden_states_bias = nn.Parameter(torch.zeros(config.hidden_size))
         self.layers = nn.ModuleList(
             ZayaDecoderLayer(
-                config, i, vllm_config.quant_config, f"{prefix}.layers.{i}"
+                config,
+                i,
+                vllm_config.quant_config,
+                f"{prefix}.layers.{i}",
+                vllm_config=vllm_config,
             )
             for i in range(config.num_hidden_layers)
         )
+        share_steering_index_across_layers(self.layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(

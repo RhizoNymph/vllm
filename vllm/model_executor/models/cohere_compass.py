@@ -75,8 +75,14 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.models.common.interventions import register_layer_steering_buffers
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     ImageItem,
@@ -2069,8 +2075,12 @@ class CohereCompassDecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         max_position_embeddings: int | None = None,
         prefix: str = "",
+        vllm_config: VllmConfig | None = None,
     ):
         super().__init__()
+        self.layer_idx = extract_layer_index(prefix)
+        if vllm_config is not None:
+            register_layer_steering_buffers(self, vllm_config, config.hidden_size)
         self.self_attn = CohereCompassAttention(
             config,
             cache_config,
@@ -2095,14 +2105,32 @@ class CohereCompassDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Parallel block (as in CommandR): one norm feeds both branches and
+        # the full stream is returned. Unlike CommandR, both branches reduce
+        # inside their RowParallelLinear, so every hook below is complete
+        # under TP with no fused all-reduce to split.
         residual = hidden_states
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states_attention = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
-        hidden_states_mlp = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states_attention + hidden_states_mlp
+        stream = residual + hidden_states_attention
+        stream = apply_layer_steering(self, stream, SteeringHookPoint.POST_ATTN)
+        # mlp_in steers only the MLP's view of the shared normed input.
+        hidden_states_mlp = self.mlp(
+            apply_layer_steering(self, hidden_states, SteeringHookPoint.MLP_IN)
+        )
+        hidden_states_mlp = apply_layer_steering(
+            self, hidden_states_mlp, SteeringHookPoint.MLP_OUT
+        )
+        hidden_states = stream + hidden_states_mlp
+        # The full stream is returned (no deferred add), so post_block is the
+        # plain layer-steering op on it, as in CommandR.
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.POST_BLOCK
+        )
         return hidden_states, residual
 
 
@@ -2136,9 +2164,11 @@ class CohereCompassTextModel(nn.Module):
                 quant_config=quant_config,
                 max_position_embeddings=vllm_config.model_config.max_model_len,
                 prefix=prefix,
+                vllm_config=vllm_config,
             ),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.norm = LayerNorm(
             param_shape=config.hidden_size,
             eps=config.layer_norm_eps,

@@ -44,6 +44,18 @@ Steering is wired into the following decoder architectures:
 - Molmo family: `molmo`, `molmo2`
 - Falcon / Baichuan / Command: `falcon`, `baichuan`, `commandr`
 - Other: `AXK1`, `hyperclovax`, `opt`, `orion`, `persimmon`, `mimo_v2_flash`
+- Added upstream after the 08-19 sync, all with the five-hook set unless
+  noted: `ricursive`, `k2_horizon`, `lfm3` (conv and attention layers; also
+  the LFM3 VL / audio / omni wrappers), `domyn_edge`, `zaya`, `cohere_compass`
+  (text decoder of `CohereCompassForConditionalGeneration`), `alice_ai`
+  (block attention residuals: the hooks steer the carried block-local partial
+  sum and the newest committed source, so `post_block` captures are
+  block-local and steering reaches later sublayers through the depth softmax),
+  `dory` (each physical layer is attention-only, with `pre_attn` / `post_attn`,
+  or MLP-only, with `mlp_in` / `mlp_out` / `post_block`; recurrent layers fire
+  once per loop, and the nGPT renormalization makes vectors act non-linearly),
+  and `unlimited_ocr` (`UnlimitedOCR2TextForCausalLM`; `pre_attn` / `post_attn`
+  / `post_block` through the inherited `deepseek_v2` forward)
 
 `llama` here means the native `vllm/model_executor/models/llama.py`, which
 still serves architectures the registry maps to it (`InternLM3ForCausalLM`,
@@ -122,6 +134,46 @@ hooked per implementation, so coverage can differ by platform:
   its own `KimiDecoderLayer` with a separate attention-residual forward path and
   is **not** hooked, so steering, capture, and patching are inert for this
   architecture on ROCm.
+- `step5` — `Step5ForCausalLM` and `Step5ForConditionalGeneration`, NVIDIA and
+  ROCm. On NVIDIA, configuring an intervention turns off sequence parallelism
+  (and with it the reduce-scattered `o_proj`), so the MegaMoE path dispatches
+  every token on each TP rank. The MTP drafter registers no buffers.
+- `beam` — NVIDIA and ROCm. The fused `beam_norm_residual_norm` boundary never
+  materializes the branch, so an intervened server runs the same arithmetic
+  unfused and, on NVIDIA, skips the MNNVL all-reduce workspace. Each sublayer
+  join rescales the stream, so a `pre_attn` vector reaches the block output
+  scaled by the two downstream residual scales and a `post_attn` vector by one.
+- `flint` — single implementation. The low-latency kernels that fold the input
+  add-norm into the QKV GEMV and the post-attention add-norm into the MoE are
+  skipped when an intervention is configured.
+- `muse_spark` — NVIDIA and ROCm. The FP32 stream is a gated blend whose FFN
+  half is deferred into the next layer's fused boundary, so an intervened layer
+  does the blend itself and exposes `post_block` on the blended stream;
+  `pre_attn` / `post_attn` vectors reach the block output scaled by the
+  downstream gate. `decode_backend=latency_specialized` (NVIDIA) and
+  `--monokernel` (ROCm) are rejected at startup when an intervention is
+  configured.
+- `mistral_large4` — NVIDIA and ROCm; the deferred all-reduce is off when an
+  intervention is configured, and the ROCm specialized/monokernel decode is
+  rejected.
+- `deepseek_v41`, `glm5next`, `hy_v4`, `hy_v4_flash` — multi-stream residuals
+  (DeepSeek-style mHC for V4.1 and GLM-5.3; HY V4's gated iHC channels), wired
+  with the [mHC hook set](#mhc-steering): single-stream `pre_attn` /
+  `post_attn` / `mlp_in` / `mlp_out` plus `mhc_streams_*`, no `post_block`.
+  Single-stream configurations (GLM `mhc=False`, HY `enable_ihc=False`) get
+  the standard five hooks. NVIDIA and ROCm are hooked for V4.1, GLM-5.3 (one
+  shared forward) and HY V4; HY V4 Flash is NVIDIA-only. With an intervention
+  configured, sequence-parallel MoE / iHC sequence parallelism, the mHC side
+  stream and fused mHC all-reduce, decoder replay, and specialized/mono decode
+  are turned off (`auto` falls back; an explicit `latency_specialized` or
+  `--monokernel` is rejected, as is V4.1 MegaMoE, which requires sequence
+  parallelism). Capture picks the mHC schema from the top-level
+  `hf_config.hc_mult`, so the GLM-5.3 VL wrapper and single-stream GLM / HY
+  configurations get a mismatched capture schema (known gap).
+
+Not hooked: `deepseek_v32` (`DeepseekV32ForCausalLM`, `GlmMoeDsaForCausalLM`)
+and `dots3_note`, whose decoder layers never carried hooks; `inkling`,
+`minimax_m3`; and `inkling2`, which is wired separately.
 
 End-to-end tested with real weights:
 
@@ -373,8 +425,9 @@ layer's forward path. Unused hook points are zero-valued no-ops.
 The three residual-stream hooks steer the carried residual and are wired on
 every steerable model. `mlp_in`/`mlp_out` steer the MLP *branch* tensor and
 are wired on gemma3, gemma4, the qwen3 family (`qwen3`, `qwen3_moe`,
-`qwen3_next`/Qwen3.5), `qwen4_exp`, and every Transformers-backend
-architecture; on other models they are silent no-ops (buffers exist
+`qwen3_next`/Qwen3.5), `qwen4_exp`, every Transformers-backend architecture,
+and the families added after the 08-19 sync listed above; on other models
+they are silent no-ops (buffers exist
 but no emission site). Note an additive steer at `mlp_out` propagates
 identically to `post_block` — the branch is added to the residual stream —
 so `mlp_out` exists chiefly for patching (replace/ablate the MLP branch);
