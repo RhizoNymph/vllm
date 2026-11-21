@@ -39,6 +39,10 @@ from vllm.model_executor.layers.quantization.online.base import (
 from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+)
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
@@ -47,6 +51,12 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     extract_layer_index,
     sequence_parallel_chunk,
+)
+from vllm.models.common.interventions import interventions_configured
+from vllm.models.muse_spark.common.interventions import (
+    blend_ffn_with_hooks,
+    refuse_hook_bypassing_backend,
+    wire_decoder_layer_interventions,
 )
 from vllm.models.muse_spark.common.layers import (
     MulTanhSoftCap,
@@ -145,6 +155,28 @@ def token_sharded_stream_supported(vllm_config: VllmConfig) -> bool:
         and pc.decode_context_parallel_size == 1
         and not pc.use_sequence_parallel_moe
         and all(t == "sparse" for t in config.mlp_layer_types)
+    )
+
+
+def token_shard_min_tokens(vllm_config: VllmConfig) -> int:
+    """Smallest batch that token-shards the stream; 0 disables sharding.
+
+    Off under interventions: hooks must see every token's row.
+    """
+    if interventions_configured(vllm_config) or not token_sharded_stream_supported(
+        vllm_config
+    ):
+        return 0
+    return envs.VLLM_ROCM_MUSE_SP_MIN_TOKENS
+
+
+def refuse_monokernel(vllm_config: VllmConfig) -> None:
+    """The monokernel runs every decoder layer in one fused kernel that
+    bypasses the intervention hooks, so it is refused under interventions."""
+    refuse_hook_bypassing_backend(
+        vllm_config,
+        enabled=bool(vllm_config.kernel_config.monokernel),
+        backend="--monokernel",
     )
 
 
@@ -832,6 +864,11 @@ class MuseSparkDecoderLayer(nn.Module):
 
         self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
+        # Target layers with an intervention configured take the hooked path
+        # (see vllm/models/muse_spark/common/interventions.py).
+        self.intervenable = wire_decoder_layer_interventions(
+            self, vllm_config, is_draft=is_draft
+        )
 
         self.self_attn = MuseSparkAttention(
             config=config,
@@ -938,10 +975,12 @@ class MuseSparkDecoderLayer(nn.Module):
         positions: torch.Tensor,
         x: MuseSparkResidualStream | torch.Tensor,
         shard: TokenShard | None = None,
-    ) -> MuseSparkResidualStream:
+    ) -> MuseSparkResidualStream | torch.Tensor:
         """Run attention and FFN; the FFN boundary is returned unblended.
 
-        With `shard`, the stream holds the current rank's tokens only.
+        With `shard`, the stream holds the current rank's tokens only. On the
+        hooked path (interventions configured, never token-sharded) the
+        blended stream is returned instead.
         """
         if isinstance(x, torch.Tensor):
             stream = x
@@ -953,6 +992,9 @@ class MuseSparkDecoderLayer(nn.Module):
                 x, self.self_attn.pre_qkv_proj_norm, out_dtype=self.default_dtype
             )
         assert stream.dtype == self.residual_dtype
+        if self.intervenable:
+            assert shard is None, "token sharding is off under interventions"
+            stream = apply_layer_steering(self, stream, SteeringHookPoint.PRE_ATTN)
 
         attn_out = self.self_attn(
             positions=positions, hidden_states=attn_input, shard=shard
@@ -976,6 +1018,8 @@ class MuseSparkDecoderLayer(nn.Module):
             self.pre_ffn_norm,
             out_dtype=self.default_dtype,
         )
+        if self.intervenable:
+            return self._hooked_ffn(ffn_in, stream)
         if shard is None:
             branch = self.feed_forward(ffn_in)
         else:
@@ -986,6 +1030,17 @@ class MuseSparkDecoderLayer(nn.Module):
             post_norm=self.post_ffn_norm,
             connection=self.add_ffn,
         )
+
+    def _hooked_ffn(self, ffn_in: torch.Tensor, stream: torch.Tensor) -> torch.Tensor:
+        """post_attn / mlp_in / mlp_out / post_block and the in-layer blend."""
+
+        def hook(t: torch.Tensor, point: SteeringHookPoint) -> torch.Tensor:
+            return apply_layer_steering(self, t, point)
+
+        stream = hook(stream, SteeringHookPoint.POST_ATTN)
+        ffn_in = hook(ffn_in, SteeringHookPoint.MLP_IN)
+        branch = self.feed_forward(ffn_in)
+        return blend_ffn_with_hooks(self, stream, branch, hook)
 
 
 def _reject_online_quantized_linears(model: nn.Module) -> None:
@@ -1055,11 +1110,7 @@ class MuseSparkModel(LlamaModel):
 
         self.default_dtype = torch.get_default_dtype()
         self.residual_dtype = torch.float32
-        self.token_shard_min_tokens = (
-            envs.VLLM_ROCM_MUSE_SP_MIN_TOKENS
-            if token_sharded_stream_supported(vllm_config)
-            else 0
-        )
+        self.token_shard_min_tokens = token_shard_min_tokens(vllm_config)
         # TP-sharded experts reduce-scatter the [T, top_k, H]. Padding to a
         # multiple of TP would require copying, so shard only when they split
         # evenly.
@@ -1201,6 +1252,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 "Muse Spark gated_delta_net layers are not supported by the "
                 "native vLLM text stack."
             )
+        refuse_monokernel(vllm_config)
         if vllm_config.quant_config is not None and not isinstance(
             vllm_config.quant_config, self.supported_quantization_configs
         ):

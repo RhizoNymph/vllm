@@ -75,6 +75,10 @@ from vllm.model_executor.layers.quantization.online.base import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+)
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
@@ -85,6 +89,7 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     sequence_parallel_chunk,
 )
+from vllm.models.common.interventions import interventions_configured
 from vllm.models.common.ops.sequence_parallel import (
     can_sp_all_gather_matmul,
     is_sequence_parallel_active,
@@ -92,6 +97,11 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather_matmul,
     sp_reduce_scatter,
     sp_shard,
+)
+from vllm.models.muse_spark.common.interventions import (
+    blend_ffn_with_hooks,
+    refuse_hook_bypassing_backend,
+    wire_decoder_layer_interventions,
 )
 from vllm.models.muse_spark.common.layers import (  # noqa: F401 re-exported
     MulTanhSoftCap,
@@ -142,6 +152,7 @@ from vllm.models.muse_spark.nvidia.ops.prepare_trtllm_nvfp4 import (
     norm_quant_trtllm_nvfp4,
 )
 from vllm.models.muse_spark.nvidia.specialized_decode.runtime import (
+    decode_backend,
     specialized_decode_config,
 )
 from vllm.platforms import current_platform
@@ -390,6 +401,17 @@ def norm_residual_then_norm(
     if router_input is not None:
         router_input.copy_(pre_norm(new_stream, out_dtype=torch.float32))
     return out, new_stream
+
+
+def refuse_specialized_decode(vllm_config: VllmConfig) -> None:
+    """The specialized decode replays whole layers in megakernels that bypass
+    the intervention hooks (its DSpark draft shares the backend switch), so it
+    is refused rather than silently skipping hooks."""
+    refuse_hook_bypassing_backend(
+        vllm_config,
+        enabled=decode_backend(vllm_config) == "latency_specialized",
+        backend="decode_backend=latency_specialized",
+    )
 
 
 def is_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
@@ -1449,6 +1471,11 @@ class MuseSparkDecoderLayer(nn.Module):
 
         self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
+        # Target layers with an intervention configured take the hooked path
+        # (see vllm/models/muse_spark/common/interventions.py).
+        self.intervenable = wire_decoder_layer_interventions(
+            self, vllm_config, is_draft=is_draft
+        )
 
         self.self_attn = MuseSparkAttention(
             config=config,
@@ -1565,8 +1592,12 @@ class MuseSparkDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         x: MuseSparkResidualStream | torch.Tensor,
-    ) -> MuseSparkResidualStream:
-        """Run attention and FFN; the FFN boundary is returned unblended."""
+    ) -> MuseSparkResidualStream | torch.Tensor:
+        """Run attention and FFN; the FFN boundary is returned unblended.
+
+        On the hooked path (interventions configured) the blended stream is
+        returned instead.
+        """
         if isinstance(x, torch.Tensor):
             stream = x
             attn_input = self.self_attn.pre_qkv_proj_norm(
@@ -1581,6 +1612,13 @@ class MuseSparkDecoderLayer(nn.Module):
         sp_active = is_sequence_parallel_active(
             self.is_sequence_parallel, positions.shape[0], self.sp_min_tokens
         )
+        if self.intervenable:
+            stream = self._hook(
+                stream,
+                SteeringHookPoint.PRE_ATTN,
+                sp_active and self.is_sequence_parallel_input,
+                positions.shape[0],
+            )
         gather_input = sp_active and self.is_sequence_parallel_input
         if gather_input and not self.self_attn.can_fuse_sp_gather(attn_input):
             # Positions carries the unpadded length of the gathered sequence.
@@ -1630,6 +1668,10 @@ class MuseSparkDecoderLayer(nn.Module):
                 out_dtype=self.default_dtype,
                 router_input=router_input,
             )
+        if self.intervenable:
+            return self._hooked_ffn(
+                ffn_in, stream, router_input, sp_active, positions.shape[0]
+            )
         if sp_active and not self.feed_forward.use_mega_moe:
             # Non-megakernel experts need every token.
             branch = sp_shard(self.feed_forward(sp_all_gather(ffn_in)))
@@ -1660,6 +1702,55 @@ class MuseSparkDecoderLayer(nn.Module):
             post_norm=self.post_ffn_norm,
             connection=self.add_ffn,
         )
+
+    def _hook(
+        self,
+        x: torch.Tensor,
+        hook_point: SteeringHookPoint,
+        sharded: bool,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Run ``hook_point`` on the complete tensor.
+
+        A sequence-parallel shard is gathered (trimmed to ``num_tokens`` so the
+        rows line up with ``steering_index``), hooked, and re-sharded.
+        """
+        if not sharded:
+            return apply_layer_steering(self, x, hook_point)
+        full = sp_all_gather(x)[:num_tokens]
+        return sp_shard(apply_layer_steering(self, full, hook_point))
+
+    def _hooked_ffn(
+        self,
+        ffn_in: torch.Tensor,
+        stream: torch.Tensor,
+        router_input: torch.Tensor | None,
+        sp_active: bool,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """post_attn / mlp_in / mlp_out / post_block and the in-layer blend."""
+
+        def hook(t: torch.Tensor, point: SteeringHookPoint) -> torch.Tensor:
+            return self._hook(t, point, sp_active, num_tokens)
+
+        stream = hook(stream, SteeringHookPoint.POST_ATTN)
+        hooked_in = hook(ffn_in, SteeringHookPoint.MLP_IN)
+        if router_input is not None:
+            # The fused boundary also emitted the unrounded FP32 pre-norm for
+            # the router; carry any mlp_in edit into it (a zero edit keeps it).
+            router_input = router_input + (hooked_in.float() - ffn_in.float())
+        ffn_in = hooked_in
+        # The column-deferred unpooler is not taken here: mlp_out needs the
+        # complete branch.
+        if sp_active and not self.feed_forward.use_mega_moe:
+            branch = sp_shard(self.feed_forward(sp_all_gather(ffn_in)))
+        elif isinstance(self.feed_forward, MuseSparkMoE):
+            branch = self.feed_forward(
+                ffn_in, router_input=router_input, sp_active=sp_active
+            )
+        else:
+            branch = self.feed_forward(ffn_in)
+        return blend_ffn_with_hooks(self, stream, branch, hook)
 
     def _attn_boundary_constants(self, has_router: bool) -> Any:
         from vllm.models.muse_spark.nvidia.ops.all_reduce_dual_norm import (
@@ -1729,6 +1820,8 @@ class MuseSparkModel(LlamaModel):
         self.residual_dtype = torch.float32
 
         self.fuse_across_layers = get_pp_group().world_size == 1
+        # Hooked layers return the blended stream; no cross-layer deferral.
+        self.interventions = interventions_configured(vllm_config)
         self.is_sequence_parallel = is_sequence_parallel_enabled(vllm_config)
         self.sp_min_tokens = get_trtllm_token_threshold(vllm_config) + 1
         self.make_empty_intermediate_tensors = self._make_empty_intermediate_tensors
@@ -1776,6 +1869,9 @@ class MuseSparkModel(LlamaModel):
 
     def _configure_column_gather(self) -> None:
         """Let sharded unpoolers hand their columns to the next boundary."""
+        if self.interventions:
+            # mlp_out / post_block need the complete branch in-layer.
+            return
         layers = list(islice(self.layers, self.start_layer, self.end_layer))
         sharded = [
             idx
@@ -2000,6 +2096,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 "Muse Spark gated_delta_net layers are not supported by the "
                 "native vLLM text stack."
             )
+        refuse_specialized_decode(vllm_config)
         if vllm_config.quant_config is not None and not isinstance(
             vllm_config.quant_config, self.supported_quantization_configs
         ):
