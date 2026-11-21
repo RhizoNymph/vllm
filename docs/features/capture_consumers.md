@@ -63,7 +63,7 @@ and `mlp_out` are the paired taps needed to **train transcoders** (a
 transcoder learns `mlp_in → mlp_out` for one layer; cross-layer
 transcoders consume them across layers, aligned per token). They are
 wired on **gemma3, gemma4, the qwen3 family** (`qwen3`, `qwen3_moe`,
-`qwen3_next`/Qwen3.5), **and every Transformers-backend architecture**; request them explicitly by name (e.g.
+`qwen3_next`/Qwen3.5), **Qwen4Exp, and every Transformers-backend architecture**; request them explicitly by name (e.g.
 `{"mlp_in": [12], "mlp_out": [12]}`). They are deliberately excluded from
 the `:all` fan-out so `:all` stays model-agnostic, but are injectable
 (steering + patching) like the residual hooks on the wired models. On gemma
@@ -152,6 +152,14 @@ hooks in the model's hook schema:
   and the stream-mixing coefficients `mhc_attn_post_mix` /
   `mhc_ffn_post_mix` (`(hc_mult,)` fp32) and `mhc_attn_res_mix` /
   `mhc_ffn_res_mix` (the Sinkhorn matrix, `(hc_mult, hc_mult)` fp32).
+
+- **Qwen4Exp (hyper-connections)** keeps all five standard hooks at
+  `(hidden_size,)`. `pre_attn` / `post_attn` / `post_block` are the *mean
+  over HC streams* of the multi-stream residual, and `mlp_in` / `mlp_out`
+  are the MoE branch. It adds `mhc_streams_pre_attn`, `mhc_streams_pre_mlp`,
+  and `mhc_streams_final` (the full streams, `(hc_count, hidden_size)` in
+  the model dtype). It has no coefficient hooks. See
+  [Hyper-Connection Steering (Qwen4Exp)](steering.md#hyper-connection-steering-qwen4exp).
 
 `mhc_streams_final` is a **model-level hook** — it fires once at the
 model tail, not per layer, so its layer selector's value is ignored

@@ -75,3 +75,26 @@ class BufferKnob:
         if vllm_config is not None:
             return self._config_getter(vllm_config)
         return self._test_value
+
+
+# The ``VllmConfig`` fields whose presence means a decoder layer's hook points
+# can be read (capture) or written (steering, clamps, SAE, patching).
+_INTERVENTION_CONFIG_FIELDS: tuple[str, ...] = (
+    "steering_config",
+    "patch_config",
+    "capture_consumers_config",
+)
+
+
+def interventions_configured(vllm_config: VllmConfig) -> bool:
+    """Whether steering, patching, or activation capture can touch the model.
+
+    Clamps and SAE steering ride ``steering_config``, so these three fields
+    cover every intervention family. Models use this to give up a fusion that
+    hides a hook point's complete tensor only when something can observe or
+    edit it; servers with none configured keep the fused path unchanged.
+    """
+    return any(
+        getattr(vllm_config, name, None) is not None
+        for name in _INTERVENTION_CONFIG_FIELDS
+    )

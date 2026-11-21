@@ -25,6 +25,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -76,6 +80,13 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..common.hyperconnection import is_hc_sequence_parallel_enabled
+from ..common.interventions import (
+    init_qwen4_exp_interventions,
+    intervene_block_output,
+    intervene_branch,
+    intervene_final_streams,
+    intervene_sublayer_input,
+)
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.sequence_parallel import sp_reduce_scatter, sp_shard
@@ -270,6 +281,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hc_config,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
+        # Steering/capture geometry, or None when the hooks are inert (MTP
+        # drafter layers, or no intervention configured).
+        self.hc_interventions = init_qwen4_exp_interventions(
+            self,
+            vllm_config,
+            layer_idx=self.layer_idx,
+            num_hidden_layers=config.num_hidden_layers,
+            hidden_size=config.hidden_size,
+            hc_count=config.hc_count,
+        )
 
     def forward(
         self,
@@ -308,6 +329,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+        # The attention mix has read the streams; mhc_streams_pre_attn and
+        # pre_attn edit the residual carried past attention.
+        hidden_states = intervene_sublayer_input(self, hidden_states, "attn")
 
         if self.use_hc_sequence_parallel:
             # Positions retain the full token axis for both text and MRoPE inputs.
@@ -328,6 +352,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
             hidden_states, attn_out, injection
         )
+        hidden_states = intervene_sublayer_input(self, hidden_states, "mlp")
+        block_input = intervene_branch(self, block_input, SteeringHookPoint.MLP_IN)
         if self.use_sequence_parallel:
             # MoE consumes local tokens and returns complete local outputs.
             mlp_out = self.mlp(block_input, already_sequence_parallel=True)
@@ -342,6 +368,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 mlp_out = (
                     sp_reduce_scatter(mlp_out) if reduce_output else sp_shard(mlp_out)
                 )
+        mlp_out = intervene_branch(self, mlp_out, SteeringHookPoint.MLP_OUT)
+        # post_block observes the pending combine; edits land on the streams.
+        hidden_states = intervene_block_output(self, hidden_states, mlp_out, injection)
         return hidden_states, mlp_out, injection
 
 
@@ -444,6 +473,7 @@ class Qwen4ExpModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        share_steering_index_across_layers(self.layers)
         self.fused_shared_expert_layers = get_fused_shared_expert_layers(
             self,
             Qwen4ExpSparseMoeBlock,
@@ -579,6 +609,11 @@ class Qwen4ExpModel(nn.Module):
         # the sampled single stream and the materialized multi-stream state.
         final_mixer = self.hyper_connection_mixer
         assert final_mixer is not None
+        if last_layer is not None:
+            # mhc_streams_final rides the pending combine into the mixer.
+            hidden_states = intervene_final_streams(
+                last_layer, hidden_states, block_output, injection
+            )
         multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
             hidden_states, block_output, injection
         )

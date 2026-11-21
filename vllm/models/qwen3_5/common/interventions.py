@@ -5,28 +5,21 @@
 from torch import nn
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.intervention_common import interventions_configured
 from vllm.model_executor.layers.steering import (
     get_steering_buffer_config,
     get_steering_buffer_dtype,
     register_steering_buffers,
 )
 
-
-def interventions_configured(vllm_config: VllmConfig) -> bool:
-    """Whether steering, patching, or activation capture can touch this model.
-
-    The NVIDIA and ROCm decoder layers defer each MLP/MoE all-reduce into the
-    next norm, so under TP>1 the branch output at ``mlp_out`` / ``post_block``
-    is an un-reduced partial; the NVIDIA layer also quantizes the normed MLP
-    input for ``gate_up_proj``, leaving ``mlp_in`` no full-precision tensor to
-    steer. Those fusions are turned off when any intervention is configured so
-    every hook point observes and edits the complete activation. Servers with
-    no intervention configured keep the fused path unchanged.
-    """
-    return any(
-        getattr(vllm_config, name, None) is not None
-        for name in ("steering_config", "patch_config", "capture_consumers_config")
-    )
+# Re-exported for the platform layers. The NVIDIA and ROCm decoder layers defer
+# each MLP/MoE all-reduce into the next norm, so under TP>1 the branch output
+# at ``mlp_out`` / ``post_block`` is an un-reduced partial; the NVIDIA layer
+# also quantizes the normed MLP input for ``gate_up_proj``, leaving ``mlp_in``
+# no full-precision tensor to steer. Those fusions are turned off when
+# ``interventions_configured`` holds so every hook point observes and edits the
+# complete activation.
+__all__ = ["interventions_configured", "register_qwen3_5_steering_buffers"]
 
 
 def register_qwen3_5_steering_buffers(

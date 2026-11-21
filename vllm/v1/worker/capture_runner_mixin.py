@@ -132,16 +132,19 @@ class CaptureRunnerMixin:
         # and surfaced on ``StepRequestView.steering``.
         self._sync_steering_gates: dict[str, list | None] = {}
 
-        from vllm.v1.capture.types import build_hook_schema
+        from vllm.v1.capture.types import build_model_hook_schema
 
         # Per-hook row geometry for this model, resolved once. Driven from
-        # ``hf_config`` (not the model object, which may not be loaded yet):
+        # the HF configs (not the model object, which may not be loaded yet):
         # mHC models expose ``hc_mult`` and get the wider/fp32 stream and
-        # coefficient hooks; every other model gets the standard residual set.
-        self._capture_hook_schema = build_hook_schema(
+        # coefficient hooks, Qwen4Exp (``hc_count``) adds its multi-stream
+        # hooks to the standard set, and every other model gets the standard
+        # residual set.
+        self._capture_hook_schema = build_model_hook_schema(
             self.model_config.get_hidden_size(),
             self.model_config.dtype,
-            getattr(self.model_config.hf_config, "hc_mult", None),
+            getattr(self.model_config, "hf_config", None),
+            getattr(self.model_config, "hf_text_config", None),
         )
 
         cc_config = self.vllm_config.capture_consumers_config

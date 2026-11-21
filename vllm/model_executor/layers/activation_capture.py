@@ -63,6 +63,21 @@ _HOOK_NAME_TO_ID: dict[str, int] = {
 _HOOK_ID_TO_NAME: dict[int, str] = {v: k for k, v in _HOOK_NAME_TO_ID.items()}
 
 
+def capture_hook_id(hook_name: str) -> int:
+    """The integer id a capture custom op carries for ``hook_name``.
+
+    For model-specific capture ops that must form their tapped tensor inside
+    the op (see :func:`maybe_capture_residual_add` for why) and so cannot go
+    through :func:`maybe_capture_residual`.
+    """
+    return _HOOK_NAME_TO_ID[hook_name]
+
+
+def capture_hook_name(hook_id: int) -> str:
+    """Inverse of :func:`capture_hook_id`."""
+    return _HOOK_ID_TO_NAME[hook_id]
+
+
 # ---------------------------------------------------------------------------
 # Module-global active manager
 # ---------------------------------------------------------------------------

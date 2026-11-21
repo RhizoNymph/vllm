@@ -406,6 +406,17 @@ per-sublayer routing live once in
 amd decoder layers), which routes the steerable tensors through these
 helpers while the fp32 mixing coefficients remain capture-only.
 
+When a hook's tensor is a *derived view* of the carried state rather than a
+tensor the model holds, capture through a custom op that forms the view
+inside the op, anchored on a live input, and edit through
+`apply_layer_interventions` (the capture-free half of
+`apply_layer_steering`). Then fold `edited - view` back into the state.
+`qwen4_exp` is the reference (`vllm/models/qwen4_exp/common/interventions.py`).
+Its hidden-width residual hooks are the mean over hyper-connection streams,
+and its `post_block` is a combine the next layer would otherwise fuse. A view
+formed outside the op is dead in a compiled graph whenever nothing edits it,
+and the capture would be eliminated.
+
 The extension work is model-specific, but the runtime invariants above do not
 change.
 
