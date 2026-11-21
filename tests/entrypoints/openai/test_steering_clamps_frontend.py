@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from vllm.config.steering import SteeringConfig
+from vllm.config.steering_geometry import SteeringSiteGeometry
 from vllm.config.steering_types import SteeringClamps
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -116,7 +117,9 @@ class TestCompletionProtocolClamps:
 class TestRegistryClamps:
     @pytest.mark.asyncio
     async def test_register_clamp_only_module(self):
-        registry = SteeringModuleRegistry(expected_row_width=_HIDDEN)
+        registry = SteeringModuleRegistry(
+            site_geometry=SteeringSiteGeometry.standard(_HIDDEN, num_hidden_layers=32)
+        )
         await registry.register(name="c", clamps=_clamps("5"))
         module = registry.get("c")
         assert module.clamps is not None
@@ -124,7 +127,9 @@ class TestRegistryClamps:
 
     @pytest.mark.asyncio
     async def test_dump_for_broadcast_carries_clamps(self):
-        registry = SteeringModuleRegistry(expected_row_width=_HIDDEN)
+        registry = SteeringModuleRegistry(
+            site_geometry=SteeringSiteGeometry.standard(_HIDDEN, num_hidden_layers=32)
+        )
         await registry.register(
             name="c",
             clamps=_clamps("5"),
@@ -144,7 +149,9 @@ class TestRegistryClamps:
 
     @pytest.mark.asyncio
     async def test_wrong_width_clamp_rejected(self):
-        registry = SteeringModuleRegistry(expected_row_width=_HIDDEN)
+        registry = SteeringModuleRegistry(
+            site_geometry=SteeringSiteGeometry.standard(_HIDDEN, num_hidden_layers=32)
+        )
         with pytest.raises(ValueError, match="width"):
             await registry.register(name="c", clamps=_clamps("5", hidden=4))
 
@@ -167,7 +174,9 @@ class TestRegistryClamps:
 def _make_processor(steering_config=None, hidden_size=_HIDDEN):
     proc = MagicMock()
     proc.steering_config = steering_config
-    proc.model_config.get_hidden_size.return_value = hidden_size
+    proc.steering_site_geometry = SteeringSiteGeometry.standard(
+        hidden_size, num_hidden_layers=32
+    )
     from vllm.v1.engine.input_processor import InputProcessor
 
     proc._validate_steering = InputProcessor._validate_steering.__get__(proc)

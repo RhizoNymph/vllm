@@ -189,8 +189,12 @@ class CaptureContext:
 `HookSchema`. Without `hc_mult` it is the five standard residual hooks
 (`pre_attn` / `post_attn` / `post_block` / `mlp_in` / `mlp_out`); a model
 exposing `hf_config.hc_mult` (DeepSeek-V4) gets the mHC hooks instead,
-sized from `hc_mult`. The runner and the OpenAI entrypoints build it from
-`model_config` and pass it on `CaptureContext` (admission) and to the
+sized from `hc_mult`. `build_model_hook_schema(hidden_size, dtype,
+hf_config, hf_text_config)` picks the family from the HF configs; steering
+admission derives its per-hook row widths from it
+([Steering Site Validation](../features/steering_site_validation.md)), so
+steering and capture agree on every hook's width. The runner and the
+OpenAI entrypoints build it from `model_config` and pass it on `CaptureContext` (admission) and to the
 `CaptureManager` (buffer sizing / scratch dtype). The schema is what makes
 `mhc_*` hooks per-model: admission rejects any hook not in it, so they are
 accepted only on mHC models. `mlp_in` / `mlp_out` stay in the standard

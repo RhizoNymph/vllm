@@ -336,7 +336,13 @@ class TestSamplingParamsClamps:
             steering_clamps={"post_block": {0: [_entry([1.0, 0.0], 1.0)]}}
         )
         before = sp.steering_clamps
-        maybe_pack_inline_steering_for_request(sp, torch.float32, expected_row_width=2)
+        from vllm.config.steering_geometry import SteeringSiteGeometry
+
+        maybe_pack_inline_steering_for_request(
+            sp,
+            torch.float32,
+            site_geometry=SteeringSiteGeometry.standard(2, num_hidden_layers=32),
+        )
         assert sp.steering_clamps is before
 
     def test_from_optional_threads_clamps(self):

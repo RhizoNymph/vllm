@@ -28,6 +28,7 @@ import numpy as np
 from typing_extensions import NotRequired
 
 if TYPE_CHECKING:
+    from vllm.config.steering_geometry import SteeringSiteGeometry
     from vllm.sampling_params import SamplingParams
 
 # Per-layer entry: bare list (scale=1.0) or {"vector": [...], "scale": float}.
@@ -1439,7 +1440,7 @@ def hash_steering_config(
 def maybe_pack_inline_steering_for_request(
     sp: SamplingParams,
     torch_dtype: object,
-    expected_row_width: int | None = None,
+    site_geometry: SteeringSiteGeometry | None = None,
 ) -> None:
     """Pre-resolve + pack inline steering vectors on *sp* in-place.
 
@@ -1486,18 +1487,22 @@ def maybe_pack_inline_steering_for_request(
     ):
         return
 
-    # Width gate. This runs before the inline fields are cleared (step 3),
+    # Site gate. This runs before the inline fields are cleared (step 3),
     # making it the one seam every inline-steering request crosses — the
-    # engine-side validator never sees the raw specs after packing. A
-    # wrong-width row would otherwise shape-crash the worker's steering
-    # table population and kill the engine.
-    if expected_row_width is not None:
+    # engine-side validator never sees the raw specs after packing. Each
+    # row is checked against its own hook's width (multi-stream mHC hooks
+    # are ``hc * hidden`` wide) and each layer against the model's layer
+    # count. A wrong-width row would otherwise shape-crash the worker's
+    # steering table population; an out-of-range layer would be dropped
+    # silently. Failures raise ``SteeringSiteValidationError`` (HTTP 400).
+    # ``site_geometry=None`` (no model known) skips the gate.
+    if site_geometry is not None:
         for field_name, spec in (
             ("steering_vectors", sp.steering_vectors),
             ("prefill_steering_vectors", sp.prefill_steering_vectors),
             ("decode_steering_vectors", sp.decode_steering_vectors),
         ):
-            validate_spec_row_widths(spec, expected_row_width, field_name=field_name)
+            site_geometry.validate_vectors(spec, field_name=field_name)
 
     np_dtype = _torch_dtype_to_pack_dtype(torch_dtype)
 

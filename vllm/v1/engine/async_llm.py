@@ -453,14 +453,13 @@ class AsyncLLM(EngineClient):
             except AttributeError:
                 torch_dtype = None
             if torch_dtype is not None:
-                try:
-                    expected_row_width = (
-                        self.vllm_config.model_config.get_hidden_size()
-                    )
-                except AttributeError:
-                    expected_row_width = None
+                # Raises SteeringSiteValidationError (a VLLMValidationError,
+                # so generate() re-raises it unwrapped and the frontends
+                # answer 400) for a hook, width or layer the model lacks.
                 maybe_pack_inline_steering_for_request(
-                    params, torch_dtype, expected_row_width=expected_row_width
+                    params,
+                    torch_dtype,
+                    site_geometry=self.input_processor.steering_site_geometry,
                 )
 
         if (

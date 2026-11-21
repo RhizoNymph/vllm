@@ -276,6 +276,23 @@ def build_hook_schema(
     }
 
 
+def build_model_hook_schema(
+    hidden_size: int,
+    dtype: torch.dtype,
+    hf_config: Any,
+    hf_text_config: Any,
+) -> dict[str, HookSchema]:
+    """Resolve a model's hook schema from its HF configs.
+
+    DeepSeek-V4 exposes ``hc_mult`` on ``hf_config``. Every other model
+    gets the standard residual hooks.
+    """
+    hc_mult = getattr(hf_config, "hc_mult", None)
+    if hc_mult is not None:
+        return build_hook_schema(hidden_size, dtype, hc_mult)
+    return default_hook_schema(hidden_size, dtype)
+
+
 # ---------------------------------------------------------------------------
 # CaptureChunk and CaptureFinalize
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ from vllm.config.sae_steering_types import (
     SteeringModuleKind,
     hash_sae_clamp_specs_for_phase,
 )
+from vllm.config.steering_geometry import SteeringSiteGeometry
 from vllm.config.steering_types import (
     SteeringVectorSpec,
     hash_steering_config,
@@ -307,7 +308,9 @@ class TestSteeringModuleRegistry:
 
     @pytest.mark.asyncio
     async def test_register_wrong_width_list_rejected(self):
-        registry = SteeringModuleRegistry(expected_row_width=4)
+        registry = SteeringModuleRegistry(
+            site_geometry=SteeringSiteGeometry.standard(4, num_hidden_layers=32)
+        )
         with pytest.raises(ValueError, match="width 2 != expected"):
             await registry.register(
                 name="narrow",
@@ -316,7 +319,9 @@ class TestSteeringModuleRegistry:
 
     @pytest.mark.asyncio
     async def test_register_wrong_width_scaled_entry_rejected(self):
-        registry = SteeringModuleRegistry(expected_row_width=4)
+        registry = SteeringModuleRegistry(
+            site_geometry=SteeringSiteGeometry.standard(4, num_hidden_layers=32)
+        )
         with pytest.raises(ValueError, match="prefill_vectors.*width 3"):
             await registry.register(
                 name="narrow",
@@ -338,13 +343,17 @@ class TestSteeringModuleRegistry:
             "layer_indices": [0],
             "data": base64.b64encode(rows.tobytes()).decode("ascii"),
         }
-        registry = SteeringModuleRegistry(expected_row_width=4)
+        registry = SteeringModuleRegistry(
+            site_geometry=SteeringSiteGeometry.standard(4, num_hidden_layers=32)
+        )
         with pytest.raises(ValueError, match="width 2 != expected"):
             await registry.register(name="narrow", vectors={"post_block": packed})
 
     @pytest.mark.asyncio
     async def test_register_correct_width_accepted(self):
-        registry = SteeringModuleRegistry(expected_row_width=3)
+        registry = SteeringModuleRegistry(
+            site_geometry=SteeringSiteGeometry.standard(3, num_hidden_layers=32)
+        )
         await registry.register(
             name="ok",
             vectors={"post_block": {0: [1.0, 2.0, 3.0]}},

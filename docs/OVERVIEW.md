@@ -91,6 +91,21 @@ Features Index:
       ["SamplingParams.steering_vectors", "SamplingParams.steering_clamps", "--enable-steering"]
     depends_on: [activation_capture]
     doc: docs/features/steering.md
+  steering_site_validation:
+    description: >
+      Model-aware admission of client steering specs. SteeringSiteGeometry
+      (per-hook row width + num_hidden_layers, resolved once per process from
+      the capture hook schema) gates every seam that admits per-request or
+      named-module vectors/clamps: rejects hooks the model does not steer,
+      rows not as wide as their hook (mHC stream hooks are hc * hidden), and
+      out-of-range layers, with a typed SteeringSiteValidationError -> 400.
+    entry_points:
+      - vllm/config/steering_geometry.py (SteeringSiteGeometry, resolve_steering_site_geometry)
+      - vllm/config/steering_types.py (maybe_pack_inline_steering_for_request)
+      - vllm/v1/engine/input_processor.py (InputProcessor._validate_steering)
+      - vllm/entrypoints/openai/steering/registry.py (SteeringModuleRegistry.register)
+    depends_on: [activation_steering, activation_capture]
+    doc: docs/features/steering_site_validation.md
   activation_patching:
     description: >
       Overwrite/interpolate residual activations at (layer, hook, position)

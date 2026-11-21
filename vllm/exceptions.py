@@ -60,6 +60,19 @@ class SteeringVectorError(VLLMValidationError):
     """Raised when a steering vector fails validation (wrong size, non-finite)."""
 
 
+class SteeringSiteValidationError(SteeringVectorError, ValueError):
+    """A steering spec does not fit the served model's steering sites.
+
+    Raised by :class:`vllm.config.steering_geometry.SteeringSiteGeometry`
+    for a hook the model does not steer, a row whose width differs from its
+    hook's width, or a layer index outside ``num_hidden_layers``. As a
+    :class:`VLLMValidationError` it passes through ``AsyncLLM.generate``
+    unwrapped and the frontends answer it with HTTP 400 and its message;
+    it is also a ``ValueError`` so pydantic validators and the existing
+    ``ValueError`` handlers on the registry seams keep catching it.
+    """
+
+
 class PromptUpdateMismatchError(VLLMValidationError):
     """Raised when a multi-modal item has no matching placeholder in the prompt."""
 

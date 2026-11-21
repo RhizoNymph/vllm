@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from vllm.config.sae_steering_types import SAEClampEntry, SAEClampSpec
+from vllm.config.steering_geometry import SteeringSiteGeometry
 from vllm.config.steering_types import (
     _torch_dtype_to_pack_dtype,
     maybe_pack_inline_steering_for_request,
@@ -148,7 +149,9 @@ class TestMaybePack:
         )
         with pytest.raises(ValueError, match="width 2 != expected"):
             maybe_pack_inline_steering_for_request(
-                sp, torch.float32, expected_row_width=8
+                sp,
+                torch.float32,
+                site_geometry=SteeringSiteGeometry.standard(8, num_hidden_layers=32),
             )
         # Nothing was packed or cleared: the request never leaves admission.
         assert sp.steering_vectors is not None
@@ -165,7 +168,9 @@ class TestMaybePack:
             ValueError, match=r"prefill_steering_vectors\['pre_attn'\]\[3\]"
         ):
             maybe_pack_inline_steering_for_request(
-                sp, torch.float32, expected_row_width=8
+                sp,
+                torch.float32,
+                site_geometry=SteeringSiteGeometry.standard(8, num_hidden_layers=32),
             )
 
     def test_matching_width_packs(self):
@@ -174,7 +179,9 @@ class TestMaybePack:
             steering_vectors={"post_block": {0: [1.0, 2.0]}},
         )
         maybe_pack_inline_steering_for_request(
-            sp, torch.float32, expected_row_width=2
+            sp,
+            torch.float32,
+            site_geometry=SteeringSiteGeometry.standard(2, num_hidden_layers=32),
         )
         assert sp.steering_vectors is None
         assert sp._effective_prefill_steering_packed is not None
