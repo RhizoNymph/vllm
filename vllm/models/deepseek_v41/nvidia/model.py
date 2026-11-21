@@ -45,6 +45,11 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import _unpack
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -68,12 +73,14 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.models.common.interventions import interventions_configured
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
     sp_reduce_scatter,
     sp_shard,
 )
+from vllm.models.deepseek_v4.common.interventions import steer_and_capture_mhc
 from vllm.models.deepseek_v4.common.spec_decode import needs_mtp_hidden_buffer
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MixtureOfExperts,
@@ -109,6 +116,7 @@ from ..common.engram import (
     can_share_engram_tables,
     gather_engram_hashes,
 )
+from ..common.interventions import register_v41_steering_buffers, steer_final_streams
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
@@ -132,13 +140,18 @@ from .ops.mhc import (
 )
 from .pipeline import PipelineBoundary, PipelineRelay, get_pipeline_boundaries
 from .quantization import DeferringMarlinExperts
-from .specialized_decode import records_decode_metadata, specialized_decode_config
+from .specialized_decode import (
+    decode_backend,
+    records_decode_metadata,
+    specialized_decode_config,
+)
 from .specialized_decode.ampere import is_ampere
 from .specialized_decode.hopper import is_hopper
 
 if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
+    from .specialized_decode import DecodeConfig
     from .specialized_decode.runtime.decode import DecodeStep, SpecializedDecode
 
 logger = init_logger(__name__)
@@ -315,11 +328,52 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     moe_needs_token_sharded_input = (
         vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
     )
-    return (
+    if not (
         parallel_config.enable_expert_parallel
         and parallel_config.tensor_parallel_size > 1
         and (moe_needs_token_sharded_input or parallel_config.data_parallel_size > 1)
-    )
+    ):
+        return False
+    if not interventions_configured(vllm_config):
+        return True
+    # Sequence parallel hands every intervention hook this rank's token shard,
+    # which the per-token steering_index and capture rows do not follow.
+    if moe_needs_token_sharded_input:
+        raise NotImplementedError(
+            "DeepSeek-V4.1 MegaMoE backends shard tokens across TP ranks "
+            "(sequence parallel), which splits the intervention hook tensors; "
+            "pick another --moe-backend to use steering, patching or "
+            "activation capture."
+        )
+    return False
+
+
+def _mhc_overlap_support(vllm_config: VllmConfig) -> tuple[bool, bool]:
+    """Whether FULL graphs compute the mHC coefficients on a side stream: the
+    SM100 overlap path, and the SM80/SM90 kernels' one.
+
+    Both are off when interventions are configured: the hooks read and steer
+    the streams and mixing coefficients on the caller stream while the side
+    stream writes them, and the TP all-reduce fused into those boundaries
+    leaves the attention and FFN outputs TP-partial at their hooks.
+    """
+    if interventions_configured(vllm_config):
+        return False, False
+    return supports_mhc_overlap(vllm_config), supports_ampere_mhc_overlap(vllm_config)
+
+
+def _specialized_decode_config(vllm_config: VllmConfig) -> "DecodeConfig | None":
+    """`specialized_decode_config`, refused under interventions: its decode
+    executor runs whole layers without the intervention hooks."""
+    if not interventions_configured(vllm_config):
+        return specialized_decode_config(vllm_config)
+    if decode_backend(vllm_config) != "auto":
+        raise ValueError(
+            "decode_backend=latency_specialized runs DeepSeek-V4.1 decode steps "
+            "without the intervention hooks; use decode_backend=auto with "
+            "steering, patching or activation capture."
+        )
+    return None
 
 
 def _shard_fused_wqa_wkv(vllm_config: VllmConfig) -> bool:
@@ -385,6 +439,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.layer_idx = extract_layer_index(prefix)
         self.mhc_stream = mhc_stream
         self.fuse_mhc_all_reduce = fuse_mhc_all_reduce
         # SM80 runs every mHC boundary through its CuTe DSL kernels, SM90 the
@@ -442,6 +497,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.hc_post_alpha = 2.0
+        # Per-request interventions on the DeepSeek-V4 mHC hook set (see
+        # deepseek_v41/common/interventions.py); DSpark draft layers skip it.
+        register_v41_steering_buffers(self, vllm_config, config.num_hidden_layers)
         if vllm_config.kernel_config.enable_jit_warmup and current_platform.is_cuda():
             from vllm.model_executor.kernels.mhc.tilelang_kernels import (
                 mhc_fused_post_pre_splits,
@@ -736,6 +794,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             if capture_previous_aux:
                 previous_aux = aux
 
+        # mHC steering + capture taps (static no-ops when nothing is
+        # configured): ``residual`` is the multi-stream residual entering
+        # attention, ``x`` the normed single-stream attention input (attn_norm
+        # is fused into the mHC pre above). Under interventions the overlap
+        # stream is off, so the mixes are ready on this stream.
+        residual, x = steer_and_capture_mhc(
+            self, residual, post_mix, res_mix, x, "attn"
+        )
+
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
@@ -744,6 +811,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
         if self.use_sequence_parallel and self.attn.gemm_rs is None:
             x = sp_reduce_scatter(x)
+        # Complete under interventions: the fused mHC all-reduce is off then.
+        x = apply_layer_steering(self, x, SteeringHookPoint.POST_ATTN)
 
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
@@ -767,11 +836,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             reduce_results=self.fuse_mhc_all_reduce,
             boundary_weight=self.hc_ffn_boundary_weight,
         )
+        residual, x = steer_and_capture_mhc(self, residual, post_mix, res_mix, x, "ffn")
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             # The next layer's first boundary finalizes it with the all-reduce.
+            # Never under interventions, which turn the fused all-reduce off.
             x = self.ffn.forward_unfinalized(x, input_ids)
         else:
             x = self.ffn(x, input_ids, mega_gate_metadata)
+            x = apply_layer_steering(self, x, SteeringHookPoint.MLP_OUT)
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
@@ -909,8 +981,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
         # Keep mHC independent of the streams used inside attention.
-        mhc_overlap = supports_mhc_overlap(vllm_config)
-        ampere_mhc_overlap = supports_ampere_mhc_overlap(vllm_config)
+        mhc_overlap, ampere_mhc_overlap = _mhc_overlap_support(vllm_config)
         mhc_stream = torch.cuda.Stream() if mhc_overlap or ampere_mhc_overlap else None
         # SM100's overlap path and SM90's SM80-kernel boundaries (which
         # supports_mhc_all_reduce tells apart) fuse the all-reduce; SM80's
@@ -1018,6 +1089,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        # One steering_index for every steerable layer (no-op when steering
+        # is off: the layers register no buffers).
+        share_steering_index_across_layers(list(self.layers))
         if self.pipeline_relay is not None:
             self.pipeline_relay.configure(
                 self.layers[self.start_layer].attn, vllm_config
@@ -1390,6 +1464,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 }
             )
 
+        # The final multi-stream residual, before the MTP stash and collapse.
+        hidden_states = steer_final_streams(
+            self.layers, self.start_layer, self.end_layer, hidden_states
+        )
+
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
         if self._mtp_hidden_buffer is not None:
@@ -1585,7 +1664,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         draft_window = getattr(draft_hf_config, "sliding_window", None)
         draft_layer_types = getattr(draft_hf_config, "layer_types", None) or ()
         window = self.config.sliding_window
-        if self.start_layer > cut or self.end_layer < self.config.num_hidden_layers:
+        if interventions_configured(vllm_config):
+            reason = (
+                "interventions read every row at every layer, and the replay "
+                "layers run on each request's trailing window only"
+            )
+        elif self.start_layer > cut or self.end_layer < self.config.num_hidden_layers:
             reason = (
                 "the pipeline stage holding the last KV source layer must also "
                 "hold every layer after it"
@@ -1891,7 +1975,7 @@ class DeepseekV41LLMForCausalLM(
         self.config = config
         # decode_backend=latency_specialized: a decode executor over self.model, built
         # by the model state once the weights are loaded.
-        self.specialized_decode_config = specialized_decode_config(vllm_config)
+        self.specialized_decode_config = _specialized_decode_config(vllm_config)
         self.specialized_decode: SpecializedDecode | None = None
         # SM80 and SM90 record the metadata builds of FULL decode steps.
         self.records_decode_metadata = records_decode_metadata(vllm_config)
