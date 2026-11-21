@@ -157,3 +157,158 @@ def test_space_from_text_config_and_key_bound():
         get_total_num_hidden_layers=lambda: 24,
     )
     assert num_layer_keys(flat) == 24
+
+
+# --------------------------------------------------------------------------
+# Ingestion seams: vectors, packed vectors, clamps, patches, SAE specs
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mini(monkeypatch):
+    monkeypatch.setattr(loop_layers, "_ACTIVE", MINI)
+    return MINI
+
+
+def _vec(value, width=4):
+    return [float(value)] * width
+
+
+def test_sampling_params_steering_targets_passes(mini):
+    from vllm.sampling_params import SamplingParams
+
+    params = SamplingParams(
+        steering_vectors={
+            "post_block": {"7": _vec(1), "7@1": _vec(10), 20: _vec(5)},
+        },
+        decode_steering_vectors={
+            "pre_attn": {"8@2": {"vector": _vec(2), "scale": 3.0}}
+        },
+    )
+    base = params.steering_vectors["post_block"]
+    assert set(base) == {31, 55, 79, 20}
+    assert list(base[31]) == _vec(1) and list(base[79]) == _vec(1)
+    # "7" (every pass) and "7@1" add at pass 1.
+    assert list(base[55]) == _vec(11)
+    assert list(params.decode_steering_vectors["pre_attn"]) == [80]
+    # Re-validation (another process's decode) keeps the keys.
+    params._validate_steering_vectors()
+    assert set(params.steering_vectors["post_block"]) == {31, 55, 79, 20}
+
+
+def test_sampling_params_rejects_bad_passes(mini):
+    from vllm.sampling_params import SamplingParams
+
+    with pytest.raises(ValueError, match="outside the loop core"):
+        SamplingParams(steering_vectors={"post_block": {"3@1": _vec(1)}})
+    with pytest.raises(ValueError, match="out of range"):
+        SamplingParams(steering_vectors={"post_block": {"7@3": _vec(1)}})
+
+
+def test_non_looped_model_keeps_indices_and_rejects_passes():
+    from vllm.sampling_params import SamplingParams
+
+    params = SamplingParams(steering_vectors={"post_block": {7: _vec(1)}})
+    assert list(params.steering_vectors["post_block"]) == [7]
+    with pytest.raises(ValueError, match="needs a looped model"):
+        SamplingParams(steering_vectors={"post_block": {"7@0": _vec(1)}})
+
+
+def test_packed_vectors_accept_pass_indices(mini):
+    import base64
+
+    import numpy as np
+
+    from vllm.config.steering_types import unpack_steering_vectors
+
+    rows = np.array([[1.0] * 4, [10.0] * 4], dtype=np.float32)
+    packed = {
+        "post_attn": {
+            "dtype": "float32",
+            "shape": [2, 4],
+            "layer_indices": [7, "7@2"],
+            "data": base64.b64encode(rows.tobytes()).decode(),
+        }
+    }
+    out = unpack_steering_vectors(packed)["post_attn"]
+    assert set(out) == {31, 55, 79}
+    assert out[79].tolist() == [11.0] * 4 and out[31].tolist() == [1.0] * 4
+
+
+def test_clamps_target_passes(mini):
+    import base64
+
+    import numpy as np
+
+    from vllm.config.steering_types import SteeringClamps
+
+    entry = {"vector": _vec(1), "max": 1.0}
+    clamps = SteeringClamps.from_obj({"post_attn": {"7@2": [entry], "20": [entry]}})
+    assert clamps.hooks["post_attn"].layer_indices == [20, 79]
+    every = SteeringClamps.from_obj({"post_attn": {"7": [entry]}})
+    assert every.hooks["post_attn"].layer_indices == [31, 55, 79]
+    rows = np.ones((1, 4), dtype=np.float64)
+    packed = SteeringClamps.from_obj(
+        {
+            "post_attn": {
+                "dtype": "float64",
+                "shape": [1, 4],
+                "layer_indices": [7],
+                "data": base64.b64encode(rows.tobytes()).decode(),
+                "bounds": [[None, 1.0]],
+                "strengths": [1.0],
+            }
+        }
+    )
+    table = packed.hooks["post_attn"]
+    assert table.layer_indices == [31, 55, 79] and table.shape == [3, 4]
+    assert table.hi == [1.0] * 3
+    with pytest.raises(ValueError, match="invalid layer index"):
+        SteeringClamps.from_obj({"post_attn": {"3@2": [entry]}})
+
+
+def test_patch_entries_target_passes(mini):
+    from vllm.sampling_params import SamplingParams
+
+    entry = {"hook": "post_block", "dest_position": 0, "source_module": "zeros"}
+    params = SamplingParams(
+        patch=[
+            {**entry, "layer": 7, "pass": 1},
+            {**entry, "layer": "8@0"},
+            {**entry, "layer": 9},
+            {**entry, "layer": 2},
+        ]
+    )
+    assert [e["layer"] for e in params.patch] == [55, 32, 33, 57, 81, 2]
+    assert all("pass" not in e for e in params.patch)
+    params._validate_patch()
+    assert [e["layer"] for e in params.patch] == [55, 32, 33, 57, 81, 2]
+    with pytest.raises(ValueError, match="already names a pass"):
+        SamplingParams(patch=[{**entry, "layer": "7@1", "pass": 1}])
+
+
+def test_sae_clamp_specs_target_passes(mini):
+    from vllm.config.sae_steering_types import coerce_sae_clamp_specs
+
+    feature = {"feature_idx": 3, "kind": "absolute", "value": 1.0}
+    other = {"feature_idx": 4, "kind": "absolute", "value": 1.0}
+    (spec,) = coerce_sae_clamp_specs(
+        [
+            {
+                "module_name": "m",
+                "clamps": {"post_block": {"7@1": [feature], "7": [other]}},
+            }
+        ]
+    )
+    layers = spec.clamps["post_block"]
+    assert set(layers) == {31, 55, 79}
+    assert [e.feature_idx for e in layers[55]] == [3, 4]
+    with pytest.raises(ValueError, match="duplicate layer key"):
+        coerce_sae_clamp_specs(
+            [
+                {
+                    "module_name": "m",
+                    "clamps": {"post_block": {"7@1": [feature], "7@01": [other]}},
+                }
+            ]
+        )
