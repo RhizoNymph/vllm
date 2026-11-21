@@ -493,7 +493,9 @@ def _rel_decode_combine_kernel(
     tl.store(y_ptrs, o)
 
 
-_bw = gl.nvidia.blackwell
+# None when Triton is unavailable (CPU-only imports); the Gluon kernels
+# only compile on SM100.
+_bw = gl.nvidia.blackwell if hasattr(gl, "nvidia") else None
 
 
 @gluon.jit

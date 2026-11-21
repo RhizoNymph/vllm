@@ -26,6 +26,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -59,8 +60,9 @@ from ..processing import (
     Inkling2MultiModalProcessor,
     Inkling2ProcessingInfo,
 )
-from ..quant_config import Inkling2QuantConfig
 from .attention import Inkling2Attention
+from .backend import Inkling2LayerQuant, cast_dense_weight, select_inkling2_backend
+from .experts_quant import Inkling2QuantMoE, load_quant_expert_weight
 from .lora import (
     LORA_NAME_PREFIXES,
     LORA_NAME_SUBSTRINGS,
@@ -161,18 +163,31 @@ class Inkling2AttnRes(nn.Module):
         param.data.copy_(weight.view(param.shape)).mul_(self.scale)
 
 
+def as_layer_quant(
+    quant: "Inkling2LayerQuant | QuantizationConfig | None",
+) -> Inkling2LayerQuant:
+    """The decoder backend of a quantization config (or an already
+    selected backend)."""
+    if isinstance(quant, Inkling2LayerQuant):
+        return quant
+    return select_inkling2_backend(quant, get_tensor_model_parallel_world_size())
+
+
 class Inkling2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Inkling2ModelConfig,
         layer_id: int,
-        quant_config: Inkling2QuantConfig | None,
+        quant_config: Inkling2LayerQuant | QuantizationConfig | None,
         prefix: str,
         num_passes: int = 1,
     ) -> None:
         """`num_passes > 1` (a loop core layer) gives each pass its own KV and
-        conv-state caches."""
+        conv-state caches. `quant_config` is the checkpoint's quantization
+        config or the backend selected for it (`backend.py`)."""
         super().__init__()
+        quant = as_layer_quant(quant_config)
+        self.layer_idx = layer_id
         self.is_local = layer_id in config.local_layer_ids
         num_kv_heads = (
             config.swa_num_key_value_heads
@@ -197,6 +212,8 @@ class Inkling2DecoderLayer(nn.Module):
             self.conv_state,
             prefix=f"{prefix}.attn",
             pass_conv_states=self.conv_states[1:],
+            quant_config=quant.linear,
+            split_linears=quant.split_attention_linears,
         )
         eps = config.rms_norm_eps
         # Local layers: attn_norm; full layers: q/k/v_input_norm, stacked.
@@ -205,12 +222,21 @@ class Inkling2DecoderLayer(nn.Module):
             config.hidden_size, eps, num_inputs=self.num_attn_inputs
         )
         self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
-        expert_format: QuantFormat = (
-            "mxfp8"
-            if quant_config is not None and quant_config.is_mxfp8_layer(layer_id)
-            else "nvfp4"
-        )
-        self.mlp = Inkling2MoE(config, expert_format, config.layer_visit_ids(layer_id))
+        self.mlp: Inkling2MoE | Inkling2QuantMoE
+        if quant.uses_quant_method:
+            self.mlp = Inkling2QuantMoE(
+                config, quant.linear, f"{prefix}.mlp", config.layer_visit_ids(layer_id)
+            )
+        else:
+            native = quant.native
+            expert_format: QuantFormat = (
+                "mxfp8"
+                if native is not None and native.is_mxfp8_layer(layer_id)
+                else "nvfp4"
+            )
+            self.mlp = Inkling2MoE(
+                config, expert_format, config.layer_visit_ids(layer_id)
+            )
         self.attn_sconv, self.mlp_sconv = (
             Inkling2ShortConv(
                 config.hidden_size, config.sconv_kernel_size, self.conv_state, stream
@@ -249,15 +275,19 @@ class Inkling2Model(nn.Module):
     def __init__(
         self,
         config: Inkling2ModelConfig,
-        quant_config: Inkling2QuantConfig | None,
+        quant_config: Inkling2LayerQuant | QuantizationConfig | None,
         prefix: str,
     ) -> None:
         super().__init__()
+        quant_config = self.quant = as_layer_quant(quant_config)
         self.config = config
         self.block_size = config.n_layers_per_attn_res_block
         self.normalize_values = config.attn_res_normalize_values
         self.embed_tokens = VocabParallelEmbedding(
-            config.padded_vocab_size, config.hidden_size
+            config.padded_vocab_size,
+            config.hidden_size,
+            quant_config=quant_config.linear,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.embed_norm = Inkling2RMSNorm(
             config.hidden_size, config.rms_norm_eps, out_dtype=None
@@ -295,7 +325,7 @@ class Inkling2Model(nn.Module):
         self,
         config: Inkling2ModelConfig,
         layer_id: int,
-        quant_config: Inkling2QuantConfig | None,
+        quant_config: Inkling2LayerQuant,
         prefix: str,
     ) -> Inkling2DecoderLayer:
         return Inkling2DecoderLayer(config, layer_id, quant_config, prefix)
@@ -518,7 +548,11 @@ class Inkling2ForConditionalGeneration(
     SupportsLoRA,
 ):
     # LoRA (``lora.py``): adapters use the checkpoint's module names.
-    packed_modules_mapping = PACKED_MODULES_MAPPING
+    packed_modules_mapping = {
+        **PACKED_MODULES_MAPPING,
+        # `Inkling2Attention.split_linears` (QUANT_METHOD backend).
+        "q_proj": ["wq_du", "wr_du", "gate_attn", "attn_sink_proj"],
+    }
     embedding_modules: dict[str, str] = {}
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr=LORA_NAME_SUBSTRINGS,
@@ -546,13 +580,37 @@ class Inkling2ForConditionalGeneration(
         ".k_input_norm.": (".attn_norm.", 1),
         ".v_input_norm.": (".attn_norm.", 2),
     }
+    # The `QUANT_METHOD` backend with a quantization config: q-side, k and v
+    # are separate quantizable linears (`Inkling2Attention.split_linears`).
+    _split_shards = {
+        ".attn.wq_du.": (".attn.q_proj.", 0),
+        ".attn.wr_du.": (".attn.q_proj.", 1),
+        ".attn.gate_attn.": (".attn.q_proj.", 2),
+        ".attn.attn_sink_proj.": (".attn.q_proj.", 3),
+        ".q_input_norm.": (".attn_norm.", 0),
+        ".k_input_norm.": (".attn_norm.", 1),
+        ".v_input_norm.": (".attn_norm.", 2),
+    }
+    _split_renames = (
+        (".attn.wk_dv.", ".attn.k_proj."),
+        (".attn.wv_dv.", ".attn.v_proj."),
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Inkling2MMConfig = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        assert quant_config is None or isinstance(quant_config, Inkling2QuantConfig)
         assert vllm_config.parallel_config.pipeline_parallel_size == 1
+        # NATIVE (NVFP4 / MXFP8 experts) or QUANT_METHOD (any vLLM
+        # quantization method, or BF16 on SM8x); see backend.py.
+        self.quant = quant = select_inkling2_backend(
+            vllm_config.quant_config,
+            vllm_config.parallel_config.tensor_parallel_size,
+        )
+        if quant.uses_quant_method and vllm_config.lora_config is not None:
+            raise ValueError(
+                "Inkling2 LoRA needs the native backend (SM90+ with the "
+                "checkpoint's NVFP4 / MXFP8 experts)"
+            )
         if vllm_config.model_config.enable_prompt_embeds:
             # The reference applies embed_norm to raw input embeddings, which
             # cannot be told apart from already-normalized ones here.
@@ -571,9 +629,12 @@ class Inkling2ForConditionalGeneration(
             from .loop import Inkling2LoopModel
 
             model_cls = Inkling2LoopModel
-        self.model = model_cls(text_config, quant_config, f"{prefix}model")
+        self.model = model_cls(text_config, quant, f"{prefix}model")
         self.lm_head = ParallelLMHead(
-            text_config.padded_vocab_size, text_config.hidden_size
+            text_config.padded_vocab_size,
+            text_config.hidden_size,
+            quant_config=quant.linear,
+            prefix=f"{prefix}lm_head",
         )
         processor = (
             Inkling2LogitsProcessor
@@ -764,6 +825,9 @@ class Inkling2ForConditionalGeneration(
         loaded: set[str] = set()
         loaded_shards: set[tuple[str, int]] = set()
         visual_weights: list[tuple[str, torch.Tensor]] = []
+        quant_method = self.quant.uses_quant_method
+        split = self.quant.split_attention_linears
+        shards = self._split_shards if split else self._shards
         for name, weight in weights:
             if name.startswith("model.visual."):
                 if self.visual is not None:
@@ -771,8 +835,16 @@ class Inkling2ForConditionalGeneration(
                 continue
             for old, new in self._renames:
                 name = name.replace(old, new)
+            if split:
+                for old, new in self._split_renames:
+                    name = name.replace(old, new)
+            if quant_method:
+                expert_param = load_quant_expert_weight(params, name, weight)
+                if expert_param is not None:
+                    loaded.add(expert_param)
+                    continue
             shard_id = None
-            for old, (new, shard) in self._shards.items():
+            for old, (new, shard) in shards.items():
                 if old in name:
                     name = name.replace(old, new)
                     shard_id = shard
@@ -785,7 +857,12 @@ class Inkling2ForConditionalGeneration(
                     continue
                 raise ValueError(f"Unexpected checkpoint tensor: {name}")
             param = params[name]
-            if param.dtype != weight.dtype:
+            if quant_method:
+                # Dense tensors may arrive in another float dtype (e.g. F32
+                # GGUF norms); quantized ones go to their quant method's
+                # loader as they are.
+                weight = cast_dense_weight(param, weight)
+            elif param.dtype != weight.dtype:
                 if ".mlp.experts." in name and weight.dtype == torch.bfloat16:
                     raise ValueError(
                         f"{name}: BF16 expert weights are not supported; the "
@@ -804,7 +881,7 @@ class Inkling2ForConditionalGeneration(
             else:
                 loader(param, weight, shard_id)
                 loaded_shards.add((name, shard_id))
-        num_shards = Counter(new for new, _ in self._shards.values())
+        num_shards = Counter(new for new, _ in shards.values())
         for name, count in Counter(name for name, _ in loaded_shards).items():
             fused = next(f for f in num_shards if f in name)
             if count == num_shards[fused]:

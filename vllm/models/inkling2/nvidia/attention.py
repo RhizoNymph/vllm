@@ -20,9 +20,11 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.nvidia.ops.fa4_rel_attention import bucket_max_seqlen_q
 from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
@@ -177,6 +179,12 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
     for pass 0, `pass_caches[p - 1]` after). With `loop_share_cache`, every
     pass reads and writes this layer's KV cache (later tokens see the last
     pass's K/V).
+
+    With `split_linears` (the `QUANT_METHOD` backend with a quantization
+    config) the projections are three quantizable linears, `q_proj` (q, r,
+    gate, sink), `k_proj` and `v_proj`, run through their quant methods,
+    instead of slices of one BF16 `qkvr` weight; `wo_ud` takes
+    `quant_config` too.
     """
 
     def __init__(
@@ -186,9 +194,12 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         conv_state: InklingConvState,
         prefix: str,
         pass_conv_states: tuple[InklingConvState, ...] = (),
+        quant_config: QuantizationConfig | None = None,
+        split_linears: bool = False,
     ) -> None:
         super().__init__()
         self.prefix = prefix
+        self.split_linears = split_linears
         self.is_local = is_local
         num_heads = (
             config.swa_num_attention_heads if is_local else config.num_attention_heads
@@ -228,20 +239,43 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         # from the K rows, are discarded).
         q_side = sum(self.split_sizes[:4])
         self.q_side_splits = [*self.split_sizes[:4], -q_side % 8]
-        pad_size = -sum(self.split_sizes) % 8
-        if pad_size:
-            self.split_sizes.append(pad_size)
-        self.qkvr = MergedColumnParallelLinear(
-            config.hidden_size,
-            [size * tp_size for size in self.split_sizes],
-            bias=False,
-            prefix=f"{prefix}.qkvr",
-        )
+        if split_linears:
+            hidden = config.hidden_size
+            self.q_proj = MergedColumnParallelLinear(
+                hidden,
+                [size * tp_size for size in self.split_sizes[:4]],
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_proj",
+                return_bias=False,
+            )
+            self.k_proj, self.v_proj = (
+                ColumnParallelLinear(
+                    hidden,
+                    kv_size * tp_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.{name}",
+                    return_bias=False,
+                )
+                for name in ("k_proj", "v_proj")
+            )
+        else:
+            pad_size = -sum(self.split_sizes) % 8
+            if pad_size:
+                self.split_sizes.append(pad_size)
+            self.qkvr = MergedColumnParallelLinear(
+                config.hidden_size,
+                [size * tp_size for size in self.split_sizes],
+                bias=False,
+                prefix=f"{prefix}.qkvr",
+            )
         self.wo_ud = RowParallelLinear(
             q_size * tp_size,
             config.hidden_size,
             bias=False,
             reduce_results=False,
+            quant_config=quant_config if split_linears else None,
             prefix=f"{prefix}.wo_ud",
         )
         self.rel_logits_proj = nn.Parameter(
@@ -330,6 +364,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
     def _project(
         self, x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor
     ) -> list[torch.Tensor]:
+        if self.split_linears:
+            q_side = self.q_proj(x_q).split(self.split_sizes[:4], dim=-1)
+            return [*q_side, self.k_proj(x_k), self.v_proj(x_v)]
         # ``linear`` on the weight bypasses the layer (and a LoRA wrapper's
         # forward), so the LoRA deltas are added here (no-op without LoRA).
         weight = self.qkvr.weight
@@ -395,6 +432,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             output,
             pass_idx,
         )
+        if self.split_linears:
+            projected, _ = self.wo_ud(output)
+            return projected if out is None else out.copy_(projected)
         out = linear(output, self.wo_ud.weight, out)
         add_linear_lora(self.wo_ud, out, output)
         return out
