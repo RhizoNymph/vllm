@@ -4,7 +4,7 @@
 import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
 
 class SAEModuleManifestRequest(BaseModel):
@@ -27,8 +27,11 @@ class SAEModuleManifestRequest(BaseModel):
     activation: Literal["relu", "jumprelu", "topk"] = Field(
         description="Encoder activation function the SAE was trained with."
     )
-    layers: list[tuple[StrictInt, str]] = Field(
-        description="(layer_idx, hook_point) pairs the SAE applies to.",
+    layers: list[tuple[StrictInt | StrictStr, str]] = Field(
+        description=(
+            "(layer_idx, hook_point) pairs the SAE applies to; on looped "
+            "models a loop core layer is named with its pass, 'layer@pass'."
+        ),
         min_length=1,
     )
     clampable_features: list[StrictInt] = Field(

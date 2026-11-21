@@ -229,8 +229,7 @@ def default_hook_schema(hidden_size: int, dtype: torch.dtype) -> dict[str, HookS
     appear only in an mHC model's schema, see :func:`build_hook_schema`).
     """
     return {
-        hook: HookSchema(hidden_size, dtype, (hidden_size,))
-        for hook in STANDARD_HOOKS
+        hook: HookSchema(hidden_size, dtype, (hidden_size,)) for hook in STANDARD_HOOKS
     }
 
 
@@ -406,3 +405,21 @@ def capture_expert_parallel_size(parallel_config: ParallelConfig) -> int:
     if getattr(parallel_config, "enable_expert_parallel", False):
         return parallel_config.tensor_parallel_size * parallel_config.data_parallel_size
     return 1
+
+
+def expand_capture_spec(spec: CaptureSpec | None, space) -> CaptureSpec | None:
+    """``spec`` with each requested layer replaced by the layer keys of its
+    visits on a looped model (``vllm.config.loop_layers.LoopLayerSpace``):
+    one capture row per (layer, pass). Identity without a loop space;
+    idempotent."""
+    if spec is None or space is None:
+        return spec
+    from vllm.config.loop_layers import expand_layer_list
+
+    return CaptureSpec(
+        hooks={
+            hook: expand_layer_list(layers, space)
+            for hook, layers in spec.hooks.items()
+        },
+        positions=spec.positions,
+    )

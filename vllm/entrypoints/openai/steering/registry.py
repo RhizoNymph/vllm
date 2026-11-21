@@ -71,6 +71,26 @@ class SAEModuleManifest:
     ``"fp8_e4m3"`` (fp8 with per-row fp32 scales, quantized at
     worker attach time)."""
 
+    def __post_init__(self) -> None:
+        # Sites are layer keys (``vllm.config.loop_layers``). On a looped
+        # model an SAE is trained on one visit of a layer, so a loop core
+        # layer must name its pass (``"L@p"``); its weights are then read
+        # from the site file of the visit's layer key (the key capture
+        # writes it under). Idempotent.
+        from vllm.config.loop_layers import expand_layer_key
+
+        sites: list[tuple[int, str]] = []
+        for layer, hook in self.layers:
+            keys = expand_layer_key(layer, label="SAE manifest layer")
+            if len(keys) != 1:
+                raise ValueError(
+                    f"SAE manifest site ({layer!r}, {hook!r}): layer {layer} "
+                    "runs once per loop pass; name the pass the SAE was "
+                    f"trained on as '{layer}@<pass>'"
+                )
+            sites.append((keys[0], hook))
+        self.layers = tuple(sites)
+
 
 @dataclass
 class SteeringModule:
