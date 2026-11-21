@@ -21,6 +21,12 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.steering import (
+    SteeringHookPoint,
+    apply_block_steering,
+    apply_layer_steering,
+    share_steering_index_across_layers,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -31,8 +37,13 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
 from vllm.model_executor.models.utils import (
     WeightsMapper,
+    extract_layer_index,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
+)
+from vllm.models.common.interventions import (
+    interventions_configured,
+    register_layer_steering_buffers,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.mistral.amd.attention import MistralMLAAttention
@@ -43,6 +54,10 @@ from vllm.models.mistral.common.rope import MistralRotaryEmbedding
 from vllm.models.mistral.mistral_large4.amd.specialized_decode import (
     DecodeConfig,
     specialized_decode_config,
+)
+from vllm.models.mistral.mistral_large4.amd.specialized_decode.runtime.spec import (
+    AUTO,
+    decode_backend,
 )
 from vllm.v1.attention.backends.mla.index_group import (
     SparseMLAIndexGroupBuilder,
@@ -57,14 +72,31 @@ if TYPE_CHECKING:
 
 def defers_allreduce(vllm_config: VllmConfig) -> bool:
     """Whether sublayers leave their outputs TP-partial and fuse the all-reduce
-    into the next residual RMSNorm."""
+    into the next residual RMSNorm. Never under interventions: the hooks need
+    the complete attention and MLP outputs."""
     parallel_config = vllm_config.parallel_config
     return bool(
         vllm_config.compilation_config.pass_config.fuse_allreduce_rms
         and vllm_config.model_config.dtype == torch.bfloat16
         and not parallel_config.enable_expert_parallel
         and not parallel_config.use_sequence_parallel_moe
+        and not interventions_configured(vllm_config)
     )
+
+
+def _specialized_decode_config(vllm_config: VllmConfig) -> DecodeConfig | None:
+    """`specialized_decode_config`, refused under interventions: the decode
+    kernels run whole layers without the intervention hooks."""
+    if not interventions_configured(vllm_config):
+        return specialized_decode_config(vllm_config)
+    if decode_backend(vllm_config) != AUTO:
+        raise ValueError(
+            "The Mistral Large 4 specialized decode (decode_backend="
+            "latency_specialized or --monokernel) runs decode steps without "
+            "the intervention hooks; use decode_backend=auto with steering, "
+            "patching or activation capture."
+        )
+    return None
 
 
 class MistralLarge4DecoderLayer(nn.Module):
@@ -85,6 +117,11 @@ class MistralLarge4DecoderLayer(nn.Module):
         if quant_config is None:
             quant_config = vllm_config.quant_config
         self.defer_allreduce = defers_allreduce(vllm_config)
+        self.layer_idx = extract_layer_index(prefix)
+        # Per-request interventions; DSpark draft layers (built past their own
+        # layer count, at the target's following indices) are not steered.
+        if self.layer_idx < config.num_hidden_layers:
+            register_layer_steering_buffers(self, vllm_config, config.hidden_size)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = MistralMLAAttention(
             vllm_config,
@@ -146,13 +183,24 @@ class MistralLarge4DecoderLayer(nn.Module):
         rotary_emb: MistralRotaryEmbedding,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the layer on the outputs of `input_norm`."""
+        # The residual stream entering the layer (input_norm folded in the
+        # previous layer's MLP branch); hidden_states is its normed copy.
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.PRE_ATTN)
         hidden_states = self.self_attn(
             positions, hidden_states, log_positions, rotary_emb
         )
         hidden_states, residual = self.residual_norm(
             self.post_attention_layernorm, hidden_states, residual
         )
-        return self.mlp(hidden_states), residual
+        residual = apply_layer_steering(self, residual, SteeringHookPoint.POST_ATTN)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_IN
+        )
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = apply_layer_steering(
+            self, hidden_states, SteeringHookPoint.MLP_OUT
+        )
+        return apply_block_steering(self, hidden_states, residual)
 
 
 class MistralLarge4Model(nn.Module, EagleModelMixin):
@@ -160,8 +208,8 @@ class MistralLarge4Model(nn.Module, EagleModelMixin):
         super().__init__()
         # before any module allocates weights: an unsupported deployment that
         # asked for the specialized decode fails here, listing every reason
-        self.specialized_decode_config: DecodeConfig | None = specialized_decode_config(
-            vllm_config
+        self.specialized_decode_config: DecodeConfig | None = (
+            _specialized_decode_config(vllm_config)
         )
         self.specialized_decode: SpecializedDecode | None = None
         config = vllm_config.model_config.hf_config
@@ -208,6 +256,9 @@ class MistralLarge4Model(nn.Module, EagleModelMixin):
             )
             for spec in self.layer_specs
         )
+        # One steering_index for every steerable layer (no-op when steering
+        # is off: the layers register no buffers).
+        share_steering_index_across_layers(list(self.layers))
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def build_specialized_decode(self, vllm_config: VllmConfig) -> None:
