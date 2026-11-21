@@ -91,6 +91,19 @@ Features Index:
       ["SamplingParams.steering_vectors", "SamplingParams.steering_clamps", "--enable-steering"]
     depends_on: [activation_capture]
     doc: docs/features/steering.md
+  transformers_backend_interventions:
+    description: >
+      Gives decoder layers built by the Transformers modeling backend the
+      native hook points (pre_attn, post_attn, mlp_in, mlp_out, post_block)
+      by analysing each layer's forward source for its residual adds and
+      rewriting them into calls to apply_layer_steering / apply_block_steering.
+      Installed only when an intervention is configured; unsupported layouts
+      fail loudly with UnsupportedInterventionLayout.
+    entry_points:
+      - vllm/model_executor/models/transformers/base.py (Base._install_interventions)
+      - vllm/model_executor/models/transformers/interventions/ (analysis, rewrite, hooks, install)
+    depends_on: [activation_capture, activation_steering]
+    doc: docs/features/transformers_backend_interventions.md
   activation_patching:
     description: >
       Overwrite/interpolate residual activations at (layer, hook, position)

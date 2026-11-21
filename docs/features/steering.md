@@ -48,38 +48,44 @@ Steering is wired into the following decoder architectures:
 `llama` here means the native `vllm/model_executor/models/llama.py`, which
 still serves architectures the registry maps to it (`InternLM3ForCausalLM`,
 `IQuestCoderForCausalLM`) and the inner Llama language model of composite
-models. A top-level `LlamaForCausalLM` checkpoint is routed to the
-Transformers modeling backend (see below) and is **not** hooked. Likewise,
-inner Qwen2 language models of composite models (Qwen2-VL, Qwen2.5-VL,
+models. Inner Qwen2 language models of composite models (Qwen2-VL, Qwen2.5-VL,
 Qwen2-Audio, dots.ocr, MiniCPM-V, ...) are built as `qwen3` with Qwen2-style
-attention and carry the `qwen3` hook set, while a top-level
-`Qwen2ForCausalLM` is not hooked.
+attention and carry the `qwen3` hook set.
+
+### Transformers modeling backend
 
 Architectures served by the Transformers modeling backend
-(`vllm/model_executor/models/transformers/`) are **not** hooked: steering,
-capture, patching, clamps, and SAE steering are inert for them. Upstream has
-migrated these formerly-hooked architectures to that backend, so they lost
-coverage when their native implementations were deleted: `arcee`
-(`ArceeForCausalLM`), `flex_olmo` (`FlexOlmoForCausalLM`), `gemma`
-(`GemmaForCausalLM`), `gpt_neox` (`GPTNeoXForCausalLM`), `hunyuan_v1`
-(`HunYuanDenseV1ForCausalLM`, `HunYuanMoEV1ForCausalLM`), `jais2`
-(`Jais2ForCausalLM`), `olmo3` (`Olmo3ForCausalLM`), `olmoe`
-(`OlmoeForCausalLM`), `phi` (`PhiForCausalLM`), `qwen2` (`Qwen2ForCausalLM`,
-and the `Qwen2Model` embedding entry), `qwen2_moe` (`Qwen2MoeForCausalLM`),
-`seed_oss` (`SeedOssForCausalLM`), and `stablelm` (`StableLmForCausalLM`).
-Architectures that inherited their hooks from `llama` or `qwen3_moe` lost them
-the same way when upstream deleted their wrappers and routed them to the
-Transformers backend: `glm` (`GlmForCausalLM`), `phi3` (`Phi3ForCausalLM`),
-`mellum` (`MellumForCausalLM`), and `aria` (`AriaForConditionalGeneration`),
-as did the top-level `LlamaForCausalLM`, `CwmForCausalLM`, and the
-`LlamaModel` / `MistralModel` embedding entries, whose `llama.py`
-implementation survives but is no longer selected for them. `olmo`, `olmo2`,
-and `starcoder2` were already Transformers-backed before this. `arctic`
+(`vllm/model_executor/models/transformers/`) are hooked generically: when
+steering, patching, or capture is configured, the backend rewrites each
+decoder layer's forward so its residual adds go through the same
+`apply_layer_steering` / `apply_block_steering` sites as native layers, with
+all five hook points (`pre_attn`, `post_attn`, `mlp_in`, `mlp_out`,
+`post_block`) and the full capture → patch → steer → SAE → clamp stack. See
+[Transformers Backend Interventions](transformers_backend_interventions.md).
+This covers, among the registry's Transformers-backed entries:
+
+- Llama family: top-level `llama` (`LlamaForCausalLM`), the `LlamaModel` and
+  `MistralModel` embedding entries, `arcee`, `cwm`, `smollm3`
+- Qwen family: `qwen2` (`Qwen2ForCausalLM`, `Qwen2Model`), `qwen2_moe`
+- Gemma family: `gemma`, `vaultgemma`
+- MoE: `olmoe`, `flex_olmo`, `hunyuan_v1` (dense and MoE), `mellum`,
+  `kolibri1`
+- Olmo family: `olmo`, `olmo2`, `olmo3`
+- Phi family: `phi` (parallel block), `phi3`
+- GLM: `glm`
+- Other: `gpt_neox` (parallel and sequential), `stablelm` (parallel and
+  sequential), `jais2`, `seed_oss`, `starcoder2`, `gpt_bigcode`
+- Composite models built through the backend (e.g. `aria`, or Llava with
+  `--model-impl transformers`): their language model is hooked; vision towers
+  are not
+
+A decoder layer whose forward the backend cannot analyse fails model loading
+with `UnsupportedInterventionLayout` when an intervention is configured,
+rather than serving with the intervention silently inert. Servers with no
+intervention configured run the upstream forward unchanged. `arctic`
 (`ArcticForCausalLM`), `StableLMEpochForCausalLM`, `LLaMAForCausalLM`,
 `TeleChat2ForCausalLM`, `TeleChat3ForCausalLM`, `RWForCausalLM`,
 `Fairseq2LlamaForCausalLM`, and `GritLM` were removed upstream outright.
-Generic instrumentation of the Transformers backend is tracked as a
-follow-up.
 
 Architectures that live in the hardware-split `vllm/models/` packages (a
 per-vendor `nvidia/` and `amd/` implementation behind one registry entry) are
@@ -106,7 +112,8 @@ hooked per implementation, so coverage can differ by platform:
 End-to-end tested with real weights:
 
 - Gemma 3 (primary test target)
-- step3p5, Mixtral, DeepSeek V2, PhiMoE, GLM4 MoE, Exaone MoE
+- StableLM (Transformers backend), step3p5, Mixtral, DeepSeek V2, PhiMoE,
+  GLM4 MoE, Exaone MoE
   (via `*_real_weights` tests in
   `tests/models/language/generation/test_steering.py`)
 
@@ -348,8 +355,9 @@ layer's forward path. Unused hook points are zero-valued no-ops.
 
 The three residual-stream hooks steer the carried residual and are wired on
 every steerable model. `mlp_in`/`mlp_out` steer the MLP *branch* tensor and
-are wired on gemma3, gemma4, and the qwen3 family (`qwen3`, `qwen3_moe`,
-`qwen3_next`/Qwen3.5); on other models they are silent no-ops (buffers exist
+are wired on gemma3, gemma4, the qwen3 family (`qwen3`, `qwen3_moe`,
+`qwen3_next`/Qwen3.5), and every Transformers-backend architecture; on other
+models they are silent no-ops (buffers exist
 but no emission site). Note an additive steer at `mlp_out` propagates
 identically to `post_block` — the branch is added to the residual stream —
 so `mlp_out` exists chiefly for patching (replace/ablate the MLP branch);
