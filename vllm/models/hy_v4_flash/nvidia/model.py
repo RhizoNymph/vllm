@@ -12,8 +12,13 @@ from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.steering import SteeringHookPoint
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.models.hy_v4.interventions import (
+    register_hy_v4_steering_buffers,
+    steer_streams,
+)
 from vllm.models.hy_v4.nvidia.hc import HYV4HCLayer
 from vllm.models.hy_v4.nvidia.model import (
     HYV4DecoderLayer,
@@ -123,6 +128,17 @@ class HYV4FlashDecoderLayer(HYV4DecoderLayer):
         self.hc_mlp_layer = HYV4HCLayer(
             config, self.layer_idx, prefix=f"{prefix}.hc_mlp_layer"
         )
+        # This __init__ replaces HYV4DecoderLayer's, so it registers the HY V4
+        # intervention buffers itself; the hooked forward is inherited.
+        if self.intervention_hooks:
+            if self.enable_ihc:
+                self.hc_mult = config.hc_mult
+            register_hy_v4_steering_buffers(
+                self,
+                vllm_config,
+                ihc=self.enable_ihc,
+                is_last_layer=self.layer_idx == config.num_hidden_layers - 1,
+            )
 
 
 class HYV4FlashModel(HYV4Model):
@@ -192,6 +208,10 @@ class HYV4FlashModel(HYV4Model):
                 hidden = layer.hc_attn_layer.prepare_input(hidden)
                 hidden = layer.engram_layer(hidden, hashes[hash_indices[index]])
             hidden, _ = layer(positions, hidden, None)
+        # mhc_streams_final, owned by the last layer (Flash has no PP).
+        hidden = steer_streams(
+            self.layers[-1], hidden, SteeringHookPoint.MHC_STREAMS_FINAL
+        )
         return self.norm(self.hc_head(hidden))
 
     def _record_part(self, name: str, part: Any) -> None:
