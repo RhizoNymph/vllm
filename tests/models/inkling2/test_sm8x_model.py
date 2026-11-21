@@ -197,7 +197,9 @@ def test_decode_attention_after_prologue_on_sm8x(is_local, num_splits):
 
 
 @torch.inference_mode()
-def test_quant_moe_bf16_matches_dense_reference(dist_init, default_vllm_config):
+def test_quant_moe_bf16_matches_dense_reference(
+    dist_init, default_vllm_config, workspace_init
+):
     """`Inkling2QuantMoE` with BF16 weights (UnquantizedFusedMoEMethod's
     Triton experts, vLLM SITU) against `sum_k w_k * W2 @ situ(W13 @ x)` with
     the torch router."""
@@ -391,7 +393,9 @@ def test_tiny_model_routed_experts_per_visit(tmp_path, enable_pickle, looped):
     for visit, call in enumerate(calls):
         # The Triton router and the torch reference may break exact ties
         # differently; random gates leave none in practice.
-        torch.testing.assert_close(captured[:, visit], call[:n], atol=0, rtol=0)
+        torch.testing.assert_close(
+            captured[:, visit], call[:n].to(torch.int64), atol=0, rtol=0
+        )
 
 
 @pytest.mark.parametrize("looped", [False, True])
