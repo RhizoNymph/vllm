@@ -359,7 +359,7 @@ class _LoaderParam:
         self.calls.append((name, shard_id, expert_id, weight.clone()))
 
 
-@pytest.mark.parametrize("suffix", ["weight", "qweight", "qweight_type"])
+@pytest.mark.parametrize("suffix", ["weight", "weight_type", "expert_scale"])
 @pytest.mark.parametrize("layer_prefix", ["model.layers.7", "model.llm.layers.7"])
 def test_per_expert_names_map_to_routed_expert_shards(suffix, layer_prefix):
     params = {
