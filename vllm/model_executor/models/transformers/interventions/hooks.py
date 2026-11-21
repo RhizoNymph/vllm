@@ -36,7 +36,9 @@ def _site(layer: nn.Module, x: torch.Tensor, hook: SteeringHookPoint) -> torch.T
     return x if out is flat else out.view(x.shape)
 
 
-def _block(layer: nn.Module, residual: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
+def _block(
+    layer: nn.Module, residual: torch.Tensor, branch: torch.Tensor
+) -> torch.Tensor:
     """`residual + branch` with the `post_block` site applied to the sum."""
     if residual.shape != branch.shape:
         raise ValueError(

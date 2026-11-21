@@ -66,9 +66,7 @@ ARCHITECTURES = [
     pytest.param("gpt_neox", {"use_parallel_residual": True}, id="gpt_neox-parallel"),
     pytest.param("gpt_neox", {"use_parallel_residual": False}, id="gpt_neox"),
     pytest.param("hunyuan_v1_dense", {"head_dim": 16}, id="hunyuan_v1_dense"),
-    pytest.param(
-        "hunyuan_v1_moe", {"head_dim": 16, **_SMALL_MOE}, id="hunyuan_v1_moe"
-    ),
+    pytest.param("hunyuan_v1_moe", {"head_dim": 16, **_SMALL_MOE}, id="hunyuan_v1_moe"),
     pytest.param("jais2", {}, id="jais2"),
     pytest.param("kolibri1", _SMALL_MOE, id="kolibri1"),
     pytest.param("llama", {}, id="llama"),
@@ -123,7 +121,9 @@ def _build(model_type: str, overrides: dict) -> nn.Module:
 def _decoder_layers(model: nn.Module) -> nn.ModuleList:
     decoder = model.get_decoder() if hasattr(model, "get_decoder") else model
     return next(
-        m for m in decoder.modules() if isinstance(m, nn.ModuleList) and len(m) == LAYERS
+        m
+        for m in decoder.modules()
+        if isinstance(m, nn.ModuleList) and len(m) == LAYERS
     )
 
 
@@ -143,7 +143,9 @@ def test_hf_architecture(model_type, overrides, monkeypatch):
     layers = _decoder_layers(model)
     plans = [analyze_layer(layer, is_hf_attention) for layer in layers]
     parallel = any(
-        isinstance(layout, ParallelResidual) for plan in plans for layout in plan.layouts
+        isinstance(layout, ParallelResidual)
+        for plan in plans
+        for layout in plan.layouts
     )
     mlp_child = plans[0].layouts[0].mlp_input.child
 

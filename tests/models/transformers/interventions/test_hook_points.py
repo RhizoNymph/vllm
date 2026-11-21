@@ -197,7 +197,11 @@ def test_existing_layer_idx_must_agree():
     layer.layer_idx = 3
     with pytest.raises(UnsupportedInterventionLayout, match="layer_idx"):
         install_interventions(
-            [layer], [0], hidden_size=HIDDEN, sizes=SIZES, is_attention=is_stub_attention
+            [layer],
+            [0],
+            hidden_size=HIDDEN,
+            sizes=SIZES,
+            is_attention=is_stub_attention,
         )
 
 

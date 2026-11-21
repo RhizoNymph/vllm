@@ -128,7 +128,9 @@ def _steering():
 
 
 def test_unconfigured_server_keeps_upstream_forward(single_rank, monkeypatch, tmp_path):
-    model = _build(_tiny("llama", str(tmp_path)), "TransformersForCausalLM", monkeypatch)
+    model = _build(
+        _tiny("llama", str(tmp_path)), "TransformersForCausalLM", monkeypatch
+    )
     for layer in _layers(model):
         assert "forward" not in vars(layer)
         assert not hasattr(layer, "steering_index")
@@ -136,7 +138,10 @@ def test_unconfigured_server_keeps_upstream_forward(single_rank, monkeypatch, tm
 
 def test_steering_hooks_every_layer(single_rank, monkeypatch, tmp_path):
     model = _build(
-        _tiny("llama", str(tmp_path)), "TransformersForCausalLM", monkeypatch, **_steering()
+        _tiny("llama", str(tmp_path)),
+        "TransformersForCausalLM",
+        monkeypatch,
+        **_steering(),
     )
     layers = _layers(model)
     for i, layer in enumerate(layers):
@@ -178,7 +183,10 @@ def test_only_pipeline_local_layers_are_hooked(single_rank, monkeypatch, tmp_pat
 
     monkeypatch.setattr(Base, "_pp_indices", lambda self: (1, LAYERS))
     model = _build(
-        _tiny("llama", str(tmp_path)), "TransformersForCausalLM", monkeypatch, **_steering()
+        _tiny("llama", str(tmp_path)),
+        "TransformersForCausalLM",
+        monkeypatch,
+        **_steering(),
     )
     layers = _layers(model)
     assert "forward" not in vars(layers[0])

@@ -324,7 +324,9 @@ class _Interpreter:
                 and isinstance(func.value.func, ast.Name)
                 and func.value.func.id == "super"
             ):
-                raise self.fail("its forward delegates to super(), which is not analysed")
+                raise self.fail(
+                    "its forward delegates to super(), which is not analysed"
+                )
             is_self_attr = (
                 isinstance(func.value, ast.Name) and func.value.id == self.self_name
             )
@@ -345,7 +347,9 @@ class _Interpreter:
                 )
             args.append(receiver)
         if tracked_args and self.writes_through_args(node):
-            raise self.fail(f"line {node.lineno} writes a residual-stream value in place")
+            raise self.fail(
+                f"line {node.lineno} writes a residual-stream value in place"
+            )
         return _join(*args)
 
     @staticmethod
@@ -429,7 +433,9 @@ class _Interpreter:
         except _InfeasiblePath:
             return []
 
-    def run(self, stmts: list[ast.stmt], env: dict[str, _Val], st: _State) -> list[_Path]:
+    def run(
+        self, stmts: list[ast.stmt], env: dict[str, _Val], st: _State
+    ) -> list[_Path]:
         for i, stmt in enumerate(stmts):
             rest = stmts[i + 1 :]
             if isinstance(stmt, ast.If):
@@ -527,7 +533,12 @@ class _Interpreter:
 
         if len(adds) == 2:
             attn, mlp = adds
-            if len(attn.attn) == 1 and not attn.mlp and len(mlp.mlp) == 1 and not mlp.attn:
+            if (
+                len(attn.attn) == 1
+                and not attn.mlp
+                and len(mlp.mlp) == 1
+                and not mlp.attn
+            ):
                 (attn_branch, _), (mlp_branch, mlp_val) = attn.attn[0], mlp.mlp[0]
                 return SequentialResidual(
                     attn_add=attn.node,
