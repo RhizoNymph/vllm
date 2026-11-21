@@ -27,6 +27,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.steering import SteeringHookPoint, apply_layer_steering
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -54,6 +55,12 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
 )
 
 from ..configs import Inkling2MMConfig, Inkling2ModelConfig
+from ..interventions import (
+    hook_branch,
+    hook_state,
+    interventions_configured,
+    make_intervention_sites,
+)
 from ..processing import (
     IMAGE_PLACEHOLDER,
     Inkling2DummyInputsBuilder,
@@ -187,7 +194,6 @@ class Inkling2DecoderLayer(nn.Module):
         config or the backend selected for it (`backend.py`)."""
         super().__init__()
         quant = as_layer_quant(quant_config)
-        self.layer_idx = layer_id
         self.is_local = layer_id in config.local_layer_ids
         num_kv_heads = (
             config.swa_num_key_value_heads
@@ -298,6 +304,15 @@ class Inkling2Model(nn.Module):
         )
         self.attn_res = Inkling2AttnRes(config)
         self.norm = Inkling2RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # One intervention site per layer visit (`interventions.py`); with
+        # steering, patching or capture configured the forward runs the
+        # unfused convs and mixes so every hook sees what the next
+        # sublayer reads.
+        vllm_config = get_current_vllm_config()
+        self.interventions = interventions_configured(vllm_config)
+        self.intervention_sites = make_intervention_sites(
+            config, vllm_config if self.interventions else None
+        )
         # Large batches keep a token shard of the hidden stream on each rank.
         self.allreduce_workspace = None
         self.seq_parallel = None
@@ -348,6 +363,8 @@ class Inkling2Model(nn.Module):
     def forward(
         self, positions: torch.Tensor, inputs_embeds: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        if self.interventions:
+            return self._forward_interventions(positions, inputs_embeds)
         num_tokens, hidden = inputs_embeds.shape
         aux_hidden_states = []
         num_layers = len(self.layers)
@@ -517,6 +534,120 @@ class Inkling2Model(nn.Module):
         if self.aux_hidden_state_layers:
             return out, [*aux_hidden_states, out]
         return out
+
+    def _forward_interventions(
+        self, positions: torch.Tensor, inputs_embeds: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """`forward` with the intervention hooks of `interventions.py`, on
+        unfused convs and mixes (all-reduced sublayer outputs, no sequence
+        parallel)."""
+        num_tokens, hidden = inputs_embeds.shape
+        max_blocks = -(-len(self.layers) // self.block_size)
+        stack = inputs_embeds.new_empty((max_blocks + 1, num_tokens, hidden))
+        stack[0].copy_(inputs_embeds)
+        tau = self._log_scaling_tau(positions)
+        aux_hidden_states = []
+        num_blocks = 0
+        for i in range(len(self.layers)):
+            if i in self.aux_hidden_state_layers:
+                aux_hidden_states.append(stack[num_blocks].clone())
+            num_blocks = self._hooked_visit(
+                i, 0, self.intervention_sites[i], stack, num_blocks, positions, tau
+            )
+        out = self._mix(
+            stack[:num_blocks], stack[num_blocks], self.attn_res.output_query, self.norm
+        )[0]
+        if self.aux_hidden_state_layers:
+            return out, [*aux_hidden_states, out]
+        return out
+
+    def _visit_attn_inputs(
+        self,
+        i: int,
+        layer: Inkling2DecoderLayer,
+        stack: torch.Tensor,
+        num_blocks: int,
+        bank: torch.Tensor | None,
+    ) -> tuple[Sequence[torch.Tensor], torch.Tensor | None]:
+        """The attention inputs of layer `i` from the block stack, and the
+        visit's loop messages (None: not a looped visit)."""
+        assert bank is None
+        partial = stack[num_blocks]
+        if num_blocks == 0:
+            return [
+                layer.attn_norm(partial, j) for j in range(layer.num_attn_inputs)
+            ], None
+        query = self.attn_res.attn_queries[i - 1]
+        return self._mix(stack[:num_blocks], partial, query, layer.attn_norm), None
+
+    def _hooked_visit(
+        self,
+        i: int,
+        pass_idx: int,
+        site: nn.Module,
+        stack: torch.Tensor,
+        num_blocks: int,
+        positions: torch.Tensor,
+        tau: torch.Tensor | None,
+        bank: torch.Tensor | None = None,
+    ) -> int:
+        """Run layer `i` in loop pass `pass_idx` with the hooks of `site`
+        (see `interventions.py` for what each hook sees); `bank` holds the
+        previous pass's blocks for a looped visit. Returns the number of
+        completed blocks after the layer."""
+        layer = self.layers[i]
+        partial = stack[num_blocks]
+        hook_state(site, partial, SteeringHookPoint.PRE_ATTN)
+        attn_inputs, messages = self._visit_attn_inputs(
+            i, layer, stack, num_blocks, bank
+        )
+        attn_partial = layer.attention(positions, attn_inputs, tau, pass_idx=pass_idx)
+        owner = layer.conv_states[pass_idx]
+        attn_out = layer.attn_sconv(
+            tensor_model_parallel_all_reduce(attn_partial), positions, owner=owner
+        )
+        first = i % self.block_size == 0
+        attn_out = hook_branch(
+            site, SteeringHookPoint.POST_ATTN, attn_out, None if first else partial
+        )
+        # The MLP input mixes the blocks with (partial +) attn_out; a looped
+        # visit blends its message into the fp32 mix before the norm.
+        norm = None if messages is not None else layer.mlp_norm
+        mix_args = (
+            self.attn_res.mlp_queries[i],
+            None if norm is None else norm.weight,
+            0.0 if norm is None else norm.eps,
+            self.normalize_values,
+        )
+        if first:
+            mlp_in = attn_res(stack[: num_blocks + 1], attn_out, None, *mix_args)
+        else:
+            mlp_in = attn_res(stack[:num_blocks], partial, attn_out, *mix_args)
+        if messages is not None:
+            mlp_norm = layer.mlp_norm
+            mlp_in = layer.blend(
+                slice(3, 4), mlp_in, messages[3:], mlp_norm.weight, mlp_norm.eps
+            )
+        moe_in = apply_layer_steering(site, mlp_in[0], SteeringHookPoint.MLP_IN)
+        if pass_idx:
+            moe_out = layer.mlp(moe_in, pass_idx=pass_idx)
+        else:
+            moe_out = layer.mlp(moe_in)
+        moe_out = apply_layer_steering(site, moe_out, SteeringHookPoint.MLP_OUT)
+        # The MLP short conv also applies the residual update.
+        residual = None if first else partial
+        if first:
+            num_blocks += 1
+        layer.mlp_sconv(
+            moe_out,
+            positions,
+            addend=attn_out,
+            residual=residual,
+            out=stack[num_blocks],
+            owner=owner,
+        )
+        hook_state(site, stack[num_blocks], SteeringHookPoint.POST_BLOCK)
+        return num_blocks
 
     def _log_scaling_tau(self, positions: torch.Tensor) -> torch.Tensor | None:
         if self.config.log_scaling_n_floor is None:

@@ -322,6 +322,8 @@ class Inkling2LoopModel(Inkling2Model):
         """Prelude, `num_passes` core passes, then the coda. Each sublayer's
         short conv runs fused with the next AttnRes mix (and small batches
         with its all-reduce)."""
+        if self.interventions:
+            return self._forward_interventions(positions, inputs_embeds)
         num_tokens, hidden = inputs_embeds.shape
         core = self.loop_core
         num_passes = self.config.num_loop_passes
@@ -397,6 +399,101 @@ class Inkling2LoopModel(Inkling2Model):
         if self.aux_hidden_state_layers:
             return out, [*aux_hidden_states, out]
         return out
+
+    def _visits(self) -> list[tuple[int, int]]:
+        """(layer, pass) visits; the prelude and coda run as pass 0."""
+        core = self.loop_core
+        visits = [(i, 0) for i in range(core.start)]
+        visits += [(i, p) for p in range(self.config.num_loop_passes) for i in core]
+        visits += [(i, 0) for i in range(core.stop, len(self.layers))]
+        return visits
+
+    def _forward_interventions(
+        self, positions: torch.Tensor, inputs_embeds: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """`forward` with a hook site per layer visit (`interventions.py`):
+        site `visit` of `intervention_sites` is that visit's, so the hooks
+        of a core layer address each pass separately. Unfused convs and
+        mixes; each visit reads its inputs from the block stack after its
+        `pre_attn` hook."""
+        num_tokens, hidden = inputs_embeds.shape
+        core = self.loop_core
+        stack = inputs_embeds.new_empty(
+            (self._max_loop_blocks() + 1, num_tokens, hidden)
+        )
+        stack[0].copy_(inputs_embeds)
+        tau = self._log_scaling_tau(positions)
+        aux_hidden_states = []
+        num_blocks = 0
+        bank = prelude_blocks = prelude_partial = None
+        for visit, (i, pass_idx) in enumerate(self._visits()):
+            looped = pass_idx > 0
+            if i == core.start and not looped:
+                # The state every pass restarts from (before any core hook).
+                prelude_blocks = num_blocks
+                prelude_partial = stack[num_blocks].clone()
+            elif i == core.start:
+                assert prelude_blocks is not None and prelude_partial is not None
+                bank = stack[prelude_blocks + 1 : num_blocks + 1].clone()
+                num_blocks = prelude_blocks
+                stack[num_blocks].copy_(prelude_partial)
+            if visit in self.aux_hidden_state_layers:
+                aux_hidden_states.append(stack[num_blocks].clone())
+            num_blocks = self._hooked_visit(
+                i,
+                pass_idx,
+                self.intervention_sites[visit],
+                stack,
+                num_blocks,
+                positions,
+                tau,
+                bank if looped else None,
+            )
+        out = self._mix(
+            stack[:num_blocks], stack[num_blocks], self.attn_res.output_query, self.norm
+        )[0]
+        if self.aux_hidden_state_layers:
+            return out, [*aux_hidden_states, out]
+        return out
+
+    def _visit_attn_inputs(
+        self,
+        i: int,
+        layer: Inkling2DecoderLayer,
+        stack: torch.Tensor,
+        num_blocks: int,
+        bank: torch.Tensor | None,
+    ) -> tuple[Sequence[torch.Tensor], torch.Tensor | None]:
+        if bank is None:
+            return super()._visit_attn_inputs(i, layer, stack, num_blocks, bank)
+        assert isinstance(layer, Inkling2LoopDecoderLayer)
+        # All four streams' messages (a mix of the bank's two blocks), blended
+        # into the fp32 attention-input mixes of this pass's state.
+        messages = attn_res(
+            bank[:1],
+            bank[1],
+            None,
+            self.message_queries[i - self.loop_core.start],
+            None,
+            0.0,
+            True,
+        )
+        dests = attn_res(
+            stack[:num_blocks],
+            stack[num_blocks],
+            None,
+            self.attn_res.attn_queries[i - 1],
+            None,
+            0.0,
+            True,
+        )
+        norm = layer.attn_norm
+        norm_weight = norm.weight
+        if layer.is_local:
+            dests = dests.expand(3, -1, -1)
+            norm_weight = norm_weight.expand(3, -1)
+        inputs = layer.blend(slice(0, 3), dests, messages[:3], norm_weight, norm.eps)
+        return inputs, messages
 
 
 class Inkling2LoopForConditionalGeneration(Inkling2ForConditionalGeneration):
