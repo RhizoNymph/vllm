@@ -66,6 +66,7 @@ from vllm.inputs import MultiModalHashes
 from vllm.model_executor.layers.dash_attention import DASHAttention
 from vllm.model_executor.layers.fused_moe import RoutedScaleMode
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.steering import share_steering_index_across_layers
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_v2 import (
@@ -75,6 +76,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2Model,
     DeepseekV2MoE,
 )
+from vllm.models.common.interventions import register_layer_steering_buffers
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.inputs import MultiModalKwargsItems
@@ -303,6 +305,9 @@ class UnlimitedOCR2DecoderLayer(DeepseekV2DecoderLayer):
         quant_config = vllm_config.quant_config
         self.hidden_size = config.hidden_size
         self.layer_idx = int(prefix.split(".")[-1])
+        # nn.Module.__init__ above skips DeepseekV2DecoderLayer's registration;
+        # the inherited forward emits pre_attn / post_attn / post_block.
+        register_layer_steering_buffers(self, vllm_config, self.hidden_size)
         self.use_mha = True
         is_moe_layer = (
             config.n_routed_experts is not None
@@ -369,6 +374,7 @@ class UnlimitedOCR2Model(DeepseekV2Model):
             lambda prefix: UnlimitedOCR2DecoderLayer(vllm_config, prefix),
             prefix=f"{prefix}.layers",
         )
+        share_steering_index_across_layers(self.layers)
         self.fused_shared_expert_layers = get_fused_shared_expert_layers(
             self,
             DeepseekV2MoE,
