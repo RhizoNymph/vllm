@@ -47,7 +47,9 @@ request.neuron_clamps (pydantic NeuronClampSpec, HTTP 400 on schema errors)
        steering enabled, supported architecture, layer/neuron range,
        per-layer per-phase count <= max_neuron_clamps_per_layer
   -> Request.{prefill,decode}_steering_config_hash
-       scheduler admission against max_steering_configs (unchanged)
+       scheduler admission against max_steering_configs: a phase with
+       neuron clamps reserves its additive row
+       (Scheduler._request_uses_additive_steering), clamp-only included
        prefix-cache extra keys use the prefill hash (unchanged)
   -> worker: SteeringModelRunnerMixin._register_request_phase_config
        registers (hash, phase) when it has vectors, directional clamps OR

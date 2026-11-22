@@ -3170,9 +3170,12 @@ class SteeringModelRunnerMixin:
                             clamp_buf.zero_()
                 # Neuron-clamp tables are only written by populate (which
                 # does not run here): disable any layer still flagged.
-                self._steering_manager.clear_neuron_clamp_flags(
-                    self._steerable_layers_cache
+                # Duck-typed test managers may not implement it.
+                clear_neuron = getattr(
+                    self._steering_manager, "clear_neuron_clamp_flags", None
                 )
+                if clear_neuron is not None:
+                    clear_neuron(self._steerable_layers_cache)
                 self._steering_index_dirty = False
             # Nothing dynamic is active; revert any request still reported as
             # dynamically steered back to its admitted decode key.
