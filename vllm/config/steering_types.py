@@ -21,12 +21,14 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import Counter
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 import msgspec
 import numpy as np
 
 from vllm.config.loop_layers import expand_layer_key, expand_layer_map
+from vllm.config.neuron_clamp_types import NeuronClamp, encode_clamps_for_hash
 
 if TYPE_CHECKING:
     from vllm.config.steering_geometry import SteeringSiteGeometry
@@ -1391,12 +1393,20 @@ def hash_steering_config(
     sae_clamp_specs: tuple[Any, ...] | None = None,
     sae_full_reconstruction_specs: tuple[Any, ...] | None = None,
     clamps: SteeringClamps | dict | None = None,
+    neuron_clamps: Sequence[NeuronClamp] | None = None,
 ) -> int:
     """Deterministic SHA-256 hash of pre-resolved steering vectors.
 
     Returns 0 if *effective_vectors*, *module_ref*, *sae_clamp_specs*,
-    and *sae_full_reconstruction_specs* are all ``None`` or empty.  The
-    hash is masked to fit in ``np.int64``.
+    *sae_full_reconstruction_specs*, *clamps* and *neuron_clamps* are all
+    ``None`` or empty.  The hash is masked to fit in ``np.int64``.
+
+    *neuron_clamps* are the phase-effective MLP neuron clamps (see
+    :mod:`vllm.config.neuron_clamp_types`). They are part of the phase
+    identity: a clamp-only request gets a nonzero hash (and therefore a
+    steering-table row and a distinct prefix-cache key for prefill), and
+    vectors + clamps hash as one config. When no clamps are given the
+    digest is bit-for-bit what it was before clamps existed.
 
     *module_ref* is an optional ``(name, scale)`` reference to a
     worker-side named steering module.  When set, the reference is
@@ -1441,6 +1451,7 @@ def hash_steering_config(
         and clamp_spec is None
         and not sae_clamp_specs
         and not sae_full_reconstruction_specs
+        and not neuron_clamps
     ):
         return 0
     h = hashlib.sha256()
@@ -1516,6 +1527,11 @@ def hash_steering_config(
                     h.update(np.float64(lo[i]).tobytes())
                     h.update(np.float64(hi[i]).tobytes())
                     h.update(np.float64(strength[i]).tobytes())
+    if neuron_clamps:
+        # Domain-separated like ``module_ref`` so a clamp segment can never
+        # collide with vector bytes or a module reference.
+        h.update(b"\x00neuron_clamps\x00")
+        h.update(encode_clamps_for_hash(neuron_clamps))
     return int(h.hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
 

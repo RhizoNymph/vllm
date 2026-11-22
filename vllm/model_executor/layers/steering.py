@@ -504,8 +504,13 @@ def share_steering_index_across_layers(layers: list[nn.Module]) -> None:
             continue
         if shared_index is None:
             shared_index = layer.steering_index
-            continue
-        layer.steering_index = shared_index
+        else:
+            layer.steering_index = shared_index
+        # A clamp-capable MLP (see ``neuron_clamp.py``) reads the same
+        # per-token row index; keep it pointing at the shared tensor.
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None and hasattr(mlp, "steering_index"):
+            mlp.steering_index = shared_index
 
 
 def share_steering_token_scales_across_layers(layers) -> None:

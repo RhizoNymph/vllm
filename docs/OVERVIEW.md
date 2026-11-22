@@ -97,6 +97,20 @@ Features Index:
       ["SamplingParams.steering_vectors", "SamplingParams.steering_clamps", "--enable-steering"]
     depends_on: [activation_capture]
     doc: docs/features/steering.md
+  neuron_clamps:
+    description: >
+      Per-request set / add / scale of single MLP neurons (the SiLU-gated
+      down_proj input) per phase, on native Qwen3 decoders. Clamps are part of
+      the request's steering config and physical-row hash; per-layer
+      (rows, K) tables on each Qwen3MLP are read through the shared
+      steering_index by the apply_neuron_clamp op (Triton on CUDA).
+    entry_points:
+      - SamplingParams.neuron_clamps
+      - --max-neuron-clamps-per-layer
+      - vllm/model_executor/layers/neuron_clamp.py (apply_mlp_neuron_clamp)
+      - vllm/v1/worker/steering_manager.py (_populate_neuron_clamp_tables)
+    depends_on: [activation_steering]
+    doc: docs/design/neuron_clamp.md
   transformers_backend_interventions:
     description: >
       Gives decoder layers built by the Transformers modeling backend the

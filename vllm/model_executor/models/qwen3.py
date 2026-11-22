@@ -48,6 +48,11 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.neuron_clamp import (
+    apply_mlp_neuron_clamp,
+    get_neuron_clamp_buffer_config,
+    register_decoder_mlp_neuron_clamp,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.steering import (
@@ -139,6 +144,9 @@ class Qwen3MLP(nn.Module):
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        # Per-request neuron clamps on the down_proj input (no-op trace when
+        # the decoder layer registered no clamp tables).
+        x = apply_mlp_neuron_clamp(self, x)
         x, _ = self.down_proj(x)
         return x
 
@@ -272,6 +280,7 @@ class Qwen3DecoderLayer(nn.Module):
         max_steering_tokens: int = 1,
         max_steering_configs: int = 0,
         steering_dtype: torch.dtype | None = None,
+        max_neuron_clamps: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -317,6 +326,11 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+        )
+        register_decoder_mlp_neuron_clamp(
+            self,
+            max_steering_configs=max_steering_configs,
+            max_clamps_per_layer=max_neuron_clamps,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -430,6 +444,7 @@ class Qwen3Model(nn.Module, EagleModelMixin):
                     max_steering_tokens=max_steering_tokens,
                     max_steering_configs=max_steering_configs,
                     steering_dtype=steering_dtype,
+                    max_neuron_clamps=get_neuron_clamp_buffer_config(vllm_config),
                 )
             ),
             prefix=f"{prefix}.layers",

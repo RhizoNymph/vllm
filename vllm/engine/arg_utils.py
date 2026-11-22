@@ -836,6 +836,7 @@ class EngineArgs:
     sae_spare_slot_sites: list[str] = get_field(SteeringConfig, "sae_spare_slot_sites")
     sae_spare_slots_per_site: int = SteeringConfig.sae_spare_slots_per_site
     sae_spare_slot_features: int = SteeringConfig.sae_spare_slot_features
+    max_neuron_clamps_per_layer: int = SteeringConfig.max_neuron_clamps_per_layer
     # Startup steering modules (``name=path`` entries).  CLI parsing is
     # owned by the frontend (``--steering-modules`` in
     # vllm/entrypoints/openai/cli_args.py, which also loads the weights
@@ -1992,6 +1993,10 @@ class EngineArgs:
             "--sae-spare-slot-features",
             **steering_kwargs["sae_spare_slot_features"],
         )
+        steering_group.add_argument(
+            "--max-neuron-clamps-per-layer",
+            **steering_kwargs["max_neuron_clamps_per_layer"],
+        )
 
         # Patching related configs
         patch_kwargs = get_kwargs(PatchConfig)
@@ -3030,6 +3035,7 @@ class EngineArgs:
                 sae_spare_slot_sites=self.sae_spare_slot_sites,
                 sae_spare_slots_per_site=self.sae_spare_slots_per_site,
                 sae_spare_slot_features=self.sae_spare_slot_features,
+                max_neuron_clamps_per_layer=self.max_neuron_clamps_per_layer,
             )
             if self.enable_steering
             else None

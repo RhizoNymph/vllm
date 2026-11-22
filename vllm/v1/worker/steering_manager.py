@@ -48,6 +48,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from vllm.config.neuron_clamp_types import NeuronClamp, global_to_local_neuron
 from vllm.config.steering_types import (
     SteeringClamps,
     _clamp_unit_rows,
@@ -59,6 +60,15 @@ from vllm.model_executor.layers.clamp import (
     CLAMP_BOUNDS_ATTR,
     CLAMP_DIRS_ATTR,
     CLAMP_STRENGTH_ATTR,
+)
+from vllm.model_executor.layers.neuron_clamp import (
+    NEURON_CLAMP_ADD_ATTR,
+    NEURON_CLAMP_ANY_ACTIVE_ATTR,
+    NEURON_CLAMP_INDEX_ATTR,
+    NEURON_CLAMP_LOCAL_SIZE_ATTR,
+    NEURON_CLAMP_MUL_ATTR,
+    NEURON_CLAMP_TP_RANK_ATTR,
+    get_neuron_clamp_module,
 )
 from vllm.model_executor.layers.steering import (
     _ROW_MONITOR_DEFAULT_PARAMS,
@@ -190,6 +200,17 @@ class SteeringManager:
         self.config_vectors: dict[
             tuple[int, str], dict[str, dict[int, torch.Tensor]]
         ] = {}
+        # (config_hash, phase) -> phase-effective MLP neuron clamps (global
+        # neuron indices; mapped to TP-local slots at populate time). Only
+        # configs that carry clamps have an entry. Part of the row's
+        # identity: the clamps are folded into ``config_hash`` and into the
+        # additive row hash, so configs aliasing one physical row carry
+        # identical clamps (each live alias keeps its own entry).
+        self.config_neuron_clamps: dict[tuple[int, str], tuple[NeuronClamp, ...]] = {}
+        # Layers whose clamp tables currently hold entries (flag set). Lets
+        # populate clear exactly the layers that went from clamped to
+        # unclamped without touching the other ~all layers.
+        self._clamp_layers_written: set[int] = set()
         # (config_hash, phase) -> number of active requests using this config
         self.config_refcounts: dict[tuple[int, str], int] = defaultdict(int)
         # SAE clamp state is folded into the *logical* request hash
@@ -511,6 +532,7 @@ class SteeringManager:
         content_hash: int | None = None,
         locally_owned_layers: frozenset[int] | None = None,
         clamps: SteeringClamps | dict | None = None,
+        neuron_clamps: tuple[NeuronClamp, ...] | None = None,
     ) -> int:
         """Register a steering config, return its table row index.
 
@@ -545,6 +567,10 @@ class SteeringManager:
                 tensors like ``vectors``; the clamp content is already
                 part of ``config_hash``, so a refcount hit implies
                 identical clamps.
+            neuron_clamps: Phase-effective MLP neuron clamps carried by
+                this config (already folded into ``config_hash``). A
+                clamp-only config passes empty ``vectors``; it still gets a
+                row so its tokens can be routed to the clamp tables.
 
         If the ``(config_hash, phase)`` pair is already registered,
         increments refcount and returns the existing row. Otherwise
@@ -578,7 +604,7 @@ class SteeringManager:
         if content_hash is not None:
             row_hash = content_hash
         elif phase == "prefill":
-            row_hash = hash_steering_config(vectors)
+            row_hash = hash_steering_config(vectors, neuron_clamps=neuron_clamps)
         else:
             row_hash = config_hash
         content_key = (row_hash, phase)
@@ -599,6 +625,8 @@ class SteeringManager:
             self.config_to_row[key] = row
             self.config_vectors[key] = self._content_vectors[content_key]
             self.config_refcounts[key] = 1
+            if neuron_clamps:
+                self.config_neuron_clamps[key] = tuple(neuron_clamps)
             self._config_to_content[key] = content_key
             self._content_refcounts[content_key] += 1
             self._dirty.mark_membership()
@@ -640,6 +668,8 @@ class SteeringManager:
         # content). (Refcount-hit path doesn't mark dirty because the row's
         # contents are already in the table.)
         self._dirty.mark_membership()
+        if neuron_clamps:
+            self.config_neuron_clamps[key] = tuple(neuron_clamps)
         return row
 
     def _store_vectors(
@@ -923,6 +953,7 @@ class SteeringManager:
             self.config_to_row.pop(key)
             self.config_vectors.pop(key, None)
             self.config_clamps.pop(key, None)
+            self.config_neuron_clamps.pop(key, None)
             del self.config_refcounts[key]
             self._config_to_content.pop(key, None)
             # Last live registration of this logical hash released: drop its
@@ -2368,12 +2399,113 @@ class SteeringManager:
             )
             scales_written.add(id(scales_buf))
 
+        self._populate_neuron_clamp_tables(steerable_layers, ordered_configs)
+
         # All per-layer table buffers now reflect current state. Subsequent
         # calls can be skipped by the caller until a mutator sets dirty again.
         # A full populate writes scales alongside the tables, so it clears
         # every dirty flag (membership was cleared in the indices-rebuild block
         # above; clearing it again is a no-op).
         self._dirty.clear_after_full_populate()
+
+    # ------------------------------------------------------------------
+    # MLP neuron clamps (docs/design/neuron_clamp.md)
+    # ------------------------------------------------------------------
+
+    @property
+    def has_neuron_clamps(self) -> bool:
+        """True if any registered config carries neuron clamps."""
+        return bool(self.config_neuron_clamps)
+
+    def _populate_neuron_clamp_tables(
+        self,
+        steerable_layers: dict[int, "torch.nn.Module"],
+        ordered_configs: list[tuple[tuple[int, str], int]],
+    ) -> None:
+        """Write per-layer clamp tables for every registered config row.
+
+        Row ``r`` of layer ``L``'s tables holds the clamps of the config
+        assigned to row ``r`` that target ``L`` and whose neuron this TP
+        rank owns (``global_to_local_neuron``). Rows 0/1/2 and
+        dynamic-override rows never carry clamps. Only layers that have or
+        had entries are rewritten; the per-layer ``any_active`` flag is set
+        iff the layer has at least one entry on this rank.
+
+        Rank-local by construction: every rank sees the same
+        ``ordered_configs`` (determinism contract) and fills only the slots
+        it owns, so row ids stay aligned while each shard clamps exactly
+        its own neurons. Layers not owned by this PP stage are skipped.
+        """
+        per_layer: dict[int, list[tuple[int, NeuronClamp]]] = defaultdict(list)
+        # Aliased configs share a physical row and carry identical clamps:
+        # write each row once, or ``add`` / ``scale`` clamps would stack.
+        seen_rows: set[int] = set()
+        for key, row in ordered_configs:
+            clamps = self.config_neuron_clamps.get(key)
+            if not clamps or row in seen_rows:
+                continue
+            seen_rows.add(row)
+            for clamp in clamps:
+                per_layer[clamp.layer].append((row, clamp))
+        if not per_layer and not self._clamp_layers_written:
+            return
+
+        written: set[int] = set()
+        for layer_idx in set(per_layer) | self._clamp_layers_written:
+            layer = steerable_layers.get(layer_idx)
+            mlp = get_neuron_clamp_module(layer) if layer is not None else None
+            if mlp is None:
+                continue
+            index_buf: torch.Tensor = getattr(mlp, NEURON_CLAMP_INDEX_ATTR)
+            num_rows, width = index_buf.shape
+            tp_rank = int(getattr(mlp, NEURON_CLAMP_TP_RANK_ATTR))
+            local_size = int(getattr(mlp, NEURON_CLAMP_LOCAL_SIZE_ATTR))
+            index_cpu = torch.full((num_rows, width), -1, dtype=torch.int32)
+            mul_cpu = torch.ones(num_rows, width, dtype=torch.float32)
+            add_cpu = torch.zeros(num_rows, width, dtype=torch.float32)
+            used: dict[int, int] = defaultdict(int)
+            for row, clamp in per_layer.get(layer_idx, ()):
+                local = global_to_local_neuron(
+                    clamp.neuron, tp_rank=tp_rank, local_size=local_size
+                )
+                if local is None:
+                    continue
+                slot = used[row]
+                if slot >= width:
+                    raise RuntimeError(
+                        f"neuron clamp table overflow on layer {layer_idx} "
+                        f"row {row}: more than {width} clamps; the input "
+                        "processor must enforce --max-neuron-clamps-per-layer"
+                    )
+                used[row] = slot + 1
+                mul, add = clamp.affine()
+                index_cpu[row, slot] = local
+                mul_cpu[row, slot] = mul
+                add_cpu[row, slot] = add
+            index_buf.copy_(index_cpu)
+            getattr(mlp, NEURON_CLAMP_MUL_ATTR).copy_(mul_cpu)
+            getattr(mlp, NEURON_CLAMP_ADD_ATTR).copy_(add_cpu)
+            active = bool(used)
+            getattr(mlp, NEURON_CLAMP_ANY_ACTIVE_ATTR).fill_(active)
+            if active:
+                written.add(layer_idx)
+        self._clamp_layers_written = written
+
+    def clear_neuron_clamp_flags(
+        self, steerable_layers: dict[int, "torch.nn.Module"]
+    ) -> None:
+        """Disable every clamp table that currently holds entries.
+
+        Used on the runner's nothing-active transition (no populate runs
+        there). Stale table contents are harmless once the flag is clear;
+        the next populate rewrites any layer that gains entries.
+        """
+        for layer_idx in self._clamp_layers_written:
+            layer = steerable_layers.get(layer_idx)
+            mlp = get_neuron_clamp_module(layer) if layer is not None else None
+            if mlp is not None:
+                getattr(mlp, NEURON_CLAMP_ANY_ACTIVE_ATTR).fill_(False)
+        self._clamp_layers_written = set()
 
     @property
     def num_active_configs(self) -> int:

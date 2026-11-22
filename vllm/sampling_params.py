@@ -17,6 +17,11 @@ from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
+from vllm.config.neuron_clamp_types import (
+    NeuronClamp,
+    coerce_neuron_clamps,
+    effective_clamps_for_phase,
+)
 from vllm.config.sae_steering_types import (
     SAEClampSpec,
     SAEFullReconstructionSpec,
@@ -677,6 +682,22 @@ class SamplingParams(
     requests on a build without SAE support, preserving prefix-cache
     reuse."""
 
+    neuron_clamps: list[dict[str, Any]] | None = None
+    """Per-request MLP neuron clamps: a list of
+    ``{"layer": int, "neuron": int, "mode": "set"|"add"|"scale",
+    "value": float, "phase": "both"|"prefill"|"decode"}`` (``phase``
+    defaults to ``"both"``). Each clamp overrides one coordinate of the
+    SiLU-gated MLP intermediate activation (the input of ``down_proj``) at
+    one decoder layer. Zero ablation is ``set 0``; mean ablation is
+    ``set <mean>``. :class:`~vllm.config.neuron_clamp_types.NeuronClamp`
+    instances are accepted too and normalized to the dict wire form.
+
+    Clamps are folded into the phase-effective steering config hash, so
+    a request with clamps (with or without steering vectors) uses one
+    steering-table row per phase and prefill clamps are part of the
+    prefix-cache key. Requires ``--enable-steering``. See
+    docs/features/steering.md "Neuron clamps"."""
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -749,6 +770,7 @@ class SamplingParams(
         routed_experts_prompt_start: int = 0,
         # Debugging / RL-specific parameters.
         trace_decode_token_ids: list[int] | None = None,
+        neuron_clamps: list[dict[str, Any]] | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Fast path uses a dict comprehension; on failure we iterate once
@@ -830,6 +852,7 @@ class SamplingParams(
             decode_steering_clamps=decode_steering_clamps,
             routed_experts_prompt_start=routed_experts_prompt_start,
             trace_decode_token_ids=trace_decode_token_ids,
+            neuron_clamps=neuron_clamps,
         )
 
     def __post_init__(self) -> None:
@@ -1243,6 +1266,39 @@ class SamplingParams(
             )
 
         self._validate_steering_vectors()
+        self._validate_neuron_clamps()
+
+    def _validate_neuron_clamps(self) -> None:
+        """Structurally validate ``neuron_clamps`` and normalize to dicts.
+
+        Raises :class:`~vllm.config.neuron_clamp_types.\
+NeuronClampValidationError` (a ``ValueError``; HTTP 400) on malformed
+        entries or overlapping duplicates. Model-dependent range checks run
+        in the input processor. An empty list is normalized to ``None`` so
+        it hashes like "no clamps".
+        """
+        clamps = coerce_neuron_clamps(self.neuron_clamps)
+        self.neuron_clamps = None if clamps is None else [c.to_dict() for c in clamps]
+        self.__dict__["parsed_neuron_clamps"] = clamps
+
+    @cached_property
+    def parsed_neuron_clamps(self) -> tuple[NeuronClamp, ...] | None:
+        """Validated :class:`NeuronClamp` view of ``neuron_clamps``.
+
+        Recomputed lazily after an IPC round-trip (``cached_property``
+        values live in ``__dict__``, which msgspec does not serialize).
+        """
+        return coerce_neuron_clamps(self.neuron_clamps)
+
+    @cached_property
+    def effective_prefill_neuron_clamps(self) -> tuple[NeuronClamp, ...] | None:
+        """Clamps active during prefill (``both`` + ``prefill``)."""
+        return effective_clamps_for_phase(self.parsed_neuron_clamps, "prefill")
+
+    @cached_property
+    def effective_decode_neuron_clamps(self) -> tuple[NeuronClamp, ...] | None:
+        """Clamps active during decode (``both`` + ``decode``)."""
+        return effective_clamps_for_phase(self.parsed_neuron_clamps, "decode")
 
     def _verify_extra_args(self) -> None:
         # JSON accepts arbitrary integers, but the engine's MessagePack
@@ -1691,6 +1747,7 @@ class SamplingParams(
             sae_full_reconstruction_specs=(
                 self._phase_filtered_sae_full_recon_specs("prefill")
             ),
+            neuron_clamps=self.effective_prefill_neuron_clamps,
         )
 
     @cached_property
@@ -1706,6 +1763,7 @@ class SamplingParams(
             sae_full_reconstruction_specs=(
                 self._phase_filtered_sae_full_recon_specs("decode")
             ),
+            neuron_clamps=self.effective_decode_neuron_clamps,
         )
 
     @cached_property
@@ -1722,6 +1780,7 @@ class SamplingParams(
             self.effective_prefill_steering,
             module_ref=self.steering_module_ref,
             clamps=self.effective_prefill_clamps,
+            neuron_clamps=self.effective_prefill_neuron_clamps,
         )
 
     @cached_property
@@ -1735,6 +1794,7 @@ class SamplingParams(
             self.effective_decode_steering,
             module_ref=self.steering_module_ref,
             clamps=self.effective_decode_clamps,
+            neuron_clamps=self.effective_decode_neuron_clamps,
         )
 
     @cached_property
@@ -1957,6 +2017,9 @@ class SamplingParams(
             "effective_decode_steering",
             "effective_prefill_clamps",
             "effective_decode_clamps",
+            "parsed_neuron_clamps",
+            "effective_prefill_neuron_clamps",
+            "effective_decode_neuron_clamps",
         ):
             if key in self.__dict__:
                 new_sp.__dict__[key] = self.__dict__[key]

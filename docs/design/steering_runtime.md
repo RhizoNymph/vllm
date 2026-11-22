@@ -40,6 +40,10 @@ prefill token -> global_prefill_effective + request_prefill_effective
 decode token  -> global_decode_effective  + request_decode_effective
 ```
 
+A phase-effective config may also carry per-request MLP neuron clamps,
+which are folded into the same phase hash and table row; see
+[Neuron Clamp Design](neuron_clamp.md).
+
 ## Main Components
 
 ### `SamplingParams`

@@ -1057,6 +1057,70 @@ response = client.chat.completions.create(
 
 In this example, the effective base vectors are `creativity.vectors + inline steering_vectors` (additive per hook/layer).
 
+## Neuron Clamps
+
+A request can also override individual MLP neurons: coordinates of the
+SiLU-gated MLP activation `silu(gate) * up` that feeds `down_proj`, at
+chosen decoder layers. This gives exact zero and mean ablations, and
+composes with steering vectors in the same request.
+
+Each entry in `neuron_clamps` is:
+
+| Field    | Type                                  | Meaning |
+|----------|---------------------------------------|---------|
+| `layer`  | int                                   | decoder layer index |
+| `neuron` | int                                   | global MLP intermediate index (`< intermediate_size`) |
+| `mode`   | `"set"` \| `"add"` \| `"scale"`       | replace with `value`, add `value`, or multiply by `value` |
+| `value`  | finite float                          | the clamp operand |
+| `phase`  | `"both"` (default) \| `"prefill"` \| `"decode"` | when the clamp applies |
+
+Zero ablation is `{"mode": "set", "value": 0}`; mean ablation is
+`{"mode": "set", "value": <mean>}`.
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-8b",
+    "messages": [{"role": "user", "content": "Who created the universe?"}],
+    "max_tokens": 64,
+    "neuron_clamps": [
+      {"layer": 9,  "neuron": 3757, "mode": "set", "value": 0.0},
+      {"layer": 8,  "neuron": 1931, "mode": "set", "value": 0.0, "phase": "decode"},
+      {"layer": 18, "neuron": 7807, "mode": "scale", "value": 0.5}
+    ]
+  }'
+```
+
+With the Python client, pass the field through `extra_body`. Offline:
+`SamplingParams(neuron_clamps=[{"layer": 9, "neuron": 3757, "mode": "set",
+"value": 0.0}])`.
+
+Semantics:
+
+- Clamps are part of the request's per-phase steering config. They are
+  folded into the prefill/decode steering hash, so vectors + clamps (or
+  clamps alone) take **one** steering-table row per phase and count once
+  against `--max-steering-configs`.
+- Prefill clamps (`both` or `prefill`) change the prompt KV and are part of
+  the prefix-cache key; decode-only clamps leave prompt KV shareable.
+- `set` writes the value exactly; `add`/`scale` are computed in fp32 and
+  rounded once to the model dtype.
+- Under tensor parallelism the global neuron index is mapped to the rank
+  that owns it (`down_proj` is row-parallel); other ranks do nothing.
+
+Validation (HTTP 400 on failure): malformed entries, two clamps on the same
+`(layer, neuron)` with overlapping phases, `layer >= num_hidden_layers`,
+`neuron >= intermediate_size`, more than `--max-neuron-clamps-per-layer`
+clamps (default 16) on one layer in one phase, steering not enabled, or a
+model whose MLP is not wired.
+
+Supported models: `Qwen3ForCausalLM` (the `Qwen3MLP` forward).
+`Qwen2ForCausalLM` now runs on the Transformers backend and is rejected. `--max-neuron-clamps-per-layer 0` disables clamps and
+removes the op from the forward. Requests with decode clamps reject dynamic
+per-request overrides (dynamic-override rows carry vectors only). See
+[Neuron Clamp Design](../design/neuron_clamp.md).
+
 ## Runtime Semantics
 
 The main operational rules are:
@@ -1114,6 +1178,8 @@ as long as the model has been wired correctly.
   them on any shared deployment
 - Per-request steering requires `--enable-steering`
 - Distinct steering configs in flight are capped by `--max-steering-configs`
+- Neuron clamps per layer per phase are capped by
+  `--max-neuron-clamps-per-layer` (default 16, `0` disables clamps)
 
 ## Distributed Execution
 
@@ -1195,5 +1261,6 @@ semantics (add vs. lerp vs. bound) differ by design.
 - [Activation Patching](activation_patching.md)
 - [Capture Consumers](capture_consumers.md) — the tap side of the same hooks
 - [Steering + Capture on the V2 Model Runner](../design/v2_runner_steering_capture.md)
+- [Neuron Clamp Design](../design/neuron_clamp.md)
 - [Automatic Prefix Caching](automatic_prefix_caching.md)
 - [OpenAI-Compatible Server](../serving/openai_compatible_server.md)

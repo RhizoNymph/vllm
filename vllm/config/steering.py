@@ -212,6 +212,12 @@ class SteeringConfig:
     slot. A claiming module needs ``n_clamp <= sae_spare_slot_features``
     (smaller modules are zero-padded). ``0`` disables spare slots even
     when sites are listed."""
+    max_neuron_clamps_per_layer: int = Field(default=16, ge=0)
+    """Width of the per-layer MLP neuron-clamp table: the maximum number
+    of ``neuron_clamps`` one request may place on a single decoder layer in
+    one phase. Clamp tables are sized ``(steering rows, this)`` per
+    supported layer. ``0`` disables neuron clamps (no buffers, no op in the
+    MLP forward). See docs/design/neuron_clamp.md."""
 
     def compute_hash(self) -> str:
         """
@@ -256,6 +262,9 @@ class SteeringConfig:
         # Clamp direction count changes the clamp buffer shapes (and 0 vs >0
         # changes whether the clamp ops are emitted at all).
         factors.append(self.max_clamp_directions)
+        # Clamp table width is baked into compiled graphs, and 0 removes
+        # the clamp op from the MLP forward entirely.
+        factors.append(self.max_neuron_clamps_per_layer)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str

@@ -43,6 +43,11 @@ from vllm.entrypoints.openai.steering.registry import (
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
 from vllm.model_executor.layers.clamp import CLAMP_ANY_ACTIVE_ATTR
+from vllm.model_executor.layers.neuron_clamp import (
+    NEURON_CLAMP_INDEX_ATTR,
+    NEURON_CLAMP_LOCAL_SIZE_ATTR,
+    get_neuron_clamp_module,
+)
 from vllm.model_executor.layers.sae_fp8 import (
     FP8_STORAGE_DTYPE,
     dequantize_fp8_rowwise,
@@ -969,6 +974,33 @@ class SteeringModelRunnerMixin:
                         device=table_device,
                         capture_sizes=list(capture_sizes) if capture_sizes else None,
                     )
+
+            # Warm the MLP neuron-clamp kernel (emitted in every
+            # clamp-capable MLP forward) before CUDA-graph capture.
+            clamp_mlp = next(
+                (
+                    m
+                    for m in map(get_neuron_clamp_module, steerable.values())
+                    if m is not None
+                ),
+                None,
+            )
+            if clamp_mlp is not None:
+                from vllm.model_executor.layers.neuron_clamp_kernel import (
+                    warmup_neuron_clamp_kernel,
+                )
+
+                clamp_index = getattr(clamp_mlp, NEURON_CLAMP_INDEX_ATTR)
+                warmup_neuron_clamp_kernel(
+                    intermediate_size_local=int(
+                        getattr(clamp_mlp, NEURON_CLAMP_LOCAL_SIZE_ATTR)
+                    ),
+                    table_rows=int(clamp_index.shape[0]),
+                    max_clamps_per_layer=int(clamp_index.shape[1]),
+                    compute_dtype=compute_dtype,
+                    device=table_device,
+                    capture_sizes=list(capture_sizes) if capture_sizes else None,
+                )
 
         # Pre-allocate SAE buffers for the startup-declared module
         # topology (plus configured spare slots) so compiled graphs /
@@ -2634,6 +2666,18 @@ class SteeringModelRunnerMixin:
                 "request is still prefilling (overrides are decode-only; "
                 "prefill steering feeds prefix-cache keys)"
             )
+        rs = self._steering_reqs.get(req_id)
+        if (
+            rs is not None
+            and rs.sampling_params is not None
+            and getattr(rs.sampling_params, "effective_decode_neuron_clamps", None)
+        ):
+            # Dynamic-override rows carry vectors only; routing a clamped
+            # request there would silently drop its decode neuron clamps.
+            return _reject(
+                "request has decode neuron clamps (dynamic override rows "
+                "cannot carry clamps)"
+            )
 
         # Per-override clamps (optional). REPLACE semantics on update:
         # ``None`` keeps the override's previous clamps, an empty spec
@@ -3124,6 +3168,11 @@ class SteeringModelRunnerMixin:
                         clamp_buf = getattr(mod, CLAMP_ANY_ACTIVE_ATTR[hp], None)
                         if clamp_buf is not None:
                             clamp_buf.zero_()
+                # Neuron-clamp tables are only written by populate (which
+                # does not run here): disable any layer still flagged.
+                self._steering_manager.clear_neuron_clamp_flags(
+                    self._steerable_layers_cache
+                )
                 self._steering_index_dirty = False
             # Nothing dynamic is active; revert any request still reported as
             # dynamically steered back to its admitted decode key.
@@ -3419,6 +3468,42 @@ class SteeringModelRunnerMixin:
         h = getattr(sp, f"{phase}_additive_steering_config_hash", None)
         return {} if h is None else {"content_hash": h}
 
+    def _register_request_phase_config(
+        self,
+        sp: SamplingParams,
+        config_hash: int,
+        phase: str,
+    ) -> bool:
+        """Register a request's phase-effective config; True if registered.
+
+        The phase config is the resolved steering vectors plus the
+        phase-effective directional clamps and MLP neuron clamps, all folded
+        into ``config_hash``. A config with clamps but no vectors
+        (clamp-only) still registers: the hash reserved a scheduler row, and
+        skipping here would crash ``get_row_for_config`` downstream. Only a
+        phase with none of them (or ``config_hash == 0``) is skipped.
+        """
+        mgr = self._steering_manager
+        if mgr is None or config_hash == 0:
+            return False
+        vectors = self._resolve_request_steering(sp, phase)
+        clamps = self._resolve_request_clamps(sp, phase)
+        neuron_clamps = getattr(sp, f"effective_{phase}_neuron_clamps", None)
+        if not vectors and not clamps and not neuron_clamps:
+            return False
+        # Optional kwargs only when present: clamp-free requests keep the
+        # original call shape (duck-typed test managers rely on it).
+        mgr.register_config(
+            config_hash,
+            vectors or {},
+            phase=phase,
+            locally_owned_layers=self._locally_owned_layers,
+            **self._content_hash_kwargs(sp, phase),
+            **({"clamps": clamps} if clamps else {}),
+            **({"neuron_clamps": neuron_clamps} if neuron_clamps else {}),
+        )
+        return True
+
     def _steering_add_request(self, new_req_data: "NewRequestData") -> None:
         """Track a newly admitted request and register its initial config.
 
@@ -3506,35 +3591,13 @@ class SteeringModelRunnerMixin:
             # Clamp-only configs (nonzero hash, empty effective vectors)
             # must still register: the hash reserved a scheduler row, and
             # skipping here would crash get_row_for_config downstream.
-            effective_decode = self._resolve_request_steering(sp, "decode")
-            decode_clamps = self._resolve_request_clamps(sp, "decode")
-            if decode_hash != 0 and (effective_decode or decode_clamps):
-                # ``clamps=`` only when present: clamp-free requests keep the
-                # original call shape (duck-typed test managers rely on it).
-                mgr.register_config(
-                    decode_hash,
-                    effective_decode or {},
-                    phase="decode",
-                    locally_owned_layers=self._locally_owned_layers,
-                    **self._content_hash_kwargs(sp, "decode"),
-                    **({"clamps": decode_clamps} if decode_clamps else {}),
-                )
+            if self._register_request_phase_config(sp, decode_hash, "decode"):
                 additive_registered = (decode_hash, "decode")
             rs.phase = "decode"
         else:
             # Normal: start in prefill; the decode config is registered lazily
             # at the prefill->decode boundary in _update_steering_buffers.
-            effective_prefill = self._resolve_request_steering(sp, "prefill")
-            prefill_clamps = self._resolve_request_clamps(sp, "prefill")
-            if prefill_hash != 0 and (effective_prefill or prefill_clamps):
-                mgr.register_config(
-                    prefill_hash,
-                    effective_prefill or {},
-                    phase="prefill",
-                    locally_owned_layers=self._locally_owned_layers,
-                    **self._content_hash_kwargs(sp, "prefill"),
-                    **({"clamps": prefill_clamps} if prefill_clamps else {}),
-                )
+            if self._register_request_phase_config(sp, prefill_hash, "prefill"):
                 additive_registered = (prefill_hash, "prefill")
             rs.phase = "prefill"
 
@@ -3637,20 +3700,9 @@ class SteeringModelRunnerMixin:
         )
         if rs.prefill_hash != 0:
             mgr.release_config(rs.prefill_hash, "prefill")
-        if rs.decode_hash != 0:
-            effective_decode = self._resolve_request_steering(
-                rs.sampling_params, "decode"
-            )
-            decode_clamps = self._resolve_request_clamps(rs.sampling_params, "decode")
-            if effective_decode or decode_clamps:
-                mgr.register_config(
-                    rs.decode_hash,
-                    effective_decode or {},
-                    phase="decode",
-                    locally_owned_layers=self._locally_owned_layers,
-                    **self._content_hash_kwargs(rs.sampling_params, "decode"),
-                    **({"clamps": decode_clamps} if decode_clamps else {}),
-                )
+        self._register_request_phase_config(
+            rs.sampling_params, rs.decode_hash, "decode"
+        )
         rs.phase = "decode"
 
     def _reset_steering_for_resumption(

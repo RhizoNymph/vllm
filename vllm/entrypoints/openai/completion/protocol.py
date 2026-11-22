@@ -35,6 +35,10 @@ from vllm.entrypoints.generate.base.protocol import (
     validate_structural_tag_response_format,
     validate_structured_outputs_structural_tag,
 )
+from vllm.entrypoints.openai.steering.neuron_clamp_protocol import (
+    NeuronClampSpec,
+    neuron_clamps_to_wire,
+)
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -457,6 +461,15 @@ class CompletionRequest(OpenAIBaseModel):
         "requires --enable-steering.",
     )
 
+    neuron_clamps: list[NeuronClampSpec] | None = Field(
+        default=None,
+        description="Per-request MLP neuron clamps: each entry "
+        "{layer, neuron, mode: set|add|scale, value, phase: "
+        "both|prefill|decode} overrides one coordinate of the SiLU-gated MLP "
+        "activation (down_proj input). Zero ablation is mode=set value=0. "
+        "Requires --enable-steering; composes with steering vectors.",
+    )
+
     # --8<-- [end:completion-extra-params]
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
@@ -612,6 +625,7 @@ class CompletionRequest(OpenAIBaseModel):
             steering_clamps=self.steering_clamps,
             prefill_steering_clamps=self.prefill_steering_clamps,
             decode_steering_clamps=self.decode_steering_clamps,
+            neuron_clamps=neuron_clamps_to_wire(self.neuron_clamps),
         )
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)
