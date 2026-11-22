@@ -31,19 +31,17 @@ Steering is wired into the following decoder architectures:
 - Qwen family: `qwen3`, `qwen3_moe`, `qwen3_next`, `qwen3_5`
 - Gemma family: `gemma2`, `gemma3`, `gemma3n`, `gemma4`
 - Mixtral / MoE: `mixtral`, `phimoe`, `deepseek_v2`, `glm4_moe`,
-  `glm4_moe_lite`, `exaone_moe`, `granitemoe`, `granitemoeshared`, `dots1`,
-  `ernie45_moe`, `openpangu`, `grok1`, `minimax_m2`, `minimax_text_01`,
-  `param2moe`
+  `glm4_moe_lite`, `exaone_moe`, `granitemoe`, `granitemoeshared`,
+  `ernie45_moe`, `openpangu`, `minimax_m2`, `param2moe`
 - GLM / ChatGLM: `glm4`
-- InternLM family: `internlm2`, `internlm2_ve`, `interns1_pro`,
-  `iquest_loopcoder`
+- InternLM family: `internlm2`, `interns1_pro`, `iquest_loopcoder`
 - Olmo family: `olmo_hybrid`
 - Exaone family: `exaone`, `exaone4`
 - Plamo family: `plamo3`
 - Step family: `step1`, `step3_text`, `step3p5`
 - Molmo family: `molmo`, `molmo2`
-- Falcon / Baichuan / Command: `falcon`, `baichuan`, `commandr`
-- Other: `AXK1`, `hyperclovax`, `opt`, `orion`, `persimmon`, `mimo_v2_flash`
+- Falcon / Command: `falcon`, `commandr`
+- Other: `AXK1`, `hyperclovax`, `opt`, `orion`, `mimo_v2`
 
 `llama` here means the native `vllm/model_executor/models/llama.py`, which
 still serves architectures the registry maps to it (`InternLM3ForCausalLM`,
