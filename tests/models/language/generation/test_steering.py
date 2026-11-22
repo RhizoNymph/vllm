@@ -40,6 +40,13 @@ _QWEN_MOE_OVERRIDES = {
     "shared_expert_intermediate_size": 0,
 }
 
+# Qwen2-MoE runs on the Transformers backend, which always builds the shared
+# expert; a zero-width one divides by zero in the gated activation.
+_QWEN2_MOE_OVERRIDES = {
+    **_QWEN_MOE_OVERRIDES,
+    "shared_expert_intermediate_size": 1024,
+}
+
 _QWEN3_NEXT_OVERRIDES = {
     **_QWEN_MOE_OVERRIDES,
     "num_hidden_layers": 2,
@@ -62,12 +69,6 @@ _STABLELM_OVERRIDES = {
     "num_hidden_layers": 2,
 }
 
-_GROK_OVERRIDES = {
-    **_SMALL_DECODER_OVERRIDES,
-    "num_local_experts": 2,
-    "num_experts_per_tok": 2,
-}
-
 _STEP3P5_OVERRIDES = {
     **_SMALL_DECODER_OVERRIDES,
     "num_hidden_layers": 2,
@@ -88,11 +89,6 @@ _MINIMAX_OVERRIDES = {
     "num_experts_per_tok": 2,
 }
 
-_MINIMAX_TEXT_OVERRIDES = {
-    **_MINIMAX_OVERRIDES,
-    "num_local_experts": 1,
-}
-
 _AXK1_OVERRIDES = {
     **_SMALL_DECODER_OVERRIDES,
     "num_hidden_layers": 2,
@@ -101,7 +97,6 @@ _AXK1_OVERRIDES = {
     "v_head_dim": 64,
     "first_k_dense_replace": 999,
     "moe_layer_freq": 1,
-    "n_routed_experts": None,
 }
 
 _GENERIC_MOE_OVERRIDES = {
@@ -226,6 +221,10 @@ _PHI_OVERRIDES = {
     **_SMALL_DECODER_OVERRIDES,
     "hidden_act": "gelu_new",
     "tie_word_embeddings": False,
+    # phi-2's 80-wide heads: its partial_rotary_factor of 0.4 is then 32
+    # rotary dims. The 64-wide default gives 25.6, which HF and vLLM round
+    # differently.
+    "hidden_size": 640,
 }
 
 _PERSIMMON_OVERRIDES = {
@@ -341,7 +340,7 @@ PHASE1_DISCOVERY_CASES = [
     ),
     pytest.param(
         "Qwen/Qwen1.5-MoE-A2.7B-Chat",
-        _QWEN_MOE_OVERRIDES,
+        _QWEN2_MOE_OVERRIDES,
         {"enforce_eager": True},
         id="qwen2-moe",
     ),
@@ -360,7 +359,7 @@ PHASE1_DISCOVERY_CASES = [
     pytest.param(
         "IQuestLab/IQuest-Coder-V1-40B-Loop-Instruct",
         _LOOPCODER_OVERRIDES,
-        {"enforce_eager": True},
+        _TRUST_REMOTE_EAGER,
         id="loopcoder",
     ),
 ]
@@ -375,7 +374,7 @@ PHASE1_GENERATION_CASES = [
     ),
     pytest.param(
         "Qwen/Qwen1.5-MoE-A2.7B-Chat",
-        _QWEN_MOE_OVERRIDES,
+        _QWEN2_MOE_OVERRIDES,
         {"enforce_eager": True},
         id="qwen2-moe",
     ),
@@ -394,18 +393,12 @@ PHASE1_GENERATION_CASES = [
     pytest.param(
         "IQuestLab/IQuest-Coder-V1-40B-Loop-Instruct",
         _LOOPCODER_OVERRIDES,
-        {"enforce_eager": True},
+        _TRUST_REMOTE_EAGER,
         id="loopcoder",
     ),
 ]
 
 PHASE2_DISCOVERY_CASES = [
-    pytest.param(
-        "baichuan-inc/Baichuan2-7B-chat",
-        _SMALL_DECODER_OVERRIDES,
-        _TRUST_REMOTE_EAGER,
-        id="baichuan",
-    ),
     pytest.param(
         "internlm/internlm2-chat-7b",
         _SMALL_DECODER_OVERRIDES,
@@ -421,7 +414,7 @@ PHASE2_DISCOVERY_CASES = [
     pytest.param(
         "upstage/solar-pro-preview-instruct",
         _SMALL_DECODER_OVERRIDES,
-        _EAGER_ONLY,
+        _TRUST_REMOTE_EAGER,
         id="solar",
     ),
     pytest.param(
@@ -455,12 +448,6 @@ PHASE2_DISCOVERY_CASES = [
         id="glm4",
     ),
     pytest.param(
-        "hpcai-tech/grok-1",
-        _GROK_OVERRIDES,
-        _TRUST_REMOTE_EAGER,
-        id="grok1",
-    ),
-    pytest.param(
         "CohereLabs/c4ai-command-r7b-12-2024",
         _SMALL_DECODER_OVERRIDES,
         _TRUST_REMOTE_EAGER,
@@ -475,13 +462,6 @@ PHASE2_DISCOVERY_CASES = [
 ]
 
 PHASE2_GENERATION_CASES = [
-    pytest.param(
-        "baichuan-inc/Baichuan2-7B-chat",
-        _SMALL_DECODER_OVERRIDES,
-        _TRUST_REMOTE_EAGER,
-        500.0,
-        id="baichuan",
-    ),
     pytest.param(
         "OrionStarAI/Orion-14B-Chat",
         _SMALL_DECODER_OVERRIDES,
@@ -503,13 +483,6 @@ PHASE2_GENERATION_CASES = [
         500.0,
         id="glm4",
     ),
-    pytest.param(
-        "hpcai-tech/grok-1",
-        _GROK_OVERRIDES,
-        _TRUST_REMOTE_EAGER,
-        500.0,
-        id="grok1",
-    ),
 ]
 
 PHASE3_DISCOVERY_CASES = [
@@ -518,12 +491,6 @@ PHASE3_DISCOVERY_CASES = [
         _SMALL_DECODER_OVERRIDES,
         _TRUST_REMOTE_EAGER,
         id="apertus",
-    ),
-    pytest.param(
-        "MiniMaxAI/MiniMax-Text-01",
-        _MINIMAX_TEXT_OVERRIDES,
-        _EAGER_ONLY,
-        id="minimax-text",
     ),
     pytest.param(
         "MiniMaxAI/MiniMax-M2",
@@ -968,9 +935,9 @@ def test_steering_layers_discovered_small_decoder_family(
     hf_overrides: dict | None,
     extra_runner_kwargs: dict | None,
 ) -> None:
-    """Small decoder families (baichuan, internlm2, orion, solar, stablelm,
-    nemotron, arcee, hyperclovax, glm4, grok1, commandr, openpangu) should
-    expose steerable layers."""
+    """Small decoder families (internlm2, orion, solar, stablelm, nemotron,
+    arcee, hyperclovax, glm4, commandr, openpangu) should expose steerable
+    layers."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 

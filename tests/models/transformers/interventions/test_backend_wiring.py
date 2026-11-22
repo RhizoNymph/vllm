@@ -23,6 +23,10 @@ from vllm.model_executor.models.transformers.interventions import (
     UnsupportedInterventionLayout,
 )
 
+# The module-scoped `single_rank` group must outlive each test; the global
+# per-test cleanup would tear it down after the first one.
+pytestmark = pytest.mark.skip_global_cleanup
+
 LAYERS = 3
 
 
