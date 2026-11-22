@@ -8,6 +8,7 @@ import pytest
 
 from vllm.config.sae_steering_types import SAEClampEntry, SAEClampSpec
 from vllm.config.steering import SteeringConfig
+from vllm.config.steering_geometry import SteeringSiteGeometry
 from vllm.config.steering_types import maybe_pack_inline_steering_for_request
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -18,7 +19,9 @@ def _make_processor(steering_config=None, hidden_size=3):
     ``_validate_steering`` (steering config + model hidden size)."""
     proc = MagicMock()
     proc.steering_config = steering_config
-    proc.model_config.get_hidden_size.return_value = hidden_size
+    proc.steering_site_geometry = SteeringSiteGeometry.standard(
+        hidden_size, num_hidden_layers=32
+    )
     # Bind the real method to the mock so we exercise the actual logic.
     from vllm.v1.engine.input_processor import InputProcessor
 

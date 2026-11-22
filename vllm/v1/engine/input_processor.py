@@ -3,12 +3,17 @@
 
 import time
 from collections.abc import Callable, Mapping
+from functools import cached_property
 from typing import Any, Literal
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.steering_geometry import (
+    SteeringSiteGeometry,
+    resolve_steering_site_geometry,
+)
 from vllm.config.utils import hash_factors
-from vllm.exceptions import VLLMValidationError
+from vllm.exceptions import SteeringSiteValidationError, VLLMValidationError
 from vllm.inputs import (
     EngineInput,
     PromptType,
@@ -296,6 +301,18 @@ class InputProcessor:
                 "[lora_path]` to use the LoRA tokenizer."
             )
 
+    @cached_property
+    def steering_site_geometry(self) -> SteeringSiteGeometry | None:
+        """Per-hook row widths + layer count of the model's steering sites.
+
+        Resolved once, on first use; ``None`` iff steering is disabled.
+        Every seam admitting client steering specs (this processor, the
+        AsyncLLM / LLM inline packing) validates against it.
+        """
+        if not self.steering_config:
+            return None
+        return resolve_steering_site_geometry(self.model_config)
+
     def _validate_steering(self, params: SamplingParams | PoolingParams) -> None:
         if not isinstance(params, SamplingParams):
             return
@@ -323,26 +340,27 @@ class InputProcessor:
                 "is not enabled. Start the server with --enable-steering "
                 "to use per-request steering."
             )
-        # Width gate: SamplingParams validation is model-blind, and a
+        # Site gate: SamplingParams validation is model-blind, and a
         # wrong-width row shape-crashes the worker's steering table
-        # population — reject here (frontend process, request-level error)
-        # on every path: online HTTP, offline LLM(), and the Rust frontend.
-        from vllm.config.steering_types import (
-            resolve_effective_clamps,
-            validate_spec_row_widths,
-        )
+        # population (an out-of-range layer is dropped silently) — reject
+        # here (frontend process, request-level error) on every path:
+        # online HTTP, offline LLM(), and the Rust frontend. Each hook is
+        # checked against its own width (mHC stream hooks: hc * hidden).
+        from vllm.config.steering_types import resolve_effective_clamps
 
-        expected = self.model_config.get_hidden_size()
+        geometry = self.steering_site_geometry
+        assert geometry is not None, "resolved whenever steering is enabled"
         # ``steering_types`` raises ValueError so it can double as a pydantic
         # validator; re-raise as VLLMValidationError so the entrypoints map
-        # these to 400 rather than letting them escape as a 500.
+        # these to 400 rather than letting them escape as a 500. The site
+        # gate's SteeringSiteValidationError already is one and passes as-is.
         try:
             for field_name, spec in (
                 ("steering_vectors", params.steering_vectors),
                 ("prefill_steering_vectors", params.prefill_steering_vectors),
                 ("decode_steering_vectors", params.decode_steering_vectors),
             ):
-                validate_spec_row_widths(spec, expected, field_name=field_name)
+                geometry.validate_vectors(spec, field_name=field_name)
             if has_clamps:
                 max_dirs = int(getattr(self.steering_config, "max_clamp_directions", 0))
                 if max_dirs <= 0:
@@ -355,8 +373,7 @@ class InputProcessor:
                     ("prefill_steering_clamps", params.prefill_steering_clamps),
                     ("decode_steering_clamps", params.decode_steering_clamps),
                 ):
-                    if cspec is not None:
-                        cspec.validate_row_width(expected, field_name=field_name)
+                    geometry.validate_clamps(cspec, field_name=field_name)
                 # Per-site K cap after the tier concat — reject over-budget
                 # requests here (request-level error) rather than crashing the
                 # step thread at manager materialization.
@@ -370,6 +387,8 @@ class InputProcessor:
                     params.decode_steering_clamps,
                     max_directions=max_dirs,
                 )
+        except SteeringSiteValidationError:
+            raise
         except ValueError as exc:
             raise VLLMValidationError(str(exc)) from exc
 

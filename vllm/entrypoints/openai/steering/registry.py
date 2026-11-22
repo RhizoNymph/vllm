@@ -28,6 +28,7 @@ from vllm.config.sae_steering_types import (
     coerce_sae_full_reconstruction_specs,
     validate_sae_storage_dtype,
 )
+from vllm.config.steering_geometry import SteeringSiteGeometry
 from vllm.config.steering_types import (
     SteeringClamps,
     SteeringVectorSpec,
@@ -39,7 +40,6 @@ from vllm.config.steering_types import (
     resolve_effective_clamps,
     resolve_effective_vectors,
     scale_steering_spec,
-    validate_spec_row_widths,
     validate_steering_index,
 )
 from vllm.logger import init_logger
@@ -130,16 +130,18 @@ class SteeringModuleRegistry:
     def __init__(
         self,
         valid_layer_indices: set[int] | None = None,
-        expected_row_width: int | None = None,
+        site_geometry: SteeringSiteGeometry | None = None,
     ) -> None:
         self._modules: dict[str, SteeringModule] = {}
         self._lock = asyncio.Lock()
         self._valid_layer_indices = valid_layer_indices
-        # Steering row width (== model hidden size). When set, registration
-        # rejects wrong-width vectors — such rows otherwise broadcast to
+        # The model's steering sites (per-hook row width, layer count). When
+        # set, registration rejects hooks the model does not steer, rows
+        # not as wide as their hook (mHC stream hooks are hc * hidden), and
+        # out-of-range layers — wrong-width rows otherwise broadcast to
         # workers, pre-materialize into the steering row table, and
         # shape-crash the engine at the next table population.
-        self._expected_row_width = expected_row_width
+        self._site_geometry = site_geometry
 
     async def register(
         self,
@@ -232,11 +234,9 @@ class SteeringModuleRegistry:
                                 layer_idx=layer_idx,
                                 entry=entry,
                             )
-                    if self._expected_row_width is not None:
-                        validate_spec_row_widths(
-                            spec,
-                            self._expected_row_width,
-                            field_name=f"module {name!r} {tier_name}",
+                    if self._site_geometry is not None:
+                        self._site_geometry.validate_vectors(
+                            spec, field_name=f"module {name!r} {tier_name}"
                         )
 
             # Validate clamp tiers: hook points, layer indices and direction
@@ -258,10 +258,9 @@ class SteeringModuleRegistry:
                 for table in cspec.hooks.values():
                     for layer_idx in table.site_counts():
                         self._validate_layer_index(name=name, layer_idx=layer_idx)
-                if self._expected_row_width is not None:
-                    cspec.validate_row_width(
-                        self._expected_row_width,
-                        field_name=f"module {name!r} {tier_name}",
+                if self._site_geometry is not None:
+                    self._site_geometry.validate_clamps(
+                        cspec, field_name=f"module {name!r} {tier_name}"
                     )
 
             module = SteeringModule(

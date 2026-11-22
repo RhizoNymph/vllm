@@ -510,6 +510,11 @@ params = SamplingParams(
 `mhc_streams_final` is a model-level hook: it is keyed to the last decoder
 layer index, so request it on that layer.
 
+Per-request and named-module rows are width-checked per hook (see
+[Request Validation](#request-validation)), so a stream-hook row must be
+`hc_mult * hidden` wide and a single-stream row `hidden` wide on the same
+request.
+
 ## Hyper-Connection Steering (Qwen4Exp)
 
 Qwen4Exp (Qwen3.8-Flash-Next) carries `hc_count` hyper-connection streams of
@@ -883,6 +888,26 @@ packed shape for phase-specific additions.
 
 See [`examples/online_serving/openai_steering_client.py`](../../examples/online_serving/openai_steering_client.py)
 for a runnable end-to-end client.
+
+### Request Validation
+
+Per-request vectors and clamps (and named-module tiers) are checked against
+the served model before admission:
+
+- the hook must be one the model steers (`mhc_*` stream hooks only on
+  hyper-connection models; no `post_block` on DeepSeek-V4);
+- each row must be as wide as **its hook** — `hidden_size` for the
+  single-stream hooks, `hc_mult * hidden_size` for the multi-stream hooks
+  (so a packed stream-hook blob is `(num_layers, hc_mult * hidden_size)`);
+- each layer index must be below `num_hidden_layers` (for a looped model's
+  `"layer@pass"` key, the layer part).
+
+A violation is answered with HTTP 400 naming the field, hook, layer and
+widths, e.g. `steering_vectors['pre_attn'][0]: vector width 100 != expected
+steering row width 2560 for hook 'pre_attn'` or `steering_vectors['pre_attn']
+[48]: layer index 48 out of range for num_hidden_layers=48`. See
+[Steering Site Validation](steering_site_validation.md) for the seams and
+types.
 
 ## Named Steering Modules
 

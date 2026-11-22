@@ -98,14 +98,15 @@ async def init_app_state(
 
     if getattr(args, "enable_steering", False):
         # Initialize steering module registry for named steering vectors.
+        from vllm.config.steering_geometry import resolve_steering_site_geometry
         from vllm.entrypoints.openai.steering.registry import (
             SteeringModuleRegistry,
         )
 
         steering_model_config = getattr(vllm_config, "model_config", None)
         steering_registry = SteeringModuleRegistry(
-            expected_row_width=(
-                steering_model_config.get_hidden_size()
+            site_geometry=(
+                resolve_steering_site_geometry(steering_model_config)
                 if steering_model_config is not None
                 else None
             ),
