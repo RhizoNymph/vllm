@@ -86,10 +86,12 @@ class TestAdmission:
         out = sched.schedule()
         assert _scheduled_ids(out) == {"a", "c"}
 
-    @pytest.mark.parametrize("capacity,expected", [(3, {"a", "b"}), (2, {"a"})])
+    @pytest.mark.parametrize("capacity,expected", [(4, {"a", "b"}), (3, {"a"})])
     def test_vectors_plus_clamps_single_config(self, capacity, expected):
         # vectors+clamps is ONE (hash, phase) per phase: request a reserves
-        # exactly its prefill + decode pair (2), leaving room for b at 3.
+        # exactly its prefill + decode pair (2), not one pair per kind. b's
+        # vectors-only rows differ in content from a's, so b needs its own
+        # pair (2): both fit at 4, b waits at 3.
         sched = _scheduler(capacity)
         vec = {"post_block": {0: [1.0, 2.0]}}
         sched.add_request(_req("a", clamps=_clamp(1), vectors=vec))
