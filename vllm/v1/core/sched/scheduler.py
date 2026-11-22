@@ -1385,7 +1385,7 @@ class Scheduler(SchedulerInterface):
                         )
                     ):
                         request_queue.pop_request()
-                        step_skipped_waiting.prepend_request(request)
+                        step_skipped_waiting.appendleft(request)
                         continue
 
                 # Patch-slot capacity (backpressure). Hold the request if
@@ -1406,7 +1406,7 @@ class Scheduler(SchedulerInterface):
                             for site, n in demand.items()
                         ):
                             request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
+                            step_skipped_waiting.appendleft(request)
                             continue
 
                 num_external_computed_tokens = 0
