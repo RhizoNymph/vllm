@@ -109,13 +109,21 @@ def test_pass_targeting_changes_output_and_differs_from_all_passes(steer_llm, ho
 def test_pass_index_is_rejected_on_non_looped_models(tmp_path):
     llm = _llm(tmp_path, False, enable_steering=True, max_steering_configs=4)
     try:
-        with pytest.raises(ValueError, match="looped model"):
-            _run(llm, steering_vectors={"post_block": {"1@0": [1.0] * 512}})
-        with pytest.raises(ValueError, match="out of range|outside the loop core"):
-            SamplingParams(steering_vectors={"post_block": {"1@5": [1.0] * 512}})
+        for key in ("1@0", "1@5"):
+            with pytest.raises(ValueError, match="looped model"):
+                _run(llm, steering_vectors={"post_block": {key: [1.0] * 512}})
     finally:
         del llm
         cleanup_dist_env_and_memory()
+
+
+@pytest.mark.parametrize(
+    ("key", "error"),
+    [("2@3", "pass 3 out of range"), ("0@1", "outside the loop core")],
+)
+def test_missing_pass_is_rejected_on_looped_models(steer_llm, key, error):
+    with pytest.raises(ValueError, match=error):
+        _run(steer_llm, steering_vectors={"post_block": {key: [1.0] * HIDDEN[True]}})
 
 
 def test_clamp_and_patch_target_a_pass(steer_llm):
